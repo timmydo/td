@@ -18,6 +18,10 @@
 #[allow(dead_code, reason = "shared immutable application policy")]
 #[path = "../../td-busd/src/app_policy.rs"]
 mod app_policy;
+// The workload account ledger the application policy resolves uids from.
+#[allow(dead_code, reason = "audio reads the ledger; td-firstboot seeds it")]
+#[path = "../../engine/src/workload_accounts.rs"]
+mod workload_accounts;
 
 mod alsa;
 mod device;
@@ -697,6 +701,10 @@ mod tests {
             ("tone.rs", include_str!("tone.rs")),
             ("wav.rs", include_str!("wav.rs")),
             ("wire.rs", include_str!("wire.rs")),
+            (
+                "workload_accounts.rs",
+                include_str!("../../engine/src/workload_accounts.rs"),
+            ),
         ]
     }
 
@@ -807,12 +815,16 @@ mod tests {
                 "{file} declares a submodule, which no scan here reads"
             );
         }
-        // One shared source is inventoried above and staged by the recipe.
-        let shared = concat!("#[pa", "th=\"../../td-busd/src/app_policy.rs\"]");
-        assert_eq!(squeezed().matches(shared).count(), 1);
-        assert!(!squeezed()
-            .replacen(shared, "", 1)
-            .contains(concat!("#[pa", "th")));
+        // Two shared sources are inventoried above and staged by the recipe.
+        let mut rest = squeezed();
+        for shared in [
+            concat!("#[pa", "th=\"../../td-busd/src/app_policy.rs\"]"),
+            concat!("#[pa", "th=\"../../engine/src/workload_accounts.rs\"]"),
+        ] {
+            assert_eq!(rest.matches(shared).count(), 1, "{shared}");
+            rest = rest.replacen(shared, "", 1);
+        }
+        assert!(!rest.contains(concat!("#[pa", "th")));
     }
 
     /// The list this module scans is every `.rs` file on disk, and there are
@@ -847,7 +859,7 @@ mod tests {
         }
         let mut scanned: Vec<String> = sources()
             .into_iter()
-            .filter(|(file, _)| *file != "app_policy.rs")
+            .filter(|(file, _)| !["app_policy.rs", "workload_accounts.rs"].contains(file))
             .map(|(file, _)| file.to_string())
             .collect();
         on_disk.sort();

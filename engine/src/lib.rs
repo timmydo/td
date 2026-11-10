@@ -86,9 +86,9 @@ pub mod permissions;
 pub mod principals;
 pub mod sha256;
 pub mod target_profile;
-// `workload_accounts` is the workload account ledger's pure half, which
-// td-firstboot `#[path]`-includes to seed it; td-builder and
-// td-recipe-eval do not use it.
+// `workload_accounts` is the workload account ledger, which td-firstboot
+// `#[path]`-includes to seed it and td-login and the bus policy's includers
+// to read it; td-builder and td-recipe-eval do not use it.
 pub mod workload_accounts;
 pub mod xz;
 
@@ -97,8 +97,9 @@ pub mod xz;
 mod test_temp;
 
 /// `workload_accounts` keeps its own copy of the principal table's
-/// application name grammar, since its coming readers do not compile
-/// `principals`; hold the two equal.
+/// application name grammar: its readers (td-login and the bus policy's
+/// includers) do not compile `principals`, and a leaf file both include
+/// would be staged by every recipe of either set. Hold the two equal.
 #[cfg(test)]
 mod account_name_grammar {
     fn admitted(name: &str) -> (bool, bool) {
@@ -137,6 +138,139 @@ mod account_name_grammar {
         assert!(admitted_any);
         assert_eq!(admitted(&"a".repeat(64)), (true, true));
         assert_eq!(admitted(&"a".repeat(65)), (false, false));
+    }
+}
+
+/// The ledger's one live reader, which every consumer shares.
+#[cfg(test)]
+mod account_ledger_reader {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::test_temp::TempDir;
+    use crate::workload_accounts::{load_from, Kind, Ledger, FILE_NAME, MAX_BYTES};
+    use std::fs;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n";
+
+    fn fixture() -> (TempDir, (u32, u32)) {
+        let root = TempDir::new("td-account-ledger").unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(root.path()).unwrap();
+        (root, (metadata.uid(), metadata.gid()))
+    }
+
+    fn write(root: &TempDir, text: &str, mode: u32) {
+        let path = root.path().join(FILE_NAME);
+        let _ = fs::remove_file(&path);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn the_reader_admits_only_the_published_shape() {
+        let (root, owner) = fixture();
+        // Absent is an error, not an empty ledger.
+        assert!(load_from(root.path(), owner).is_err());
+        write(&root, LEDGER, 0o644);
+        let ledger = load_from(root.path(), owner).unwrap();
+        assert_eq!(ledger, Ledger::parse(LEDGER).unwrap());
+        assert_eq!(ledger.name(Kind::Application, 65537), Some("mail"));
+        assert_eq!(ledger.name(Kind::Application, 65538), None);
+        assert_eq!(ledger.name(Kind::Workspace, 65536), None);
+        for other in [
+            (owner.0.wrapping_add(1), owner.1),
+            (owner.0, owner.1.wrapping_add(1)),
+        ] {
+            assert!(load_from(root.path(), other).is_err());
+        }
+        for mode in [0o600, 0o640, 0o664, 0o666, 0o444, 0o755, 0o4644] {
+            write(&root, LEDGER, mode);
+            assert!(load_from(root.path(), owner).is_err(), "{mode:o}");
+        }
+        write(&root, LEDGER, 0o644);
+        let path = root.path().join(FILE_NAME);
+        let other = root.path().join("other");
+        fs::hard_link(&path, &other).unwrap();
+        assert!(load_from(root.path(), owner).is_err());
+        fs::remove_file(&path).unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(load_from(root.path(), owner).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&other).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(load_from(root.path(), owner).is_err());
+        fs::remove_dir(&path).unwrap();
+        // Oversized, and malformed, are refused.
+        write(&root, &"x".repeat(MAX_BYTES + 1), 0o644);
+        assert!(load_from(root.path(), owner).is_err());
+        write(&root, &LEDGER.replace("65537", "065537"), 0o644);
+        assert!(load_from(root.path(), owner).is_err());
+        // A directory others may write, or a link to one, is refused.
+        write(&root, LEDGER, 0o644);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(load_from(root.path(), owner).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(load_from(root.path(), owner).is_ok());
+        let link = root.path().with_extension("link");
+        symlink(root.path(), &link).unwrap();
+        assert!(load_from(&link, owner).is_err());
+        fs::remove_file(link).unwrap();
+    }
+
+    #[test]
+    fn a_later_ledger_extends_an_earlier_one() {
+        let earlier = Ledger::parse(LEDGER).unwrap();
+        let later = Ledger::parse(&format!("{LEDGER}application\tnews\t65538\n")).unwrap();
+        assert!(later.extends(&earlier));
+        assert!(earlier.extends(&earlier));
+        assert!(!earlier.extends(&later));
+        let moved = Ledger::parse(&LEDGER.replace("65537", "65539")).unwrap();
+        assert!(!moved.extends(&earlier));
+        assert!(earlier.extends(&Ledger::default()));
+    }
+
+    /// A republished ledger has another stamp, an untouched one the same;
+    /// the stamp read beside a load is the one `stamp_from` reports.
+    #[test]
+    fn a_republished_ledger_has_another_stamp() {
+        use crate::workload_accounts::{load_stamped_from, stamp_from};
+        let (root, owner) = fixture();
+        assert!(stamp_from(root.path(), owner).is_err());
+        write(&root, LEDGER, 0o644);
+        let (_, loaded) = load_stamped_from(root.path(), owner).unwrap();
+        assert_eq!(stamp_from(root.path(), owner).unwrap(), loaded);
+        assert_eq!(stamp_from(root.path(), owner).unwrap(), loaded);
+        // Publication renames a new file into place: same bytes, new inode.
+        let staged = root.path().join(".accounts.next");
+        fs::write(&staged, LEDGER).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::rename(&staged, root.path().join(FILE_NAME)).unwrap();
+        assert_ne!(stamp_from(root.path(), owner).unwrap(), loaded);
+        assert!(stamp_from(root.path(), (owner.0.wrapping_add(1), owner.1)).is_err());
+    }
+
+    /// `tda` and canonical digits is the application account form, held to
+    /// the application uid range by nothing but the ledger.
+    #[test]
+    fn the_application_account_name_spells_a_uid() {
+        use crate::workload_accounts::{
+            application_account_name, application_account_uid, APPLICATION_UIDS, LEDGER_UIDS,
+            WORKLOAD_UIDS,
+        };
+        assert_eq!(application_account_uid("tda65536"), Some(65536));
+        assert_eq!(application_account_uid("tda7"), Some(7));
+        for name in ["tda065536", "tda4294967296"] {
+            assert!(application_account_name(name));
+            assert_eq!(application_account_uid(name), None, "{name}");
+        }
+        for name in ["tda", "tdadam", "tda1x", "xtda1", "TDA1", "tda-1", ""] {
+            assert!(!application_account_name(name), "{name}");
+            assert_eq!(application_account_uid(name), None);
+        }
+        assert_eq!(LEDGER_UIDS.start(), APPLICATION_UIDS.start());
+        assert_eq!(APPLICATION_UIDS.end() + 1, *WORKLOAD_UIDS.start());
+        assert_eq!(LEDGER_UIDS.end(), WORKLOAD_UIDS.end());
     }
 }
 

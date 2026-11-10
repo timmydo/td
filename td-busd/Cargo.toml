@@ -21,6 +21,11 @@ td-source-scan = { path = "../td-source-scan" }
 name = "td-busd"
 path = "src/main.rs"
 
+# The recipe stages the shared sources beside main.rs and sets this, so
+# their `#[path]` attributes apply only to the checkout's own build.
+[features]
+target-recipe = []
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

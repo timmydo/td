@@ -1322,7 +1322,7 @@ fn accounts() {
     for (name, text, mode) in [
         ("td-principals.tsv", session, 0o444),
         // The session's applications: none.
-        ("td-bus-applications.tsv", "td-bus-applications-v1\t1000\n", 0o444),
+        ("td-bus-applications.tsv", "td-bus-applications-v2\t1000\n", 0o444),
         ("td-launcher.tsv", "", 0o444),
         // Root's registry, as empty, so the installed set answers at once.
         ("td-applications.tsv", "", 0o444),
@@ -1343,6 +1343,9 @@ fn accounts() {
     }
     fs::write("/var/lib/td/principals.tsv", session).unwrap();
     fs::set_permissions("/var/lib/td/principals.tsv", Permissions::from_mode(0o600)).unwrap();
+    // The workload account ledger the application policy joins: no rows.
+    fs::write("/var/lib/td/accounts.tsv", "td-accounts-v1\n").unwrap();
+    fs::set_permissions("/var/lib/td/accounts.tsv", Permissions::from_mode(0o644)).unwrap();
 }
 
 /// The compositor's runtime directories and devices, given to its account

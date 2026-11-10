@@ -256,10 +256,14 @@ fn init() {
     for path in ["/run/user/1000", "/home/alice"] {
         std::os::unix::fs::chown(path, Some(1000), Some(1000)).unwrap();
     }
-    let table = "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n";
+    // The image reserves no application; the retained table keeps mail's
+    // earlier reservation.
+    let table = "td-principals-v1\nsession\t1000\t993\t992\t991\n";
+    let retained =
+        "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n";
     for (path,text,mode) in [
         ("/etc/td-principals.tsv",table,0o444),
-        ("/var/lib/td/principals.tsv",table,0o600),
+        ("/var/lib/td/principals.tsv",retained,0o600),
         ("/etc/passwd","root:!:0:0:root:/root:/bin/false\nalice::1000:1000:Test:/home/alice:/bin/false\ntdc1000:!td-service:993:993:Compositor:/run:/bin/false\n",0o644),
         ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }

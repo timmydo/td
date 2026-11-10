@@ -1924,7 +1924,7 @@ fn private_application_home(home: &Path) -> bool {
     else {
         return false;
     };
-    (65536..=2147483647).contains(&uid)
+    crate::workload_accounts::APPLICATION_UIDS.contains(&uid)
         && home.as_os_str() == std::ffi::OsStr::new(&format!("/var/lib/td/applications/{uid}"))
 }
 
@@ -1940,7 +1940,7 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
         .and_then(|name| name.parse::<u32>().ok())
         .ok_or_else(|| invalid("invalid private application home"))?;
     let policy = crate::app_policy::load().map_err(invalid)?;
-    let component = match policy.for_uid(uid).map(|rule| rule.application.as_str()) {
+    let component = match policy.for_uid(uid).map(|rule| rule.application).as_deref() {
         Some("firefox") => "Downloads",
         _ => return Ok(None),
     };
@@ -4016,8 +4016,9 @@ mod tests {
 
     #[test]
     fn personal_names_share_only_the_assigned_human_identity_and_runtime() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\t\n1000\tmail\t\n1000\tnews\t\n",
+        let policy = crate::app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tpersonal\t\nnews\tpersonal\t\n",
+            LEDGER,
         )
         .unwrap();
         for name in ["mail", "news"] {
@@ -4034,12 +4035,14 @@ mod tests {
         assert!(application_account(1000, "absent", &policy).is_err());
     }
 
+    /// The ledger's carried application rows.
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\napplication\tweb\t65540\n";
+    const SERVICE: &str =
+        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\n";
+
     #[test]
     fn stock_display_belongs_to_compositor_and_runtime_to_the_assigned_app() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
-        )
-        .unwrap();
+        let policy = crate::app_policy::Policy::from_tables(SERVICE, LEDGER).unwrap();
         let (display, uid, runtime) = application_session(65536, "firefox", &policy).unwrap();
         assert_eq!(display, Path::new("/run/td-compositor/1000/wayland-0"));
         assert_eq!(uid, 993);
@@ -4052,12 +4055,23 @@ mod tests {
 
     #[test]
     fn a_product_launch_admits_only_the_application_account_assigned_its_name() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
-        )
-        .unwrap();
+        let policy = crate::app_policy::Policy::from_tables(SERVICE, LEDGER).unwrap();
         application_account(65536, "firefox", &policy).unwrap();
         application_account(65537, "mail", &policy).unwrap();
+        // The account is the ledger's row, not a uid the image spells.
+        let moved = crate::app_policy::Policy::from_tables(
+            SERVICE,
+            &LEDGER.replace("firefox\t65536", "firefox\t70000"),
+        )
+        .unwrap();
+        application_account(70000, "firefox", &moved).unwrap();
+        assert!(application_account(65536, "firefox", &moved).is_err());
+        let absent = crate::app_policy::Policy::from_tables(
+            SERVICE,
+            "td-accounts-v1\napplication\tmail\t65537\n",
+        )
+        .unwrap();
+        assert!(application_account(65536, "firefox", &absent).is_err());
         for (uid, name) in [
             (1000, "firefox"),
             (0, "firefox"),

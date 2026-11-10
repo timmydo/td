@@ -426,7 +426,8 @@ after dropping to the UID the deployment assigned it (`application-start`,
 td-authd/DESIGN.md), which is the identity its private home, account
 cache, cgroup and bus registration belong to. Before any session, cgroup
 or cache exists td-jail refuses a by-name launch whose effective UID is
-not the one the immutable bus policy (`/etc/td-bus-applications.tsv`)
+not the one the application policy (the image's
+`/etc/td-bus-applications.tsv` joined with the workload account ledger)
 assigns that name, in one line: `td-jail: firefox runs only as its own
 application account, not uid 1000; td starts it from the desktop, not
 from a shell`. Stage 1 checks the same rule again as it resolves the
@@ -4241,16 +4242,25 @@ and the first thing that wants one is a design review rather than a
 config file.
 
 **Deployment application identity.** `run-session` loads
-`/etc/td-bus-applications.tsv` before binding. The image generates this
-regular root-owned 0444 file from the same application names and reserved
-UIDs as `/etc/td-principals.tsv`, with exact `own` grants from each
-package's permission declaration. The broker pins `/etc`, refuses links,
-other writers, non-regular or multiply-linked files, and reads at most
-64 KiB plus one overflow byte. The canonical ASCII format is a
-`td-bus-applications-v1<TAB>1000` header followed by name-sorted rows of
-`UID<TAB>application<TAB>comma-separated sorted owned names`. Rows have
-unique UIDs and application names; limits are 256 applications and 32
-owned names each. Stock names use the intersection of the principal
+`/etc/td-bus-applications.tsv` and the workload account ledger,
+`/var/lib/td/accounts.tsv` (td-authd/DESIGN.md, "Workload account
+ledger"), before binding. The image generates the declarations, a regular
+root-owned 0444 file, from the shipped applications, with exact `own`
+grants from each package's permission declaration; it carries no uid.
+The broker pins `/etc`, refuses links, other writers, non-regular or
+multiply-linked files, and reads at most 64 KiB plus one overflow byte.
+The canonical ASCII format is a `td-bus-applications-v2<TAB>1000` header
+followed by name-sorted rows of `application<TAB>class<TAB>comma-separated
+sorted owned names`, class `personal` (the application runs as the
+session's human) or `service` (it runs as its own account, the ledger's
+application row of its name). Rows have unique application names; limits
+are 256 applications and 32 owned names each. A service application whose
+name the ledger does not hold is declared but inactive. The broker reads
+the ledger again when a peer's uid in the application range, or a
+declared application, has no row and the file changed since its last read,
+and keeps the fresh ledger only when it extends the one it holds; a
+ledger it cannot read at start admits no application until it changes
+(td-authd/DESIGN.md, "Workload account ledger"). Stock names use the intersection of the principal
 and launcher grammars defined in §B. Reserved broker/portal names are
 never grants. Multiple reviewed applications may receive the same
 owned-name grant; ownership arbitration remains the broker's ordinary
@@ -4270,9 +4280,10 @@ role. Generic host/test brokers retain their caller-supplied registry.
 Application identities and private state are active. The stock registry
 requires the UID assigned to the name: the human UID for personal mail/news
 and a dedicated service UID for foreign applications. Root's trusted portal connection cannot register an app
-either. This policy table is rebuilt for the selected deployment; the
-persistent UID reservation ledger also retains removed assignments and
-does not grant them access to a deployment where they are absent.
+either. The declarations are rebuilt for the selected deployment; the
+workload account ledger and the persistent UID reservations also retain
+removed applications' rows and do not grant them access to a deployment
+that does not declare them.
 
 `td-busd` also **absorbs `xdg-dbus-proxy`**. Upstream starts a filtering
 proxy per sandbox and bind-mounts the proxied socket; td bind-mounts the
@@ -8797,15 +8808,18 @@ the credential store and has a read-only mapped Downloads grant, with no
 access to the remaining private human home.
 
 Firefox runs under external service UID 65536, and td's own browser,
-`web` (td-web/DESIGN.md §3), under 65540, `tda65540`. The source-built
-mail and news applications run as the login user, UID 1000, inside
-td-jail. Their former 65537 and 65538 account rows remain reserved and
-are never reused, as is Claude Code's 65539 (§W.9); firstboot prepares
-neither private homes nor service runtimes for those personal
-applications. The immutable bus table names the actual launch UID
-for each installed application. Root-configured units invoke
+`web` (td-web/DESIGN.md §3), under 65540, `tda65540`. Each is the
+workload account ledger's application row of its name, which firstboot
+seeds with these carried rows; no passwd or group entry names an
+application account, and td-login resolves `tda<uid>` from the ledger
+alone. The source-built mail and news applications run as the login
+user, UID 1000, inside td-jail. Their 65537 and 65538 ledger rows remain
+and are never reused, as is Claude Code's 65539 (§W.9); firstboot
+prepares neither private homes nor service runtimes for those personal
+applications. The declarations name each installed application's class,
+and the ledger its account. Root-configured units invoke
 `td-authd application-start`, which checks the enrolled account reservation
-and this table, then uses td-login's checked credential drop. Personal
+and this policy, then uses td-login's checked credential drop. Personal
 applications use `exec-primary` and `/td-user-1000/session`; foreign
 applications use `exec-service-as` and their application session cgroup.
 No caller may choose an executable or UID through that operation. There
@@ -10516,9 +10530,10 @@ volatile release, and applications receive only their credential bytes.
 `td-secret/DESIGN.md` specifies the memory, physical-bus, rollback and update
 boundaries and the separate pinned-emulator oracles.
 
-The secure-attention prerequisites reserve distinct compositor, broker,
-portal, and application identities in immutable
-`/etc/td-principals.tsv`. Firstboot checks those reservations against
+The secure-attention prerequisites reserve distinct compositor, broker
+and portal identities in immutable `/etc/td-principals.tsv`; application
+identities are the workload account ledger's rows, and the image's table
+holds none. Firstboot checks those reservations against
 all account databases and persists their union in
 `/var/lib/td/principals.tsv`, retaining retired assignments so updates
 cannot reuse their UIDs. The image consumes the compositor assignment at
@@ -11866,10 +11881,11 @@ with that release stream (the third class of foreign output AGENTS.md
 named), its recipe, verifier and key, its shell launch and its oracle.
 A machine enrolled while it shipped keeps what a deployment cannot reach, by
 design: td-firstboot's ledger, `/var/lib/td/principals.tsv`, retains the
-`claude` assignment, since a retired UID is never reassigned, and the
-boot verifies only the accounts a deployment still names, so it admits
-that row with no `tda65539` account in the image, while still refusing
-any account that claims the reserved UID or name. Its home,
+`claude` assignment, since a retired UID is never reassigned, and seeds
+it into the workload account ledger; the boot verifies only the accounts
+a deployment still names, so it admits that row with no `tda65539`
+account anywhere, while still refusing any passwd or group entry that
+claims the reserved UID or name. Its home,
 `/var/lib/td/applications/65539`, with the release binaries and runtime
 its cache held, stays as inert data: firstboot prepares only the
 applications the deployment names, and no unit, launcher, grant or jail

@@ -11,6 +11,10 @@
     )
 )]
 
+// Application declarations joined with the workload account ledger.
+#[path = "../../td-busd/src/app_policy.rs"]
+#[allow(dead_code, reason = "a private write reads one account")]
+mod app_policy;
 #[path = "../../td-busd/src/bus_client.rs"]
 mod bus_client;
 mod client;
@@ -76,6 +80,9 @@ mod tpm;
 #[path = "../../td-busd/src/wire.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod wire;
+#[path = "../../engine/src/workload_accounts.rs"]
+#[allow(dead_code, reason = "the application policy reads the ledger")]
+mod workload_accounts;
 mod write_operation;
 
 // td-fido's modules, by the names this crate's modules, and the files
@@ -396,19 +403,43 @@ mod confinement {
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
-            0x5fe202ee099e5378
+            0x5ffe53cca5bded20
         );
         assert_eq!(
             fingerprint(include_str!("enrollment_operation.rs")),
             0x5e3fb383c97e2405
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xbc471d0016e8d79d, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x15cb18f54f2439bd, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(
             "#[path = \"../../td-firstboot/src/hostname.rs\"]\n#[allow(dead_code, reason = \"the shared consent's hostname rules\")]\nmod hostname;\n"
         ));
         assert_eq!(production.matches("mod hostname;").count(), 1);
+        // The application policy and the ledger reader it joins, compiled
+        // once each at the crate root; the raw-surface scan above holds
+        // them free of unsafe code.
+        for (attribute, module) in [
+            (
+                "#[path = \"../../td-busd/src/app_policy.rs\"]\n#[allow(dead_code, reason = \"a private write reads one account\")]\nmod app_policy;\n",
+                "mod app_policy;",
+            ),
+            (
+                "#[path = \"../../engine/src/workload_accounts.rs\"]\n#[allow(dead_code, reason = \"the application policy reads the ledger\")]\nmod workload_accounts;\n",
+                "mod workload_accounts;",
+            ),
+        ] {
+            assert_eq!(production.matches(attribute).count(), 1, "{module}");
+            assert_eq!(production.matches(module).count(), 1, "{module}");
+        }
+        for shared in [
+            include_str!("../../td-busd/src/app_policy.rs"),
+            include_str!("../../engine/src/workload_accounts.rs"),
+        ] {
+            for forbidden in ["Command", "std::process", "#[path", "include!"] {
+                assert!(!shared.contains(forbidden), "{forbidden}");
+            }
+        }
         assert_eq!(
             fingerprint(include_str!("../../td-firstboot/src/hostname.rs")),
             0x49026f28c1db76ec,
@@ -570,6 +601,15 @@ mod confinement {
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
             ("main.rs", include_str!("main.rs")),
+            // The application policy and the ledger reader it joins.
+            (
+                "app_policy.rs",
+                include_str!("../../td-busd/src/app_policy.rs"),
+            ),
+            (
+                "workload_accounts.rs",
+                include_str!("../../engine/src/workload_accounts.rs"),
+            ),
             (
                 "bus_client.rs",
                 include_str!("../../td-busd/src/bus_client.rs"),

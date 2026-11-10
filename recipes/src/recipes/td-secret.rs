@@ -206,6 +206,16 @@ const MODULES: &[(&str, &str)] = &[
     ("name", include_str!("../../../td-busd/src/name.rs")),
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
+    // A private write binds the uid the workload account ledger holds for
+    // a declared application.
+    (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
 ];
 
 pub fn recipe() -> Recipe {
@@ -279,6 +289,8 @@ pub fn recipe() -> Recipe {
                 "name" => "{src}/td-busd/src/name.rs".into(),
                 "message" => "{src}/td-busd/src/message.rs".into(),
                 "wire" => "{src}/td-busd/src/wire.rs".into(),
+                "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
+                "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
                 _ => format!("{{src}}/td-secret/src/{name}.rs"),
             },
             content: (*source).into(),

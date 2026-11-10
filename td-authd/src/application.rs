@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 const DEADLINE: Duration = Duration::from_secs(2);
 /// How long one wait for the check looks before draining its stderr again.
 const READ_STEP: Duration = Duration::from_millis(10);
-const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=2147483647;
+// An application account is the workload account ledger's.
+use crate::workload_accounts::APPLICATION_UIDS;
 const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
 
 struct Request {
@@ -302,6 +303,18 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The launcher, the shared consent codec and the ledger agree on what
+    /// an application uid is; a uid past the ledger's range is no launch.
+    #[test]
+    fn every_application_uid_check_is_the_ledgers_range() {
+        assert_eq!(crate::consent::APPLICATION_UIDS, APPLICATION_UIDS);
+        assert_eq!(launch_uid("65536"), Ok(65536));
+        assert_eq!(launch_uid("98303"), Ok(98303));
+        for text in ["65535", "98304", "131071", "2147483647"] {
+            assert!(launch_uid(text).is_err(), "{text}");
+        }
+    }
 
     fn request() -> Vec<String> {
         ["1000", "mail", "direct", "--", "literal;argument"]

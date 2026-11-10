@@ -285,12 +285,23 @@ pub fn recipe() -> Recipe {
         "{src}/td-install/src",
         "{src}/td-secret/src",
         "{src}/td-civil/src",
+        "{src}/td-busd/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
     }
     for (path, source) in [
+        // Application declarations joined with the workload account
+        // ledger, the one source of an application's uid.
+        (
+            "{src}/td-busd/src/app_policy.rs",
+            include_str!("../../../td-busd/src/app_policy.rs"),
+        ),
+        (
+            "{src}/engine/src/workload_accounts.rs",
+            include_str!("../../../engine/src/workload_accounts.rs"),
+        ),
         (
             "{src}/td-firstboot/src/principals.rs",
             include_str!("../../../td-firstboot/src/principals.rs"),

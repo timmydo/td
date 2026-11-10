@@ -41,6 +41,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-jail/src/transition.rs"),
     ),
     (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
+    (
         "workspace",
         include_str!("../../../td-jail/src/workspace.rs"),
     ),

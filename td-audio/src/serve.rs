@@ -84,11 +84,17 @@ pub const WAIT_MS: i32 = 100;
 /// The most bytes read from one client per pass.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// The one application whose account may connect.
+const BROWSER: &str = "firefox";
+
 /// Who may connect.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
-    /// Dedicated audio, the human seat and the assigned Firefox principal.
+    /// Dedicated audio and the human seat.
     pub allowed_uids: Vec<u32>,
+    /// The deployment's application policy, which names the browser's
+    /// account. Asked on each admission, so an account the ledger gains
+    /// after the daemon started is admitted without a restart.
+    applications: Option<crate::app_policy::Policy>,
 }
 
 impl Policy {
@@ -103,14 +109,17 @@ impl Policy {
         if own != SEAT_UID {
             allowed_uids.push(SEAT_UID);
         }
-        Self { allowed_uids }
+        Self {
+            allowed_uids,
+            applications: None,
+        }
     }
 
     pub fn for_deployment(own: u32) -> io::Result<Self> {
         Self::deployment_policy(
             own,
             std::fs::symlink_metadata(crate::app_policy::PATH).map(|_| ()),
-            || crate::app_policy::load().map_err(io::Error::other),
+            || crate::app_policy::load_session().map_err(io::Error::other),
         )
     }
 
@@ -128,26 +137,45 @@ impl Policy {
             Err(error) => return Err(error),
             Ok(()) => {}
         }
-        let applications = load()?;
-        if let Some(firefox) = applications.for_name("firefox") {
-            policy.allowed_uids.push(firefox.uid);
-        }
+        policy.applications = Some(load()?);
         Ok(policy)
     }
 
+    /// The browser's account, when the deployment declares it and the
+    /// ledger holds its row.
+    fn browser(&self) -> Option<u32> {
+        self.applications
+            .as_ref()
+            .and_then(|applications| applications.for_name(BROWSER))
+            .map(|rule| rule.uid)
+    }
+
+    /// Every uid admitted now: the fixed pair and the browser's account.
+    pub fn permitted(&self) -> Vec<u32> {
+        let mut uids = self.allowed_uids.clone();
+        if let Some(uid) = self
+            .browser()
+            .filter(|uid| !self.allowed_uids.contains(uid))
+        {
+            uids.push(uid);
+        }
+        uids
+    }
+
     pub fn admits(&self, peer: &sys::Peer) -> bool {
-        self.allowed_uids.contains(&peer.uid)
+        self.allowed_uids.contains(&peer.uid) || self.browser() == Some(peer.uid)
     }
 
     /// Why a peer was refused, in words a log line can carry. §K.5 asks for a
     /// decision "in code that can say why it refused".
     pub fn refusal(&self, peer: &sys::Peer) -> String {
+        let permitted = self.permitted();
         format!(
             "uid {} (pid {}) is not one of the {} permitted uids {:?}",
             peer.uid,
             peer.pid,
-            self.allowed_uids.len(),
-            self.allowed_uids
+            permitted.len(),
+            permitted
         )
     }
 }
@@ -377,8 +405,8 @@ impl<S: AudioSink> Server<S> {
     /// The uids this daemon will admit, for the banner it prints on startup.
     /// §K.5 wants the decision visible, and a daemon that announces who it
     /// serves is one whose refusals can be read against something.
-    pub fn policy_uids(&self) -> &[u32] {
-        &self.policy.allowed_uids
+    pub fn policy_uids(&self) -> Vec<u32> {
+        self.policy.permitted()
     }
 
     /// Run until the device is gone, or for `max_passes` passes.
@@ -2080,12 +2108,16 @@ mod tests {
 
     #[test]
     fn deployment_audio_admits_only_the_assigned_browser_and_fails_closed() {
+        const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\n";
         let installed = || {
-            crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
-        ).map_err(io::Error::other)
+            crate::app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tpersonal\t\n",
+                LEDGER,
+            )
+            .map_err(io::Error::other)
         };
         let policy = Policy::deployment_policy(994, Ok(()), installed).unwrap();
+        assert_eq!(policy.permitted(), [994, 1000, 65536]);
         for uid in [994, 1000, 65536] {
             assert!(policy.admits(&sys::Peer {
                 pid: 1,
@@ -2116,11 +2148,29 @@ mod tests {
                 .is_err()
         );
         let no_browser = Policy::deployment_policy(994, Ok(()), || {
-            crate::app_policy::Policy::parse("td-bus-applications-v1\t1000\n65537\tmail\t\n")
-                .map_err(io::Error::other)
+            crate::app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nmail\tservice\t\n",
+                LEDGER,
+            )
+            .map_err(io::Error::other)
         })
         .unwrap();
-        assert_eq!(no_browser.allowed_uids, [994, 1000]);
+        assert_eq!(no_browser.permitted(), [994, 1000]);
+        assert!(!no_browser.admits(&sys::Peer {
+            pid: 1,
+            uid: 65536,
+            gid: 65536
+        }));
+        // A declared browser without a ledger account is admitted nowhere.
+        let unallocated = Policy::deployment_policy(994, Ok(()), || {
+            crate::app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\n",
+                "td-accounts-v1\napplication\tmail\t65537\n",
+            )
+            .map_err(io::Error::other)
+        })
+        .unwrap();
+        assert_eq!(unallocated.permitted(), [994, 1000]);
     }
 
     /// The policy accepts the daemon's own uid and the seat user, and nothing
@@ -2337,6 +2387,7 @@ mod tests {
             MemorySink::fixed(),
             Policy {
                 allowed_uids: Vec::new(),
+                applications: None,
             },
         )
         .unwrap();

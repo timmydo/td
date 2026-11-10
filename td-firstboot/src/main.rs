@@ -86,6 +86,14 @@ mod ssh_render;
     reason = "shared sealed-store format and root enrollment entry points"
 )]
 mod tpm;
+// The workload account ledger: principal_store seeds it, the application
+// policy reads it.
+#[path = "../../engine/src/workload_accounts.rs"]
+#[allow(
+    dead_code,
+    reason = "the ledger's readers share the file; firstboot uses its seed and reader"
+)]
+mod workload_accounts;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -297,7 +305,7 @@ fn usage() -> String {
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot metadata applies an attached NoCloud seed's hostname and Ed25519 keys on a server\n  \
          td-firstboot cloud-metadata applies the hostname and Ed25519 keys of the metadata service DMI names, once the network is up\n  \
-         td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
+         td-firstboot check-principals ROOT [--applications] validates staged deployment identities without writing; --applications requires ROOT's application declarations, which a root without it must lack\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
@@ -356,9 +364,12 @@ fn run_with_primary(
         Invocation::Hostname => return activate_hostname(),
         Invocation::Metadata => return apply_metadata(),
         Invocation::CloudMetadata => return apply_cloud_metadata(),
-        Invocation::CheckPrincipals(root) => {
+        Invocation::CheckPrincipals(root, applications) => {
             let registry = principals::check_deployment(&root).map_err(Failure::Failed)?;
-            principal_store::check_accounts(&registry).map_err(Failure::Failed)?;
+            let declarations =
+                deployment_declarations(&root, applications).map_err(Failure::Failed)?;
+            principal_store::check_accounts(&registry, declarations.as_ref())
+                .map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
         }
         Invocation::CheckPrimaryName(root, name) => {
@@ -427,28 +438,31 @@ fn run_with_primary(
         principal_store::prepare_runtime_store().map_err(Failure::Failed)?;
         application_runtime::prepare_runtime_account().map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
+        // The active applications: each the image declares whose account the
+        // ledger, published above, holds. A personal one runs as the human
+        // and gets no home, cgroup or runtime of its account's.
         let policy = app_policy::load().map_err(Failure::Failed)?;
-        for application in desired.active_applications().map_err(Failure::Failed)? {
+        let owner = policy.owner();
+        for declaration in policy.declarations().rows() {
+            let name = &declaration.application;
+            let Some(uid) = policy.account(name) else {
+                continue;
+            };
             let former = applications
                 .as_ref()
-                .filter(|home| home.uid == application.owner)
+                .filter(|home| home.uid == owner)
                 .ok_or_else(|| {
                     Failure::Failed(
                         "active application lacks its configured human migration home".into(),
                     )
                 })?;
-            if policy
-                .for_name(&application.name)
-                .is_some_and(|rule| rule.uid == application.owner)
-            {
+            if declaration.class == app_policy::Class::Personal {
                 continue;
             }
-            application_state::prepare(former, &application.name, application.uid)
-                .map_err(Failure::Failed)?;
-            application_runtime::prepare(application.uid).map_err(Failure::Failed)?;
+            application_state::prepare(former, name, uid).map_err(Failure::Failed)?;
+            application_runtime::prepare(uid).map_err(Failure::Failed)?;
             emit(&format!(
-                "TD-APPLICATION-STATE-READY owner={} app={} uid={}\n",
-                application.owner, application.name, application.uid
+                "TD-APPLICATION-STATE-READY owner={owner} app={name} uid={uid}\n"
             ))
             .map_err(Failure::Failed)?;
         }
@@ -501,13 +515,40 @@ fn run_with_primary(
     Ok(())
 }
 
+/// The application declarations a staged deployment root carries, read as
+/// the live loader reads them but under the staged tree's owner. A desktop
+/// (`expected`) must carry them; a server declares none and must lack the
+/// file, so neither profile passes on a file it should not have.
+fn deployment_declarations(
+    root: &Path,
+    expected: bool,
+) -> Result<Option<app_policy::Declarations>, String> {
+    let etc = root.join("etc");
+    let name = Path::new(app_policy::PATH)
+        .file_name()
+        .ok_or("bus policy has no filename")?;
+    match std::fs::symlink_metadata(etc.join(name)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !expected => return Ok(None),
+        Err(error) => return Err(format!("inspect the bus application policy: {error}")),
+        Ok(_) if !expected => {
+            return Err("a deployment without applications carries application declarations".into())
+        }
+        Ok(_) => {}
+    }
+    let metadata = std::fs::symlink_metadata(&etc)
+        .map_err(|error| format!("inspect {}: {error}", etc.display()))?;
+    app_policy::load_declarations_from(&etc, (metadata.uid(), metadata.gid())).map(Some)
+}
+
 /// What an argv asked for.
 enum Invocation {
     Help,
     Hostname,
     Metadata,
     CloudMetadata,
-    CheckPrincipals(PathBuf),
+    /// A staged root, and whether it must declare applications (a
+    /// desktop's) or must not (a server's).
+    CheckPrincipals(PathBuf, bool),
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
     PreparePrimaryProfile(PathBuf),
@@ -683,12 +724,19 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         ));
     }
     if args.first().is_some_and(|verb| verb == "check-principals") {
-        let [_, root] = args else {
-            return Err(Failure::Usage(
-                "check-principals requires one deployment root".into(),
-            ));
-        };
-        return Ok(Invocation::CheckPrincipals(PathBuf::from(root)));
+        let (root, applications) =
+            match args {
+                [_, root] => (root, false),
+                [_, root, flag] if flag == "--applications" => (root, true),
+                _ => return Err(Failure::Usage(
+                    "check-principals requires one deployment root and optionally --applications"
+                        .into(),
+                )),
+            };
+        return Ok(Invocation::CheckPrincipals(
+            PathBuf::from(root),
+            applications,
+        ));
     }
     let mut state: Option<PathBuf> = None;
     let mut enroll_principals = false;
@@ -1774,7 +1822,7 @@ mod tests {
             | Invocation::Hostname
             | Invocation::Metadata
             | Invocation::CloudMetadata
-            | Invocation::CheckPrincipals(_)
+            | Invocation::CheckPrincipals(..)
             | Invocation::CheckPrimaryName(_, _)
             | Invocation::PreparePrimaryProfile(_)
             | Invocation::EnsureLoginDirectory(_)
@@ -2826,16 +2874,48 @@ mod principal_arguments {
         assert!(parse(&extra).is_err());
     }
 
+    /// A desktop root must carry its declarations and a server's must not:
+    /// neither check passes vacuously on the other profile's tree.
+    #[test]
+    fn the_staged_declarations_follow_the_profile() {
+        use std::os::unix::fs::PermissionsExt;
+        let guard = td_fs::TempDir::new("td-firstboot-declarations").unwrap();
+        let etc = guard.path().join("etc");
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::set_permissions(guard.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(deployment_declarations(guard.path(), false)
+            .unwrap()
+            .is_none());
+        assert!(deployment_declarations(guard.path(), true).is_err());
+        let file = etc.join("td-bus-applications.tsv");
+        std::fs::write(&file, "td-bus-applications-v2\t1000\nmail\tpersonal\t\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let declared = deployment_declarations(guard.path(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(declared.rows().len(), 1);
+        assert!(deployment_declarations(guard.path(), false).is_err());
+    }
+
     #[test]
     fn staged_check_accepts_only_a_deployment_root() {
         let args = ["check-principals".to_string(), "/staged".to_string()];
         assert!(
-            matches!(parse(&args), Ok(Invocation::CheckPrincipals(root)) if root == Path::new("/staged"))
+            matches!(parse(&args), Ok(Invocation::CheckPrincipals(root, false)) if root == Path::new("/staged"))
         );
         assert!(parse(&args[..1]).is_err());
+        let mut desktop = args.to_vec();
+        desktop.push("--applications".into());
+        assert!(matches!(
+            parse(&desktop),
+            Ok(Invocation::CheckPrincipals(_, true))
+        ));
         let mut mixed = args.to_vec();
         mixed.push("--enroll-principals".into());
         assert!(parse(&mixed).is_err());
+        desktop.push("--applications".into());
+        assert!(parse(&desktop).is_err());
     }
 
     #[test]

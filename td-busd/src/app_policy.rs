@@ -1,13 +1,17 @@
-//! Immutable deployment grants; the wire never allocates an application identity.
+//! Immutable deployment grants joined with the workload account ledger: the
+//! image declares each application, the account it runs as and the names it
+//! may own, and an application with an account of its own takes that
+//! account's uid from `/var/lib/td/accounts.tsv` (td-authd/DESIGN.md,
+//! "Workload account ledger"). The wire never allocates an application
+//! identity. Every includer also declares `crate::workload_accounts`.
 
+use crate::workload_accounts::{self, Kind, Ledger, Stamp};
+use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-
-const O_NOFOLLOW: i32 = 0x20000;
-const O_DIRECTORY: i32 = 0x10000;
-const O_NONBLOCK: i32 = 0x800;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 pub const PORTAL_UID: u32 = 991;
 
@@ -15,8 +19,21 @@ pub const PATH: &str = "/etc/td-bus-applications.tsv";
 pub const MAX_BYTES: usize = 64 * 1024;
 const MAX_APPS: usize = 256;
 const MAX_OWNED: usize = 32;
-const HEADER: &str = "td-bus-applications-v1";
+const HEADER: &str = "td-bus-applications-v2";
 
+/// How a loaded policy treats a ledger it cannot read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// The load fails: a launcher, a credential binding or a check.
+    Strict,
+    /// A long-running session service starts with no application rows,
+    /// says so on stderr, and reads the ledger again once it changes, so
+    /// the human's own connections survive a damaged ledger while every
+    /// application stays refused.
+    Session,
+}
+
+/// One declared application at the uid it runs as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub uid: u32,
@@ -24,44 +41,73 @@ pub struct Rule {
     pub owned: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Policy {
-    owner: u32,
-    rules: Vec<Rule>,
+/// The account a declared application runs as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// The session's human (td's mail and news).
+    Personal,
+    /// Its own account: the ledger's application row of its name.
+    Service,
 }
 
-impl Policy {
-    pub fn new(owner: u32, mut rules: Vec<Rule>) -> Result<Self, String> {
-        if !(1000..=65533).contains(&owner) || rules.len() > MAX_APPS {
+impl Class {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "personal" => Some(Self::Personal),
+            "service" => Some(Self::Service),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Service => "service",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    pub application: String,
+    pub class: Class,
+    pub owned: Vec<String>,
+}
+
+/// The image's `/etc/td-bus-applications.tsv`: a header naming the session
+/// owner, then one `NAME<TAB>CLASS<TAB>OWNED` row per application, sorted by
+/// name. It carries no uid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declarations {
+    owner: u32,
+    rows: Vec<Declaration>,
+}
+
+impl Declarations {
+    pub fn new(owner: u32, mut rows: Vec<Declaration>) -> Result<Self, String> {
+        if !(1000..=65533).contains(&owner) || rows.len() > MAX_APPS {
             return Err("invalid application policy owner or row count".into());
         }
-        let mut uids = BTreeSet::new();
         let mut names = BTreeSet::new();
-        for rule in &mut rules {
-            if (rule.uid != owner && !(65536..=2147483647).contains(&rule.uid))
-                || !application_name(&rule.application)
-                || (rule.uid != owner && !uids.insert(rule.uid))
-                || !names.insert(rule.application.clone())
-                || rule.owned.len() > MAX_OWNED
-                || rule.owned.iter().any(|name| !owned_grant(name))
+        for row in &mut rows {
+            if !application_name(&row.application)
+                || !names.insert(row.application.clone())
+                || row.owned.len() > MAX_OWNED
+                || row.owned.iter().any(|name| !owned_grant(name))
             {
                 return Err("invalid or duplicate application policy entry".into());
             }
-            rule.owned.sort();
-            if rule
-                .owned
-                .windows(2)
-                .any(|pair| pair.first() == pair.get(1))
-            {
+            row.owned.sort();
+            if row.owned.windows(2).any(|pair| pair.first() == pair.get(1)) {
                 return Err("duplicate application bus grant".into());
             }
         }
-        rules.sort_by(|left, right| left.application.cmp(&right.application));
-        let policy = Self { owner, rules };
-        if policy.to_tsv().len() > MAX_BYTES {
+        rows.sort_by(|left, right| left.application.cmp(&right.application));
+        let declarations = Self { owner, rows };
+        if declarations.to_tsv().len() > MAX_BYTES {
             return Err("application policy exceeds 64 KiB".into());
         }
-        Ok(policy)
+        Ok(declarations)
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -77,13 +123,13 @@ impl Policy {
             return Err("unsupported application policy format".into());
         }
         let owner = decimal(owner)?;
-        let mut rules = Vec::new();
+        let mut rows = Vec::new();
         for line in lines {
-            if rules.len() == MAX_APPS {
+            if rows.len() == MAX_APPS {
                 return Err("too many application policy rows".into());
             }
             let fields: Vec<&str> = line.split('\t').take(4).collect();
-            let [uid, application, owned] = fields.as_slice() else {
+            let [application, class, owned] = fields.as_slice() else {
                 return Err("invalid application policy row".into());
             };
             let owned = if owned.is_empty() {
@@ -95,27 +141,27 @@ impl Policy {
                     .map(str::to_string)
                     .collect()
             };
-            rules.push(Rule {
-                uid: decimal(uid)?,
+            rows.push(Declaration {
                 application: (*application).into(),
+                class: Class::parse(class).ok_or("unknown application policy class")?,
                 owned,
             });
         }
-        let policy = Self::new(owner, rules)?;
-        if policy.to_tsv() != text {
+        let declarations = Self::new(owner, rows)?;
+        if declarations.to_tsv() != text {
             return Err("application policy is not canonical".into());
         }
-        Ok(policy)
+        Ok(declarations)
     }
 
     pub fn to_tsv(&self) -> String {
         let mut text = format!("{HEADER}\t{}\n", self.owner);
-        for rule in &self.rules {
+        for row in &self.rows {
             text.push_str(&format!(
                 "{}\t{}\t{}\n",
-                rule.uid,
-                rule.application,
-                rule.owned.join(",")
+                row.application,
+                row.class.as_str(),
+                row.owned.join(",")
             ));
         }
         text
@@ -125,22 +171,212 @@ impl Policy {
         self.owner
     }
 
-    pub fn for_uid(&self, uid: u32) -> Option<&Rule> {
-        self.rules
-            .iter()
-            .find(|rule| uid != self.owner && rule.uid == uid)
+    pub fn rows(&self) -> &[Declaration] {
+        &self.rows
     }
 
-    pub fn for_name(&self, name: &str) -> Option<&Rule> {
-        self.rules.iter().find(|rule| rule.application == name)
+    fn row(&self, name: &str) -> Option<&Declaration> {
+        self.rows.iter().find(|row| row.application == name)
+    }
+}
+
+/// The ledger copy a policy resolves against, and the stamp of the file
+/// it last read or tried to read (`None`: there was none to inspect).
+struct Accounts {
+    ledger: Ledger,
+    seen: Option<Stamp>,
+    /// Ledger reads after the first, for the tests that hold a miss to one.
+    #[cfg(test)]
+    reads: usize,
+}
+
+/// Where a live policy re-reads the ledger.
+struct Source {
+    directory: PathBuf,
+    owner: (u32, u32),
+}
+
+/// The declarations joined with the ledger's application rows. A uid comes
+/// only from the ledger; a personal application runs as the session owner.
+///
+/// Ledger rows are appended and never reassigned, so a copy read earlier is
+/// a correct subset of the published ledger. A loaded policy therefore keeps
+/// its copy and, when a lookup misses (a uid in the application range, or a
+/// declared application with no row), inspects the ledger and reads it again
+/// only when it changed since the last read: publication renames a new file
+/// into place. It adopts the new copy only when it extends the old. No
+/// timer: a ledger published just after any miss is seen by the next one.
+pub struct Policy {
+    declarations: Declarations,
+    accounts: Mutex<Accounts>,
+    source: Option<Source>,
+}
+
+impl Policy {
+    /// The declarations joined with `ledger`, which this policy never
+    /// re-reads.
+    pub fn join(declarations: Declarations, ledger: Ledger) -> Self {
+        Self {
+            declarations,
+            accounts: Mutex::new(Accounts {
+                ledger,
+                seen: None,
+                #[cfg(test)]
+                reads: 0,
+            }),
+            source: None,
+        }
+    }
+
+    fn live(
+        declarations: Declarations,
+        directory: &Path,
+        owner: (u32, u32),
+        admission: Admission,
+    ) -> Result<Self, String> {
+        let (ledger, seen) = match workload_accounts::load_stamped_from(directory, owner) {
+            Ok((ledger, stamp)) => (ledger, Some(stamp)),
+            Err(error) if admission == Admission::Session => {
+                eprintln!(
+                    "td application policy: {error}; admitting no application until the account ledger changes"
+                );
+                (
+                    Ledger::default(),
+                    workload_accounts::stamp_from(directory, owner).ok(),
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            declarations,
+            accounts: Mutex::new(Accounts {
+                ledger,
+                seen,
+                #[cfg(test)]
+                reads: 0,
+            }),
+            source: Some(Source {
+                directory: directory.to_path_buf(),
+                owner,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn from_tables(declarations: &str, ledger: &str) -> Result<Self, String> {
+        Ok(Self::join(
+            Declarations::parse(declarations)?,
+            Ledger::parse(ledger)?,
+        ))
+    }
+
+    /// How many times a miss has read the ledger since the load.
+    #[cfg(test)]
+    pub fn ledger_reads(&self) -> usize {
+        self.accounts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reads
+    }
+
+    pub fn owner(&self) -> u32 {
+        self.declarations.owner
+    }
+
+    pub fn declarations(&self) -> &Declarations {
+        &self.declarations
+    }
+
+    /// The service application whose ledger account is `uid`. The session
+    /// owner's uid names no one application.
+    pub fn for_uid(&self, uid: u32) -> Option<Rule> {
+        if uid == self.owner() {
+            return None;
+        }
+        let name = self.resolve(
+            |ledger| ledger.name(Kind::Application, uid).map(str::to_string),
+            workload_accounts::APPLICATION_UIDS.contains(&uid),
+        )?;
+        let row = self
+            .declarations
+            .row(&name)
+            .filter(|row| row.class == Class::Service)?;
+        Some(Rule {
+            uid,
+            application: name,
+            owned: row.owned.clone(),
+        })
+    }
+
+    /// The declared application `name` at the uid it runs as.
+    pub fn for_name(&self, name: &str) -> Option<Rule> {
+        let row = self.declarations.row(name)?;
+        let uid = match row.class {
+            Class::Personal => self.owner(),
+            Class::Service => self.account(name)?,
+        };
+        Some(Rule {
+            uid,
+            application: name.into(),
+            owned: row.owned.clone(),
+        })
+    }
+
+    /// The ledger account of the declared application `name`, whatever its
+    /// class: the uid its private home, cgroup and credential records name.
+    pub fn account(&self, name: &str) -> Option<u32> {
+        self.declarations.row(name)?;
+        self.resolve(|ledger| ledger.uid_of(Kind::Application, name), true)
+    }
+
+    /// `find` on the ledger copy; a miss may re-read the published ledger.
+    fn resolve<T>(&self, find: impl Fn(&Ledger) -> Option<T>, reread: bool) -> Option<T> {
+        let mut accounts = self.accounts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = find(&accounts.ledger) {
+            return Some(found);
+        }
+        let source = self.source.as_ref().filter(|_| reread)?;
+        // Read again only what changed since the last read or attempt, so a
+        // stream of misses costs one inspection each and no read.
+        let now = workload_accounts::stamp_from(&source.directory, source.owner).ok();
+        if now == accounts.seen {
+            return None;
+        }
+        accounts.seen = now;
+        #[cfg(test)]
+        {
+            accounts.reads += 1;
+        }
+        // A ledger that fails to read, or that dropped or moved a row, is
+        // not adopted; the lookup misses until the file changes again.
+        let fresh = match workload_accounts::load_stamped_from(&source.directory, source.owner) {
+            Ok((fresh, stamp)) => {
+                accounts.seen = Some(stamp);
+                fresh
+            }
+            Err(error) => {
+                eprintln!(
+                    "td application policy: keeping the account ledger read earlier: {error}"
+                );
+                return None;
+            }
+        };
+        if !fresh.extends(&accounts.ledger) {
+            eprintln!(
+                "td application policy: the account ledger dropped or moved a row; keeping the copy read earlier"
+            );
+            return None;
+        }
+        accounts.ledger = fresh;
+        find(&accounts.ledger)
     }
 
     pub fn admits(&self, uid: u32) -> bool {
-        uid == 0 || uid == self.owner || self.is_portal(uid) || self.for_uid(uid).is_some()
+        uid == 0 || uid == self.owner() || self.is_portal(uid) || self.for_uid(uid).is_some()
     }
 
     pub fn is_portal(&self, uid: u32) -> bool {
-        self.owner == 1000 && uid == PORTAL_UID
+        self.owner() == 1000 && uid == PORTAL_UID
     }
 
     pub fn registration(
@@ -164,13 +400,48 @@ impl Policy {
     }
 }
 
-/// The immutable image owns both the policy file and its parent.
+/// The image's declarations joined with the published ledger, failing on
+/// either: a launcher's, a credential binding's or a check's. The image
+/// owns the declarations and their parent; root owns the ledger.
 pub fn load() -> Result<Policy, String> {
-    let directory = Path::new(PATH).parent().ok_or("bus policy has no parent")?;
-    load_policy_from(directory, (0, 0))
+    load_live(Admission::Strict)
 }
 
-fn load_policy_from(directory: &Path, owner: (u32, u32)) -> Result<Policy, String> {
+/// `load` for a long-running session service (the broker, the display, the
+/// portal, audio): a ledger it cannot read admits no application until it
+/// changes, rather than stopping the service the human's session needs.
+/// The declarations stay strict.
+pub fn load_session() -> Result<Policy, String> {
+    load_live(Admission::Session)
+}
+
+fn load_live(admission: Admission) -> Result<Policy, String> {
+    let directory = Path::new(PATH).parent().ok_or("bus policy has no parent")?;
+    load_from(
+        directory,
+        Path::new(workload_accounts::DIRECTORY),
+        (0, 0),
+        admission,
+    )
+}
+
+/// `load` from `etc` and the ledger's `state` directory, both `owner`'s.
+pub fn load_from(
+    etc: &Path,
+    state: &Path,
+    owner: (u32, u32),
+    admission: Admission,
+) -> Result<Policy, String> {
+    let declarations = load_declarations_from(etc, owner)?;
+    if declarations.owner() != 1000 {
+        return Err("bus application policy names another session".into());
+    }
+    Policy::live(declarations, state, owner, admission)
+}
+
+/// The declarations in `directory`, which `owner` must control: the live
+/// image's, or a staged tree's for the image build's check.
+pub fn load_declarations_from(directory: &Path, owner: (u32, u32)) -> Result<Declarations, String> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -209,11 +480,7 @@ fn load_policy_from(directory: &Path, owner: (u32, u32)) -> Result<Policy, Strin
     file.take(MAX_BYTES as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|error| format!("read bus application policy: {error}"))?;
-    let policy = Policy::parse(&text)?;
-    if policy.owner() != 1000 {
-        return Err("bus application policy names another session".into());
-    }
-    Ok(policy)
+    Declarations::parse(&text)
 }
 
 fn decimal(text: &str) -> Result<u32, String> {
@@ -223,7 +490,6 @@ fn decimal(text: &str) -> Result<u32, String> {
     }
     Ok(value)
 }
-
 pub(crate) fn application_name(name: &str) -> bool {
     // Stock names must satisfy both the reserved principal and jail grammars.
     name.len() <= 32
@@ -301,72 +567,22 @@ pub(crate) fn owned_name(name: &str) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    #[test]
-    fn policy_loader_refuses_mutable_redirected_and_noncanonical_files() {
-        let root = std::env::temp_dir().join(format!(
-            "td-bus-policy-{}-{}",
-            std::process::id(),
-            module_path!()
-        ));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-        let metadata = fs::metadata(&root).unwrap();
-        let owner = (metadata.uid(), metadata.gid());
-        let path = root.join(Path::new(PATH).file_name().unwrap());
-        let valid = "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n";
-        assert!(load_policy_from(&root, owner).is_err());
-        fs::write(&path, valid).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-        assert_eq!(load_policy_from(&root, owner).unwrap().to_tsv(), valid);
-        assert!(load_policy_from(&root, (owner.0.wrapping_add(1), owner.1)).is_err());
-        for mode in [0o644, 0o400, 0o1444] {
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-            assert!(load_policy_from(&root, owner).is_err(), "mode {mode:o}");
-        }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-        let other = root.join("other");
-        fs::hard_link(&path, &other).unwrap();
-        assert!(load_policy_from(&root, owner).is_err());
-        fs::remove_file(&path).unwrap();
-        symlink(&other, &path).unwrap();
-        assert!(load_policy_from(&root, owner).is_err());
-        fs::remove_file(&path).unwrap();
-        fs::remove_file(&other).unwrap();
-        fs::create_dir(&path).unwrap();
-        assert!(load_policy_from(&root, owner).is_err());
-        fs::remove_dir(&path).unwrap();
-        for content in [
-            valid.replace("1000", "1001"),
-            valid.replace("65536", "065536"),
-            "x".repeat(MAX_BYTES + 1),
-        ] {
-            fs::write(&path, content).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-            assert!(load_policy_from(&root, owner).is_err());
-            fs::remove_file(&path).unwrap();
-        }
-        fs::write(&path, valid).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(load_policy_from(&root, owner).is_err());
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-        let link = root.with_extension("link");
-        symlink(&root, &link).unwrap();
-        assert!(load_policy_from(&link, owner).is_err());
-        fs::remove_file(link).unwrap();
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(root).unwrap();
-    }
 
-    const TABLE: &str =
-        "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n";
+    const DECLARED: &str =
+        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\n";
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n";
+
+    fn policy(declared: &str) -> Policy {
+        Policy::from_tables(declared, LEDGER).unwrap()
+    }
 
     #[test]
     fn registration_uses_canonical_lists_and_shared_grants_remain_explicit() {
-        let policy = Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tone\torg.example.A,org.example.B\n65537\ttwo\torg.example.A\n"
-        ).unwrap();
+        let policy = Policy::from_tables(
+            "td-bus-applications-v2\t1000\none\tservice\torg.example.A,org.example.B\ntwo\tservice\torg.example.A\n",
+            "td-accounts-v1\napplication\tone\t65536\napplication\ttwo\t65537\n",
+        )
+        .unwrap();
         let sorted = vec!["org.example.A".into(), "org.example.B".into()];
         policy.registration(65536, "one", &[], &sorted).unwrap();
         let reversed = vec!["org.example.B".into(), "org.example.A".into()];
@@ -378,14 +594,18 @@ mod tests {
 
     #[test]
     fn personal_applications_share_the_human_uid_but_keep_distinct_registered_names() {
-        let policy = Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\t\n1000\tmail\t\n1000\tnews\t\n",
-        )
-        .unwrap();
+        let policy = policy(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tpersonal\t\nnews\tpersonal\t\n",
+        );
         assert!(policy.for_uid(1000).is_none());
+        // A personal application's ledger row is its account, not the uid
+        // it runs as.
+        assert!(policy.for_uid(65537).is_none());
+        assert_eq!(policy.account("mail"), Some(65537));
+        assert_eq!(policy.account("news"), None);
         for app in ["mail", "news"] {
             policy.registration(1000, app, &[], &[]).unwrap();
-            assert!(policy.registration(65536, app, &[], &[]).is_err());
+            assert!(policy.registration(65537, app, &[], &[]).is_err());
         }
         assert!(policy.registration(1000, "firefox", &[], &[]).is_err());
         assert!(policy.registration(1000, "absent", &[], &[]).is_err());
@@ -393,8 +613,8 @@ mod tests {
 
     #[test]
     fn canonical_policy_binds_kernel_identity_and_exact_grants() {
-        let policy = Policy::parse(TABLE).unwrap();
-        assert_eq!(policy.to_tsv(), TABLE);
+        let policy = policy(DECLARED);
+        assert_eq!(policy.declarations().to_tsv(), DECLARED);
         let grants = vec!["org.mozilla.firefox".into()];
         policy.registration(65536, "firefox", &[], &grants).unwrap();
         for uid in [0, 991, 992, 1000, 1001, 65537, u32::MAX] {
@@ -414,11 +634,47 @@ mod tests {
         }
     }
 
+    /// The uid comes from the ledger alone: a declaration carries none, an
+    /// application without a row has no account, and a row the image does
+    /// not declare (a removed application's) admits nothing.
+    #[test]
+    fn an_application_uid_comes_only_from_the_ledger() {
+        let policy = Policy::from_tables(
+            DECLARED,
+            "td-accounts-v1\napplication\tclaude\t65539\napplication\tfirefox\t65536\n",
+        )
+        .unwrap();
+        assert_eq!(policy.for_name("firefox").unwrap().uid, 65536);
+        assert!(policy.for_name("mail").is_none());
+        assert!(policy.for_uid(65537).is_none());
+        assert_eq!(policy.account("mail"), None);
+        assert!(policy.for_uid(65539).is_none());
+        assert!(policy.for_name("claude").is_none());
+        assert!(!policy.admits(65539));
+        assert!(policy.registration(65537, "mail", &[], &[]).is_err());
+        // The same declarations under another ledger take its uids.
+        let moved = Policy::from_tables(
+            DECLARED,
+            "td-accounts-v1\napplication\tfirefox\t70000\napplication\tmail\t65537\n",
+        )
+        .unwrap();
+        assert_eq!(moved.for_uid(70000).unwrap().application, "firefox");
+        assert!(moved.for_uid(65536).is_none());
+        // Only application rows are application accounts.
+        let workspace = Policy::from_tables(
+            DECLARED,
+            "td-accounts-v1\napplication\tmail\t65537\nworkspace\tfirefox\t98304\n",
+        )
+        .unwrap();
+        assert!(workspace.for_name("firefox").is_none());
+        assert!(workspace.for_uid(98304).is_none());
+    }
+
     #[test]
     fn a_policy_row_carries_a_narrow_suffix_grant_and_registers_it_exactly() {
-        let text = "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox,org.mozilla.firefox.*\n";
-        let policy = Policy::parse(text).unwrap();
-        assert_eq!(policy.to_tsv(), text);
+        let text = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox,org.mozilla.firefox.*\n";
+        let policy = policy(text);
+        assert_eq!(policy.declarations().to_tsv(), text);
         let grants = vec!["org.mozilla.firefox".into(), "org.mozilla.firefox.*".into()];
         policy.registration(65536, "firefox", &[], &grants).unwrap();
         assert!(policy
@@ -426,7 +682,7 @@ mod tests {
             .is_err());
         for wide in ["org.mozilla.*", "org.freedesktop.impl.*"] {
             let text = text.replace("org.mozilla.firefox.*", wide);
-            assert!(Policy::parse(&text).is_err(), "{wide}");
+            assert!(Declarations::parse(&text).is_err(), "{wide}");
         }
         assert!(grant_covers(
             "org.mozilla.firefox.*",
@@ -444,7 +700,10 @@ mod tests {
 
     #[test]
     fn the_fixed_portal_belongs_only_to_the_stock_session() {
-        let policy = Policy::new(1001, Vec::new()).unwrap();
+        let policy = Policy::join(
+            Declarations::new(1001, Vec::new()).unwrap(),
+            Ledger::default(),
+        );
         assert!(!policy.admits(PORTAL_UID));
         assert!(!policy.is_portal(PORTAL_UID));
     }
@@ -452,28 +711,41 @@ mod tests {
     #[test]
     fn policy_refuses_aliases_reserved_names_and_noncanonical_encodings() {
         for text in [
-            TABLE.replace("65537", "65536"),
-            TABLE.replace("\tmail\t", "\tfirefox\t"),
-            TABLE.replace("65537", "1001"),
-            TABLE.replace("firefox", "app..name"),
-            TABLE.replace("firefox", &"a".repeat(33)),
-            TABLE.replace("firefox", "App"),
-            TABLE.replace("firefox", "1app"),
-            TABLE.replace("1000", "01000"),
-            TABLE.replace("\tfirefox\t", "\t../firefox\t"),
-            TABLE.replace("\n", "\r\n"),
-            TABLE.replace("org.mozilla.firefox", "org.freedesktop.portal.Desktop"),
-            TABLE.replace("org.mozilla.firefox", "org.mozilla.*"),
-            TABLE.replace(
+            DECLARED.replace("mail", "firefox"),
+            DECLARED.replace("firefox", "app..name"),
+            DECLARED.replace("firefox", &"a".repeat(33)),
+            DECLARED.replace("firefox", "App"),
+            DECLARED.replace("firefox", "1app"),
+            DECLARED.replace("firefox\t", "../firefox\t"),
+            DECLARED.replace("1000", "01000"),
+            DECLARED.replace("1000", "999"),
+            DECLARED.replace("\tservice\t", "\tService\t"),
+            DECLARED.replace("mail\tservice", "mail\t1000"),
+            DECLARED.replace("mail\tservice\t", "mail\t"),
+            DECLARED.replace("mail\tservice\t", "65537\tmail\tservice\t"),
+            DECLARED.replacen("v2", "v1", 1),
+            DECLARED.replace('\n', "\r\n"),
+            DECLARED.replace("org.mozilla.firefox", "org.freedesktop.portal.Desktop"),
+            DECLARED.replace("org.mozilla.firefox", "org.mozilla.*"),
+            DECLARED.replace(
                 "org.mozilla.firefox",
                 "org.mozilla.firefox,org.mozilla.firefox",
             ),
-            TABLE.replace("org.mozilla.firefox", "org.zzz,org.aaa"),
-            TABLE.trim_end().into(),
-            format!("{TABLE}\n"),
+            DECLARED.replace("org.mozilla.firefox", "org.zzz,org.aaa"),
+            DECLARED.replace(
+                "firefox\tservice\torg.mozilla.firefox\nmail",
+                "mail\tservice\t\nfirefox\tservice\torg.mozilla.firefox\nzzz",
+            ),
+            DECLARED.trim_end().into(),
+            format!("{DECLARED}\n"),
         ] {
-            assert!(Policy::parse(&text).is_err(), "{text:?}");
+            assert!(Declarations::parse(&text).is_err(), "{text:?}");
         }
-        assert!(Policy::parse(&"x".repeat(MAX_BYTES + 1)).is_err());
+        assert!(Declarations::parse(&"x".repeat(MAX_BYTES + 1)).is_err());
+        // The image's old uid-bearing table is refused, not misread.
+        assert!(Declarations::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n"
+        )
+        .is_err());
     }
 }

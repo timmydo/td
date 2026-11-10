@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DELEGATE_COMPONENT: &str = "td-user-1000";
-// Reserved range: td-authd/DESIGN.md, Principal registry prerequisite.
-const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=2147483647;
+// An application account is the workload account ledger's (td-authd/DESIGN.md,
+// "Workload account ledger").
+use crate::workload_accounts::APPLICATION_UIDS;
 
 struct Delegation {
     uid: u32,
@@ -1320,7 +1321,7 @@ mod tests {
     #[test]
     fn external_identities_select_disjoint_delegations() {
         let instance = "mail-0123456789abcdef";
-        for uid in [1000, 65536, 65537, 2147483647] {
+        for uid in [1000, 65536, 65537, 98303] {
             let delegation = Delegation::for_uid(uid).unwrap();
             let membership = membership_for_instance(instance, uid).unwrap();
             let (parsed, leaf) = Delegation::parse_membership(&membership).unwrap();
@@ -1346,7 +1347,18 @@ mod tests {
             Delegation::for_uid(65536).unwrap().root(),
             Delegation::for_uid(65537).unwrap().root()
         );
-        for uid in [0, 991, 1001, 65534, 65535, 2147483648, u32::MAX] {
+        // A sandbox or workspace account is no application's.
+        for uid in [
+            0,
+            991,
+            1001,
+            65534,
+            65535,
+            98304,
+            131071,
+            2147483647,
+            u32::MAX,
+        ] {
             assert!(Delegation::for_uid(uid).is_err());
         }
         for component in [
@@ -1355,6 +1367,7 @@ mod tests {
             "td-app-+65536",
             "td-app-65535",
             "td-app-2147483648",
+            "td-app-98304",
             "td-user-1001",
         ] {
             assert!(

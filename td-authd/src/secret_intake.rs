@@ -236,17 +236,20 @@ impl Pending {
     }
 }
 
+/// A credential's target is an application the image declares for this
+/// session whose account the workload account ledger holds; that account's
+/// uid is the one the credential binds.
 fn admit_target(target: &Target, owner: u32) -> io::Result<Operation> {
     let registry = principals::Registry::load().map_err(io::Error::other)?;
     registry
         .verify_installed_accounts(&registry)
         .map_err(io::Error::other)?;
-    let active = registry.active_applications().map_err(io::Error::other)?;
-    let app = active
-        .iter()
-        .find(|app| app.owner == owner && app.name == target.app)
+    let policy = crate::app_policy::load().map_err(io::Error::other)?;
+    let uid = Some(&policy)
+        .filter(|policy| policy.owner() == owner)
+        .and_then(|policy| policy.account(&target.app))
         .ok_or_else(|| io::Error::other("credential target is not installed"))?;
-    target.operation(owner, app.uid).map_err(io::Error::other)
+    target.operation(owner, uid).map_err(io::Error::other)
 }
 
 fn expires(duration: Duration) -> io::Result<Instant> {

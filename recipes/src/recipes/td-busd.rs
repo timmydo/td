@@ -29,11 +29,18 @@ const MODULES: &[(&str, &str)] = &[
     ("registry", include_str!("../../../td-busd/src/registry.rs")),
     ("session", include_str!("../../../td-busd/src/session.rs")),
     ("sys", include_str!("../../../td-busd/src/sys.rs")),
+    // Compiled only by the checkout's tests; staged so every declared
+    // module has its source.
+    ("test_temp", include_str!("../../../td-fs/src/temp_dir.rs")),
     (
         "transport",
         include_str!("../../../td-busd/src/transport.rs"),
     ),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
 ];
 
 #[cfg(test)]
@@ -78,6 +85,8 @@ pub fn recipe() -> Recipe {
             &[
                 "--edition",
                 "2021",
+                "--cfg",
+                "feature=\"target-recipe\"",
                 "-C",
                 "opt-level=s",
                 "--target",

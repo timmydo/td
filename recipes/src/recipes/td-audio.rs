@@ -31,7 +31,21 @@ const MODULES: &[(&str, &str)] = &[
     ("tone", include_str!("../../../td-audio/src/tone.rs")),
     ("wav", include_str!("../../../td-audio/src/wav.rs")),
     ("wire", include_str!("../../../td-audio/src/wire.rs")),
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
 ];
+
+/// Where a module is staged: the shared sources at the paths
+/// the crate root's `#[path]` attributes name, the rest beside `main.rs`.
+fn staged_path(name: &str) -> String {
+    match name {
+        "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
+        "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
+        _ => format!("{{src}}/td-audio/src/{name}.rs"),
+    }
+}
 
 #[cfg(test)]
 fn declared_modules() -> Vec<String> {
@@ -99,11 +113,7 @@ pub fn recipe() -> Recipe {
     ];
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: if *name == "app_policy" {
-                "{src}/td-busd/src/app_policy.rs".into()
-            } else {
-                format!("{{src}}/td-audio/src/{name}.rs")
-            },
+            path: staged_path(name),
             content: (*source).into(),
             exec: false,
         });
@@ -163,17 +173,15 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 14);
+        assert_eq!(written.len(), 15);
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
         let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())
-            .chain(MODULES.iter().map(|(name, _)| {
-                if *name == "app_policy" {
-                    "td-busd/src/app_policy.rs".to_string()
-                } else {
-                    format!("td-audio/src/{name}.rs")
-                }
-            }))
+            .chain(
+                MODULES
+                    .iter()
+                    .map(|(name, _)| staged_path(name).replacen("{src}/", "", 1)),
+            )
             .collect();
         staged.sort_unstable();
         expected.sort_unstable();

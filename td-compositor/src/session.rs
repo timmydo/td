@@ -14,7 +14,7 @@ static APPLICATION_POLICY: OnceLock<Result<crate::app_policy::Policy, String>> =
 
 pub(crate) fn application_policy() -> Result<&'static crate::app_policy::Policy, String> {
     APPLICATION_POLICY
-        .get_or_init(crate::app_policy::load)
+        .get_or_init(crate::app_policy::load_session)
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -358,8 +358,9 @@ mod tests {
 
     #[test]
     fn application_display_admission_does_not_grant_human_control() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        let policy = crate::app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\n",
+            "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\n",
         )
         .unwrap();
         for uid in [65536, 65537] {
@@ -379,8 +380,9 @@ mod tests {
     fn the_installer_is_a_display_client_only() {
         assert_eq!(INSTALLER_UID, 990);
         let table: &'static crate::app_policy::Policy = Box::leak(Box::new(
-            crate::app_policy::Policy::parse(
-                "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n",
+            crate::app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\n",
+                "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n",
             )
             .unwrap(),
         ));

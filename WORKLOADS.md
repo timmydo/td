@@ -49,9 +49,12 @@ login user (`APPLICATIONS.md` §L, "Firefox runs under external service UID
 
 Already built and reused by this design:
 
-- reserved application uids in `/etc/td-principals.tsv` and the firstboot
-  reservation ledger `/var/lib/td/principals.tsv`, which never reuses a
-  uid (td-authd/DESIGN.md);
+- the workload account ledger `/var/lib/td/accounts.tsv`, the one source
+  of an application's uid, which firstboot seeds with the carried rows
+  and the retained reservations of `/var/lib/td/principals.tsv`, and
+  which never reuses a uid; td-login resolves application accounts from
+  it and every application identity consumer reads it
+  (td-authd/DESIGN.md, "Workload account ledger");
 - td-jail's mapping of an external uid to 1000 inside the jail;
 - root-made, value-pinned idmapped views of the human's files:
   `prepare-portal-files` (Downloads, 1000→991, read-only) and
@@ -233,10 +236,15 @@ account.
 5. The ledger allocator in td-authd, with applications moved onto it:
    the bus broker and td-portal read application uids from the ledger,
    and td-software's installs allocate. In three landings: the ledger's
-   format and its seeding by td-firstboot (landed; nothing reads the
-   ledger yet); every consumer moving to it at once, with the
-   application rows leaving passwd, group and `/etc/td-principals.tsv`;
-   then allocation at install.
+   format and its seeding by td-firstboot (landed); every consumer moving
+   to it at once, with the application rows leaving passwd, group and
+   `/etc/td-principals.tsv` and the uid leaving the bus declarations
+   (landed: td-login resolves `tda<uid>` from the ledger and refuses a
+   passwd or group entry that speaks for one, and the broker, td-portal,
+   td-jail, td-compositor, td-audio, td-authd, td-secret and td-firstboot
+   join the image's declarations with the ledger, td-authd/DESIGN.md,
+   "Workload account ledger"); then allocation at install, until which
+   the carried rows are the only application rows a fresh install has.
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.

@@ -27,7 +27,7 @@ td-sandbox-source td-sandbox td-fs,td-ui,td-compositor,engine
 td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-luks,td-encoding,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
 td-software-source td-software td-civil,td-fs,td-ui,td-compositor,engine
 td-ssh-interop-source td-ssh-interop td-firstboot
-td-ssh-source td-ssh td-primitives,td-encoding,td-login,td-fs,td-source-scan
+td-ssh-source td-ssh td-primitives,td-encoding,td-login,td-fs,td-source-scan,engine
 td-taskmgr-source td-taskmgr td-ui,td-compositor,td-fs,td-test-compositor
 td-term-source td-term td-fs,td-ui,td-compositor
 td-time-source td-time td-civil,td-fs,engine

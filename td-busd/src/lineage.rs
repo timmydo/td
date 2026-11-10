@@ -1484,8 +1484,9 @@ mod tests {
     #[test]
     fn deployment_policy_checks_registration_before_creating_an_instance() {
         let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        let policy = crate::app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\n",
+            "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n",
         )
         .unwrap();
         let instances = Instances::for_session(policy);
@@ -1520,8 +1521,9 @@ mod tests {
 
     #[test]
     fn an_application_uid_without_jail_lineage_has_only_registration_authority() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n",
+        let policy = crate::app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\n",
+            "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n",
         )
         .unwrap();
         let instances = Instances::for_session(policy);

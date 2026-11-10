@@ -749,14 +749,33 @@ pub(crate) mod vm_tests {
         use std::os::unix::fs::PermissionsExt;
         assert!(!std::path::Path::new("/etc/td-principals.tsv").exists());
         fs::create_dir_all("/etc").unwrap();
-        for (name, text, mode) in [
-            ("td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n", 0o444),
-            ("passwd", "tester::1000:1000::/home/tester:/bin/false\ntda65537:!td-service:65537:65537::/var/lib/td/applications/65537:/bin/false\n", 0o644),
-            ("group", "tester:x:1000:\ntda65537:x:65537:\n", 0o644),
+        fs::create_dir_all("/var/lib/td").unwrap();
+        // mail's account is the ledger's row; no table names it.
+        for (path, text, mode) in [
+            (
+                "/etc/td-principals.tsv",
+                "td-principals-v1\nsession\t1000\t993\t992\t991\n",
+                0o444,
+            ),
+            (
+                "/etc/passwd",
+                "tester::1000:1000::/home/tester:/bin/false\n",
+                0o644,
+            ),
+            ("/etc/group", "tester:x:1000:\n", 0o644),
+            (
+                "/etc/td-bus-applications.tsv",
+                "td-bus-applications-v2\t1000\nmail\tpersonal\t\n",
+                0o444,
+            ),
+            (
+                "/var/lib/td/accounts.tsv",
+                "td-accounts-v1\napplication\tmail\t65537\n",
+                0o644,
+            ),
         ] {
-            let path = std::path::Path::new("/etc").join(name);
-            fs::write(&path, text).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            fs::write(path, text).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         }
     }
 
@@ -1139,13 +1158,33 @@ pub(crate) mod vm_tests {
             fs::write("/etc/td-app.conf", "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n").unwrap();
             fs::write("/etc/td-portal-settings", "format=1\ncolor-scheme=1\naccent-color=0.125,0.375,0.75\ncontrast=0\ngtk-theme=Adwaita\nicon-theme=Adwaita\ncursor-theme=Adwaita\ncursor-size=24\nfont-name=Sans 11\ndocument-font-name=Sans 11\nmonospace-font-name=Monospace 11\ntext-scaling-factor=1.0\n").unwrap();
             for (name, text) in [
-                            ("passwd", concat!("tdb1000:!td-service:992:992::/run/td-bus/1000:/bin/false\ntdp1000:!td-service:991:991::/run/td-portal", "/1000:/bin/false\ntda65538:!td-service:65538:65538::/var/lib/td/applications/65538:/bin/false\n")),
-                            ("group", "tdb1000:x:992:\ntdp1000:x:991:\ntda65538:x:65538:\n"),
-                            ("td-principals.tsv", "application\t1000\tnews\t65538\n"),
-                        ] {
-                            OpenOptions::new().append(true).open(format!("/etc/{name}"))
-                                .unwrap().write_all(text.as_bytes()).unwrap();
-                        }
+                (
+                    "passwd",
+                    concat!(
+                        "tdb1000:!td-service:992:992::/run/td-bus/1000:/bin/false\ntdp1000:!td-service:991:991::/run/td-portal",
+                        "/1000:/bin/false\n"
+                    ),
+                ),
+                ("group", "tdb1000:x:992:\ntdp1000:x:991:\n"),
+            ] {
+                OpenOptions::new()
+                    .append(true)
+                    .open(format!("/etc/{name}"))
+                    .unwrap()
+                    .write_all(text.as_bytes())
+                    .unwrap();
+            }
+            // Both applications' accounts are the ledger's rows.
+            fs::write(
+                "/var/lib/td/accounts.tsv",
+                "td-accounts-v1\napplication\tmail\t65537\napplication\tnews\t65538\n",
+            )
+            .unwrap();
+            fs::set_permissions(
+                "/var/lib/td/accounts.tsv",
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
             if reopen {
                 assert_eq!(
                     fs::read("/etc/td-principals.tsv").unwrap(),
@@ -1161,7 +1200,7 @@ pub(crate) mod vm_tests {
             }
             fs::write(
                 "/etc/td-bus-applications.tsv",
-                "td-bus-applications-v1\t1000\n65537\tmail\t\n65538\tnews\t\n",
+                "td-bus-applications-v2\t1000\nmail\tservice\t\nnews\tservice\t\n",
             )
             .unwrap();
             // The launcher table the paired compositor's card reads.
@@ -1650,7 +1689,7 @@ pub(crate) mod vm_tests {
             crate::login_directory::ensure(Path::new("/")).unwrap();
             fs::write(
                 "/etc/td-bus-applications.tsv",
-                "td-bus-applications-v1\t1000\n65537\tmail\t\n",
+                "td-bus-applications-v2\t1000\nmail\tservice\t\n",
             )
             .unwrap();
             fs::set_permissions(

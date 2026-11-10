@@ -194,13 +194,32 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
     assert!(!std::path::Path::new("/etc/passwd").exists());
     fs::create_dir_all("/etc").unwrap();
     fs::set_permissions("/etc", fs::Permissions::from_mode(0o755)).unwrap();
-    for (name, text, mode) in [
-        ("td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n", 0o444),
-        ("passwd", "tester::1000:1000::/home/tester:/bin/false\ntda65537:!td-service:65537:65537::/var/lib/td/applications/65537:/bin/false\n", 0o644),
-        ("group", "tester:x:1000:\ntda65537:x:65537:\n", 0o644),
+    // mail's account is the ledger's row; no table names it.
+    fs::create_dir_all("/var/lib/td").unwrap();
+    for (path, text, mode) in [
+        (
+            "/etc/td-principals.tsv",
+            "td-principals-v1\nsession\t1000\t993\t992\t991\n",
+            0o444,
+        ),
+        (
+            "/etc/passwd",
+            "tester::1000:1000::/home/tester:/bin/false\n",
+            0o644,
+        ),
+        ("/etc/group", "tester:x:1000:\n", 0o644),
+        (
+            "/etc/td-bus-applications.tsv",
+            "td-bus-applications-v2\t1000\nmail\tpersonal\t\n",
+            0o444,
+        ),
+        (
+            "/var/lib/td/accounts.tsv",
+            "td-accounts-v1\napplication\tmail\t65537\n",
+            0o644,
+        ),
     ] {
-        let path = format!("/etc/{name}");
-        fs::write(&path, text).unwrap();
+        fs::write(path, text).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
     let mut intake = Intake::bind(1000).unwrap();

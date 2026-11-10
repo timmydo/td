@@ -11,6 +11,9 @@
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
+// The workload account ledger, by the name the shared application policy
+// reads it under.
+use td_engine::workload_accounts;
 pub mod application;
 pub mod catalog;
 #[cfg(test)]

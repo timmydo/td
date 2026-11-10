@@ -1,15 +1,13 @@
 //! Durable UID reservations. Enrollment never releases an old assignment.
 
-#[path = "../../engine/src/workload_accounts.rs"]
-mod workload_accounts;
-
+use crate::app_policy::Declarations;
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+use crate::workload_accounts::{self, Kind, Ledger};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use workload_accounts::Ledger;
 
 const PATH_ONLY: i32 = 0x200000;
 const LIMIT: u64 = MAX_BYTES as u64;
@@ -23,7 +21,7 @@ const PRIVATE_MODE: u32 = 0o600;
 /// The workload account ledger (td-authd/DESIGN.md, "Workload account
 /// ledger"). It holds only kinds, names and uids, so every account reads it.
 const ACCOUNTS_STAGED: &str = ".accounts.next";
-const ACCOUNTS_MODE: u32 = 0o644;
+const ACCOUNTS_MODE: u32 = workload_accounts::MODE;
 const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
 /// `flathub_app::RUNTIME_STORE`'s last component, below `/var/lib/td`, and
 /// the runtime account that owns it (`flathub_app::RUNTIME_UID`). This file
@@ -89,7 +87,7 @@ pub(crate) fn prepare_runtime_store() -> Result<(), String> {
 
 /// Private client endpoints exist only for an installed application account.
 pub(crate) fn prepare_application_runtime(uid: u32) -> Result<(), String> {
-    if !(65536..=2147483647).contains(&uid) {
+    if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
         return Err("invalid application runtime identity".into());
     }
     let run = Directory::open(Path::new("/run"), 0, 0)?;
@@ -480,15 +478,47 @@ fn seed(prior: &Ledger, registry: &Registry) -> Result<Ledger, String> {
     )
 }
 
-/// The image build's check: the deployment's application rows fit an
-/// account ledger beside the carried rows, so its first boot can seed one.
-pub(crate) fn check_accounts(registry: &Registry) -> Result<(), String> {
-    seed(&Ledger::default(), registry).map(|_| ())
+/// The image's own principal table reserves no application: an application
+/// account is a ledger row. Retained reservations keep theirs.
+fn require_no_application_rows(desired: &Registry) -> Result<(), String> {
+    match desired.applications().next() {
+        Some(application) => Err(format!(
+            "the deployment's principal table reserves application {:?}; application \
+             accounts come from the workload account ledger",
+            application.name
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The image build's check: the deployment's principal table reserves no
+/// application, and every application it declares (`declarations`, which a
+/// server lacks) has a carried ledger row, since nothing allocates one
+/// before an install does.
+pub(crate) fn check_accounts(
+    registry: &Registry,
+    declarations: Option<&Declarations>,
+) -> Result<(), String> {
+    require_no_application_rows(registry)?;
+    let carried = seed(&Ledger::default(), registry)?;
+    for row in declarations.map_or(&[][..], Declarations::rows) {
+        if carried
+            .uid_of(Kind::Application, &row.application)
+            .is_none()
+        {
+            return Err(format!(
+                "application {:?} has no carried workload account",
+                row.application
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reserve the deployment's identities and seed the workload account
-/// ledger from them. No consumer reads that ledger yet.
+/// ledger, the one source of application uids, from them.
 pub(crate) fn provision(desired: &Registry) -> Result<(), String> {
+    require_no_application_rows(desired)?;
     state_directory()?.enroll_checked(desired, |retained| {
         retained.verify_installed_accounts(desired)
     })?;
@@ -508,16 +538,34 @@ pub(crate) fn check_launch_application(owner: u32, name: &str) -> Result<u32, St
     let desired = Registry::load()?;
     let prior = state_directory()?.verify_enrolled(&desired)?;
     prior.verify_installed_accounts(&desired)?;
-    let application = desired
-        .active_applications()?
-        .into_iter()
-        .find(|application| application.owner == owner && application.name == name)
-        .ok_or("application has no active account in the enrolled deployment")?;
-    let policy = crate::app_policy::load()?;
+    launch_uid(&prior, &crate::app_policy::load()?, owner, name)
+}
+
+/// The uid `name` launches as: the session owner for a personal
+/// application, else its ledger account. Either way the image declares it
+/// and the ledger holds its account, at the uid any retained reservation of
+/// it names.
+fn launch_uid(
+    retained: &Registry,
+    policy: &crate::app_policy::Policy,
+    owner: u32,
+    name: &str,
+) -> Result<u32, String> {
+    if policy.owner() != owner {
+        return Err("application launch names another session".into());
+    }
+    let account = policy
+        .account(name)
+        .ok_or("application has no workload account in the enrolled deployment")?;
     let rule = policy
         .for_name(name)
         .ok_or("application has no bus assignment")?;
-    if policy.owner() != owner || (rule.uid != owner && rule.uid != application.uid) {
+    // `for_name` gives the owner or this account; only a retained
+    // reservation can disagree.
+    if retained
+        .applications()
+        .any(|application| application.name == name && application.uid != account)
+    {
         return Err("application launch and retained assignments disagree".into());
     }
     Ok(rule.uid)

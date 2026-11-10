@@ -149,6 +149,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/vm_wire.rs"),
     ),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
 ];
 
 /// Sibling sources staged beside the modules, at the paths the

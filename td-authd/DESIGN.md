@@ -335,7 +335,11 @@ changes no running uid. Every reserved uid/gid is checked against the
 complete current passwd and group tables, including retired
 assignments. A future activated account must use the canonical name
 `tdc<owner>`, `tdb<owner>`, or `tdp<owner>` for compositor, broker, or
-portal, and `tda<uid>` for an application. Its primary gid equals uid,
+portal. An application's account is no passwd entry: it is the workload
+account ledger's row (below), and passwd and group must hold no entry of
+the `tda<digits>` form, none at a uid or gid in the ledger's ranges
+(65536 through 131071) and none at a retained application reservation's
+uid. Its primary gid equals uid,
 shell is `/bin/false`, and password field is exactly `!td-service`; it has
 no supplementary membership and its primary group exists and admits no
 other members. Aliases, shared primary gids, missing active human owners,
@@ -387,6 +391,10 @@ survives a rename. The persistent ledger is not an alternate source of
 active applications: only the current immutable deployment declares those.
 Root and deployment configuration remain trusted; these checks catch
 accidental UID recycling, not a root attacker rewriting the ledger.
+The image's own table holds no application row: an application's uid is
+the workload account ledger's. Retained application rows stay, from
+deployments before it, and seed that ledger; enrollment refuses an image
+table that reserves an application.
 
 ### Application runtime preparation
 
@@ -566,7 +574,7 @@ application name grammar above, under each kind; a sandbox and a workspace
 may share a name, never a uid. Application uids are 65536 through 98303;
 sandbox and workspace uids share 98304 through 131071. Both lie inside
 the principal table's application range (65536 through 2147483647), which
-the cgroup delegation and launch checks still use, and clear of 65534,
+still bounds its retained rows, and clear of 65534,
 65535 and every other uid td assigns; a subordinate id range, should td
 ever allocate one, belongs above 131071. The parser refuses an unknown
 kind, a uid outside its kind's range, noncanonical decimal spelling, an
@@ -575,13 +583,27 @@ held by two rows. It bounds the ledger to 4096 rows and 256 KiB, a 64-byte
 average row, with the same headroom reason: a bound a later deployment
 outgrows strands the rollback.
 
+Every check that a uid is an application's uses the ledger's application
+range, 65536 through 98303 (`APPLICATION_UIDS`): td-login's and td-jail's
+cgroup delegation, td-jail's private-home check, td-authd's launcher
+reply, the consent codec's credential target (a data-only copy td-authd's
+tests hold equal) and firstboot's state and runtime preparation. Only the
+principal table's parser keeps its wider range, for retained rows. No
+passwd or group entry may hold a uid or gid anywhere in 65536 through
+131071 (`LEDGER_UIDS`) or take the `tda<digits>` form
+(`application_account_name`); the ledger reader's file shares both with
+td-login, td-firstboot and td-ssh, and the server check's reserved name
+prefixes take the application one from it.
+
 The ledger narrows the principal table in two ways. Its application uids
 stop at 98303, and its rows are keyed by name alone, not by human owner.
 A retained principal table whose application row lies above 98303, or that
 gives one application name to two owners at different uids, therefore
 refuses the boot; serving more than one human with applications is a later
-decision. The image build's `td-firstboot check-principals` seeds an empty
-ledger from the image's table, so no image ships rows that cannot seed.
+decision. The image build's `td-firstboot check-principals` refuses an
+image table that holds any application row, and an application the image
+declares (`/etc/td-bus-applications.tsv`) without a carried row, since
+nothing allocates one before td-authd does.
 
 Rows are never removed. A removed application keeps its row, so a
 reinstall gets the same uid and no uid is ever reused. The ledger is
@@ -613,15 +635,54 @@ reservations above: restore a copy holding every row, or rebuild it from
 complete history; never drop a row, and keep every application launcher
 disabled until it is whole.
 
-No consumer reads the ledger yet. td-login, the bus broker's application
-policy and its includers, td-portal and td-authd move to it in one
-landing, which removes the application rows from passwd, group and
-`/etc/td-principals.tsv` and the uid column from the bus policy (WORKLOADS.md,
-step 5). td-authd's allocation when td-software installs an application
-follows. It will hold `.principals.lock`, return an existing row, and
-otherwise take the lowest uid in the kind's range that no row holds and
-that no retained principal row (of any owner), passwd entry or group
-names; no caller supplies a uid.
+The ledger is the one source of an application's uid. Its readers share
+`load` in the same file, which opens `/var/lib/td` without following
+links, requires it root-owned and writable by no one else, and admits
+the ledger only at the published shape above. To a launcher, a credential
+binding or a check (`app_policy::load`) a missing or malformed ledger is
+an error, never an empty ledger:
+
+- td-login's `exec-service-as tda<uid>` resolves the name from the
+  ledger alone (td-login/THREAT-MODEL.md §7).
+- The application policy (`td-busd/src/app_policy.rs`) joins the image's
+  declarations, `/etc/td-bus-applications.tsv` at
+  `td-bus-applications-v2`, a `NAME CLASS OWNED` row per application with
+  class `personal` (runs as the session's human) or `service` (runs as
+  its own account) and no uid, with the ledger's application rows. An
+  application is active when the image declares it and the ledger holds
+  its row. The broker, td-portal, td-jail, td-compositor, td-audio,
+  td-authd, td-secret and td-firstboot include it. A loaded policy reads
+  the ledger at start and, on a miss (an uncovered uid in the application
+  range, or a declared application without a row), inspects the file
+  through the pinned directory and reads it again only when its device,
+  inode, size, modification or change time differ from the last read or
+  attempt. Publication renames a new file into place, so a row published
+  just after any miss is seen by the next one; a stream of misses against
+  an unchanged ledger costs one inspection each and no read. A failed
+  read is retried once the file changes. The fresh ledger is adopted only
+  when it extends the one held: rows are never removed or moved, so one
+  that drops or moves a row is ignored, with one line on stderr. Neither
+  an undeclared name nor a uid outside the application range causes a
+  read.
+- The long-running session services, the broker, the compositor, the
+  portal and the audio daemon, load it with `load_session`: a ledger they
+  cannot read at start leaves them running with no application rows, says
+  so on stderr, and is read again once it changes, so a damaged ledger
+  refuses every service application without taking down the human's
+  session. Their declarations stay strict.
+- td-authd's credential intake and td-secret's private write bind the
+  ledger's uid of a declared application; td-firstboot's
+  `check-launch-application` selects the launch uid from the policy and
+  refuses when a retained reservation names the application at another
+  uid; per-boot preparation iterates the declared service applications
+  the ledger holds.
+
+td-authd's allocation when td-software installs an application follows
+(WORKLOADS.md, step 5). It will hold `.principals.lock`, return an
+existing row, and otherwise take the lowest uid in the kind's range that
+no row holds and that no retained principal row (of any owner), passwd
+entry or group names; no caller supplies a uid. Until then the carried
+rows are the only application rows a fresh install has.
 
 ## Fixed program launch prerequisite
 
@@ -1068,7 +1129,8 @@ substitute for successful firstboot dependency ordering.
 
 After validation the authority execs the fixed td-login helper: `exec-primary`
 for a personal application assigned to the human, or `exec-service-as tdaUID`
-for an application assigned a service account. Both then execute the authority's
+for an application assigned a service account, which td-login resolves
+from the workload account ledger. Both then execute the authority's
 own `application-exec` wrapper. All
 standard descriptors become null, the environment is cleared and cwd is `/`.
 The supervisor PID is retained across execs. No inherited root endpoint or
@@ -1391,8 +1453,9 @@ failed ledger admission or a remaining mount is reported, not silently
 ignored. The image must stop services before releasing these mounts and
 release them before unmounting /var.
 
-Application activation uses the same immutable application policy reader in
-the broker, jail, portal, compositor and audio daemon. Broker registration
+Application activation uses the same application policy reader, the
+image's declarations joined with the workload account ledger, in the
+broker, jail, portal, compositor and audio daemon. Broker registration
 requires the assigned execution UID. The human UID may register the
 personal names explicitly assigned to it, but confined peers cannot
 register another instance.
@@ -1585,7 +1648,7 @@ own record, answering `Last` for a removal, whose commit follows it, and
 proof is made once, before an enrollment's first key.
 
 The human UID is 1000 through 65533; the external application UID is 65536
-through 2147483647. A write's requester must equal its human owner. Names are
+through 98303, the account ledger's application range. A write's requester must equal its human owner. Names are
 at most 64 ASCII bytes: application names share the launcher predicate,
 credential names admit alphanumerics, hyphen and underscore and retain case.
 The value contains no credential bytes, file path, executable or arbitrary

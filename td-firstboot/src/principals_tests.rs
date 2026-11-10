@@ -11,13 +11,12 @@ const GROUP: &str = "root:x:0:\ntester:x:1000:\nother:x:1001:\nwheel:x:10:tester
 fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
     let registry = Registry::parse(TABLE).unwrap();
     let passwd = format!(
-        "{}tdc1000:!td-service:993:993:Compositor:/run/tdc1000:/bin/false\n\
-        tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n",
+        "{}tdc1000:!td-service:993:993:Compositor:/run/tdc1000:/bin/false\n",
         PASSWD
             .replace(":Tester:", ":tester comment:")
             .replace("tester::", "tester:opaque-tester-hash:")
     );
-    let group = format!("{GROUP}tdc1000:x:993:\ntda65536:x:65536:\nteam:x:2000:tester,other\n");
+    let group = format!("{GROUP}tdc1000:x:993:\nteam:x:2000:tester,other\n");
     let renamed = rename_primary_tables(&registry, &passwd, &group, "alice").unwrap();
     assert_eq!(
         renamed.passwd,
@@ -27,10 +26,6 @@ fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
         )
     );
     assert_eq!(renamed.group, group.replace("tester", "alice"));
-    assert_eq!(
-        registry.application_accounts(&renamed.passwd).unwrap(),
-        registry.application_accounts(&passwd).unwrap()
-    );
     let again = rename_primary_tables(&registry, &renamed.passwd, &renamed.group, "alice").unwrap();
     assert_eq!(again.passwd, renamed.passwd);
     assert_eq!(again.group, renamed.group);
@@ -303,35 +298,44 @@ fn primary_name_check_refuses_orphan_authority_and_inconsistent_tables() {
     }
 }
 
+/// An application account is a ledger row, so neither table may carry
+/// one: not by its name form, not by an id the ledger allocates from, and
+/// not by a retained application reservation's uid.
 #[test]
-fn active_application_accounts_bind_reserved_uids_to_private_homes() {
+fn no_account_or_group_speaks_for_a_workload_account() {
     let registry = Registry::parse(TABLE).unwrap();
-    assert!(registry.application_accounts(PASSWD).unwrap().is_empty());
-    let row =
-        "tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n";
-    let passwd = format!("{PASSWD}{row}");
-    let group = format!("{GROUP}tda65536:x:65536:\n");
-    registry.verify_accounts(&passwd, &group).unwrap();
-    let active = registry.application_accounts(&passwd).unwrap();
-    assert_eq!(
-        active,
-        vec![Application {
-            owner: 1000,
-            name: "firefox".into(),
-            uid: 65536
-        }]
-    );
-    for bad in [
-        passwd.replace("applications/65536", "applications/65537"),
-        passwd.replace("/var/lib/td/applications/65536", "/home/tester"),
-        passwd.replace("applications/65536", "applications/65536/../65536"),
-        passwd.replace("applications/65536", "applications//65536"),
-        passwd.replace("applications/65536", "applications/./65536"),
-        passwd.replace("65536:65536", "65536:1000"),
-        passwd.replace("tda65536", "tester-app"),
-        format!("{passwd}{row}"),
+    registry.verify_accounts(PASSWD, GROUP).unwrap();
+    for row in [
+        "tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false",
+        "tda7:!td-service:2007:2007:A:/:/bin/false",
+        "app::65536:1001:A:/home/app:/bin/sh",
+        "app::2000:98304:A:/home/app:/bin/sh",
+        "app::131071:131071:A:/home/app:/bin/sh",
     ] {
-        assert!(registry.verify_accounts(&bad, &group).is_err());
+        let passwd = format!("{PASSWD}{row}\n");
+        assert!(registry.verify_accounts(&passwd, GROUP).is_err(), "{row}");
+        assert!(registry
+            .check_primary_name(&passwd, GROUP, "alice")
+            .is_err());
+    }
+    for row in [
+        "tda65536:x:65536:",
+        "apps:x:65540:",
+        "apps:x:98304:",
+        "audio:x:994:tester,tda65536",
+    ] {
+        let group = format!("{GROUP}{row}\n");
+        assert!(registry.verify_accounts(PASSWD, &group).is_err(), "{row}");
+    }
+    // A retained application reservation outside today's ranges is refused
+    // as well, and the ids beside the ranges are ordinary.
+    let retained = Registry::parse(&TABLE.replace("65538", "200000")).unwrap();
+    let passwd = format!("{PASSWD}app::200000:200000:A:/home/app:/bin/sh\n");
+    assert!(retained.verify_accounts(&passwd, GROUP).is_err());
+    for id in [65535, 131072] {
+        let passwd = format!("{PASSWD}app::{id}:{id}:A:/home/app:/bin/sh\n");
+        let group = format!("{GROUP}app:x:{id}:\n");
+        registry.verify_accounts(&passwd, &group).unwrap();
     }
 }
 

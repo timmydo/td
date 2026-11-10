@@ -93,6 +93,10 @@ const MODULES: &[(&str, &str)] = &[
     ("status", include_str!("../../../td-login/src/status.rs")),
     ("sys", include_str!("../../../td-login/src/sys.rs")),
     ("tty", include_str!("../../../td-login/src/tty.rs")),
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
 ];
 
 /// The modules `main.rs` reaches by `#[path]`, each staged where that path
@@ -100,6 +104,7 @@ const MODULES: &[(&str, &str)] = &[
 const SHARED: &[(&str, &str)] = &[
     ("primary_account", "{src}/td-authd/src/primary_account.rs"),
     ("login_state", "{src}/td-secret/src/login_state.rs"),
+    ("workload_accounts", "{src}/engine/src/workload_accounts.rs"),
 ];
 
 /// Where a module's source is written: its shared path, or beside `main.rs`.
@@ -152,6 +157,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-login/src",
         "{src}/td-authd/src",
         "{src}/td-secret/src",
+        "{src}/engine/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -249,13 +255,17 @@ mod tests {
 
     /// Each shared source is staged where `main.rs`'s `#[path]` resolves from
     /// `{src}/td-login/src`, under the `mod` line that attribute governs, and
-    /// those two are the crate root's only path attributes. The login-state
-    /// predicate is the one the console refusal reads (THREAT-MODEL.md §3).
+    /// those three are the crate root's only path attributes. The login-state
+    /// predicate is the one the console refusal reads (THREAT-MODEL.md §3);
+    /// the ledger reader resolves application accounts (§7).
     #[test]
     fn the_shared_sources_are_staged_at_their_declared_paths() {
         let mut names: Vec<&str> = SHARED.iter().map(|(name, _)| *name).collect();
         names.sort_unstable();
-        assert_eq!(names, ["login_state", "primary_account"]);
+        assert_eq!(
+            names,
+            ["login_state", "primary_account", "workload_accounts"]
+        );
         for (name, path) in SHARED {
             let relative = path.strip_prefix("{src}/").unwrap();
             let attribute = format!("#[path = \"../../{relative}\"]\n");

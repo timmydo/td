@@ -52,6 +52,8 @@ Adversaries considered:
   specifies its complete admission and publication. A build-time tailoring
   mistake or damaged saved setting must refuse, and readers still validate
   the live files. Numeric identities and authentication fields are preserved.
+  The workload account ledger, `/var/lib/td/accounts.tsv`, is part of the
+  database: it alone names application accounts (§7).
 - **A3 — a hostile caller of td-login**: whatever execs `login`,
   `login-primary`, `exec-as`, `exec-primary` or `exec-service-as` chooses
   argv, the environment, the current directory, and the open file
@@ -156,8 +158,8 @@ later unprivileged td-jail cannot move its child into a sibling per-instance
 leaf: cgroup v2 requires write authority at the source/destination common
 ancestor.
 The human UID 1000 selects `td-user-1000/session`; the Flathub runtime
-account, UID 998, selects `td-runtimes/session`; application UIDs
-65536 through 2147483647 select `td-app-UID/session`. Every other non-root
+account, UID 998, selects `td-runtimes/session`; the ledger's application
+UIDs, 65536 through 98303, select `td-app-UID/session`. Every other non-root
 UID reports that no delegation is configured. Firstboot prepares only the
 installed, durably reserved application accounts' cgroups and, on the
 desktop, the runtime account's at sysinit, as specified in
@@ -345,13 +347,18 @@ alone.
 
 The shared reader is compiled beneath `forbid(unsafe_code)` and is included
 in the source-level confinement scan alongside the local modules. Exactly
-two reviewed external paths are admitted: that reader and, since
+three reviewed external paths are admitted: that reader, since
 TOKEN-LOGIN.md's increment 4 (C5), the shared std-only login-state
 predicate `td-secret/src/login_state.rs` (below), which forbids
 `unsafe_code` on itself and is compiled under a reasoned `dead_code`
 allowance, since td-login calls only its predicate; the confinement scan
 holds that its temporaries sweep, the one place it unlinks, is named
-nowhere else. Other path attributes and code inclusion remain forbidden.
+nowhere else. The third is the workload account ledger reader
+`engine/src/workload_accounts.rs` (§7), compiled beneath
+`forbid(unsafe_code)` with a reasoned `dead_code` allowance, since td-login
+reads the ledger and never seeds it; its two owner checks are its only
+zero-argument UID and GID reads. Other path attributes and code inclusion
+remain forbidden.
 Metadata's zero-argument UID and GID reads are distinct from credential
 setters and are pinned per file; the shared sources' and the terminal
 tests' test-only mode fixtures are pinned separately from the two
@@ -367,6 +374,10 @@ decision; the console refusal below adds a hand-back to root that reuses
 | `!`, `!!`, `*`, `x` | `Locked`     | denied              | **denied** | **denied**         | denied            |
 | anything else       | `Hashed`     | **denied**          | allowed    | allowed            | denied            |
 | no entry / no file  | —            | denied              | denied     | denied             | denied            |
+| ledger `tda<uid>`   | `Service`    | denied              | denied     | denied             | **allowed**       |
+
+The last row is no passwd entry: an application account is the workload
+account ledger's row (§7), of the service class by construction.
 
 Consequences worth stating plainly:
 
@@ -393,8 +404,8 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has eight infrastructure service identities plus four
-  locked application identities. td-sshd's `sshd`
+  The shipped image has eight infrastructure service identities in passwd;
+  its application identities are the ledger's carried rows. td-sshd's `sshd`
   privilege-separation account, `td-profiler`'s `profiler` account and
   `td-netd`'s `td-netd` account are not td-svc `exec-as` targets; each daemon
   performs its own fixed-purpose drop. td-netd's keeps CAP_NET_ADMIN and
@@ -828,6 +839,41 @@ Against A2, the parsers fail closed rather than fail soft:
 - A `/etc/group` line naming a user is only honoured if the group's gid
   parses; a malformed group file fails the lookup rather than silently
   granting a smaller set.
+
+Application accounts come from the workload account ledger
+(`td-authd/DESIGN.md`, "Workload account ledger") alone. `tda<uid>`, `tda`
+followed by digits, is their reserved form; another name that merely
+begins `tda` is an ordinary name.
+
+- `exec-service-as tda<uid>` reads the ledger through the shared reader in
+  `engine/src/workload_accounts.rs`, which opens `/var/lib/td` without
+  following links, requires it root-owned and writable by no one else,
+  and requires `accounts.tsv` to be a single-link, bounded, root-owned
+  regular file of mode 0644 at the canonical format. The uid must be
+  spelled canonically and an application row must hold it. The account
+  is then fixed, not read: gid equal to uid, home
+  `/var/lib/td/applications/<uid>`, shell `/bin/false`, the service class,
+  and no supplementary group. A missing, hostile or malformed ledger, or a
+  uid it does not hold, refuses. Any application row resolves, a retired
+  application's (a former install's `tda65539`) or a personal one's
+  included: td-login reads no declarations, and `exec-service-as`'s caller
+  is root, which could run as any uid anyway. Such an account has no
+  home, runtime or cgroup delegation prepared, since firstboot prepares
+  only the declared service applications; td-login only warns when the
+  join fails (§1), and the root launchers that start applications, td-authd's
+  among them, select only declared ones and make a failed placement fatal.
+- Every lookup, human or service, reads passwd and group whole and
+  refuses when any entry is of the reserved form or holds a uid or gid in
+  the ledger's ranges (65536 through 131071), or a group lists a
+  reserved-form member. Such an entry would be a second account policy
+  for a ledger uid, the class confusion the alias rule above refuses
+  within passwd: an empty password field the forced paths admit, or
+  supplementary groups the ledger's account does not have. The range
+  check needs no ledger read, so an ordinary login does not depend on the
+  ledger.
+- `login`, `login -f`, `exec-as` and `exec-primary` refuse a reserved-form
+  name before any lookup, and a primary name of that form stays refused
+  by the shared primary validator.
 
 The supplementary set handed to `setgroups(2)` is the user's `/etc/group`
 memberships **plus** the primary gid, sorted and deduplicated. Sorting is

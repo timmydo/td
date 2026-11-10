@@ -45,6 +45,12 @@ const MODULES: &[(&str, &str)] = &[
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
+    // The workload account ledger principal_store seeds and the
+    // application policy reads.
+    (
+        "workload_accounts",
+        include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
     (
         "primary_profile",
         include_str!("../../../td-firstboot/src/primary_profile.rs"),
@@ -179,6 +185,7 @@ pub fn recipe() -> Recipe {
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),
                 "encoding" => "{src}/td-encoding/src/lib.rs".into(),
+                "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
                 _ => format!("{{src}}/td-firstboot/src/{name}.rs"),
             },
             content: (*source).into(),
@@ -198,12 +205,6 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{src}/engine/src/principals.rs".into(),
         content: include_str!("../../../engine/src/principals.rs").into(),
-        exec: false,
-    });
-    // The workload account ledger principal_store seeds.
-    steps.push(Step::WriteFile {
-        path: "{src}/engine/src/workload_accounts.rs".into(),
-        content: include_str!("../../../engine/src/workload_accounts.rs").into(),
         exec: false,
     });
     steps.push(Step::WriteFile {
@@ -370,7 +371,7 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "{src}/principal-tests.rs".into(),
-        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
+        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"engine/src/workload_accounts.rs\"] mod workload_accounts;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
         exec: false,
     });
     steps.push(

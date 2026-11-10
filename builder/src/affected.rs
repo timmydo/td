@@ -302,7 +302,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/workload_accounts.rs",
-        "host and target-static td-firstboot's workload account ledger seeding",
+        "host and target-static td-firstboot's workload account ledger seeding, and its readers: td-login's application accounts and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
     ),
     (
         "engine/src/sha256.rs",
@@ -2452,6 +2452,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!(
         "engine/src/workload_accounts.rs",
         "td-firstboot's workload account ledger"
+    );
+    assert_contains!(
+        "engine/src/workload_accounts.rs",
+        "td-login's application accounts"
     );
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
@@ -6979,11 +6983,13 @@ mod tests {
         );
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
-        // a name is a name wherever it is spelled.
+        // a name is a name wherever it is spelled. td-authd includes the
+        // application policy to bind a credential to the ledger's uid.
         assert_eq!(
             readers_of("td-busd"),
             [
                 "td-audio",
+                "td-authd",
                 "td-compositor",
                 "td-firstboot",
                 "td-jail",

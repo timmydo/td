@@ -47,8 +47,10 @@ These are fixed by the deployment, and this proposal keeps them fixed:
 
 - the registry `/etc/td-applications.tsv` and the launcher table
   `/etc/td-launcher.tsv` (§A.0, "Launcher integration");
-- `/etc/td-principals.tsv`, which assigns Firefox 65536, mail 65537,
-  news 65538, web 65540 (and, until its removal, Claude 65539) (§L);
+- the workload account ledger `/var/lib/td/accounts.tsv`, whose carried
+  rows give Firefox 65536, mail 65537, news 65538 and web 65540 (and a
+  retained install keeps Claude's 65539) (§L; td-authd/DESIGN.md,
+  "Workload account ledger"); nothing adds a row at run time yet;
 - the accounts, cgroups and runtimes that firstboot prepares at sysinit
   (td-authd/DESIGN.md, "Application runtime preparation" and
   "Application state preparation");

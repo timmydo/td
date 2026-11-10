@@ -29,6 +29,10 @@
 //! registration methods still do their work, because the flag withdraws the
 //! answer and not the request.
 
+#[allow(
+    dead_code,
+    reason = "the shared application policy's other includers read the parts the broker does not"
+)]
 mod app_policy;
 mod auth;
 mod authscript;
@@ -47,8 +51,21 @@ mod recorded;
 mod registry;
 mod session;
 mod sys;
+#[cfg(test)]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-fs/src/temp_dir.rs")]
+mod test_temp;
 mod transport;
 mod wire;
+// The workload account ledger the application policy resolves uids from.
+#[allow(
+    dead_code,
+    reason = "the broker reads the ledger; td-firstboot seeds it"
+)]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/workload_accounts.rs"
+)]
+mod workload_accounts;
 
 use std::env;
 use std::path::Path;
@@ -344,7 +361,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("recorded", include_str!("recorded.rs")),
     ("registry", include_str!("registry.rs")),
     ("session", include_str!("session.rs")),
+    ("test_temp", include_str!("../../td-fs/src/temp_dir.rs")),
     ("wire", include_str!("wire.rs")),
+    (
+        "workload_accounts",
+        include_str!("../../engine/src/workload_accounts.rs"),
+    ),
 ];
 
 #[cfg(test)]
@@ -460,7 +482,10 @@ mod tests {
         thread::spawn(move || {
             let _ = serve_bound(
                 bound,
-                Some(app_policy::Policy::new(session::HUMAN_UID, Vec::new()).unwrap()),
+                Some(app_policy::Policy::join(
+                    app_policy::Declarations::new(session::HUMAN_UID, Vec::new()).unwrap(),
+                    workload_accounts::Ledger::default(),
+                )),
             );
         });
         let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();

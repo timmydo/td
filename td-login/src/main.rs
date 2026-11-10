@@ -50,6 +50,13 @@ mod session;
 mod status;
 mod sys;
 mod tty;
+#[forbid(unsafe_code)]
+#[path = "../../engine/src/workload_accounts.rs"]
+#[allow(
+    dead_code,
+    reason = "td-login resolves application accounts; td-firstboot seeds the ledger"
+)]
+mod workload_accounts;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -676,14 +683,18 @@ mod confinement {
     use std::path::Path;
     use td_source_scan::{self as scan, squeeze, unsafe_allows, unsafe_blocks, unsafe_items};
 
-    /// The two reviewed shared sources, as `main.rs` names them by `#[path]`
-    /// (THREAT-MODEL.md §3), and the file name each is scanned under.
+    /// The three reviewed shared sources, as `main.rs` names them by `#[path]`
+    /// (THREAT-MODEL.md §3 and §7), and the file name each is scanned under.
     const SHARED: &[(&str, &str)] = &[
         (
             "../../td-authd/src/primary_account.rs",
             "primary_account.rs",
         ),
         ("../../td-secret/src/login_state.rs", "login_state.rs"),
+        (
+            "../../engine/src/workload_accounts.rs",
+            "workload_accounts.rs",
+        ),
     ];
 
     /// Every source file of the crate, read from disk (see `scan::read_tree`),
@@ -757,8 +768,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            11,
-            "expected nine local modules and the two audited shared modules"
+            12,
+            "expected nine local modules and the three audited shared modules"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -770,7 +781,7 @@ mod confinement {
         }
     }
 
-    /// The ten local files plus the two shared sources are the complete
+    /// The ten local files plus the three shared sources are the complete
     /// input.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
@@ -782,7 +793,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn the_scan_holds_exactly_the_twelve_audited_modules() {
+    fn the_scan_holds_exactly_the_thirteen_audited_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -800,6 +811,7 @@ mod confinement {
                 "status.rs",
                 "sys.rs",
                 "tty.rs",
+                "workload_accounts.rs",
             ],
             "the crate's file set changed"
         );
@@ -983,17 +995,17 @@ mod confinement {
     /// build then accepts a second asm entry point with every other assertion
     /// in this module intact.
     ///
-    /// The lint is denied at root, forbidden on the shared account reader
+    /// The lint is denied at root, forbidden on the shared account readers
     /// (the login-state predicate forbids it on itself) and allowed only on
     /// the one asm body.
     #[test]
-    fn the_unsafe_lint_has_only_the_four_reviewed_mentions() {
+    fn the_unsafe_lint_has_only_the_five_reviewed_mentions() {
         const LINT: &str = concat!("un", "safe_code");
         let mut total = 0;
         for (path, text) in sources() {
             let count = text.matches(LINT).count();
             let expected = match path.as_str() {
-                "main.rs" => 2,
+                "main.rs" => 3,
                 "sys.rs" | "login_state.rs" => 1,
                 _ => 0,
             };
@@ -1004,13 +1016,18 @@ mod confinement {
             total += count;
         }
         assert_eq!(
-            total, 4,
+            total, 5,
             "denied at root, forbidden on each shared module, allowed on the syscall body"
         );
         assert!(source("main.rs").contains(concat!(
             "#[forbid(un",
             "safe_code)]\n#[",
             "path = \"../../td-authd/src/primary_account.rs\"]\nmod primary_account;"
+        )));
+        assert!(source("main.rs").contains(concat!(
+            "#[forbid(un",
+            "safe_code)]\n#[",
+            "path = \"../../engine/src/workload_accounts.rs\"]\n"
         )));
         assert!(source("main.rs").contains(concat!(
             "#[",
@@ -1328,12 +1345,14 @@ mod confinement {
         // MetadataExt reads take no argument; CommandExt setters require one.
         // Each file's zero-argument reads are pinned: the account reader's
         // owner checks, the predicate's `Facts::of` and its test fixture, the
-        // hand-back's read-back and the console and terminal tests' fixtures.
+        // hand-back's read-back, the ledger reader's two owner checks and the
+        // console and terminal tests' fixtures.
         const READS: &[(&str, usize, usize)] = &[
             ("login.rs", 1, 1),
             ("login_state.rs", 2, 2),
             ("primary_account.rs", 4, 0),
             ("tty.rs", 2, 2),
+            ("workload_accounts.rs", 2, 2),
         ];
         let uid_read = concat!(".u", "id()");
         let gid_read = concat!(".g", "id()");

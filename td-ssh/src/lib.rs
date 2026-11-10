@@ -16,3 +16,12 @@ pub mod prompt;
 pub mod server;
 pub mod sys;
 pub mod wire;
+// The workload account ledger reader td-login's account tables include: they
+// refuse a passwd or group entry that speaks for a workload account.
+#[allow(
+    dead_code,
+    reason = "td-login's tables name it; sshd uses their passwd checks alone"
+)]
+#[forbid(unsafe_code)]
+#[path = "../../engine/src/workload_accounts.rs"]
+mod workload_accounts;

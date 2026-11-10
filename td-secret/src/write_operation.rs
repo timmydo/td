@@ -1,15 +1,14 @@
 //! One captured credential, one presented request, one fresh token assertion.
 
+use crate::app_policy::Policy;
 use crate::consent::{Operation, Request, Role};
 use crate::operation::{remaining, Credential, Wire, OPERATION_TIME};
 use crate::{crypto, fido_device, fido_enroll, fido_metadata, operation, principals, store, tpm};
 use std::time::Instant;
 
-fn description(
-    bytes: &[u8],
-    uid: u32,
-    applications: &[principals::Application],
-) -> Result<Request, String> {
+/// The request, if it writes for an application this session's image
+/// declares at the uid the workload account ledger holds for it.
+fn description(bytes: &[u8], uid: u32, applications: &Policy) -> Result<Request, String> {
     let request = Request::decode(bytes)?;
     match request.operation() {
         Operation::Set {
@@ -17,9 +16,8 @@ fn description(
             application_uid,
             ..
         } if request.owner() == uid
-            && applications.iter().any(|app| {
-                app.owner == uid && app.name == *application && app.uid == *application_uid
-            }) =>
+            && applications.owner() == uid
+            && applications.account(application) == Some(*application_uid) =>
         {
             Ok(request)
         }
@@ -58,7 +56,7 @@ pub fn run(uid: u32) -> Result<(), String> {
     let mut wire = Wire::new(stream, deadline)?;
     let registry = principals::Registry::load()?;
     registry.verify_installed_accounts(&registry)?;
-    let applications = registry.active_applications()?;
+    let applications = crate::app_policy::load()?;
     let request = description(&wire.receive()?, uid, &applications)?;
     let store = super::owned_store(uid)?;
     if !store.token_protected()? {
@@ -131,11 +129,10 @@ mod tests {
         )
         .unwrap()
     }
-    fn registry() -> principals::Registry {
-        principals::Registry::parse(
-            "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n",
-        )
-        .unwrap()
+    const DECLARED: &str = "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tservice\t\n";
+    const LEDGER: &str = "td-accounts-v1\napplication\tmail\t65537\napplication\tnews\t65538\n";
+    fn policy() -> Policy {
+        Policy::from_tables(DECLARED, LEDGER).unwrap()
     }
     fn pair() -> (Wire, Wire, UnixStream) {
         let (one, two) = UnixStream::pair().unwrap();
@@ -250,11 +247,21 @@ mod tests {
     #[test]
     fn write_description_requires_the_installed_assignment_and_binds_every_argument() {
         let original = request(Role::Primary);
-        assert!(registry().applications().any(|app| app.name == "mail"));
-        assert!(
-            description(&original.encode(), 1000, &[]).is_err(),
-            "a retained reservation without an active account must refuse"
-        );
+        for (declared, ledger) in [
+            (DECLARED, "td-accounts-v1\napplication\tnews\t65538\n"),
+            ("td-bus-applications-v2\t1000\nnews\tservice\t\n", LEDGER),
+            (&*DECLARED.replace("v2\t1000", "v2\t1001"), LEDGER),
+        ] {
+            assert!(
+                description(
+                    &original.encode(),
+                    1000,
+                    &Policy::from_tables(declared, ledger).unwrap()
+                )
+                .is_err(),
+                "an undeclared or unallocated application, or another session's, must refuse"
+            );
+        }
         assert_eq!(
             challenge(&original),
             [
@@ -263,20 +270,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            description(
-                &original.encode(),
-                1000,
-                &registry().applications().cloned().collect::<Vec<_>>()
-            )
-            .unwrap(),
+            description(&original.encode(), 1000, &policy()).unwrap(),
             original
         );
-        assert!(description(
-            &original.encode(),
-            1001,
-            &registry().applications().cloned().collect::<Vec<_>>()
-        )
-        .is_err());
+        assert!(description(&original.encode(), 1001, &policy()).is_err());
         let mut old_tag = original.encode();
         old_tag[44] = 3;
         assert!(Request::decode(&old_tag).is_err());
@@ -303,12 +300,7 @@ mod tests {
             .unwrap();
             assert_ne!(challenge(&changed), challenge(&original));
             assert_eq!(
-                description(
-                    &changed.encode(),
-                    1000,
-                    &registry().applications().cloned().collect::<Vec<_>>()
-                )
-                .is_ok(),
+                description(&changed.encode(), 1000, &policy()).is_ok(),
                 app == "mail" && app_uid == 65537
             );
         }
@@ -322,19 +314,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(description(
-            &unlock.encode(),
-            1000,
-            &registry().applications().cloned().collect::<Vec<_>>()
-        )
-        .is_err());
+        assert!(description(&unlock.encode(), 1000, &policy()).is_err());
         for elevation in crate::elevation_descriptions(1000) {
-            assert!(description(
-                &elevation,
-                1000,
-                &registry().applications().cloned().collect::<Vec<_>>()
-            )
-            .is_err());
+            assert!(description(&elevation, 1000, &policy()).is_err());
         }
         assert!(request(Role::Recovery)
             .lines()
@@ -378,25 +360,30 @@ mod tests {
         assert!(!std::path::Path::new("/etc/passwd").exists());
         fs::create_dir_all("/etc").unwrap();
         fs::set_permissions("/etc", fs::Permissions::from_mode(0o755)).unwrap();
-        let table =
-            "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n";
-        for (name, text, mode) in [
-            ("td-principals.tsv", table, 0o444),
+        // mail is declared, but the ledger holds no account for it yet.
+        fs::create_dir_all("/var/lib/td").unwrap();
+        let ledger = "/var/lib/td/accounts.tsv";
+        for (path, text, mode) in [
             (
-                "passwd",
+                "/etc/td-principals.tsv",
+                "td-principals-v1\nsession\t1000\t993\t992\t991\n",
+                0o444,
+            ),
+            (
+                "/etc/passwd",
                 "tester::1000:1000::/home/tester:/bin/false\n",
                 0o644,
             ),
-            ("group", "tester:x:1000:\n", 0o644),
+            ("/etc/group", "tester:x:1000:\n", 0o644),
+            ("/etc/td-bus-applications.tsv", DECLARED, 0o444),
+            (ledger, "td-accounts-v1\napplication\tnews\t65538\n", 0o644),
         ] {
-            let path = format!("/etc/{name}");
-            fs::write(&path, text).unwrap();
+            fs::write(path, text).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         }
-        let policy = principals::Registry::load().unwrap();
-        policy.verify_installed_accounts(&policy).unwrap();
-        assert_eq!(policy.applications().count(), 1);
-        assert!(policy.active_applications().unwrap().is_empty());
+        let registry = principals::Registry::load().unwrap();
+        registry.verify_installed_accounts(&registry).unwrap();
+        assert_eq!(crate::app_policy::load().unwrap().account("mail"), None);
         fs::create_dir_all("/run/td-secret/1000").unwrap();
         let key = "/run/td-secret/1000/key";
         fs::write(key, [9; 64]).unwrap();
@@ -420,25 +407,12 @@ mod tests {
                 .contains("private write does not match its installed application and session"));
             assert_eq!(fs::read(key).unwrap(), [9; 64]);
         }
-        let mut passwd = fs::OpenOptions::new()
-            .append(true)
-            .open("/etc/passwd")
-            .unwrap();
-        passwd
-            .write_all(
-                b"tda65537:!td-service:65537:65537::/var/lib/td/applications/65537:/bin/false\n",
-            )
-            .unwrap();
-        let mut group = fs::OpenOptions::new()
-            .append(true)
-            .open("/etc/group")
-            .unwrap();
-        group.write_all(b"tda65537:x:65537:\n").unwrap();
-        policy.verify_installed_accounts(&policy).unwrap();
+        fs::write(ledger, LEDGER).unwrap();
+        registry.verify_installed_accounts(&registry).unwrap();
         assert!(description(
             &request(Role::Primary).encode(),
             1000,
-            &policy.active_applications().unwrap()
+            &crate::app_policy::load().unwrap()
         )
         .is_ok());
     }

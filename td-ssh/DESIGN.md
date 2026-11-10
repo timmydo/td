@@ -363,7 +363,10 @@ its password field classifies as `NoPassword` or `Hashed` under td-login's
 refused and `td-admin-key-only` is not; `AllowUsers` names it if present; shell
 exists and is executable; key found in one of the account's files. `td-login/src/db.rs`
 is mounted by `#[path]`, so accounts parse fail-closed exactly as td-login reads
-them. This is the account-locking rule `td-login/TOKEN-LOGIN.md`, "SSH" relies on
+them, including its refusal of any passwd or group entry that speaks for a
+workload account (td-login/THREAT-MODEL.md §7); the crate root mounts the
+ledger reader `engine/src/workload_accounts.rs` that file names, and an
+application account, being no passwd entry, is never an SSH login. This is the account-locking rule `td-login/TOKEN-LOGIN.md`, "SSH" relies on
 for refusing non-primary accounts in the ordinary form.
 
 **Key files.** A root-owned absolute path is read by the monitor, after

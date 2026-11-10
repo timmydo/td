@@ -41,6 +41,13 @@ mod primary_account;
 mod seccomp;
 mod sys;
 mod transition;
+// The workload account ledger the application policy resolves uids from.
+#[allow(dead_code, reason = "td-jail reads the ledger; td-firstboot seeds it")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/workload_accounts.rs"
+)]
+mod workload_accounts;
 mod workspace;
 
 use std::io::Write;
@@ -302,6 +309,36 @@ mod confinement {
         assert_eq!(TRANSITION.matches("unsafe {").count(), 0);
         assert!(!WORKSPACE.contains("unsafe"));
         assert!(!WORKSPACE.contains("sys::"));
+        // The application policy and the ledger reader it joins read two
+        // root-owned files and run nothing; the root includes each once.
+        for (name, shared) in [
+            (
+                "app_policy.rs",
+                include_str!("../../td-busd/src/app_policy.rs"),
+            ),
+            (
+                "workload_accounts.rs",
+                include_str!("../../engine/src/workload_accounts.rs"),
+            ),
+        ] {
+            for forbidden in ["unsafe", "Command", "std::process", "#[path", "include!"] {
+                assert!(!shared.contains(forbidden), "{name}: {forbidden}");
+            }
+            assert_eq!(
+                shipped_main
+                    .matches(&format!(
+                        "    path = \"../../{}/src/{name}\"\n)]\nmod ",
+                        if name == "app_policy.rs" {
+                            "td-busd"
+                        } else {
+                            "engine"
+                        }
+                    ))
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
     }
 
     /// The image compiler pins the literal (the td-jail recipe's tests);

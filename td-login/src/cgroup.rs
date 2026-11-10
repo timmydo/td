@@ -79,11 +79,15 @@ fn session_paths(uid: u32) -> Result<(String, String), String> {
 const RUNTIME_UID: u32 = 998;
 const RUNTIME_DELEGATION: &str = "td-runtimes";
 
+/// The delegation `uid`'s session joins. An application account's is its
+/// own, for a uid in the ledger's application range.
 fn delegation(uid: u32) -> Result<String, String> {
     match uid {
         1000 => Ok("td-user-1000".into()),
         RUNTIME_UID => Ok(RUNTIME_DELEGATION.into()),
-        65536..=2147483647 => Ok(format!("td-app-{uid}")),
+        uid if crate::workload_accounts::APPLICATION_UIDS.contains(&uid) => {
+            Ok(format!("td-app-{uid}"))
+        }
         _ => Err(format!(
             "no delegated session cgroup is configured for uid {uid}"
         )),
@@ -116,9 +120,10 @@ mod tests {
     #[test]
     fn human_and_application_sessions_have_disjoint_delegations() {
         assert_eq!(delegation(1000).unwrap(), "td-user-1000");
-        for uid in [65536, 65537, 2147483647] {
+        for uid in [65536, 65537, 98303] {
             assert_eq!(delegation(uid).unwrap(), format!("td-app-{uid}"));
         }
+        // A sandbox or workspace account is no application's.
         for uid in [
             0,
             991,
@@ -128,6 +133,9 @@ mod tests {
             65533,
             65534,
             65535,
+            98304,
+            131071,
+            2147483647,
             2147483648,
             u32::MAX,
         ] {

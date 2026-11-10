@@ -17,16 +17,18 @@ pub(crate) mod primary_account;
 #[path = "../../engine/src/principals.rs"]
 mod table;
 use table::decimal;
-pub(crate) use table::{Application, Registry, MAX_BYTES};
+pub(crate) use table::{Registry, MAX_BYTES};
 
 pub(crate) fn application_home(uid: u32) -> PathBuf {
     Path::new("/var/lib/td/applications").join(uid.to_string())
 }
 
+// The ledger's accounts come from the ledger, so no passwd or group entry
+// may take the application name form or hold a uid it allocates.
+use crate::workload_accounts::{application_account_name, LEDGER_UIDS};
+pub(crate) use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+
 const TABLE_NAME: &str = "td-principals.tsv";
-pub(crate) const O_NOFOLLOW: i32 = 0x20000;
-pub(crate) const O_NONBLOCK: i32 = 0x800;
-pub(crate) const O_DIRECTORY: i32 = 0x10000;
 
 fn root_directory(path: &Path, owner: Option<(u32, u32)>) -> Result<File, String> {
     let file = OpenOptions::new()
@@ -332,39 +334,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Call after the complete current and retained account validation.
-    pub(crate) fn active_applications(&self) -> Result<Vec<Application>, String> {
-        let etc = etc_directory(Path::new("/"), Some((0, 0)))?;
-        self.application_accounts(&read_root_file(&etc, "passwd", None)?)
-    }
-
-    fn application_accounts(&self, passwd: &str) -> Result<Vec<Application>, String> {
-        let mut active = Vec::new();
-        for row in account_rows(passwd)? {
-            let [name, _, uid, gid, _, home, shell] = row.as_slice() else {
-                return Err("invalid principal passwd row".into());
-            };
-            let uid = decimal(uid, 0..=u32::MAX)?;
-            if let Some(application) = self
-                .applications()
-                .find(|application| application.uid == uid)
-            {
-                if *name != format!("tda{uid}")
-                    || *gid != uid.to_string()
-                    || std::ffi::OsStr::new(home) != application_home(uid).as_os_str()
-                    || *shell != "/bin/false"
-                    || active.iter().any(|prior: &Application| prior.uid == uid)
-                {
-                    return Err(
-                        "application account does not match its private identity and home".into(),
-                    );
-                }
-                active.push(application.clone());
-            }
-        }
-        Ok(active)
-    }
-
     pub fn verify_launch_session(
         &self,
         user: &str,
@@ -452,10 +421,19 @@ impl Registry {
         for (owner, uid) in self.notebooks() {
             names.insert(uid, format!("tdv{owner}"));
         }
-        for application in self.applications() {
-            names.insert(application.uid, format!("tda{}", application.uid));
-        }
         names
+    }
+
+    /// Whether an account or group entry speaks for a workload account: the
+    /// application name form, an id the ledger allocates from, or a retained
+    /// application reservation's uid. Workload accounts come from the
+    /// ledger, so passwd and group carry none.
+    fn workload_entry(&self, name: &str, ids: [u32; 2]) -> bool {
+        application_account_name(name)
+            || ids.into_iter().any(|id| {
+                LEDGER_UIDS.contains(&id)
+                    || self.applications().any(|application| application.uid == id)
+            })
     }
 
     #[cfg(test)]
@@ -469,7 +447,6 @@ impl Registry {
         passwd: &str,
         group: &str,
     ) -> Result<(), String> {
-        self.application_accounts(passwd)?;
         let names = self.account_names();
         let mut seen_uids = BTreeSet::new();
         let mut seen_names = BTreeSet::new();
@@ -480,6 +457,12 @@ impl Registry {
             };
             let uid = decimal(uid, 0..=u32::MAX)?;
             let gid = decimal(gid, 0..=u32::MAX)?;
+            if self.workload_entry(name, [uid, gid]) {
+                return Err(
+                    "an account takes a workload account's name or id; workload accounts come from the account ledger"
+                        .into(),
+                );
+            }
             if !seen_uids.insert(uid) || !seen_names.insert(*name) {
                 return Err("ambiguous account name or uid".into());
             }
@@ -511,6 +494,14 @@ impl Registry {
                 return Err("invalid principal group row".into());
             };
             let gid = decimal(gid, 0..=u32::MAX)?;
+            if self.workload_entry(name, [gid, gid])
+                || members.split(',').any(application_account_name)
+            {
+                return Err(
+                    "a group takes or admits a workload account; workload accounts come from the account ledger"
+                        .into(),
+                );
+            }
             if !seen_gids.insert(gid) || !group_names.insert(*name) {
                 return Err("ambiguous group name or gid".into());
             }

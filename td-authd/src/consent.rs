@@ -28,6 +28,10 @@ pub const MODEL_WIDTH: usize = 32;
 pub const SERIAL_WIDTH: usize = 24;
 pub const HOSTNAME_BYTES: usize = 63;
 pub const USERNAME_BYTES: usize = 32;
+/// The workload account ledger's application uids, which a credential
+/// target names (`engine/src/workload_accounts.rs` `APPLICATION_UIDS`; this
+/// codec is data only, so td-authd's tests hold the copy equal).
+pub const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=98303;
 const ABSENT_LABEL: u8 = 0xff;
 const TRUNCATED_LABEL: u8 = 0x80;
 
@@ -1689,7 +1693,7 @@ impl Request {
                 requester,
             } if !application_name(application)
                 || !secret_name(name)
-                || !(65536..=2147483647).contains(application_uid)
+                || !APPLICATION_UIDS.contains(application_uid)
                 || *requester != owner =>
             {
                 return Err("invalid consent credential target".into());

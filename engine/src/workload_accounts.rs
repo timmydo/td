@@ -1,16 +1,31 @@
 //! The workload account ledger (td-authd/DESIGN.md, "Workload account
 //! ledger"; WORKLOADS.md, "Accounts"): the uid each workload account holds,
 //! keyed by kind and name. Rows are never removed, so no uid is reused,
-//! after an application's removal included. Parsing and seeding perform no
-//! I/O and use no other module, so target programs can `#[path]`-include
-//! this file; callers establish file authority.
+//! after an application's removal included. The file is std-only and uses
+//! no other module, so target programs include it by path: td-firstboot
+//! seeds the ledger, and `load` is the one live reader td-login and the bus
+//! policy's includers share. Parsing and seeding perform no I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::ops::RangeInclusive;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
 
 const MAGIC: &str = "td-accounts-v1\n";
-/// The ledger's name in td's persistent state directory, `/var/lib/td`.
+/// The ledger's name in td's persistent state directory, `DIRECTORY`.
 pub const FILE_NAME: &str = "accounts.tsv";
+/// td's persistent state directory, root-owned without other writers.
+pub const DIRECTORY: &str = "/var/lib/td";
+/// The published ledger's exact mode: every account reads it.
+pub const MODE: u32 = 0o644;
+/// Linux x86-64 open flags, which std does not name; the ledger's readers
+/// and the application policy's declarations reader share them.
+pub const O_NOFOLLOW: i32 = 0x20000;
+pub const O_DIRECTORY: i32 = 0x10000;
+pub const O_NONBLOCK: i32 = 0x800;
 /// Rows are permanent, so the v1 bounds hold every row a later deployment
 /// may add, or rolling back to this one would refuse its ledger: 4096 rows
 /// at a 64-byte average.
@@ -21,6 +36,32 @@ pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
 /// Sandbox and workspace accounts, which share one range. Nothing writes
 /// those kinds yet; v1 parses them so a deployment that does can roll back.
 pub const WORKLOAD_UIDS: RangeInclusive<u32> = 98304..=131071;
+/// Every uid the ledger allocates, application through workspace: no
+/// passwd or group entry may hold one.
+pub const LEDGER_UIDS: RangeInclusive<u32> = 65536..=131071;
+/// The reserved name of an application account: this, then its uid.
+pub const APPLICATION_ACCOUNT_PREFIX: &str = "tda";
+
+/// Whether `name` has the reserved application account form, `tda` and
+/// decimal digits. Only the ledger answers for such a name; another name
+/// that merely begins `tda` is an ordinary one.
+pub fn application_account_name(name: &str) -> bool {
+    name.strip_prefix(APPLICATION_ACCOUNT_PREFIX)
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// The uid an application account name spells canonically, if it is one.
+pub fn application_account_uid(name: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix(APPLICATION_ACCOUNT_PREFIX)
+        .filter(|_| application_account_name(name))?;
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| uid.to_string() == digits)
+}
 
 /// The uids the image reserved before the ledger existed. Every seeded
 /// ledger holds them, whether or not the deployment ships the application.
@@ -138,8 +179,26 @@ impl Ledger {
         text
     }
 
-    pub fn uid(&self, kind: Kind, name: &str) -> Option<u32> {
+    pub fn uid_of(&self, kind: Kind, name: &str) -> Option<u32> {
         self.rows.get(&(kind, name.to_string())).copied()
+    }
+
+    /// The name of the `kind` account holding `uid`.
+    pub fn name(&self, kind: Kind, uid: u32) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|((held, _), row)| *held == kind && **row == uid)
+            .map(|((_, name), _)| name.as_str())
+    }
+
+    /// Whether this ledger holds every row of `older` at the same uid. Rows
+    /// are never removed or reassigned, so a later read of the published
+    /// ledger always does; a reader keeps its copy when one does not.
+    pub fn extends(&self, older: &Self) -> bool {
+        older
+            .rows
+            .iter()
+            .all(|(key, uid)| self.rows.get(key) == Some(uid))
     }
 
     /// This ledger with the carried reservations and `imported` application
@@ -162,7 +221,7 @@ impl Ledger {
                 "account {name:?} uid {uid} is outside the account ledger's rules"
             ));
         }
-        match self.uid(kind, name) {
+        match self.uid_of(kind, name) {
             Some(held) if held == uid => return Ok(()),
             Some(held) => {
                 return Err(format!(
@@ -182,6 +241,98 @@ impl Ledger {
     fn checked(self) -> Result<Self, String> {
         Self::parse(&self.encode())
     }
+}
+
+/// The published ledger, read as every consumer reads it.
+pub fn load() -> Result<Ledger, String> {
+    load_from(Path::new(DIRECTORY), (0, 0))
+}
+
+/// What identifies one published ledger: publication renames a new file
+/// into place, so a later ledger has another inode, and an edit or a mode
+/// repair in place changes its size, modification or change time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl Stamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// `directory`, opened without following links, if `owner` owns it and no
+/// one else may write it.
+fn open_directory(directory: &Path, owner: (u32, u32)) -> Result<std::fs::File, String> {
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+        .open(directory)
+        .map_err(|error| format!("open the account ledger's directory: {error}"))?;
+    let metadata = parent.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || (metadata.uid(), metadata.gid()) != owner
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("the account ledger's directory is not root-controlled".into());
+    }
+    Ok(parent)
+}
+
+/// The stamp of the ledger in `directory` as it stands, read without
+/// opening it, so a reader can tell whether it changed since its last read.
+pub fn stamp_from(directory: &Path, owner: (u32, u32)) -> Result<Stamp, String> {
+    let parent = open_directory(directory, owner)?;
+    std::fs::symlink_metadata(format!("/proc/self/fd/{}/{FILE_NAME}", parent.as_raw_fd()))
+        .map(|metadata| Stamp::of(&metadata))
+        .map_err(|error| format!("inspect {FILE_NAME}: {error}"))
+}
+
+/// The ledger in `directory`, which `owner` must own without other writers:
+/// opened through the pinned directory without following links, a
+/// single-link regular file of exact mode 0644 that `owner` owns, read to a
+/// bound. An absent ledger is an error: firstboot seeds it before any
+/// consumer starts.
+pub fn load_from(directory: &Path, owner: (u32, u32)) -> Result<Ledger, String> {
+    load_stamped_from(directory, owner).map(|(ledger, _)| ledger)
+}
+
+/// `load_from`, with the stamp of the file it read.
+pub fn load_stamped_from(directory: &Path, owner: (u32, u32)) -> Result<(Ledger, Stamp), String> {
+    let parent = open_directory(directory, owner)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}/{FILE_NAME}", parent.as_raw_fd()))
+        .map_err(|error| format!("open {FILE_NAME}: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    let stamp = Stamp::of(&metadata);
+    if !metadata.is_file()
+        || (metadata.uid(), metadata.gid()) != owner
+        || metadata.mode() & 0o7777 != MODE
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_BYTES as u64
+    {
+        return Err(format!(
+            "{FILE_NAME} must be one bounded, single-link, root-owned regular file of mode 0644"
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("read {FILE_NAME}: {error}"))?;
+    Ledger::parse(&text).map(|ledger| (ledger, stamp))
 }
 
 #[cfg(test)]
@@ -211,8 +362,8 @@ mod tests {
         let ledger = seeded();
         assert_eq!(ledger.encode(), SEEDED);
         assert_eq!(Ledger::parse(SEEDED).unwrap(), ledger);
-        assert_eq!(ledger.uid(Kind::Application, "web"), Some(65540));
-        assert_eq!(ledger.uid(Kind::Application, "claude"), None);
+        assert_eq!(ledger.uid_of(Kind::Application, "web"), Some(65540));
+        assert_eq!(ledger.uid_of(Kind::Application, "claude"), None);
         assert_eq!(Ledger::parse(MAGIC).unwrap(), Ledger::default());
         assert_eq!(Ledger::default().encode(), MAGIC);
     }
@@ -225,8 +376,8 @@ mod tests {
         );
         let ledger = Ledger::parse(&text).unwrap();
         assert_eq!(ledger.encode(), text);
-        assert_eq!(ledger.uid(Kind::Sandbox, "default"), Some(98304));
-        assert_eq!(ledger.uid(Kind::Workspace, "agent-1"), Some(131071));
+        assert_eq!(ledger.uid_of(Kind::Sandbox, "default"), Some(98304));
+        assert_eq!(ledger.uid_of(Kind::Workspace, "agent-1"), Some(131071));
         assert_eq!(ledger.seed([]).unwrap(), ledger);
         // A sandbox and a workspace may share a name, never a uid.
         assert!(Ledger::parse(&format!("{MAGIC}sandbox\tx\t98304\nworkspace\tx\t98305\n")).is_ok());
@@ -255,7 +406,7 @@ mod tests {
         assert_eq!(ledger.seed(image).unwrap(), ledger);
         // An install enrolled while Claude Code shipped keeps 65539.
         let imported = Ledger::default().seed([("claude", 65539)]).unwrap();
-        assert_eq!(imported.uid(Kind::Application, "claude"), Some(65539));
+        assert_eq!(imported.uid_of(Kind::Application, "claude"), Some(65539));
         assert_eq!(imported.seed([]).unwrap(), imported);
         assert_eq!(ledger.seed([("claude", 65539)]).unwrap(), imported);
         // A row the ledger already holds, an allocation's, survives.

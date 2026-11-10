@@ -178,7 +178,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xbc471d0016e8d79d,
+        0x15cb18f54f2439bd,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -765,6 +765,61 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert!(!shared.contains(forbidden), "saved.rs: {forbidden}");
     }
+    // The application policy and the workload account ledger reader it
+    // joins, each one reviewed copy compiled at the crate root: they read
+    // two root-owned files and write, run and include nothing.
+    let main = include_str!("../src/main.rs");
+    for (attribute, module) in [
+        (
+            "#[path = \"../../td-busd/src/app_policy.rs\"]\n#[allow(dead_code, reason = \"td-authd resolves one application's account\")]\nmod app_policy;\n",
+            "mod app_policy;",
+        ),
+        (
+            "#[path = \"../../engine/src/workload_accounts.rs\"]\n#[allow(dead_code, reason = \"the application policy reads the ledger\")]\nmod workload_accounts;\n",
+            "mod workload_accounts;",
+        ),
+    ] {
+        assert_eq!(main.matches(attribute).count(), 1, "{module}");
+        assert_eq!(main.matches(module).count(), 1, "{module}");
+    }
+    for (name, shared) in [
+        (
+            "app_policy.rs",
+            include_str!("../../td-busd/src/app_policy.rs"),
+        ),
+        (
+            "workload_accounts.rs",
+            include_str!("../../engine/src/workload_accounts.rs"),
+        ),
+    ] {
+        let production: String = shared
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(shared.matches("unsafe").count(), 0, "{name}");
+        for forbidden in [
+            "Command",
+            "spawn",
+            "std::process",
+            "std::net",
+            "std::env",
+            "#[path",
+            "include!",
+            "include_str!",
+            "include_bytes!",
+            "write",
+            "remove",
+            "create",
+            "rename",
+            "set_permissions",
+            "chown",
+        ] {
+            assert!(!production.contains(forbidden), "{name}: {forbidden}");
+        }
+    }
     // Amendment 7: two fixed root helpers, td-svc's control socket, the
     // line's hand-back and the record through firstboot's one shared
     // publication; production's deadlines only from the constants.
@@ -1001,7 +1056,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x2715b08a429b96ba,
+        0x805924b84e7cc79e,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1431,12 +1486,12 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x71cde0436d992a4f;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
-const MAIN_FINGERPRINT: u64 = 0x8926b3ca2853c8aa;
+const MAIN_FINGERPRINT: u64 = 0xa25ebeeebfcacca8;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
-const INTAKE_FINGERPRINT: u64 = 0xad60fdb29c45fd9b;
+const INTAKE_FINGERPRINT: u64 = 0x755e883a75780a83;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;

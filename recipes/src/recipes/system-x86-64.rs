@@ -44,6 +44,7 @@ use crate::td_boot_protocol;
 #[allow(dead_code)]
 mod bus_application_policy;
 const BUS_APPLICATION_POLICY: &str = bus_application_policy::PATH;
+use bus_application_policy::Class;
 
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 /// How many /etc/bootsuccess sweeps the bus marker may be missing for before
@@ -179,8 +180,10 @@ struct ShippedApplication {
     name: &'static str,
     package: &'static str,
     package_recipe: fn() -> Recipe,
-    /// Stable external service identity for this installed application.
-    external_uid: u32,
+    /// Whether it runs as the session's human or as its own account, the
+    /// workload account ledger's row of its name (td-authd/DESIGN.md,
+    /// "Workload account ledger"). No uid: the ledger holds it.
+    class: Class,
     /// The runtime key the declaration names.
     runtime: &'static str,
     /// The recipe that builds that runtime as a payload input, or `None` when
@@ -443,20 +446,20 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: FIREFOX_NAME,
         package: FIREFOX_NAME,
         package_recipe: super::firefox::recipe,
-        external_uid: 65536,
+        class: Class::Service,
         runtime: "freedesktop-platform-25-08",
         runtime_recipe: None,
     },
     // The source-built applications: td-owned static programs on the
     // data-only runtime, each a td-ui window of its own. None holds a bus
     // name; the tripwire below counts the applications that do. Mail and
-    // news run as the login user (`launch_uid`); web, td's own browser,
+    // news run as the login user (`Class::Personal`); web, td's own browser,
     // under its own service account, as Firefox does (td-web/DESIGN.md §3).
     ShippedApplication {
         name: TD_MAIL_NAME,
         package: TD_MAIL_NAME,
         package_recipe: super::mail::recipe,
-        external_uid: 65537,
+        class: Class::Personal,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -464,7 +467,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: TD_NEWS_NAME,
         package: TD_NEWS_NAME,
         package_recipe: super::news::recipe,
-        external_uid: 65538,
+        class: Class::Personal,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -474,7 +477,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: TD_WEB_NAME,
         package: TD_WEB_NAME,
         package_recipe: super::web::recipe,
-        external_uid: WEB_UID,
+        class: Class::Service,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -1335,12 +1338,9 @@ fn build_passwd(sys: &SystemDef) -> String {
             u.shell
         ));
     }
-    for application in sys.applications {
-        let uid = application.external_uid;
-        s.push_str(&format!(
-            "tda{uid}:!td-service:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
-        ));
-    }
+    // An application's account is the workload account ledger's row
+    // (td-authd/DESIGN.md, "Workload account ledger"); td-login resolves it
+    // from there and refuses a passwd entry that speaks for it.
     s.push_str(&format!(
         "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:td-sshd privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
     ));
@@ -1352,10 +1352,6 @@ fn build_group(sys: &SystemDef) -> String {
     // Primary group per user (group name == user name).
     for u in sys.users {
         s.push_str(&format!("{}:x:{}:\n", u.name, u.gid));
-    }
-    for application in sys.applications {
-        let uid = application.external_uid;
-        s.push_str(&format!("tda{uid}:x:{uid}:\n"));
     }
     s.push_str(&format!("{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"));
     // A `wheel` group (gid 10) whose members are the users that declare it.
@@ -4674,14 +4670,10 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
 
 /// td's own source-built mail and news clients run as the login user, not
 /// a service account (APPLICATIONS.md §D); every other application, td's
-/// own web browser among them (td-web/DESIGN.md §3), has its reserved
-/// external UID.
-fn launch_uid(application: &ShippedApplication) -> u32 {
-    if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
-        UI_UID
-    } else {
-        application.external_uid
-    }
+/// own web browser among them (td-web/DESIGN.md §3), runs as its own
+/// ledger account.
+fn runs_as_human(application: &ShippedApplication) -> bool {
+    application.class == Class::Personal
 }
 
 /// The applications with a `/bin/NAME` link to td-jail: those the
@@ -4692,7 +4684,7 @@ fn launch_uid(application: &ShippedApplication) -> u32 {
 fn application_bin_links(sys: &SystemDef) -> Vec<&'static str> {
     sys.applications
         .iter()
-        .filter(|application| launch_uid(application) == UI_UID)
+        .filter(|application| runs_as_human(application))
         .map(|application| application.name)
         .collect()
 }
@@ -4897,17 +4889,14 @@ fn build_principals(sys: &SystemDef) -> String {
     if sys.desktop() {
         text.push_str(&format!("notebook\t{UI_UID}\t{NOTEBOOK_RESERVED_UID}\n"));
     }
-    let mut applications: Vec<&ShippedApplication> = sys.applications.iter().collect();
-    applications.sort_by_key(|application| application.name);
-    for application in applications {
-        text.push_str(&format!(
-            "application\t{UI_UID}\t{}\t{}\n",
-            application.name, application.external_uid
-        ));
-    }
+    // No application row: an application's account is the workload account
+    // ledger's, which firstboot seeds with the carried rows.
     text
 }
 
+/// Each shipped application's declaration: its name, whether it runs as the
+/// session's human or its own account, and the bus names it may own. No
+/// uid: an own account's uid is the workload account ledger's.
 fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
     let mut rules = Vec::new();
     for application in sys.applications {
@@ -4920,13 +4909,13 @@ fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
             .filter(|(_, access)| *access == td_engine::permissions::BusAccess::Own)
             .map(|(name, _)| name.to_string())
             .collect();
-        rules.push(bus_application_policy::Rule {
-            uid: launch_uid(application),
+        rules.push(bus_application_policy::Declaration {
             application: application.name.into(),
+            class: application.class,
             owned,
         });
     }
-    bus_application_policy::Policy::new(UI_UID, rules).map(|policy| policy.to_tsv())
+    bus_application_policy::Declarations::new(UI_UID, rules).map(|policy| policy.to_tsv())
 }
 
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
@@ -6715,14 +6704,17 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         .env("PATH", "{tools}"),
     );
 
-    steps.push(Step::run(
-        "{root}",
-        &[
-            "{in:td-firstboot}/bin/td-firstboot",
-            "check-principals",
-            "{root}/real-root",
-        ],
-    ));
+    // A desktop must declare its applications, each with a carried ledger
+    // row; a server must declare none.
+    let mut check_principals = vec![
+        "{in:td-firstboot}/bin/td-firstboot",
+        "check-principals",
+        "{root}/real-root",
+    ];
+    if sys.desktop() {
+        check_principals.push("--applications");
+    }
+    steps.push(Step::run("{root}", &check_principals));
 
     steps.push(Step::run(
         "{root}",
@@ -8601,8 +8593,14 @@ mod tests {
             .iter()
             .find(|application| application.name == TD_WEB_NAME)
             .unwrap();
-        assert_eq!(web.external_uid, WEB_UID);
-        assert_eq!(launch_uid(web), WEB_UID);
+        assert_eq!(web.class, Class::Service);
+        assert_eq!(
+            td_engine::workload_accounts::Ledger::default()
+                .seed([])
+                .unwrap()
+                .uid_of(td_engine::workload_accounts::Kind::Application, TD_WEB_NAME),
+            Some(WEB_UID)
+        );
         for (key, value) in [
             (
                 "exec",
@@ -10163,7 +10161,7 @@ mod tests {
             name: "fixture",
             package: "fixture",
             package_recipe: without_permissions,
-            external_uid: 65536,
+            class: Class::Service,
             runtime: "empty-runtime",
             runtime_recipe: Some(super::super::empty_runtime::recipe),
         }];
@@ -10180,6 +10178,8 @@ mod tests {
         );
     }
 
+    /// Two declarations of one name: the ledger keys an application's
+    /// account by its name alone.
     #[test]
     fn invalid_application_identity_prevents_root_staging() {
         const DUPLICATE: &[ShippedApplication] = &[
@@ -10187,15 +10187,15 @@ mod tests {
                 name: "one",
                 package: "td-jail-fixture",
                 package_recipe: super::super::td_jail_fixture::recipe,
-                external_uid: 65536,
+                class: Class::Service,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
             ShippedApplication {
-                name: "two",
+                name: "one",
                 package: "td-jail-fixture",
                 package_recipe: super::super::td_jail_fixture::recipe,
-                external_uid: 65536,
+                class: Class::Service,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -10244,25 +10244,33 @@ mod tests {
         }
     }
 
+    /// The image declares each application and its grants and no uid; joined
+    /// with the ledger firstboot seeds (the carried rows), each runs as the
+    /// human or as its own carried account. No table of the image names an
+    /// application account.
     #[test]
-    fn broker_policy_is_derived_from_the_deployments_principals_and_grants() {
+    fn broker_policy_is_derived_from_the_deployments_declarations_and_grants() {
+        use td_engine::workload_accounts::Ledger;
         let text = build_bus_application_policy(&SYSTEM).unwrap();
-        let policy = bus_application_policy::Policy::parse(&text).unwrap();
+        assert!(text.starts_with(&format!("td-bus-applications-v2\t{UI_UID}\n")));
+        let declarations = bus_application_policy::Declarations::parse(&text).unwrap();
+        let carried = Ledger::default().seed(std::iter::empty()).unwrap();
+        let policy = bus_application_policy::Policy::join(declarations, carried);
         assert_eq!(policy.owner(), UI_UID);
         let principals = build_principals(&SYSTEM);
+        assert!(!principals.contains("application\t"));
+        for table in [build_passwd(&SYSTEM), build_group(&SYSTEM)] {
+            assert!(!table.contains("tda"), "{table}");
+        }
         for application in SYSTEM.applications {
             let rule = policy.for_name(application.name).unwrap();
-            let expected_uid = if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
-                UI_UID
-            } else {
-                application.external_uid
+            let account = policy.account(application.name).unwrap();
+            let expected_uid = match application.class {
+                Class::Personal => UI_UID,
+                Class::Service => account,
             };
             assert_eq!(rule.uid, expected_uid);
             assert_eq!(rule.application, application.name);
-            assert!(principals.contains(&format!(
-                "application\t{UI_UID}\t{}\t{}\n",
-                application.name, application.external_uid
-            )));
             let permissions = (application.package_recipe)()
                 .application_permissions
                 .unwrap();
@@ -10889,7 +10897,7 @@ mod tests {
             for sys in [&SYSTEM, &SERVER] {
                 assert!(
                     sys.users.iter().all(|user| user.uid != worker)
-                        && sys.applications.iter().all(|a| a.external_uid != worker),
+                        && !td_engine::workload_accounts::LEDGER_UIDS.contains(&worker),
                     "uid {worker} is a worker's alone"
                 );
             }
@@ -11387,7 +11395,7 @@ mod tests {
             name: "fixture",
             package: "fixture-package",
             package_recipe: super::super::td_jail_fixture::recipe,
-            external_uid: 65539,
+            class: Class::Service,
             runtime: "fixture-runtime",
             runtime_recipe: Some(super::super::empty_runtime::recipe),
         }];
@@ -12088,7 +12096,7 @@ mod tests {
                 name: "rg",
                 package: "catalog-rg",
                 package_recipe: super::super::td_jail_fixture::recipe,
-                external_uid: 65539,
+                class: Class::Service,
                 runtime: "runtime-rg",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -12096,7 +12104,7 @@ mod tests {
                 name: "td-netd",
                 package: "catalog-netd",
                 package_recipe: super::super::td_jail_fixture::recipe,
-                external_uid: 65540,
+                class: Class::Service,
                 runtime: "runtime-netd",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -17771,6 +17779,9 @@ mod principal_tests {
         }
     }
 
+    /// The image's principal table reserves the session's accounts and no
+    /// application, and its passwd and group name no application account:
+    /// those are the workload account ledger's rows.
     #[test]
     fn deployment_principals_parse_and_cannot_alias_system_credentials() {
         let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
@@ -17782,27 +17793,19 @@ mod principal_tests {
             (session.compositor, session.broker, session.portal),
             (993, 992, 991)
         );
-        for (name, uid) in [
-            ("firefox", 65536),
-            ("mail", 65537),
-            ("news", 65538),
-            ("web", 65540),
-        ] {
-            assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
-            assert!(build_passwd(&SYSTEM).contains(&format!(
-                "tda{uid}:!td-service:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
-            )));
-            assert!(build_group(&SYSTEM).contains(&format!("tda{uid}:x:{uid}:\n")));
+        assert_eq!(registry.applications().count(), 0);
+        for uid in [65536, 65537, 65538, 65539, 65540] {
+            assert!(!build_passwd(&SYSTEM).contains(&format!(":{uid}:")));
+            assert!(!build_group(&SYSTEM).contains(&format!(":{uid}:")));
         }
         // Claude Code shipped as 65539 until it left td. An install enrolled
-        // then keeps that reservation in its ledger: the union still enrolls
-        // and verifies against accounts that no longer name it, so the boot
-        // admits it and no later deployment can reuse the UID.
-        assert!(registry.application(UI_UID, "claude").is_none());
-        assert!(!build_passwd(&SYSTEM).contains("tda65539"));
-        let prior = principal_schema::Registry::parse(&build_principals(&SYSTEM).replace(
-            "application\t1000\tfirefox\t65536\n",
-            "application\t1000\tclaude\t65539\napplication\t1000\tfirefox\t65536\n",
+        // then keeps that reservation in its retained table, and firstboot
+        // imports it into the ledger: the union still enrolls and verifies
+        // against accounts that do not name it, and no later deployment can
+        // reuse the UID.
+        let prior = principal_schema::Registry::parse(&format!(
+            "{}application\t1000\tclaude\t65539\napplication\t1000\tfirefox\t65536\n",
+            build_principals(&SYSTEM)
         ))
         .unwrap();
         let retained = prior.enroll(&registry).unwrap();
@@ -17821,8 +17824,8 @@ mod principal_tests {
 
     /// td-firstboot seeds the workload account ledger with its carried rows
     /// and the retained reservations, and the image build's
-    /// `check-principals` refuses rows that do not fit beside them. The
-    /// shipped rows are exactly the carried ones.
+    /// `check-principals` refuses a declared application without a carried
+    /// row. Every shipped application's uid constant is its carried row.
     #[test]
     fn the_account_ledger_carries_every_shipped_application_uid() {
         use td_engine::workload_accounts::{Kind, Ledger};
@@ -17837,23 +17840,82 @@ mod principal_tests {
             .unwrap();
         assert_eq!(seeded, carried);
         for application in SHIPPED_APPLICATIONS {
-            assert_eq!(
-                carried.uid(Kind::Application, application.name),
-                Some(application.external_uid),
+            assert!(
+                carried
+                    .uid_of(Kind::Application, application.name)
+                    .is_some(),
                 "{}",
                 application.name
             );
         }
+        assert_eq!(
+            carried.uid_of(Kind::Application, TD_WEB_NAME),
+            Some(WEB_UID)
+        );
     }
 
+    /// Every application account a unit or oracle spells out by uid
+    /// (`exec-service-as tda65536`, Firefox's autotest and input probes) is
+    /// the carried ledger row of the application it drives: td-login
+    /// resolves the name from the ledger alone.
     #[test]
-    fn reserved_ids_remain_fixed_when_the_application_order_changes() {
+    fn every_spelled_application_account_is_a_carried_ledger_row() {
+        use td_engine::workload_accounts::{Kind, Ledger};
+        let carried = Ledger::default().seed([]).unwrap();
+        const SPELLING: &str = concat!("exec-service-as ", "tda");
+        let spelled = |text: &str| -> Vec<u32> {
+            text.split(SPELLING)
+                .skip(1)
+                .filter_map(|after| {
+                    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse().ok()
+                })
+                .collect()
+        };
+        let source = include_str!("system-x86-64.rs");
+        let in_source = spelled(source);
+        assert!(in_source.len() >= 10, "{in_source:?}");
+        for uid in in_source {
+            assert_eq!(carried.name(Kind::Application, uid), Some(FIREFOX_NAME));
+        }
+        let rendered = spelled(&build_td_svc_conf(&SYSTEM));
+        assert!(rendered.contains(&65536) && rendered.contains(&WEB_UID));
+        for uid in rendered {
+            assert!(carried.name(Kind::Application, uid).is_some(), "{uid}");
+        }
+    }
+
+    /// The image build checks a desktop's declarations against the carried
+    /// rows and requires a server to declare nothing.
+    #[test]
+    fn the_image_check_names_whether_the_deployment_declares_applications() {
+        let argv = |sys: &SystemDef| -> Vec<String> {
+            system_recipe(sys)
+                .steps
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|step| match step {
+                    Step::Run { argv, .. } if argv.iter().any(|a| a == "check-principals") => {
+                        Some(argv)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(argv(&SYSTEM).last().unwrap(), "--applications");
+        assert_eq!(argv(&SERVER).last().unwrap(), "{root}/real-root");
+    }
+
+    /// The declarations are sorted by name, whatever the deployment's
+    /// order: an application's uid follows its name in the ledger.
+    #[test]
+    fn declarations_do_not_depend_on_the_application_order() {
         const REVERSED: &[ShippedApplication] = &[
             ShippedApplication {
                 name: "news",
                 package: "news",
                 package_recipe: super::super::news::recipe,
-                external_uid: 65538,
+                class: Class::Personal,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -17861,7 +17923,7 @@ mod principal_tests {
                 name: "mail",
                 package: "mail",
                 package_recipe: super::super::mail::recipe,
-                external_uid: 65537,
+                class: Class::Personal,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -17870,11 +17932,11 @@ mod principal_tests {
             applications: REVERSED,
             ..SYSTEM
         };
-        let text = build_principals(&sys);
-        let registry = principal_schema::Registry::parse(&text).unwrap();
-        assert_eq!(registry.application(UI_UID, "mail").unwrap().uid, 65537);
-        assert_eq!(registry.application(UI_UID, "news").unwrap().uid, 65538);
-        assert!(text.ends_with("application\t1000\tmail\t65537\napplication\t1000\tnews\t65538\n"));
+        assert_eq!(
+            build_bus_application_policy(&sys).unwrap(),
+            "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tpersonal\t\n"
+        );
+        assert!(!build_principals(&sys).contains("application\t"));
     }
     #[test]
     fn boot_menu_is_packed_only_in_the_selector() {

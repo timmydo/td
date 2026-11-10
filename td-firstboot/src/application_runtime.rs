@@ -156,7 +156,7 @@ const RUNTIME_DELEGATION: &str = "td-runtimes";
 /// The immutable account and durable reservation must already be validated.
 /// Startup precedes every human/app process; this never repairs a live tree.
 pub(crate) fn prepare(uid: u32) -> Result<(), String> {
-    if !(65536..=2147483647).contains(&uid) {
+    if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
         return Err("invalid application runtime uid".into());
     }
     delegate(&format!("td-app-{uid}"), uid, "application")

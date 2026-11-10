@@ -11998,8 +11998,9 @@ mod tests {
 
     #[test]
     fn the_application_probe_separates_human_observer_from_assigned_subject() {
-        let policy = crate::app_policy::Policy::parse(
-            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        let policy = crate::app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\n",
+            "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n",
         )
         .unwrap();
         assert_eq!(

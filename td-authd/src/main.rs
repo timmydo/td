@@ -6,6 +6,11 @@
 #[path = "../../td-boot/src/admission.rs"]
 #[allow(dead_code, reason = "the record's writer is td-boot's")]
 mod admission;
+// Application declarations joined with the workload account ledger: a
+// credential binds the ledger's uid.
+#[path = "../../td-busd/src/app_policy.rs"]
+#[allow(dead_code, reason = "td-authd resolves one application's account")]
+mod app_policy;
 mod application;
 mod application_cache;
 mod application_files;
@@ -86,6 +91,9 @@ mod storage;
 mod suspend;
 mod sys;
 mod unlock;
+#[path = "../../engine/src/workload_accounts.rs"]
+#[allow(dead_code, reason = "the application policy reads the ledger")]
+mod workload_accounts;
 
 use std::io::Write;
 use std::process::ExitCode;

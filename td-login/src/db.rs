@@ -10,11 +10,35 @@
 //! deployment tables may be projected read-only for the validated saved username
 //! before consumers start. Readers still validate the live files; see
 //! THREAT-MODEL.md and td-install/INSTALLER.md for admission and publication.
+//!
+//! An application account is not here at all: `tda<uid>` names the workload
+//! account ledger's application row holding that uid, and no passwd or group
+//! entry may take that form or an id in a workload account range, so neither
+//! file can speak for an account of the other class (THREAT-MODEL.md §7).
 
+pub use crate::workload_accounts::application_account_name as application_name;
+use crate::workload_accounts::{self, Kind, Ledger, LEDGER_UIDS};
 use std::fs;
 
 pub const PASSWD: &str = "/etc/passwd";
 pub const GROUP: &str = "/etc/group";
+
+/// Refuse an entry that would make passwd or group speak for a workload
+/// account: the reserved name form, or an id the ledger allocates.
+fn refuse_workload_entry(
+    path: &str,
+    lineno: usize,
+    name: &str,
+    ids: [u32; 2],
+) -> Result<(), String> {
+    if application_name(name) || ids.iter().any(|id| LEDGER_UIDS.contains(id)) {
+        return Err(format!(
+            "{path}:{lineno}: {name:?} takes a workload account's name or id; \
+             workload accounts come from the account ledger alone"
+        ));
+    }
+    Ok(())
+}
 
 /// One `/etc/passwd` entry. `gecos` is carried because `login` has no use for it
 /// and dropping it would make the seven-field check look like six.
@@ -162,15 +186,18 @@ pub fn account_in(text: &str, path: &str, want: &str) -> Result<Account, String>
         else {
             return Err(format!("{path}:{lineno}: malformed entry"));
         };
+        // `?`, not a silent skip, on every line. A 7-field line whose ids do
+        // not parse was the one malformation this function tolerated:
+        // `fields` has always failed the whole lookup for a wrong field COUNT
+        // on any line, so a passwd file that cannot be read is already refused
+        // rather than partly believed. Tolerating it would also mean an
+        // unreadable line could hide an alias or a workload id, which are the
+        // cases being closed. Pinned by `a_malformed_line_fails_the_whole_lookup`.
+        let uid = number(path, lineno, "uid", uid)?;
+        let gid = number(path, lineno, "gid", gid)?;
+        refuse_workload_entry(path, lineno, name, [uid, gid])?;
         if *name != want {
-            // `?`, not a silent skip. A 7-field line whose uid does not parse
-            // was the one malformation this function tolerated: `fields` has
-            // always failed the whole lookup for a wrong field COUNT on any
-            // line, so a passwd file that cannot be read is already refused
-            // rather than partly believed. Tolerating it here would also mean
-            // an unreadable line could hide an alias, which is the case being
-            // closed. Pinned by `a_malformed_line_fails_the_whole_lookup`.
-            aliases.push((number(path, lineno, "uid", uid)?, lineno, name));
+            aliases.push((uid, lineno, name));
             continue;
         }
         if hit.is_some() {
@@ -179,8 +206,6 @@ pub fn account_in(text: &str, path: &str, want: &str) -> Result<Account, String>
                  choose between conflicting entries"
             ));
         }
-        let uid = number(path, lineno, "uid", uid)?;
-        let gid = number(path, lineno, "gid", gid)?;
         // `login` execs the shell by absolute path with no PATH search, and
         // chdir's to the home; a relative one would resolve against whatever
         // directory the caller happened to be in.
@@ -215,20 +240,77 @@ pub fn account(name: &str) -> Result<Account, String> {
     account_in(&read(PASSWD)?, PASSWD, name)
 }
 
+/// The application account `name` (`tda<uid>`), resolved from the ledger
+/// alone: its application row holds that uid. Its group is its uid, its home
+/// the private one firstboot prepares, its shell `/bin/false`; the class is
+/// the service class. passwd and group are read whole and must speak for no
+/// workload account, so no entry of either aliases this one.
+pub fn application_account_in(
+    ledger: &Ledger,
+    passwd: &str,
+    group: &str,
+    name: &str,
+) -> Result<Account, String> {
+    let uid = workload_accounts::application_account_uid(name)
+        .ok_or_else(|| format!("{name:?} does not spell an application account's uid"))?;
+    ledger
+        .name(Kind::Application, uid)
+        .ok_or_else(|| format!("the account ledger holds no application account {uid}"))?;
+    for (lineno, line) in entries(passwd) {
+        let f = fields(line, 7, PASSWD, lineno)?;
+        let (Some(entry), Some(id), Some(gid)) = (f.first(), f.get(2), f.get(3)) else {
+            return Err(format!("{PASSWD}:{lineno}: malformed entry"));
+        };
+        let ids = [
+            number(PASSWD, lineno, "uid", id)?,
+            number(PASSWD, lineno, "gid", gid)?,
+        ];
+        refuse_workload_entry(PASSWD, lineno, entry, ids)?;
+    }
+    // Refuses a workload group or member, so the account has no
+    // supplementary group.
+    supplementary_in(group, GROUP, name)?;
+    Ok(Account {
+        name: name.to_string(),
+        uid,
+        gid: uid,
+        gecos: "td application".into(),
+        home: format!("/var/lib/td/applications/{uid}"),
+        shell: "/bin/false".into(),
+    })
+}
+
+pub fn application_account(name: &str) -> Result<Account, String> {
+    application_account_in(
+        &workload_accounts::load()?,
+        &read(PASSWD)?,
+        &read(GROUP)?,
+        name,
+    )
+}
+
 /// The gids of every group that lists `user` as a member. The primary gid is NOT
 /// added here — `Credentials::new` does that, so there is one place that decides
-/// what the complete set is.
+/// what the complete set is. A group named or numbered as a workload account,
+/// or listing one as a member, fails the whole lookup: a workload account
+/// holds only its primary group.
 pub fn supplementary_in(text: &str, path: &str, user: &str) -> Result<Vec<u32>, String> {
     let mut gids = Vec::new();
     for (lineno, line) in entries(text) {
         let f = fields(line, 4, path, lineno)?;
-        let (Some(gid), Some(members)) = (f.get(2), f.get(3)) else {
+        let (Some(name), Some(gid), Some(members)) = (f.first(), f.get(2), f.get(3)) else {
             return Err(format!("{path}:{lineno}: malformed entry"));
         };
         // Parsed for EVERY line, member or not: a group file with an unparseable
         // gid is a broken file, and answering from the lines that happened to
         // parse would hand out a set that is quietly too small.
         let gid = number(path, lineno, "gid", gid)?;
+        refuse_workload_entry(path, lineno, name, [gid, gid])?;
+        if let Some(member) = members.split(',').find(|member| application_name(member)) {
+            return Err(format!(
+                "{path}:{lineno}: group {name:?} lists the application account {member:?}"
+            ));
+        }
         // EXACT, not trimmed: trimming is the permissive direction — it would grant
         // a group on a whitespace-padded member field — and every other name match
         // in this file is exact. The empty check keeps an empty member slot in
@@ -454,6 +536,110 @@ mod tests {
         assert_eq!(supplementary_in(g, GROUP, "test").unwrap(), vec![20]);
         assert_eq!(supplementary_in(g, GROUP, "root").unwrap(), vec![10]);
         assert_eq!(supplementary_in(g, GROUP, "").unwrap(), Vec::<u32>::new());
+    }
+
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tweb\t65540\nworkspace\tagent\t98304\n";
+
+    fn ledger() -> Ledger {
+        Ledger::parse(LEDGER).unwrap()
+    }
+
+    /// `tda<uid>` is the ledger's application row holding that uid, with
+    /// its fixed group, home and shell, and no supplementary group.
+    #[test]
+    fn an_application_account_comes_from_the_ledger_alone() {
+        let account = application_account_in(&ledger(), PW, GR, "tda65540").unwrap();
+        assert_eq!(
+            account,
+            Account {
+                name: "tda65540".into(),
+                uid: 65540,
+                gid: 65540,
+                gecos: "td application".into(),
+                home: "/var/lib/td/applications/65540".into(),
+                shell: "/bin/false".into(),
+            }
+        );
+        assert_eq!(
+            supplementary_in(GR, GROUP, "tda65540").unwrap(),
+            Vec::<u32>::new()
+        );
+        // A uid the ledger does not hold, or holds for another kind, and a
+        // spelling that is not the uid's canonical one.
+        for name in [
+            "tda65537",
+            "tda98304",
+            "tda065536",
+            "tda4294967296",
+            "tda",
+            "tdafirefox",
+            "firefox",
+        ] {
+            assert!(
+                application_account_in(&ledger(), PW, GR, name).is_err(),
+                "{name}"
+            );
+        }
+        assert!(application_account_in(&Ledger::default(), PW, GR, "tda65536").is_err());
+        // The reserved form is `tda` and digits; other `tda` names are names.
+        assert!(application_name("tda1"));
+        for name in ["tda", "tdadam", "tda1x", "xtda1", "TDA1"] {
+            assert!(!application_name(name), "{name}");
+        }
+        let tdadam = "tdadam::1000:1000:Adam:/home/tdadam:/bin/sh\n";
+        assert_eq!(account_in(tdadam, PASSWD, "tdadam").unwrap().uid, 1000);
+    }
+
+    /// Neither file may speak for a workload account, whatever is looked up:
+    /// a passwd entry of the reserved form or with a workload id would be a
+    /// second account policy for a uid the ledger allocates (an empty
+    /// password field the forced paths admit, its own group list), and a
+    /// group would hand a workload account authority beyond its own group.
+    #[test]
+    fn no_passwd_or_group_entry_speaks_for_a_workload_account() {
+        for entry in [
+            "tda65536:!td-service:65536:65536:td application:/var/lib/td/applications/65536:/bin/false",
+            "tda1:!:1:1::/:/bin/false",
+            "evil::65536:65536:Evil:/home/evil:/bin/sh",
+            "evil::1001:65540:Evil:/home/evil:/bin/sh",
+            "evil::98304:1001:Evil:/home/evil:/bin/sh",
+            "evil::131071:1001:Evil:/home/evil:/bin/sh",
+        ] {
+            let passwd = format!("{PW}{entry}\n");
+            for name in ["tester", "root", "evil"] {
+                assert!(account_in(&passwd, PASSWD, name).is_err(), "{entry}: {name}");
+            }
+            assert!(
+                application_account_in(&ledger(), &passwd, GR, "tda65536").is_err(),
+                "{entry}"
+            );
+        }
+        for group in [
+            "tda65536:x:65536:",
+            "apps:x:70000:",
+            "audio:x:994:tda65536",
+            "audio:x:994:tester,tda1",
+        ] {
+            let text = format!("{GR}{group}\n");
+            assert!(supplementary_in(&text, GROUP, "tester").is_err(), "{group}");
+            assert!(
+                application_account_in(&ledger(), PW, &text, "tda65536").is_err(),
+                "{group}"
+            );
+        }
+        // The ranges are exact: the ids beside them are ordinary.
+        for id in [65534, 65535, 131072] {
+            let passwd = format!("{PW}other::{id}:{id}:Other:/home/other:/bin/sh\n");
+            assert_eq!(account_in(&passwd, PASSWD, "other").unwrap().uid, id);
+            let group = format!("{GR}other:x:{id}:tester\n");
+            assert!(supplementary_in(&group, GROUP, "tester")
+                .unwrap()
+                .contains(&id));
+        }
+        // A malformed id anywhere still fails the lookup.
+        let broken = format!("{PW}broken:x:1001:zero:B:/home/b:/bin/sh\n");
+        assert!(account_in(&broken, PASSWD, "tester").is_err());
+        assert!(application_account_in(&ledger(), &broken, GR, "tda65536").is_err());
     }
 
     #[test]

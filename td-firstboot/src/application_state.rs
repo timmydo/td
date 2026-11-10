@@ -125,7 +125,7 @@ pub(crate) fn prepare(
         return Err("application migration requires a nonzero, non-sentinel human gid".into());
     }
     if !(1000..=65533).contains(&former.uid)
-        || !(65536..=2147483647).contains(&uid)
+        || !crate::workload_accounts::APPLICATION_UIDS.contains(&uid)
         || application.len() > 64
         || !application
             .as_bytes()

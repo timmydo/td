@@ -175,7 +175,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const PASSWD_TEXT: &str = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\ntda65536:x:65536:65536:application:/var/lib/td/applications/65536:/bin/false\n";
+    const PASSWD_TEXT: &str = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\naudio:!td-service:994:994:audio:/run/td-audio:/bin/false\n";
 
     #[test]
     fn selected_identity_drives_the_home_without_changing_the_numeric_owner() {
@@ -195,7 +195,7 @@ mod tests {
         for text in [
             PASSWD_TEXT.replace("alice", "root"),
             format!("{PASSWD_TEXT}alias:x:1000:1000:Alias:/home/alias:/bin/sh\n"),
-            format!("{PASSWD_TEXT}alias:x:65536:65536:Alias:/home/alias:/bin/sh\n"),
+            format!("{PASSWD_TEXT}alias:x:994:994:Alias:/home/alias:/bin/sh\n"),
             PASSWD_TEXT.replace("1000:1000", "1000:0"),
             PASSWD_TEXT.replace("1000:1000", "1001:1001"),
             PASSWD_TEXT.replace("alice", "../root"),
@@ -218,8 +218,8 @@ mod tests {
             PASSWD_TEXT.replace("/home/alice", "/var/lib/td/secrets"),
             PASSWD_TEXT.replace("/home/alice", "/home/alice/../root"),
             PASSWD_TEXT.replace("/home/alice", "/home/alice/"),
-            PASSWD_TEXT.replace("65536:65536", "bad:65536"),
-            PASSWD_TEXT.replace("65536:65536", "65536:4294967296"),
+            PASSWD_TEXT.replace("994:994", "bad:994"),
+            PASSWD_TEXT.replace("994:994", "994:4294967296"),
             format!("{PASSWD_TEXT}broken\n"),
             PASSWD_TEXT.trim_end().to_owned(),
             PASSWD_TEXT.replace("Alice", "Alice\0"),

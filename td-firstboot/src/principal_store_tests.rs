@@ -500,7 +500,7 @@ fn a_refused_seed_publishes_no_reservation() {
         assert!(directory.enroll_checked(desired, |_| Ok(())).is_err());
         unchanged(&directory, &[(LEDGER, None), (NOTEBOOK_LEDGER, None)]);
         assert!(account_ledger(&directory).is_none());
-        assert!(check_accounts(desired).is_err());
+        assert!(check_accounts(desired, None).is_err());
         temp.cleanup().unwrap();
         // After an enrolled boot every file keeps its bytes.
         let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
@@ -514,10 +514,33 @@ fn a_refused_seed_publishes_no_reservation() {
         unchanged(&directory, &before);
         temp.cleanup().unwrap();
     }
-    check_accounts(&notebook(
-        "application\t1000\tclaude\t65539\napplication\t1000\tmail\t65537\n",
+}
+
+/// The image's principal table reserves no application, and every
+/// application the image declares has a carried ledger row.
+#[test]
+fn the_image_check_wants_declarations_the_carried_rows_cover() {
+    use crate::app_policy::Declarations;
+    let image = Registry::parse(&format!("{SESSION}notebook\t1000\t989\n")).unwrap();
+    let declared =
+        |rows: &str| Declarations::parse(&format!("td-bus-applications-v2\t1000\n{rows}")).unwrap();
+    let carried = declared(
+        "firefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nnews\tservice\t\nweb\tservice\t\n",
+    );
+    check_accounts(&image, None).unwrap();
+    check_accounts(&image, Some(&carried)).unwrap();
+    // claude's row is imported from a retained reservation, never carried.
+    for uncarried in ["claude\tservice\t\n", "photo\tpersonal\t\n"] {
+        assert!(check_accounts(&image, Some(&declared(uncarried))).is_err());
+    }
+    // An application row in the image's own table refuses, even one the
+    // ledger carries at that uid.
+    let reserving = Registry::parse(&format!(
+        "{SESSION}notebook\t1000\t989\napplication\t1000\tmail\t65537\n"
     ))
     .unwrap();
+    assert!(check_accounts(&reserving, None).is_err());
+    assert!(check_accounts(&reserving, Some(&carried)).is_err());
 }
 
 #[test]
@@ -624,4 +647,29 @@ fn interrupted_account_staging_is_removed_but_other_writers_are_refused() {
         .is_err());
     assert!(staged.exists());
     temp.cleanup().unwrap();
+}
+
+/// The launcher's uid is the ledger's account for a service application
+/// and the session owner for a personal one, and a retained reservation
+/// that disagrees with the ledger refuses.
+#[test]
+fn the_launch_uid_comes_from_the_ledger() {
+    use crate::app_policy::Policy;
+    const DECLARED: &str = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nnews\tservice\t\n";
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n";
+    let policy = Policy::from_tables(DECLARED, LEDGER).unwrap();
+    let none = Registry::parse(SESSION).unwrap();
+    assert_eq!(launch_uid(&none, &policy, 1000, "firefox").unwrap(), 65536);
+    assert_eq!(launch_uid(&none, &policy, 1000, "mail").unwrap(), 1000);
+    // Declared without a ledger row, undeclared, or another session's.
+    assert!(launch_uid(&none, &policy, 1000, "news").is_err());
+    assert!(launch_uid(&none, &policy, 1000, "web").is_err());
+    assert!(launch_uid(&none, &policy, 1001, "firefox").is_err());
+    // A retained reservation at the ledger's uid agrees; at another refuses.
+    assert_eq!(
+        launch_uid(&app("firefox", 65536), &policy, 1000, "firefox").unwrap(),
+        65536
+    );
+    assert!(launch_uid(&app("firefox", 65541), &policy, 1000, "firefox").is_err());
+    assert!(launch_uid(&app("mail", 65541), &policy, 1000, "mail").is_err());
 }

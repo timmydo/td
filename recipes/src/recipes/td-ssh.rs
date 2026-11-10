@@ -4,7 +4,8 @@ use crate::types::Recipe;
 /// recipe from the checkout's own trees. The crate's cryptography is
 /// td-primitives and its base64 td-encoding, both by path; its server mounts
 /// td-login's account tables and status reader by relative `#[path]`, so td-login
-/// is staged beside them, with td-fs and td-source-scan, which its lock names for
+/// is staged beside them, with the engine tree for the workload account ledger
+/// reader td-login's tables include, and td-fs and td-source-scan, which its lock names for
 /// its tests, td-source-scan being td-primitives' dev-dependency too. The lock lists
 /// only td crates, so the closure is std and the vendor set is empty; the
 /// binaries are linked fully static, as each server stage re-executes its own
@@ -19,6 +20,7 @@ pub fn recipe() -> Recipe {
             "td-login",
             "td-fs",
             "td-source-scan",
+            "engine",
         ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
@@ -45,7 +47,8 @@ mod tests {
                     "td-encoding",
                     "td-login",
                     "td-fs",
-                    "td-source-scan"
+                    "td-source-scan",
+                    "engine"
                 ]
                 .map(String::from)
                 .to_vec()

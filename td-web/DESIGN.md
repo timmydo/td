@@ -59,8 +59,9 @@ td-web runs under its own external service account, not as the login
 user: the browsing it does, and the state a later cookie jar keeps, stay
 outside the human's UID domain, as Firefox's do. Its registry name is
 `web`, its account `tda65540`, its external UID 65540 (the first not
-reserved; 65537-65539 stay reserved, APPLICATIONS.md §L), its home
-`/var/lib/td/applications/65540`. Inside its jail it is UID 1000, as
+reserved; 65537-65539 stay reserved, APPLICATIONS.md §L), the workload
+account ledger's carried row (td-authd/DESIGN.md, "Workload account
+ledger"), its home `/var/lib/td/applications/65540`. Inside its jail it is UID 1000, as
 every application is.
 
 It is a `ShippedApplication` on `static-runtime`, packaged by the `web`

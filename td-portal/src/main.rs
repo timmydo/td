@@ -95,6 +95,13 @@ mod tpm;
     reason = "the shared broker codec is broader than one portal"
 )]
 mod wire;
+// The workload account ledger the application policy resolves uids from.
+#[path = "../../engine/src/workload_accounts.rs"]
+#[allow(
+    dead_code,
+    reason = "the portal reads the ledger; td-firstboot seeds it"
+)]
+mod workload_accounts;
 
 // The file chooser and its private-Wayland dialog live in the crate library
 // (`lib.rs`), shared with the integration tests; the binary drives them.
@@ -1179,7 +1186,7 @@ fn run(paths: &Paths) -> Result<(), String> {
     connection
         .finish_setup()
         .map_err(|error| format!("cannot enter portal service mode: {error}"))?;
-    serve(&mut connection, &settings, app_policy::load()?)
+    serve(&mut connection, &settings, app_policy::load_session()?)
         .map_err(|error| format!("the portal service connection ended: {error}"))
 }
 
@@ -3719,6 +3726,10 @@ mod confinement {
             "bus_client.rs",
             include_str!("../../td-busd/src/bus_client.rs"),
         ),
+        (
+            "workload_accounts.rs",
+            include_str!("../../engine/src/workload_accounts.rs"),
+        ),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
@@ -3863,7 +3874,14 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
         let mut expected = SOURCES
             .iter()
             .filter(|(name, _)| {
-                !["sys.rs", "scm.rs", "app_policy.rs", "bus_client.rs"].contains(name)
+                ![
+                    "sys.rs",
+                    "scm.rs",
+                    "app_policy.rs",
+                    "bus_client.rs",
+                    "workload_accounts.rs",
+                ]
+                .contains(name)
             })
             .map(|(name, _)| (*name).to_string())
             .collect::<Vec<_>>();
@@ -3880,8 +3898,9 @@ mod tests {
 
     pub(super) fn service_state() -> ServiceState {
         ServiceState {
-            application_policy: Some(app_policy::Policy::parse(
-                "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
+            application_policy: Some(app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\n",
+                "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\napplication\tweb\t65540\n",
             ).unwrap()),
             ..ServiceState::default()
         }
@@ -3889,9 +3908,11 @@ mod tests {
 
     #[test]
     fn personal_credential_identity_still_requires_the_broker_application_name() {
-        let policy =
-            app_policy::Policy::parse("td-bus-applications-v1\t1000\n1000\tmail\t\n1000\tnews\t\n")
-                .unwrap();
+        let policy = app_policy::Policy::from_tables(
+            "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tpersonal\t\n",
+            "td-accounts-v1\napplication\tmail\t65537\napplication\tnews\t65538\n",
+        )
+        .unwrap();
         for (uid, name, expected) in [
             (1000, Some("mail"), Some("mail")),
             (1000, Some("news"), Some("news")),

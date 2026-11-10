@@ -33,8 +33,16 @@ pub(crate) const KEY_TYPE: &str = "ssh-ed25519";
 const MAX_KEYS: usize = 64;
 const MAX_COMMENT: usize = 256;
 /// The account forms td-firstboot reserves for sessions and applications:
-/// one of these followed by decimal digits.
-const RESERVED_ACCOUNT_PREFIXES: &[&str] = &["tda", "tdb", "tdc", "tdi", "tdp", "tdv"];
+/// one of these followed by decimal digits. The application form is the
+/// workload account ledger's.
+const RESERVED_ACCOUNT_PREFIXES: &[&str] = &[
+    td_engine::workload_accounts::APPLICATION_ACCOUNT_PREFIX,
+    "tdb",
+    "tdc",
+    "tdi",
+    "tdp",
+    "tdv",
+];
 
 pub(crate) struct ProvisionedAccount {
     name: String,

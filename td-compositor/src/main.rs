@@ -107,6 +107,16 @@ mod ui;
 mod vm_bridge;
 mod vm_wire;
 mod wire;
+// The workload account ledger the application policy resolves uids from.
+#[allow(
+    dead_code,
+    reason = "the compositor reads the ledger; td-firstboot seeds it"
+)]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/workload_accounts.rs"
+)]
+mod workload_accounts;
 
 use framebuffer::Framebuffer;
 use output::OutputBackend;
@@ -1220,6 +1230,7 @@ mod confinement {
         "sfnt.rs",
         "temp_dir.rs",
         "timezone.rs",
+        "workload_accounts.rs",
     ];
 
     const OTHER: &[(&str, &str)] = &[
@@ -1278,6 +1289,10 @@ mod confinement {
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
         ("vm_wire.rs", include_str!("vm_wire.rs")),
         ("wire.rs", include_str!("wire.rs")),
+        (
+            "workload_accounts.rs",
+            include_str!("../../engine/src/workload_accounts.rs"),
+        ),
     ];
 
     /// A module's source with its test module removed. Anchored on the test
@@ -1357,7 +1372,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xbc471d0016e8d79d,
+            0x15cb18f54f2439bd,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -1382,7 +1397,7 @@ mod confinement {
             (
                 "primary_account.rs",
                 include_str!("../../td-authd/src/primary_account.rs"),
-                0xe44c4437071a8ed4,
+                0x4f03d336c3420d68,
             ),
             (
                 "hostname.rs",
