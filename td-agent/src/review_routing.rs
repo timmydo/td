@@ -66,15 +66,28 @@ pub(crate) fn prepare(
 ) -> Result<models::Models, String> {
     let selected = options.model.as_deref().unwrap_or(&client.model);
     let mut listed = None;
-    if matches!(selected, "opus-latest" | "gpt-sol-latest") {
+    if matches!(selected, "opus-latest" | "gpt-sol-latest")
+        || (selected.starts_with('~') && explicit(options))
+    {
         let models = review::models(&client.base_url, &[])?;
-        let resolved = models.review_model(selected)?;
+        let resolved = if selected.starts_with('~') {
+            models
+                .find(selected)
+                .ok_or_else(|| format!("{selected} is not in the models list"))?
+                .routing_model()?
+                .to_string()
+        } else {
+            models.review_model(selected)?
+        };
         journal.event(
             "review_model_resolved",
             Json::Obj(vec![
                 ("requested".into(), Json::Str(selected.into())),
                 ("model".into(), Json::Str(resolved.clone())),
-                ("effort".into(), Json::Str("high".into())),
+                (
+                    "effort".into(),
+                    options.effort.clone().map_or(Json::Null, Json::Str),
+                ),
             ]),
         )?;
         options.model = Some(resolved);

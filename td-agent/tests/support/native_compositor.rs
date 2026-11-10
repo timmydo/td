@@ -795,8 +795,9 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
         "Control-N starts a conversation and opens it",
         || {
             let state = agent.state();
-            (!state.contains("active=none") && state.contains("model=anthropic/claude-sonnet-5.5"))
-                .then_some(())
+            (!state.contains("active=none")
+                && state.contains("model=~deepseek/deepseek-flash-latest"))
+            .then_some(())
         },
     );
     compositor.chord(&[], KEY_F10);
@@ -811,7 +812,7 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
         || {
             agent
                 .state()
-                .contains("picker=anthropic/claude-sonnet-5.5")
+                .contains("picker=~deepseek/deepseek-flash-latest")
                 .then_some(())
         },
     );

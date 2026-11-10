@@ -2783,7 +2783,7 @@ impl Session {
         let meta = self.conversation.meta();
         let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
         let setting = if chosen.is_some() { CHOSEN } else { DEFAULT };
-        let name = chosen.unwrap_or_else(|| client.model.clone());
+        let mut name = chosen.unwrap_or_else(|| client.model.clone());
         let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());
         let model = match self.model(setting, &name, &client) {
             Ok(model) => model,
@@ -2801,7 +2801,10 @@ impl Session {
             // Reasoning endpoints where the turn would send an effort.
             let reasoning = model.as_ref().is_none_or(|m| m.supports("reasoning"));
             match self.routed(&client, &name, &routing, reasoning) {
-                Ok(envelope) => (Some(envelope), Some(routing)),
+                Ok(envelope) => {
+                    name = envelope.id.clone();
+                    (Some(envelope), Some(routing))
+                }
                 Err(why) => return Ok(Err(why)),
             }
         };
@@ -6889,6 +6892,20 @@ impl Session {
         routing: &str,
         reasoning: bool,
     ) -> Result<Model, String> {
+        let target = if model.starts_with('~') {
+            let models = Models::load(&self.state)?;
+            Some(
+                models
+                    .as_ref()
+                    .and_then(|list| list.find(model))
+                    .ok_or_else(|| format!("{model} is not in the models list"))?
+                    .routing_model()?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        let model = target.as_deref().unwrap_or(model);
         self.routes
             .retain(|route| route.fetched.elapsed() < ROUTE_KEPT);
         if let Some(route) = self

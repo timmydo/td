@@ -182,6 +182,11 @@ impl Session {
                 )
             }
         };
+        let name = if routing.is_some() {
+            model.as_ref().map_or(name.clone(), |m| m.id.clone())
+        } else {
+            name
+        };
         capabilities(&name, setting, model.as_ref(), explicit_effort)?;
         Ok(Asking {
             name,

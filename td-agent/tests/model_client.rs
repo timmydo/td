@@ -729,7 +729,7 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert!(!requests[1].stream);
     assert_eq!(requests[1].limit, Some(512 * 1024));
     let body = flat(&turn.text());
-    assert_eq!(body["model"], "anthropic/claude-sonnet-5.5");
+    assert_eq!(body["model"], td_agent::config::DEFAULT_MODEL);
     assert_eq!(body["max_tokens"], "16384");
     assert_eq!(body["stream"], "true");
     // Drawn as it came, a delta per frame that brought anything, and
@@ -795,7 +795,7 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["reasoning.effort"], "medium");
     assert_eq!(body["provider.require_parameters"], "true");
     assert_eq!(body["provider.data_collection"], "deny");
-    assert_eq!(body["cache_control.type"], "ephemeral");
+    assert!(!body.contains_key("cache_control.type"));
     assert_eq!(body["messages.0.role"], "system");
     // A message the model is given begins with when it was sent.
     assert!(
@@ -820,7 +820,7 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     // one the model lists; the title's as well.
     let models = Models::from_provider(&fixture("models.json")).unwrap();
     for (request, model) in [
-        (turn, "anthropic/claude-sonnet-5.5"),
+        (turn, td_agent::config::DEFAULT_MODEL),
         (&requests[1], "anthropic/claude-haiku-4.5"),
     ] {
         let model = models.find(model).unwrap();
@@ -1180,13 +1180,23 @@ fn a_chosen_routing_is_what_the_next_request_asks_for() {
         "route",
         Role::Conversation,
         vec![
-            Reply::ok("endpoints-sonnet.json"),
+            Reply::Http {
+                status: 200,
+                headers: Vec::new(),
+                body: String::from_utf8(fixture("endpoints-sonnet.json"))
+                    .unwrap()
+                    .replace("anthropic/claude-sonnet-5.5", "deepseek/flash-test")
+                    .into_bytes(),
+            },
             Reply::sse("stream-sonnet.sse"),
             Reply::ok("title.json"),
             Reply::sse("stream-sonnet.sse"),
         ],
     );
-    h.setup(Client::default());
+    h.setup(Client {
+        routing: "nitro".into(),
+        ..Client::default()
+    });
     h.down(&Down::Route {
         routing: Some("nitro".into()),
     });
@@ -1200,9 +1210,9 @@ fn a_chosen_routing_is_what_the_next_request_asks_for() {
     let requests = h.mock.requests();
     assert!(requests[0]
         .url
-        .ends_with("/models/anthropic/claude-sonnet-5.5/endpoints"));
+        .ends_with("/models/deepseek/flash-test/endpoints"));
     let body = flat(&requests[1].text());
-    assert_eq!(body["model"], "anthropic/claude-sonnet-5.5:nitro");
+    assert_eq!(body["model"], "deepseek/flash-test:nitro");
     // The fast tier, nitro's alone, is the dearest it may reach.
     assert_eq!(body["provider.max_price.prompt"], "6.000000");
     assert_eq!(body["provider.max_price.completion"], "30.000000");
@@ -1218,7 +1228,7 @@ fn a_chosen_routing_is_what_the_next_request_asks_for() {
         .find(|r| r.text().contains("again"))
         .unwrap();
     let body = flat(&again.text());
-    assert_eq!(body["model"], "anthropic/claude-sonnet-5.5");
+    assert_eq!(body["model"], td_agent::config::DEFAULT_MODEL);
     assert!(!body.keys().any(|k| k.starts_with("provider.max_price")));
     assert_eq!(
         requests
@@ -1229,6 +1239,7 @@ fn a_chosen_routing_is_what_the_next_request_asks_for() {
     );
     let (conversation, _) = h.close();
     assert_eq!(conversation.meta().routing.as_deref(), Some("balanced"));
+    assert_eq!(conversation.meta().model, None);
 }
 
 /// A routed turn's endpoints are fetched on a thread of their own, so a
@@ -1236,7 +1247,10 @@ fn a_chosen_routing_is_what_the_next_request_asks_for() {
 #[test]
 fn a_stalled_endpoints_fetch_is_interrupted() {
     let mut h = Harness::new("route-stall", Role::Conversation, vec![Reply::Hang]);
-    h.setup(Client::default());
+    h.setup(Client {
+        model: "anthropic/claude-sonnet-5.5".into(),
+        ..Client::default()
+    });
     h.down(&Down::Route {
         routing: Some("floor".into()),
     });
@@ -2667,7 +2681,10 @@ fn task_routing_can_be_cleared_and_unsupported_effort_is_refused() {
             Reply::ok("title.json"),
         ],
     );
-    h.setup(Client::default());
+    h.setup(Client {
+        model: "anthropic/claude-sonnet-5.5".into(),
+        ..Client::default()
+    });
     h.down(&Down::Route {
         routing: Some("nitro".into()),
     });
@@ -7792,7 +7809,7 @@ fn a_request_past_compact_at_prunes_old_tool_results_first() {
     h.say("Go on.");
     let (events, outcome, _) = h.turn();
     assert!(
-        outcome.contains("past compact_at, 80% of anthropic/claude-sonnet-5.5's context of 100000; auto_compact is off"),
+        outcome.contains("past compact_at, 80% of ~deepseek/deepseek-flash-latest's context of 100000; auto_compact is off"),
         "{outcome}"
     );
     assert!(kinds(&events)
@@ -7961,6 +7978,11 @@ fn a_request_pruning_cannot_bring_under_compact_at_is_summarized() {
         .unwrap()
         .text();
     let head = td_json::parse_slice(asked.as_bytes()).unwrap();
+    assert_eq!(
+        head.get("model").and_then(td_json::Json::as_str),
+        Some(td_agent::config::DEFAULT_COMPACT_MODEL)
+    );
+    assert_eq!(flat(&asked)["cache_control.type"], "ephemeral");
     assert_eq!(
         head.get("max_tokens").and_then(td_json::Json::as_u64),
         Some(10_000)

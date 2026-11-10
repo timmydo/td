@@ -16,9 +16,11 @@ pub use td_url::Destination;
 /// Where models are asked for (DESIGN.md §5).
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// The model a conversation uses by default.
-pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5.5";
+pub const DEFAULT_MODEL: &str = "~deepseek/deepseek-flash-latest";
 /// The cheap model titles come from (DESIGN.md §13).
 pub const DEFAULT_TITLE_MODEL: &str = "anthropic/claude-haiku-4.5";
+/// The model that writes conversation summaries (DESIGN.md §14).
+pub const DEFAULT_COMPACT_MODEL: &str = "~anthropic/claude-haiku-latest";
 /// The classifier's two stages' models (DESIGN.md §11): Jev, and the
 /// reasoning stage's bring-your-own-policy safety model.
 pub const DEFAULT_JEV_MODEL: &str = "typesafe/jev-1.13";
@@ -230,7 +232,7 @@ impl Default for Client {
             auto_compact: true,
             compact_at: DEFAULT_COMPACT_AT,
             compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
-            compact_model: None,
+            compact_model: Some(DEFAULT_COMPACT_MODEL.into()),
             explore_model: None,
             explore_routing: None,
             review_model: None,
@@ -2201,6 +2203,11 @@ mod tests {
         assert!(!Config::default().unconfined_without_jail);
         let client = Config::default().client;
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(client.model, "~deepseek/deepseek-flash-latest");
+        assert_eq!(
+            client.compact_model.as_deref(),
+            Some("~anthropic/claude-haiku-latest")
+        );
         assert_eq!(client.reasoning_effort, "medium");
         assert_eq!(client.routing, "balanced");
         assert!(!client.allow_data_collection);
@@ -2330,7 +2337,7 @@ mod tests {
     #[test]
     fn every_listed_key_is_accepted_and_the_unread_ones_said() {
         // DESIGN.md §15's example, whole.
-        let example = "model = \"anthropic/claude-sonnet-5.5\"\nmode = \"auto\"\n\
+        let example = "model = \"~deepseek/deepseek-flash-latest\"\nmode = \"auto\"\n\
                        max_cost_per_day = 25\n\n[[shared]]\npath = \"~/Downloads\"\n\n\
                        [[shared]]\npath = \"~/src/reference\"\nwrite = false\n\n\
                        [[template]]\nname = \"td\"\n\n[[template.repos]]\n\
@@ -2368,7 +2375,7 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(config.client.model, "anthropic/claude-sonnet-5.5");
+        assert_eq!(config.client.model, "~deepseek/deepseek-flash-latest");
         assert_eq!(config.client.limits.day, Some(25 * cost::ONE));
         for (key, use_) in KEYS {
             // A table is no key's value: each read key refuses it.
@@ -2510,7 +2517,7 @@ mod tests {
         let default = Config::default().client;
         assert_eq!(
             (default.compact_keep_tokens, default.compact_model),
-            (20_000, None)
+            (20_000, Some(DEFAULT_COMPACT_MODEL.into()))
         );
         let client = parse("compact_keep_tokens = 8000\ncompact_model = \"a/cheap\"\n")
             .unwrap()

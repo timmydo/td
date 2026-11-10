@@ -2210,9 +2210,9 @@ the deltas, serialized once. Either way td-agent never re-encodes a stored
 array afterward.
 
 **Prompt caching.** Every request is the conversation's stored prefix plus
-its messages (§6, §13). For `anthropic/*` models the request carries
-top-level `cache_control: {type: "ephemeral"}`. Other providers cache
-automatically. Cached and cache-write token counts are shown in the turn's
+its messages (§6, §13). For `anthropic/*` models and `~anthropic/*`
+aliases the request carries top-level
+`cache_control: {type: "ephemeral"}`. Other providers cache automatically. Cached and cache-write token counts are shown in the turn's
 usage.
 
 **Usage and cost.** The final response, or the final chunk when
@@ -2263,9 +2263,15 @@ and is refused while a limit is set.
 Conversation → Routing (§4); the choice is logged as a `routing` event,
 kept in `meta` and put right from the log at the next open, as a model
 choice is, and it moves to no other conversation. Balanced sends the
-request as above, priced from the models list. Any other mode is
-routed as the review command's (§2), from one code path: the
-conversation process fetches the model's `/models/{id}/endpoints` on a
+request as above, priced from the models list. For any other mode, an
+`~` alias first resolves through the cached catalog's `alias_target.slug`.
+The endpoint lookup and request both name that concrete target, so the
+price envelope cannot describe a different release. The conversation's
+selected alias remains unchanged; balanced requests still send it. A
+missing or invalid target refuses explicit routing until the catalog is
+refreshed or a concrete model is chosen. Reviews and sub-agents resolve
+explicit routing the same way. Any other mode is routed as the review
+command's (§2), from one code path: the conversation process fetches the model's `/models/{id}/endpoints` on a
 thread of its own, so an interrupt ends the wait, and keeps what it
 found for 15 minutes for each model, mode and whether the turn would
 send an effort. The turn's limits and capabilities are those of the
@@ -2354,7 +2360,7 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   exact text of the other members, logged with the request: `model`,
   `max_tokens`, `reasoning: {effort}`, `tool_choice: "none"` in a
   turn's last request at a limit (§5), `provider: {require_parameters:
-  true, data_collection}`, and `cache_control` for `anthropic/*`. The
+  true, data_collection}`, and `cache_control` for `anthropic/*` and `~anthropic/*`. The
   prefix's messages come from §6's prefix. `MESSAGES` are the user
   messages and turn replies logged before the request, a reply as
   `{"role":"assistant","content":…,"reasoning_details":…}` with the
@@ -2385,7 +2391,11 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   `u64`, parsed exactly from the decimal text a response or price
   carries. Prices round up and costs to nearest. The pricing used is
   `prompt`, `completion`, `request`, `internal_reasoning`,
-  `input_cache_read` and `input_cache_write`. A negative price, as
+  `input_cache_read` and `input_cache_write`. For each field, pricing
+  takes the highest rate across the base and every `pricing.overrides`
+  tier, regardless of the current prompt length, and caches that
+  conservative envelope. Invalid tier prices make the model unpriced.
+  A negative price, as
   `openrouter/auto` gives, means no pricing, and so does a missing
   prompt or completion price. A reservation is the prompt estimate at the
   larger of the prompt and cache-write rates, plus `max_tokens` at the
@@ -2421,9 +2431,10 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   thread of the window's, under a 16 MiB bound. It is cached as the
   state directory's `models`, and only `id`, `context_length` (or the
   top provider's), `top_provider.max_completion_tokens`, the pricing
-  above, `supported_parameters` and `architecture.input_modalities` are
-  kept. A model whose `input_modalities` names `image`, or that the list
-  leaves out or whose entry names no modality, is sent the person's
+  above, `supported_parameters`, `architecture.input_modalities` and a
+  concrete `alias_target.slug` for explicit routing are kept. A model
+  whose `input_modalities` names `image`, or that the list leaves out
+  or whose entry names no modality, is sent the person's
   pictures; one whose list names others alone is sent a line in each
   one's place saying it was left out (§6, Pictures). A model the
   configuration names (`model`, `title_model`, `classifier_model`,
@@ -7049,10 +7060,11 @@ threshold and asks the human instead. Compaction has two steps:
    threshold, the model writes a handoff summary for a successor:
    progress, decisions, constraints, open questions, next steps and
    critical data, naming the sequence numbers of what it relies on. This
-   follows Codex's compaction prompt. It uses the conversation's model,
-   or `compact_model`, and its output is bounded to a tenth of the
-   budget. Its input is the prefix, the compaction prompt and the pruned
-   view with its oldest steps dropped, by sequence number, until it fits
+   follows Codex's compaction prompt. It uses `compact_model`, defaulting
+   to `~anthropic/claude-haiku-latest`, and its output is bounded to a
+   tenth of the budget. Its input is the prefix, the compaction prompt
+   and the pruned view with its oldest steps dropped, by sequence
+   number, until it fits
    the summary model's budget less that output bound; the summary is told
    which were dropped. It is reserved against the cost limits like any
    request.
@@ -7326,8 +7338,8 @@ default; `jev_threshold`'s is calibrated (§11):
   on its card, rather than none at all (§8, Unconfined workspaces)
 - `auto_compact`, `compact_at`, a share of the context from 0.1 to 1 in
   at most two decimal places, `compact_keep_tokens`, from 1,000 to
-  1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
-  conversation's model (§14)
+  1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and
+  `~anthropic/claude-haiku-latest` (§14)
 - `explore_model` and `explore_routing`, one of `routing`'s modes;
   defaults the conversation's model and routing (§12,
 "`task`")
@@ -7344,7 +7356,7 @@ and its value is not checked. Other unknown keys are refused by name.
 For example:
 
 ```toml
-model = "anthropic/claude-sonnet-5.5"
+model = "~deepseek/deepseek-flash-latest"
 mode = "auto"
 max_cost_per_day = 25
 
@@ -7378,7 +7390,7 @@ is ignored, as the XDG base directory rules say, for `$HOME/.config` or
 **Model and limit keys.** `base_url`, `model`, `title_model`,
 `reasoning_effort`, `data_collection` and the three cost limits are
 read and checked. The defaults are `https://openrouter.ai/api/v1`,
-`anthropic/claude-sonnet-5.5` for conversations,
+`~deepseek/deepseek-flash-latest` for conversations,
 `anthropic/claude-haiku-4.5` for titles, and
 `medium`. `base_url` must be an `https://` URL with a host and no query,
 fragment or space, so the key is never sent in the clear; a trailing
@@ -7388,8 +7400,11 @@ non-negative number of credits, or `none`. `model` and
 `reasoning_effort` are what every conversation starts with; the
 Conversation menu chooses another for one conversation, and a default
 model the window saves replaces `model` until the key is edited (§4);
-this file records neither. `routing` is likewise what every
-conversation starts with until Conversation → Routing chooses another
+this file records neither. The `~…-latest` defaults follow OpenRouter's
+current family targets; their catalog entries supply the current prices
+and capabilities. Explicit model settings still take precedence.
+`routing` is likewise what every conversation starts with until
+Conversation → Routing chooses another
 (§5, Routing). The key file is not a key of this file (§6).
 
 **Templates.** `template` is read. A `name` is visible text

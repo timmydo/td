@@ -121,7 +121,13 @@ pub fn head(params: &Params<'_>) -> String {
     }
     pairs.push(("provider".into(), provider(params.client)));
     // Anthropic's models cache only where asked (DESIGN.md §5).
-    if params.cache && params.model.starts_with("anthropic/") {
+    if params.cache
+        && params
+            .model
+            .strip_prefix('~')
+            .unwrap_or(params.model)
+            .starts_with("anthropic/")
+    {
         pairs.push((
             "cache_control".into(),
             Json::Obj(vec![("type".into(), Json::Str("ephemeral".into()))]),

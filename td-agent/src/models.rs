@@ -87,6 +87,8 @@ pub fn fetch(base_url: &str, wanted: &[&str]) -> Result<Models, String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
     pub id: String,
+    /// The catalog target of an evergreen alias, used for explicit routing.
+    pub alias_target: Option<String>,
     pub context_length: Option<u64>,
     pub max_completion_tokens: Option<u64>,
     /// `None` when the list gives no usable price: none at all, or a
@@ -96,8 +98,7 @@ pub struct Model {
     /// What it reads, as its `architecture.input_modalities` says:
     /// `text`, `image` and the like; empty where the list says nothing.
     pub input_modalities: Vec<String>,
-    /// The list's price strings as given, kept so the cache says what the
-    /// provider said.
+    /// The highest published price strings, including context tiers.
     prices: Vec<(String, String)>,
 }
 
@@ -173,6 +174,7 @@ impl Model {
         Self {
             pricing: pricing(&prices),
             id,
+            alias_target: None,
             context_length,
             max_completion_tokens,
             supported_parameters,
@@ -191,16 +193,60 @@ impl Model {
     }
 
     fn prices_of(value: Option<&Json>) -> Vec<(String, String)> {
-        let Some(object) = value.and_then(Json::as_obj) else {
-            return Vec::new();
-        };
-        PRICES
-            .iter()
-            .filter_map(|name| {
-                let value = object.iter().find(|(key, _)| key == name)?;
-                Some((name.to_string(), price_text(&value.1)?))
+        Self::price_envelope(value).unwrap_or_default()
+    }
+
+    fn price_envelope(value: Option<&Json>) -> Option<Vec<(String, String)>> {
+        let value = value?;
+        let object = value.as_obj()?;
+        let mut prices = Vec::new();
+        for (name, value) in object {
+            if PRICES.contains(&name.as_str()) {
+                prices.push((name.clone(), price_text(value)?));
+            }
+        }
+        // Overrides cannot make an unpriced base model reservable.
+        pricing(&prices)?;
+        if let Some(overrides) = value.get("overrides") {
+            for tier in overrides.as_arr()? {
+                for (name, value) in tier.as_obj()? {
+                    if !PRICES.contains(&name.as_str()) {
+                        continue;
+                    }
+                    let text = price_text(value)?;
+                    let rate = cost::parse(&text, true)?;
+                    if let Some((_, held)) = prices.iter_mut().find(|(key, _)| key == name) {
+                        if rate > cost::parse(held, true)? {
+                            *held = text;
+                        }
+                    } else {
+                        prices.push((name.clone(), text));
+                    }
+                }
+            }
+        }
+        Some(prices)
+    }
+
+    fn with_alias(mut self, entry: &Json) -> Self {
+        self.alias_target = entry
+            .get("alias_target")
+            .and_then(|a| a.get("slug"))
+            .and_then(Json::as_str)
+            .filter(|id| pathable(id) && !id.contains(':'))
+            .map(str::to_string);
+        self
+    }
+
+    /// Pin explicit routing to the same concrete target as its envelope.
+    pub(crate) fn routing_model(&self) -> Result<&str, String> {
+        if self.id.starts_with('~') {
+            self.alias_target.as_deref().ok_or_else(|| {
+                format!("{} has no concrete alias target in the models list; refresh it or choose balanced routing", self.id)
             })
-            .collect()
+        } else {
+            Ok(&self.id)
+        }
     }
 
     fn parameters_of(value: Option<&Json>) -> Vec<String> {
@@ -217,6 +263,12 @@ impl Model {
     fn to_json(&self) -> Json {
         Json::Obj(vec![
             ("id".into(), Json::Str(self.id.clone())),
+            (
+                "alias_target".into(),
+                self.alias_target.as_ref().map_or(Json::Null, |slug| {
+                    Json::Obj(vec![("slug".into(), Json::Str(slug.clone()))])
+                }),
+            ),
             (
                 "context_length".into(),
                 self.context_length.map_or(Json::Null, Json::from),
@@ -270,15 +322,18 @@ impl Models {
                 continue;
             };
             let top = entry.get("top_provider");
-            models.push(Model::from_parts(
-                id.to_string(),
-                number(entry.get("context_length"))
-                    .or_else(|| number(top.and_then(|t| t.get("context_length")))),
-                number(top.and_then(|t| t.get("max_completion_tokens"))),
-                Model::prices_of(entry.get("pricing")),
-                Model::parameters_of(entry.get("supported_parameters")),
-                Model::modalities_of(entry),
-            ));
+            models.push(
+                Model::from_parts(
+                    id.to_string(),
+                    number(entry.get("context_length"))
+                        .or_else(|| number(top.and_then(|t| t.get("context_length")))),
+                    number(top.and_then(|t| t.get("max_completion_tokens"))),
+                    Model::prices_of(entry.get("pricing")),
+                    Model::parameters_of(entry.get("supported_parameters")),
+                    Model::modalities_of(entry),
+                )
+                .with_alias(entry),
+            );
         }
         Ok(Self { models })
     }
@@ -367,14 +422,17 @@ impl Models {
                 .get("id")
                 .and_then(Json::as_str)
                 .ok_or("a cached model with no id")?;
-            models.push(Model::from_parts(
-                id.to_string(),
-                number(entry.get("context_length")),
-                number(entry.get("max_completion_tokens")),
-                Model::prices_of(entry.get("pricing")),
-                Model::parameters_of(entry.get("supported_parameters")),
-                Model::parameters_of(entry.get("input_modalities")),
-            ));
+            models.push(
+                Model::from_parts(
+                    id.to_string(),
+                    number(entry.get("context_length")),
+                    number(entry.get("max_completion_tokens")),
+                    Model::prices_of(entry.get("pricing")),
+                    Model::parameters_of(entry.get("supported_parameters")),
+                    Model::parameters_of(entry.get("input_modalities")),
+                )
+                .with_alias(entry),
+            );
         }
         Ok(Self { models })
     }
@@ -509,6 +567,64 @@ mod tests {
         }
         assert!(list.find("openai/gpt-6.1-sol").is_some());
         assert!(list.find("gpt-6.1-sol").is_none());
+    }
+
+    #[test]
+    fn evergreen_routing_targets_survive_the_cache_and_must_be_concrete() {
+        let body = br#"{"data":[{"id":"~deepseek/deepseek-flash-latest","alias_target":{"slug":"deepseek/flash-test"}}]}"#;
+        let models = Models::from_provider(body).unwrap();
+        let cached = Models::from_cache(models.to_cache().as_bytes()).unwrap();
+        assert_eq!(cached, models);
+        assert_eq!(
+            cached.models.first().unwrap().routing_model().unwrap(),
+            "deepseek/flash-test"
+        );
+        for target in [
+            "~other/latest",
+            "../escape",
+            "model/tier:nitro",
+            "model/name?key=x",
+            "",
+        ] {
+            let text = String::from_utf8(body.to_vec())
+                .unwrap()
+                .replace("deepseek/flash-test", target);
+            let models = Models::from_provider(text.as_bytes()).unwrap();
+            assert!(
+                models.models.first().unwrap().routing_model().is_err(),
+                "{target}"
+            );
+        }
+        let older = Models::from_cache(br#"[{"id":"~deepseek/deepseek-flash-latest"}]"#);
+        // Legacy caches with no target must not invent a concrete model.
+        let older = older.unwrap();
+        assert!(older.models.first().unwrap().routing_model().is_err());
+    }
+
+    #[test]
+    fn context_price_overrides_bound_reservations_and_survive_the_cache() {
+        let body = br#"{"data":[{"id":"~anthropic/claude-haiku-latest","pricing":{"prompt":"0.0000001","completion":"0.0000005","input_cache_write":"0.000000125","overrides":[{"min_prompt_tokens":100000,"prompt":"0.0000005","completion":"0.0000025","input_cache_write":"0.000000625"},{"min_prompt_tokens":200000,"completion":"0.000001"}]}}]}"#;
+        let models = Models::from_provider(body).unwrap();
+        let cached = Models::from_cache(models.to_cache().as_bytes()).unwrap();
+        assert_eq!(cached, models);
+        let prices = cached.models.first().unwrap().pricing.unwrap();
+        assert_eq!(
+            (prices.prompt, prices.completion, prices.cache_write),
+            (500_000, 2_500_000, 625_000)
+        );
+        for tokens in [99_999, 100_000, 200_000] {
+            assert_eq!(
+                prices.reserve(tokens, 10_000),
+                tokens * 625_000 + 25_000_000_000
+            );
+        }
+        for bad in ["null", "{}", "-1", "\"bad\""] {
+            let text = String::from_utf8(body.to_vec())
+                .unwrap()
+                .replace("\"0.000000625\"", bad);
+            let models = Models::from_provider(text.as_bytes()).unwrap();
+            assert!(models.models.first().unwrap().pricing.is_none(), "{bad}");
+        }
     }
 
     #[test]
