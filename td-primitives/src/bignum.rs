@@ -262,7 +262,7 @@ impl<const N: usize> Modulus<N> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
     use super::{from_be, less_mask, negated_inverse, select, to_be, zero_mask, Modulus};
 
     const P: [u64; 2] = [0xffffffffffffff61, 0xffffffffffffffff]; // 2^128 - 159, prime
@@ -326,6 +326,58 @@ mod tests {
                 let difference = if a >= b { a - b } else { p - (b - a) };
                 assert_eq!(value(&modulus.sub(&x, &y)), difference, "{a} - {b}");
             }
+        }
+    }
+
+    /// tests/bignum_vectors.py's rows for the modulus `name`, of N limbs: each
+    /// function's raw output, Montgomery form included, from Python's integers.
+    fn corpus_rows<const N: usize>(name: &str) -> usize {
+        let parse = |field: &str| from_be::<N>(&crate::test_corpus::hex(field)).unwrap();
+        let (mut modulus, mut operands, mut rows) = (None, Vec::new(), 0);
+        for line in include_str!("../tests/bignum_vectors.txt").lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            match fields[..] {
+                ["modulus", label, limbs, m] if label == name => {
+                    assert_eq!(limbs, N.to_string(), "{name}");
+                    modulus = Some(Modulus::new(parse(m)));
+                }
+                ["operand", label, index, value] if label == name => {
+                    assert_eq!(index, operands.len().to_string(), "{line}");
+                    operands.push(parse(value));
+                }
+                [label, op, a, b, want] if label == name => {
+                    let m = modulus.as_ref().unwrap();
+                    let a = &operands[a.parse::<usize>().unwrap()];
+                    let b = b.parse::<usize>().ok().map(|index| &operands[index]);
+                    let got = match (op, b) {
+                        ("mul", Some(b)) => m.mul(a, b),
+                        ("add", Some(b)) => m.add(a, b),
+                        ("sub", Some(b)) => m.sub(a, b),
+                        ("pow", Some(b)) => m.pow(a, b),
+                        ("enter", None) => m.enter(a),
+                        ("leave", None) => m.leave(a),
+                        ("invert", None) => m.invert(a),
+                        _ => panic!("malformed row: {line}"),
+                    };
+                    assert_eq!(got, parse(want), "{line}");
+                    rows += 1;
+                }
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn curve_widths_agree_with_python() {
+        for name in ["P256-p", "P256-n"] {
+            assert_eq!(corpus_rows::<4>(name), 383, "{name}");
+        }
+        for name in ["P384-p", "P384-n"] {
+            assert_eq!(corpus_rows::<6>(name), 383, "{name}");
+        }
+        for name in ["P521-p", "P521-n"] {
+            assert_eq!(corpus_rows::<9>(name), 383, "{name}");
         }
     }
 

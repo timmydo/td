@@ -621,9 +621,17 @@ construction validates the key with td-primitives. EC keys require
 SEC1 points: uncompressed 04 with 65/97/133 bytes, or compressed 02/03 with
 33/49/67 bytes for P-256/P-384/P-521, which td-primitives' `uncompressed`
 checks are on the curve and stores uncompressed; the hybrid form and the
-point at infinity are refused. Ed25519 takes any 32 bytes, as a verifier
-would. RSA uses the minimal PKCS#1 public encoding already checked above,
-which td-primitives' RSA public-key parser must accept: an odd modulus of
+point at infinity are refused. Ed25519 takes 32 bytes, compared and not
+decoded here, except a small-order point in any of its fourteen spellings
+(td-primitives' `ed25519::is_small_order`): verification is cofactorless,
+so such an anchor or issuer would verify a forgery anyone can make. A
+mixed-order key is taken, as nobody without its prime-order discrete log
+forges for it, and a key on no point is taken and verifies nothing. A
+peer's leaf or intermediate key does not pass through this admission, so
+a small-order one would verify forged signatures; that needs a trusted CA
+to have issued it a certificate. RSA uses the minimal PKCS#1 public
+encoding already checked above, which td-primitives' RSA public-key
+parser must accept: an odd modulus of
 2048 through 8192 bits and an odd exponent of at least 3 and at most 33
 bits. These are the keys AWS-LC admitted when it was the backend. Nested SPKI,
 trailing bytes and incompatible encodings are Invalid. Local identity
@@ -1218,8 +1226,49 @@ slice lengths and which is not gated. The routines that branch only on
 loop counters or lengths (the table selection, the X25519 ladder,
 ChaCha20's block, `ct::eq`, `mont_mul`) are not gated, nor is any
 instruction whose latency depends on its data, so a change to them, or to
-the review's other findings, needs the review again. The independent
-cryptographic review F04 requires has not taken place.
+the review's other findings, needs the review again.
+
+Cryptographic review scope. Two model-run cryptographic reviews (Claude
+Opus 5.5 and Claude Fable 5.1), made independently of each other, read
+every td-primitives path td-crypto uses, and td-crypto's own key admission,
+at a8d3d3e33: the secret paths the side-channel review lists, and P-256,
+P-384, P-521, Ed25519 and RSA PKCS#1 and PSS verification, point
+decoding, `bignum`, DER and certificate key admission. Fable built
+references of its own for ECDSA verification, ECDH, point decoding, RFC
+6979 signing and RSA, and ran 2,344 ECDSA verification rows, 300 RFC 6979
+signatures compared byte for byte, 566 ECDH rows, 846 point-decoding rows
+and 897 RSA rows, the e = 3 forgery shape among them. Opus built
+references for EC public keys, ECDH, decompression, ECDSA and RFC 6979
+signing, X25519, Ed25519, RSA, and AES-GCM and ChaCha20-Poly1305 (a
+textbook AEAD), and ran 1,029 EC, RSA and Ed25519 vectors, 261 AEAD
+cases, 20,000 random robustness inputs and 152,437 single-bit flips.
+Everything else was checked against the specifications and the committed
+corpora. Key-usage parsing (`certificate.rs`) was read by Fable only;
+Opus read only the public-key extraction and `rsa_size`. Neither found a
+disagreement or a blocking defect. The repository user accepted these
+two model-run reviews as F04's independent cryptographic review; no human
+has reviewed this cryptography. Their findings are answered: a
+small-order Ed25519 key is refused as an anchor or local issuer (above);
+td-primitives reports which hardware backends a test run reached and can
+require all of them; ECDSA signing's nonce retries, and `bignum` at 4, 6
+and 9 limbs, have known answers from Python; and td-primitives/DESIGN.md
+states the e = 0 bound exactly and records what is not claimed: fault
+attacks on deterministic signing, low-s normalisation, a bound on AES-GCM's
+AAD, and a device-type check on `/dev/random`. The changes those answers
+made to reviewed paths, `canonical_key` and the signing loop, were covered
+by two code reviews of their own (Opus and Fable), which reran the
+generators and found signing byte for byte unchanged over 5,000 keys.
+Not reviewed: rustls's internals and webpki's path building; this crate's
+session and record layer, and X.509 parsing beyond the public key and key
+usage; this crate's own `Sha256` (`sha256.rs`), `BulkSha256`
+(`bulk_sha256.rs`) and `der.rs`; whether the TLS identity key signs
+anything else (ES256 and ACME key separation), the ACME/JWS consumer of
+`sign_es256`, and td-mta's use of the facade; td-primitives code td-crypto
+does not use; Ed25519 signing; behaviour on CPUs without AES-NI, SHA-NI or
+AVX2; and aarch64 and the portable artifacts, as the review ran on the
+x86-64 host build. The reviewers ran no mutation testing of their own.
+The review holds for the code it read; a change to a reviewed path needs
+it again.
 
 Selected-key health currently uses the owned key's mutex-backed public-point
 operation. A server session checks it before work, after backend calls and at
@@ -1295,15 +1344,17 @@ Certificate key admission has
 known answers built with Python's big integers
 (`src/fixtures/canonical_keys.py`): valid, off-curve, out-of-range,
 non-residue, hybrid, infinity and truncated EC points in both forms, with
-compressed and uncompressed aliases comparing equal, and RSA keys at and
-past each modulus and exponent bound.
+compressed and uncompressed aliases comparing equal, RSA keys at and
+past each modulus and exponent bound, and Ed25519's eight small-order
+points and six other spellings of them, refused, beside a prime-order, a
+mixed-order and an undecodable key, taken.
 
 The same tests run on the portable musl artifact as named smoke cases
 (PORTABLE.md); its aarch64 cross-build compiles them, and the emulated
 aarch64 runtime runs them under qemu-aarch64. This is functional evidence.
 Allocation, stack and RSS evidence is in td-mta/RESOURCES.md and
-PORTABLE.md; F04's independent cryptographic and exact-artifact
-side-channel review and the M07 mail/TLS service integration remain open
+PORTABLE.md. The model-run cryptographic and side-channel reviews are
+scoped above; the M07 mail/TLS service integration remains open
 (td-mta/IMPLEMENTATION.md F04).
 
 ### Exact issued DNS identifiers

@@ -2910,7 +2910,7 @@ code and its direct dependency do not change with backend selection.
 2. Implement primitive increments in `td-primitives`, behind td-crypto's
    private bridge, with pinned/approved known-answer, adversarial and
    differential inputs. Done for the configured TLS backend and the direct
-   operations. Still required: independent cryptographic and exact-artifact
+   operations. Required: independent cryptographic and exact-artifact
    side-channel review of the secret-dependent paths td-crypto uses (P-256
    key generation and signing with its RFC 6979 nonce; X25519, P-256 and
    P-384 ECDH; AES-GCM; ChaCha20-Poly1305; HMAC and HKDF; comparison;
@@ -2932,8 +2932,15 @@ code and its direct dependency do not change with backend selection.
    multiplications call the ungated `mont_mul`, which the review found
    branches only on slice lengths, and the routines that branch only on
    loop counters are not gated.
-   No independent cryptographic review has taken place. Tests alone are
-   insufficient, and this blocks deployment.
+   An independent cryptographic review of the td-primitives paths
+   td-crypto uses has been performed by two model reviewers, Claude Opus
+   5.5 and Claude Fable 5.1, against references of their own for most
+   paths; it found no blocking defect, its findings are fixed, and
+   td-crypto/DESIGN.md ("Cryptographic review scope") states what it
+   covered and what it did not. The repository user accepted these two
+   model-run reviews as this step's independent cryptographic review; no
+   human has reviewed this cryptography. Both reviews hold for the code
+   and toolchain they read, and are repeated when either changes.
 3. Take the Rustls CryptoProvider from `td-tls-provider`, the provider td-net
    also uses, so that both consumers share one implementation (the
    repository user's decision, under AGENTS.md principle 2), kept private
@@ -2942,7 +2949,8 @@ code and its direct dependency do not change with backend selection.
    feature/configuration selector or new mail dependency.
 4. Cut over. This step was reordered: it first required the M07 mail/TLS
    integration and step 2's review before the atomic switch, and the switch
-   now precedes both, which remain below. Done: td-crypto's library uses td-primitives and
+   now precedes both; the review is done and the integration remains
+   below. Done: td-crypto's library uses td-primitives and
    td-tls-provider and nothing else for cryptography; AWS-LC and every
    package and native build input only it needed left the manifests, locks,
    crypto-cargo wiring and portable builds, and no admitted crate compiles
@@ -2963,10 +2971,13 @@ code and its direct dependency do not change with backend selection.
    its closure std-only. Algorithm, trust or format changes are
    separate explicit compatibility work.
 
-What remains of F04 is step 2's independent cryptographic review and the
-M07 mail/TLS service integration and resource qualification it shares with
-v1, both of which the original order put before the cutover, and a repeat of
-the side-channel review whenever toolchain, flags or target change.
+Step 2's independent cryptographic review is the two model-run reviews,
+which the repository user accepted as such; no human has reviewed this
+cryptography. What remains of F04 before deployment is the M07 mail/TLS
+service integration and resource qualification it shares with v1, which
+the original order put before the cutover, and a repeat of the
+cryptographic and side-channel reviews whenever the reviewed code,
+toolchain, flags or target change.
 
 ## Completion report for each milestone
 

@@ -158,6 +158,11 @@ What is **not** claimed:
   call `mont_mul`, which is not checked. That covers one consumer's build
   of those routines, not every build of this crate, not the routines that
   branch on loop counters, and not instruction latency.
+- Fault resistance. Signing does not verify a signature before returning it.
+  An RFC 6979 nonce depends only on the key and the message, so a fault in one
+  signature's arithmetic, by glitch, voltage or Rowhammer, beside a correct
+  signature of the same message, can give the key. Fault and other physical
+  attacks are out of scope.
 - Microarchitectural or physical resistance: power, EM, speculation, or
   operand-dependent instruction latency. "Timing measurement" below found no
   |t| above 4.5 on one x86-64 machine, which is evidence for that machine,
@@ -282,13 +287,22 @@ a change to any of these reds:
   form the rest take.
 - Ed25519 refuses S of L or more, a non-canonical key and a key of x = 0 with its
   sign bit set. It is cofactorless and takes small-order and mixed-order keys: a
-  key is trusted before it is used here, and a trusted key is neither.
-- Verification still accepts small-order keys, as Wycheproof pins. A caller holding
-  untrusted key material can ask `ed25519::is_small_order`, true of all fourteen
-  small-order encodings: the eight torsion points and the six spellings of them
-  `verify` refuses anyway. It says nothing of mixed-order keys.
+  key is trusted before it is used here.
+- Verification still accepts small-order keys, as Wycheproof pins, and one
+  verifies forgeries anyone can make. A caller admitting key material asks
+  `ed25519::is_small_order`, true of all fourteen small-order encodings: the
+  eight torsion points and the six spellings of them `verify` refuses anyway.
+  td-crypto does, for trust anchors and local issuers. It says nothing of
+  mixed-order keys, and need not: without the discrete log of the prime-order
+  part nobody forges for one, and cofactorless verification only fails some of
+  its own holder's signatures.
 - ECDSA takes strict DER only, with r and s in 1 to n - 1, and a digest of at
-  least 32 bytes: at e = 0 anyone can forge for any key. A digest longer than
+  least 32 bytes. At e = 0 anyone can forge for any key. The empty digest,
+  which is refused, is e = 0 outright; a digest of 32 bytes or more reaches it
+  only by a 2^-256 hash event, its leftmost bits a multiple of n. Signatures are not normalised to low s:
+  signing returns the s it computes and verification takes s or n - s, so
+  anyone holding a signature can make the other, as ECDSA allows and TLS does
+  not mind. A digest longer than
   the order keeps as many leftmost bits as the order has, as FIPS 186-5 says;
   on P-521 that cuts inside a byte, though only a digest of 66 bytes or more,
   which no hash here makes, is long enough to be cut.
@@ -305,9 +319,17 @@ a change to any of these reds:
 - `bcrypt_pbkdf` refuses an empty passphrase, salt or output, zero rounds and more than
   1024 bytes of output, writing nothing.
 
+AES-GCM refuses a plaintext past SP 800-38D's 2^36 - 32 bytes and checks no
+AAD length against SP 800-38D's 2^61 - 1 bytes. The bound is the address
+space: Rust allows a slice up to `isize::MAX` bytes, 2^63 - 1, which is past
+that limit in principle, but no x86-64 or aarch64 process can map 2^61
+bytes, their virtual addresses being at most 57 and 52 bits wide.
+
 `random` reads `/dev/random`, which since Linux 5.6 blocks only until the kernel's
 generator is ready and never after. It exists in td-jail's tree and the builder
-sandbox, and a read that fails refuses rather than falling back.
+sandbox, and a read that fails refuses rather than falling back. It opens the
+path and does not check that what it opened is the character device: the mount
+namespace it runs in is trusted to put the kernel's device there.
 
 ## Speed
 
@@ -387,6 +409,8 @@ inventory and the vendor's instruction documentation.
 | `tests/ssh/mlkem768_openssl.txt` | OpenSSL 3.5.7, with one bit of each ciphertext flipped for its implicit rejection, 16 rows | The `genpkey`, `pkey` and `pkeyutl` commands its header names, over random seeds |
 | `tests/ssh/ed25519_edges.txt` | RFC 8032 5.1.7 answers from a Python reference, with what OpenSSL 3.5.7 said beside them, 28 rows, the eight torsion points among them. Kept beyond Wycheproof for those, and for non-canonical spellings of A | none: copied |
 | `tests/ssh/openssh_ed25519_{a2,a16,chachapoly}.txt` | OpenSSH 10.3's `ssh-keygen`: real files, the only second implementation of `bcrypt_pbkdf` to be had here. Throwaway keys, passphrases in their headers | `ssh-keygen -t ed25519` with the `-a` and `-Z` each header names |
+| `tests/bignum_vectors.txt` | Python big integers in `bignum_vectors.py`: `bignum`'s Montgomery multiplication, addition, subtraction, entry, exit, inversion and exponentiation, as raw limbs, modulo P-256's, P-384's and P-521's field primes and orders at 4, 6 and 9 limbs, over 0, 1, 2, m - 1, m - 2, the halves of m, a value a limb below m and two drawn values, every pair for the binary operations, and entry of m, m + 1 and all ones. 2,298 rows; the curves' own moduli are checked equal to the file's | `python3 -I bignum_vectors.py > bignum_vectors.txt`, from `tests/` |
+| `tests/ecdsa_retry.txt` | Python's `hmac` and big integers in `ecdsa_retry.py`: P-256 signatures after the first nonce candidates are replaced by ones out of range, zero, or making s zero, so the signature comes from RFC 6979's later blocks. The script first reproduces RFC 6979 A.2.5's k and r | `python3 -I ecdsa_retry.py > ecdsa_retry.txt`, from `tests/` |
 | Inline | FIPS 180, FIPS 197, RFC 4231, RFC 5903, RFC 6979, RFC 7748, RFC 8032, RFC 8439 including A.3's reduction edges, and a few values from Python big integers, each marked where it stands | none |
 
 `tests/vectors.rs` and `tests/ssh_vectors.rs` go through the public API, so on a
@@ -403,6 +427,26 @@ rather than quietly leaving a backend untested. On a CPU without the
 instructions, those tests have only the software path to run. A scratch copy with
 `target_arch` renamed compiled only the software paths and passed the crate's suite
 when this landed; that run is a record in the landing commit, as nothing gates it.
+
+So the suite says which hardware backends it reached: `test_corpus`'s
+`hardware_backends_exercised` prints each as exercised or absent, and with
+`TD_PRIMITIVES_REQUIRE_ACCEL=1` fails if any is absent. No gate sets it, as no
+gate host is promised AES-NI, PCLMULQDQ, SHA-NI and AVX2. It is an x86-64
+qualification step, run before a claim rests on the hardware paths; elsewhere
+there are no such backends, and with the variable set it fails by
+construction:
+
+```text
+TD_PRIMITIVES_REQUIRE_ACCEL=1 cargo test --manifest-path td-primitives/Cargo.toml \
+  --lib hardware_backends_exercised -- --nocapture
+```
+
+ECDSA signing's retries cannot be reached through the API: a P-256 candidate
+falls outside [1, n) about once in 2^32, and s = 0 needs a key chosen against
+the nonce. A test-only wrapper replaces the first candidates while the DRBG steps
+past each, and `ecdsa_retry.txt` holds the signatures that must follow. r = 0
+has no such row, as it needs a k whose kG has an x that is a multiple of n,
+which nobody can find; dropping its retry is a mutant no test can see.
 
 The importer drops what the API cannot express and prints the counts: of
 Wycheproof's AES-GCM rows 133 are kept and 183 dropped (other nonce, tag and key

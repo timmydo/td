@@ -4,7 +4,7 @@ big integers, independent of td-primitives, and whether td-crypto admits
 each as a trust anchor or identity key.
 
 Each row is `ALGORITHM FORM VERDICT GROUP KEY`: ALGORITHM is P256, P384,
-P521 or RSA; VERDICT is `accept` or `refuse`; accepted EC rows sharing a
+P521, RSA or Ed25519; VERDICT is `accept` or `refuse`; accepted EC rows sharing a
 GROUP are one point, so their canonical forms must be equal; KEY is the
 SubjectPublicKeyInfo bit string's contents in hex.
 
@@ -137,5 +137,96 @@ def rsa_rows():
     ]
 
 
-for row in rows() + rsa_rows():
+ED_P = 2**255 - 19
+ED_D = -121665 * pow(121666, -1, ED_P) % ED_P
+ED_L = 2**252 + 27742317777372353535851937790883648493
+ED_IDENTITY = (0, 1)
+
+
+def ed_add(a, b):
+    # Complete for edwards25519: a = -1 and d is not a square.
+    p = ED_P
+    t = ED_D * a[0] * b[0] * a[1] * b[1] % p
+    x = (a[0] * b[1] + b[0] * a[1]) * pow(1 + t, -1, p) % p
+    y = (a[1] * b[1] + a[0] * b[0]) * pow(1 - t, -1, p) % p
+    return (x, y)
+
+
+def ed_multiply(point, k):
+    result = ED_IDENTITY
+    while k:
+        if k & 1:
+            result = ed_add(result, point)
+        point = ed_add(point, point)
+        k >>= 1
+    return result
+
+
+def ed_x(y):
+    """The even x of y, or None when y is on no point."""
+    p = ED_P
+    square = (y * y - 1) * pow(ED_D * y * y + 1, -1, p) % p
+    x = pow(square, (p + 3) // 8, p)
+    if x * x % p != square:
+        x = x * pow(2, (p - 1) // 4, p) % p
+    if x * x % p != square:
+        return None
+    return p - x if x & 1 else x
+
+
+def ed_encode(point, sign=None):
+    x, y = point
+    bit = (x & 1) if sign is None else sign
+    return (y | bit << 255).to_bytes(32, "little")
+
+
+def ed_order(point):
+    for order in [1, 2, 4, 8]:
+        if ed_multiply(point, order) == ED_IDENTITY:
+            return order
+    return None
+
+
+def ed25519_rows():
+    base = (ed_x(4 * pow(5, -1, ED_P) % ED_P), 4 * pow(5, -1, ED_P) % ED_P)
+    assert ed_multiply(base, ED_L) == ED_IDENTITY
+    # A point of order 8: the torsion part of the first y on the curve that has one.
+    torsion = None
+    for y in range(2, 100):
+        x = ed_x(y)
+        if x is not None and ed_order(ed_multiply((x, y), ED_L)) == 8:
+            torsion = ed_multiply((x, y), ED_L)
+            break
+    small = [ed_multiply(torsion, i) for i in range(8)]
+    assert len(set(small)) == 8
+    out = []
+    for i, point in enumerate(small):
+        out.append(("Ed25519", f"order-{ed_order(point)}-{i}", "refuse", "-", ed_encode(point)))
+    # The six other spellings of those points, which decoding refuses anyway:
+    # x = 0 with its sign bit set, and y at or past p that reduces to one.
+    for y, sign, form in [
+        (1, 1, "identity-negative-zero"),
+        (ED_P - 1, 1, "order-2-negative-zero"),
+        (ED_P, 0, "y-p"),
+        (ED_P, 1, "y-p-signed"),
+        (ED_P + 1, 0, "y-p-plus-1"),
+        (ED_P + 1, 1, "y-p-plus-1-signed"),
+    ]:
+        out.append(("Ed25519", form, "refuse", "-", (y | sign << 255).to_bytes(32, "little")))
+    key = ed_multiply(base, 0x1234567)
+    out.append(("Ed25519", "prime-order", "accept", "-", ed_encode(key)))
+    # A key with a torsion part is not small: nobody forges for it who does not
+    # hold its discrete log, so admission takes it.
+    mixed = ed_add(key, small[1])
+    assert ed_order(mixed) is None
+    out.append(("Ed25519", "mixed-order", "accept", "-", ed_encode(mixed)))
+    # Admission compares the key and does not decode it; verification refuses
+    # a key on no point.
+    off = next(y for y in range(2, 100) if ed_x(y) is None)
+    out.append(("Ed25519", "no-point", "accept", "-", off.to_bytes(32, "little")))
+    out.append(("Ed25519", "truncated", "refuse", "-", ed_encode(key)[:31]))
+    return out
+
+
+for row in rows() + rsa_rows() + ed25519_rows():
     print(" ".join(row[:4]), row[4].hex())

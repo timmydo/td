@@ -130,3 +130,47 @@ fn detection_agrees_with_the_kernel() {
         all(&["sha_ni", "ssse3", "sse4_1"])
     );
 }
+
+/// Each hardware backend and whether this machine has it. Every test that names a
+/// backend reaches it through the same `detect`, so one absent here ran nowhere.
+#[cfg(target_arch = "x86_64")]
+fn hardware_backends() -> Vec<(&'static str, bool)> {
+    use crate::accel::{AesClmul, Avx2, ShaNi};
+    vec![
+        (
+            "AES-NI and PCLMULQDQ (AES-GCM)",
+            AesClmul::detect().is_some(),
+        ),
+        ("AVX2 (ChaCha20)", Avx2::detect().is_some()),
+        ("SHA-NI (SHA-256)", ShaNi::detect().is_some()),
+    ]
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn hardware_backends() -> Vec<(&'static str, bool)> {
+    vec![
+        ("AES-NI and PCLMULQDQ (AES-GCM)", false),
+        ("AVX2 (ChaCha20)", false),
+        ("SHA-NI (SHA-256)", false),
+    ]
+}
+
+/// Says which hardware backends this run's tests exercised; with
+/// TD_PRIMITIVES_REQUIRE_ACCEL=1, fails unless all of them were. A run on a CPU
+/// without one passes on the software path alone, and only this says so.
+#[test]
+fn hardware_backends_exercised() {
+    let backends = hardware_backends();
+    for (name, present) in &backends {
+        let state = if *present { "exercised" } else { "absent" };
+        eprintln!("td-primitives backend {name}: {state}");
+    }
+    if std::env::var("TD_PRIMITIVES_REQUIRE_ACCEL").as_deref() == Ok("1") {
+        let absent: Vec<&str> = backends
+            .iter()
+            .filter(|(_, present)| !present)
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(absent.is_empty(), "required but absent: {absent:?}");
+    }
+}

@@ -611,6 +611,16 @@ pub mod p256 {
         /// A DER ECDSA signature over SHA-256 of `message`, with RFC 6979's
         /// deterministic nonce, so a failed RNG cannot repeat one.
         pub fn sign_sha256(&self, message: &[u8]) -> Result<Vec<u8>, Refused> {
+            self.sign_sha256_with(message, |_, block| block)
+        }
+
+        /// `sign_sha256`, with each candidate passed through `replace`, which a
+        /// test uses to force the retries no reachable nonce takes.
+        fn sign_sha256_with(
+            &self,
+            message: &[u8],
+            replace: impl Fn(usize, [u8; 32]) -> [u8; 32],
+        ) -> Result<Vec<u8>, Refused> {
             let curve = p256_curve();
             let digest = Sha256::digest(message);
             let e = curve.digest_scalar(&digest)?;
@@ -620,8 +630,8 @@ pub mod p256 {
             Curve::encode_coordinate(&e, &mut e_bytes);
             let mut nonces = Rfc6979::new(&secret_bytes, &e_bytes);
             ct::zero(&mut secret_bytes);
-            for _ in 0..64 {
-                let mut candidate = nonces.next_block();
+            for attempt in 0..64 {
+                let mut candidate = replace(attempt, nonces.next_block());
                 let Some(mut k) = from_be::<4>(&candidate) else {
                     continue;
                 };
@@ -711,6 +721,19 @@ pub mod p256 {
             ct::zero(&mut self.k);
             ct::zero(&mut self.v);
         }
+    }
+
+    /// `sign_sha256` with the first candidates replaced, the DRBG still stepping
+    /// past each.
+    #[cfg(test)]
+    pub(super) fn sign_replacing(
+        key: &SecretKey,
+        message: &[u8],
+        replaced: &[[u8; 32]],
+    ) -> Result<Vec<u8>, Refused> {
+        key.sign_sha256_with(message, |attempt, block| {
+            replaced.get(attempt).copied().unwrap_or(block)
+        })
     }
 
     #[cfg(test)]
@@ -814,7 +837,7 @@ pub mod p521 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
     use super::{p256, p256_curve, p384, p384_curve, p521_curve, Curve, Digest, Sha256};
     use crate::bignum::zero_mask;
 
@@ -1011,6 +1034,62 @@ mod tests {
             p256::third_nonce(&secret, &digest).to_vec(),
             hex("94936c5c23686cf551e28906d60e9f6cd21861b504581881fe49cf741d6581c0")
         );
+    }
+
+    /// bignum's oracle rows are against these curves' moduli, not copies of them.
+    #[test]
+    fn curve_moduli_are_the_bignum_corpus_moduli() {
+        let mut seen = 0;
+        for line in include_str!("../tests/bignum_vectors.txt").lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let ["modulus", name, _, want] = fields[..] else {
+                continue;
+            };
+            let limbs: &[u64] = match name {
+                "P256-p" => &p256_curve().p.m,
+                "P256-n" => &p256_curve().n.m,
+                "P384-p" => &p384_curve().p.m,
+                "P384-n" => &p384_curve().n.m,
+                "P521-p" => &p521_curve().p.m,
+                "P521-n" => &p521_curve().n.m,
+                _ => panic!("unknown modulus {name}"),
+            };
+            let mut got = vec![0u8; limbs.len() * 8];
+            crate::bignum::to_be(limbs, &mut got);
+            assert_eq!(got, hex(want), "{name}");
+            seen += 1;
+        }
+        assert_eq!(seen, 6);
+    }
+
+    /// The signing loop's retries, with candidates no reachable nonce gives put in
+    /// place of the first: out of range, zero, and one making s zero. Answers from
+    /// tests/ecdsa_retry.py, which says how each row is built.
+    #[test]
+    fn signing_retries_past_a_refused_candidate() {
+        let mut rows = 0;
+        for line in include_str!("../tests/ecdsa_retry.txt").lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [name, secret, replaced, want] = fields[..] else {
+                panic!("malformed row: {line}");
+            };
+            let key = p256::SecretKey::from_bytes(&hex(secret).try_into().unwrap()).unwrap();
+            let replaced: Vec<[u8; 32]> = replaced
+                .split(',')
+                .map(|block| hex(block).try_into().unwrap())
+                .collect();
+            let signature = p256::sign_replacing(&key, b"sample", &replaced).unwrap();
+            assert_eq!(signature, hex(want), "{name}");
+            let digest = Sha256::digest(b"sample");
+            let public = key.public_key().unwrap();
+            assert!(p256::verify(&public, &digest, &signature).is_ok(), "{name}");
+            rows += 1;
+        }
+        assert_eq!(rows, 3);
+        // A DRBG that never yields a usable candidate ends in a refusal, not a loop.
+        let key = p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+        assert!(p256::sign_replacing(&key, b"sample", &[[0; 32]; 64]).is_err());
+        assert!(p256::sign_replacing(&key, b"sample", &[[0; 32]; 63]).is_ok());
     }
 
     #[test]

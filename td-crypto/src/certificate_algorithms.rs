@@ -219,8 +219,13 @@ pub(super) fn canonical_key(
             point = p521::uncompressed(bytes).map_err(invalid)?;
             &point
         }
-        // Any 32 bytes, as the key is only compared here.
-        ED25519_KEY if bytes.len() == 32 => bytes,
+        // Compared here, not decoded. Verification is cofactorless and takes a
+        // small-order key, which would verify a forgery of anyone's making, so
+        // every spelling of one is refused. A mixed-order key is not small.
+        ED25519_KEY => match <&[u8; 32]>::try_from(bytes) {
+            Ok(key) if !td_primitives::curve25519::ed25519::is_small_order(key) => bytes,
+            _ => return Err(TlsError::Invalid),
+        },
         RSA_KEY => {
             certificate.rsa_size()?;
             td_primitives::rsa::PublicKey::from_der(bytes).map_err(invalid)?;
@@ -282,7 +287,8 @@ mod tests {
     /// independent of td-primitives: EC points valid, off the curve, with a
     /// coordinate of p, without a square root, hybrid, at infinity and
     /// truncated, in both forms; RSA keys at and past each modulus and
-    /// exponent bound.
+    /// exponent bound; Ed25519's fourteen small-order spellings, refused, and
+    /// a prime-order, a mixed-order and an undecodable key, taken.
     #[test]
     fn certificate_key_admission_known_answers() {
         let mut canonical = std::collections::BTreeMap::new();
@@ -298,6 +304,7 @@ mod tests {
                 "P384" => P384_KEY,
                 "P521" => P521_KEY,
                 "RSA" => RSA_KEY,
+                "Ed25519" => ED25519_KEY,
                 _ => panic!("unknown algorithm {name}"),
             };
             let certificate = crate::certificate::Certificate::for_key(algorithm, &key);
@@ -306,7 +313,7 @@ mod tests {
             match verdict {
                 "accept" => {
                     let owned = result.unwrap_or_else(|e| panic!("{context}: {e:?}"));
-                    if name == "RSA" {
+                    if name == "RSA" || name == "Ed25519" {
                         assert!(owned.ends_with(&key), "{context}");
                     } else {
                         let width = match name {
@@ -329,7 +336,7 @@ mod tests {
             }
             rows += 1;
         }
-        assert_eq!(rows, 49);
+        assert_eq!(rows, 67);
         // A point's other y is another key.
         for (group, owned) in &canonical {
             if let Some(base) = group.strip_suffix("-neg") {
