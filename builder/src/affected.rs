@@ -3326,6 +3326,20 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
+        [op] if op == "crypto-portable-emulated-runtime-inner" => {
+            match crate::crypto_isolated::emulated_runtime_inner() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op, flag, artifact]
+            if op == "crypto-portable-emulated-runtime" && flag == "--artifact" =>
+        {
+            match crate::crypto_isolated::emulated_runtime(&root, Path::new(artifact)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         [op] if op == "crypto-portable-build-inner" => {
             match crate::crypto_isolated::build_inner() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -3347,7 +3361,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             match crate::crypto_isolated::cross_build(&root, Path::new(archives)) {
                 Ok(path) => {
                     println!(
-                        "aarch64 cross-compiled artifact (runtime not tested by this command): {}",
+                        "aarch64 cross-compiled artifact (run it with crypto-portable-emulated-runtime --artifact): {}",
                         path.display()
                     );
                     ExitCode::SUCCESS
@@ -3420,6 +3434,9 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
             eprintln!(
                 "       td-builder gate-crates crypto-portable-cross-build --archives DIRECTORY"
+            );
+            eprintln!(
+                "       td-builder gate-crates crypto-portable-emulated-runtime --artifact DIRECTORY"
             );
             eprintln!(concat!(
                 "       td-builder gate-crates native-compositor ",

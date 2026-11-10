@@ -111,8 +111,18 @@ fn exercise(version: &str, next: bool, bad_pin: bool, bad_peer: bool, starttls: 
     listener.set_nonblocking(true).unwrap();
     let executable = std::env::var_os("TD_MTA_TEST_TLS_PEER")
         .unwrap_or_else(|| panic!("run mail tests through td-builder crypto-cargo"));
+    // Under user-mode emulation the peer, built for the same target, runs
+    // through the same emulator.
+    let mut command = match std::env::var_os("TD_MTA_TEST_PEER_EMULATOR") {
+        Some(emulator) => {
+            let mut command = Command::new(emulator);
+            command.arg(executable);
+            command
+        }
+        None => Command::new(executable),
+    };
     let mut peer = Peer(
-        Command::new(executable)
+        command
             .args([
                 "--exact",
                 "tls_peer_tests::gateway_client_process",

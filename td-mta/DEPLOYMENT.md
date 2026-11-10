@@ -273,7 +273,9 @@ On the build host, use the pinned archive preparation and isolated build in
 5.12 or newer for its namespace sandbox; the x86-64 standalone runtime
 targets Linux 5.6 or newer. An aarch64 cross-build is also available through
 `crypto-portable-cross-build`; its successful build alone does not qualify
-the runtime. For Amazon Linux 2023 on Graviton, select that ARM artifact;
+the runtime, and `crypto-portable-emulated-runtime` runs its functional
+cases under QEMU user-mode emulation, which is functional evidence only.
+For Amazon Linux 2023 on Graviton, select that ARM artifact;
 on x86-64, select the ordinary portable artifact. Both use static musl and
 carry their own matching debug companion. Native configuration, STARTTLS,
 local delivery and restart validation are still required on the deployment

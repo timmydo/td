@@ -157,6 +157,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             .env_remove("TD_MTA_TEST_MAIL")
             .env_remove("TD_MTA_TEST_FETCH")
             .env_remove("TD_MTA_TEST_TLS_PEER")
+            .env_remove("TD_MTA_TEST_PEER_EMULATOR")
             .env_remove("TD_MTA_PORTABLE_CLI")
             .env(crate::stage0::target_linker_var(&host), &cc)
             .stdin(Stdio::null());

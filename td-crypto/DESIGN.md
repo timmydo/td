@@ -1081,8 +1081,9 @@ M03b2d2 adds the bounded local TLS smoke specified in PORTABLE.md.
 The aarch64 cross-build uses the separately pinned target library and the
 build root's Debian aarch64 cross binutils described there. It checks
 static ELF architecture
-and API confinement but reports runtime untested; successful compilation
-is not x86-64 runtime or resource qualification.
+and API confinement; PORTABLE.md's separate emulated runtime runs its
+functional cases under QEMU user-mode emulation, functional evidence only.
+Neither is x86-64 runtime or resource qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls is a direct dependency of td-crypto and of td-tls-provider, with the
 same pinned line and no built-in backend. td-primitives supplies bulk digests,
@@ -1282,8 +1283,9 @@ compressed and uncompressed aliases comparing equal, and RSA keys at and
 past each modulus and exponent bound.
 
 The same tests run on the portable musl artifact as named smoke cases
-(PORTABLE.md); its aarch64 cross-build compiles them. This is functional
-evidence. Allocation, stack and RSS evidence is in td-mta/RESOURCES.md and
+(PORTABLE.md); its aarch64 cross-build compiles them, and the emulated
+aarch64 runtime runs them under qemu-aarch64. This is functional evidence.
+Allocation, stack and RSS evidence is in td-mta/RESOURCES.md and
 PORTABLE.md; F04's independent cryptographic and exact-artifact
 side-channel review and the M07 mail/TLS service integration remain open
 (td-mta/IMPLEMENTATION.md F04).

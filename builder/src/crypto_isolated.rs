@@ -1469,6 +1469,324 @@ fn cli_evidence(output: &str) -> Result<()> {
     Ok(())
 }
 
+/// `td-crypto-smoke`'s named functional cases, each run in its own process.
+const CRYPTO_SMOKE_CASES: &[&str] = &[
+    "backend_tests::keys_aws_lc_wrote_load_and_sign_here",
+    "backend_tests::keys_written_here_have_the_shape_aws_lc_loaded",
+    "backend_tests::policy_verifiers_take_exactly_their_own_signatures",
+    "backend_tests::committed_certificate_paths_verify_under_the_policy",
+    "backend_tests::the_loader_checks_scalar_range_and_embedded_point",
+    "sha256::tests::known_answers_and_fragmented_updates",
+    "sha256::tests::differential_padding_blocks_and_every_split",
+    "sha256::tests::refusal_retires_and_clears_state",
+    "sha256::tests::inline_storage_and_fixed_debug",
+    "bulk_sha256::tests::bulk_matches_owned_digest_across_padding_and_chunk_boundaries",
+    "bulk_sha256::tests::length_refusal_retires_native_state_before_update",
+    "bulk_sha256::tests::returned_error_and_unwind_retire_partially_updated_state",
+    "entropy::tests::local_randomness_smoke",
+    "entropy::tests::construction_requires_nonempty_successful_initialization",
+    "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice",
+    "pem::tests::canonical_base64_and_transactional_output",
+    "pem::tests::certificate_decoding_matches_independent_pem_reader",
+    "pem::tests::certificate_envelopes_and_retry",
+    "pem::tests::certificate_limits_and_der_envelopes",
+    "pem::tests::p256_pem_loading_and_refusals",
+    "pem::tests::branch_free_sextet_matches_every_byte",
+    "pem::tests::branch_free_base64_classes_padding_and_refusals",
+    "pem::tests::branch_free_base64_matches_the_reference_on_random_input",
+    "der::tests::certificate_der_lengths_bit_strings_and_oids",
+    "der::tests::certificate_calendar_boundaries",
+    "certificate_algorithms::tests::certificate_algorithm_inventory_fails_closed",
+    "certificate_algorithms::tests::certificate_key_admission_known_answers",
+    "identity::tests::local_identity_owns_material_and_checks_validity",
+    "identity::tests::narrowed_identity_shares_material_and_cannot_expand_or_revive_bindings",
+    "identity::tests::identity_refuses_wrong_key_name_time_and_order",
+    "identity::tests::local_identity_enforces_key_usage_and_extensions",
+    "identity::tests::local_identity_name_and_extension_limits",
+    "identity::tests::local_identity_chain_constraints_and_maximum_depth",
+    "identity::tests::local_identity_accepts_rsa_issuer_and_refuses_unsupported_algorithms",
+    "identity::tests::identity_admission_unwind_drops_unpublished_state",
+    "identity::tests::local_identity_metadata_bounds_and_malformed_values",
+    "trust::tests::private_trust_replaces_public_and_other_private_roots",
+    "trust::tests::private_trust_bundle_limits_duplicates_and_atomic_refusal",
+    "trust::tests::private_trust_anchor_policy_and_ignored_self_signature",
+    "trust::tests::public_trust_inventory_and_source_are_fixed",
+    "trust::tests::trust_construction_unwind_drops_unpublished_state",
+    "provider::tests::factory_digest_and_fixed_comparison",
+    "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer",
+    "provider::tests::malformed_der_and_inconsistent_keys_are_refused",
+    "provider::tests::generated_keys_and_signatures_pass_independent_verification",
+    "provider::tests::generation_maps_random_failure_and_exhausted_draws",
+    "provider::tests::generated_documents_differ",
+    "provider::tests::capacity_failure_and_retired_keys_preserve_caller_output",
+    "provider::tests::shared_key_serializes_success_and_terminal_failure",
+    "sha256_oracle::tests::empty_input",
+    "sha256_oracle::tests::abc",
+    "sha256_oracle::tests::two_block_message",
+    "sha256_oracle::tests::million_a",
+    "p256_oracle::tests::independent_modular_arithmetic_covers_carries_and_borrows",
+    "p256_oracle::tests::nist_ecdh_and_openssl_scalar_boundaries_match",
+    "p256_oracle::tests::nist_signature_acceptance_and_refusal_and_rare_x_reduction",
+    "p256_oracle::tests::nist_public_key_validation_preserves_overwide_rejections",
+    "p256_oracle::tests::scalar_and_coordinate_admission_never_reduce_untrusted_values",
+    "p256_oracle::tests::exceptional_point_cases_and_projective_representations",
+    "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused",
+    "tests::explicit_provider_and_roots_construct_without_global_default",
+    "provider::tests::signature_transform_failure_retires_before_key_restore",
+    "tls_signer::tests::canonical_tls_signature_encoding_boundaries",
+    "tls_signer::tests::tls_signer_uses_owned_key_and_hashes_once",
+    "tls_signer::tests::shared_tls_signers_observe_transform_retirement",
+    "identity::tests::retained_tls_identity_completes_handshakes_and_survives_remote_refusal",
+    "identity::tests::retained_tls_identity_shares_key_lifecycle",
+    "tls_clock::tests::injected_clock_missing_time_and_shared_retirement",
+    "tls_clock::tests::injected_clock_serializes_and_drops_panicking_source",
+    "tls_client::tests::client_configuration_pins_policy_and_redacts_state",
+    "tls_client::tests::client_configuration_verifies_trust_name_alpn_and_full_handshakes",
+    "tls_client::tests::client_configuration_clock_errors_reach_handshake_and_open_tickets",
+    "tls_client::tests::client_verifier_checks_chain_bounds_before_path_work",
+    "tls_client::tests::tls12_session_save_can_ignore_transient_clock_failure",
+    "tls_server::tests::server_configuration_bounds_bindings_roles_and_private_trust",
+    "tls_server::tests::server_configuration_routes_names_and_refuses_resumption",
+    "tls_server::tests::server_configuration_pins_disabled_backend_features",
+    "tls_server::tests::server_configuration_requires_private_client_certificates",
+    "tls_server::tests::server_configuration_checks_cold_material_and_supplied_verifier_time",
+    "tls_server::tests::backend_acceptor_discards_ip_literal_sni_before_routing",
+    "tls_server::tests::server_configuration_selects_distinct_owned_identities",
+    "tls_server::tests::server_configuration_omits_oversized_ca_hint_lists",
+    "tls_server::tests::server_configuration_refuses_offered_resumption",
+    "tls_session::tests::client_session_fragmented_handshake_and_simultaneous_writes",
+    "tls_session::tests::client_session_retires_handshake_output_reserve_and_refuses_backend_growth",
+    "tls_session::tests::client_session_retains_ignored_tls12_clock_failure",
+    "tls_session::tests::client_session_checks_time_without_native_time_requests",
+    "tls_session::tests::client_session_close_halves_and_transport_eof",
+    "tls_session::tests::client_session_tls12_alert_refuses_pending_ciphertext_and_socket_tail",
+    "tls_session::tests::client_session_never_emits_after_close_or_reuses_failed_state",
+    "tls_session::tests::client_session_unwind_consumes_state_and_shared_clock_failure_fences_reuse",
+    "tls_session::tests::client_session_unread_plaintext_blocks_without_consuming_next_record",
+    "tls_session::tests::client_session_name_verification_maps_and_retires_without_output",
+    "tls_session::tests::client_session_key_update_response_advances_without_application_write",
+    "tls_session::tests::client_session_handshake_reassembly_counts_retained_record_headers",
+    "tls_session::tests::client_session_errors_are_fixed_and_do_not_export_backend_diagnostics",
+    "tls_session::tests::client_session_ticket_clock_failure_after_finished_is_terminal",
+    "tls_session::tests::client_session_ticket_flight_capacity_is_terminal_after_finished",
+    "tls_session::tests::client_session_unfinished_cancellation_eof_and_alert_refuse_evidence",
+    "session_clock::tests::observers_isolate_transient_errors_and_share_retirement",
+    "tls_record::tests::record_bounds_track_protection_not_finished",
+    "tls_record::tests::record_requires_one_complete_exact_frame",
+    "tls_session::tests::client_session_tls12_hello_request_never_adds_post_close_output",
+    "tls_session::tests::client_session_tls12_simultaneous_close_pins_pending_output_refusal",
+    "tls_hello::tests::raw_hello_fragmentation_names_and_retry",
+    "tls_hello::tests::raw_hello_refuses_malformed_sni_before_completion",
+    "tls_hello::tests::raw_hello_fixed_state_skips_large_extensions_and_bounds_messages",
+    "tls_session::tests::server::server_session_public_round_trip_and_evidence",
+    "tls_session::tests::server::server_session_refuses_raw_ip_sni_across_record_fragments",
+    "tls_session::tests::server::server_session_mandatory_client_proof_and_typed_refusals",
+    "tls_session::tests::server::server_session_valid_retry_and_fragmented_raw_retry_sni_refusal",
+    "tls_session::tests::server::server_session_public_pair_tiny_pipes_simultaneous_writes_and_close",
+    "tls_session::tests::server::server_session_selected_validity_and_shared_key_retirement",
+    "tls_session::tests::server::server_session_clock_failures_and_acceptor_unwind_retire_owned_state",
+    "tls_policy::tests::exact_tls_algorithm_inventory",
+    "tls_policy::tests::handshake_mapping_drift_is_refused",
+    "tls_policy::tests::excluded_certificate_signature_is_refused",
+    "tls_smoke::explicit_policy_negotiates_classical_groups_and_suites",
+    "tls_smoke::explicit_policy_refuses_excluded_peer_algorithms",
+    "tls_smoke::tls12_local_round_trip",
+    "tls_smoke::tls13_local_round_trip",
+    "tls_smoke::rejects_wrong_server_name",
+    "tls_smoke::rejects_untrusted_chain",
+    "tls_smoke::rejects_expired_certificate",
+    "tls_smoke::rejects_malformed_record",
+    "tls_smoke::rejects_bad_certificate_signature",
+    "tls_smoke::rejects_tampered_ciphertext",
+    "tls_smoke::tls12_mutual_authentication",
+    "tls_smoke::tls13_mutual_authentication",
+    "tls_smoke::mutual_authentication_requires_certificate",
+    "tls_smoke::mutual_authentication_refuses_unknown_issuer",
+    "tls_smoke::mutual_authentication_refuses_expired_certificate",
+    "tls_smoke::mutual_authentication_refuses_server_only_usage",
+    "tls_smoke::mutual_authentication_refuses_bad_signature",
+    "tls_smoke::mutual_authentication_refuses_mismatched_key_before_connect",
+];
+
+/// `td-mta-format-smoke`'s named functional cases, each run in its own process.
+const FORMAT_SMOKE_CASES: &[&str] = &[
+    "provider_hashes_blob_fixture",
+    "provider_hashes_import_snapshot_fixtures",
+];
+
+/// `td-mta-config-smoke`'s ordinary cases: the stack probes' scenarios run
+/// without a measured stack.
+const CONFIG_SMOKE_CASES: &[&str] = &["host_loader_scenarios", "host_materialized_scenarios"];
+
+/// `td-mta-transport-smoke`'s named functional cases, each run in its own process.
+const TRANSPORT_SMOKE_CASES: &[&str] = &[
+    "generations::tests::current_retired_and_candidate_share_two_slots_before_construction",
+    "generations::tests::failed_stale_and_foreign_candidates_preserve_active_state_and_owners",
+    "generations::tests::final_worker_release_destroys_payload_before_returning_capacity",
+    "generations::tests::racing_preparation_and_release_never_construct_a_third_live_payload",
+    "tls_policy::tests::compiled_policy_roles_bind_names_trust_and_generation_ids",
+    "tls_policy::tests::queued_and_native_reservations_retain_capacity_and_recover_exact_buffers",
+    "tls_policy::tests::gateway_comparison_survives_reordering_but_rejects_policy_or_binding_changes",
+    "tls_policy::tests::material_errors_never_publish_and_acme_requests_are_explicit",
+    "tls_policy::tests::material_reader_caps_bytes_eof_and_interrupted_work",
+    "tls_policy::tests::compiled_configs_enforce_relay_trust_protocol_and_gateway_client_auth",
+    "tls_policy::tests::https_profiles_narrow_shared_smtp_names_before_native_routing",
+    "tls_policy::tests::io_tests::handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers",
+    "tls_policy::tests::io_tests::authorized_connections_release_handshake_capacity_and_retain_generation_until_teardown",
+    "tls_policy::tests::io_tests::gateway_without_client_certificate_never_exposes_mail_proof_and_recovers_permits",
+    "tls_policy::tests::io_tests::handshake_deadline_can_only_tighten_and_failure_is_sticky",
+    "tls_policy::tests::io_tests::changed_gateway_policy_aborts_pending_connection_and_releases_capacity",
+    "tls_policy::tests::io_tests::established_clock_failure_clears_cached_authorization_and_aborts_socket",
+    "tls_policy::tests::client_tests::client_only_acme_bootstrap_never_opens_server_material",
+    "tls_policy::tests::client_tests::expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses",
+    "tls_policy::tests::client_tests::client_generation_transitions_to_complete_within_the_same_two_slots",
+    "tls_policy::starttls::tests::starttls_reply_requires_short_writes_and_complete_flush",
+    "tls_policy::starttls::tests::starttls_reply_refuses_invalid_write_counts_and_flush_failure",
+    "tls_policy::tests::starttls_tests::server_starttls_flushes_220_before_handoff_and_verifies_real_tls",
+    "tls_policy::tests::starttls_tests::server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands",
+    "tls_policy::tests::starttls_tests::server_starttls_deadlines_clock_refusal_and_cancel_release_reservations",
+    "tls_policy::tests::gateway_process_tests::gateway_starttls_process_requires_verified_pin_after_plaintext_reply",
+    "smtp_wire::tests::ehlo_offer_requires_a_complete_advertisement_and_no_tail",
+    "smtp_wire::tests::ehlo_offer_handles_fragmentation_and_skips_malformed_extensions",
+    "tls_policy::tests::client_starttls_tests::client_starttls_and_server_upgrade_verify_real_tls",
+    "tls_policy::tests::client_starttls_tests::client_starttls_refuses_bad_replies_and_accepts_fragmented_220",
+    "tls_policy::tests::client_starttls_tests::client_starttls_roles_scratch_deadlines_and_cancel_return_buffers",
+    "smtp_wire::tests::line_split_at_every_boundary_retains_exact_tail",
+    "smtp_wire::tests::strict_line_framing_is_terminal_after_failure",
+    "smtp_wire::tests::control_line_counts_crlf_and_clears_only_its_reservation",
+    "smtp_wire::tests::reply_syntax_accepts_bare_codes_and_refuses_ambiguous_separators",
+    "smtp_wire::tests::multiline_replies_require_one_code_and_leave_the_next_reply_unread",
+    "smtp_wire::tests::fragmented_220_reply_stops_before_plaintext_or_record_tail",
+    "smtp_wire::tests::reply_aggregate_cap_includes_all_lines_and_the_final_crlf",
+    "smtp_wire::tests::ehlo_greeting_is_never_a_starttls_advertisement",
+    "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins",
+    "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer",
+    "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material",
+    "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback",
+    "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server",
+    "tls_admission::tests::capacities_saturate_and_reuse_without_losing_live_reservations",
+    "tls_admission::tests::concurrent_reservations_and_worker_returns_preserve_the_global_cap",
+    "tls_admission::tests::overlapping_release_and_reservation_never_over_admit_or_leak_capacity",
+    "tls_admission::tests::refusal_and_pool_drop_preserve_linear_cleanup",
+    "clock::tests::runtime_clock_keeps_utc_and_monotonic_domains_separate",
+    "clock::tests::tls_clock_conversion_never_falls_back_after_refusal",
+    "transport::tests::tcp_bounded_io_actual_peer_and_unbuffered_flush",
+    "transport::tests::tcp_peer_eof_preserves_write_half_and_local_close_preserves_read_half",
+    "transport::tests::tcp_abort_drop_and_errors_fence_both_directions",
+    "tls_io::tests::final_handshake_write_cannot_publish_past_its_deadline",
+    "tls_io::tests::flush_backpressure_withholds_finished_and_bad_transport_counts_abort",
+    "tls_io::tests::public_tls_round_trip_with_tiny_pipes_and_independent_close",
+    "tls_io::tests::simultaneous_full_chunks_progress_without_growing_wire_storage",
+    "tls_io::tests::deadlines_and_missing_tls_time_discard_evidence_and_never_revive",
+    "tls_io::tests::malformed_records_truncation_and_constructor_refusal_close_the_transport",
+    "tls_io::tests::public_crypto_sessions_exchange_mail_bytes_over_local_tcp",
+    "tls_io::tests::established_sessions_outlive_handshake_deadline_and_preserve_backpressure",
+    "tls_io::tests::established_tcp_eof_without_tls_close_is_terminal_even_at_record_boundary",
+    "tls_io::tests::returned_buffers_are_reused_and_close_paths_keep_exclusive_ownership",
+    "tls_io::tests::constructor_refusals_return_moved_pool_buffers_without_logging_them",
+];
+
+/// Ignored resource probes the clean x86-64 runtime runs by name; they
+/// measure x86-64 stack mappings and refuse other targets.
+const STACK_PROBES: &[(&str, &str)] = &[
+    ("td-mta-config-smoke", "portable_loader_stack"),
+    ("td-mta-config-smoke", "portable_materialized_stack"),
+    (
+        "td-mta-transport-smoke",
+        "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack",
+    ),
+];
+
+/// The functional cases, by executable, that every architecture's runtime
+/// runs by exact name.
+pub(crate) const FUNCTIONAL_CASES: &[(&str, &[&str])] = &[
+    ("td-crypto-smoke", CRYPTO_SMOKE_CASES),
+    ("td-mta-format-smoke", FORMAT_SMOKE_CASES),
+    ("td-mta-config-smoke", CONFIG_SMOKE_CASES),
+    ("td-mta-transport-smoke", TRANSPORT_SMOKE_CASES),
+];
+
+/// The clean x86-64 runtime's cases: every functional case, then the stack
+/// probes, as (executable, exact name, ignored).
+fn portable_cases() -> impl Iterator<Item = (&'static str, &'static str, bool)> {
+    FUNCTIONAL_CASES
+        .iter()
+        .flat_map(|(binary, cases)| cases.iter().map(move |case| (*binary, *case, false)))
+        .chain(
+            STACK_PROBES
+                .iter()
+                .map(|(binary, case)| (*binary, *case, true)),
+        )
+}
+
+/// The aarch64 functional cases under the mounted emulator, one process per
+/// case. The resource probes are x86-64 only and are not run.
+pub(crate) fn emulated_runtime_inner() -> Result<()> {
+    require_namespace(&[
+        EMULATOR,
+        "/output",
+        "/artifacts/td-mta",
+        "/artifacts/td-crypto-smoke",
+        "/artifacts/td-mta-config-smoke",
+        "/artifacts/td-mta-format-smoke",
+        "/artifacts/td-mta-transport-smoke",
+    ])?;
+    let mut command = Command::new(EMULATOR);
+    command
+        .args(["/artifacts/td-mta", "--version"])
+        .env_clear()
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    if bounded_output(&mut command, "arm-version", 4096, 120)? != "td-mta 0.1.0\n" {
+        return Err("emulated aarch64 binary returned an unexpected version".into());
+    }
+    println!("aarch64 emulated: PASS td-mta --version");
+    let mut passed = 0usize;
+    for (index, (binary, case)) in FUNCTIONAL_CASES
+        .iter()
+        .flat_map(|(binary, cases)| cases.iter().map(move |case| (*binary, *case)))
+        .enumerate()
+    {
+        let started = Instant::now();
+        let mut command = Command::new(EMULATOR);
+        command
+            .arg(format!("/artifacts/{binary}"))
+            .args(["--exact", case, "--test-threads=1"])
+            .env_clear()
+            .stdin(Stdio::null());
+        if binary == "td-mta-transport-smoke" {
+            command
+                .env("TD_MTA_TEST_TLS_PEER", "/artifacts/td-crypto-smoke")
+                .env("TD_MTA_TEST_PEER_EMULATOR", EMULATOR);
+        }
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("arm-{binary}-{index}");
+        let output = bounded_output(&mut command, &name, 64 * 1024, 300).inspect_err(|_| {
+            println!("aarch64 emulated: FAIL {binary} {case}");
+            let path = Path::new("/output").join(format!("{name}.log"));
+            if let Ok(log) = read_output(&path, &name, 64 * 1024) {
+                eprintln!("emulated aarch64 failure in {case}:\n{log}");
+            }
+        })?;
+        if !output
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"))
+        {
+            println!("aarch64 emulated: FAIL {binary} {case} (no single passing test)");
+            return Err(format!("emulated aarch64 case did not execute: {case}"));
+        }
+        passed += 1;
+        println!(
+            "aarch64 emulated: PASS {binary} {case} ({:.2}s)",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    println!(
+        "aarch64 emulated runtime: version and all {passed} named functional cases passed under user-mode emulation; the x86-64 stack, allocation and RSS probes were not run"
+    );
+    Ok(())
+}
+
 pub(crate) fn runtime_inner() -> Result<()> {
     require_namespace(&[
         "/artifacts/td-mta",
@@ -1521,224 +1839,16 @@ pub(crate) fn runtime_inner() -> Result<()> {
     if version != "td-mta 0.1.0\n" {
         return Err("portable binary returned an unexpected version".into());
     }
-    for (index, (binary, case, ignored)) in [
-        ("td-crypto-smoke", "backend_tests::keys_aws_lc_wrote_load_and_sign_here", false),
-        ("td-crypto-smoke", "backend_tests::keys_written_here_have_the_shape_aws_lc_loaded", false),
-        ("td-crypto-smoke", "backend_tests::policy_verifiers_take_exactly_their_own_signatures", false),
-        ("td-crypto-smoke", "backend_tests::committed_certificate_paths_verify_under_the_policy", false),
-        ("td-crypto-smoke", "backend_tests::the_loader_checks_scalar_range_and_embedded_point", false),
-        ("td-crypto-smoke", "sha256::tests::known_answers_and_fragmented_updates", false),
-        ("td-crypto-smoke", "sha256::tests::differential_padding_blocks_and_every_split", false),
-        ("td-crypto-smoke", "sha256::tests::refusal_retires_and_clears_state", false),
-        ("td-crypto-smoke", "sha256::tests::inline_storage_and_fixed_debug", false),
-        ("td-crypto-smoke", "bulk_sha256::tests::bulk_matches_owned_digest_across_padding_and_chunk_boundaries", false),
-        ("td-crypto-smoke", "bulk_sha256::tests::length_refusal_retires_native_state_before_update", false),
-        ("td-crypto-smoke", "bulk_sha256::tests::returned_error_and_unwind_retire_partially_updated_state", false),
-        ("td-crypto-smoke", "entropy::tests::local_randomness_smoke", false),
-        ("td-crypto-smoke", "entropy::tests::construction_requires_nonempty_successful_initialization", false),
-        ("td-crypto-smoke", "entropy::tests::synthetic_partial_error_clears_the_entire_caller_slice", false),
-        ("td-crypto-smoke", "pem::tests::canonical_base64_and_transactional_output", false),
-        ("td-crypto-smoke", "pem::tests::certificate_decoding_matches_independent_pem_reader", false),
-        ("td-crypto-smoke", "pem::tests::certificate_envelopes_and_retry", false),
-        ("td-crypto-smoke", "pem::tests::certificate_limits_and_der_envelopes", false),
-        ("td-crypto-smoke", "pem::tests::p256_pem_loading_and_refusals", false),
-        ("td-crypto-smoke", "pem::tests::branch_free_sextet_matches_every_byte", false),
-        ("td-crypto-smoke", "pem::tests::branch_free_base64_classes_padding_and_refusals", false),
-        ("td-crypto-smoke", "pem::tests::branch_free_base64_matches_the_reference_on_random_input", false),
-        ("td-crypto-smoke", "der::tests::certificate_der_lengths_bit_strings_and_oids", false),
-        ("td-crypto-smoke", "der::tests::certificate_calendar_boundaries", false),
-        ("td-crypto-smoke", "certificate_algorithms::tests::certificate_algorithm_inventory_fails_closed", false),
-        ("td-crypto-smoke", "certificate_algorithms::tests::certificate_key_admission_known_answers", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_owns_material_and_checks_validity", false),
-        ("td-crypto-smoke", "identity::tests::narrowed_identity_shares_material_and_cannot_expand_or_revive_bindings", false),
-        ("td-crypto-smoke", "identity::tests::identity_refuses_wrong_key_name_time_and_order", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_enforces_key_usage_and_extensions", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_name_and_extension_limits", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_chain_constraints_and_maximum_depth", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_accepts_rsa_issuer_and_refuses_unsupported_algorithms", false),
-        ("td-crypto-smoke", "identity::tests::identity_admission_unwind_drops_unpublished_state", false),
-        ("td-crypto-smoke", "identity::tests::local_identity_metadata_bounds_and_malformed_values", false),
-        ("td-crypto-smoke", "trust::tests::private_trust_replaces_public_and_other_private_roots", false),
-        ("td-crypto-smoke", "trust::tests::private_trust_bundle_limits_duplicates_and_atomic_refusal", false),
-        ("td-crypto-smoke", "trust::tests::private_trust_anchor_policy_and_ignored_self_signature", false),
-        ("td-crypto-smoke", "trust::tests::public_trust_inventory_and_source_are_fixed", false),
-        ("td-crypto-smoke", "trust::tests::trust_construction_unwind_drops_unpublished_state", false),
-        ("td-crypto-smoke", "provider::tests::factory_digest_and_fixed_comparison", false),
-        ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
-        ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
-        ("td-crypto-smoke", "provider::tests::generated_keys_and_signatures_pass_independent_verification", false),
-        ("td-crypto-smoke", "provider::tests::generation_maps_random_failure_and_exhausted_draws", false),
-        ("td-crypto-smoke", "provider::tests::generated_documents_differ", false),
-        ("td-crypto-smoke", "provider::tests::capacity_failure_and_retired_keys_preserve_caller_output", false),
-        ("td-crypto-smoke", "provider::tests::shared_key_serializes_success_and_terminal_failure", false),
-        ("td-crypto-smoke", "sha256_oracle::tests::empty_input", false),
-        ("td-crypto-smoke", "sha256_oracle::tests::abc", false),
-        ("td-crypto-smoke", "sha256_oracle::tests::two_block_message", false),
-        ("td-crypto-smoke", "sha256_oracle::tests::million_a", false),
-        ("td-crypto-smoke", "p256_oracle::tests::independent_modular_arithmetic_covers_carries_and_borrows", false),
-        ("td-crypto-smoke", "p256_oracle::tests::nist_ecdh_and_openssl_scalar_boundaries_match", false),
-        ("td-crypto-smoke", "p256_oracle::tests::nist_signature_acceptance_and_refusal_and_rare_x_reduction", false),
-        ("td-crypto-smoke", "p256_oracle::tests::nist_public_key_validation_preserves_overwide_rejections", false),
-        ("td-crypto-smoke", "p256_oracle::tests::scalar_and_coordinate_admission_never_reduce_untrusted_values", false),
-        ("td-crypto-smoke", "p256_oracle::tests::exceptional_point_cases_and_projective_representations", false),
-        ("td-crypto-smoke", "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused", false),
-        ("td-crypto-smoke", "tests::explicit_provider_and_roots_construct_without_global_default", false),
-        ("td-crypto-smoke", "provider::tests::signature_transform_failure_retires_before_key_restore", false),
-        ("td-crypto-smoke", "tls_signer::tests::canonical_tls_signature_encoding_boundaries", false),
-        ("td-crypto-smoke", "tls_signer::tests::tls_signer_uses_owned_key_and_hashes_once", false),
-        ("td-crypto-smoke", "tls_signer::tests::shared_tls_signers_observe_transform_retirement", false),
-        ("td-crypto-smoke", "identity::tests::retained_tls_identity_completes_handshakes_and_survives_remote_refusal", false),
-        ("td-crypto-smoke", "identity::tests::retained_tls_identity_shares_key_lifecycle", false),
-        ("td-crypto-smoke", "tls_clock::tests::injected_clock_missing_time_and_shared_retirement", false),
-        ("td-crypto-smoke", "tls_clock::tests::injected_clock_serializes_and_drops_panicking_source", false),
-        ("td-crypto-smoke", "tls_client::tests::client_configuration_pins_policy_and_redacts_state", false),
-        ("td-crypto-smoke", "tls_client::tests::client_configuration_verifies_trust_name_alpn_and_full_handshakes", false),
-        ("td-crypto-smoke", "tls_client::tests::client_configuration_clock_errors_reach_handshake_and_open_tickets", false),
-        ("td-crypto-smoke", "tls_client::tests::client_verifier_checks_chain_bounds_before_path_work", false),
-        ("td-crypto-smoke", "tls_client::tests::tls12_session_save_can_ignore_transient_clock_failure", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_bounds_bindings_roles_and_private_trust", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_routes_names_and_refuses_resumption", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_pins_disabled_backend_features", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_requires_private_client_certificates", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_checks_cold_material_and_supplied_verifier_time", false),
-        ("td-crypto-smoke", "tls_server::tests::backend_acceptor_discards_ip_literal_sni_before_routing", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_selects_distinct_owned_identities", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_omits_oversized_ca_hint_lists", false),
-        ("td-crypto-smoke", "tls_server::tests::server_configuration_refuses_offered_resumption", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_fragmented_handshake_and_simultaneous_writes", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_retires_handshake_output_reserve_and_refuses_backend_growth", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_retains_ignored_tls12_clock_failure", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_checks_time_without_native_time_requests", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_close_halves_and_transport_eof", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_tls12_alert_refuses_pending_ciphertext_and_socket_tail", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_never_emits_after_close_or_reuses_failed_state", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_unwind_consumes_state_and_shared_clock_failure_fences_reuse", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_unread_plaintext_blocks_without_consuming_next_record", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_name_verification_maps_and_retires_without_output", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_key_update_response_advances_without_application_write", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_handshake_reassembly_counts_retained_record_headers", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_errors_are_fixed_and_do_not_export_backend_diagnostics", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_ticket_clock_failure_after_finished_is_terminal", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_ticket_flight_capacity_is_terminal_after_finished", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_unfinished_cancellation_eof_and_alert_refuse_evidence", false),
-        ("td-crypto-smoke", "session_clock::tests::observers_isolate_transient_errors_and_share_retirement", false),
-        ("td-crypto-smoke", "tls_record::tests::record_bounds_track_protection_not_finished", false),
-        ("td-crypto-smoke", "tls_record::tests::record_requires_one_complete_exact_frame", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_tls12_hello_request_never_adds_post_close_output", false),
-        ("td-crypto-smoke", "tls_session::tests::client_session_tls12_simultaneous_close_pins_pending_output_refusal", false),
-        ("td-crypto-smoke", "tls_hello::tests::raw_hello_fragmentation_names_and_retry", false),
-        ("td-crypto-smoke", "tls_hello::tests::raw_hello_refuses_malformed_sni_before_completion", false),
-        ("td-crypto-smoke", "tls_hello::tests::raw_hello_fixed_state_skips_large_extensions_and_bounds_messages", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_public_round_trip_and_evidence", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_refuses_raw_ip_sni_across_record_fragments", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_mandatory_client_proof_and_typed_refusals", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_valid_retry_and_fragmented_raw_retry_sni_refusal", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_public_pair_tiny_pipes_simultaneous_writes_and_close", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_selected_validity_and_shared_key_retirement", false),
-        ("td-crypto-smoke", "tls_session::tests::server::server_session_clock_failures_and_acceptor_unwind_retire_owned_state", false),
-        ("td-crypto-smoke", "tls_policy::tests::exact_tls_algorithm_inventory", false),
-        ("td-crypto-smoke", "tls_policy::tests::handshake_mapping_drift_is_refused", false),
-        ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_is_refused", false),
-        ("td-crypto-smoke", "tls_smoke::explicit_policy_negotiates_classical_groups_and_suites", false),
-        ("td-crypto-smoke", "tls_smoke::explicit_policy_refuses_excluded_peer_algorithms", false),
-        ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
-        ("td-crypto-smoke", "tls_smoke::tls13_local_round_trip", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_wrong_server_name", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_untrusted_chain", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_expired_certificate", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_malformed_record", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_bad_certificate_signature", false),
-        ("td-crypto-smoke", "tls_smoke::rejects_tampered_ciphertext", false),
-        ("td-crypto-smoke", "tls_smoke::tls12_mutual_authentication", false),
-        ("td-crypto-smoke", "tls_smoke::tls13_mutual_authentication", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_requires_certificate", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_unknown_issuer", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_expired_certificate", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_server_only_usage", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_bad_signature", false),
-        ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_mismatched_key_before_connect", false),
-        ("td-mta-format-smoke", "provider_hashes_blob_fixture", false),
-        ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
-        ("td-mta-config-smoke", "portable_loader_stack", true),
-        ("td-mta-config-smoke", "portable_materialized_stack", true),
-        ("td-mta-transport-smoke", "generations::tests::current_retired_and_candidate_share_two_slots_before_construction", false),
-        ("td-mta-transport-smoke", "generations::tests::failed_stale_and_foreign_candidates_preserve_active_state_and_owners", false),
-        ("td-mta-transport-smoke", "generations::tests::final_worker_release_destroys_payload_before_returning_capacity", false),
-        ("td-mta-transport-smoke", "generations::tests::racing_preparation_and_release_never_construct_a_third_live_payload", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::compiled_policy_roles_bind_names_trust_and_generation_ids", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::queued_and_native_reservations_retain_capacity_and_recover_exact_buffers", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::gateway_comparison_survives_reordering_but_rejects_policy_or_binding_changes", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::material_errors_never_publish_and_acme_requests_are_explicit", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::material_reader_caps_bytes_eof_and_interrupted_work", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::compiled_configs_enforce_relay_trust_protocol_and_gateway_client_auth", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::https_profiles_narrow_shared_smtp_names_before_native_routing", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::handoff_refuses_plaintext_tails_and_deadlines_and_returns_original_buffers", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::authorized_connections_release_handshake_capacity_and_retain_generation_until_teardown", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::gateway_without_client_certificate_never_exposes_mail_proof_and_recovers_permits", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::handshake_deadline_can_only_tighten_and_failure_is_sticky", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::changed_gateway_policy_aborts_pending_connection_and_releases_capacity", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::io_tests::established_clock_failure_clears_cached_authorization_and_aborts_socket", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_only_acme_bootstrap_never_opens_server_material", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::expired_server_does_not_block_clients_but_invalid_client_trust_still_refuses", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_tests::client_generation_transitions_to_complete_within_the_same_two_slots", false),
-        ("td-mta-transport-smoke", "tls_policy::starttls::tests::starttls_reply_requires_short_writes_and_complete_flush", false),
-        ("td-mta-transport-smoke", "tls_policy::starttls::tests::starttls_reply_refuses_invalid_write_counts_and_flush_failure", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_flushes_220_before_handoff_and_verifies_real_tls", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_refuses_unframed_parameterized_tailed_and_wrong_role_commands", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::starttls_tests::server_starttls_deadlines_clock_refusal_and_cancel_release_reservations", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_starttls_process_requires_verified_pin_after_plaintext_reply", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack", true),
-        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_requires_a_complete_advertisement_and_no_tail", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_offer_handles_fragmentation_and_skips_malformed_extensions", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_and_server_upgrade_verify_real_tls", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_refuses_bad_replies_and_accepts_fragmented_220", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::client_starttls_tests::client_starttls_roles_scratch_deadlines_and_cancel_return_buffers", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::line_split_at_every_boundary_retains_exact_tail", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::strict_line_framing_is_terminal_after_failure", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::control_line_counts_crlf_and_clears_only_its_reservation", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::reply_syntax_accepts_bare_codes_and_refuses_ambiguous_separators", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::multiline_replies_require_one_code_and_leave_the_next_reply_unread", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::fragmented_220_reply_stops_before_plaintext_or_record_tail", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::reply_aggregate_cap_includes_all_lines_and_the_final_crlf", false),
-        ("td-mta-transport-smoke", "smtp_wire::tests::ehlo_greeting_is_never_a_starttls_advertisement", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_accepts_current_and_next_verified_leaf_pins", false),
-        ("td-mta-transport-smoke", "tls_policy::tests::gateway_process_tests::gateway_mutual_tls_refuses_verified_leaf_with_wrong_pin_or_actual_peer", false),
-        ("td-mta-transport-smoke", "gateway_policy::tests::canonical_gateway_policy_ignores_only_representation_and_server_material", false),
-        ("td-mta-transport-smoke", "gateway_policy::tests::gateway_filters_and_material_limits_refuse_without_fallback", false),
-        ("td-mta-transport-smoke", "gateway_policy::tests::gateway_tls_requires_a_client_certificate_on_the_same_valid_server", false),
-        ("td-mta-transport-smoke", "tls_admission::tests::capacities_saturate_and_reuse_without_losing_live_reservations", false),
-        ("td-mta-transport-smoke", "tls_admission::tests::concurrent_reservations_and_worker_returns_preserve_the_global_cap", false),
-        ("td-mta-transport-smoke", "tls_admission::tests::overlapping_release_and_reservation_never_over_admit_or_leak_capacity", false),
-        ("td-mta-transport-smoke", "tls_admission::tests::refusal_and_pool_drop_preserve_linear_cleanup", false),
-        ("td-mta-transport-smoke", "clock::tests::runtime_clock_keeps_utc_and_monotonic_domains_separate", false),
-        ("td-mta-transport-smoke", "clock::tests::tls_clock_conversion_never_falls_back_after_refusal", false),
-        ("td-mta-transport-smoke", "transport::tests::tcp_bounded_io_actual_peer_and_unbuffered_flush", false),
-        ("td-mta-transport-smoke", "transport::tests::tcp_peer_eof_preserves_write_half_and_local_close_preserves_read_half", false),
-        ("td-mta-transport-smoke", "transport::tests::tcp_abort_drop_and_errors_fence_both_directions", false),
-        ("td-mta-transport-smoke", "tls_io::tests::final_handshake_write_cannot_publish_past_its_deadline", false),
-        ("td-mta-transport-smoke", "tls_io::tests::flush_backpressure_withholds_finished_and_bad_transport_counts_abort", false),
-        ("td-mta-transport-smoke", "tls_io::tests::public_tls_round_trip_with_tiny_pipes_and_independent_close", false),
-        ("td-mta-transport-smoke", "tls_io::tests::simultaneous_full_chunks_progress_without_growing_wire_storage", false),
-        ("td-mta-transport-smoke", "tls_io::tests::deadlines_and_missing_tls_time_discard_evidence_and_never_revive", false),
-        ("td-mta-transport-smoke", "tls_io::tests::malformed_records_truncation_and_constructor_refusal_close_the_transport", false),
-        ("td-mta-transport-smoke", "tls_io::tests::public_crypto_sessions_exchange_mail_bytes_over_local_tcp", false),
-        ("td-mta-transport-smoke", "tls_io::tests::established_sessions_outlive_handshake_deadline_and_preserve_backpressure", false),
-        ("td-mta-transport-smoke", "tls_io::tests::established_tcp_eof_without_tls_close_is_terminal_even_at_record_boundary", false),
-        ("td-mta-transport-smoke", "tls_io::tests::returned_buffers_are_reused_and_close_paths_keep_exclusive_ownership", false),
-        ("td-mta-transport-smoke", "tls_io::tests::constructor_refusals_return_moved_pool_buffers_without_logging_them", false),
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (index, (binary, case, ignored)) in portable_cases().enumerate() {
         let mut command = Command::new(format!("/artifacts/{binary}"));
         command
-            .args(["--exact", *case, "--test-threads=1"])
+            .args(["--exact", case, "--test-threads=1"])
             .env_clear()
             .stdin(Stdio::null());
-        if *binary == "td-mta-transport-smoke" {
+        if binary == "td-mta-transport-smoke" {
             command.env("TD_MTA_TEST_TLS_PEER", "/artifacts/td-crypto-smoke");
         }
-        if *ignored {
+        if ignored {
             command.args(["--ignored", "--show-output"]);
         }
         crate::host_bin::arm_check_child(&mut command);
@@ -1755,11 +1865,15 @@ pub(crate) fn runtime_inner() -> Result<()> {
         {
             return Err(format!("portable smoke case did not execute: {case}"));
         }
-        if *ignored {
-            let (prefix, ceiling) = match *case {
+        if ignored {
+            let (prefix, ceiling) = match case {
                 "portable_loader_stack" => ("config_stack_mapping_bytes=", 176 * 1024),
-                "portable_materialized_stack" => ("config_materialized_stack_mapping_bytes=", 256 * 1024),
-                "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack" => ("tls_policy_transport_stack_mapping_bytes=", 256 * 1024),
+                "portable_materialized_stack" => {
+                    ("config_materialized_stack_mapping_bytes=", 256 * 1024)
+                }
+                "tls_policy::tests::stack_tests::portable_tls_policy_transport_stack" => {
+                    ("tls_policy_transport_stack_mapping_bytes=", 256 * 1024)
+                }
                 _ => return Err("unknown portable stack qualification case".into()),
             };
             let bytes = stack_evidence(&output, prefix, ceiling)?;
@@ -1883,7 +1997,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
 
-    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases and both bounded configuration stacks passed without toolchain mounts");
+    println!("portable runtime: version, SHA-256 facade/failure and mail-format probes, PEM/identity/trust, entropy and P-256/oracle probes, explicit algorithm policy, owned TLS signing, inbound/outbound configuration/clock and eighteen backend TLS cases, both configuration host scenarios and both bounded configuration stacks passed without toolchain mounts");
     println!("portable runtime: sixty-five mail SMTP/policy/generation/gateway/admission/clock/TCP/TLS cases passed without toolchain mounts");
     Ok(())
 }
@@ -1894,6 +2008,230 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
 
 pub(crate) fn cross_build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> {
     build_architecture(root, archives, Architecture::Aarch64)
+}
+
+/// The static, source-fingerprinted td-builder that enters each namespace.
+fn portable_helper(root: &Path) -> Result<PathBuf> {
+    let helper_base = root.join(".td-build-cache/stage0");
+    let placed = crate::stage0::stage0_place(root, &helper_base)?;
+    let placed = Path::new(&placed)
+        .file_name()
+        .ok_or("portable helper has a malformed store path")?;
+    let helper = helper_base
+        .join("store")
+        .join(placed)
+        .join("bin/td-builder");
+    crate::elf::assert_static(&helper)?;
+    Ok(helper)
+}
+
+/// Where the emulated runtime's namespace mounts the host's emulator.
+const EMULATOR: &str = "/emulator/qemu-aarch64";
+const EMULATOR_NAME: &str = "qemu-aarch64";
+const ARM_ARTIFACT_PREFIX: &str = "crypto-artifact-aarch64-cross-";
+
+/// The host's QEMU user-mode emulator for aarch64, the first `qemu-aarch64`
+/// on PATH. It is a host tool of this qualification, mounted read-only into
+/// the runtime namespace only, and never a build or target input.
+fn host_emulator() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for directory in std::env::split_paths(&path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let Ok(resolved) = directory.join(EMULATOR_NAME).canonicalize() else {
+            continue;
+        };
+        if fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+            return Ok(resolved);
+        }
+    }
+    Err(format!(
+        "the aarch64 runtime needs QEMU user-mode emulation, and no {EMULATOR_NAME} is on PATH; nothing was run"
+    ))
+}
+
+/// The library paths `ld.so --list` printed, each as the loader named it:
+/// the target of `=>`, or a line's own absolute path (the interpreter).
+/// The vDSO has no path. An unresolved library refuses.
+fn loader_paths(listing: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for line in listing.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains("not found") {
+            return Err(format!("emulator library unresolved: {line}"));
+        }
+        let named = match line.split_once("=>") {
+            Some((_, target)) => target.trim(),
+            None => line,
+        };
+        let Some(path) = named.split_whitespace().next() else {
+            continue;
+        };
+        if path.starts_with('/') && !paths.iter().any(|known| known == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
+/// Where a loader-named spelling lands inside the namespace, whose
+/// directories are all plain: `.` and empty components dropped and each
+/// `..` taking its parent. A path that is not absolute, climbs past the
+/// root or names no file refuses. (Guix's loader prints RUNPATH spellings
+/// such as `.../lib/../lib/libffi.so.8`.)
+fn lexical_path(path: &str) -> Result<String> {
+    let rest = path
+        .strip_prefix('/')
+        .ok_or_else(|| format!("emulator library path is not absolute: {path}"))?;
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts
+                    .pop()
+                    .ok_or_else(|| format!("emulator library path climbs past the root: {path}"))?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!("emulator library path names no file: {path}"));
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+/// A loader-named library's host file and the namespace path to bind it at.
+/// On the host a `..` climbs out of a symlinked directory physically, so the
+/// spelling and its lexical form must reach the same file, or it refuses
+/// rather than bind one file where the guest's loader expects another.
+fn library_bind(path: &str) -> Result<(PathBuf, String)> {
+    let lexical = lexical_path(path)?;
+    let source = Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("resolve emulator library {path}: {e}"))?;
+    let reached = Path::new(&lexical)
+        .canonicalize()
+        .map_err(|e| format!("resolve emulator library {lexical}: {e}"))?;
+    if source != reached {
+        return Err(format!(
+            "emulator library {path} is {} on the host, but its spelling reaches {}",
+            source.display(),
+            reached.display()
+        ));
+    }
+    Ok((source, lexical))
+}
+
+/// What a dynamically linked emulator loads, as its own interpreter resolves
+/// it; a static emulator loads nothing.
+fn emulator_closure(emulator: &Path) -> Result<Vec<String>> {
+    let bytes = fs::read(emulator).map_err(|e| format!("read {EMULATOR_NAME}: {e}"))?;
+    let Some((offset, size)) = td_engine::elf::interp_slot(&bytes)? else {
+        return Ok(Vec::new());
+    };
+    let interpreter = bytes
+        .get(offset..offset.saturating_add(size))
+        .ok_or("emulator interpreter is out of range")?;
+    let interpreter = std::str::from_utf8(interpreter)
+        .map_err(|_| "emulator interpreter is not UTF-8")?
+        .trim_end_matches('\0');
+    lexical_path(interpreter)?;
+    let output = Command::new(interpreter)
+        .arg("--list")
+        .arg(emulator)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("list {EMULATOR_NAME}'s libraries: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("{interpreter} --list {EMULATOR_NAME} failed"));
+    }
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|_| "emulator library listing is not UTF-8".to_owned())?;
+    let mut paths = loader_paths(&listing)?;
+    if !paths.iter().any(|path| path == interpreter) {
+        paths.push(interpreter.to_owned());
+    }
+    Ok(paths)
+}
+
+/// Run a published aarch64 cross-build's functional cases under the host's
+/// user-mode emulator, in a fresh namespace holding only those executables,
+/// the emulator and what it loads. Functional evidence only: emulation says
+/// nothing of aarch64 timing or of a real core's behavior.
+pub(crate) fn emulated_runtime(root: &Path, artifact: &Path) -> Result<()> {
+    if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
+        return Err("the emulated aarch64 runtime currently runs on x86-64 Linux only".into());
+    }
+    let emulator = host_emulator()?;
+    let cache = root
+        .join(".td-build-cache")
+        .canonicalize()
+        .map_err(|e| format!("portable cache: {e}"))?;
+    let artifact = artifact
+        .canonicalize()
+        .map_err(|e| format!("aarch64 artifact: {e}"))?;
+    let digest = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(ARM_ARTIFACT_PREFIX))
+        .filter(|_| artifact.parent() == Some(cache.as_path()))
+        .ok_or(
+            "name a published crypto-artifact-aarch64-cross-<hash> directory in .td-build-cache",
+        )?;
+    let actual = crate::sandbox::nar_hash_of(&artifact)
+        .map_err(|e| format!("hash aarch64 artifact: {e}"))?;
+    if actual.strip_prefix("sha256:") != Some(digest) {
+        return Err("aarch64 artifact differs from its published hash".into());
+    }
+    let scratch = Scratch::new(root)?;
+    let artifacts = scratch.0.join("artifacts");
+    fs::create_dir(&artifacts).map_err(|e| format!("create emulated artifacts: {e}"))?;
+    for name in ARM_BINARIES.iter().chain(&["td-mta.debug"]) {
+        copy_binary(&artifact.join(name), &artifacts.join(name))?;
+    }
+    qualify_artifacts_architecture(&artifacts, Architecture::Aarch64)?;
+    let version = Command::new(&emulator)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("run {EMULATOR_NAME} --version: {e}"))?;
+    let version = String::from_utf8_lossy(&version.stdout);
+    let version = version.lines().next().unwrap_or_default().to_owned();
+    let helper = portable_helper(root)?;
+    let mut binds = vec![
+        bind(&artifacts, "/artifacts", true)?,
+        bind(&helper, "/td-builder", true)?,
+        bind(&emulator, EMULATOR, true)?,
+    ];
+    let mut bound: Vec<String> = Vec::new();
+    for path in emulator_closure(&emulator)? {
+        let (source, destination) = library_bind(&path)?;
+        if !bound.contains(&destination) {
+            binds.push(bind(&source, &destination, true)?);
+            bound.push(destination);
+        }
+    }
+    println!(
+        "aarch64 runtime: {} ({version}), user-mode emulation; functional evidence only, no aarch64 timing or core behavior",
+        emulator.display()
+    );
+    enter(
+        "/td-builder",
+        &[
+            "gate-crates".into(),
+            "crypto-portable-emulated-runtime-inner".into(),
+        ],
+        &binds,
+        &scratch.0.join("runtime"),
+        true,
+    )
 }
 
 fn build_architecture(
@@ -1928,16 +2266,7 @@ fn build_architecture(
     if kit_digest != expected_kit {
         return Err("prepared Rust kit differs from the qualified portable kit".into());
     }
-    let helper_base = root.join(".td-build-cache/stage0");
-    let placed = crate::stage0::stage0_place(root, &helper_base)?;
-    let placed = Path::new(&placed)
-        .file_name()
-        .ok_or("portable helper has a malformed store path")?;
-    let helper = helper_base
-        .join("store")
-        .join(placed)
-        .join("bin/td-builder");
-    crate::elf::assert_static(&helper)?;
+    let helper = portable_helper(root)?;
     let output = scratch.0.join("output");
     fs::create_dir(&output).map_err(|e| format!("create portable output: {e}"))?;
     let binds = compile_binds(&source, &vendor, &inputs, &helper, &output)?;
@@ -2068,6 +2397,82 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn emulator_closure_takes_each_resolved_path_once_and_refuses_a_missing_one() {
+        let listing = "\tlinux-vdso.so.1 (0x00007ffd)\n\
+            \tlibz.so.1 => /gnu/store/z/lib/libz.so.1 (0x00007f01)\n\
+            \tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f02)\n\
+            \tlibz.so.1 => /gnu/store/z/lib/libz.so.1 (0x00007f01)\n\
+            \t/lib64/ld-linux-x86-64.so.2 (0x00007f03)\n";
+        assert_eq!(
+            loader_paths(listing).unwrap(),
+            [
+                "/gnu/store/z/lib/libz.so.1",
+                "/lib/x86_64-linux-gnu/libc.so.6",
+                "/lib64/ld-linux-x86-64.so.2",
+            ]
+        );
+        assert!(loader_paths("\tlibgnutls.so.30 => not found\n").is_err());
+        assert!(loader_paths("").unwrap().is_empty());
+        // Guix's loader prints RUNPATH spellings, kept as printed.
+        let runpath = "\tlibffi.so.8 => /gnu/store/f/lib/../lib/libffi.so.8 (0x1)\n";
+        assert_eq!(
+            loader_paths(runpath).unwrap(),
+            ["/gnu/store/f/lib/../lib/libffi.so.8"]
+        );
+    }
+
+    #[test]
+    fn library_paths_bind_where_their_spelling_lands_and_nowhere_else() {
+        for (path, lexical) in [
+            (
+                "/gnu/store/f/lib/../lib/libffi.so.8",
+                "/gnu/store/f/lib/libffi.so.8",
+            ),
+            ("/lib/./x.so", "/lib/x.so"),
+            ("/lib//x.so", "/lib/x.so"),
+            ("/lib64/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"),
+        ] {
+            assert_eq!(lexical_path(path).unwrap(), lexical, "{path}");
+        }
+        for path in ["lib/x.so", "/..", "/lib/../../x.so", "/", "/lib/.."] {
+            assert!(lexical_path(path).is_err(), "{path}");
+        }
+        let scratch = crate::test_temp::TempDir::new("td-crypto-emulator-libs").unwrap();
+        let real = scratch.join("store/lib");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("x.so"), b"real").unwrap();
+        symlink(real.join("x.so"), real.join("x.so.1")).unwrap();
+        let root = scratch.to_str().unwrap();
+        // A symlinked file and a `..` through plain directories bind fine.
+        let (source, destination) =
+            library_bind(&format!("{root}/store/lib/../lib/x.so.1")).unwrap();
+        assert_eq!(source, real.join("x.so").canonicalize().unwrap());
+        assert_eq!(destination, format!("{root}/store/lib/x.so.1"));
+        // A `..` out of a symlinked directory reaches another file on the
+        // host than its spelling does in the namespace.
+        symlink(&real, scratch.join("link")).unwrap();
+        fs::create_dir_all(scratch.join("lib")).unwrap();
+        fs::write(scratch.join("lib/x.so"), b"other").unwrap();
+        let error = library_bind(&format!("{root}/link/../lib/x.so")).unwrap_err();
+        assert!(error.contains("its spelling reaches"), "{error}");
+        assert!(library_bind(&format!("{root}/store/lib/missing.so")).is_err());
+    }
+
+    #[test]
+    fn every_portable_case_is_named_once_and_probes_follow_the_functional_cases() {
+        let cases: Vec<_> = portable_cases().collect();
+        let functional: usize = FUNCTIONAL_CASES.iter().map(|(_, cases)| cases.len()).sum();
+        assert_eq!(cases.len(), functional + STACK_PROBES.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (binary, case, ignored) in &cases {
+            assert!(seen.insert((*binary, *case)), "{binary} {case}");
+            assert_eq!(*ignored, STACK_PROBES.contains(&(*binary, *case)));
+            assert!(ARM_BINARIES.contains(binary), "{binary}");
+        }
+        assert!(cases[..functional].iter().all(|(_, _, ignored)| !ignored));
+    }
 
     #[test]
     fn rss_symbols_require_the_named_probe_only_in_its_artifact() {

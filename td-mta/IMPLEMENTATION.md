@@ -2944,8 +2944,10 @@ code and its direct dependency do not change with backend selection.
    ECDHE-RSA suites and every admitted scheme, with corrupted signatures and
    curve, hash and scheme mismatches refused (td-crypto/DESIGN.md).
    Resources and the static x86-64 musl build were
-   requalified, and the aarch64 artifact rebuilt; td-crypto/PORTABLE.md and
-   RESOURCES.md record the evidence and the aarch64 validation status.
+   requalified, and the aarch64 artifact rebuilt and its functional cases
+   run under QEMU user-mode emulation; td-crypto/PORTABLE.md and
+   RESOURCES.md record the evidence. Emulation leaves aarch64 timing, core
+   behavior and resources unqualified.
    Rustls remains private inside td-crypto; this replacement does not make
    its closure std-only. Algorithm, trust or format changes are
    separate explicit compatibility work.

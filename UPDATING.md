@@ -269,7 +269,8 @@ it reads, a field whose meaning changes (such as the source of
 body carrying an `id` key, which its walker follows. Then grep
 PORTABLE.md and `crypto_api.rs` for the old number, which they
 restate. Prove the kit with `crypto-portable-build` and
-`crypto-portable-cross-build` over the same archive directory.
+`crypto-portable-cross-build` over the same archive directory, and run
+the cross-build's artifact with `crypto-portable-emulated-runtime`.
 
 ## Holds
 

@@ -217,34 +217,73 @@ x86-64 objects fail validation. The runtime/debug pairing, notices and input
 receipt use the same checks and publication rules as the x86-64 artifact.
 
 Cross-compilation does not execute ARM code. Its receipt explicitly records
-`runtime not-run cross-compiled`, and the command's success message says
-runtime was not tested. The test executables are retained for separate native
-or emulated functional validation. It does not run the x86-64 clean-runtime
-process suite or allocation/RSS probes and cannot substitute for that evidence.
-Current cross-build result:
-`crypto-portable-cross-build` passed: all five aarch64 executables built
-with no C compiled, passed the static-PIE, symbol, graph and API checks, and
-were published as `crypto-artifact-aarch64-cross-d71f6bbb...`. Their runtime
-is not tested; it needs an ARM host. On a native ARM host, run these
-selected functional cases from the retained artifact directory and require a
-nonzero passing test count for each command:
+`runtime not-run cross-compiled`, and the command's success message names
+the separate emulated runtime below. It does not run the x86-64
+clean-runtime process suite or allocation/RSS probes and cannot substitute
+for that evidence.
+
+### Emulated aarch64 runtime
 
 ```text
-./td-crypto-smoke --test-threads=1
-./td-mta-config-smoke host_ --test-threads=1
-./td-mta-format-smoke --test-threads=1
-./td-mta-transport-smoke tls_policy::tests::starttls_tests:: --test-threads=1
+td-builder gate-crates crypto-portable-emulated-runtime --artifact .td-build-cache/crypto-artifact-aarch64-cross-<NAR-sha256>
 ```
 
-Under user-mode emulation, prefix each command with `qemu-aarch64`. Do not
-use `--ignored`: the retained binaries also contain explicitly x86-only
-resource probes, which must continue to refuse ARM. These selected cases
-cover crypto, configuration, stored row formats and the SMTP/TLS adapter;
-they do not launch the installed receiver. The ARM build does not produce
-the x86-only clean-runtime CLI suite. Follow DEPLOYMENT.md's private pilot
-procedure for the executable's configuration, STARTTLS, receiving and restart
-checks before taking production mail. The full td distribution's
-architecture and provenance claims are unchanged.
+This explicit host qualification runs a published cross-build's executables
+under QEMU's user-mode emulator, the first `qemu-aarch64` on the caller's
+`PATH`. Without one it refuses and runs nothing; it never skips a case. The
+emulator is a host tool of this qualification only: it enters no build
+namespace, no artifact and no receipt, and nothing it does reaches the
+target graph. The argument must name a
+`crypto-artifact-aarch64-cross-<NAR-sha256>` directory directly under the
+worktree's `.td-build-cache` whose NAR hash still matches its name. The
+command copies its five executables and the debug companion into private
+scratch, repeats the aarch64 static-PIE and debug-pair checks, and runs
+them in a fresh namespace holding only those copies, the static td-builder
+helper, the emulator at `/emulator/qemu-aarch64` and, for a dynamically
+linked emulator, the libraries its own interpreter resolves for it
+(`ld.so --list`), each bound read-only where the loader's spelling lands
+inside the namespace: `.` and empty components dropped and each `..`
+taking its parent, as the namespace's plain directories resolve it. A
+spelling that is not absolute or climbs past the root refuses, and so does
+one whose `..` leaves a symlinked directory on the host, where it would
+reach another file than the one bound. Only the directories leading to a
+bound file exist inside, so a spelling whose `..` climbs out of a
+directory not on that path, such as `/a/b/../c/x.so`, names nothing there
+and the emulator fails to start. The namespace holds no
+`ld.so.cache` and no library directory beyond those paths, so an emulator
+that resolves a library only through the cache at run time fails to start
+rather than reaching the host's.
+Static musl executables need no sysroot.
+
+Inside, `td-mta --version` and every functional case the x86-64 clean
+runtime names run by exact name, one emulated process each, with a
+300-second deadline per case, the same 64 KiB output bound and the same
+requirement of exactly one passing test: the 135 `td-crypto-smoke` cases,
+the two `td-mta-format-smoke` provider-hash cases, the two
+`td-mta-config-smoke` host scenario cases and the 64 non-ignored
+`td-mta-transport-smoke` cases. Each prints `aarch64 emulated: PASS` or
+`FAIL` with its executable and name; the first failure stops the run. The
+three gateway process cases start the `td-crypto-smoke` TLS peer through
+the same emulator (`TD_MTA_TEST_PEER_EMULATOR`, a test-only variable that
+`crypto-cargo` clears, so no host test run inherits it from the caller). The ignored stack probes and the x86-only CLI,
+allocation and RSS suites are not run: they measure x86-64 resources, and
+the ARM build does not produce the last three.
+
+Emulation is functional evidence only. It translates aarch64 instructions
+to the host's, so it says nothing of aarch64 timing, of a real core's memory
+ordering, alignment or PSTATE.DIT behavior, or of a minimum kernel version,
+and it leaves no resource evidence.
+
+A run qualifies an artifact only when `td-mta --version` and all 203
+named cases pass. The emulator's version line is printed first; the
+commit that changes the artifact or this qualification records its run.
+
+These cases cover crypto, configuration, stored row formats and the
+SMTP/TLS adapter; they do not launch the installed receiver. Follow DEPLOYMENT.md's
+private pilot procedure for the executable's configuration, STARTTLS,
+receiving and restart checks on a real ARM host before taking production
+mail. The full td distribution's architecture and provenance claims are
+unchanged.
 
 ## X86-64 isolated compilation and artifact
 
@@ -382,9 +421,10 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   this does not qualify a future installed service caller, even with the
   same reader type. It is not a service dependency. The same release Cargo
   graph builds it with `--test config_stack --no-run`; selection requires
-  a test target and test profile. Runtime selects each ignored case by its
-  exact name and requires one passed test plus one positive bounded mapping
-  measurement. `portable_loader_stack` retains its 176 KiB ceiling and
+  a test target and test profile. Runtime runs `host_loader_scenarios` and
+  `host_materialized_scenarios` by exact name, then selects each ignored
+  case by its exact name and requires one passed test plus one positive
+  bounded mapping measurement. `portable_loader_stack` retains its 176 KiB ceiling and
   `config_stack_mapping_bytes` label; `portable_materialized_stack` checks
   256 KiB and emits `config_materialized_stack_mapping_bytes`. Measurements
   are relayed to the build log, not retained in `BUILD-INPUTS`.
