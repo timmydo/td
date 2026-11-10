@@ -1,0 +1,40 @@
+/* Common HTML defaults, deliberately independent of layout and painting. */
+html, body, address, article, aside, blockquote, div, dl, dt, dd, fieldset,
+figcaption, figure, footer, form, h1, h2, h3, h4, h5, h6, header, hr, main,
+nav, ol, p, pre, section, ul { display: block }
+head, title, base, link, meta, script, style, template { display: none }
+body { margin: 8px }
+p, dl, ol, ul, pre, blockquote, figure { margin: 1em 0 }
+blockquote, figure { margin-left: 40px; margin-right: 40px }
+dd { margin-left: 40px }
+ul, ol { padding-left: 40px }
+ol { list-style-type: decimal }
+ul { list-style-type: disc }
+ul ul { list-style-type: circle }
+ul ul ul { list-style-type: square }
+li { display: list-item }
+h1 { font-size: 2em; margin: .67em 0 }
+h2 { font-size: 1.5em; margin: .83em 0 }
+h3 { font-size: 1.17em; margin: 1em 0 }
+h4 { margin: 1.33em 0 }
+h5 { font-size: .83em; margin: 1.67em 0 }
+h6 { font-size: .67em; margin: 2.33em 0 }
+h1, h2, h3, h4, h5, h6, b, strong { font-weight: bolder }
+i, em, cite, dfn, address { font-style: italic }
+pre, code, kbd, samp { font-family: monospace }
+pre { white-space: pre }
+small { font-size: smaller }
+big { font-size: larger }
+a:link { color: blue; text-decoration: underline }
+s, strike, del { text-decoration: line-through }
+u, ins { text-decoration: underline }
+table { display: table }
+thead { display: table-header-group }
+tbody { display: table-row-group }
+tfoot { display: table-footer-group }
+tr { display: table-row }
+td, th { display: table-cell }
+th { font-weight: bold; text-align: center }
+colgroup { display: table-column-group }
+col { display: table-column }
+caption { display: table-caption; text-align: center }

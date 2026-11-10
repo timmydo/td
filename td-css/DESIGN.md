@@ -117,7 +117,10 @@ parent's computed value, never reparses the parent's specified value.
 An absent parent supplies the initial value. Font size computes before
 font-relative lengths; color computes before `currentcolor` references.
 The caller computes parents before children and supplies the root's
-computed font size for `rem` (16px while computing the root itself).
+computed font size for descendant `rem` values. An absent parent identifies
+the root: its own `font-size` resolves `rem` against the initial 16px,
+then its other properties use its newly computed font size, as specified
+by [CSS Values Level 3 §5.1.1](https://www.w3.org/TR/2022/CR-css-values-3-20221201/#font-relative-lengths).
 
 ## 4. First computed property set
 
@@ -158,6 +161,12 @@ position/float/layout contract. Font keyword sizes are 9, 10, 13, 16,
 18, 24 and 32px; smaller/larger multiply the parent's size by 1/1.2 or
 1.2. Thin/medium/thick are 1/3/5px. These are td's UA choices.
 
+Recognized generic font families are serif, sans-serif, monospace,
+cursive, fantasy, system-ui, ui-serif, ui-sans-serif, ui-monospace and
+ui-rounded. Quoted names remain named families even when they spell a
+generic keyword. Unquoted identifier sequences are joined by single
+spaces; CSS-wide and generic keywords cannot be words of such a name.
+
 The embedded `HTML_UA_CSS` supplies common block elements, hidden metadata
 and script/style, body inset, paragraphs/headings/lists, monospace code
 and pre, emphasis, links and table display roles. It is an ordinary UA
@@ -179,7 +188,7 @@ it as a stylesheet matching nothing.
 | MAX_TOKENS | 131,072 emitted tokens per input, whitespace included |
 | MAX_NESTING | 32 function/block levels, also on skipped syntax |
 | MAX_RULES | 8,192 top-level rules per sheet and compiled rules per style set |
-| MAX_DECLARATIONS | 32,768 declarations per list and compiled declarations per style set |
+| MAX_DECLARATIONS | 32,768 declarations per list, expanded declarations per style set, and expanded inline declarations per compute call |
 | MAX_SELECTORS | 256 selector-list members, including nested lists |
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
 | MAX_SELECTOR_DEPTH | 8 nested logical functions |
@@ -217,6 +226,17 @@ caller-constructed recursive AST. `selectors::SelectorList::parse` and
 an element, optional parent `ComputedStyle`, root font size and inline
 style text. `ComputedStyle` exposes typed read-only property values.
 No filesystem, network, clock, global mutable state or thread is needed.
+
+`cascade` exports `StyleSet`, `Origin` and `HTML_UA_CSS`; these and
+`values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
+crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
+the fixed longhand roster. `ComputedStyle::get` yields immutable typed
+values (keywords, RGBA colors, px/percentage/auto lengths, family lists,
+weights and decoration flags); `font_size` and `color` are convenient
+typed accessors. A computed style owns its values and cannot be populated
+with caller-constructed non-finite values. The crate documentation has
+a compile-checked example implementing the element boundary; runtime
+pipeline tests use the repository's ordinary Cargo test runner.
 
 Tests carry small spec-derived examples with section references, written
 locally rather than vendoring a third-party suite. They cover tokens,
