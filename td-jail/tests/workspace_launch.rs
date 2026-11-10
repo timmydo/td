@@ -436,3 +436,105 @@ fn rust_probe_inside() -> Result<(), Box<dyn Error>> {
     println!("interfaces={}", interfaces.join(","));
     Ok(())
 }
+
+const RUNTIME_PROBE: &str = r#"#!/bin/sh
+echo ready
+read -r request
+touch /usr/x 2>/dev/null || echo "usr=read-only"
+echo "lib=$(readlink /lib)"
+echo "lib64=$(readlink /lib64)"
+echo "cache=$(stat -c %d:%i /etc/ld.so.cache)"
+echo "runtime-cache=$(stat -c %d:%i /usr/etc/ld.so.cache)"
+echo "path=$PATH"
+"#;
+
+/// The runtime this test names: Firefox's, so installing Firefox in
+/// td-software installs it.
+const RUNTIME: &str = "freedesktop-platform-25-08";
+
+/// A workspace naming a runtime (APPLICATIONS.md §C), against td's own
+/// runtime store: td-jail takes the store, its owner and the product
+/// configuration only as compiled values, so no fixture can stand in for
+/// them. Run it on td, as its account, with Firefox installed.
+#[test]
+#[ignore = "needs td: its product configuration, uid 1000 and an installed freedesktop-platform-25-08"]
+fn a_runtime_workspace_binds_the_held_runtime_at_usr() -> Result<(), Box<dyn Error>> {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("workspace-runtime");
+    let _ = fs::remove_dir_all(&base);
+    for name in ["home", "bin"] {
+        fs::create_dir_all(base.join(name))?;
+    }
+    let base = fs::canonicalize(&base)?;
+    fs::set_permissions(base.join("home"), fs::Permissions::from_mode(0o700))?;
+    let probe = base.join("bin/probe");
+    fs::write(&probe, RUNTIME_PROBE)?;
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))?;
+    let spec = base.join("spec");
+    fs::write(
+        &spec,
+        format!(
+            "format=1\nruntime={RUNTIME}\nentry={}\nhome={}\n",
+            probe.display(),
+            base.join("home").display()
+        ),
+    )?;
+    fs::set_permissions(&spec, fs::Permissions::from_mode(0o600))?;
+    let store = Path::new("/var/lib/td/runtimes").join(RUNTIME);
+    let selection = store
+        .join(fs::read_link(store.join("current"))?)
+        .join("selection");
+
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
+        .arg("--workspace")
+        .arg(std::process::id().to_string())
+        .arg(&spec)
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone()?)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut ready = Vec::new();
+    let mut byte = [0u8; 1];
+    while ready.last() != Some(&b'\n') {
+        if ours.read(&mut byte)? == 0 {
+            break;
+        }
+        ready.push(byte[0]);
+    }
+    // The entry is running: stage 1 holds the generation it binds.
+    let held = matches!(
+        fs::File::open(&selection)?.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    );
+    ours.write_all(b"go\n")?;
+    let mut reply = String::new();
+    ours.read_to_string(&mut reply)?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{reply}\n{stderr}");
+    assert_eq!(ready, b"ready\n", "{reply}\n{stderr}");
+    assert!(held, "the launch did not hold {}", selection.display());
+    for line in [
+        "usr=read-only",
+        "lib=/usr/lib",
+        "lib64=/usr/lib64",
+        "path=/opt/workspace/path:/opt/workspace/bin:/bin:/usr/bin",
+    ] {
+        assert!(
+            reply.lines().any(|got| got == line),
+            "{line} absent from:\n{reply}"
+        );
+    }
+    let field = |key: &str| {
+        reply
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::to_string)
+    };
+    let cache = field("cache=").ok_or("no cache line")?;
+    assert_eq!(Some(cache), field("runtime-cache="), "{reply}");
+    // Once the launch ends, the lease goes with it.
+    fs::File::open(&selection)?.try_lock()?;
+    fs::remove_dir_all(&base)?;
+    Ok(())
+}

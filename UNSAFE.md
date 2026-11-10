@@ -2162,7 +2162,16 @@ host's compiled system-tree list bound recursively read-only, `nosuid`
 and `nodev`, or recreated as the same link; a `/run` holding only a
 compiled link name, to a target inside a bound tree; an `/etc` tmpfs of
 synthesized files and a compiled allowlist of host entries, bound
-read-only and `noexec`; at most four admitted program files, read-only
+read-only and `noexec`; with a spec's Flathub runtime, on td only, the
+held runtime tree at `/usr` through the application kind's own bind and
+read-only remount (`MS_BIND`, then
+`MS_REMOUNT|MS_BIND|MS_RDONLY|MS_NOSUID|MS_NODEV`), `/lib` and `/lib64`
+links into it in place of the host's `/usr`, `/lib` and `/lib64`, and
+the runtime's loader files in `/etc` in place of the host's, through the
+application kind's runtime-entry bind, with no new call, flag or
+operation, the descriptor sweep keeping that runtime's lock in stage 1
+as an application launch keeps its generation locks (close-on-exec, so
+stage 2 starts without it); at most four admitted program files, read-only
 and executable, device and inode checked; and the admitted directories
 at their real paths through the same grant bind and hardening loop,
 `noexec` but for worktrees and development's private home and shared trees, which keeps
@@ -2172,8 +2181,9 @@ mounts with four admitted persistent directory binds at compiled targets
 existing bind operations and identity checks; stage 2 checks mount flags
 and writable directories without requiring tmpfs sizes or empty contents.
 No syscall surface is added. Admission refuses a pseudo-filesystem mounted below any of them. Stage
-2 reads it all back, down to every scaffold directory's names and the
-absence of any unplanned mount, before it clears capabilities, then
+2 reads it all back, down to every scaffold directory's names, the
+runtime's links, flags and loader entries, and the absence of any
+unplanned mount, before it clears capabilities, then
 installs the selected profile's filter. For the isolated profile this is
 the second compiled program, `WORKSPACE_FILTER`: the standard filter but
 for its socket rules, which refuse `socket(2)` for `AF_UNIX` with

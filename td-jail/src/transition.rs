@@ -208,6 +208,38 @@ const RUNTIME_ALIASES: &[(&str, &str)] = &[
     ("lib64", "/usr/lib64"),
     ("sbin", "/usr/sbin"),
 ];
+/// A workspace's runtime takes the loader's directories alone: td's own
+/// `/bin` stays (WORKLOADS.md, "Runtimes").
+const WORKSPACE_RUNTIME_ALIASES: &[(&str, &str)] = &[("lib", "/usr/lib"), ("lib64", "/usr/lib64")];
+/// A workspace's runtime supplies the loader's files in place of the
+/// host's, and nothing else of its `/etc`.
+const WORKSPACE_RUNTIME_ETC_ALLOWLIST: &[&str] = &["ld.so.cache", "ld.so.conf", "ld.so.conf.d"];
+/// The workspace `/etc` names a runtime may never replace: its synthesized
+/// files and development's resolver.
+const WORKSPACE_OWNED_ETC_NAMES: &[&str] = &[
+    "group",
+    "hostname",
+    "hosts",
+    "nsswitch.conf",
+    "passwd",
+    "resolv.conf",
+];
+
+/// What a kind's `/etc` takes from its runtime's `usr/etc`, and the names
+/// the kind owns, which the allowlist must leave out.
+struct RuntimeEtc {
+    allowlist: &'static [&'static str],
+    owned: &'static [&'static str],
+}
+
+const APPLICATION_RUNTIME_ETC: RuntimeEtc = RuntimeEtc {
+    allowlist: RUNTIME_ETC_ALLOWLIST,
+    owned: TD_OWNED_ETC_NAMES,
+};
+const WORKSPACE_RUNTIME_ETC: RuntimeEtc = RuntimeEtc {
+    allowlist: WORKSPACE_RUNTIME_ETC_ALLOWLIST,
+    owned: WORKSPACE_OWNED_ETC_NAMES,
+};
 
 const DEVICE_NODES: &[(&str, u64, u64)] = &[
     ("null", 1, 3),
@@ -438,11 +470,14 @@ impl Stage2Action {
 
 /// What stage 2 of a `workspace` launch was told: the plan it reads back
 /// and the entry it starts. The environment is not carried; it follows
-/// from `home` and `path` (`workspace::environment`).
+/// from `home`, `path` and `runtime` (`workspace::environment`).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Workspace {
     development: bool,
     persistent: bool,
+    /// A runtime is bound at `/usr`, in place of the host's `/usr`, `/lib` and
+    /// `/lib64`.
+    runtime: bool,
     programs: Vec<String>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -1883,12 +1918,13 @@ fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
 }
 
-/// The runtime's own `/etc` entries a kind admits, by its `allowlist`.
+/// The runtime's own `/etc` entries a kind admits, by its `selection`.
 fn selected_runtime_etc(
     runtime_files: &Path,
-    allowlist: &'static [&'static str],
+    selection: &RuntimeEtc,
 ) -> io::Result<Vec<RuntimeEtcEntry>> {
-    validate_runtime_etc_allowlist(allowlist)?;
+    validate_runtime_etc_allowlist(selection)?;
+    let allowlist = selection.allowlist;
     let root = runtime_files.join("etc");
     match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1931,13 +1967,13 @@ fn selected_runtime_etc(
     Ok(selected)
 }
 
-fn validate_runtime_etc_allowlist(allowlist: &[&str]) -> io::Result<()> {
+fn validate_runtime_etc_allowlist(selection: &RuntimeEtc) -> io::Result<()> {
     let mut previous = None;
-    for name in allowlist {
+    for name in selection.allowlist {
         if name.is_empty()
             || name.contains('/')
             || previous.is_some_and(|prior: &str| prior >= *name)
-            || TD_OWNED_ETC_NAMES.contains(name)
+            || selection.owned.contains(name)
         {
             return Err(io::Error::other(
                 "runtime configuration allowlist is not sorted, unique and disjoint",
@@ -2240,7 +2276,7 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
             "Firefox autotest CA",
         )?;
     }
-    for entry in selected_runtime_etc(&application.runtime_files, RUNTIME_ETC_ALLOWLIST)? {
+    for entry in selected_runtime_etc(&application.runtime_files, &APPLICATION_RUNTIME_ETC)? {
         mount_runtime_etc_entry(&entry, &etc)?;
     }
     remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
@@ -2376,11 +2412,11 @@ fn prepare_mount_plan(
             "mode=0755,size=67108864",
         )?;
         create_dir(&format!("{run}/user"), 0o755)?;
-        let runtime = format!("{run}/user/{}", identity.uid);
-        create_dir(&runtime, 0o700)?;
-        let application_runtime = format!("{runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
+        let user_runtime = format!("{run}/user/{}", identity.uid);
+        create_dir(&user_runtime, 0o700)?;
+        let application_runtime = format!("{user_runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
         create_dir(&application_runtime, 0o700)?;
-        let wayland = format!("{runtime}/wayland-0");
+        let wayland = format!("{user_runtime}/wayland-0");
         let listener = UnixListener::bind(&wayland)
             .map_err(|e| io::Error::other(format!("create Wayland bind target: {e}")))?;
         drop(listener);
@@ -2392,7 +2428,7 @@ fn prepare_mount_plan(
         // just as well while meaning nothing. Binding a listener and dropping
         // it is simply how one makes a socket inode; it never accepts, and what
         // survives the drop is the inode.
-        let bus = format!("{runtime}/bus");
+        let bus = format!("{user_runtime}/bus");
         let listener = UnixListener::bind(&bus)
             .map_err(|e| io::Error::other(format!("create session bus bind target: {e}")))?;
         drop(listener);
@@ -2401,7 +2437,7 @@ fn prepare_mount_plan(
         // and a jail bound to the directory connects to the new one.
         let fetch = match &application.fetch_runtime {
             Some(source) => {
-                let target = format!("{runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
+                let target = format!("{user_runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
                 create_dir(&target, 0o700)?;
                 Some((source.clone(), target))
             }
@@ -3082,6 +3118,11 @@ fn grant_scaffold_names(
             "app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var",
         ]
         .into_iter()
+        .chain(
+            application_runtime_aliases(runtime_aliases)
+                .iter()
+                .map(|(name, _)| *name),
+        )
         .map(str::to_string)
         .collect::<BTreeSet<_>>()
     } else {
@@ -3090,11 +3131,6 @@ fn grant_scaffold_names(
             .map(str::to_string)
             .collect::<BTreeSet<_>>()
     };
-    root.extend(
-        application_runtime_aliases(runtime_aliases)
-            .iter()
-            .map(|(name, _)| (*name).to_string()),
-    );
     if firefox_seccomp_probe {
         root.insert("opt".to_string());
     }
@@ -3142,8 +3178,8 @@ fn expected_etc_names(
     runtime_etc: &[RuntimeEtcEntry],
     etc: EtcBinding<'_>,
 ) -> io::Result<BTreeSet<String>> {
-    validate_runtime_etc_allowlist(RUNTIME_ETC_ALLOWLIST)?;
-    let mut expected = TD_OWNED_ETC_NAMES
+    let mut expected = APPLICATION_RUNTIME_ETC
+        .owned
         .iter()
         .filter(|name| etc.resolv_conf || **name != "resolv.conf")
         .filter(|name| etc.timezone.is_some() || **name != "localtime")
@@ -3160,7 +3196,8 @@ fn expected_etc_names(
         ));
     }
     for entry in runtime_etc {
-        if !RUNTIME_ETC_ALLOWLIST.contains(&entry.name) || !expected.insert(entry.name.to_string())
+        if !APPLICATION_RUNTIME_ETC.allowlist.contains(&entry.name)
+            || !expected.insert(entry.name.to_string())
         {
             return Err(io::Error::other(
                 "runtime configuration selection is not closed and unique",
@@ -3331,7 +3368,7 @@ fn require_etc_plan(
     } = etc;
     let expected_machine_id =
         machine_id.ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
-    let runtime_etc = selected_runtime_etc(Path::new(RUNTIME_ROOT), RUNTIME_ETC_ALLOWLIST)?;
+    let runtime_etc = selected_runtime_etc(Path::new(RUNTIME_ROOT), &APPLICATION_RUNTIME_ETC)?;
     let expected = expected_etc_names(&runtime_etc, etc)?;
     let actual = read_dir_names("/etc")?;
     if actual != expected {
@@ -3477,8 +3514,16 @@ fn require_etc_plan(
     if let Some(name) = terminal {
         require_bound_terminfo(mountinfo, name)?;
     }
+    require_runtime_etc_binds(mountinfo, &runtime_etc)?;
+    require_read_only_mount("/etc", token)
+}
+
+/// Each selected runtime entry is bound at `/etc/<name>` from the runtime
+/// at `/usr`, the same file or directory, read-only, `nosuid`, `nodev` and
+/// `noexec`.
+fn require_runtime_etc_binds(mountinfo: &str, runtime_etc: &[RuntimeEtcEntry]) -> io::Result<()> {
     for entry in runtime_etc {
-        require_runtime_etc_source_identity(&entry)?;
+        require_runtime_etc_source_identity(entry)?;
         let target = PathBuf::from("/etc").join(entry.name);
         let metadata = fs::symlink_metadata(&target)?;
         if metadata.dev() != entry.source_device
@@ -3502,7 +3547,7 @@ fn require_etc_plan(
             },
         )?;
     }
-    require_read_only_mount("/etc", token)
+    Ok(())
 }
 
 struct Stage2MountExpectation<'a> {
@@ -3675,14 +3720,14 @@ fn require_mount_plan(
         )?;
         require_etc_plan(&mountinfo, token, etc, identity)?;
         require_names("/run", required_run_names(pulse))?;
-        let runtime = format!("/run/user/{}", identity.uid);
-        require_mode(&runtime, 0o700)?;
+        let user_runtime = format!("/run/user/{}", identity.uid);
+        require_mode(&user_runtime, 0o700)?;
         require_names("/run/user", &[&identity.uid.to_string()])?;
-        let mut runtime_names = vec![crate::authority::RUNTIME_ROOT_NAME, "bus", "wayland-0"];
+        let mut user_runtime_names = vec![crate::authority::RUNTIME_ROOT_NAME, "bus", "wayland-0"];
         if fetch_socket {
-            runtime_names.push(crate::authority::FETCH_RUNTIME_NAME);
+            user_runtime_names.push(crate::authority::FETCH_RUNTIME_NAME);
         }
-        require_names(&runtime, &runtime_names)?;
+        require_names(&user_runtime, &user_runtime_names)?;
         require_mount(
             &mountinfo,
             "/app",
@@ -3744,20 +3789,20 @@ fn require_mount_plan(
         require_writable_directory("/home/td/.cache/tmp", token)?;
         require_mount(
             &mountinfo,
-            &format!("{runtime}/wayland-0"),
+            &format!("{user_runtime}/wayland-0"),
             None,
             &["ro", "nosuid", "nodev", "noexec"],
             &["rw"],
         )?;
         require_mount(
             &mountinfo,
-            &format!("{runtime}/bus"),
+            &format!("{user_runtime}/bus"),
             None,
             &["ro", "nosuid", "nodev", "noexec"],
             &["rw"],
         )?;
         if fetch_socket {
-            let fetch = format!("{runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
+            let fetch = format!("{user_runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
             require_mount(
                 &mountinfo,
                 &fetch,
@@ -3818,7 +3863,7 @@ fn require_mount_plan(
             require_read_only_mount("/run/flatpak", token)?;
             require_read_only_mount("/run/flatpak/pulse", token)?;
         }
-        let application_runtime = format!("{runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
+        let application_runtime = format!("{user_runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
         require_mode(&application_runtime, 0o700)?;
         require_mode("/home/td", 0o700)?;
         require_mount(
@@ -6656,7 +6701,15 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
         sys::bring_up_loopback()
             .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     }
-    close_inherited_descriptors(&[])?;
+    // The runtime's lock stays with stage 1, which outlives the entry:
+    // td-app collects no generation a launch holds.
+    let runtime_hold = plan
+        .runtime
+        .as_ref()
+        .map(|runtime| u32::try_from(runtime.hold.as_raw_fd()))
+        .transpose()
+        .map_err(|e| io::Error::other(format!("runtime lock descriptor: {e}")))?;
+    close_inherited_descriptors(runtime_hold.as_slice())?;
     prepare_workspace_mount_plan(&plan, inside_identity)?;
     prepare_capability_bridge()?;
 
@@ -6759,6 +6812,11 @@ fn stage2_workspace_arguments(
         } else {
             "persistent"
         }),
+        OsString::from(if plan.runtime.is_some() {
+            "runtime"
+        } else {
+            "native"
+        }),
         OsString::from(STAGE2_PROGRAMS_ARG),
         OsString::from(plan.programs.len().to_string()),
     ];
@@ -6848,6 +6906,11 @@ where
         Some("ephemeral") => false,
         _ => return Err(usage_error()),
     };
+    let runtime = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some("runtime") => true,
+        Some("native") => false,
+        _ => return Err(usage_error()),
+    };
     expect(STAGE2_PROGRAMS_ARG, args)?;
     let count = parse_count(args.next(), "program count")?;
     if count == 0 || count > workspace::MAX_PROGRAMS {
@@ -6878,6 +6941,7 @@ where
             .into_string()
             .map_err(|_| usage_error())?;
         let source = tree(args.next())?;
+        workspace::refuse_runtime_tree("PATH alias source", &source, runtime)?;
         let alias = crate::host_path::Alias { name, source };
         workspace::admit_alias(&alias)?;
         if aliases.iter().any(|known| known.name == alias.name) {
@@ -6893,7 +6957,10 @@ where
     let mut path: Vec<PathBuf> = Vec::with_capacity(count);
     for _ in 0..count {
         let directory = PathBuf::from(args.next().ok_or_else(usage_error)?);
-        if !workspace::path_directory_named(&directory) || path.contains(&directory) {
+        if !workspace::path_directory_named(&directory)
+            || path.contains(&directory)
+            || (runtime && workspace::in_runtime_tree(&directory))
+        {
             return Err(usage_error());
         }
         path.push(directory);
@@ -6988,6 +7055,7 @@ where
     let plan = Stage2Workspace {
         development,
         persistent,
+        runtime,
         programs,
         aliases,
         path,
@@ -7013,7 +7081,9 @@ where
 }
 
 /// Stage 1's plan for a workspace: the base trees, the host's system
-/// trees and selective `/etc`, the programs, the home, the worktrees, the
+/// trees, or with a runtime its tree at `/usr` and `/lib` and `/lib64`
+/// links in place of the host's, and selective `/etc`, the programs, the
+/// home, the worktrees, the
 /// shared directories, the repositories, and the git chain over them in
 /// its order, each link after the one it lies on.
 fn refresh_workspace_run_link(target: &Path, resolved: &Path) -> io::Result<()> {
@@ -7090,12 +7160,15 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         let Ok(resolved) = fs::canonicalize(&host) else {
             continue;
         };
-        if in_system_tree(&resolved) {
+        if in_system_tree(&resolved, plan.runtime.is_some()) {
             let target = format!("{NEW_ROOT}/run/{name}");
             refresh_workspace_run_link(Path::new(&target), &resolved)?;
         }
     }
     for name in workspace::SYSTEM_TREES {
+        if plan.runtime.is_some() && workspace::RUNTIME_TREES.contains(name) {
+            continue;
+        }
         bind_system_tree(name)?;
     }
     if !workspace::PROGRAM_TREES.iter().any(|name| {
@@ -7104,6 +7177,16 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         return Err(io::Error::other(
             "the host has neither a /usr nor a /td directory for the workspace kind to bind",
         ));
+    }
+    if let Some(runtime) = &plan.runtime {
+        create_dir(&format!("{NEW_ROOT}{RUNTIME_ROOT}"), 0o555)?;
+        mount_runtime_tree(&runtime.files, WORKSPACE_RUNTIME_ALIASES)?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        require_bind_source(
+            &mountinfo,
+            &runtime.files,
+            Path::new(&format!("{NEW_ROOT}{RUNTIME_ROOT}")),
+        )?;
     }
     prepare_workspace_etc(plan, identity)?;
     for program in &plan.programs {
@@ -7158,31 +7241,42 @@ fn bind_system_tree(name: &str) -> io::Result<()> {
     }
 }
 
-/// Whether `path` lies in a host system tree the plan binds.
-fn in_system_tree(path: &Path) -> bool {
+/// Whether `path` lies in a host system tree the plan binds: with a
+/// `runtime`, not in one the runtime replaces.
+fn in_system_tree(path: &Path, runtime: bool) -> bool {
     workspace::SYSTEM_TREES
         .iter()
         .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
+        && !(runtime && workspace::in_runtime_tree(path))
 }
 
 /// What a host `/etc` link becomes in the jail: the host's own text when
 /// that already names a bound tree, since tools read a zone's name from
 /// `/etc/localtime`'s; else where it resolves when that is in one, since a
 /// chain through an unbound tree (NixOS's `/etc/static`) would dangle;
-/// else the host's text.
-fn bound_link_target(host: &Path) -> io::Result<PathBuf> {
+/// else the host's text. With a `runtime`, none for a link that names or
+/// resolves into a tree it replaces, which would be the runtime's file.
+fn bound_link_target(host: &Path, runtime: bool) -> io::Result<Option<PathBuf>> {
     let text = fs::read_link(host)?;
-    if text.is_absolute() && in_system_tree(&text) {
-        return Ok(text);
+    let resolved = fs::canonicalize(host).ok();
+    if runtime
+        && (workspace::in_runtime_tree(&text)
+            || resolved.as_deref().is_some_and(workspace::in_runtime_tree))
+    {
+        return Ok(None);
     }
-    match fs::canonicalize(host) {
-        Ok(resolved) if in_system_tree(&resolved) => Ok(resolved),
-        _ => Ok(text),
+    if text.is_absolute() && in_system_tree(&text, runtime) {
+        return Ok(Some(text));
+    }
+    match resolved {
+        Some(resolved) if in_system_tree(&resolved, runtime) => Ok(Some(resolved)),
+        _ => Ok(Some(text)),
     }
 }
 
 /// The selective `/etc`: synthesized account, group and host files, and the
-/// allowlisted host entries, each as the host has it, read-only.
+/// allowlisted host entries, each as the host has it, read-only; with a
+/// runtime, the runtime's loader files in place of the host's.
 fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result<()> {
     let etc = PathBuf::from(format!("{NEW_ROOT}/etc"));
     let etc_text = etc
@@ -7207,13 +7301,19 @@ fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result
         create_file(&etc.join(name), contents.as_bytes(), 0o444)?;
     }
     for name in workspace::HOST_ETC {
+        // The runtime's loader files, below, not the host's.
+        if plan.runtime.is_some() && WORKSPACE_RUNTIME_ETC.allowlist.contains(name) {
+            continue;
+        }
         let host = Path::new("/etc").join(name);
         let target = etc.join(name);
         match fs::symlink_metadata(&host) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                symlink(bound_link_target(&host)?, &target)?;
+                if let Some(link) = bound_link_target(&host, plan.runtime.is_some())? {
+                    symlink(link, &target)?;
+                }
             }
             Ok(metadata) if metadata.is_file() => {
                 create_file(&target, b"", 0o444)?;
@@ -7242,6 +7342,11 @@ fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result
             }
             // A device, socket or FIFO under /etc is no configuration.
             Ok(_) => {}
+        }
+    }
+    if let Some(runtime) = &plan.runtime {
+        for entry in selected_runtime_etc(&runtime.files, &WORKSPACE_RUNTIME_ETC)? {
+            mount_runtime_etc_entry(&entry, &etc)?;
         }
     }
     if plan.development {
@@ -7300,6 +7405,22 @@ fn mount_workspace_program(program: &workspace::Program) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `name` may be in a workspace's `/etc`: a synthesized file,
+/// development's resolver, and the allowlisted host entries, but with a
+/// runtime its selected loader files in place of the host's.
+fn workspace_etc_name(name: &str, development: bool, runtime: Option<&[RuntimeEtcEntry]>) -> bool {
+    let host = workspace::HOST_ETC.contains(&name);
+    workspace::SYNTHESIZED_ETC.contains(&name)
+        || (development && name == "resolv.conf")
+        || match runtime {
+            None => host,
+            Some(selected) => {
+                selected.iter().any(|entry| entry.name == name)
+                    || (host && !WORKSPACE_RUNTIME_ETC.allowlist.contains(&name))
+            }
+        }
+}
+
 /// Stage 2's readback of a workspace plan.
 fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN]) -> io::Result<()> {
     if fs::symlink_metadata(OLD_ROOT).is_ok() {
@@ -7339,6 +7460,9 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     require_planned_rows(plan, &mountinfo)?;
     let mut programs = false;
     for name in workspace::SYSTEM_TREES {
+        if plan.runtime && workspace::RUNTIME_TREES.contains(name) {
+            continue;
+        }
         let path = format!("/{name}");
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -7369,6 +7493,9 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "workspace root binds neither the host's /usr nor its /td directory",
         ));
     }
+    if plan.runtime {
+        require_runtime_tree(&mountinfo, token, WORKSPACE_RUNTIME_ALIASES)?;
+    }
     for name in if plan.persistent {
         BTreeSet::new()
     } else {
@@ -7392,20 +7519,33 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
         &["rw"],
     )?;
     let etc = read_dir_names("/etc")?;
-    for name in workspace::SYNTHESIZED_ETC {
-        if !etc.contains(*name) {
+    // Selected again inside, from the runtime at `/usr`.
+    let runtime_etc = if plan.runtime {
+        Some(selected_runtime_etc(
+            Path::new(RUNTIME_ROOT),
+            &WORKSPACE_RUNTIME_ETC,
+        )?)
+    } else {
+        None
+    };
+    for name in workspace::SYNTHESIZED_ETC
+        .iter()
+        .copied()
+        .chain(runtime_etc.iter().flatten().map(|entry| entry.name))
+    {
+        if !etc.contains(name) {
             return Err(io::Error::other(format!("workspace /etc lacks {name}")));
         }
     }
-    if let Some(stray) = etc.iter().find(|name| {
-        !workspace::SYNTHESIZED_ETC.contains(&name.as_str())
-            && !workspace::HOST_ETC.contains(&name.as_str())
-            && !(plan.development && name.as_str() == "resolv.conf")
-    }) {
+    if let Some(stray) = etc
+        .iter()
+        .find(|name| !workspace_etc_name(name, plan.development, runtime_etc.as_deref()))
+    {
         return Err(io::Error::other(format!(
             "workspace /etc holds {stray}, which its plan does not"
         )));
     }
+    require_runtime_etc_binds(&mountinfo, runtime_etc.as_deref().unwrap_or_default())?;
     for row in grant_mount_rows(&mountinfo, Path::new("/etc"))? {
         for required in ["ro", "nosuid", "nodev", "noexec"] {
             if !row.options.contains(required) {
@@ -7737,14 +7877,17 @@ fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<(
         planned.push(PathBuf::from("/run"));
     }
     planned.push(PathBuf::from(workspace::PROGRAM_DIR));
+    // A runtime's tree is one bind with nothing below it.
     planned.extend(
         workspace::SYSTEM_TREES
             .iter()
+            .filter(|name| !(plan.runtime && workspace::RUNTIME_TREES.contains(name)))
             .map(|name| Path::new("/").join(name)),
     );
     planned.extend(plan.trees().map(Path::to_path_buf));
     for row in grant_mount_rows(mountinfo, Path::new("/"))? {
         if row.mountpoint != Path::new("/")
+            && !(plan.runtime && row.mountpoint == Path::new(RUNTIME_ROOT))
             && !planned
                 .iter()
                 .any(|root| path_is_same_or_child(&row.mountpoint, root))
@@ -7801,7 +7944,7 @@ fn run_stage2_workspace(
     command
         .args(&plan.arguments)
         .env_clear()
-        .envs(workspace::environment(&plan.home, &plan.path))
+        .envs(workspace::environment(&plan.home, &plan.path, plan.runtime))
         .stdin(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stdout(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stderr(Stdio::from(
@@ -7880,6 +8023,7 @@ mod tests {
         let plan = Stage2Workspace {
             development: false,
             persistent: false,
+            runtime: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -7966,6 +8110,7 @@ mod tests {
             ],
             shared: vec![grant("/d", true), grant("/e", false)],
             arguments: vec!["tool-host".into(), "--root".into()],
+            runtime: None,
         };
         let identity = Identity {
             uid: 1000,
@@ -7981,6 +8126,7 @@ mod tests {
         );
         let mut rest = arguments.into_iter().skip(7);
         let parsed = parse_stage2_workspace(&mut rest).unwrap();
+        assert!(!parsed.runtime);
         assert_eq!(parsed.programs, ["td-agent", "td-txt"]);
         assert_eq!(parsed.path, [PathBuf::from("/gnu/store/x-profile/bin")]);
         assert_eq!(
@@ -8056,12 +8202,186 @@ mod tests {
             "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
-                parse_stage2_workspace(&mut words(&format!("confined ephemeral {bad}")).into_iter()).is_err(),
+                parse_stage2_workspace(&mut words(&format!("confined ephemeral native {bad}")).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good = "confined ephemeral --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
+        let good = "confined ephemeral native --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
+
+        // The runtime word: one of two, and with a runtime no path
+        // directory or alias source in a tree the runtime replaces.
+        let tail =
+            format!("--home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments");
+        let usr_path = format!("--programs 1 a --path-aliases 0 --path 1 /usr/bin {tail}");
+        assert!(parse_stage2_workspace(
+            &mut words(&format!("confined ephemeral native {usr_path}")).into_iter()
+        )
+        .is_ok());
+        let runtime = format!("--programs 1 a --path-aliases 0 --path 1 /td/store/x/bin {tail}");
+        assert!(
+            parse_stage2_workspace(
+                &mut words(&format!("confined ephemeral runtime {runtime}")).into_iter()
+            )
+            .unwrap()
+            .runtime
+        );
+        for bad in [
+            format!("confined ephemeral runtime {usr_path}"),
+            format!("confined ephemeral runtime --programs 1 a --path-aliases 0 --path 1 /lib64 {tail}"),
+            format!("confined ephemeral runtime --programs 1 a --path-aliases 1 cc /usr/bin/gcc --path 0 {tail}"),
+            format!("confined ephemeral flathub {runtime}"),
+            format!("confined ephemeral {runtime}"),
+            format!("confined runtime ephemeral {runtime}"),
+        ] {
+            assert!(
+                parse_stage2_workspace(&mut words(&bad).into_iter()).is_err(),
+                "{bad}"
+            );
+        }
+        let mut plan = plan;
+        plan.runtime = Some(workspace::WorkspaceRuntime {
+            files: "/var/lib/td/runtimes/r/deploy/c/files".into(),
+            hold: fs::File::open("/dev/null").unwrap(),
+        });
+        let arguments = stage2_workspace_arguments(
+            &[7; TOKEN_LEN],
+            LaunchIdentityMap {
+                inside: identity,
+                outside: identity,
+            },
+            &plan,
+        );
+        assert_eq!(arguments.get(9).unwrap(), "runtime");
+        let parsed = parse_stage2_workspace(&mut arguments.into_iter().skip(7)).unwrap();
+        assert!(parsed.runtime);
+    }
+
+    /// In runtime mode stage 2 admits one mount at `/usr` and none below
+    /// it, the replaced trees are no host trees for links, and a
+    /// workspace's scaffold carries no application alias.
+    #[test]
+    fn a_workspace_runtime_is_one_mount_and_its_trees_hold_no_host_link() {
+        let plan = |runtime| Stage2Workspace {
+            development: false,
+            persistent: false,
+            runtime,
+            programs: vec!["a".into()],
+            aliases: Vec::new(),
+            path: Vec::new(),
+            home: "/h".into(),
+            worktrees: Vec::new(),
+            repositories: Vec::new(),
+            chain: Vec::new(),
+            shared: Vec::new(),
+            working_directory: "/h".into(),
+            arguments: Vec::new(),
+        };
+        let row =
+            |id: u32, point: &str| format!("{id} 1 0:1 / {point} ro,nosuid - ext4 /dev/a ro\n");
+        let base = [
+            row(1, "/"),
+            row(2, "/h"),
+            row(3, "/usr"),
+            row(4, "/opt/workspace/bin"),
+        ]
+        .concat();
+        assert!(require_planned_rows(&plan(false), &base).is_ok());
+        assert!(require_planned_rows(&plan(true), &base).is_ok());
+        // Below the runtime's tree, or at a replaced tree's link: the
+        // host's own trees may carry mounts, a runtime's carries none.
+        for stray in ["/usr/lib/x", "/usr/etc", "/lib", "/lib64/y"] {
+            let rows = [base.clone(), row(9, stray)].concat();
+            assert!(require_planned_rows(&plan(false), &rows).is_ok(), "{stray}");
+            assert!(require_planned_rows(&plan(true), &rows).is_err(), "{stray}");
+        }
+
+        // A non-application plan's root takes no application alias.
+        let probe = grant_scaffold_names(false, true, false, &[]).unwrap();
+        let root = probe.get(Path::new("/")).unwrap();
+        for (name, _) in RUNTIME_ALIASES {
+            assert!(!root.contains(*name), "{name}");
+        }
+
+        // A host `/etc` link into a replaced tree names the runtime's
+        // file there, so a runtime workspace leaves it out.
+        let directory = td_fs::TempDir::new("workspace-runtime-links").unwrap();
+        let into_usr = directory.join("into-usr");
+        symlink("/usr/share/zoneinfo/UTC", &into_usr).unwrap();
+        let into_td = directory.join("into-td");
+        symlink("/td/store/x-tzdata/share/zoneinfo/UTC", &into_td).unwrap();
+        assert_eq!(
+            bound_link_target(&into_usr, false).unwrap(),
+            Some(PathBuf::from("/usr/share/zoneinfo/UTC"))
+        );
+        assert_eq!(bound_link_target(&into_usr, true).unwrap(), None);
+        assert_eq!(
+            bound_link_target(&into_td, true).unwrap(),
+            Some(PathBuf::from("/td/store/x-tzdata/share/zoneinfo/UTC"))
+        );
+        assert!(in_system_tree(Path::new("/usr/bin"), false));
+        assert!(!in_system_tree(Path::new("/usr/bin"), true));
+        assert!(in_system_tree(Path::new("/td/store"), true));
+    }
+
+    /// The workspace kind's runtime aliases are the application kind's
+    /// loader directories alone, and with `/usr` exactly the trees the
+    /// runtime replaces; its `/etc` takes the loader's files from the
+    /// runtime, in place of the host's, and nothing it owns.
+    #[test]
+    fn a_workspace_runtime_replaces_the_loader_trees_and_files_alone() {
+        for alias in WORKSPACE_RUNTIME_ALIASES {
+            assert!(RUNTIME_ALIASES.contains(alias), "{alias:?}");
+        }
+        let mut replaced: Vec<&str> = WORKSPACE_RUNTIME_ALIASES
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(std::iter::once("usr"))
+            .collect();
+        replaced.sort_unstable();
+        assert_eq!(replaced, workspace::RUNTIME_TREES);
+        assert_eq!(RUNTIME_ROOT, "/usr");
+
+        validate_runtime_etc_allowlist(&APPLICATION_RUNTIME_ETC).unwrap();
+        validate_runtime_etc_allowlist(&WORKSPACE_RUNTIME_ETC).unwrap();
+        for name in WORKSPACE_RUNTIME_ETC.allowlist {
+            assert!(workspace::HOST_ETC.contains(name), "{name}");
+            assert!(APPLICATION_RUNTIME_ETC.allowlist.contains(name), "{name}");
+        }
+        for name in workspace::SYNTHESIZED_ETC {
+            assert!(WORKSPACE_RUNTIME_ETC.owned.contains(name), "{name}");
+        }
+        // Each kind's allowlist is held to that kind's own names.
+        let workspace_passwd = RuntimeEtc {
+            allowlist: &["ld.so.cache", "passwd"],
+            owned: WORKSPACE_OWNED_ETC_NAMES,
+        };
+        assert!(validate_runtime_etc_allowlist(&workspace_passwd).is_err());
+        let localtime = |owned| RuntimeEtc {
+            allowlist: &["localtime"],
+            owned,
+        };
+        assert!(validate_runtime_etc_allowlist(&localtime(TD_OWNED_ETC_NAMES)).is_err());
+        assert!(validate_runtime_etc_allowlist(&localtime(WORKSPACE_OWNED_ETC_NAMES)).is_ok());
+
+        let entry = |name| RuntimeEtcEntry {
+            name,
+            source: Path::new("/usr/etc").join(name),
+            source_kind: FilesystemSourceKind::File,
+            source_device: 1,
+            source_inode: 2,
+        };
+        let selected = [entry("ld.so.cache"), entry("ld.so.conf")];
+        for name in ["passwd", "hosts", "gitconfig", "ld.so.cache", "ld.so.conf"] {
+            assert!(workspace_etc_name(name, false, None), "{name}");
+            assert!(workspace_etc_name(name, false, Some(&selected)), "{name}");
+        }
+        // The host's loader file the runtime lacks is not the host's.
+        assert!(workspace_etc_name("ld.so.conf.d", false, None));
+        assert!(!workspace_etc_name("ld.so.conf.d", false, Some(&selected)));
+        assert!(!workspace_etc_name("resolv.conf", false, None));
+        assert!(workspace_etc_name("resolv.conf", true, Some(&selected)));
+        assert!(!workspace_etc_name("fonts", false, Some(&selected)));
     }
     use crate::authority::{
         mount_identities_outside_allowed_home, mount_tree_identities,
@@ -10917,7 +11237,7 @@ mod tests {
         let fonts = fs::symlink_metadata(etc.join("fonts")).unwrap();
         let ld_so_conf = fs::symlink_metadata(etc.join("ld.so.conf")).unwrap();
 
-        let selected = selected_runtime_etc(&runtime, RUNTIME_ETC_ALLOWLIST).unwrap();
+        let selected = selected_runtime_etc(&runtime, &APPLICATION_RUNTIME_ETC).unwrap();
         assert_eq!(
             selected,
             [
@@ -10988,7 +11308,7 @@ mod tests {
         fs::write(etc.join("ld.so.conf"), b"changed identity\n").unwrap();
         assert!(require_runtime_etc_source_identity(selected.get(1).unwrap()).is_err());
         symlink("fonts", etc.join("xdg")).unwrap();
-        assert!(selected_runtime_etc(&runtime, RUNTIME_ETC_ALLOWLIST).is_err());
+        assert!(selected_runtime_etc(&runtime, &APPLICATION_RUNTIME_ETC).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 

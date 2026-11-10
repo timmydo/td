@@ -4,16 +4,18 @@
 //!
 //! `td-app` (td-net) performs the I/O. Everything here is std-only, does
 //! none and uses no other module, so td-jail can `#[path]`-include it to
-//! read the same `selection` and pointers td-app writes.
+//! read the same `selection` and pointers td-app writes, and td-sandbox to
+//! name the same runtimes.
 
 /// One declared Flathub runtime (APPLICATIONS.md §W.9): the ref fetched and
 /// its td name. The bytes are not reviewed; the ref, Flathub's signing key
 /// and the admission rules are.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlathubRuntime {
-    /// The td runtime name: what an application's manifest names, and the
-    /// key of its environment policy and, with the application's name, of
-    /// its dynamic-library policy.
+    /// The td runtime name: what an application's manifest and a
+    /// workspace spec name, the key of an application's environment policy
+    /// and, with the application's name, of its dynamic-library policy. A
+    /// runtime no application names has neither.
     pub name: &'static str,
     /// The runtime ref.
     pub exact_ref: &'static str,
@@ -40,7 +42,15 @@ const PLATFORM_25_08: FlathubRuntime = FlathubRuntime {
     exact_ref: "runtime/org.freedesktop.Platform/x86_64/25.08",
 };
 
-pub const FLATHUB_RUNTIMES: &[FlathubRuntime] = &[PLATFORM_25_08];
+/// Named by no application: a workspace may name it (WORKLOADS.md,
+/// "Runtimes"), and until a runtime install path exists nothing installs
+/// it.
+const SDK_25_08: FlathubRuntime = FlathubRuntime {
+    name: "freedesktop-sdk-25-08",
+    exact_ref: "runtime/org.freedesktop.Sdk/x86_64/25.08",
+};
+
+pub const FLATHUB_RUNTIMES: &[FlathubRuntime] = &[PLATFORM_25_08, SDK_25_08];
 
 pub const FLATHUB_SOURCES: &[FlathubSource] = &[FlathubSource {
     name: "firefox",
@@ -1132,6 +1142,10 @@ mod tests {
         for runtime in FLATHUB_RUNTIMES {
             assert!(valid_name(runtime.name), "{}", runtime.name);
         }
+        // A runtime no application names is declared all the same.
+        let sdk = flathub_runtime("freedesktop-sdk-25-08").unwrap();
+        assert_eq!(sdk.exact_ref, "runtime/org.freedesktop.Sdk/x86_64/25.08");
+        assert!(FLATHUB_SOURCES.iter().all(|source| source.runtime != sdk));
     }
 
     #[test]

@@ -406,16 +406,53 @@ mod confinement {
             at(launch, "require_workspace_channel()?;")
                 < at(launch, "sys::unshare_namespaces(!plan.shared_network)")
                 && at(launch, "sys::bring_up_loopback()")
-                    < at(launch, "close_inherited_descriptors(&[])?;")
-                && at(launch, "close_inherited_descriptors(&[])?;")
                     < at(
                         launch,
-                        "prepare_workspace_mount_plan(&plan, inside_identity)?;"
+                        "close_inherited_descriptors(runtime_hold.as_slice())?;"
                     )
+                && at(
+                    launch,
+                    "close_inherited_descriptors(runtime_hold.as_slice())?;"
+                ) < at(
+                    launch,
+                    "prepare_workspace_mount_plan(&plan, inside_identity)?;"
+                )
                 && at(launch, "prepare_capability_bridge()?;") < at(launch, "command.spawn()?")
                 && at(launch, "require_child_pid_namespace_changed(")
                     < at(launch, "proof_writer.write_all(&token)")
         );
+        // The sweep keeps the runtime's lease, and only it: the plan's
+        // runtime outlives the launch's last use of it, so stage 1 holds
+        // it until the entry ends.
+        assert!(
+            at(
+                launch,
+                ".map(|runtime| u32::try_from(runtime.hold.as_raw_fd()))"
+            ) < at(
+                launch,
+                "close_inherited_descriptors(runtime_hold.as_slice())?;"
+            )
+        );
+        assert_eq!(launch.matches("close_inherited_descriptors(").count(), 1);
+        // The lease is the plan's: the plan, which `launch_workspace` owns,
+        // is only borrowed until the entry ends, never moved, dropped or
+        // taken apart before `child.wait()`.
+        assert!(at(launch, "let status = child.wait()?;") > at(launch, "command.spawn()?"));
+        for moved in [
+            "drop(plan",
+            "plan.runtime.take()",
+            "plan.runtime = ",
+            "let WorkspacePlan",
+            "mem::take(",
+            "mem::replace(",
+            "(plan)",
+            "(plan,",
+            ", plan)",
+            ", plan,",
+            "= plan;",
+        ] {
+            assert!(!launch.contains(moved), "launch_workspace: {moved}");
+        }
         let stage2 = TRANSITION
             .split_once("fn run_stage2_workspace(")
             .unwrap()
@@ -457,6 +494,42 @@ mod confinement {
         assert!(TRANSITION.contains(
             "fn install_workspace_seccomp_filter(development: bool) -> io::Result<()> {\n    let program = if development {\n        seccomp::development_program()?"
         ));
+        // A spec's runtime comes from td's compiled configuration and store
+        // alone: the launch builds no other source.
+        let shipped = WORKSPACE.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            shipped.contains("plan.runtime = Some(spec_runtime(runtime, &td_runtime_source())?);")
+        );
+        assert_eq!(shipped.matches("RuntimeSource {").count(), 1);
+        assert_eq!(shipped.matches("spec_runtime(").count(), 2);
+        // Nothing else holds a workspace runtime or builds a source: the
+        // definition and the one call above are the only shipped uses.
+        let shipped_flathub = FLATHUB.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            shipped_flathub.matches("hold_workspace_runtime(").count(),
+            1
+        );
+        assert_eq!(shipped.matches("hold_workspace_runtime(").count(), 1);
+        for other in [
+            AUTHORITY,
+            TRANSITION,
+            MAIN.split("#[cfg(test)]").next().unwrap(),
+        ] {
+            assert!(!other.contains("hold_workspace_runtime("));
+            assert!(!other.contains("RuntimeSource {"));
+        }
+        assert!(FLATHUB.contains(
+            "pub(crate) const WORKSPACE_RUNTIME_STORE: (&str, u32) = (RUNTIME_STORE, RUNTIME_UID);"
+        ));
+        // A runtime is bound by the application kind's one mount, with the
+        // workspace's own aliases, and read back by its one check.
+        assert_eq!(TRANSITION.matches("mount_runtime_tree(").count(), 3);
+        assert!(
+            TRANSITION.contains("mount_runtime_tree(&runtime.files, WORKSPACE_RUNTIME_ALIASES)?;")
+        );
+        assert_eq!(TRANSITION.matches("require_runtime_tree(").count(), 3);
+        assert!(TRANSITION
+            .contains("require_runtime_tree(&mountinfo, token, WORKSPACE_RUNTIME_ALIASES)?;"));
     }
 
     /// §D's two-phase registration is an ORDERING, and no type expresses it.
@@ -1390,7 +1463,7 @@ mod confinement {
         );
         assert_eq!(
             TRANSITION
-                .matches(".envs(workspace::environment(&plan.home, &plan.path))")
+                .matches(".envs(workspace::environment(&plan.home, &plan.path, plan.runtime))")
                 .count(),
             1
         );

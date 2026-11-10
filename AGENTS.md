@@ -88,7 +88,10 @@ the image, but it is never a tool, compilation input, or execution input to a
 source-built output. Only the explicit read-only `payload_inputs` channel may
 carry it into image composition or runtime association; td runs it only
 through the application confinement path described below and in
-`APPLICATIONS.md`.
+`APPLICATIONS.md`. Flathub payloads, the second class of foreign output
+below, run through the same path, except that a Flathub runtime a td
+workspace names also runs in that workspace's jail, which is not that
+path.
 
 ## Control plane
 
@@ -156,7 +159,7 @@ an amendment to this file.
 
 Flathub applications and runtimes are the second class (`APPLICATIONS.md`
 §W.9). Their bytes are neither pinned nor in
-`/td/store` or the image: what is reviewed is the application's declaration
+`/td/store` or the image: what is reviewed is each declaration
 (repository, exact app and runtime refs and td's own policy) and Flathub's
 signing key compiled into td-net. The payload is fetched, only when the
 session owner installs or updates it in td-software (or an autotest
@@ -166,7 +169,18 @@ runtime store a dedicated runtime account owns, and admitted only under
 that signature, exact ref bindings, a monotonic commit time and
 §B.3.1's bounds and validators. It is never an input to any recipe, is
 outside every closure and source-bootstrap claim, and runs only through
-the same confinement.
+the same confinement or, for a runtime a td workspace names, inside that
+workspace's jail (`APPLICATIONS.md` §C). That jail confines less than
+an application's: the runtime's code runs under the workspace kind's
+seccomp filter (td-sandbox's development profile where that applies), as
+the human (uid 1000) with the workspace's grants (its writable worktrees
+and shares, its network and the host-local sockets that reaches) until
+WORKLOADS.md step 7 gives workspaces accounts of their own, and not behind
+the application kind's D-Bus, portal or Wayland boundaries. td's own
+glibc programs in such a workspace can load the runtime's code too: td's
+imported glibc keeps its compiled-in `/usr` paths, so its library search
+after `RUNPATH`, its gconv modules, its locale data and its `libgcc_s`
+resolve into the runtime there.
 
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an
@@ -174,7 +188,8 @@ explicit store `ld.so` can load them, and static payloads have no interpreter.
 The claim is narrower and exact: no foreign application binary is a tool,
 compilation input, or execution input to a source-built output. td's supported
 run path puts applications behind td-owned namespace, seccomp, D-Bus, portal,
-and Wayland boundaries. See `APPLICATIONS.md` §B.8.
+and Wayland boundaries; a Flathub runtime a workspace names has the
+workspace's boundaries alone (above). See `APPLICATIONS.md` §B.8.
 
 Image-shipped applications ride the system deployment, so independent
 side-by-side retention is deferred for them (`APPLICATIONS.md` §W.2); a

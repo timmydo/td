@@ -60,6 +60,9 @@ Already built and reused by this design:
 - the signed Flathub runtime fetch and its generations, in the runtime
   store below, and the leases a launch holds on them (`APPLICATIONS.md`
   §W.9);
+- td-jail's one runtime mount at `/usr`, shared by the application kind
+  and the workspace kind, whose spec may name a runtime (`runtime=`) and
+  which td-sandbox profiles set with `td-sandbox runtime`;
 - td-portal's caller identity from the bus broker's uid and jail lineage
   (`APPLICATIONS.md` §E).
 
@@ -101,7 +104,14 @@ Runtime declarations are a table of their own, `FLATHUB_RUNTIMES`
 its environment policy and, with the application, its dynamic-library
 policy are keyed by. Every Flathub declaration uses the one repository
 constant. Application declarations name the runtime they accept.
-Workspaces name a runtime by its td name.
+Workspaces name a runtime by its td name (td-sandbox/DESIGN.md,
+"Runtime"; `APPLICATIONS.md` §C) and install none: a runtime is installed
+and kept only by an application that names it, and a workspace launch
+finding no `current` is refused, naming those applications. The table
+also declares `org.freedesktop.Sdk//25.08` (`freedesktop-sdk-25-08`),
+which no application names, so a workspace naming it is refused as not
+installed until a runtime install path exists; it has no environment or
+dynamic-library policy, which are keyed by application.
 
 Runtimes live in one store, `/var/lib/td/runtimes/`, one store per
 runtime named by its td name, owned by the runtime account `td-runtimes`
@@ -199,7 +209,13 @@ account.
    until step 10 the runtime half of an install shows no progress in
    td-software.
 4. One td-jail runtime mount shared by the application and workspace
-   kinds; workspace `runtime=`.
+   kinds; workspace `runtime=`. The shared mount, the workspace kind's
+   `runtime=` and td-sandbox's `runtime` landed; td-agent's workspaces
+   naming a runtime are pending. This widens the interim until step 7:
+   a runtime a workspace names runs as the human, with that workspace's
+   grants, under its seccomp filter and outside the application kind's
+   bus, portal and Wayland boundaries, and td's own glibc programs there
+   can load its code (APPLICATIONS.md §C). The target above is unchanged.
 5. The ledger allocator in td-authd, with applications moved onto it:
    the bus broker and td-portal read application uids from the ledger,
    and td-software's installs allocate.

@@ -306,7 +306,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/flathub_app.rs",
-        "target-static td-authd's application-cache relay, td-jail's Flathub admission and td-app's status writer, and td-software's status reader",
+        "target-static td-authd's application-cache relay, td-jail's Flathub admission and td-app's status writer, td-software's status reader, and target-static td-sandbox's runtime names",
     ),
     (
         "engine/src/crc32.rs",
@@ -2459,6 +2459,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/cpio.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-install (its live installation");
     assert_contains!("engine/src/flathub_app.rs", "td-software's status reader");
+    assert_contains!("engine/src/flathub_app.rs", "td-sandbox's runtime names");
     // The other half. Without it a table that matched EVERY engine source would
     // satisfy every line above, and the note would claim a target consumer for
     // control-plane-only code.

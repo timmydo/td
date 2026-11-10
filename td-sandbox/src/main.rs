@@ -1,5 +1,8 @@
 //! Named private-home development environments. Confinement belongs to td-jail.
 #![forbid(unsafe_code)]
+#[allow(dead_code, reason = "td-app's and td-jail's runtime declarations")]
+#[path = "../../engine/src/flathub_app.rs"]
+mod flathub_app;
 #[path = "../../engine/src/host_path.rs"]
 mod host_path;
 mod relay;
@@ -22,6 +25,7 @@ const HELP: &str = "td-sandbox [--jail PATH] COMMAND\n\
   share NAME PATH --read|--write\n\
   unshare NAME PATH\n\
   network NAME off|host\n\
+  runtime NAME RUNTIME|native bind a declared Flathub runtime at /usr (td only)\n\
   shell NAME                  start an interactive shell\n\
   run NAME -- COMMAND [ARG...] run a command in the private home\n\
   stop NAME                   terminate the active session\n\
@@ -34,12 +38,53 @@ fn word(arg: Option<OsString>) -> io::Result<String> {
     arg.and_then(|v| v.into_string().ok())
         .ok_or_else(|| error(HELP))
 }
-fn system_path(path: &Path) -> bool {
+/// Whether `path` lies in a system tree every instance binds; with a
+/// `runtime`, not in one it replaces, which td-jail refuses.
+fn system_path(path: &Path, runtime: bool) -> bool {
     [
         "/usr", "/bin", "/sbin", "/lib", "/lib64", "/gnu", "/nix", "/td",
     ]
     .iter()
     .any(|p| path.starts_with(p))
+        && !(runtime && RUNTIME_TREES.iter().any(|p| path.starts_with(p)))
+}
+/// What a runtime replaces in the jail (td-jail's `workspace::RUNTIME_TREES`).
+const RUNTIME_TREES: &[&str] = &["/usr", "/lib", "/lib64"];
+/// td's product configuration, td-jail's `authority::CONFIG_PATH`: where it
+/// is absent, td-jail refuses every runtime.
+const TD_CONFIG: &str = "/etc/td-app.conf";
+/// `native`, or a declared runtime's td name, which only td can bind: a
+/// development host, with no product configuration at `config`, may not
+/// set one.
+fn runtime_choice(word: &str, config: &Path) -> io::Result<Option<&'static str>> {
+    if word == "native" {
+        return Ok(None);
+    }
+    let runtime = state::runtime(word)?;
+    match fs::symlink_metadata(config) {
+        Ok(_) => Ok(Some(runtime)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(error(
+            "a runtime is td's alone: this development host has no td product configuration",
+        )),
+        Err(e) => Err(e),
+    }
+}
+/// The launch spec's first lines, in td-jail's order: the profile, the
+/// runtime, the entry.
+fn spec_head(network: bool, runtime: Option<&str>, entry: &str) -> String {
+    let mut head = format!(
+        "format=1\nprofile={}\n",
+        if network {
+            "development"
+        } else {
+            "development-offline"
+        }
+    );
+    if let Some(runtime) = runtime {
+        head.push_str(&format!("runtime={runtime}\n"));
+    }
+    head.push_str(&format!("entry={entry}\n"));
+    head
 }
 fn command_path(name: &str) -> io::Result<PathBuf> {
     td_fs::executable_on_path(name)
@@ -119,13 +164,14 @@ fn run() -> io::Result<u8> {
     match command.as_str() {
         "inspect" if args.peek().is_none() => {
             println!(
-                "Home: {}\nNetwork: {}",
+                "Home: {}\nNetwork: {}\nRuntime: {}",
                 state.home.display(),
                 if state.network {
                     "host (includes localhost and LAN)"
                 } else {
                     "off"
-                }
+                },
+                state.runtime.as_deref().unwrap_or("native")
             );
             for (path, write) in &state.shares {
                 println!(
@@ -141,6 +187,14 @@ fn run() -> io::Result<u8> {
                 "off" => false,
                 _ => return Err(error(HELP)),
             };
+            if args.next().is_some() {
+                return Err(error(HELP));
+            }
+            state.save()?;
+        }
+        "runtime" => {
+            state.runtime =
+                runtime_choice(&word(args.next())?, Path::new(TD_CONFIG))?.map(String::from);
             if args.next().is_some() {
                 return Err(error(HELP));
             }
@@ -187,10 +241,11 @@ fn run() -> io::Result<u8> {
                         "shell requires an interactive terminal; use run for pipes",
                     ));
                 }
+                let runtime = state.runtime.is_some();
                 let shell = std::env::var_os("SHELL")
                     .and_then(|p| fs::canonicalize(p).ok())
-                    .filter(|p| system_path(p))
-                    .or_else(|| command_path("sh").ok())
+                    .filter(|p| system_path(p, runtime))
+                    .or_else(|| command_path("sh").ok().filter(|p| system_path(p, runtime)))
                     .ok_or_else(|| error("no admitted shell"))?;
                 vec![shell.into_os_string(), "-i".into()]
             } else {
@@ -259,17 +314,14 @@ fn launch(
         spec: state.root.join("launch-spec"),
         control,
     };
-    let mut spec = format!(
-        "format=1\nprofile={}\nentry={}\n",
-        if state.network {
-            "development"
-        } else {
-            "development-offline"
-        },
-        state::text(&executable)?
+    let mut spec = spec_head(
+        state.network,
+        state.runtime.as_deref(),
+        state::text(&executable)?,
     );
+    let runtime = state.runtime.is_some();
     let parent_path = std::env::var_os("PATH");
-    for alias in host_path::aliases(parent_path.as_deref(), system_path) {
+    for alias in host_path::aliases(parent_path.as_deref(), |path| system_path(path, runtime)) {
         spec.push_str(&format!(
             "alias={} {}\n",
             alias.name,
@@ -284,7 +336,11 @@ fn launch(
         .flatten()
     {
         if let Ok(path) = fs::canonicalize(path) {
-            if system_path(&path) && path.is_dir() && !paths.contains(&path) && paths.len() < 16 {
+            if system_path(&path, runtime)
+                && path.is_dir()
+                && !paths.contains(&path)
+                && paths.len() < 16
+            {
                 state::text(&path)?;
                 paths.push(path);
             }
@@ -347,5 +403,47 @@ fn main() -> ExitCode {
             let _ = writeln!(io::stderr(), "td-sandbox: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_spec_carries_a_runtime_where_td_jail_reads_it() -> io::Result<()> {
+        let host = td_fs::TempDir::new("sandbox-runtime-config")?;
+        let config = host.join("td-app.conf");
+        // A development host may clear a runtime but not set one.
+        assert_eq!(runtime_choice("native", &config)?, None);
+        let refused = runtime_choice("freedesktop-sdk-25-08", &config)
+            .err()
+            .ok_or_else(|| error("a development host set a runtime"))?;
+        assert!(refused.to_string().contains("development host"));
+        fs::write(&config, "format=1\n")?;
+        assert_eq!(
+            runtime_choice("freedesktop-sdk-25-08", &config)?,
+            Some("freedesktop-sdk-25-08")
+        );
+        assert!(runtime_choice("org.freedesktop.Sdk", &config).is_err());
+        assert!(runtime_choice("", &config).is_err());
+        assert_eq!(
+            spec_head(false, None, "/e"),
+            "format=1\nprofile=development-offline\nentry=/e\n"
+        );
+        assert_eq!(
+            spec_head(true, Some("freedesktop-platform-25-08"), "/e"),
+            "format=1\nprofile=development\nruntime=freedesktop-platform-25-08\nentry=/e\n"
+        );
+        // With a runtime, nothing in the trees it replaces is offered.
+        for path in ["/usr/bin", "/lib", "/lib64/x"] {
+            assert!(system_path(Path::new(path), false), "{path}");
+            assert!(!system_path(Path::new(path), true), "{path}");
+        }
+        for path in ["/bin", "/td/store/x/bin", "/gnu/store/y/bin"] {
+            assert!(system_path(Path::new(path), true), "{path}");
+        }
+        assert!(!system_path(Path::new("/home/u/bin"), false));
+        Ok(())
     }
 }

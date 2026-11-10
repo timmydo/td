@@ -4,7 +4,9 @@
 //! a package; binds the launcher's worktrees read-write and executable at
 //! their real paths, its git repositories through the git mount chain,
 //! shared directories at theirs, a private home, and the host's own system
-//! trees read-only; and grants no Wayland, bus, audio, fetch, tty or
+//! trees read-only, on td optionally with a declared Flathub runtime at
+//! `/usr` in place of the host's `/usr`, `/lib` and `/lib64`; and grants
+//! no Wayland, bus, audio, fetch, tty or
 //! network. Its entry's standard input and output are one stream socket
 //! the launcher holds the other end of.
 //!
@@ -21,6 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::authority::{
     self, path_is_same_or_child, paths_overlap, FilesystemGrant, FilesystemSourceKind,
 };
+use crate::flathub_app::{self, FlathubRuntime};
 
 /// The argument after the exact `td-jail` argv[0] that selects this kind.
 pub(crate) const WORKSPACE_ARG: &str = "--workspace";
@@ -33,6 +36,9 @@ pub(crate) const ALIAS_DIR: &str = "/opt/workspace/path";
 /// on another host they are absent and cost a lookup.
 pub(crate) const PATH: &str =
     "/usr/local/bin:/usr/bin:/bin:/run/current-system/profile/bin:/run/current-system/sw/bin";
+/// `PATH`'s tail with a runtime at `/usr`: td's own `/bin` first, then
+/// the runtime's.
+pub(crate) const RUNTIME_PATH: &str = "/bin:/usr/bin";
 pub(crate) const TMPDIR: &str = "/tmp";
 /// Persistent development mounts, ordered as the spec's scratch lines.
 pub(crate) const SCRATCH_TARGETS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run"];
@@ -48,6 +54,9 @@ pub(crate) const SYSTEM_TREES: &[&str] = &[
 /// The system trees one of which the host must have as a directory:
 /// where its programs are. td has no `/usr`; another host has no `/td`.
 pub(crate) const PROGRAM_TREES: &[&str] = &["td", "usr"];
+/// The system trees a spec's runtime replaces: its tree at `/usr`, and
+/// `/lib` and `/lib64` links into it. Nothing of the host's is bound there.
+pub(crate) const RUNTIME_TREES: &[&str] = &["lib", "lib64", "usr"];
 /// td's one account, the human's: where the product configuration is
 /// installed, the kind serves it alone, whose td-agent launches it
 /// (APPLICATIONS.md §X.8).
@@ -211,6 +220,17 @@ pub(crate) struct WorkspacePlan {
     /// Read-only or read-write, not executable.
     pub(crate) shared: Vec<FilesystemGrant>,
     pub(crate) arguments: Vec<OsString>,
+    /// The spec's runtime, held; none for a native workspace.
+    pub(crate) runtime: Option<WorkspaceRuntime>,
+}
+
+/// A runtime store's `current`, held for the launch, and its tree, which
+/// the plan binds at `/usr`.
+#[derive(Debug)]
+pub(crate) struct WorkspaceRuntime {
+    pub(crate) files: PathBuf,
+    /// The shared lock stage 1 keeps through its descriptor sweep.
+    pub(crate) hold: fs::File,
 }
 
 impl WorkspacePlan {
@@ -222,8 +242,15 @@ impl WorkspacePlan {
     }
 }
 
-/// The entry's whole environment: `path` first on its `PATH`.
-pub(crate) fn environment(home: &Path, path: &[PathBuf]) -> Vec<(OsString, OsString)> {
+/// The entry's whole environment: `path` first on its `PATH`, and with a
+/// `runtime` td's `/bin` before the runtime's. No `LD_LIBRARY_PATH`: td's
+/// programs find their libraries by their own store interpreter and
+/// `RUNPATH`.
+pub(crate) fn environment(
+    home: &Path,
+    path: &[PathBuf],
+    runtime: bool,
+) -> Vec<(OsString, OsString)> {
     let mut search = OsString::new();
     search.push(ALIAS_DIR);
     search.push(":");
@@ -233,7 +260,7 @@ pub(crate) fn environment(home: &Path, path: &[PathBuf]) -> Vec<(OsString, OsStr
     }
     search.push(PROGRAM_DIR);
     search.push(":");
-    search.push(PATH);
+    search.push(if runtime { RUNTIME_PATH } else { PATH });
     vec![
         ("HOME".into(), home.as_os_str().to_os_string()),
         ("LANG".into(), LANG.into()),
@@ -254,6 +281,14 @@ pub(crate) fn path_directory_named(path: &Path) -> bool {
             .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
 }
 
+/// Whether `path` lies in a tree a runtime replaces, where a host path
+/// would name the runtime's file inside the jail.
+pub(crate) fn in_runtime_tree(path: &Path) -> bool {
+    RUNTIME_TREES
+        .iter()
+        .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
+}
+
 pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
     argument == WORKSPACE_ARG
 }
@@ -263,6 +298,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 struct Spec {
     development: bool,
     shared_network: bool,
+    runtime: Option<FlathubRuntime>,
     scratch: Vec<PathBuf>,
     programs: Vec<PathBuf>,
     aliases: Vec<crate::host_path::Alias>,
@@ -275,9 +311,11 @@ struct Spec {
     write: Vec<PathBuf>,
 }
 
-/// The exact, ordered keyfile: `format=1`, one `entry`, any `program`s
-/// and `path` directories, one `home`, then any `worktree`, `checkout`,
-/// `repository`, `read` and `write` lines, each group in that order.
+/// The exact, ordered keyfile: `format=1`, an optional `profile`, an
+/// optional `runtime` naming a declared Flathub runtime, one `entry`, any
+/// `program`s and `path` directories, one `home`, then any `worktree`,
+/// `checkout`, `repository`, `read` and `write` lines, each group in that
+/// order.
 fn parse_spec(text: &str) -> io::Result<Spec> {
     let mut lines = text.lines().peekable();
     if lines.next() != Some(FORMAT_LINE) {
@@ -293,6 +331,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         lines.next();
     }
     const ORDER: &[&str] = &[
+        "runtime",
         "entry",
         "program",
         "alias",
@@ -321,13 +360,26 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             .iter()
             .position(|known| *known == key)
             .ok_or_else(|| invalid(format!("workspace spec has an unknown key {key:?}")))?;
-        let once = matches!(key, "entry" | "home");
-        if rank < last || (once && rank == last && (entry || home.is_some())) {
+        let repeated = match key {
+            "runtime" => spec.runtime.is_some(),
+            "entry" => entry,
+            "home" => home.is_some(),
+            _ => false,
+        };
+        if rank < last || repeated {
             return Err(invalid(format!(
                 "workspace spec key {key:?} is out of order or repeated"
             )));
         }
         last = rank;
+        if key == "runtime" {
+            spec.runtime = Some(flathub_app::flathub_runtime(value).ok_or_else(|| {
+                invalid(format!(
+                    "workspace spec names {value:?}, which is no declared runtime"
+                ))
+            })?);
+            continue;
+        }
         if key == "alias" {
             let (name, source) = value
                 .split_once(' ')
@@ -426,6 +478,7 @@ where
     let spec_path = Path::new(spec_path);
     let text = read_spec(spec_path, uid)?;
     let spec = parse_spec(&text)?;
+    let runtime = spec.runtime;
     let real_home = authority::account_home(uid)?;
     // The home as the account names it and as it resolves, which differ
     // where `/home` is a link (`/var/home` on OSTree hosts).
@@ -434,7 +487,58 @@ where
         _ => vec![real_home],
     };
     let arguments = authority::collect_arguments(arguments)?;
-    admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)
+    let mut plan = admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)?;
+    if let Some(runtime) = runtime {
+        plan.runtime = Some(spec_runtime(runtime, &td_runtime_source())?);
+    }
+    Ok(plan)
+}
+
+/// Where a spec's runtime may come from: td, with its product
+/// configuration at `config`, and the runtime store below `store` that
+/// `owner` keeps.
+pub(crate) struct RuntimeSource<'a> {
+    pub(crate) config: &'a Path,
+    pub(crate) store: &'a Path,
+    pub(crate) owner: u32,
+}
+
+/// td's, compiled: no caller names another.
+pub(crate) fn td_runtime_source() -> RuntimeSource<'static> {
+    let (store, owner) = crate::flathub::WORKSPACE_RUNTIME_STORE;
+    RuntimeSource {
+        config: Path::new(authority::CONFIG_PATH),
+        store: Path::new(store),
+        owner,
+    }
+}
+
+/// The spec's `runtime`, on td only, its store's `current` held.
+fn spec_runtime(runtime: FlathubRuntime, source: &RuntimeSource) -> io::Result<WorkspaceRuntime> {
+    require_td_for_runtime(source.config)?;
+    let held = crate::flathub::hold_workspace_runtime(runtime, source.store, source.owner)?;
+    Ok(WorkspaceRuntime {
+        files: held.files,
+        hold: held.generation.hold,
+    })
+}
+
+/// A runtime replaces `/usr`, where a development host keeps its programs,
+/// and its store is td's alone: where no product configuration is
+/// installed at `config`, the spec may name none.
+fn require_td_for_runtime(config: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(config) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a workspace runtime is td's alone: on a development host it would replace the \
+             host's /usr, and the runtime store exists only on td",
+        )),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("inspect product application configuration: {error}"),
+        )),
+    }
 }
 
 /// Where the product configuration at `config` is installed, td's, the
@@ -506,11 +610,13 @@ fn admit(
     arguments: Vec<OsString>,
     reserved: &[&str],
 ) -> io::Result<WorkspacePlan> {
+    let runtime = spec.runtime.is_some();
     let mut alias_names = std::collections::BTreeSet::new();
     for alias in &spec.aliases {
         if !alias_names.insert(alias.name.clone()) {
             return Err(invalid("workspace PATH alias is named twice"));
         }
+        refuse_runtime_tree("PATH alias source", &alias.source, runtime)?;
         admit_alias(alias)?;
     }
     let mut programs: Vec<Program> = Vec::new();
@@ -526,6 +632,7 @@ fn admit(
     }
     let mut path: Vec<PathBuf> = Vec::new();
     for directory in spec.path {
+        refuse_runtime_tree("path directory", &directory, runtime)?;
         admit_path_directory(&directory)?;
         if path.contains(&directory) {
             return Err(invalid(format!(
@@ -733,7 +840,20 @@ fn admit(
         chain,
         shared,
         arguments,
+        runtime: None,
     })
+}
+
+/// With a `runtime`, a host path in a tree it replaces would resolve into
+/// the runtime inside the jail, so a spec may not name one there.
+pub(crate) fn refuse_runtime_tree(what: &str, path: &Path, runtime: bool) -> io::Result<()> {
+    if runtime && in_runtime_tree(path) {
+        return Err(invalid(format!(
+            "workspace {what} {} lies in /usr, /lib or /lib64, which the spec's runtime replaces",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn admit_alias(alias: &crate::host_path::Alias) -> io::Result<()> {
@@ -1368,6 +1488,7 @@ mod tests {
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
             development: false,
             shared_network: false,
+            runtime: None,
             scratch: Vec::new(),
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
             aliases: Vec::new(),
@@ -1715,7 +1836,7 @@ mod tests {
 
     #[test]
     fn the_environment_is_fixed_but_for_home_and_path() {
-        let fixed = environment(Path::new("/s/home"), &[]);
+        let fixed = environment(Path::new("/s/home"), &[], false);
         let keys: Vec<_> = fixed.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);
         assert_eq!(fixed[0].1, "/s/home");
@@ -1726,6 +1847,7 @@ mod tests {
         let searched = environment(
             Path::new("/s/home"),
             &["/gnu/store/x-profile/bin".into(), "/usr/local/sbin".into()],
+            false,
         );
         assert_eq!(
             searched[2].1,
@@ -1733,6 +1855,179 @@ mod tests {
                 "{ALIAS_DIR}:/gnu/store/x-profile/bin:/usr/local/sbin:{PROGRAM_DIR}:{PATH}"
             ))
         );
+        // With a runtime, td's `/bin` precedes the runtime's, and nothing
+        // names a library path.
+        let runtime = environment(Path::new("/s/home"), &["/td/store/x-git/bin".into()], true);
+        assert_eq!(
+            runtime[2].1,
+            OsString::from(format!(
+                "{ALIAS_DIR}:/td/store/x-git/bin:{PROGRAM_DIR}:/bin:/usr/bin"
+            ))
+        );
+        assert_eq!(
+            runtime
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            keys
+        );
+    }
+
+    /// `runtime=` is optional, once, before `entry`, and names a declared
+    /// runtime; a development host refuses it.
+    #[test]
+    fn a_spec_names_at_most_one_declared_runtime_before_its_entry() {
+        let spec = parse_spec(
+            "format=1\nprofile=development\nruntime=freedesktop-sdk-25-08\nentry=/a\nhome=/h\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.runtime,
+            flathub_app::flathub_runtime("freedesktop-sdk-25-08")
+        );
+        let spec = parse_spec("format=1\nruntime=freedesktop-platform-25-08\nentry=/a\nhome=/h\n")
+            .unwrap();
+        assert_eq!(spec.runtime.unwrap().name, "freedesktop-platform-25-08");
+        assert_eq!(
+            parse_spec("format=1\nentry=/a\nhome=/h\n").unwrap().runtime,
+            None
+        );
+        for bad in [
+            "format=1\nruntime=org.freedesktop.Platform\nentry=/a\nhome=/h\n",
+            "format=1\nruntime=\nentry=/a\nhome=/h\n",
+            "format=1\nruntime=freedesktop-platform-25-08\nruntime=freedesktop-platform-25-08\nentry=/a\nhome=/h\n",
+            "format=1\nentry=/a\nruntime=freedesktop-platform-25-08\nhome=/h\n",
+            "format=1\nentry=/a\nhome=/h\nruntime=freedesktop-platform-25-08\n",
+            "format=1\nruntime=freedesktop-platform-25-08\nprofile=development\nentry=/a\nhome=/h\n",
+        ] {
+            assert!(parse_spec(bad).is_err(), "{bad:?}");
+        }
+        let base = crate::test_temp::TempDir::new("td-jail-workspace-runtime-host").unwrap();
+        let config = base.path().join("td-app.conf");
+        let refused = require_td_for_runtime(&config).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused.to_string().contains("development host"));
+        fs::write(&config, "format=1\n").unwrap();
+        assert!(require_td_for_runtime(&config).is_ok());
+    }
+
+    /// A spec's runtime refuses a development host, names its installers
+    /// when absent, and is held from the store and owner given while the
+    /// plan lives; production gives td's compiled ones.
+    #[test]
+    fn a_spec_runtime_is_tds_compiled_store_held() {
+        use std::os::unix::fs::symlink;
+        // Production names td's configuration and store, and no other.
+        let td = td_runtime_source();
+        assert_eq!(td.config, Path::new("/etc/td-app.conf"));
+        assert_eq!(td.store, Path::new(flathub_app::RUNTIME_STORE));
+        assert_eq!(td.owner, flathub_app::RUNTIME_UID);
+
+        let base = crate::test_temp::TempDir::new("td-jail-workspace-spec-runtime").unwrap();
+        let base = fs::canonicalize(base.path()).unwrap();
+        let runtime = flathub_app::flathub_runtime("freedesktop-sdk-25-08").unwrap();
+        let config = base.join("td-app.conf");
+        let store = base.join("runtimes");
+        let source = RuntimeSource {
+            config: &config,
+            store: &store,
+            owner: fs::metadata(&base).unwrap().uid(),
+        };
+        // A development host: refused before the store is read.
+        let refused = spec_runtime(runtime, &source).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        fs::write(&config, "format=1\n").unwrap();
+        assert!(spec_runtime(runtime, &source)
+            .unwrap_err()
+            .to_string()
+            .contains("no application installs it yet"));
+        // The store as td-app publishes it.
+        let commit = "7".repeat(64);
+        let root = store.join(runtime.name);
+        let generation = root.join("generations/1");
+        fs::create_dir_all(&generation).unwrap();
+        let selection = flathub_app::RuntimeSelection {
+            name: runtime.name.into(),
+            runtime: flathub_app::Admitted {
+                exact_ref: runtime.exact_ref.into(),
+                commit: commit.clone(),
+                timestamp: 1,
+            },
+        };
+        fs::write(generation.join("selection"), selection.render()).unwrap();
+        fs::set_permissions(
+            generation.join("selection"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("generations/1", root.join("current")).unwrap();
+        let files = root.join("deploy").join(&commit).join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
+        let held = spec_runtime(runtime, &source).unwrap();
+        assert_eq!(held.files, files);
+        let probe = fs::File::open(generation.join("selection")).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        probe.try_lock().unwrap();
+    }
+
+    /// With a runtime, nothing the spec names may lie where the runtime
+    /// replaces the host's trees; without one, those trees are the host's.
+    #[test]
+    fn a_runtime_refuses_path_and_alias_sources_in_the_trees_it_replaces() {
+        for replaced in [
+            "/usr",
+            "/usr/bin",
+            "/lib",
+            "/lib64/x",
+            "/usr/lib/x86_64-linux-gnu",
+        ] {
+            assert!(in_runtime_tree(Path::new(replaced)), "{replaced}");
+            assert!(refuse_runtime_tree("path directory", Path::new(replaced), true).is_err());
+            assert!(refuse_runtime_tree("path directory", Path::new(replaced), false).is_ok());
+        }
+        for kept in [
+            "/bin",
+            "/td/store/x/bin",
+            "/lib32",
+            "/libx32",
+            "/usrx",
+            "/sbin",
+        ] {
+            assert!(!in_runtime_tree(Path::new(kept)), "{kept}");
+            assert!(refuse_runtime_tree("path directory", Path::new(kept), true).is_ok());
+        }
+        // Each replaced tree is one every instance otherwise binds.
+        for tree in RUNTIME_TREES {
+            assert!(SYSTEM_TREES.contains(tree), "{tree}");
+        }
+        // Admission refuses them before it looks at anything on disk.
+        let runtime = flathub_app::flathub_runtime("freedesktop-platform-25-08");
+        let path = Spec {
+            runtime,
+            path: vec!["/usr/bin".into()],
+            home: "/h".into(),
+            ..Spec::default()
+        };
+        let alias = Spec {
+            runtime,
+            aliases: vec![crate::host_path::Alias {
+                name: "cc".into(),
+                source: "/usr/bin/gcc".into(),
+            }],
+            home: "/h".into(),
+            ..Spec::default()
+        };
+        for spec in [path, alias] {
+            let refused = admit(spec, Path::new("/s/spec"), 1, 1, &[], Vec::new(), RESERVED)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("runtime replaces"), "{refused}");
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! fetched and admitted the trees; td-jail asks it which generation serves
 //! the declaration, holds that generation and the runtime store's `current`
 //! against collection for the life of the launch, and names their trees. A
+//! workspace naming a runtime holds that runtime's `current` alone. A
 //! launch fetches nothing.
 
 use std::fs::{self, File};
@@ -15,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use crate::flathub_app::{
     self, FlathubRuntime, FlathubSource, RuntimeSelection, Selection, CACHE_DIR, CURRENT, DEPLOY,
-    FILES, GENERATIONS, MAX_STATE_BYTES, RUNTIME_STORE, RUNTIME_UID, SELECTION,
+    FILES, FLATHUB_SOURCES, GENERATIONS, MAX_STATE_BYTES, RUNTIME_STORE, RUNTIME_UID, SELECTION,
 };
 
 /// td-net's applet, linked beside td-jail in the image.
@@ -160,7 +161,10 @@ fn hold_with(
         let Some((selection, hold)) = hold(&cache, generation, uid)? else {
             continue;
         };
-        let Some(held_runtime) = hold_runtime(name, runtime)? else {
+        let Some(held_runtime) = hold_runtime(runtime, || {
+            application_runtime_absent(name, runtime.declared)
+        })?
+        else {
             continue;
         };
         // The runtime moved after td-app answered: the next `ready` answers
@@ -281,21 +285,97 @@ fn hold(cache: &Path, generation: u64, uid: u32) -> io::Result<Option<(Selection
     Ok(Some((selection, file)))
 }
 
+/// The refusal for an application whose runtime store has no `current`.
+fn application_runtime_absent(name: &str, runtime: FlathubRuntime) -> io::Error {
+    refused(format!(
+        "{name}'s runtime {} is not installed; update {name} in td-software",
+        runtime.name
+    ))
+}
+
+/// The refusal for a workspace whose runtime store has no `current`: a
+/// workspace installs nothing, and an application that names the runtime
+/// installs and keeps it.
+fn workspace_runtime_absent(runtime: FlathubRuntime) -> io::Error {
+    let installers: Vec<&str> = FLATHUB_SOURCES
+        .iter()
+        .filter(|source| source.runtime == runtime)
+        .map(|source| source.name)
+        .collect();
+    if installers.is_empty() {
+        return refused(format!(
+            "the runtime {} is not installed, and no application installs it yet",
+            runtime.name
+        ));
+    }
+    refused(format!(
+        "the runtime {} is not installed; install an application that uses it ({}) in \
+         td-software",
+        runtime.name,
+        installers.join(", ")
+    ))
+}
+
+/// A workspace's runtime: the store's `current`, held for the launch, and
+/// its tree.
+pub(crate) struct HeldRuntime {
+    pub(crate) generation: RuntimeGeneration,
+    pub(crate) files: PathBuf,
+}
+
+/// The runtime store a workspace launch holds from, compiled.
+pub(crate) const WORKSPACE_RUNTIME_STORE: (&str, u32) = (RUNTIME_STORE, RUNTIME_UID);
+
+/// The declared `runtime`'s `current` for a workspace launch (WORKLOADS.md,
+/// "Runtimes"), held as an application's is, from the store below `root`
+/// that `owner` keeps. A workspace follows `current` and asks td-app
+/// nothing.
+pub(crate) fn hold_workspace_runtime(
+    runtime: FlathubRuntime,
+    root: &Path,
+    owner: u32,
+) -> io::Result<HeldRuntime> {
+    hold_store_current(&RuntimeStore {
+        declared: runtime,
+        root: root.join(runtime.name),
+        owner,
+    })
+}
+
+fn hold_store_current(store: &RuntimeStore) -> io::Result<HeldRuntime> {
+    for _ in 0..ATTEMPTS {
+        // Collected between reading `current` and the lock: read it again.
+        let Some(generation) = hold_runtime(store, || workspace_runtime_absent(store.declared))?
+        else {
+            continue;
+        };
+        let files = tree(
+            &generation.store,
+            &generation.selection.runtime.commit,
+            store.owner,
+        )?;
+        return Ok(HeldRuntime { generation, files });
+    }
+    Err(refused(format!(
+        "the runtime {}'s current named a generation td-jail could not hold each time it \
+         tried: it moved, or its selection is missing",
+        store.declared.name
+    )))
+}
+
 /// The runtime store's `current`, held as [`hold`] holds a generation: the
 /// store canonical, its selection and deploy the runtime account's and
 /// writable by no one else, naming the declared runtime. `None` when it
-/// was collected before the lock.
-fn hold_runtime(name: &str, store: &RuntimeStore) -> io::Result<Option<RuntimeGeneration>> {
+/// was collected before the lock; `absent`'s refusal when there is none.
+fn hold_runtime(
+    store: &RuntimeStore,
+    absent: impl FnOnce() -> io::Error,
+) -> io::Result<Option<RuntimeGeneration>> {
     let root = &store.root;
     let link = root.join(CURRENT);
     let target = match fs::read_link(&link) {
         Ok(target) => target,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(refused(format!(
-                "{name}'s runtime {} is not installed; update {name} in td-software",
-                store.declared.name
-            )))
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(absent()),
         Err(error) => {
             return Err(io::Error::new(
                 error.kind(),
@@ -465,6 +545,84 @@ mod tests {
         }
     }
 
+    fn hold_for_fixture(store: &RuntimeStore) -> io::Result<Option<RuntimeGeneration>> {
+        hold_runtime(store, || {
+            application_runtime_absent("fixture", store.declared)
+        })
+    }
+
+    /// A workspace holds the runtime store's `current` alone, as an
+    /// application's launch holds it; with none it names who installs the
+    /// runtime, and it asks again only while `current` names a generation
+    /// collected under it.
+    #[test]
+    fn a_workspace_holds_the_runtime_current_or_says_who_installs_it() {
+        let root = crate::test_temp::TempDir::new("td-jail-flathub-workspace").unwrap();
+        let store = runtime_store(root.path());
+        assert_eq!(
+            hold_store_current(&store).err().unwrap().to_string(),
+            "the runtime freedesktop-platform-25-08 is not installed; install an application \
+             that uses it (firefox) in td-software"
+        );
+        let sdk = flathub_app::flathub_runtime("freedesktop-sdk-25-08").unwrap();
+        assert_eq!(
+            workspace_runtime_absent(sdk).to_string(),
+            "the runtime freedesktop-sdk-25-08 is not installed, and no application installs it yet"
+        );
+
+        let files = runtime_generation(&store.root, 1, COMMIT);
+        let held = hold_store_current(&store).unwrap();
+        assert_eq!(held.files, files);
+        assert_eq!(held.generation.selection.runtime.commit, COMMIT);
+        let selection = store.root.join(GENERATIONS).join("1").join(SELECTION);
+        let probe = File::open(&selection).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        drop(probe);
+
+        // Another account's store, a selection or tree another account
+        // could write: nothing to bind.
+        let foreign = RuntimeStore {
+            owner: uid().wrapping_add(1),
+            ..runtime_store(root.path())
+        };
+        assert!(hold_store_current(&foreign).is_err());
+        fs::set_permissions(&selection, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(hold_store_current(&store).is_err());
+        fs::set_permissions(&selection, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(hold_store_current(&store).is_err());
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(hold_store_current(&store).is_ok());
+
+        // Through the workspace's entry, from the store root it is given.
+        let held = hold_workspace_runtime(
+            store.declared,
+            &fs::canonicalize(root.path()).unwrap().join("runtimes"),
+            uid(),
+        );
+        assert_eq!(held.unwrap().files, files);
+        assert!(hold_workspace_runtime(
+            store.declared,
+            &fs::canonicalize(root.path()).unwrap().join("runtimes"),
+            uid().wrapping_add(1)
+        )
+        .is_err());
+
+        // `current` naming a generation collected before the lock, every
+        // time it is read, or one whose selection is missing.
+        runtime_generation(&store.root, 2, MOVED);
+        fs::remove_file(store.root.join(GENERATIONS).join("2").join(SELECTION)).unwrap();
+        assert_eq!(
+            hold_store_current(&store).err().unwrap().to_string(),
+            "the runtime freedesktop-platform-25-08's current named a generation td-jail \
+             could not hold each time it tried: it moved, or its selection is missing"
+        );
+    }
+
     #[test]
     fn a_held_generation_names_only_direct_private_trees() {
         let root = crate::test_temp::TempDir::new("td-jail-flathub-hold").unwrap();
@@ -557,14 +715,14 @@ mod tests {
     fn the_runtime_current_is_held_only_as_the_runtime_accounts() {
         let root = crate::test_temp::TempDir::new("td-jail-flathub-runtime").unwrap();
         let store = runtime_store(root.path());
-        let error = hold_runtime("fixture", &store).err().unwrap();
+        let error = hold_for_fixture(&store).err().unwrap();
         assert_eq!(
             error.to_string(),
             "fixture's runtime freedesktop-platform-25-08 is not installed; \
              update fixture in td-software"
         );
         let files = runtime_generation(&store.root, 1, COMMIT);
-        let held = hold_runtime("fixture", &store).unwrap().unwrap();
+        let held = hold_for_fixture(&store).unwrap().unwrap();
         assert_eq!(held.selection.runtime.commit, COMMIT);
         assert_eq!(tree(&held.store, COMMIT, store.owner).unwrap(), files);
         assert!(tree(&held.store, COMMIT, uid().wrapping_add(1)).is_err());
@@ -581,7 +739,7 @@ mod tests {
             owner: uid().wrapping_add(1),
             ..runtime_store(root.path())
         };
-        assert!(hold_runtime("fixture", &foreign).is_err());
+        assert!(hold_for_fixture(&foreign).is_err());
         let other = RuntimeStore {
             declared: FlathubRuntime {
                 name: RUNTIME_NAME,
@@ -589,7 +747,7 @@ mod tests {
             },
             ..runtime_store(root.path())
         };
-        assert!(hold_runtime("fixture", &other)
+        assert!(hold_for_fixture(&other)
             .err()
             .unwrap()
             .to_string()
@@ -601,7 +759,7 @@ mod tests {
             root: linked,
             ..runtime_store(root.path())
         };
-        assert!(hold_runtime("fixture", &through).is_err());
+        assert!(hold_for_fixture(&through).is_err());
     }
 
     /// A launch never fetches (td-software/DESIGN.md §4.1, §6): it asks

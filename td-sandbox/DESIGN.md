@@ -8,10 +8,11 @@ namespace, mount, identity, capability, seccomp and descendant confinement;
 APPLICATIONS.md section C is normative for that boundary. The frontend
 forbids unsafe code and depends only on td-fs and td-ui. Its executable is
 the workspace's immutable entry; the target recipe stages engine's one
-shared host-PATH alias implementation too.
+shared host-PATH alias implementation and its Flathub declarations
+(`flathub_app.rs`) too.
 
 The first increment provides create, list, inspect, share, unshare, network,
-shell, run, stop and delete. One active session or metadata mutation per name
+runtime, shell, run, stop and delete. One active session or metadata mutation per name
 holds a kernel file lock. `delete` explicitly removes an inactive private
 home and all its state; it never deletes a shared directory. No credentials,
 profile scripts, environment variables, desktop sockets or working directory
@@ -22,6 +23,7 @@ to an explicitly shared directory at its original absolute path.
 td-sandbox create tools
 td-sandbox share tools /home/user/src/project --write
 td-sandbox network tools host
+td-sandbox runtime tools freedesktop-platform-25-08
 td-sandbox shell tools
 td-sandbox run tools -- command argument
 td-sandbox stop tools
@@ -31,10 +33,62 @@ The jail is the companion binary beside the launcher, the installed host
 companion under ../lib/td, or td-jail on PATH. `--jail PATH` explicitly selects
 another build. Failure to launch the jail is fatal, with no unconfined retry.
 `./install-apps` installs the host launcher; the desktop image includes the
-target-built launcher. This increment uses host tools. A compatibility
-runtime supplying conventional dynamic-loader paths and additional shells,
-and GUI socket grants, are subsequent increments. No general distribution
-installer or package manager is implemented or promised.
+target-built launcher. A profile uses host tools, and on td it may name a
+Flathub runtime that supplies conventional dynamic-loader paths and its own
+programs (below). GUI socket grants are a subsequent increment. No general
+distribution installer or package manager is implemented or promised.
+
+## Runtime
+
+On td a profile may name a declared Flathub runtime
+(`flathub_app::FLATHUB_RUNTIMES`: `freedesktop-platform-25-08`,
+`freedesktop-sdk-25-08`) with `td-sandbox runtime NAME RUNTIME`, and drop
+it with `td-sandbox runtime NAME native`; `inspect` shows it. The policy
+carries `runtime=RUNTIME` after `network`, and the launch spec carries it
+after `profile` (APPLICATIONS.md §C). Setting a runtime requires a
+declared name and td: where no product configuration is installed
+(`/etc/td-app.conf`, the test td-jail applies), the verb refuses, since
+there the runtime would replace the host's own `/usr` and the runtime
+store exists only on td. Opening a policy checks the name's syntax alone
+(1–64 lowercase ASCII letters, digits or hyphens), so a profile whose
+runtime a later system no longer declares still inspects, clears to
+`native` and deletes. td-jail is the authority at launch: it refuses an
+undeclared name and any runtime without product configuration.
+
+The jail binds the runtime store's `current` tree read-only at `/usr`,
+with `/lib` and `/lib64` links into it, and takes the runtime's
+`ld.so.cache`, `ld.so.conf` and `ld.so.conf.d` into `/etc` in place of the
+host's. td's `/bin` stays, first on `PATH` before `/usr/bin`, and no
+`LD_LIBRARY_PATH` is set, so the runtime's loader cache serves the
+runtime's programs. td's own programs are static or linked against td's
+imported Debian glibc, and nothing requires one to carry a `RUNPATH`
+covering every library it needs (`builder/src/build_root.rs`'s
+`check_output` only refuses an interpreter or `RUNPATH` outside the
+store, and only for build-root outputs). That glibc keeps Debian's
+compiled-in `/usr` paths, so here a td process's library search after its
+`RUNPATH` (the runtime's cache, then default directories under `/lib`
+and `/usr`), its gconv modules, its locale data and glibc's own `dlopen`
+of `libgcc_s.so.1` resolve into the runtime: a td program in such a
+workspace can load Flathub code built against another glibc. The
+runtime's code runs under the workspace filter (this frontend's
+development profile when network is on), as the user, with the profile's
+grants, network and host-local sockets, and outside the application
+kind's D-Bus, portal and Wayland boundaries, until WORKLOADS.md step 7
+gives workspaces accounts of their own (APPLICATIONS.md §C). With a
+runtime, the launcher offers no path directory, alias or shell, the
+`SHELL` or the `sh` it falls back to, under `/usr`, `/lib` or `/lib64`,
+and td-jail refuses any. The launch holds that generation until it ends
+(WORKLOADS.md, "Runtimes").
+
+A workspace installs no runtime. Its runtime is installed and kept only
+by an application that names it, today Firefox for
+`freedesktop-platform-25-08`. With no `current` in the runtime's store the
+launch is refused, naming the applications whose installation in
+td-software installs it, or saying that no application installs it yet,
+as for `freedesktop-sdk-25-08` until a runtime install path exists.
+Removing the last installed application that names a runtime removes the
+runtime: a running session keeps the generation it holds, and the next
+launch is refused.
 
 ## Persistent state and authority
 
@@ -42,8 +96,8 @@ State is under `$HOME/.local/share/td-sandbox/NAME`, owned by the caller and
 private. Names contain 1–32 lowercase ASCII letters, digits or hyphens.
 Only its `home` directory is mounted into the jail. `policy`, `lock`,
 `launch-spec` and `control` remain outside every grant. The policy is a
-bounded exact keyfile with network=off/host and at most 30 directory grants.
-Writes replace the policy atomically. Existing symlink/private-directory
+bounded exact keyfile with network=off/host, an optional declared runtime
+and at most 30 directory grants, in that order. Writes replace the policy atomically. Existing symlink/private-directory
 violations fail. The jail additionally admits each mount source by canonical
 path and mount identity, refuses whole-home and reserved-tree aliases, and
 refuses writable access to its own binaries or the launch specification.
@@ -58,7 +112,9 @@ restriction if one exists. User-local installations and replacement binaries
 persist across sessions; HOME/.local/bin comes first on PATH. The frontend
 does not download, validate, install or update third-party payloads itself.
 Those runtime files never become target recipe inputs or distribution seeds.
-A future managed foreign-runtime admission needs its own reviewed policy.
+The one managed foreign runtime is a declared Flathub runtime, admitted
+under APPLICATIONS.md §W.9 and bound as above; any other needs its own
+reviewed policy.
 
 Network defaults to off. The `development-offline` workspace profile retains
 the development syscall policy and executable home while creating a private
@@ -141,7 +197,8 @@ while the environment lock is held.
 ## Validation
 
 Committed tests name no foreign application binary. Unit tests cover bounded
-frames, invalid policy, private state and serialization; td-ui tests verify
+frames, invalid policy, the runtime key and its spec line, private state and
+serialization; td-ui tests verify
 exact terminal restoration and pin its raw surface. Live opt-in namespace
 tests use only their own Rust executable, copied into the private home. They
 prove ungranted-file absence, read-only and writable shares, offline versus

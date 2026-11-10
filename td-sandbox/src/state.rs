@@ -8,8 +8,33 @@ pub struct State {
     pub root: PathBuf,
     pub home: PathBuf,
     pub network: bool,
+    /// A runtime's td name; none for a native workspace. Only setting it
+    /// asks whether it is declared: one a later system no longer declares
+    /// still opens, shows and clears, and td-jail refuses its launch.
+    pub runtime: Option<String>,
     pub shares: Vec<(PathBuf, bool)>,
     _lock: File,
+}
+
+/// A declared runtime's td name, as the spec and policy carry it.
+pub fn runtime(name: &str) -> io::Result<&'static str> {
+    crate::flathub_app::flathub_runtime(name)
+        .map(|runtime| runtime.name)
+        .ok_or_else(|| io::Error::other(format!("{name} is no declared runtime")))
+}
+
+/// A runtime name as a policy line may carry it: 1–64 lowercase ASCII
+/// letters, digits or hyphens.
+fn runtime_name(name: &str) -> io::Result<&str> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(io::Error::other("invalid runtime policy"));
+    }
+    Ok(name)
 }
 
 pub fn name(name: &str) -> io::Result<()> {
@@ -118,21 +143,29 @@ impl State {
             .map_err(|e| io::Error::other(format!("sandbox is active or being changed: {e}")))?;
         let policy = td_fs::read_bounded_real_file(&root.join("policy"), "sandbox policy", 65536)?;
         let policy = String::from_utf8(policy).map_err(io::Error::other)?;
-        let (network, shares) = parse(&policy)?;
+        let (network, runtime, shares) = parse(&policy)?;
         Ok(Self {
             home: root.join("home"),
             root,
             network,
+            runtime,
             shares,
             _lock: lock,
         })
     }
 
     pub fn save(&self) -> io::Result<()> {
+        td_fs::replace(&self.root.join("policy"), self.render()?.as_bytes(), 0o600)
+    }
+
+    fn render(&self) -> io::Result<String> {
         let mut policy = format!(
             "format=1\nnetwork={}\n",
             if self.network { "host" } else { "off" }
         );
+        if let Some(runtime) = &self.runtime {
+            policy.push_str(&format!("runtime={runtime}\n"));
+        }
         for (path, write) in &self.shares {
             policy.push_str(&format!(
                 "{}={}\n",
@@ -140,7 +173,7 @@ impl State {
                 text(path)?
             ));
         }
-        td_fs::replace(&self.root.join("policy"), policy.as_bytes(), 0o600)
+        Ok(policy)
     }
 
     pub fn share(&mut self, base: &Path, path: &Path, write: bool) -> io::Result<()> {
@@ -166,8 +199,11 @@ impl State {
     }
 }
 
-fn parse(policy: &str) -> io::Result<(bool, Vec<(PathBuf, bool)>)> {
-    let mut lines = policy.lines();
+type Policy = (bool, Option<String>, Vec<(PathBuf, bool)>);
+
+/// `format=1`, `network`, an optional `runtime`, then the shares.
+fn parse(policy: &str) -> io::Result<Policy> {
+    let mut lines = policy.lines().peekable();
     if lines.next() != Some("format=1") {
         return Err(io::Error::other("unsupported sandbox policy"));
     }
@@ -175,6 +211,14 @@ fn parse(policy: &str) -> io::Result<(bool, Vec<(PathBuf, bool)>)> {
         Some("network=host") => true,
         Some("network=off") => false,
         _ => return Err(io::Error::other("invalid network policy")),
+    };
+    let runtime = match lines.peek().and_then(|line| line.strip_prefix("runtime=")) {
+        Some(name) => {
+            let name = runtime_name(name)?.to_string();
+            lines.next();
+            Some(name)
+        }
+        None => None,
     };
     let mut shares = Vec::new();
     for line in lines {
@@ -190,7 +234,7 @@ fn parse(policy: &str) -> io::Result<(bool, Vec<(PathBuf, bool)>)> {
         text(Path::new(path))?;
         shares.push((PathBuf::from(path), key == "write"));
     }
-    Ok((network, shares))
+    Ok((network, runtime, shares))
 }
 
 #[cfg(test)]
@@ -258,6 +302,70 @@ mod tests {
         assert!(State::open(&base, "tools")?.network);
         assert!(name("../escape").is_err());
         assert!(parse("format=1\nnetwork=host\nentry=/bin/sh\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_runtime_is_one_declared_name_after_the_network() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-runtime")?;
+        State::create(&base, "tools")?;
+        let mut state = State::open(&base, "tools")?;
+        assert_eq!(state.runtime, None);
+        state.runtime = Some(runtime("freedesktop-sdk-25-08")?.to_string());
+        state.shares.push((PathBuf::from("/w"), true));
+        state.save()?;
+        drop(state);
+        assert_eq!(
+            fs::read_to_string(base.join("tools/policy"))?,
+            "format=1\nnetwork=off\nruntime=freedesktop-sdk-25-08\nwrite=/w\n"
+        );
+        let mut state = State::open(&base, "tools")?;
+        assert_eq!(state.runtime.as_deref(), Some("freedesktop-sdk-25-08"));
+        state.runtime = None;
+        assert_eq!(state.render()?, "format=1\nnetwork=off\nwrite=/w\n");
+        assert_eq!(
+            parse("format=1\nnetwork=host\nruntime=freedesktop-platform-25-08\nread=/r\n")?,
+            (
+                true,
+                Some("freedesktop-platform-25-08".to_string()),
+                vec![(PathBuf::from("/r"), false)]
+            )
+        );
+        assert!(runtime("firefox").is_err());
+        for bad in [
+            "format=1\nruntime=freedesktop-platform-25-08\nnetwork=off\n",
+            "format=1\nnetwork=off\nruntime=Org.Freedesktop\n",
+            "format=1\nnetwork=off\nruntime=../x\n",
+            "format=1\nnetwork=off\nruntime=\n",
+            "format=1\nnetwork=off\nruntime=freedesktop-platform-25-08\nruntime=freedesktop-platform-25-08\n",
+            "format=1\nnetwork=off\nwrite=/w\nruntime=freedesktop-platform-25-08\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    /// A runtime a later system no longer declares leaves the profile
+    /// usable: it opens and shows the name, clears to native, and deletes.
+    #[test]
+    fn a_retired_runtime_still_opens_clears_and_deletes() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-retired-runtime")?;
+        State::create(&base, "tools")?;
+        td_fs::replace(
+            &base.join("tools/policy"),
+            b"format=1\nnetwork=off\nruntime=freedesktop-platform-24-08\n",
+            0o600,
+        )?;
+        assert!(runtime("freedesktop-platform-24-08").is_err());
+        let mut state = State::open(&base, "tools")?;
+        assert_eq!(state.runtime.as_deref(), Some("freedesktop-platform-24-08"));
+        state.runtime = None;
+        state.save()?;
+        drop(state);
+        let state = State::open(&base, "tools")?;
+        assert_eq!(state.runtime, None);
+        fs::remove_dir_all(&state.root)?;
+        assert!(!base.join("tools").exists());
         Ok(())
     }
 }

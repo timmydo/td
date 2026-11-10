@@ -2908,8 +2908,8 @@ on a load-bearing bind is fatal, never degraded:
         without which every other one is decoration.
  1  mount MS_REC|MS_PRIVATE on /
  2  tmpfs <newroot>, mode 0755, nosuid/nodev where compatible
- 3  /usr   <- runtime deploy files/            ro, nosuid, nodev
- 4  /app   <- app deploy files/                ro, nosuid, nodev
+ 3  /app   <- app deploy files/                ro, nosuid, nodev
+ 4  /usr   <- runtime deploy files/            ro, nosuid, nodev
  5  apps on the dynamic runtime only: /bin /sbin /lib /lib64 -> exact
         symlinks into usr/, with or without a package library path.
         Static empty-runtime apps omit the four aliases.
@@ -3770,10 +3770,11 @@ no one else can write, at most 64 KiB, and an exact, ordered keyfile:
 ```text
 format=1
 profile=development
+runtime=freedesktop-platform-25-08
 entry=/absolute/td-agent
 program=/absolute/td-txt
-alias=cc /gnu/store/...-gcc/bin/gcc
-path=/gnu/store/...-profile/bin
+alias=cc /td/store/...-td-link/bin/td-link
+path=/td/store/...-uutils/bin
 home=/absolute/private/home
 worktree=/absolute/worktree
 checkout=/absolute/linked/worktree
@@ -3790,8 +3791,8 @@ Unix sockets and datagram pairs. It binds the canonical regular-file target of
 `/etc/resolv.conf` read-only (at most 64 KiB); a missing or invalid resolver
 refuses launch. Host-local services and sockets are intentionally reachable;
 the filesystem grants do not constrain the authority those services expose.
-The stage-2 protocol carries the exact development/confined profile word
-and persistent/ephemeral scratch word. Only development may request persistent
+The stage-2 protocol carries the exact development/confined profile word,
+persistent/ephemeral scratch word and runtime/native word. Only development may request persistent
 scratch: exactly four `scratch` source lines after `home`, mapped in order
 to `/tmp`, `/var/tmp`, `/dev/shm` and `/run`. Sources pass the same directory,
 overlap, mount-identity and pseudo-filesystem admission as other grants and
@@ -3823,12 +3824,36 @@ both nonrecursive bind and open_tree clones of protected Git metadata. It
 also runs an i386 executable. Interpreter tests cover both denial tables and
 ABI dispatch, including x32, without depending on host kernel defaults.
 
-`entry` and `home` appear once; `program` (with `entry`, at most four)
+`runtime`, which may follow the profile, `entry` and `home` appear
+once; `program` (with `entry`, at most four)
 and `alias` (at most 64) and `path` (at most 16) repeat, as do `worktree`, `checkout`,
 `repository`, `read` and `write`, at most 32 of these in all; keys
 appear in that order. Admission is §C's filesystem-grant source checks
 with the kind's own departures:
 
+- **Runtime** (WORKLOADS.md, "Runtimes"). `runtime=` names a Flathub
+  runtime by its td name in `flathub_app::FLATHUB_RUNTIMES`
+  (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`); any other
+  value is refused. It is td's alone: where no product configuration is
+  installed it is refused, since it would replace the host's `/usr` and
+  the runtime store exists only on td. td-jail holds the runtime store's
+  `current` as an application launch holds it (§W.9, "What a launch
+  holds"), retrying three times while a collection races it, binds that
+  generation's tree, and keeps the lock through stage 1's descriptor
+  sweep until the instance ends; with no `current` it refuses, naming the
+  declared applications that install the runtime from td-software, or
+  saying that none does yet. A workspace installs no runtime. With a
+  runtime, no path directory or alias source may lie in `/usr`, `/lib`
+  or `/lib64`, which inside the jail would be the runtime's, and stage 2
+  refuses them again. Its confinement is weaker than an application's:
+  the runtime's code runs under the workspace kind's seccomp filter
+  (td-sandbox's development profile where that applies), as the caller,
+  the human (uid 1000), with the workspace's grants (its writable
+  worktrees and shares, its network and the host-local sockets that
+  reaches) until WORKLOADS.md step 7 gives workspaces accounts of their
+  own, and not behind the application kind's D-Bus, portal or Wayland
+  boundaries. td's own glibc programs in the workspace can load the
+  runtime's code too (the loader boundary below).
 - **Programs**, the entry first, are direct executable regular files,
   bound read-only and executable at `/opt/workspace/bin/<file name>`,
   their device and inode checked before and after the bind. The entry
@@ -3914,7 +3939,14 @@ are executable, since a worktree is anyway. The host's
 executable, or recreated as the same link, and are absent where the host
 lacks them; a `/usr` or a `/td` directory is required, where the host's
 programs are (td has no `/usr`, and its `/bin` and `/etc` links resolve
-into `/td/store`). Without persistent scratch, `/run` holds only a store-based host's
+into `/td/store`). With a runtime, the host's `/usr`, `/lib` and `/lib64`
+are not bound: the held runtime tree is bound at `/usr` as an
+application's runtime is (`MS_BIND`, remounted read-only, `nosuid,nodev`,
+executable), and `/lib` and `/lib64` are links to `/usr/lib` and
+`/usr/lib64`, the application kind's loader aliases alone; td's `/bin`
+and `/sbin` stay the host's. A host `/run` or `/etc` link that names or
+resolves into `/usr`, `/lib` or `/lib64` is then not recreated, since
+there it would name the runtime's file. Without persistent scratch, `/run` holds only a store-based host's
 `current-system` link, to its resolved target when that lies in a bound
 tree. `/etc` is a tmpfs holding synthesized account, group, host,
 hostname and NSS files, the account the caller's identity with the
@@ -3922,11 +3954,33 @@ spec's home, and a compiled allowlist of host entries, a link among them
 pointing where it resolves when that is in a bound tree (the dynamic
 loader's cache and configuration, certificates, `gitconfig`,
 `localtime`, `os-release`, `terminfo` and similar), bound read-only and
-`noexec`. There is no `/home` but the admitted directories, no `/sys`,
+`noexec`. With a runtime, the loader's `ld.so.cache`, `ld.so.conf` and
+`ld.so.conf.d` come from the runtime's `usr/etc` instead, each present
+one a direct file or directory bound read-only, `nosuid,nodev,noexec`,
+as an application's runtime entries are, and the host's are absent, so
+the runtime's programs find its libraries through its cache. No
+`LD_LIBRARY_PATH` is set. The loader boundary: td's own programs on the
+workspace's `PATH` are static or linked against td's imported Debian
+glibc, and nothing requires one to carry a `RUNPATH` covering every
+library it needs (`builder/src/build_root.rs`'s `check_output` only
+refuses an interpreter or `RUNPATH` outside the store, and only for
+build-root outputs). That glibc keeps Debian's compiled-in `/usr` paths,
+so in a runtime workspace a td process's library search after its
+`RUNPATH` (the runtime's `ld.so.cache`, then default directories that
+`/lib` and `/usr` now name in the runtime), its gconv modules
+(`/usr/lib/x86_64-linux-gnu/gconv`), its locale data (`/usr/lib/locale`)
+and glibc's own `dlopen` of `libgcc_s.so.1` resolve into the Flathub
+runtime: a td process there can load Flathub code built against another
+glibc. This is stated, not prevented. There
+is no `/home` but the admitted directories, no `/sys`,
 no cgroupfs, and no host Wayland, bus, audio, fetch, tty or runtime
 directory. Stage 2 reads all of it back before confinement: the exact
 names of the root, of every directory between it and an admitted tree,
-and of `/run`, `/etc` and `/opt/workspace`; every program's flags; every
+and of `/run`, `/etc` and `/opt/workspace`; with a runtime, the `/lib`
+and `/lib64` links, `/usr`'s flags and a refused write to it, no mount
+below `/usr` or at `/lib` or `/lib64`, and each loader entry again
+selected from `/usr/etc` and required to be that file at `/etc`; every
+program's flags; every
 mount row below every directory; each repository's chain links, derived
 again inside from the fixed names and the read-only `worktrees/` and
 required to be exactly the plan's in path and mode, only `objects/`
@@ -3988,7 +4042,8 @@ the entry receives two clones as its standard input and output, with the
 null device as standard error. Its environment is exactly `HOME` (the
 spec's home), `LANG=C.UTF-8`, `PATH` (the read-only alias directory, then
 the spec's path directories in order, then the read-only admitted program
-directory, then the ordinary directories and a store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
+directory, then the ordinary directories and a store-based host's system
+profile, or with a runtime td's `/bin` and then `/usr/bin`), `TERM=dumb` and `TMPDIR=/tmp`; it
 starts in the first worktree, else in the home. No cgroup is created and
 no data limit set: an instance keeps its launcher's cgroup and whatever
 limit it inherits, and says so with one named diagnostic,
@@ -11402,9 +11457,10 @@ runtime branch, never by commit. The repository, the refs, the entry
 and the runtime's td name are declared in `engine/src/flathub_app.rs`,
 which td-app reads and the cutover's specs are compiled from: the
 repository is one constant, `REPOSITORY`; `FLATHUB_RUNTIMES` declares
-each runtime's ref and td name (`freedesktop-platform-25-08`), which an
-application's manifest names and, with the application, keys its
-dynamic-library policy; and `FLATHUB_SOURCES` declares each
+each runtime's ref and td name (`freedesktop-platform-25-08`,
+`freedesktop-sdk-25-08`), which an application's manifest or a workspace
+spec names and, with the application, keys its dynamic-library policy;
+and `FLATHUB_SOURCES` declares each
 application's app ref, entry and the one declared runtime it accepts.
 Flathub's signing key is compiled into td-net
 (§B.3.1). The payload bytes are *not* reviewed: whatever commit
@@ -11696,7 +11752,18 @@ a regular file, ends the collection. An application's update or
 revalidation holds the runtime's `current` the same way while it
 validates. So a running application's trees outlive any number of newer
 generations of either, and a td-jail that locks a generation just
-collected finds it unlinked and asks again (three times at most). The
+collected finds it unlinked and asks again (three times at most). A
+workspace launch that names a runtime (§C, "The `workspace` kind") holds
+that runtime store's `current` the same way, with the same checks on the
+store, selection and tree, and keeps it in stage 1 until the instance
+ends; it asks td-app nothing, and with no `current` it is refused, since
+only an application's install brings a runtime into the store. The
+declared `freedesktop-sdk-25-08` (`runtime/org.freedesktop.Sdk/x86_64/25.08`)
+is named by no application, so it is refused as not installed until a
+runtime install path exists; root's `runtime-cache` operation accepts it
+by name. Removing the last application that names a runtime removes it
+under a running workspace as under a running application: the held
+generation stays, and the next launch is refused. The
 held runtime generation must be the one the application generation's
 `runtime=` row names; when the runtime moved between td-app's answer and
 the hold, td-jail asks again, and that `ready` answers `absent`, so the
