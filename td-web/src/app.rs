@@ -3,7 +3,8 @@
 //! thread of its own, which hands the reply to the one render thread
 //! to be decoded, a page rendered into logical lines, and waits for it,
 //! its document taken when the window next polls. Wrapping those lines
-//! at the page's width in pixels is the window's.
+//! at the page's width in pixels, the ones near those shown, is the
+//! window's.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -419,7 +420,7 @@ impl App {
             fitted: None,
         };
         self.relayout();
-        self.current.view.top = self.current.rendered.line_at(top);
+        self.current.view.top = self.current.rendered.snap(&mut self.metrics, top);
         self.scroll(0);
         self.show_address();
     }
@@ -429,7 +430,7 @@ impl App {
         Some(Entry {
             url: self.current.doc.url.clone()?,
             fragment: self.current.fragment.clone(),
-            top: self.current.rendered.place(self.current.view.top),
+            top: self.current.view.top,
         })
     }
 
@@ -486,29 +487,25 @@ impl App {
     /// Wraps the page again when its width, scale or body face changed,
     /// keeping the text at the top, the focused link and find's marks,
     /// made again on the new lines without moving to a match, and keeps
-    /// the view inside the page. The old rendering is gone before the new
-    /// one is made.
+    /// the view inside the page. The old lines are gone before the new
+    /// ones are laid.
     fn relayout(&mut self) {
         if self.metrics.scale() != self.surface.scale {
             self.metrics = Metrics::new(self.faces.as_ref(), self.surface.scale);
         }
         let layout = self.layout();
         if self.current.rendered_for != Some(layout) {
-            let old = std::mem::take(&mut self.current.rendered);
-            let top = old.place(self.current.view.top);
-            drop(old);
-            self.current.rendered =
-                self.current
-                    .doc
-                    .render(&mut self.metrics, layout.width, layout.body);
+            let top = self.current.view.top;
+            self.current.rendered = Rendered::default();
+            self.current.rendered = self.current.doc.render(layout.width, layout.body);
             self.current.rendered_for = Some(layout);
-            let rendered = &self.current.rendered;
+            let rendered = &mut self.current.rendered;
             let view = &mut self.current.view;
-            view.top = rendered.line_at(top);
+            view.top = rendered.snap(&mut self.metrics, top);
             view.focus = view.focus.filter(|&link| link < rendered.page.links.len());
             if !view.hits.is_empty() || self.focus == Focus::Find {
                 let query = self.query.text().to_string();
-                self.current.view.remark(&query, &self.current.rendered);
+                view.remark(&query, rendered, &mut self.metrics);
             }
         }
         self.scroll(0);
@@ -517,7 +514,10 @@ impl App {
     fn refind(&mut self) {
         let rows = self.rows();
         let query = self.query.text().to_string();
-        self.current.view.find(&query, &self.current.rendered, rows);
+        let current = &mut self.current;
+        current
+            .view
+            .find(&query, &mut current.rendered, &mut self.metrics, rows);
         self.refresh_hover();
     }
 
@@ -531,9 +531,10 @@ impl App {
 
     fn scroll(&mut self, delta: isize) {
         let rows = self.rows();
-        self.current
+        let current = &mut self.current;
+        current
             .view
-            .scroll(delta, &self.current.rendered, rows);
+            .scroll(delta, &mut current.rendered, &mut self.metrics, rows);
         self.refresh_hover();
     }
 
@@ -544,27 +545,27 @@ impl App {
     fn page_key(&mut self, chord: &str) {
         let rows = self.rows();
         let page = rows.saturating_sub(1).max(1) as isize;
-        let view = &mut self.current.view;
-        let rendered = &self.current.rendered;
+        let metrics = &mut self.metrics;
+        let Current { view, rendered, .. } = &mut self.current;
         match chord {
             "Up" => self.scroll(-1),
             "Down" => self.scroll(1),
             "PageUp" | "S-space" => self.scroll(-page),
             "PageDown" | "space" => self.scroll(page),
             "Home" | "C-Home" => {
-                view.home();
+                view.home(rendered, metrics, rows);
                 self.refresh_hover();
             }
             "End" | "C-End" => {
-                view.end(rendered, rows);
+                view.end(rendered, metrics, rows);
                 self.refresh_hover();
             }
             "Tab" => {
-                view.step_link(true, rendered, rows);
+                view.step_link(true, rendered, metrics, rows);
                 self.refresh_hover();
             }
             "S-Tab" => {
-                view.step_link(false, rendered, rows);
+                view.step_link(false, rendered, metrics, rows);
                 self.refresh_hover();
             }
             "Return" => {
@@ -573,11 +574,11 @@ impl App {
                 }
             }
             "n" => {
-                view.step_hit(true, rows);
+                view.step_hit(true, rendered, metrics, rows);
                 self.refresh_hover();
             }
             "N" | "S-n" => {
-                view.step_hit(false, rows);
+                view.step_hit(false, rendered, metrics, rows);
                 self.refresh_hover();
             }
             "/" => self.open_find(),
@@ -687,9 +688,10 @@ impl App {
             },
             Focus::Find => {
                 let rows = self.rows();
+                let Current { view, rendered, .. } = &mut self.current;
                 match chord {
-                    "Return" => self.current.view.step_hit(true, rows),
-                    "S-Return" => self.current.view.step_hit(false, rows),
+                    "Return" => view.step_hit(true, rendered, &mut self.metrics, rows),
+                    "S-Return" => view.step_hit(false, rendered, &mut self.metrics, rows),
                     "Escape" => self.focus = Focus::Page,
                     _ => {
                         if Self::edit(&mut self.query, chord, clipboard) {
@@ -771,15 +773,14 @@ impl App {
         if doc.status != 0 && !(200..300).contains(&doc.status) {
             parts.push(format!("status {}", doc.status));
         }
-        let lines = rendered.lines.len();
-        if lines > self.rows() {
-            let bottom = (self.current.view.top + self.rows()).min(lines);
+        let lines = rendered.page.lines.len();
+        if let Some(bottom) = rendered.bottom(self.current.view.top, self.rows()) {
             parts.push(format!("{bottom} of {lines} lines"));
         }
         if let Some(note) = &doc.note {
             parts.push(note.clone());
         }
-        if rendered.cut {
+        if rendered.page.cut {
             parts.push(format!(
                 "only the first {} lines are shown",
                 document::MAX_LINES
@@ -921,13 +922,20 @@ impl Handler for App {
                 }
                 self.current.fitted = fitted;
             }
-            None => view::paint(
-                &self.current.rendered,
-                &self.current.view,
-                self.hover,
-                &self.pane(),
-                &mut sink,
-            ),
+            None => {
+                let rows = self.rows();
+                let current = &mut self.current;
+                current
+                    .rendered
+                    .settle(&mut self.metrics, current.view.top, rows);
+                view::paint(
+                    &self.current.rendered,
+                    &self.current.view,
+                    self.hover,
+                    &self.pane(),
+                    &mut sink,
+                )
+            }
         }
         let status = self.status();
         let mut sink = |draw| raster.draw(draw);
@@ -1003,6 +1011,8 @@ pub fn run(start: Option<String>) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+    use crate::document::tests::Laid;
+    use crate::document::Wrapped;
     use crate::fetch::tests::Table;
     use crate::fetch::Reply;
     use std::sync::Mutex;
@@ -1131,6 +1141,21 @@ mod tests {
     /// The text a wrapped line shows, from its glyphs.
     fn shown(line: &td_ui::prose::Line) -> String {
         line.glyphs.iter().map(|glyph| glyph.scalar).collect()
+    }
+
+    /// The lines on the screen, as laid.
+    fn on_screen(app: &App) -> Vec<Wrapped> {
+        let top = app.current.view.top;
+        app.current
+            .rendered
+            .shown(top, app.rows())
+            .cloned()
+            .collect()
+    }
+
+    /// Every line of the page, laid as the window lays them.
+    fn every(app: &App) -> Laid {
+        Laid::of(app.current.rendered.clone(), &mut app.metrics.clone())
     }
 
     fn history(app: &App) -> (Vec<String>, Vec<String>) {
@@ -1273,7 +1298,7 @@ mod tests {
     fn a_failed_fetch_is_a_page_that_says_why() {
         let mut app = app(site());
         typed(&mut app, "example.org/missing");
-        let text = shown(&app.current.rendered.lines[0].line);
+        let text = shown(&on_screen(&app)[0].line);
         assert!(
             text.contains("no route to https://example.org/missing"),
             "{text}"
@@ -1338,8 +1363,9 @@ mod tests {
         typed(&mut app, "example.org");
         let (inset, height) = (app.inset(), i64::from(app.metrics.line().height));
         let page = app.page_rect();
-        let line = app.current.rendered.link_lines[0];
-        let left = app.current.rendered.lines[line]
+        let all = every(&app);
+        let line = all.link_lines()[0];
+        let left = all.lines[line]
             .line
             .pieces
             .iter()
@@ -1367,6 +1393,62 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.title(), "A - td-web");
         assert_eq!(app.hover, None, "nothing under the pointer on the new page");
+    }
+
+    /// A link whose text is all past the pane's edge on a line that is
+    /// not wrapped is laid nowhere, but takes focus on its line, nothing
+    /// marked, the status row naming where it goes.
+    #[test]
+    fn a_link_past_an_unwrapped_lines_edge_takes_focus_and_is_named() {
+        let page = format!(
+            "<pre>{}<a href=\"/far\">far</a></pre><p><a href=\"/near\">near</a>",
+            "x".repeat(300)
+        );
+        let mut app = app(site().page("https://example.org/w", "text/html", &page));
+        typed(&mut app, "example.org/w");
+        let pre = &on_screen(&app)[0];
+        assert!(pre
+            .line
+            .pieces
+            .iter()
+            .all(|piece| piece.tag == document::NO_LINK));
+        key(&mut app, "Tab");
+        assert_eq!(app.current.view.focus, Some(0));
+        assert_eq!(app.status_text(), "https://example.org/far");
+        key(&mut app, "Tab");
+        assert_eq!(app.status_text(), "https://example.org/near");
+        // A pane wide enough lays it, and a click there follows it.
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(3000)), &mut board);
+        let pre = &on_screen(&app)[0];
+        assert!(pre.line.pieces.iter().any(|piece| piece.tag == 0));
+    }
+
+    /// The status row says where the reader is by logical lines: the
+    /// one the last line shown is part of, of the page's, so it needs no
+    /// more of the page laid than is shown; and nothing on a page shown
+    /// whole.
+    #[test]
+    fn the_status_row_counts_logical_lines() {
+        let mut lines = String::new();
+        for n in 0..200 {
+            lines.push_str(&format!(
+                "<p>line {n} with words enough to wrap twice here</p>"
+            ));
+        }
+        let mut app = app(site().page("https://example.org/long", "text/html", &lines));
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(200)), &mut board);
+        typed(&mut app, "example.org/long");
+        let count = app.current.rendered.page.lines.len();
+        let shown = on_screen(&app);
+        let bottom = shown.last().unwrap().logical + 1;
+        assert!(bottom < shown.len(), "lines wrapped");
+        assert_eq!(app.status_text(), format!("{bottom} of {count} lines"));
+        key(&mut app, "End");
+        assert_eq!(app.status_text(), format!("{count} of {count} lines"));
+        typed(&mut app, "example.org/a");
+        assert_eq!(app.status_text(), "");
     }
 
     #[test]
@@ -1414,7 +1496,7 @@ mod tests {
     fn f8_sets_body_text_in_serif_and_back_and_is_listed() {
         let mut app = app(site());
         typed(&mut app, "example.org");
-        let family = |app: &App| app.current.rendered.lines[0].line.pieces[0].style.family;
+        let family = |app: &App| on_screen(app)[0].line.pieces[0].style.family;
         assert_eq!(family(&app), TextFamily::Sans);
         key(&mut app, "F8");
         assert_eq!(family(&app), TextFamily::Serif);
@@ -1429,9 +1511,9 @@ mod tests {
         assert!(BROWSER_KEYS.iter().any(|(keys, _)| *keys == "F8"));
     }
 
-    /// The words a line shows.
-    fn words(app: &App, line: usize) -> String {
-        shown(&app.current.rendered.lines[line].line)
+    /// The words the line starting at `top` shows.
+    fn words(app: &App, top: Place) -> String {
+        shown(&app.current.rendered.shown(top, 1).next().unwrap().line)
     }
 
     /// A page that is one logical line of numbered words, and an app
@@ -1467,7 +1549,7 @@ mod tests {
                 None => key(&mut app, "F8"),
             }
             let top = app.current.view.top;
-            assert!(top > 0, "not the paragraph's start");
+            assert!(top != Place::default(), "not the paragraph's start");
             let shown = words(&app, top);
             assert!(shown.split(' ').any(|w| w == word), "{word} in {shown}");
         }
@@ -1485,7 +1567,7 @@ mod tests {
         key(&mut app, "M-Left");
         settle(&mut app);
         let top = app.current.view.top;
-        assert!(top > 0);
+        assert!(top != Place::default());
         let shown = words(&app, top);
         assert!(shown.split(' ').any(|w| w == word), "{word} in {shown}");
     }
@@ -1508,14 +1590,21 @@ mod tests {
             key(&mut app, &chord);
         }
         key(&mut app, "Return");
-        assert!(app.current.view.top > 0, "find moved to a match");
+        assert!(
+            app.current.view.top > Place::default(),
+            "find moved to a match"
+        );
         let at = app.current.view.at;
         let hits = app.current.view.hits.len();
         key(&mut app, "Escape");
         key(&mut app, "Home");
         let mut board = Board::default();
         app.input(Input::Resize(surface(400)), &mut board);
-        assert_eq!(app.current.view.top, 0, "not moved to the match");
+        assert_eq!(
+            app.current.view.top,
+            Place::default(),
+            "not moved to the match"
+        );
         assert_eq!(app.current.view.hits.len(), hits);
         assert_eq!(app.current.view.at, at);
     }
@@ -1550,7 +1639,7 @@ mod tests {
         let pane = app.pane();
         let edge = pane.rect.x + i64::from(pane.rect.width);
         let left = pane.rect.x + pane.inset;
-        let laid = &app.current.rendered.lines;
+        let laid = on_screen(&app);
         assert!(
             laid.iter()
                 .any(|wrapped| left + i64::from(wrapped.line.width) > edge),
@@ -1584,19 +1673,17 @@ mod tests {
         for _ in 0..41 {
             key(&mut app, "Down");
         }
-        let logical = |app: &App| app.current.rendered.lines[app.current.view.top].logical;
+        let logical = |app: &App| app.current.view.top.logical;
         assert_eq!(logical(&app), 41);
-        let wide = app.current.rendered.lines.len();
+        let wide = every(&app).lines.len();
         let mut board = Board::default();
         app.input(Input::Resize(surface(200)), &mut board);
-        assert!(app.current.rendered.lines.len() > wide);
+        let all = every(&app).lines;
+        assert!(all.len() > wide);
         assert_eq!(logical(&app), 41);
         let top = app.current.view.top;
-        assert_eq!(
-            app.current.rendered.lines[top - 1].logical,
-            40,
-            "its first line"
-        );
+        let at = all.iter().position(|w| w.place() == top).unwrap();
+        assert_eq!(all[at - 1].logical, 40, "its first line");
     }
 
     /// The pinned faces' directories for `family`: the image's and the
@@ -1631,8 +1718,8 @@ mod tests {
         typed(&mut app, "example.org/p");
         assert!(app.metrics.proportional());
         assert_eq!(app.metrics.line().height, 22);
-        let rendered = app.current.rendered.clone();
-        let first = &rendered.lines[0].line;
+        let rendered = on_screen(&app);
+        let first = &rendered[0].line;
         assert_eq!(shown(first), "iiii mmmm a link after");
         let advance = |at: usize| first.glyphs[at + 1].x - first.glyphs[at].x;
         assert!(
@@ -1657,13 +1744,31 @@ mod tests {
         for c in "after".chars() {
             key(&mut app, &c.to_string());
         }
-        let hit = app.current.view.hits[0];
-        assert_eq!((hit.line, hit.left), (0, first.glyphs[17].x));
-        assert_eq!(hit.right, first.width);
+        assert_eq!(app.current.view.hits.len(), 1);
+        let mut marked = Vec::new();
+        view::paint(
+            &app.current.rendered,
+            &app.current.view,
+            None,
+            &app.pane(),
+            &mut |draw| {
+                if let td_ui::raster::Primitive::Glyph {
+                    x, scalar, style, ..
+                } = draw.primitive
+                {
+                    if style.background == td_ui::raster::SELECTED {
+                        marked.push((x - left, scalar));
+                    }
+                }
+            },
+        );
+        let after: String = marked.iter().map(|&(_, scalar)| scalar).collect();
+        assert_eq!(after, "after");
+        assert_eq!(marked[0].0, i64::from(first.glyphs[17].x));
         key(&mut app, "Escape");
         // A preformatted line is in the monospace face, one advance a
         // glyph, and not wrapped.
-        let pre = &rendered.lines[2].line;
+        let pre = &rendered[2].line;
         assert!(pre
             .pieces
             .iter()
@@ -1679,7 +1784,7 @@ mod tests {
         assert!(high - low <= 1, "{steps:?}");
         // Serif measures otherwise than Sans.
         key(&mut app, "F8");
-        let serif = &app.current.rendered.lines[0].line;
+        let serif = &on_screen(&app)[0].line;
         assert_eq!(serif.pieces[0].style.family, TextFamily::Serif);
         assert_ne!(serif.width, first.width);
         // And the window's raster, lent the same faces, draws it.

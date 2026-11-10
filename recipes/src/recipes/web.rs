@@ -31,12 +31,13 @@ pub fn recipe() -> Recipe {
     // The fetch socket, its one way to the network (no `shared=network`),
     // and the Wayland socket it draws in. No filesystem grant: it keeps
     // nothing between runs. No terminal and no bus name. `memory-high` is
-    // 640 MiB for td-web's worst on a 3840x2160 output, 582 MB: its own
+    // 640 MiB for td-web's worst on a 3840x2160 output, 564 MB: its own
     // memory with three window buffers (144 MB), a 16 MiB body for each of
     // four fetches out (67), one rendering of 2 MiB of markup within its
-    // 32 MiB budget (252) or picture decoding (201), and the page shown
-    // with its wrap (119) or a picture (100) (td-web/DESIGN.md §3, which
-    // a td-web test holds to these figures). `memory-max` stays 768 MiB.
+    // 32 MiB budget (252) or picture decoding (201), and a picture shown
+    // (100) or a page with the lines of it laid (70) (td-web/DESIGN.md §3,
+    // which a td-web test holds to these figures). `memory-max` stays
+    // 768 MiB.
     // The tasks hold the window's thread, td-ui's, the render thread and
     // up to four fetch workers with room, since td-svc does not restart a
     // program that exits on the cap.

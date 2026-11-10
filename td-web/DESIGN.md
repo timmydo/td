@@ -100,8 +100,8 @@ names, no environment and no terminal.
 **Memory.** The bounds hold td-web's own memory; a body at
 `MAX_DOCUMENT` (16 MiB) for each fetch out, held at its own length;
 one rendering of markup within `HTML_LIMITS` (§5) or one decoding of a
-picture; and what is shown, a page with its wrap or a picture with its
-copy fitted to the pane. Renderings and decodings run on one render
+picture; and what is shown, a page with the lines of it laid or a
+picture with its copy fitted to the pane. Renderings and decodings run on one render
 thread, for every fetch thread, one at a time; a navigation stopped or
 overtaken before its turn takes neither, and a document made for one
 stopped while it was made is dropped there before the next reply is
@@ -121,17 +121,20 @@ costliest decoding, a 16-bit RGBA PNG of 16 Mi pixels inflated at 8
 bytes a pixel beside its 4-byte RGBA, 201 MB (201 measured; a JPEG
 of as many pixels some 112 MB); and the larger of what may be shown:
 a page, which holds no more than td-html's output for it, so no more
-than the budget's 34 MB (at most 19 MB measured), with its wrap on the
-window's thread, 77 MB at most measured at its peak and taken as 85
-(§5), 119 MB, or a picture's 67 MB with its copy fitted to the pane,
-33 MB at 3840x2160: 582 MB. That is why `memory-high` is 640 MiB
-(671 MB), 89 MB above the sum, so that pages as large as long
-Wikipedia articles render whole; `memory-max` stays 768 MiB (805 MB).
-A test (`the_html_limits_fit_the_jail`) holds the sum at least 20 MB
-under `memory-high`, the measured figures and the jail's copied by hand
-and reviewed when `web.rs` or the limits change. Wrapping only the
-lines near those shown (§10) would take most of the wrap's term away
-and bring the sum back under 512 MiB.
+than the budget's 34 MB (at most 19 MB measured), or a text page, whose
+tabs are expanded, at most 46 MB (eight bytes a byte of `MAX_TEXT` and
+120 a line; 43 MB measured, tabs 41 to a line), with the lines of it
+laid on the window's thread, only those near the ones shown however
+long the page, 19.3 MB at most measured and taken as 24 (§5), 70 MB;
+or a picture's 67 MB with its copy fitted to the pane, 33 MB at
+3840x2160, 100 MB, the larger: 564 MB. That is why `memory-high` is
+640 MiB (671 MB), 107 MB above the sum, so that pages as large as long
+Wikipedia articles render whole: under 512 MiB (537 MB) with the same
+room the sum fits only with markup cut at some 1.5 MiB, the wrap no
+longer weighing in it; `memory-max` stays 768 MiB (805 MB). A test
+(`the_html_limits_fit_the_jail`) holds the sum at least 20 MB under
+`memory-high`, the measured figures and the jail's copied by hand and
+reviewed when `web.rs` or the limits change.
 
 The allocator (glibc's) gives a thread that allocates beside another an
 arena of its own and keeps much of a rendering's peak in it after, for
@@ -143,13 +146,14 @@ defaults), where on the one render thread four peak
 at 243 to 250 MB. So the sum counts one rendering or decoding, and the
 fetch threads allocate only their requests and bodies. A panic while a
 reply is made answers an error page and leaves the thread to take the
-next (td-web's Cargo build unwinds; it sets no `panic=abort`), and a
-render thread found gone is started again. `memory-high` throttles
+next (td-web's build unwinds: a `compile_error!` refuses one that would
+abort on panic, by a profile's `panic` or a recipe's `-C panic`), and
+a render thread found gone is started again. `memory-high` throttles
 before `memory-max` ends the jail. The tasks hold the window's
 thread, td-ui's, the render thread and `MAX_WORKERS` fetches with
 room, since td-svc does not
 restart a program that exits on the cap. One CPU, twice news's, since
-a page is rendered on the render thread and wrapped on the window's
+a page is rendered on the render thread and laid out on the window's
 (§8).
 
 td-jail gives td-web the standard seccomp program, not an allowlist:
@@ -236,7 +240,7 @@ sniff of its first bytes for `<!doctype html` or `<html`:
   `MIN_WRAP_EMS` (8) ems, 128 pixels at scale one, a narrower pane
   showing each line's start, cut at its edge; measured with the faces
   the window draws with, and again when the width, the scale or the
-  body face changes.
+  body face changes; and only the lines near those shown (below).
   Body text is in Noto Sans, or Noto Serif after `F8` (not kept between
   runs); `<strong>` and `<em>` in its bold and italic styles; code and
   preformatted text in the monospace face on the prose line (td-ui's
@@ -249,9 +253,9 @@ sniff of its first bytes for `<!doctype html` or `<html`:
   and laid out only as far as the pane shows it, its edge and td-ui's
   `OVERHANG` past it, again at each width: without horizontal scrolling
   (§10) a pane shows no more. Find matches, and the pointer and focus
-  mark, only what is laid: a match past the edge is not found, and a
-  link whose text is all past it is focused on its line with nothing
-  marked, the status row naming where it goes.
+  mark, only what of such a line is laid: a match past the edge is not
+  found, and a link whose text is all past it is focused on its line
+  with nothing marked, the status row naming where it goes.
   Without the proportional faces (none installed, `TD_UI_FACE=bitmap`,
   every in-process test) td-ui measures every glyph a cell and the page
   draws on the cell. Links keep their looks; colours named by the
@@ -273,10 +277,11 @@ characters other than the tab (C0, DEL and C1), which prose would show
 as U+FFFD, are dropped before the page is wrapped, a CR before an LF
 among them. Markup past `MAX_MARKUP` (2 MiB) and text past `MAX_TEXT`
 (4 MiB) are not rendered, a page keeps at most `MAX_LINES` (100,000)
-logical lines and a rendering lays out and keeps as many wrapped ones
-however narrow it is, an unwrapped line at most `MAX_PRE_CHARS`
-characters, and the status row says when any of these, or td-html's
-output budget (below), cut the page short. A status other than `2xx`
+logical lines, an unwrapped line at most `MAX_PRE_CHARS` characters,
+and the status row says when any of these, or td-html's output budget
+(below), cut the page short. The wrapped lines are not counted or cut:
+however many a page wraps to, only those near the ones shown are laid
+(below). A status other than `2xx`
 with a body is shown with its status in the status row; one without a
 body is an error page.
 
@@ -305,28 +310,76 @@ inside 62 quotes 198 MB; 2 MiB of empty paragraphs 48 MB. td-html
 ends a rendering it cut short
 with a line of notice (`td_html::CUT_NOTICE`), which td-web leaves out
 of the page, saying in the status row that the rest is too large to
-render; a page whose own last line is that text is taken for one cut.
-A page td-web cuts at `MAX_LINES` before the notice never reaches it,
-so its status row shows only the `MAX_LINES` note. What runs on the
-window's thread is the wrap, at each width and body face, at most
-`MAX_LINES` lines laid out. Measured there with Noto's metrics, by
-what the window's thread grew to at the wrap's peak, at widths from
-128 to 3820 pixels: one word of `MAX_MARKUP`, alone or inside 3, 8 or
-38 quotes whose marks each continuation repeats, is the costliest,
-77 MB at most (inside 8 quotes at 300 pixels or 3 at 200, some
-100,000 lines), in under a second; a paragraph of the document's own
-starting with 100 quote marks 55 MB; a list of eight-word items nested
-eight deep 39 MB; a pile of combining marks 36 MB; one-letter
-paragraphs in 62 quotes, each line repeating 62 marks, 29 MB; a
-table whose first cell pads every row past `MAX_PRE_CHARS`, and
-preformatted lines of tabs,
-3 MB at most, laid only to the pane's edge. That is the wrap the
-memory bounds count (§3), and the page they count as at most the
-budget: a run keeps its text at its own length, so a page held at most
-19 MB of the 32 MiB in the shapes tried. A
-paint walks only the lines shown, each up to the pane's edge, and
-draws at most eight glyphs at one pen (`MAX_STACKED`), so a pile of
-combining marks costs a walk rather than a glyph each (§10).
+render; a page whose own last line is that text is taken for one cut,
+and one whose first block alone is past the budget (a paragraph of
+some 2 MiB of words, say) renders empty but for that note. A page
+td-web cuts at `MAX_LINES` before the notice never reaches it, so its
+status row shows only the `MAX_LINES` note.
+
+What runs on the window's thread is the wrap, and only of the lines
+near those shown. Where the reader is, the top of the pane, is a place
+in the logical lines (`Place`: a logical line, and a run and a byte in
+it where one of its wrapped lines starts), as the history keeps it
+(§8). The lines laid are consecutive wrapped lines, from a screenful,
+or `STRIDE` (64) lines if more, above the top to as many past the
+bottom, laid `STRIDE` at a time as the reader moves and forgotten past
+that, so what the wrap holds is bounded by the pane, not by the page.
+A logical line is wrapped from its start, or again from where one of
+its wrapped lines starts, since a line's breaks depend only on its text
+from there on; it is handed to `prose` a slice at a time, 4 KiB
+(`FIRST_SLICE`) and twice that while a slice holds no whole line, at
+most `MAX_ROW_BYTES` (64 KiB, with a byte more for each run), each
+slice's last line laid again from its start by the next. A slice of
+`MAX_ROW_BYTES` holding no whole line, none of its text overflowing
+the width at a break, is one line, and the next starts at the first
+character after it that is no space, as after any break, a line of
+spaces alone being none. A line never breaks at a space, so when it is
+spaces that run past the slice that is the line a wrap of the whole
+logical line makes. A slice starting with spaces that its wrap drops
+as a line of their own, as indentation or the text after a hang's
+structure may, is laid again from the first character after them, the
+wrap starting afresh there as the whole wrap does, so a word crossing
+the slice's end is not cut. Only characters of no advance, which never
+fill the width, end a line there that the whole wrap would not (a
+test, `a_page_laid_a_slice_at_a_time_is_its_whole_lines_wrapped`,
+holds words, runs of spaces and tabs, leading ones before a word
+crossing a slice's end included, to the whole wrap). Moving down lays on
+from the last line laid. Moving up lays a logical line from its start,
+or from the nearest of the starts a walk along it last found, every
+`STRIDE`th of its wrapped lines, kept for the last two logical lines
+walked, keeping the lines before where it is going. `End` lays back
+from the last logical line; a place found again after a resize, `F8`
+or a history step, a link focused or a match shown lays its logical
+line up to it from the nearest start remembered. So a resize or a jump
+costs the lines shown and at most one logical line, not the page: the
+costliest logical line, one word of `MAX_MARKUP` alone, in quotes or
+in alternating bold runs of eight letters, takes 29 to 54 ms to walk
+to its end, a screenful's scroll about half a millisecond, and a jump
+back and forth between two logical lines of 1 MiB each, once walked,
+0.06 to 0.2 ms. There is no count of the page's wrapped lines: the
+status row says where the reader is in logical lines (§8).
+Measured on a development host, release build, with Noto's metrics at
+1920x1200 and 3840x2160 (scale one and two) and at 300 pixels, by what
+the window's thread grew to: a word of `MAX_MARKUP` alone or inside 3,
+8 or 38 quotes whose marks each continuation repeats, one-letter
+paragraphs in 62 quotes, a paragraph of the document's own starting
+with 100 quote marks, a list of eight-word items nested eight deep, a
+table whose first cell pads every row past `MAX_PRE_CHARS`,
+preformatted and plain lines of tabs, and 100,000 lines of text each
+hold at most 1 MB of wrap; a paragraph of 2 MiB of combining marks,
+whose 32 lines of 64 KiB are all near the top, 6.2 MB; paragraphs of
+combining marks in runs of four to eight, bold and plain, bold and
+italic, or bold, italic and plain, 13 to 18 MB; and the costliest, a
+paragraph of combining marks in alternating bold and plain runs of
+four, 19.3 MB, a piece for each run of the page in the lines laid
+(taken as 24 MB, some 4.7 MB of room). That is the wrap the memory
+bounds count (§3), and the page they count as at most the budget: a
+run keeps its text at its own length, so a page held at most 19 MB of
+the 32 MiB in the shapes tried, and a text page at most 46 MB, its
+tabs expanded. A paint walks
+only the lines shown, each up to the pane's edge, and draws at most
+eight glyphs at one pen (`MAX_STACKED`), so a pile of combining marks
+costs a walk rather than a glyph each (§10).
 
 Each character takes the advance of the face that draws it: Noto's
 for body text, the monospace face's one advance for code, preformatted
@@ -361,8 +414,8 @@ rule is three dashes (§10).
 The rendered page is td-web's own model, independent of how it was
 produced: a page of logical lines of styled runs with link targets,
 filled once from td-html's rich output, and its rendering, those lines
-wrapped into prose lines whose pieces carry their run's link as their
-tag. The layout engine of §10 replaces that producer without changing
+near the ones shown wrapped into prose lines whose pieces carry their
+run's link as their tag. The layout engine of §10 replaces that producer without changing
 the view above it.
 
 ## 6. State
@@ -390,8 +443,11 @@ at the bottom. The status row says, first that applies: what the last
 input made happen (a link not followed, a refusal, a copy), until the
 next key, click, wheel turn or paste; what is loading; where the link under the pointer, else the
 focused link, goes; the response's status, the place in the page and
-any cut. Its app id is `td-web`; its title is the document's `<title>`,
-else its URL, then ` - td-web`.
+any cut. The place, said only of a page not shown whole, is `N of M
+lines`: the logical line the last line shown is part of, of the page's
+logical lines, which needs nothing laid but the lines shown (§5). Its
+app id is `td-web`; its title is the document's `<title>`, else its
+URL, then ` - td-web`.
 
 | Key | Does |
 |---|---|
@@ -412,15 +468,26 @@ else its URL, then ` - td-web`.
 A click on a link follows it, the pointer over one says where it goes,
 and the wheel scrolls; which link a point is on is the piece of its
 line under it, by pixel, never in the inset left of the lines or on a
-line not shown whole. Find matches within a line, across its runs and
-ignoring case, and marks each match by the pixels its glyphs span. A
-navigation's fetch runs on a thread of its own, which hands the reply
+line not shown whole. Find searches the page's logical lines, all of
+them however few are laid (§5), and matches within one, across its
+runs and the ends of its wrapped lines and ignoring case, looking at
+each character once (Knuth, Morris and Pratt), so a search costs the
+text searched whatever the query: 16 to 19 ms for a word of 2 MiB,
+200-character queries included. Showing a match lays the lines around
+it and shows it whole where the pane holds it, from the line its last
+character is on up to the one its first drawn glyph is on, a space a
+wrapped line ends with being dropped there; each line it is on marks
+it by the pixels its glyphs span there. `Tab` and `Shift+Tab` go
+through every link of the page, a link's place being where its text
+starts on the logical line it starts on. A navigation's fetch runs on
+a thread of its own, which hands the reply
 to the render thread (§3) for its decoding, a picture's and a page's
 rendering into logical lines included, and waits for it there, so
 the window stays responsive while a page loads, and `Escape` on the
-page stops waiting for it; wrapping at the page's width, again on a
-resize or `F8`, is the window's. A stopped fetch runs on until the
-service answers or times out, so td-web keeps at most `MAX_WORKERS` (4)
+page stops waiting for it; laying out the lines near those shown at
+the page's width, again on a resize or `F8`, is the window's. A
+stopped fetch runs on until the service answers or times out, so
+td-web keeps at most `MAX_WORKERS` (4)
 fetches out, stopped ones included, and asks the person to wait past
 that; a navigation overtaken by another is stopped. The history keeps
 at most 100 pages each way, each at the text its top line began with,
@@ -495,14 +562,9 @@ order; each is its own design amendment when it starts:
   `HTML_LIMITS`, before td-web keeps `MAX_LINES` of it, so a hostile
   page costs the render thread the memory and time §5 states; a line
   limit inside its rich output at `MAX_LINES` would bound that
-  further. The window's thread wraps the page at each width up to
-  `MAX_LINES` lines, an unwrapped line only to the pane's edge, and
-  grows by some twice the bytes the wrap itself holds (a wrap of
-  100,000 lines holding 31 MB grew it 55 MB, 62 at its peak), the
-  memory bounds' largest term after the baseline and the render
-  thread's (§3): wrapping only the lines near those shown would bound
-  that pause and that memory further, and bring td-web's worst back
-  under a `memory-high` of 512 MiB.
+  further. That rendering, the bodies of the fetches out and a picture
+  shown with its fitted copy, not the window's wrap, are what keep
+  td-web's worst above a `memory-high` of 512 MiB (§3).
 - **Wide text**: horizontal scrolling for preformatted lines, with
   the rest of a line past `MAX_PRE_CHARS` kept for it; table columns
   and rules laid out in pixels rather than td-html's characters, until
