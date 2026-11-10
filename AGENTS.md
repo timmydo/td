@@ -26,6 +26,7 @@ needs them:
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For shared HTML rendering or text extraction, read `td-html/DESIGN.md`.
+- For CSS parsing, selectors or the cascade, read `td-css/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
 - For td's own cryptographic primitives, read `td-primitives/DESIGN.md`;
   for the rustls provider built on them, read `td-tls-provider/DESIGN.md`.
