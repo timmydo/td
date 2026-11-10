@@ -214,6 +214,8 @@ impl<const N: usize> Curve<N> {
     }
 
     /// Algorithm 4, whose step numbers are in the comments.
+    // Out of line: the portable builds check this body (td-crypto/PORTABLE.md).
+    #[inline(never)]
     fn add(&self, a: &Point<N>, c: &Point<N>) -> Point<N> {
         let f = &self.p;
         let (x1, y1, z1) = (&a.x, &a.y, &a.z);

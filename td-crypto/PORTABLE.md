@@ -141,10 +141,10 @@ read-only, each at its path in the root, and nothing else of it:
 | `usr/lib` | `/lib` | the usrmerge link the root's loader link and `libc.so` script name |
 | `usr/lib64` | `/lib64` | the loader, `/lib64/ld-linux-x86-64.so.2` |
 
-| Target | `nm`, `objcopy` |
+| Target | `nm`, `objdump`, `objcopy` |
 | --- | --- |
-| `x86_64` | `/usr/bin/nm`, `/usr/bin/objcopy` |
-| `aarch64` | `/usr/bin/aarch64-linux-gnu-nm`, `/usr/bin/aarch64-linux-gnu-objcopy` |
+| `x86_64` | `/usr/bin/nm`, `/usr/bin/objdump`, `/usr/bin/objcopy` |
+| `aarch64` | `/usr/bin/aarch64-linux-gnu-nm`, `/usr/bin/aarch64-linux-gnu-objdump`, `/usr/bin/aarch64-linux-gnu-objcopy` |
 
 No target C compiler, archiver or assembler is used: no admitted package
 compiles C. Every `CC` and `AR` spelling Cargo's build scripts consult (plain,
@@ -334,7 +334,8 @@ Source/vendor/output paths map to `/td-build`, `/td-cargo/vendor` and
 image's whole-closure profiling qualification.
 
 The linker requests a deterministic SHA-1 GNU build ID. After symbol
-inspection, the build root's `objcopy` creates `td-mta.debug` from the
+inspection, the compiled constant-time check below runs on the unstripped
+receiver; then the build root's `objcopy` creates `td-mta.debug` from the
 receiver, prunes all DWARF, line tables included, using the shared target
 profiling policy, then strips the runtime. The existing ELF pair validator
 requires matching build IDs, ordinary companion symbols, no companion DWARF
@@ -514,6 +515,62 @@ for reconstructible build caches. Private `crypto-build-<pid>-<attempt>` trees
 are removed on normal completion/error; after a hard kill remove one only after
 confirming its process ended. Retained artifacts follow the same explicit cache
 cleanup rule as prepared inputs.
+
+## Compiled constant-time form
+
+Both portable builds, x86-64 and aarch64, check the receiver they produce
+before stripping it. The build root's `nm --defined-only --demangle
+--print-size` (the target's own binutils, above) lists its text symbols,
+and each td-primitives routine td-crypto/DESIGN.md names as branch-free
+must appear under its exact demangled name:
+
+- `<td_primitives::ec::Curve<4>>::add` and `<td_primitives::ec::Curve<6>>::add`,
+  P-256's and P-384's complete point addition;
+- `td_primitives::aes_gcm::sbox`, `ortho` and `shift_rows`, the bitsliced AES
+  rounds;
+- `<td_primitives::aes_gcm::HashKey>::absorb`, the integer GHASH.
+
+td-primitives marks each `#[inline(never)]`, so the symbol is the one copy
+of its body that the build runs. A name with no symbol fails the build, so
+a rename, or an inlining that leaves no symbol behind, cannot silently drop
+a routine from the check. Every copy under the name is checked. The
+target's `objdump --disassemble --insn-width=16` disassembles exactly each
+symbol's address range, whose instructions must run back to back from the
+symbol's start to exactly its end, by the encodings objdump prints; a
+listing that stops short, skips bytes or prints `(bad)`, `.word`, `.inst`
+or another directive fails. The build fails on any conditional branch
+there: x86's `jcc`, `jrcxz` and `loop` family, aarch64's `b.cond`,
+`bc.cond`, `cbz`, `cbnz`, every other `cb` form (FEAT_CMPBR's `cb<cc>`,
+should `target-cpu` be raised to emit it), `tbz` and `tbnz`. On aarch64,
+`b` and `bl` are direct, `br` and `blr` indirect and `ret` a return; any
+other branch form, the pointer-authenticated `braa`, `blraa`, `retaa` and
+the rest included, and any other mnemonic beginning with `b` that is not
+a known data-processing instruction, fails as unrecognised. On x86, the
+prefixes the matcher reads past are those rustc and LLD emit. A call or
+jump leaving the routine must name its target directly, and that target
+must be another listed routine or the slice-generic
+`td_primitives::bignum::mont_mul`, whose branches count its loops over
+public lengths; an indirect one fails. Each routine's instruction and
+outgoing-call counts reach the build log, and the commands reach
+`BUILD-INPUTS`. Unit tests hold the matcher to synthetic disassembly of
+both architectures, passing and failing.
+
+The check is deliberately narrow. It reads the out-of-line bodies of these
+routines and nothing else: an inlined copy would not be read, which is why
+each is kept out of line. `Curve::add`'s fourteen Montgomery
+multiplications are calls to `mont_mul`, whose body is not gated; the
+side-channel review found it branches only on slice lengths. The check
+does not follow any callee; it does not check the routines that branch
+only on loop counters and lengths (the P-256 and P-384 table selection
+inside `multiply_sum`, the X25519 ladder, ChaCha20's block, `ct::eq`,
+`mont_mul`), because telling a counter from a secret needs data flow the
+matcher does not have, and those remain reviewed rather than gated; and
+it says nothing of memory access patterns or of instructions whose latency
+depends on their data, a multiplication's or a division's included. It
+holds the compiled form of what was reviewed against a later compiler,
+flag or source change, which must then fail here or pass a renewed review.
+The build log's counts for a run are recorded by the commit that changes
+the check or the routines.
 
 ## Private gateway process peer
 

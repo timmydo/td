@@ -1200,10 +1200,20 @@ electromagnetic or microarchitectural leakage. It assumes data-independent
 timing of AESENC, PCLMULQDQ, MUL and UMULH and the conditional moves and
 selects, which on aarch64 holds without PSTATE.DIT only by core
 implementation. It does not cover rustls's internals, and it holds for that
-toolchain, those flags and those targets only. No gate asserts the compiled
-form of the constant-time routines, so a change to any of them needs the
-review again. The independent cryptographic review F04 requires has not
-taken place.
+toolchain, those flags and those targets only. The portable builds of both
+targets assert part of it (PORTABLE.md, "Compiled constant-time form"):
+the out-of-line bodies of P-256's and P-384's point addition, the bitsliced
+AES S-box, `ortho` and `shift_rows`, and GHASH, each kept out of line by
+`#[inline(never)]`, must hold no conditional branch and call nothing but
+each other and the loop-counting `mont_mul`, and a routine missing from
+the symbols fails. Point addition's fourteen Montgomery multiplications
+are calls to `mont_mul`, whose body the review found branches only on
+slice lengths and which is not gated. The routines that branch only on
+loop counters or lengths (the table selection, the X25519 ladder,
+ChaCha20's block, `ct::eq`, `mont_mul`) are not gated, nor is any
+instruction whose latency depends on its data, so a change to them, or to
+the review's other findings, needs the review again. The independent
+cryptographic review F04 requires has not taken place.
 
 Selected-key health currently uses the owned key's mutex-backed public-point
 operation. A server session checks it before work, after backend calls and at

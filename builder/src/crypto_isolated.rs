@@ -48,9 +48,11 @@ const HOST_CC: &str = "/usr/bin/gcc";
 const HOST_BINUTILS: &str = "/usr/bin/";
 
 /// One target's binutils from the build root, by absolute path: `nm` lists
-/// symbols and `objcopy` splits debug companions. Nothing compiles C.
+/// symbols, `objdump` disassembles the branch-free routines and `objcopy`
+/// splits debug companions. Nothing compiles C.
 struct Tools {
     nm: &'static str,
+    objdump: &'static str,
     objcopy: &'static str,
 }
 
@@ -58,10 +60,12 @@ fn tools(architecture: Architecture) -> Tools {
     match architecture {
         Architecture::X86_64 => Tools {
             nm: "/usr/bin/nm",
+            objdump: "/usr/bin/objdump",
             objcopy: "/usr/bin/objcopy",
         },
         Architecture::Aarch64 => Tools {
             nm: "/usr/bin/aarch64-linux-gnu-nm",
+            objdump: "/usr/bin/aarch64-linux-gnu-objdump",
             objcopy: "/usr/bin/aarch64-linux-gnu-objcopy",
         },
     }
@@ -455,6 +459,334 @@ fn split_mail_debug_architecture(receipt: &mut String, architecture: Architectur
     crate::elf::assert_debug_pair(runtime, debug)
 }
 
+/// td-primitives routines whose compiled form must hold no conditional
+/// branch at all, by demangled name (td-crypto/DESIGN.md, "Compiled
+/// constant-time form"). Each is `#[inline(never)]` in td-primitives, so its
+/// symbol is the body that runs, and must be a symbol of the receiver: a
+/// rename, or an inlining that leaves no symbol, fails rather than shrinking
+/// the check. `Modulus::mul` is not listed: it is inlined into its callers,
+/// and an out-of-line copy would say nothing of them.
+const BRANCH_FREE: &[&str] = &[
+    "<td_primitives::ec::Curve<4>>::add",
+    "<td_primitives::ec::Curve<6>>::add",
+    "td_primitives::aes_gcm::sbox",
+    "td_primitives::aes_gcm::ortho",
+    "td_primitives::aes_gcm::shift_rows",
+    "<td_primitives::aes_gcm::HashKey>::absorb",
+];
+
+/// What else a branch-free routine may call or jump to: the slice-generic
+/// Montgomery multiplication, whose branches count its loops over public
+/// lengths. It was reviewed, and its body is not gated.
+const COUNTED_CALLEES: &[&str] = &["td_primitives::bignum::mont_mul"];
+
+/// One `nm --defined-only --demangle --print-size` text symbol.
+struct Symbol<'a> {
+    address: u64,
+    size: u64,
+    name: &'a str,
+}
+
+/// Every defined text symbol with a size.
+fn text_symbols(symbols: &str) -> Result<Vec<Symbol<'_>>> {
+    let mut found = Vec::new();
+    for line in symbols.lines() {
+        let mut fields = line.splitn(4, ' ');
+        let (Some(address), Some(size), Some(kind), Some(name)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !matches!(kind, "t" | "T") {
+            continue;
+        }
+        let parse = |text: &str| {
+            u64::from_str_radix(text, 16).map_err(|_| format!("malformed symbol line: {line}"))
+        };
+        found.push(Symbol {
+            address: parse(address)?,
+            size: parse(size)?,
+            name,
+        });
+    }
+    Ok(found)
+}
+
+/// One `objdump --disassemble --insn-width=16` instruction line.
+struct Instruction<'a> {
+    address: u64,
+    /// Bytes, from the raw encoding objdump prints beside it.
+    length: u64,
+    /// Past any prefix objdump prints as a word.
+    mnemonic: &'a str,
+    operand: &'a str,
+}
+
+/// An instruction line, `ADDRESS:\tBYTES\tMNEMONIC OPERANDS`, or `None` for
+/// any other line (headers, labels, blanks). A line with an address and no
+/// mnemonic, a wrapped encoding, is an error rather than skipped, so the
+/// byte count stays exact.
+fn instruction(line: &str) -> Option<Result<Instruction<'_>>> {
+    let (address, rest) = line.trim_start().split_once(":\t")?;
+    let address = u64::from_str_radix(address, 16).ok()?;
+    let (bytes, text) = match rest.split_once('\t') {
+        Some((bytes, text)) => (bytes, text),
+        None => return Some(Err(format!("wrapped or bare instruction at {address:#x}"))),
+    };
+    let digits = bytes.chars().filter(|c| !c.is_whitespace()).count();
+    if digits == 0
+        || digits % 2 != 0
+        || !bytes
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ' ')
+    {
+        return Some(Err(format!("unreadable encoding at {address:#x}")));
+    }
+    let mut words = text.split_whitespace();
+    let mut mnemonic = words.next().unwrap_or_default();
+    // The prefixes rustc's code generation and LLD emit and objdump prints as
+    // words; another would be read as the mnemonic and fail as unrecognised
+    // only if it is a branch form below.
+    while matches!(
+        mnemonic,
+        "bnd"
+            | "notrack"
+            | "lock"
+            | "rep"
+            | "repz"
+            | "repnz"
+            | "repe"
+            | "repne"
+            | "data16"
+            | "cs"
+            | "ds"
+            | "es"
+            | "ss"
+            | "fs"
+            | "gs"
+            | "addr32"
+    ) {
+        mnemonic = words.next().unwrap_or_default();
+    }
+    Some(Ok(Instruction {
+        address,
+        length: (digits / 2) as u64,
+        mnemonic,
+        operand: words.next().unwrap_or_default(),
+    }))
+}
+
+/// How the gate reads one instruction.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Falls through, or returns.
+    Straight,
+    /// Branches on a flag or register value.
+    Conditional,
+    /// A call or jump: `Some(address)` when direct.
+    Transfer(Option<u64>),
+    /// Neither decodable as an instruction nor a branch form the gate knows,
+    /// which fails rather than passing as straight-line code.
+    Unrecognised,
+}
+
+/// aarch64 data-processing mnemonics that begin with `b`; anything else that
+/// begins with `b`, or with `ret` or `eret`, is a branch form.
+const AARCH64_B_DATA: &[&str] = &[
+    "bic", "bics", "bif", "bit", "bsl", "bfi", "bfxil", "bfm", "bfc", "bcax", "bfcvt", "bfcvtn",
+    "bfcvtn2", "bfdot", "bfmlalb", "bfmlalt", "bfmmla", "bti",
+];
+
+/// x86's `jcc`, `jrcxz` and `loop` family are conditional; `call` and `jmp`
+/// transfer. aarch64's `b.cond`, `bc.cond`, `cbz`, `cbnz`, `tbz`, `tbnz` and
+/// every other `cb` form are conditional (FEAT_CMPBR's `cb<cc>` is one, should
+/// `target-cpu` ever be raised to emit it); `b` and `bl` transfer directly,
+/// `br` and `blr` indirectly; `ret` returns. Pointer-authenticated forms
+/// (`braa`, `blraa`, `retaa` and the rest) and any other `b`, `br`, `bl` or
+/// `ret` form are unrecognised.
+fn flow(instruction: &Instruction<'_>, architecture: Architecture) -> Flow {
+    let mnemonic = instruction.mnemonic;
+    if mnemonic.is_empty() || mnemonic.starts_with('.') || mnemonic.starts_with('(') {
+        return Flow::Unrecognised;
+    }
+    let direct = || {
+        let target = instruction.operand.trim_start_matches("0x");
+        Flow::Transfer(u64::from_str_radix(target, 16).ok())
+    };
+    match architecture {
+        Architecture::X86_64 => {
+            if (mnemonic.starts_with('j') && !mnemonic.starts_with("jmp"))
+                || mnemonic.starts_with("loop")
+            {
+                Flow::Conditional
+            } else if mnemonic.starts_with("call") || mnemonic.starts_with("jmp") {
+                direct()
+            } else {
+                Flow::Straight
+            }
+        }
+        Architecture::Aarch64 => {
+            if mnemonic.starts_with("b.")
+                || mnemonic.starts_with("bc.")
+                || mnemonic.starts_with("cb")
+                || matches!(mnemonic, "tbz" | "tbnz")
+            {
+                Flow::Conditional
+            } else if matches!(mnemonic, "b" | "bl") {
+                direct()
+            } else if matches!(mnemonic, "br" | "blr") {
+                Flow::Transfer(None)
+            } else if mnemonic == "ret" {
+                Flow::Straight
+            } else if mnemonic.starts_with("ret")
+                || mnemonic.starts_with("eret")
+                || (mnemonic.starts_with('b') && !AARCH64_B_DATA.contains(&mnemonic))
+            {
+                Flow::Unrecognised
+            } else {
+                Flow::Straight
+            }
+        }
+    }
+}
+
+/// Check one routine's disassembly of [start, start + size): its
+/// instructions must run back to back from `start` to exactly the end, each
+/// one recognised, with no conditional branch, and every call or jump
+/// leaving it must reach a branch-free routine or a counted callee by a
+/// direct address. Returns the instruction count and the calls leaving it.
+fn branch_free(
+    disassembly: &str,
+    architecture: Architecture,
+    symbols: &[Symbol<'_>],
+    name: &str,
+    start: u64,
+    size: u64,
+) -> Result<(usize, usize)> {
+    let end = start.checked_add(size).ok_or("symbol range overflows")?;
+    let instructions = disassembly
+        .lines()
+        .filter_map(instruction)
+        .collect::<Result<Vec<_>>>()
+        .map_err(|e| format!("{name}: {e}"))?;
+    let mut next = start;
+    let mut branches = Vec::new();
+    let mut calls = 0usize;
+    for instruction in &instructions {
+        let (address, mnemonic) = (instruction.address, instruction.mnemonic);
+        if address != next {
+            return Err(format!(
+                "{name}: instruction at {address:#x} where {next:#x} was due: the listing does not cover it exactly"
+            ));
+        }
+        next = address
+            .checked_add(instruction.length)
+            .filter(|after| *after <= end)
+            .ok_or_else(|| format!("{name}: instruction at {address:#x} lies outside it"))?;
+        let target = match flow(instruction, architecture) {
+            Flow::Straight => continue,
+            Flow::Conditional => {
+                branches.push(format!("{mnemonic} at {address:#x}"));
+                continue;
+            }
+            Flow::Unrecognised => {
+                return Err(format!(
+                    "{name}: unrecognised instruction {mnemonic} at {address:#x}"
+                ));
+            }
+            Flow::Transfer(target) => {
+                target.ok_or_else(|| format!("{name}: indirect {mnemonic} at {address:#x}"))?
+            }
+        };
+        if (start..end).contains(&target) {
+            continue;
+        }
+        calls += 1;
+        let allowed = symbols.iter().any(|symbol| {
+            symbol.address == target
+                && (BRANCH_FREE.contains(&symbol.name) || COUNTED_CALLEES.contains(&symbol.name))
+        });
+        if !allowed {
+            return Err(format!(
+                "{name}: {mnemonic} at {address:#x} reaches {target:#x}, which is neither branch-free nor a counted callee"
+            ));
+        }
+    }
+    if instructions.is_empty() || next != end {
+        return Err(format!(
+            "{name}: the listing stops at {next:#x}, short of its end at {end:#x}"
+        ));
+    }
+    if !branches.is_empty() {
+        return Err(format!(
+            "{name} must hold no conditional branch, and holds {}: {}",
+            branches.len(),
+            branches.join(", ")
+        ));
+    }
+    Ok((instructions.len(), calls))
+}
+
+/// Disassemble each branch-free routine of the unstripped receiver with the
+/// build root's binutils and refuse a conditional branch in it or a call
+/// out of it to anything unreviewed.
+fn branch_free_routines(receipt: &mut String, architecture: Architecture) -> Result<()> {
+    let receiver = "/output/artifacts/td-mta";
+    let mut command = Command::new(tools(architecture).nm);
+    command
+        .args(["--defined-only", "--demangle", "--print-size", receiver])
+        .env_clear()
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    command_record(&command, "branch-free-symbols", receipt)?;
+    let listing = bounded_output(&mut command, "branch-free-symbols", 64 * 1024 * 1024, 30)?;
+    let symbols = text_symbols(&listing)?;
+    let mut index = 0usize;
+    for name in BRANCH_FREE {
+        let copies: Vec<&Symbol<'_>> = symbols.iter().filter(|s| s.name == *name).collect();
+        if copies.is_empty() {
+            return Err(format!("{name} is not a symbol of the receiver"));
+        }
+        for symbol in copies {
+            let end = symbol
+                .address
+                .checked_add(symbol.size)
+                .filter(|_| symbol.size > 0)
+                .ok_or_else(|| format!("{name} has no extent"))?;
+            let mut command = Command::new(tools(architecture).objdump);
+            command
+                .args([
+                    "--disassemble",
+                    "--insn-width=16",
+                    &format!("--start-address={:#x}", symbol.address),
+                    &format!("--stop-address={end:#x}"),
+                    receiver,
+                ])
+                .env_clear()
+                .stdin(Stdio::null());
+            crate::host_bin::arm_check_child(&mut command);
+            let label = format!("branch-free-{index}");
+            index += 1;
+            command_record(&command, &label, receipt)?;
+            let disassembly = bounded_output(&mut command, &label, 4 * 1024 * 1024, 30)?;
+            let (count, calls) = branch_free(
+                &disassembly,
+                architecture,
+                &symbols,
+                name,
+                symbol.address,
+                symbol.size,
+            )?;
+            println!(
+                "portable constant-time form: {name} at {:#x}: {count} instructions, no conditional branch, {calls} calls out",
+                symbol.address
+            );
+        }
+    }
+    Ok(())
+}
+
 fn qualify_artifacts_architecture(directory: &Path, architecture: Architecture) -> Result<()> {
     for binary in binary_names(architecture) {
         let path = directory.join(binary);
@@ -509,6 +841,7 @@ pub(crate) fn build_inner() -> Result<()> {
         "/rust/bin/cargo",
         HOST_CC,
         "/usr/bin/nm",
+        "/usr/bin/objdump",
         "/usr/bin/objcopy",
         "/lib64/ld-linux-x86-64.so.2",
     ])?;
@@ -660,6 +993,7 @@ pub(crate) fn build_inner() -> Result<()> {
         Path::new("/output/artifacts/td-mta-rust-allocation-probe"),
     )?;
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
+    branch_free_routines(&mut receipt, architecture)?;
     split_mail_debug(&mut receipt)?;
     crate::crypto_api::qualify(&mut receipt, architecture)?;
     refuse_decoy(Path::new("/output"))?;
@@ -676,6 +1010,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         "/rust/bin/cargo",
         HOST_CC,
         "/usr/bin/aarch64-linux-gnu-nm",
+        "/usr/bin/aarch64-linux-gnu-objdump",
         "/usr/bin/aarch64-linux-gnu-objcopy",
         "/lib64/ld-linux-x86-64.so.2",
     ])?;
@@ -769,6 +1104,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         copy_binary(&binary, &Path::new("/output/artifacts").join(installed))?;
     }
     refuse_decoy(Path::new("/output"))?;
+    branch_free_routines(&mut receipt, architecture)?;
     split_mail_debug_architecture(&mut receipt, architecture)?;
     crate::crypto_api::qualify(&mut receipt, architecture)?;
     refuse_decoy(Path::new("/output"))?;
@@ -2398,6 +2734,185 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
 
+    const GATE_SYMBOLS: &str = "\
+0000000000001000 0000000000000020 t td_primitives::aes_gcm::sbox
+0000000000002000 0000000000000040 t td_primitives::bignum::mont_mul
+0000000000002000 0000000000000040 t td_primitives::bignum::mont_mul_alias
+0000000000003000 0000000000000010 T memcpy
+0000000000004000 0000000000000010 d td_primitives::aes_gcm::TABLE
+";
+
+    fn gate(text: &str, architecture: Architecture, size: u64) -> Result<(usize, usize)> {
+        let symbols = text_symbols(GATE_SYMBOLS).unwrap();
+        branch_free(
+            text,
+            architecture,
+            &symbols,
+            "td_primitives::aes_gcm::sbox",
+            0x1000,
+            size,
+        )
+    }
+
+    #[test]
+    fn text_symbols_take_sized_code_only() {
+        let symbols = text_symbols(GATE_SYMBOLS).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "td_primitives::aes_gcm::sbox",
+                "td_primitives::bignum::mont_mul",
+                "td_primitives::bignum::mont_mul_alias",
+                "memcpy",
+            ]
+        );
+        let second = symbols.get(1).unwrap();
+        assert_eq!((second.address, second.size), (0x2000, 0x40));
+        assert!(text_symbols("zz 10 t name\n").is_err());
+    }
+
+    /// objdump's x86-64 listing at `--insn-width=16`: 0x1b bytes.
+    const X86_CLEAN: &str = "\n/output/artifacts/td-mta:     file format elf64-x86-64\n\n\
+Disassembly of section .text:\n\n\
+0000000000001000 <td_primitives::aes_gcm::sbox>:\n\
+    1000:\t55                               \tpush   %rbp\n\
+    1001:\t48 89 e5                         \tmov    %rsp,%rbp\n\
+    1004:\t48 0f 45 d0                      \tcmovne %rax,%rdx\n\
+    1008:\teb 00                            \tjmp    100a <td_primitives::aes_gcm::sbox+0xa>\n\
+    100a:\te8 f1 0f 00 00                   \tcall   2000 <td_primitives::bignum::mont_mul>\n\
+    100f:\t2e 66 0f 1f 84 00 00 00 00 00    \tcs nopw 0x0(%rax,%rax,1)\n\
+    1019:\tf2 c3                            \tbnd ret\n";
+
+    #[test]
+    fn x86_branch_free_routine_passes_and_each_branch_form_fails() {
+        let clean = X86_CLEAN;
+        assert_eq!(gate(clean, Architecture::X86_64, 0x1b).unwrap(), (7, 1));
+        for branch in [
+            "jne    1000",
+            "je     1000",
+            "jb     1000",
+            "jrcxz  1000",
+            "loop   1000",
+            "loopne 1000",
+            "bnd jae 1000",
+        ] {
+            let text = clean.replace("cmovne %rax,%rdx", branch);
+            let error = gate(&text, Architecture::X86_64, 0x1b).unwrap_err();
+            assert!(error.contains("no conditional branch"), "{branch}: {error}");
+        }
+        for (call, expected) in [
+            ("call   3000 <memcpy>", "neither branch-free"),
+            ("call   *0x10(%rip)", "indirect"),
+            ("jmp    *%rax", "indirect"),
+            ("notrack jmp *%rax", "indirect"),
+            ("jmp    3000 <memcpy>", "neither branch-free"),
+            ("(bad)", "unrecognised"),
+            (".byte 0xff", "unrecognised"),
+        ] {
+            let text = clean.replace("call   2000 <td_primitives::bignum::mont_mul>", call);
+            let error = gate(&text, Architecture::X86_64, 0x1b).unwrap_err();
+            assert!(error.contains(expected), "{call}: {error}");
+        }
+    }
+
+    /// objdump's aarch64 listing: 0x18 bytes.
+    const ARM_CLEAN: &str = "\n0000000000001000 <td_primitives::aes_gcm::sbox>:\n\
+    1000:\ta9bf7bfd \tstp\tx29, x30, [sp, #-16]!\n\
+    1004:\t9a821020 \tcsel\tx0, x1, x2, ne\n\
+    1008:\t14000001 \tb\t100c <td_primitives::aes_gcm::sbox+0xc>\n\
+    100c:\t94000000 \tbl\t2000 <td_primitives::bignum::mont_mul>\n\
+    1010:\ta8c17bfd \tldp\tx29, x30, [sp], #16\n\
+    1014:\td65f03c0 \tret\n";
+
+    #[test]
+    fn aarch64_branch_free_routine_passes_and_each_branch_form_fails() {
+        let clean = ARM_CLEAN;
+        assert_eq!(gate(clean, Architecture::Aarch64, 0x18).unwrap(), (6, 1));
+        for branch in [
+            "b.ne\t1000",
+            "b.eq\t1000",
+            "bc.lt\t1000",
+            "cbz\tx0, 1000",
+            "cbnz\tw1, 1000",
+            "cbgt\tx0, x1, 1000",
+            "tbz\tx2, #3, 1000",
+            "tbnz\tx2, #63, 1000",
+        ] {
+            let text = clean.replace("csel\tx0, x1, x2, ne", branch);
+            let error = gate(&text, Architecture::Aarch64, 0x18).unwrap_err();
+            assert!(error.contains("no conditional branch"), "{branch}: {error}");
+        }
+        for data in [
+            "bic\tx0, x1, x2",
+            "bsl\tv0.16b, v1.16b, v2.16b",
+            "bfi\tx0, x1, #3, #4",
+            "bti\tc",
+        ] {
+            let text = clean.replace("csel\tx0, x1, x2, ne", data);
+            assert!(gate(&text, Architecture::Aarch64, 0x18).is_ok(), "{data}");
+        }
+        for (call, expected) in [
+            ("bl\t3000 <memcpy>", "neither branch-free"),
+            ("blr\tx8", "indirect"),
+            ("br\tx16", "indirect"),
+            ("b\t3000 <memcpy>", "neither branch-free"),
+            ("braa\tx16, x17", "unrecognised"),
+            ("braaz\tx16", "unrecognised"),
+            ("blraa\tx8, x9", "unrecognised"),
+            ("blraaz\tx8", "unrecognised"),
+            ("retaa", "unrecognised"),
+            ("eret", "unrecognised"),
+            ("brk\t#0x1", "unrecognised"),
+            (".word\t0xffffffff", "unrecognised"),
+            (".inst\t0xd503233f", "unrecognised"),
+            ("(bad)", "unrecognised"),
+        ] {
+            let text = clean.replace("bl\t2000 <td_primitives::bignum::mont_mul>", call);
+            let error = gate(&text, Architecture::Aarch64, 0x18).unwrap_err();
+            assert!(error.contains(expected), "{call}: {error}");
+        }
+        // An x86 reading of aarch64 text sees no jcc, but the aarch64 one does.
+        let branchy = clean.replace("csel\tx0, x1, x2, ne", "b.ne\t1000");
+        assert!(gate(&branchy, Architecture::X86_64, 0x18).is_ok());
+    }
+
+    #[test]
+    fn disassembly_must_cover_exactly_the_symbol() {
+        assert!(gate(ARM_CLEAN, Architecture::Aarch64, 0x18).is_ok());
+        // A listing that stops early, as objdump does at an undecodable tail.
+        let error = gate(ARM_CLEAN, Architecture::Aarch64, 0x1c).unwrap_err();
+        assert!(error.contains("short of its end"), "{error}");
+        let error = gate(ARM_CLEAN, Architecture::Aarch64, 0x14).unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+        let late = "    1004:\td65f03c0 \tret\n";
+        let error = gate(late, Architecture::Aarch64, 0x8).unwrap_err();
+        assert!(error.contains("does not cover"), "{error}");
+        let gap = ARM_CLEAN.replace(
+            "1008:\t14000001 \tb\t100c <td_primitives::aes_gcm::sbox+0xc>\n",
+            "",
+        );
+        let error = gate(&gap, Architecture::Aarch64, 0x18).unwrap_err();
+        assert!(error.contains("does not cover"), "{error}");
+        assert!(gate("", Architecture::X86_64, 0x1).is_err());
+        let wrapped = "    1000:\t48 89 e5\n";
+        let error = gate(wrapped, Architecture::X86_64, 0x3).unwrap_err();
+        assert!(error.contains("wrapped"), "{error}");
+        let x86 = "    1000:\tc3                   \tret\n";
+        assert!(gate(x86, Architecture::X86_64, 0x1).is_ok());
+    }
+
+    #[test]
+    fn branch_free_list_names_distinct_symbols() {
+        let mut names = BRANCH_FREE.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), BRANCH_FREE.len());
+        assert!(COUNTED_CALLEES
+            .iter()
+            .all(|name| !BRANCH_FREE.contains(name)));
+    }
+
     #[test]
     fn emulator_closure_takes_each_resolved_path_once_and_refuses_a_missing_one() {
         let listing = "\tlinux-vdso.so.1 (0x00007ffd)\n\
@@ -2471,7 +2986,10 @@ mod tests {
             assert_eq!(*ignored, STACK_PROBES.contains(&(*binary, *case)));
             assert!(ARM_BINARIES.contains(binary), "{binary}");
         }
-        assert!(cases[..functional].iter().all(|(_, _, ignored)| !ignored));
+        assert!(cases
+            .iter()
+            .take(functional)
+            .all(|(_, _, ignored)| !ignored));
     }
 
     #[test]

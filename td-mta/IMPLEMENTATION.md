@@ -2920,7 +2920,12 @@ code and its direct dependency do not change with backend selection.
    aarch64 musl artifacts td-crypto/PORTABLE.md's builds produce, and found
    no secret-dependent branch, secret-indexed load or nonce flaw;
    td-crypto/DESIGN.md states its scope and assumptions. It measured
-   nothing, and no gate asserts the constant-time routines' compiled form.
+   nothing. Both portable builds assert that the out-of-line bodies of
+   routines it found branch-free (point addition, the bitsliced AES rounds
+   and GHASH, kept out of line for it) still compile with no conditional
+   branch; point addition's multiplications call the ungated `mont_mul`,
+   which the review found branches only on slice lengths, and the routines
+   that branch only on loop counters are not gated.
    No independent cryptographic review has taken place. Tests alone are
    insufficient, and this blocks deployment.
 3. Take the Rustls CryptoProvider from `td-tls-provider`, the provider td-net

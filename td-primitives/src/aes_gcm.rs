@@ -323,6 +323,8 @@ fn swap_bits(x: &mut u64, y: &mut u64, low: u64, shift: u32) {
     *y = ((a & !low) >> shift) | (b & !low);
 }
 
+// Out of line: the portable builds check this body (td-crypto/PORTABLE.md).
+#[inline(never)]
 fn ortho(q: &mut Bits) {
     const TWO: u64 = 0x5555555555555555;
     const FOUR: u64 = 0x3333333333333333;
@@ -364,6 +366,8 @@ fn interleave_out(q0: u64, q1: u64) -> [u32; 4] {
     })
 }
 
+// Out of line: the portable builds check this body (td-crypto/PORTABLE.md).
+#[inline(never)]
 fn shift_rows(q: &mut Bits) {
     for word in q.iter_mut() {
         let x = *word;
@@ -393,6 +397,8 @@ fn mix_columns(q: &mut Bits) {
 }
 
 /// Boyar and Peralta's circuit, whose x0 is the high bit and x7 the low.
+// Out of line: the portable builds check this body (td-crypto/PORTABLE.md).
+#[inline(never)]
 fn sbox(q: &mut Bits) {
     let [x7, x6, x5, x4, x3, x2, x1, x0] = *q;
 
@@ -577,6 +583,8 @@ impl HashKey {
     }
 
     /// y = (y ^ block) * H in GF(2^128); `y` is [high, low].
+    // Out of line: the portable builds check this body (td-crypto/PORTABLE.md).
+    #[inline(never)]
     fn absorb(&self, y: &mut [u64; 2], block: &[u8; 16]) {
         let whole = u128::from_be_bytes(*block);
         let [y_high, y_low] = *y;

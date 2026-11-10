@@ -147,9 +147,17 @@ What is **not** claimed:
 
 - That the compiled binary keeps those properties. Rust gives no constant-time
   guarantee. `std::hint::black_box` around comparison results and masks
-  discourages the optimizer and promises nothing. `td-secret/CRYPTO-AUDIT.md`
-  shows the instruction-level inspection such a claim needs, and none has been
-  done for this crate yet.
+  discourages the optimizer and promises nothing. A model-run review read the
+  disassembly of td-crypto's portable td-mta for x86-64 and aarch64
+  (td-crypto/DESIGN.md, "Side-channel review scope"), and those builds now
+  fail if the bodies of P-256's and P-384's point addition (`Curve::add`),
+  the bitsliced AES rounds (`sbox`, `ortho`, `shift_rows`) or GHASH
+  (`HashKey::absorb`) gain a conditional branch (td-crypto/PORTABLE.md,
+  "Compiled constant-time form"). Those five are `#[inline(never)]` so that
+  the body checked is the one that runs. Point addition's multiplications
+  call `mont_mul`, which is not checked. That covers one consumer's build
+  of those routines, not every build of this crate, not the routines that
+  branch on loop counters, and not instruction latency.
 - Microarchitectural or physical resistance: power, EM, speculation, or
   operand-dependent instruction latency.
 - Erasure. `ct::zero` and the `Drop` impls clear what they own, best effort.
