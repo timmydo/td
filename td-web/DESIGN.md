@@ -104,7 +104,7 @@ the page shown with its wrap, which keep at most some 140 MB measured
 and more while the wrap is made (§5). A rendering of a hostile page
 of empty paragraphs peaks at some 260 MB, and one nesting quotes or
 lists around many short lines, or the other hostile shapes td-html's
-design lists, no more than some 265 MB in td-html, whose output budget
+design lists, no more than some 365 MB in td-html, whose output budget
 cuts such a page short (§5, §10). The allocator keeps much
 of a rendering's peak after it, so a page near the bound leaves less
 room for the next. `memory-high` throttles before `memory-max` ends
@@ -249,7 +249,7 @@ through td-html alone, 2 MiB of one-letter paragraphs inside eight
 quotes costs about 0.23 s and 250 MB and keeps some 215,000 of its
 524,000 lines, and at td-html's nesting limit (some 62 levels) about
 the same, keeping some 32,000; the other hostile shapes
-td-html/DESIGN.md lists peak at 265 MB at most and take 0.3 s at most
+td-html/DESIGN.md lists peak at 365 MB at most and take 0.8 s at most
 there. td-html ends a rendering it cut short
 with a line of notice (`td_html::CUT_NOTICE`), which td-web leaves out
 of the page, saying in the status row that the rest is too large to

@@ -40,6 +40,15 @@ pub use window::run;
 /// when the layout has none to say: the terminal's fifteen.
 const PAGE_ROWS: usize = 15;
 
+/// What one rendering of an article's HTML, and the scan for its links,
+/// may read and build: at their worst, with the pane's copy, some 33 MB
+/// beyond the article itself, under the 128 MiB jail beside td-news's own
+/// 46-91 MB (README.md, "Memory").
+const HTML_LIMITS: td_html::Limits = td_html::Limits {
+    input: 256 << 10,
+    output: 6 << 20,
+};
+
 #[derive(Clone)]
 struct FeedRow {
     name: String,
@@ -1702,32 +1711,8 @@ impl App {
 
     fn extract_current_article_urls(&mut self) {
         self.article_urls.clear();
-        let Some(article) = self.current_article().cloned() else {
-            return;
-        };
-        let mut seen = std::collections::HashSet::new();
-        // Always include the article's own link as [1]
-        if !article.link.is_empty() {
-            seen.insert(article.link.clone());
-            self.article_urls.push(article.link.clone());
-        }
-        let html_source = if article.content.trim().is_empty() {
-            &article.description
-        } else {
-            &article.content
-        };
-        // Extract href URLs from HTML source
-        for url in extract_href_urls(html_source) {
-            if seen.insert(url.clone()) {
-                self.article_urls.push(url);
-            }
-        }
-        // Also scan the plain text rendering for URLs
-        let text = td_html::to_text(html_source.as_bytes(), 200);
-        for url in extract_plain_urls(&text) {
-            if seen.insert(url.clone()) {
-                self.article_urls.push(url);
-            }
+        if let Some(article) = self.current_article() {
+            self.article_urls = article_links(article);
         }
     }
 
@@ -2346,7 +2331,7 @@ fn article_text(article: &Article, urls: &[String], columns: usize) -> String {
     } else {
         article.content.as_str()
     };
-    let body = td_html::to_text(html.as_bytes(), columns.max(20));
+    let body = td_html::to_text_within(html.as_bytes(), columns.max(20), HTML_LIMITS);
     // The renderer's reference definitions (`[1]: https://...`) are
     // dropped: the Links section below lists the same URLs.
     let mut rendered: Vec<&str> = body
@@ -2383,6 +2368,34 @@ fn is_reference_link_def(line: &str) -> bool {
     } else {
         false
     }
+}
+
+/// The links an article carries, as the picker numbers them: its own link,
+/// then the `href`s and the plain URLs of the part of its HTML that
+/// `HTML_LIMITS` lets a rendering read, each once.
+fn article_links(article: &Article) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if !article.link.is_empty() {
+        seen.insert(article.link.clone());
+        links.push(article.link.clone());
+    }
+    let html = if article.content.trim().is_empty() {
+        &article.description
+    } else {
+        &article.content
+    };
+    let read = HTML_LIMITS.read(html);
+    let text = td_html::to_text_within(read.as_bytes(), 200, HTML_LIMITS);
+    for url in extract_href_urls(read)
+        .into_iter()
+        .chain(extract_plain_urls(&text))
+    {
+        if seen.insert(url.clone()) {
+            links.push(url);
+        }
+    }
+    links
 }
 
 fn extract_href_urls(html: &str) -> Vec<String> {
@@ -2703,6 +2716,98 @@ pub(super) mod tests {
         // Nothing else is mistaken for a definition.
         assert!(!is_reference_link_def("[a]: https://example.com/x"));
         assert!(!is_reference_link_def("[1] https://example.com/x"));
+    }
+
+    /// An article is rendered within `HTML_LIMITS`: short paragraphs deep
+    /// in quotes, whose output grows fastest with its markup, stop at the
+    /// output budget, and markup past the input limit is never read; each
+    /// ends the body with the renderer's notice.
+    #[test]
+    fn an_article_is_rendered_within_its_limits() {
+        let article = |content: String| Article {
+            hash: ARTICLE_HASH.to_string(),
+            title: "Title".to_string(),
+            link: String::new(),
+            description: String::new(),
+            content,
+            published: None,
+            feed_name: FEED_NAME.to_string(),
+            read: false,
+        };
+        let notice = format!("\n{}\n", td_html::CUT_NOTICE);
+        let mut nested = "<blockquote>".repeat(62);
+        nested.push_str(&"<p>x</p>".repeat(HTML_LIMITS.input / 9));
+        assert!(nested.len() <= HTML_LIMITS.input);
+        let body = td_html::to_text_within(nested.as_bytes(), 80, HTML_LIMITS);
+        let twice = td_html::Limits {
+            output: 2 * HTML_LIMITS.output,
+            ..HTML_LIMITS
+        };
+        let more = td_html::to_text_within(nested.as_bytes(), 80, twice);
+        assert!(body.ends_with(&notice) && more.len() > body.len());
+        let text = article_text(&article(nested), &[], 80);
+        assert!(text.ends_with(&format!("\n\n{body}")), "{}", text.len());
+        assert!(text.contains(&format!("{}x\n", "> ".repeat(30))));
+        let mut long = "<p>start</p>".to_string();
+        long.push_str(&" ".repeat(HTML_LIMITS.input - long.len()));
+        long.push_str("<p>beyond</p>");
+        let text = article_text(&article(long), &[], 80);
+        assert!(text.ends_with(&notice) && text.contains("start"));
+        assert!(!text.contains("beyond"));
+    }
+
+    /// The limits as measured against the jail (README.md, "Memory"): a
+    /// rendering's peak is at most 100 bytes per byte of input read and
+    /// 1.25 per byte of output budget (td-html/DESIGN.md, "Resident
+    /// rendering cost"), and the pane keeps the last article's text, at
+    /// most its budget, while the next renders. `BASELINE` is td-news's own
+    /// resident memory at 2880x1800 with td-ui's three window buffers, and
+    /// `MEMORY_HIGH` the jail's in recipes/src/recipes/news.rs, both
+    /// reviewed by hand when either changes.
+    #[test]
+    fn the_html_limits_fit_the_jail() {
+        const BASELINE: usize = 91_000_000;
+        const MEMORY_HIGH: usize = 128 << 20;
+        let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
+        let kept = HTML_LIMITS.output;
+        assert!(BASELINE + rendering + kept < MEMORY_HIGH);
+    }
+
+    /// The links listed are those of the part of the article a rendering
+    /// reads and keeps: an `href` past the input limit and a plain URL past
+    /// the output budget are not scanned, so a long article of distinct
+    /// links costs no more than its rendering.
+    #[test]
+    fn an_article_s_links_are_scanned_within_its_limits() {
+        let article = |content: String| Article {
+            hash: ARTICLE_HASH.to_string(),
+            title: "Title".to_string(),
+            link: "https://own.example/".to_string(),
+            description: String::new(),
+            content,
+            published: None,
+            feed_name: FEED_NAME.to_string(),
+            read: false,
+        };
+        let mut html =
+            "<a href=\"https://early.example/\">e</a> https://plain.example/x".to_string();
+        html.push_str(&" ".repeat(HTML_LIMITS.input - html.len()));
+        html.push_str("<a href=\"https://beyond.example/\">b</a>");
+        assert_eq!(
+            article_links(&article(html)),
+            [
+                "https://own.example/",
+                "https://early.example/",
+                "https://plain.example/x"
+            ]
+        );
+        // Some 20 MiB of output, past the budget but within the default.
+        let mut nested = "<blockquote>".repeat(62);
+        nested.push_str(&"<p>x</p>".repeat(2_500));
+        nested.push_str("<p>https://late.example/page</p>");
+        let whole = td_html::to_text(nested.as_bytes(), 200);
+        assert!(whole.contains("https://late.example/page"));
+        assert_eq!(article_links(&article(nested)), ["https://own.example/"]);
     }
 
     #[test]

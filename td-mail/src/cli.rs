@@ -212,6 +212,8 @@ fn serialize_email(email: &Email, headers_only: bool, max_body_chars: usize) -> 
 
     if !headers_only {
         let body_text = compose::extract_body_text(email);
+        // A body cut at `compose::HTML_LIMITS` ends with td-html's notice.
+        let cut = body_text.lines().last() == Some(td_html::CUT_NOTICE);
         let (body, truncated) = if max_body_chars > 0 && body_text.len() > max_body_chars {
             let truncated_body: String = body_text.chars().take(max_body_chars).collect();
             (truncated_body, true)
@@ -219,7 +221,7 @@ fn serialize_email(email: &Email, headers_only: bool, max_body_chars: usize) -> 
             (body_text, false)
         };
         obj.insert("body", json!(body));
-        obj.insert("body_truncated", json!(truncated));
+        obj.insert("body_truncated", json!(truncated || cut));
         obj.insert("preview", json!(email.preview));
     }
 
@@ -1859,6 +1861,8 @@ Context Control
 Both get_email, get_thread, and query_emails accept:
   - "headers_only": true — omit body/preview, return only metadata
   - "max_body_chars": 500 — truncate body text; response includes "body_truncated": true if truncated
+A body past 512 KiB is cut there and ends with a line saying the rest is
+not shown, with "body_truncated": true.
 
 Email Mutation Commands
 -----------------------
@@ -1936,4 +1940,60 @@ keybindings: Export the window's keybinding dictionary, the rows its key list (F
    < {{"ok": true, "keybindings": [{{"view": "global", "key": "?", "action": "show_keys", "description": "Show this list of keys (F1 too)"}}, ...]}}
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jmap::types::{BodyPart, BodyValue};
+
+    /// A body cut at `compose::HTML_LIMITS` is reported truncated, with
+    /// what was read and the notice, and a short one is not.
+    #[test]
+    fn a_body_cut_at_the_input_limit_is_reported_truncated() {
+        let email = |value: String| Email {
+            id: "e1".to_string(),
+            thread_id: None,
+            from: None,
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: None,
+            received_at: None,
+            sent_at: None,
+            preview: None,
+            text_body: Some(vec![BodyPart {
+                part_id: "1".to_string(),
+                blob_id: None,
+                r#type: Some("text/plain".to_string()),
+                name: None,
+                size: None,
+            }]),
+            html_body: None,
+            body_values: HashMap::from([(
+                "1".to_string(),
+                BodyValue {
+                    value,
+                    is_encoding_problem: false,
+                    is_truncated: false,
+                },
+            )]),
+            keywords: HashMap::new(),
+            mailbox_ids: HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: HashMap::new(),
+        };
+        let truncated = |value: &Value| value.get("body_truncated").and_then(Value::as_bool);
+        let short = serialize_email(&email("short".to_string()), false, 0);
+        assert_eq!(truncated(&short), Some(false));
+        let mut long = "line\n".repeat(compose::HTML_LIMITS.input / 5 + 1);
+        long.push_str("beyond\n");
+        let cut = serialize_email(&email(long), false, 0);
+        assert_eq!(truncated(&cut), Some(true));
+        let body = cut.get("body").and_then(Value::as_str).unwrap_or_default();
+        assert!(body.ends_with(&format!("\n{}\n", td_html::CUT_NOTICE)));
+        assert!(!body.contains("beyond"));
+    }
 }

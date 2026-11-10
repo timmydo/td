@@ -692,6 +692,40 @@ that policy when reconnecting. A cache write failure is logged; a missing or
 recreated cache has no retained policy. The server remains authoritative.
 Use a separate configured account name/cache for a local replica.
 
+## Memory
+
+td's jail lets td-mail grow to 192 MiB before it throttles it
+(`memory-high`) and to 256 MiB before it ends it (`recipes/src/recipes/mail.rs`).
+td-mail renders a message's HTML, for the message view and for a reply's
+quotation, on the window's thread, one rendering at a time, within
+`compose::HTML_LIMITS`: the first 512 KiB of the HTML, and an 8 MiB
+output budget (td-html/DESIGN.md, "Resident rendering cost"). A body past
+512 KiB ends with td-html's notice that the rest is not shown; ordinary
+HTML of 512 KiB needs under 6 MiB of the budget, so the budget cuts only
+hostile markup, such as one-letter paragraphs nested in quotes. A
+plain-text body is shown and quoted to the same 512 KiB, then the same
+notice, so a body of many short lines, a string each in the view, costs
+no more. The CLI's `body` is the same text, cut the same way, and a cut
+one sets `body_truncated`, as `max_body_chars` does.
+
+Measured on a development host, release build: td-mail started offline
+under a headless td-compositor with the pinned monospace face holds
+21 MB resident at 1920x1200 and 32 MB at 2880x1800, beside its window's
+shared-memory buffers, 9 or 20 MB each, of which td-ui keeps up to three:
+47 to 92 MB in all. The costliest hostile shape measured through the
+view's rendering, with its text, lines and links kept, and then a
+reply's quotation of the same HTML, is one-letter paragraphs left open
+inside 62 quotes inside a link with a 16 KiB target, each line's quote
+marks then carrying the target: it peaks 74 MB above the test's 2 MiB
+input, so 121 to 166 MB in all, under 192 MiB at either size, which
+leaves 35 to 80 MB for the mailbox and the message itself. A test holds
+`HTML_LIMITS` to td-html's rule (100 bytes a byte of input, 1.25 a byte
+of budget) beside the larger baseline and the view's kept text; those
+figures and the jail's are copied by hand, and reviewed when `mail.rs`
+or the limits change. A message is fetched whole, its body values
+included, to the fetch service's 64 MiB ceiling; these limits bound what
+rendering it costs, not what fetching it does.
+
 ## Development
 
 ```bash

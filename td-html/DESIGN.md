@@ -131,7 +131,10 @@ which its row then copies side by side, so each of the at most four
 levels of laid-out table copies its cells' lines once more. Preformatted
 text keeps the column its line has reached for its tab stops.
 
-Each rendering has an output budget of 128 MiB, which plain and rich
+Each rendering has two limits, `Limits`: the bytes of input it reads and
+an output budget. `to_text` and `to_rich` read the whole input within
+`OUTPUT_BUDGET`, 128 MiB; `to_text_within` and `to_rich_within` take a
+reader's own, sized as below. The output budget is what plain and rich
 rendering both spend: a span costs 64 bytes plus its text and, in rich
 output, 32 bytes per tag plus a link's or image's target; a line costs
 32 bytes plus its spans; a quote, list item, definition or heading costs,
@@ -167,18 +170,72 @@ trim drops, or a trailing block that emits none, such as an empty list
 item. A caller can tell a cut by the last line, though a document may
 itself end with the notice's text.
 
+An input longer than its limit is read to the limit, less a character
+the limit splits, rendered as a whole document within the output budget,
+and followed by the notice, once if the budget cut it too. What is kept
+is then the rendering of the part read, not a prefix of the whole
+document's: a table or paragraph the limit splits is laid out as what
+was read of it.
+
 Measured on a development host, release build: 2 MiB of one-letter
 paragraphs rendered rich at width 0 peaks at some 140 MB flat and some
-260 MB inside eight quotes or more, where the budget cuts it, in a
-quarter of a second. The costliest hostile shapes tried, plain and rich
-at widths 0 and 80, each peak at 265 MB at most and take 0.3 s at most:
-2 MiB of words inside a link with a 16 KiB target, in a laid-out table
-cell or not; 62 quotes inside a link with an 8 MiB target; alternating
-bold and italic words inside a 16 KiB link; a link with a 1 MiB target
-around 130,000 bold letters, 87,000 superscripts or 40,000 images; a
-2 MiB preformatted run of bold letters; an 8 MiB table cell; a 2 MiB
-word with no break in a laid-out table of 64 columns, at width 1, or
-inside 38 quotes and a list item (8 MiB there too). The budget bounds
+260 MB inside eight quotes or more, where the budget cuts it. The
+costliest hostile shapes tried, plain and rich at widths 0 and 80, each
+peak at 365 MB at most and take 0.8 s at most: 2 MiB of one-letter
+paragraphs left open (`<p>x`) inside 62 quotes (364 MB; 357 MB inside 8,
+278 MB in none, which nothing cuts), or list items (`<li>x`) inside 62
+quotes (323 MB); 2 MiB of words inside a link with a 16 KiB target, in a
+laid-out table cell or not; 62 quotes inside a link with an 8 MiB target;
+alternating bold and italic words inside a 16 KiB link; a link with a
+1 MiB target around 130,000 bold letters, 87,000 superscripts or 40,000
+images; a 2 MiB preformatted run of bold letters; an 8 MiB table cell; a
+2 MiB word with no break in a laid-out table of 64 columns, at width 1,
+or inside 38 quotes and a list item (8 MiB there too); 2 MiB of empty
+`<style>` elements, in any case, which are skipped to their closing tag
+without a copy of the rest of the document (0.03 s). The budget bounds
 what a rendering builds, not the memory a reader allows it: these peaks,
-some 265 MB at most, are what a caller must leave room for, which a
-reader whose own limit is smaller does not have.
+some 365 MB at most, are what a caller of `to_text` or `to_rich` with
+2 MiB of input must leave room for.
+
+A reader with less room sizes its limits by two terms, measured the same
+way. The output term is at most 1.25 bytes of peak per byte of output
+budget: the peak's growth from an 8 to a 128 MiB budget, on 2 MiB of the
+shapes the budget cuts (short paragraphs in 8 or 62 quotes, a long word
+in a 64-column table at width 80 or alone at width 1, a word inside 38
+quotes, links with 16 KiB targets around words or a 1 MiB target around
+images), was 1.0 to 1.25 times the budget's. The input term is the
+element tree, built whole before rendering starts, which the budget does
+not bound: at most some 100 bytes of peak per byte of input read, for
+dense markup of one-letter elements (`<p>x`, 99 MB a MiB; `<li>x` or
+`<tr><td>x`, 80; `<p>x</p>`, 50; `<br>`, 40), some 20 for ordinary
+documents (Apache's and Jim Tcl's HTML manuals) and 2 to 3 for text
+with little markup. So a rendering's peak is at most some 100 times its
+input limit plus 1.25 times its output budget, beside the input the
+caller holds; the terms overlap, so the sum overstates it. Measured worst
+peaks, with the generated input of four times the limit included, each
+of the shapes above tried at widths 0, 20 and 80, plain and rich:
+
+| input limit | output budget | worst peak |
+|---|---|---|
+| 256 KiB | 6 MiB | 36 MB |
+| 256 KiB | 8 MiB | 38 MB |
+| 256 KiB | 16 MiB | 48 MB |
+| 256 KiB | 32 MiB | 69 MB |
+| 512 KiB | 6 MiB | 62 MB |
+| 512 KiB | 8 MiB | 64 MB |
+| 512 KiB | 16 MiB | 74 MB |
+| 512 KiB | 32 MiB | 94 MB |
+| 1 MiB | 8 MiB | 116 MB |
+| 1 MiB | 16 MiB | 126 MB |
+| 1 MiB | 32 MiB | 146 MB |
+
+The worst shape at every pair is one-letter paragraphs left open
+(`<p>x`) inside 62 quotes, whose tree is as dense as any and whose lines
+each carry 62 marks.
+
+An ordinary document spends at most some 11 bytes of budget per byte of
+input at width 80, rich or plain: an 8 MiB budget rendered the 0.72 MiB of two
+copies of Jim Tcl's manual whole, and a 16 MiB budget four (1.45 MiB),
+but not eight. A reader whose memory cannot hold its largest input's tree
+therefore has its input limit, not its budget, cut ordinary documents,
+and a budget of some 11 times its input limit cuts only hostile ones.

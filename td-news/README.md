@@ -114,6 +114,41 @@ shows and draw in the toolkit's palette.
 - A `C-click` on a link in the article opens it in the browser;
   holding Control over one underlines it
 
+## Memory
+
+td's jail lets td-news grow to 128 MiB before it throttles it
+(`memory-high`) and to 192 MiB before it ends it (`recipes/src/recipes/news.rs`).
+td-news renders an article's HTML on the window's thread, one rendering
+at a time, within `HTML_LIMITS` (`src/ui/mod.rs`): the first 256 KiB of
+the HTML, and a 6 MiB output budget (td-html/DESIGN.md, "Resident
+rendering cost"). An article past 256 KiB ends with td-html's notice that
+the rest is not shown; ordinary HTML of 256 KiB needs under 3 MiB of the
+budget, so the budget cuts only hostile markup, such as one-letter
+paragraphs nested in quotes. The links the picker lists come from the
+same part of the HTML: its `href`s, and the URLs in its rendering within
+the same limits, so neither a link past the cut nor a long article of
+distinct links costs more than its rendering.
+
+Measured on a development host, release build: td-news started under a
+headless td-compositor with the pinned monospace face and no articles
+holds 19 MB resident at 1920x1200 and 30 MB at 2880x1800, beside its
+window's shared-memory buffers, 9 or 20 MB each, of which td-ui keeps up
+to three: 46 to 91 MB in all. The costliest hostile shape measured
+through an article's path (the link scan, the pane's rendering at 80 or
+200 columns and the pane's copy) is one-letter paragraphs left open
+inside 62 quotes: it peaks 33 MB above the test's 1 MiB article, so 79 to
+124 MB in all, under 128 MiB at either size, which leaves 10 to 55 MB for
+the articles held. A test holds `HTML_LIMITS` to td-html's rule (100
+bytes a byte of input, 1.25 a byte of budget) beside the larger baseline
+and the pane's last text; those figures and the jail's are copied by
+hand, and reviewed when `news.rs` or the limits change. A feed is fetched
+whole, to the fetch service's 64 MiB ceiling, and its articles are held
+whole; these limits bound what rendering one costs, not what fetching or
+holding them does, nor what a search does: it lowercases a copy of each
+article's title, description and content in turn
+(`filtered_article_indices`), so it costs some three times the largest
+article beside the articles held.
+
 ## Cache
 
 - Database: `~/.cache/td-news/cache.tdkv`

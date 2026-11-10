@@ -17,8 +17,8 @@ use td_url::{Reference, Url};
 /// builds a page's whole rendering before td-web keeps `MAX_LINES` of it,
 /// so this bounds that work, which a fetch thread does: a hostile page of
 /// empty paragraphs this size costs about 0.38 s and some 260 MB, and
-/// td-html's output budget holds nested quotes or lists to about as much
-/// in td-html (DESIGN.md §5).
+/// td-html's output budget holds nested quotes or lists to some 365 MB in
+/// td-html (DESIGN.md §5).
 pub const MAX_MARKUP: usize = 2 << 20;
 /// The most bytes of text rendered.
 pub const MAX_TEXT: usize = 4 << 20;
@@ -47,7 +47,7 @@ const MAX_LEAD: usize = 256;
 
 /// One rendering of markup or decoding of a picture at a time, whichever
 /// fetch thread asks: a rendering can cost some 260 MB at `MAX_MARKUP`,
-/// about as much in td-html when quotes or lists nest, and a picture
+/// some 365 MB in td-html when quotes or lists nest, and a picture
 /// some 112 MB, and
 /// `MAX_WORKERS` of them at once would not fit td-web's memory bound
 /// (DESIGN.md §3).

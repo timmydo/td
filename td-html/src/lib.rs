@@ -71,7 +71,13 @@ impl Span {
 /// Emphasis is marked up like markdown (`*em*`, `**strong**`, `` `code` ``),
 /// links render as `[text][n]` with an `[n]: url` reference list appended.
 pub fn to_text(html: &[u8], width: usize) -> String {
-    let lines = render(html, width, Decor::Plain);
+    to_text_within(html, width, Limits::DEFAULT)
+}
+
+/// [`to_text`] within `limits`: a rendering they cut ends with
+/// [`CUT_NOTICE`]'s line.
+pub fn to_text_within(html: &[u8], width: usize, limits: Limits) -> String {
+    let lines = render_within(html, width, Decor::Plain, limits);
     let mut out = String::new();
     for line in &lines {
         for span in line {
@@ -87,12 +93,43 @@ pub fn to_text(html: &[u8], width: usize) -> String {
 /// Markup is carried by [`Tag`] values rather than by literal characters, so
 /// a caller can map it to terminal attributes.
 pub fn to_rich(html: &[u8], width: usize) -> Vec<Vec<Span>> {
-    render(html, width, Decor::Rich)
+    to_rich_within(html, width, Limits::DEFAULT)
 }
 
-/// The last line of a rendering cut short by its output budget, one plain
-/// span in rich output, and in no rendering that was not cut
-/// (td-html/DESIGN.md, "Resident rendering cost").
+/// [`to_rich`] within `limits`: the last line of a rendering they cut is
+/// [`CUT_NOTICE`].
+pub fn to_rich_within(html: &[u8], width: usize, limits: Limits) -> Vec<Vec<Span>> {
+    render_within(html, width, Decor::Rich, limits)
+}
+
+/// What one rendering may read and build; td-html/DESIGN.md, "Resident
+/// rendering cost", says what each costs a reader's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Bytes of the input rendered; the rest is not read.
+    pub input: usize,
+    /// The output budget, in the bytes its spans and lines are charged.
+    pub output: usize,
+}
+
+impl Limits {
+    /// [`to_text`]'s and [`to_rich`]'s: the whole input, [`OUTPUT_BUDGET`].
+    pub const DEFAULT: Limits = Limits {
+        input: usize::MAX,
+        output: OUTPUT_BUDGET,
+    };
+
+    /// What a rendering within these limits reads of `html`: its first
+    /// `input` bytes, less a character the limit splits.
+    pub fn read<'h>(&self, html: &'h str) -> &'h str {
+        let end = input_prefix(html.as_bytes(), self.input).len();
+        html.get(..end).unwrap_or_default()
+    }
+}
+
+/// The last line of a rendering cut short by its limits, one plain span in
+/// rich output, and in no rendering that was not cut (td-html/DESIGN.md,
+/// "Resident rendering cost").
 pub const CUT_NOTICE: &str = "[the rest of this document is not shown: it is too large to render]";
 
 /// Maximum element nesting kept from the input; deeper elements are
@@ -119,11 +156,33 @@ enum Decor {
     Rich,
 }
 
-fn render(html: &[u8], width: usize, decor: Decor) -> Vec<Vec<Span>> {
-    render_within(html, width, decor, OUTPUT_BUDGET)
+fn render_within(html: &[u8], width: usize, decor: Decor, limits: Limits) -> Vec<Vec<Span>> {
+    let read = input_prefix(html, limits.input);
+    let mut lines = render_budget(read, width, decor, limits.output);
+    let cut = [Span::plain(CUT_NOTICE.to_string())];
+    if read.len() < html.len() && lines.last().map(Vec::as_slice) != Some(&cut[..]) {
+        lines.push(cut.to_vec());
+    }
+    lines
 }
 
-fn render_within(html: &[u8], width: usize, decor: Decor, budget: usize) -> Vec<Vec<Span>> {
+/// The first `limit` bytes of `html`, less a character the limit splits.
+fn input_prefix(html: &[u8], limit: usize) -> &[u8] {
+    if limit >= html.len() {
+        return html;
+    }
+    let mut end = limit;
+    // At most three continuation bytes follow a character's first byte.
+    for _ in 0..3 {
+        match html.get(end) {
+            Some(b) if end > 0 && b & 0xc0 == 0x80 => end -= 1,
+            _ => break,
+        }
+    }
+    html.get(..end).unwrap_or_default()
+}
+
+fn render_budget(html: &[u8], width: usize, decor: Decor, budget: usize) -> Vec<Vec<Span>> {
     let source = String::from_utf8_lossy(html);
     let nodes = build(&source);
     let (est, content) = measure(&nodes, decor);
@@ -1033,10 +1092,7 @@ impl<'a> Lexer<'a> {
 
     /// Consume everything up to `</name>` (used for `<script>` and friends).
     fn skip_element(&mut self, name: &str) {
-        let close = format!("</{}", name);
-        let rest = self.rest();
-        let lower = rest.to_ascii_lowercase();
-        match lower.find(&close) {
+        match find_close(self.rest().as_bytes(), name.as_bytes()) {
             Some(at) => {
                 self.pos += at;
                 self.skip_past(">");
@@ -1044,6 +1100,26 @@ impl<'a> Lexer<'a> {
             None => self.pos = self.src.len(),
         }
     }
+}
+
+/// Where `</name` first starts in `rest`, the name matched without regard
+/// to ASCII case, looking at each byte of `rest` once or twice rather than
+/// lowering a copy of the rest of the document per element.
+fn find_close(rest: &[u8], name: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(off) = rest.get(from..)?.iter().position(|&b| b == b'<') {
+        let at = from + off;
+        let after = rest.get(at + 1..).unwrap_or_default();
+        if after.first() == Some(&b'/')
+            && after
+                .get(1..1 + name.len())
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,10 +1797,10 @@ fn row_extent(
 // Line buffer and wrapping
 // ---------------------------------------------------------------------------
 
-/// Bytes of spans and lines one rendering may build, its table cells'
-/// included, before it stops (td-html/DESIGN.md, "Resident rendering
-/// cost").
-const OUTPUT_BUDGET: usize = 128 << 20;
+/// The output budget of [`to_text`] and [`to_rich`]: bytes of spans and
+/// lines one rendering may build, its table cells' included, before it
+/// stops (td-html/DESIGN.md, "Resident rendering cost").
+pub const OUTPUT_BUDGET: usize = 128 << 20;
 /// What a span costs the budget beyond its text and tags.
 const SPAN_COST: usize = 64;
 /// What a tag costs beyond the target it carries.
@@ -3972,16 +4048,16 @@ mod tests {
         let notice = vec![Span::plain(CUT_NOTICE.to_string())];
         for decor in [Decor::Plain, Decor::Rich] {
             for width in [0, 6, 40] {
-                let full = render(html.as_bytes(), width, decor);
+                let full = within(html.as_bytes(), width, decor, OUTPUT_BUDGET);
                 assert_ne!(full.last(), Some(&notice));
-                assert_eq!(render_within(html.as_bytes(), width, decor, 1 << 20), full);
+                assert_eq!(within(html.as_bytes(), width, decor, 1 << 20), full);
                 assert_eq!(
-                    render_within(html.as_bytes(), width, decor, 0),
+                    within(html.as_bytes(), width, decor, 0),
                     std::slice::from_ref(&notice)
                 );
                 let mut cuts = 0;
                 for budget in (cut_cost()..cut_cost() + 6000).step_by(7) {
-                    let cut = render_within(html.as_bytes(), width, decor, budget);
+                    let cut = within(html.as_bytes(), width, decor, budget);
                     assert!(output_cost(&cut) <= budget, "budget {budget}");
                     if cut == full {
                         continue;
@@ -3998,9 +4074,129 @@ mod tests {
         // A paragraph whose own spans pass the budget leaves only the notice.
         let long = format!("<p>{}</p>", "word ".repeat(1000));
         assert_eq!(
-            render_within(long.as_bytes(), 40, Decor::Rich, cut_cost() + 2000),
+            within(long.as_bytes(), 40, Decor::Rich, cut_cost() + 2000),
             [notice]
         );
+    }
+
+    /// `render_within` with an output budget alone.
+    fn within(html: &[u8], width: usize, decor: Decor, budget: usize) -> Vec<Vec<Span>> {
+        let limits = Limits {
+            input: usize::MAX,
+            output: budget,
+        };
+        render_within(html, width, decor, limits)
+    }
+
+    #[test]
+    fn a_reader_s_limits_cut_as_the_default_budget_does() {
+        // Short paragraphs eight quotes deep: the shape whose output grows
+        // fastest with its input.
+        let mut html = "<blockquote>".repeat(8);
+        html.push_str(&"<p>x</p>".repeat(20_000));
+        let html = html.as_bytes();
+        let output = 1 << 20;
+        let limits = Limits {
+            input: html.len(),
+            output,
+        };
+        let notice = format!("{CUT_NOTICE}\n");
+        let full = to_text(html, 80);
+        let cut = to_text_within(html, 80, limits);
+        let kept = cut.strip_suffix(&notice).unwrap();
+        assert!(
+            kept.len() > 10_000 && full.starts_with(kept),
+            "{}",
+            kept.len()
+        );
+        let full = to_rich(html, 80);
+        let cut = to_rich_within(html, 80, limits);
+        assert!(output_cost(&cut) <= output);
+        let (last, kept) = cut.split_last().unwrap();
+        assert_eq!(last, &[Span::plain(CUT_NOTICE.to_string())]);
+        assert!(kept.len() > 1_000 && kept[..] == full[..kept.len()]);
+        // Within them, a rendering is the default's.
+        let small = b"<blockquote><p>a <b>b</b> <a href=\"https://e.example/\">c</a>\
+                      </blockquote><table><tr><td>d<td>e</table>";
+        let ample = Limits {
+            input: small.len(),
+            output: 4096,
+        };
+        for width in [0, 3, 80] {
+            assert_eq!(to_text_within(small, width, ample), to_text(small, width));
+            assert_eq!(to_rich_within(small, width, ample), to_rich(small, width));
+        }
+        assert_eq!(
+            to_text_within(small, 80, ample),
+            "> a **b** [c][1]\n\n─┬─\nd│e\n─┴─\n\n[1]: https://e.example/\n"
+        );
+    }
+
+    #[test]
+    fn an_input_past_its_limit_renders_what_was_read() {
+        let notice = vec![Span::plain(CUT_NOTICE.to_string())];
+        let html = "<p>one two</p><p>a\u{e9} three</p>".as_bytes();
+        let at = |input| Limits {
+            input,
+            output: OUTPUT_BUDGET,
+        };
+        let split = html.iter().position(|&b| b == 0xc3).unwrap() + 1;
+        // A limit inside a character reads none of it.
+        let read = html.get(..split - 1).unwrap();
+        let mut expected = to_rich(read, 0);
+        expected.push(notice.clone());
+        assert_eq!(to_rich_within(html, 0, at(split)), expected);
+        assert_eq!(
+            to_text_within(html, 0, at(split)),
+            format!("{}{CUT_NOTICE}\n", to_text(read, 0))
+        );
+        assert_eq!(to_rich_within(html, 0, at(html.len())), to_rich(html, 0));
+        assert_eq!(
+            to_rich_within(html, 0, at(0)),
+            std::slice::from_ref(&notice)
+        );
+        // One notice when the output is cut too.
+        let both = Limits {
+            input: html.len() - 1,
+            output: cut_cost(),
+        };
+        assert_eq!(to_rich_within(html, 0, both), [notice]);
+        assert_eq!(to_text_within(html, 0, at(0)), format!("{CUT_NOTICE}\n"));
+    }
+
+    #[test]
+    fn a_limit_inside_a_character_of_any_length_reads_none_of_it() {
+        for c in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
+            let html = format!("ab{c}cd");
+            let start = 2;
+            let end = start + c.len_utf8();
+            let at = |input| Limits {
+                input,
+                output: OUTPUT_BUDGET,
+            };
+            for limit in start..end {
+                assert_eq!(at(limit).read(&html), "ab", "{c} at {limit}");
+                assert_eq!(
+                    to_text_within(html.as_bytes(), 0, at(limit)),
+                    format!("ab\n{CUT_NOTICE}\n")
+                );
+            }
+            assert_eq!(at(end).read(&html), format!("ab{c}"));
+            assert_eq!(at(0).read(&html), "");
+            assert_eq!(at(html.len()).read(&html), html);
+            assert_eq!(Limits::DEFAULT.read(&html), html);
+        }
+    }
+
+    #[test]
+    fn dropped_elements_end_at_their_closing_tag_in_any_case() {
+        let html = "a<style>x</StYlE>b<script>y</SCRIPT >c<title>z";
+        assert_eq!(to_text(html.as_bytes(), 0), "abc\n");
+        // Each is skipped from where it starts, never by rescanning the
+        // rest of the document: thousands of them stay cheap.
+        let mut many = "<style>p{}</style>".repeat(100_000);
+        many.push_str("end");
+        assert_eq!(to_text(many.as_bytes(), 0), "end\n");
     }
 
     #[test]

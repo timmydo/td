@@ -373,7 +373,7 @@ pub(crate) fn extract_body_text(email: &crate::jmap::types::Email) -> String {
                 {
                     return html_to_plain(&value.value);
                 }
-                return value.value.clone();
+                return plain_within(&value.value);
             }
         }
     }
@@ -411,7 +411,29 @@ fn looks_like_html(text: &str) -> bool {
 ///
 /// Rendering cannot fail, so there is no fallback to the raw HTML any more.
 fn html_to_plain(html: &str) -> String {
-    td_html::to_text(html.as_bytes(), 80)
+    td_html::to_text_within(html.as_bytes(), 80, HTML_LIMITS)
+}
+
+/// What one rendering of a message's HTML may read and build, here and in
+/// the message view: the view's and a reply's renderings, with the view's
+/// text kept, some 74 MB at their worst, under the 192 MiB jail beside
+/// td-mail's own 47-92 MB (README.md, "Memory").
+pub(crate) const HTML_LIMITS: td_html::Limits = td_html::Limits {
+    input: 512 << 10,
+    output: 8 << 20,
+};
+
+/// A plain-text body as the message view shows it and a reply quotes it:
+/// the part `HTML_LIMITS` lets a rendering read, then td-html's notice when
+/// that is not all of it, so a body of many short lines costs no more than
+/// an HTML one.
+pub(crate) fn plain_within(text: &str) -> String {
+    let read = HTML_LIMITS.read(text);
+    if read.len() == text.len() {
+        text.to_string()
+    } else {
+        format!("{read}\n{}\n", td_html::CUT_NOTICE)
+    }
 }
 
 /// Retained draft and sidecar paths. Nothing here ever deletes them.
@@ -988,6 +1010,62 @@ fn draft_dir_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply quotes a message's HTML rendered within `HTML_LIMITS`:
+    /// markup past the input limit is never read, and the text ends with
+    /// the renderer's notice.
+    #[test]
+    fn a_quoted_html_body_is_rendered_within_its_limits() {
+        let mut html = "<p>start</p>".to_string();
+        html.push_str(&" ".repeat(HTML_LIMITS.input - html.len()));
+        html.push_str("<p>beyond</p>");
+        let text = html_to_plain(&html);
+        assert!(text.ends_with(&format!("\n{}\n", td_html::CUT_NOTICE)));
+        assert!(text.contains("start") && !text.contains("beyond"));
+        let nested = format!("{}{}", "<ul><li>".repeat(30), "<p>x</p>".repeat(60_000));
+        let text = html_to_plain(&nested);
+        assert!(text.ends_with(&format!("\n{}\n", td_html::CUT_NOTICE)));
+        let body = td_html::to_text_within(nested.as_bytes(), 80, HTML_LIMITS);
+        let twice = td_html::Limits {
+            output: 2 * HTML_LIMITS.output,
+            ..HTML_LIMITS
+        };
+        let more = td_html::to_text_within(nested.as_bytes(), 80, twice);
+        assert!(text == body && more.len() > body.len(), "{}", text.len());
+    }
+
+    /// A plain-text body is shown and quoted to the same input limit.
+    #[test]
+    fn a_long_plain_body_is_cut_at_the_input_limit() {
+        assert_eq!(plain_within("short\nbody"), "short\nbody");
+        let mut long = "x\n".repeat(HTML_LIMITS.input / 2);
+        long.push_str("beyond");
+        let shown = plain_within(&long);
+        assert!(shown.ends_with(&format!("\n{}\n", td_html::CUT_NOTICE)));
+        assert!(!shown.contains("beyond"));
+        assert_eq!(
+            shown.len(),
+            HTML_LIMITS.input + td_html::CUT_NOTICE.len() + 2
+        );
+    }
+
+    /// The limits as measured against the jail (README.md, "Memory"): a
+    /// rendering's peak is at most 100 bytes per byte of input read and
+    /// 1.25 per byte of output budget (td-html/DESIGN.md, "Resident
+    /// rendering cost"), and the view keeps its last rendering's text and
+    /// a string per line, at most twice its budget, while a reply renders.
+    /// `BASELINE` is td-mail's own resident memory at 2880x1800 with
+    /// td-ui's three window buffers, and
+    /// `MEMORY_HIGH` the jail's in recipes/src/recipes/mail.rs, both
+    /// reviewed by hand when either changes.
+    #[test]
+    fn the_html_limits_fit_the_jail() {
+        const BASELINE: usize = 92_000_000;
+        const MEMORY_HIGH: usize = 192 << 20;
+        let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
+        let kept = 2 * HTML_LIMITS.output;
+        assert!(BASELINE + rendering + kept < MEMORY_HIGH);
+    }
 
     /// A sent draft and its sidecar move together into the private `sent`
     /// directory beside `drafts`; a draft already there by that name is

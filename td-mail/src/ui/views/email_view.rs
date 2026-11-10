@@ -86,7 +86,7 @@ fn html_to_text(html: &str) -> String {
     use td_html::Tag;
 
     let mut out = String::new();
-    for line in td_html::to_rich(html.as_bytes(), 80) {
+    for line in td_html::to_rich_within(html.as_bytes(), 80, crate::compose::HTML_LIMITS) {
         for span in line {
             out.push_str(&span.text);
             for tag in &span.tags {
@@ -107,15 +107,15 @@ fn html_to_text(html: &str) -> String {
 /// `find_urls` answers `https?://[^\s<>\]\)"'`]+` by scanning, which is what
 /// this site always wanted: a literal prefix and a byte class, no engine.
 fn extract_urls(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for m in crate::regex::find_urls(text) {
         let url = m.trim_end_matches(['.', ',', ';', ':', '!', '?']);
-        let url = url.to_string();
-        if !seen.contains(&url) {
-            seen.push(url);
+        if seen.insert(url) {
+            urls.push(url.to_string());
         }
     }
-    seen
+    urls
 }
 
 enum PendingWriteOp {
@@ -387,7 +387,7 @@ impl EmailView {
                     {
                         return html_to_text(&value.value);
                     }
-                    return value.value.clone();
+                    return crate::compose::plain_within(&value.value);
                 }
             }
         }
@@ -1569,6 +1569,83 @@ mod tests {
         assert!(text.contains("Bold"), "{text}");
         assert!(text.contains("go [http://e/x]"), "{text}");
         assert!(text.contains("Pic [img: p.png]"), "{text}");
+    }
+
+    /// A plain-text body past the input limit is shown, and quoted in a
+    /// reply, to the limit and then the notice.
+    #[test]
+    fn a_long_plain_body_is_shown_and_quoted_to_the_limit() {
+        let mut body = "line\n".repeat(crate::compose::HTML_LIMITS.input / 5 + 1);
+        body.push_str("beyond\n");
+        let mut email = make_email("e1", "Long", "preview");
+        email.text_body = Some(vec![crate::jmap::types::BodyPart {
+            part_id: "1".to_string(),
+            blob_id: None,
+            r#type: Some("text/plain".to_string()),
+            name: None,
+            size: None,
+        }]);
+        email.body_values.insert(
+            "1".to_string(),
+            crate::jmap::types::BodyValue {
+                value: body,
+                is_encoding_problem: false,
+                is_truncated: false,
+            },
+        );
+        let notice = format!("\n{}\n", td_html::CUT_NOTICE);
+        for shown in [
+            EmailView::extract_body(&email, false),
+            crate::compose::extract_body_text(&email),
+        ] {
+            assert!(shown.ends_with(&notice) && shown.starts_with("line\n"));
+            assert!(!shown.contains("beyond"));
+        }
+    }
+
+    /// Each URL is listed once, in the order it first appears, however
+    /// many the body carries.
+    #[test]
+    fn urls_are_listed_once_in_order() {
+        let text = "see https://b.example/ and https://a.example/, then https://b.example/.";
+        assert_eq!(
+            extract_urls(text),
+            ["https://b.example/", "https://a.example/"]
+        );
+        let many: String = (0..20_000)
+            .map(|i| format!("https://e.example/{i} https://e.example/{i}\n"))
+            .collect();
+        let urls = extract_urls(&many);
+        assert_eq!(urls.len(), 20_000);
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some("https://e.example/19999")
+        );
+    }
+
+    /// A message's HTML is rendered within `HTML_LIMITS`: short linked
+    /// paragraphs deep in quotes, whose output grows fastest with the
+    /// markup, stop at the output budget, and the view's text, each span's
+    /// link target included, ends with the renderer's notice.
+    #[test]
+    fn the_html_body_is_rendered_within_its_limits() {
+        let limits = crate::compose::HTML_LIMITS;
+        let mut html = format!("<a href=\"https://e.example/{}\">", "x".repeat(200));
+        html.push_str(&"<blockquote>".repeat(62));
+        html.push_str(&"<p>x</p>".repeat(limits.input / 10));
+        assert!(html.len() <= limits.input);
+        let text = html_to_text(&html);
+        let notice = format!("\n{}\n", td_html::CUT_NOTICE);
+        assert!(text.ends_with(&notice), "{}", text.len());
+        assert!(text.len() < limits.output, "{}", text.len());
+        assert!(text.contains("x [https://e.example/"));
+        let lines = td_html::to_rich_within(html.as_bytes(), 80, limits).len();
+        let twice = td_html::Limits {
+            output: 2 * limits.output,
+            ..limits
+        };
+        let more = td_html::to_rich_within(html.as_bytes(), 80, twice).len();
+        assert!(text.lines().count() == lines && more > lines, "{lines}");
     }
 
     /// `?` asks the window for its key list.
