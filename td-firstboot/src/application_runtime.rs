@@ -1,5 +1,8 @@
-//! Root sysinit preparation of activated application runtimes and cgroups.
+//! Root preparation of application runtimes and cgroups: at sysinit for
+//! every active application, and for an account an install allocates while
+//! the human's session runs (`ensure`).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -130,7 +133,9 @@ fn create(parent: &File, name: &str, uid: u32) -> io::Result<File> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    // Existing app ownership is valid only at this trusted pre-session point.
+    // Existing app ownership is valid only where nothing of the account's
+    // runs: at sysinit, or for an install's delegation, which `ensure`
+    // makes only when none is published to the account.
     let file = directory(&path, &[0, uid])?;
     if file.metadata()?.dev() != parent.metadata()?.dev() {
         return Err(invalid("application cgroup directory crosses a mount"));
@@ -152,6 +157,8 @@ fn assign(file: &File, uid: u32) -> io::Result<()> {
 /// to one value.
 const RUNTIME_UID: u32 = 998;
 const RUNTIME_DELEGATION: &str = "td-runtimes";
+/// An application account's delegation is this, then its uid.
+const APPLICATION_PREFIX: &str = "td-app-";
 
 /// The immutable account and durable reservation must already be validated.
 /// Startup precedes every human/app process; this never repairs a live tree.
@@ -159,10 +166,78 @@ pub(crate) fn prepare(uid: u32) -> Result<(), String> {
     if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
         return Err("invalid application runtime uid".into());
     }
-    delegate(&format!("td-app-{uid}"), uid, "application")
+    delegate(&format!("{APPLICATION_PREFIX}{uid}"), uid, "application")
         .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
     crate::principal_store::prepare_application_runtime(uid)
         .map_err(|error| format!("prepare application uid {uid} runtime: {error}"))
+}
+
+/// An account allocated at install, while the session runs: its delegation
+/// only when absent (or an interrupted root-owned creation), never again
+/// over a delegated one, which a running instance populates and `prepare`
+/// would refuse; then its runtime directory, which `prepare` already
+/// completes or accepts. A `fresh` account, whose ledger row this install
+/// added, refuses a cgroup or runtime directory it already owns, as a
+/// defence: allocation avoided every uid with either. A retry, the row
+/// already published, completes root's interrupted creation. The caller holds the principal lock.
+pub(crate) fn ensure(uid: u32, fresh: bool) -> Result<(), String> {
+    if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
+        return Err("invalid application runtime uid".into());
+    }
+    let name = format!("{APPLICATION_PREFIX}{uid}");
+    let found = delegated(&name).map_err(|error| format!("inspect {name}: {error}"))?;
+    let runtime = crate::principal_store::application_runtime_owner(uid)?;
+    pending(runtime, uid, fresh).map_err(|error| format!("/run/user/{uid}: {error}"))?;
+    // A delegation published to `uid` is trusted as complete: `delegate`
+    // assigns the cgroup to the account only as its last step.
+    if pending(found, uid, fresh).map_err(|error| format!("{name}: {error}"))? {
+        delegate(&name, uid, "application")
+            .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
+    }
+    crate::principal_store::prepare_application_runtime(uid)
+        .map_err(|error| format!("prepare application uid {uid} runtime: {error}"))
+}
+
+/// Whether `found`, the owner of an account's existing directory, still
+/// needs preparing: an absent one or root's interrupted creation does; one
+/// already published to `uid` does not, unless the account is `fresh`,
+/// whose leftover it refuses; any other owner refuses.
+fn pending(found: Option<(u32, u32)>, uid: u32, fresh: bool) -> Result<bool, String> {
+    match found {
+        None | Some((0, 0)) => Ok(true),
+        Some(owner) if owner == (uid, uid) && !fresh => Ok(false),
+        Some(owner) if owner == (uid, uid) => {
+            Err("a new account's directory already exists".into())
+        }
+        Some(_) => Err("belongs to another account".into()),
+    }
+}
+
+/// The uid of every `td-app-UID` cgroup at the unified root, whoever owns
+/// it: an install's new row avoids each.
+pub(crate) fn delegated_uids() -> Result<BTreeSet<u32>, String> {
+    let hierarchy = hierarchy().map_err(|error| format!("open the cgroup hierarchy: {error}"))?;
+    crate::principal_store::uid_entries(&at(&hierarchy, "."), APPLICATION_PREFIX)
+}
+
+/// The owner of the unified hierarchy's child `name`, if there is one.
+fn delegated(name: &str) -> io::Result<Option<(u32, u32)>> {
+    child_owner(&hierarchy()?, name)
+}
+
+/// The owner of `parent`'s child directory `name`, unfollowed and on
+/// `parent`'s filesystem, if there is one.
+fn child_owner(parent: &File, name: &str) -> io::Result<Option<(u32, u32)>> {
+    match fs::symlink_metadata(at(parent, name)) {
+        Ok(metadata) if metadata.is_dir() && metadata.dev() == parent.metadata()?.dev() => {
+            Ok(Some((metadata.uid(), metadata.gid())))
+        }
+        Ok(_) => Err(invalid(
+            "application cgroup is not a directory of the hierarchy",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// The runtime account's delegation, so td-app fetching a runtime runs in
@@ -174,9 +249,9 @@ pub(crate) fn prepare_runtime_account() -> Result<(), String> {
         .map_err(|error| format!("prepare runtime account cgroup: {error}"))
 }
 
-/// An empty domain cgroup `name` below the root, delegated to `uid`, with
-/// a root-owned `session` leaf whose membership files `uid` writes.
-fn delegate(name: &str, uid: u32, kind: &str) -> io::Result<()> {
+/// The root-owned unified hierarchy at `/sys/fs/cgroup`, once mountinfo
+/// shows it is the one writable cgroup2 root.
+fn hierarchy() -> io::Result<File> {
     let mut hierarchy = directory(Path::new("/"), &[0])?;
     for component in ["sys", "fs", "cgroup"] {
         hierarchy = directory(&at(&hierarchy, component), &[0])?;
@@ -185,6 +260,13 @@ fn delegate(name: &str, uid: u32, kind: &str) -> io::Result<()> {
         &bounded(File::open("/proc/self/mountinfo")?, MOUNT_LIMIT)?,
         hierarchy.metadata()?.dev(),
     )?;
+    Ok(hierarchy)
+}
+
+/// An empty domain cgroup `name` below the root, delegated to `uid`, with
+/// a root-owned `session` leaf whose membership files `uid` writes.
+fn delegate(name: &str, uid: u32, kind: &str) -> io::Result<()> {
+    let hierarchy = hierarchy()?;
     require_controllers(&read(&hierarchy, "cgroup.controllers", 0)?)?;
     // td-svc enables these before firstboot. Failure withholds enrollment;
     // this preparation never alters the system's top-level delegation.
@@ -272,6 +354,52 @@ mod tests {
     fn non_application_ids_refuse_before_any_filesystem_access() {
         for uid in [0, 991, 1000, 65533, 65534, 65535, 2147483648, u32::MAX] {
             assert_eq!(prepare(uid).unwrap_err(), "invalid application runtime uid");
+            for fresh in [false, true] {
+                assert_eq!(
+                    ensure(uid, fresh).unwrap_err(),
+                    "invalid application runtime uid"
+                );
+            }
+        }
+    }
+
+    /// An install while the application runs must not delegate its
+    /// populated cgroup again: a published delegation is kept as it is. A
+    /// new row's account refuses one it already owns; a retry completes
+    /// root's interrupted creation.
+    #[test]
+    fn an_install_prepares_only_an_absent_or_interrupted_directory() {
+        for fresh in [false, true] {
+            assert!(pending(None, 66560, fresh).unwrap());
+            assert!(pending(Some((0, 0)), 66560, fresh).unwrap());
+            for owner in [(65536, 65536), (66560, 0), (0, 66560), (1000, 1000)] {
+                assert!(pending(Some(owner), 66560, fresh).is_err(), "{owner:?}");
+            }
+        }
+        assert!(!pending(Some((66560, 66560)), 66560, false).unwrap());
+        assert!(pending(Some((66560, 66560)), 66560, true).is_err());
+    }
+
+    /// The owner `ensure` decides on is read without following a link.
+    #[test]
+    fn a_childs_owner_is_read_unfollowed() {
+        let temp = td_fs::TempDir::new("td-app-cgroup").unwrap();
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW | DIRECTORY)
+            .open(temp.path())
+            .unwrap();
+        assert_eq!(child_owner(&parent, "td-app-66560").unwrap(), None);
+        fs::create_dir(temp.path().join("td-app-66560")).unwrap();
+        let metadata = fs::metadata(temp.path().join("td-app-66560")).unwrap();
+        assert_eq!(
+            child_owner(&parent, "td-app-66560").unwrap(),
+            Some((metadata.uid(), metadata.gid()))
+        );
+        std::os::unix::fs::symlink("td-app-66560", temp.path().join("td-app-66561")).unwrap();
+        fs::write(temp.path().join("td-app-66562"), b"").unwrap();
+        for name in ["td-app-66561", "td-app-66562"] {
+            assert!(child_owner(&parent, name).is_err(), "{name}");
         }
     }
 }

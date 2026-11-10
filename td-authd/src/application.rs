@@ -9,12 +9,41 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const DEADLINE: Duration = Duration::from_secs(2);
 /// How long one wait for the check looks before draining its stderr again.
 const READ_STEP: Duration = Duration::from_millis(10);
 // An application account is the workload account ledger's.
 use crate::workload_accounts::APPLICATION_UIDS;
-const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
+
+/// One fixed td-firstboot run root asks before it acts for an application:
+/// its verb, the prefix of its one reply line, its bound, and the uids that
+/// line may name.
+struct Check {
+    verb: &'static str,
+    reply: &'static str,
+    deadline: Duration,
+    uid: fn(&str) -> Result<u32, String>,
+}
+
+/// The read-only launch admission: the account an active application runs
+/// as, the human's for a personal one.
+const LAUNCH: Check = Check {
+    verb: "check-launch-application",
+    reply: "TD-LAUNCH-APPLICATION-CHECK-OK\t",
+    deadline: Duration::from_secs(2),
+    uid: launch_uid,
+};
+
+/// An install's allocation (td-authd/DESIGN.md, "Application cache
+/// operation"): a declared Flathub application's ledger account, added
+/// when absent, its home, cgroup and runtime directory prepared. Its bound
+/// covers synced writes and cgroup setup under the principal lock, which
+/// another allocation may hold.
+const ALLOCATE: Check = Check {
+    verb: "allocate-application",
+    reply: "TD-APPLICATION-ALLOCATED\t",
+    deadline: Duration::from_secs(30),
+    uid: service_uid,
+};
 
 struct Request {
     owner: u32,
@@ -127,47 +156,54 @@ fn launch_uid(text: &str) -> Result<u32, String> {
     }
 }
 
-fn reply_uid(text: &str) -> Result<u32, String> {
-    let number = text
-        .strip_prefix(REPLY)
-        .and_then(|s| s.strip_suffix('\n'))
-        .ok_or("invalid application admission response")?;
-    launch_uid(number)
+/// An application's own account, never the human's.
+fn service_uid(text: &str) -> Result<u32, String> {
+    decimal(text, APPLICATION_UIDS)
 }
 
-fn admit(owner: u32, name: &str) -> Result<u32, String> {
+fn reply_uid(check: &Check, text: &str) -> Result<u32, String> {
+    let number = text
+        .strip_prefix(check.reply)
+        .and_then(|s| s.strip_suffix('\n'))
+        .ok_or("invalid application admission response")?;
+    (check.uid)(number)
+}
+
+fn admit(check: &Check, owner: u32, name: &str) -> Result<u32, String> {
     let deadline = Instant::now()
-        .checked_add(DEADLINE)
+        .checked_add(check.deadline)
         .ok_or("application check deadline overflow")?;
     let (parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
     let (mut said, said_end) = crate::stderr_tail::Tail::pair()?;
     // The temporary Command drops its retained child endpoints here. Keeping
     // that Command alive would prevent the reply's required EOF.
-    let mut check = CheckedChild(
+    let mut checking = CheckedChild(
         Command::new("/bin/td-firstboot")
-            .args(["check-launch-application", &owner.to_string(), name])
+            .args([check.verb, &owner.to_string(), name])
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(child)))
             .stderr(Stdio::from(said_end))
             .spawn()
-            .map_err(|e| format!("start application admission check: {e}"))?,
+            .map_err(|e| format!("start td-firstboot {}: {e}", check.verb))?,
     );
     let checked = (|| {
         let reply = read_reply(parent, deadline, &mut said)?;
         loop {
             said.drain();
             if Instant::now() >= deadline {
-                return Err("application admission check timed out".into());
+                return Err(format!("td-firstboot {} timed out", check.verb));
             }
-            match check.0.try_wait().map_err(|e| e.to_string())? {
+            match checking.0.try_wait().map_err(|e| e.to_string())? {
                 Some(status) if status.success() => {
                     let text = std::str::from_utf8(&reply)
                         .map_err(|_| "invalid application admission encoding")?;
-                    return reply_uid(text);
+                    return reply_uid(check, text);
                 }
-                Some(status) => return Err(format!("application admission failed: {status}")),
+                Some(status) => {
+                    return Err(format!("td-firstboot {} failed: {status}", check.verb))
+                }
                 None => std::thread::sleep(READ_STEP),
             }
         }
@@ -214,13 +250,22 @@ pub(crate) fn admitted_uid(name: &str) -> Result<u32, String> {
     if !crate::consent::application_name(name) {
         return Err("invalid application name".into());
     }
-    admit(1000, name)
+    admit(&LAUNCH, 1000, name)
+}
+
+/// The account td-firstboot allocates, or finds, for the declared Flathub
+/// application `name` that an install is about to fetch.
+pub(crate) fn allocated_uid(name: &str) -> Result<u32, String> {
+    if !crate::consent::application_name(name) {
+        return Err("invalid application name".into());
+    }
+    admit(&ALLOCATE, 1000, name)
 }
 
 pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
-    let uid = admit(request.owner, &request.name)?;
+    let uid = admit(&LAUNCH, request.owner, &request.name)?;
     // No root log or inherited descriptor reaches the credential helper or
     // application.
     let error = request
@@ -339,7 +384,7 @@ mod tests {
             } else {
                 let result = result.unwrap();
                 assert_eq!(
-                    reply_uid(std::str::from_utf8(&result).unwrap()).is_ok(),
+                    reply_uid(&LAUNCH, std::str::from_utf8(&result).unwrap()).is_ok(),
                     !bytes.ends_with(b"extra")
                 );
             }
@@ -484,7 +529,7 @@ mod tests {
             Some(["exec-primary", "--", "/bin/td-authd"].as_slice())
         );
         assert_eq!(
-            reply_uid("TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n").unwrap(),
+            reply_uid(&LAUNCH, "TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n").unwrap(),
             1000
         );
         let status = "Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nGroups: 1000\nCapInh: 0000000000000000\nCapPrm: 0000000000000000\nCapEff: 0000000000000000\nCapAmb: 0000000000000000\n";
@@ -501,7 +546,7 @@ mod tests {
     #[test]
     fn replies_are_one_exact_bounded_canonical_application_identity() {
         assert_eq!(
-            reply_uid("TD-LAUNCH-APPLICATION-CHECK-OK\t65537\n").unwrap(),
+            reply_uid(&LAUNCH, "TD-LAUNCH-APPLICATION-CHECK-OK\t65537\n").unwrap(),
             65537
         );
         for text in [
@@ -509,8 +554,29 @@ mod tests {
             "TD-LAUNCH-APPLICATION-CHECK-OK\t1001\n",
             "TD-LAUNCH-APPLICATION-CHECK-OK\t065537\n",
             "TD-LAUNCH-APPLICATION-CHECK-OK\t65537\nextra",
+            "TD-APPLICATION-ALLOCATED\t65537\n",
         ] {
-            assert!(reply_uid(text).is_err());
+            assert!(reply_uid(&LAUNCH, text).is_err(), "{text:?}");
+        }
+    }
+
+    /// An allocation names the account td-firstboot made or found, which is
+    /// always an application's own: never the human, nor a launch's reply.
+    #[test]
+    fn an_allocation_reply_names_one_application_account() {
+        assert_eq!(ALLOCATE.verb, "allocate-application");
+        assert_eq!(
+            reply_uid(&ALLOCATE, "TD-APPLICATION-ALLOCATED\t66560\n").unwrap(),
+            66560
+        );
+        for text in [
+            "TD-APPLICATION-ALLOCATED\t1000\n",
+            "TD-APPLICATION-ALLOCATED\t98304\n",
+            "TD-APPLICATION-ALLOCATED\t066560\n",
+            "TD-APPLICATION-ALLOCATED\t66560\nextra",
+            "TD-LAUNCH-APPLICATION-CHECK-OK\t66560\n",
+        ] {
+            assert!(reply_uid(&ALLOCATE, text).is_err(), "{text:?}");
         }
     }
 

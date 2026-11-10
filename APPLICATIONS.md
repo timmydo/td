@@ -8817,7 +8817,12 @@ user, UID 1000, inside td-jail. Their 65537 and 65538 ledger rows remain
 and are never reused, as is Claude Code's 65539 (§W.9); firstboot
 prepares neither private homes nor service runtimes for those personal
 applications. The declarations name each installed application's class,
-and the ledger its account. Root-configured units invoke
+and the ledger its account. A Flathub application the image does not
+carry a row for gets one when td-software first installs it: td-authd
+has td-firstboot allocate the lowest free application uid past the
+carried block (from 66560) and prepare
+its home, cgroup and runtime directory (td-authd/DESIGN.md, "Workload
+account ledger"); its removal keeps the row. Root-configured units invoke
 `td-authd application-start`, which checks the enrolled account reservation
 and this policy, then uses td-login's checked credential drop. Personal
 applications use `exec-primary` and `/td-user-1000/session`; foreign
@@ -11725,9 +11730,12 @@ no `delete-data`, `ready` or `revalidate`.
 
 td-authd's `application-cache` operation is the root path to `update
 --force`, `remove`, `delete-data` and `status`, selecting the account
-itself; its install and update run the runtime's `runtime update` first,
-as the runtime account, and its remove runs `runtime remove` once no
-other installed application names the runtime (td-authd/DESIGN.md,
+itself from the workload account ledger, where an install first
+allocates it and a removal keeps it; an application with no row there
+was never installed, so its status is an empty cache's and its other
+verbs refuse. Its install and update run the runtime's `runtime update`
+first, as the runtime account, and its remove runs `runtime remove` once
+no other installed application names the runtime (td-authd/DESIGN.md,
 "Application cache operation"). Its `runtime-cache` operation is the
 root path to the runtime verbs alone ("Runtime cache operation"). td-software's
 requests reach it from the compositor's control socket as private request

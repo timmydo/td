@@ -50,7 +50,8 @@ These are fixed by the deployment, and this proposal keeps them fixed:
 - the workload account ledger `/var/lib/td/accounts.tsv`, whose carried
   rows give Firefox 65536, mail 65537, news 65538 and web 65540 (and a
   retained install keeps Claude's 65539) (§L; td-authd/DESIGN.md,
-  "Workload account ledger"); nothing adds a row at run time yet;
+  "Workload account ledger"); rows are never removed, and the one added
+  at run time is a Flathub application's, by its first install;
 - the accounts, cgroups and runtimes that firstboot prepares at sysinit
   (td-authd/DESIGN.md, "Application runtime preparation" and
   "Application state preparation");
@@ -69,10 +70,13 @@ update` and `td upgrade`, as principle 6 and §W say. Image-shipped
 source-built applications are always installed. td-software lists them
 but cannot remove them, because their bytes are part of the deployment.
 
-As a result there is no mutable registry, no allocation of accounts at
-run time, and no new elevation operation. The only new mutable thing is
-which of the image's declarations currently have a payload, and §5
-derives the launcher from that.
+As a result there is no mutable registry and no new elevation
+operation. The only new mutable things are which of the image's
+declarations currently have a payload, from which §5 derives the
+launcher, and the account a Flathub application's first install
+allocates in the ledger, which its removal keeps, so a reinstall runs as
+the same account and finds its state (td-authd/DESIGN.md, "Workload
+account ledger").
 
 ## 2. Non-goals
 
@@ -103,7 +107,8 @@ application-cache OWNER APP install|update|remove|delete-data|status
 ```
 
 Root selects the account from the immutable registry and the ledger, as
-`check-launch-application` does, and runs `/bin/td-app VERB APP` with
+`check-launch-application` does, allocating a Flathub application's
+ledger row on its first install, and runs `/bin/td-app VERB APP` with
 the same credential drop. No caller supplies an executable, UID, path or
 ref.
 

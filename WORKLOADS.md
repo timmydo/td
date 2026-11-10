@@ -51,10 +51,11 @@ Already built and reused by this design:
 
 - the workload account ledger `/var/lib/td/accounts.tsv`, the one source
   of an application's uid, which firstboot seeds with the carried rows
-  and the retained reservations of `/var/lib/td/principals.tsv`, and
-  which never reuses a uid; td-login resolves application accounts from
-  it and every application identity consumer reads it
-  (td-authd/DESIGN.md, "Workload account ledger");
+  and the retained reservations of `/var/lib/td/principals.tsv`, in
+  which td-software's install of a Flathub application allocates its
+  row through td-authd, and which never reuses a uid; td-login resolves
+  application accounts from it and every application identity consumer
+  reads it (td-authd/DESIGN.md, "Workload account ledger");
 - td-jail's mapping of an external uid to 1000 inside the jail;
 - root-made, value-pinned idmapped views of the human's files:
   `prepare-portal-files` (Downloads, 1000→991, read-only) and
@@ -70,9 +71,9 @@ Already built and reused by this design:
 - td-portal's caller identity from the bus broker's uid and jail lineage
   (`APPLICATIONS.md` §E).
 
-Not built: subordinate or dynamically allocated accounts (td-software/DESIGN.md:
-"no allocation of accounts at run time"), the `map-subuid` operation
-`APPLICATIONS.md` names, and any grant other than the fixed Downloads views.
+Not built: subordinate accounts, sandbox and workspace accounts and their
+allocation, the `map-subuid` operation `APPLICATIONS.md` names, and any
+grant other than the fixed Downloads views.
 
 ## A launch
 
@@ -168,8 +169,17 @@ The ledger is `/var/lib/td/accounts.tsv`, root:root mode 0644, with one
 `KIND<TAB>NAME<TAB>UID` row per account (td-authd/DESIGN.md, "Workload
 account ledger"). Uids are split by kind: applications take 65536 through
 98303, so the reserved rows lie inside it, and sandboxes and workspaces
-98304 through 131071. A removed application keeps its row, and its
-reinstall the same uid. Besides the four carried rows, the ledger imports
+98304 through 131071. The application range's first 1024 uids, 65536
+through 66559, are the carried block: the carried rows, the reservations
+that predate the ledger, and the uid of any application a later image
+ships, which takes its carried row from the block. An install allocates
+from 66560 up and never enters it, so a carried row or retained
+reservation can never meet an installed application's uid. Only an
+account of the block can hold the human's legacy state, so boot
+migrates only into one of those. A removed application keeps its row,
+and its reinstall the same uid. A lost ledger forgets its allocations,
+but an install never re-issues a uid whose home, cgroup or runtime
+directory remains. Besides the four carried rows, the ledger imports
 every application row the reservation ledger retains, so a former
 install's Claude Code keeps 65539. Rows are keyed by kind and name,
 not by human owner; applications for a second human are a later
@@ -243,8 +253,11 @@ account.
    passwd or group entry that speaks for one, and the broker, td-portal,
    td-jail, td-compositor, td-audio, td-authd, td-secret and td-firstboot
    join the image's declarations with the ledger, td-authd/DESIGN.md,
-   "Workload account ledger"); then allocation at install, until which
-   the carried rows are the only application rows a fresh install has.
+   "Workload account ledger"); then allocation at install (landed:
+   td-authd's install has td-firstboot allocate a Flathub declaration's
+   row from 66560 up and prepare its home, cgroup and runtime
+   directory; an application the image ships keeps needing a carried
+   row from the carried block, since nothing allocates at boot).
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.

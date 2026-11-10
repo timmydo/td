@@ -268,6 +268,30 @@ fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
         .collect())
 }
 
+/// Every uid and gid the installed passwd and group name, which an
+/// allocated workload account must not take.
+pub(crate) fn installed_ids() -> Result<BTreeSet<u32>, String> {
+    let etc = etc_directory(Path::new("/"), Some((0, 0)))?;
+    account_ids(
+        &read_root_file(&etc, "passwd", None)?,
+        &read_root_file(&etc, "group", None)?,
+    )
+}
+
+/// The uids and gids `passwd` assigns and the gids `group` does.
+fn account_ids(passwd: &str, group: &str) -> Result<BTreeSet<u32>, String> {
+    let mut ids = BTreeSet::new();
+    for (table, columns) in [(passwd, &[2, 3][..]), (group, &[2][..])] {
+        for row in account_rows(table)? {
+            for column in columns {
+                let id = row.get(*column).ok_or("account row lacks its id")?;
+                ids.insert(decimal(id, 0..=u32::MAX)?);
+            }
+        }
+    }
+    Ok(ids)
+}
+
 impl Registry {
     pub(crate) fn check_primary_name(
         &self,

@@ -6704,8 +6704,9 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         .env("PATH", "{tools}"),
     );
 
-    // A desktop must declare its applications, each with a carried ledger
-    // row; a server must declare none.
+    // A desktop must declare its applications, each it ships in the image
+    // with a carried ledger row (td-authd allocates a Flathub one's at
+    // install); a server must declare none.
     let mut check_principals = vec![
         "{in:td-firstboot}/bin/td-firstboot",
         "check-principals",
@@ -17824,8 +17825,9 @@ mod principal_tests {
 
     /// td-firstboot seeds the workload account ledger with its carried rows
     /// and the retained reservations, and the image build's
-    /// `check-principals` refuses a declared application without a carried
-    /// row. Every shipped application's uid constant is its carried row.
+    /// `check-principals` refuses an application the image ships without a
+    /// carried row. Every shipped application's uid constant is its carried
+    /// row.
     #[test]
     fn the_account_ledger_carries_every_shipped_application_uid() {
         use td_engine::workload_accounts::{Kind, Ledger};

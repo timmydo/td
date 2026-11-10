@@ -58,6 +58,13 @@ mod fido_hid;
     reason = "shared token-protected store format and trusted release"
 )]
 mod fido_metadata;
+// The Flathub declarations: the applications an install allocates for.
+#[path = "../../engine/src/flathub_app.rs"]
+#[allow(
+    dead_code,
+    reason = "firstboot names the Flathub declarations; td-app and td-jail use the rest"
+)]
+mod flathub_app;
 mod hostname;
 mod http;
 mod login_directory;
@@ -109,6 +116,9 @@ use std::process::ExitCode;
 const NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
 const STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
 const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
+/// `allocate-application`'s reply, then a tab and the uid: td-authd's
+/// application cache operation reads exactly this line.
+const ALLOCATED_MARKER: &str = "TD-APPLICATION-ALLOCATED";
 const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 /// `render-primary-sshd`'s server form: the policy also names the root-owned
 /// provisioned keys (td-svc/DESIGN.md §10, "Profiles").
@@ -314,7 +324,8 @@ fn usage() -> String {
          td-firstboot render-ssh-policy publishes /{policy} the same way for the running boot and prints the form it published\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
-         td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n",
+         td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
+         td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
     )
@@ -391,6 +402,22 @@ fn run_with_primary(
             return emit(&format!("TD-LAUNCH-APPLICATION-CHECK-OK\t{uid}\n"))
                 .map_err(Failure::Failed);
         }
+        Invocation::AllocateApplication(owner, name) => {
+            // The human's session runs: nothing of the human's is migrated,
+            // and a running instance's delegation is kept as it is. A new
+            // row refuses what another account left behind.
+            let uid = principal_store::allocate_application(
+                owner,
+                &name,
+                application_runtime::delegated_uids,
+                |uid, fresh| {
+                    application_state::create(&name, uid, fresh)?;
+                    application_runtime::ensure(uid, fresh)
+                },
+            )
+            .map_err(Failure::Failed)?;
+            return emit(&format!("{ALLOCATED_MARKER}\t{uid}\n")).map_err(Failure::Failed);
+        }
         Invocation::Provision(config) => config,
     };
     let applications = config.applications.resolve(load)?;
@@ -440,7 +467,9 @@ fn run_with_primary(
         credentials::isolate_stores(&config.state, &desired)?;
         // The active applications: each the image declares whose account the
         // ledger, published above, holds. A personal one runs as the human
-        // and gets no home, cgroup or runtime of its account's.
+        // and gets no home, cgroup or runtime of its account's. Only one of
+        // the carried block gets the human's legacy state; an installed one
+        // gets the install's home (application_state::prepare).
         let policy = app_policy::load().map_err(Failure::Failed)?;
         let owner = policy.owner();
         for declaration in policy.declarations().rows() {
@@ -558,6 +587,7 @@ enum Invocation {
     RenderSshPolicy,
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
+    AllocateApplication(u32, String),
     Provision(Config),
 }
 
@@ -662,29 +692,32 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             Err(Failure::Usage("cloud-metadata takes no operands".into()))
         };
     }
-    if args
-        .first()
-        .is_some_and(|verb| verb == "check-launch-application")
-    {
-        let [_, owner, name] = args else {
-            return Err(Failure::Usage(
-                "check-launch-application requires OWNER APP".into(),
-            ));
-        };
-        let uid = owner
-            .parse::<u32>()
-            .map_err(|_| Failure::Usage("invalid application owner".into()))?;
-        if !(1000..=65533).contains(&uid)
-            || uid.to_string() != *owner
-            || name.len() > 64
-            || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            || !name.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-            })
-        {
-            return Err(Failure::Usage("invalid application launch identity".into()));
+    for (verb, invocation) in [
+        (
+            "check-launch-application",
+            Invocation::CheckLaunchApplication as fn(u32, String) -> Invocation,
+        ),
+        ("allocate-application", Invocation::AllocateApplication),
+    ] {
+        if args.first().is_some_and(|first| first == verb) {
+            let [_, owner, name] = args else {
+                return Err(Failure::Usage(format!("{verb} requires OWNER APP")));
+            };
+            let uid = owner
+                .parse::<u32>()
+                .map_err(|_| Failure::Usage("invalid application owner".into()))?;
+            if !(1000..=65533).contains(&uid)
+                || uid.to_string() != *owner
+                || name.len() > 64
+                || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                })
+            {
+                return Err(Failure::Usage("invalid application identity".into()));
+            }
+            return Ok(invocation(uid, name.clone()));
         }
-        return Ok(Invocation::CheckLaunchApplication(uid, name.clone()));
     }
 
     if args
@@ -1831,6 +1864,7 @@ mod tests {
             | Invocation::RenderSshPolicy
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
+            | Invocation::AllocateApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
             )),
@@ -1843,14 +1877,23 @@ mod tests {
         assert!(
             matches!(parse(&arguments), Ok(Invocation::CheckLaunchApplication(1000, name)) if name == "mail")
         );
-        for arguments in [
-            vec!["check-launch-application"],
-            vec!["check-launch-application", "01000", "mail"],
-            vec!["check-launch-application", "0", "mail"],
-            vec!["check-launch-application", "1000", "../mail"],
-            vec!["check-launch-application", "1000", "mail", "extra"],
-        ] {
-            assert!(parse(&arguments.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        let arguments = ["allocate-application", "1000", "firefox"].map(String::from);
+        assert!(
+            matches!(parse(&arguments), Ok(Invocation::AllocateApplication(1000, name)) if name == "firefox")
+        );
+        for verb in ["check-launch-application", "allocate-application"] {
+            for arguments in [
+                vec![verb],
+                vec![verb, "01000", "mail"],
+                vec![verb, "0", "mail"],
+                vec![verb, "1000", "../mail"],
+                vec![verb, "1000", "Mail"],
+                vec![verb, "1000", "mail", "extra"],
+            ] {
+                assert!(
+                    parse(&arguments.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+                );
+            }
         }
     }
 

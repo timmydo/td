@@ -3,6 +3,7 @@
 use crate::app_policy::Declarations;
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::workload_accounts::{self, Kind, Ledger};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -23,6 +24,11 @@ const PRIVATE_MODE: u32 = 0o600;
 const ACCOUNTS_STAGED: &str = ".accounts.next";
 const ACCOUNTS_MODE: u32 = workload_accounts::MODE;
 const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
+/// The application homes, `/var/lib/td/applications/UID`, and how many
+/// entries an allocation reads in any directory it lists: past every
+/// application uid.
+const HOMES: &str = "applications";
+const MAX_HOMES: usize = 1 << 16;
 /// `flathub_app::RUNTIME_STORE`'s last component, below `/var/lib/td`, and
 /// the runtime account that owns it (`flathub_app::RUNTIME_UID`). This file
 /// also builds alone in the recipe's principal tests, so it keeps a copy.
@@ -83,6 +89,61 @@ pub(crate) fn prepare_runtime_store() -> Result<(), String> {
     let owner = RUNTIME_UID;
     runtime_child(&td, RUNTIME_STORE, (owner, owner))?.sync()?;
     td.sync()
+}
+
+/// The uid every entry of the directory `path` names after `prefix`, in
+/// canonical decimal; entries are listed, never followed. More than
+/// `MAX_HOMES` entries refuses.
+pub(crate) fn uid_entries(path: &Path, prefix: &str) -> Result<BTreeSet<u32>, String> {
+    let mut uids = BTreeSet::new();
+    let entries =
+        fs::read_dir(path).map_err(|error| format!("list {}: {error}", path.display()))?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_HOMES {
+            return Err(format!(
+                "{} holds more than {MAX_HOMES} entries",
+                path.display()
+            ));
+        }
+        let entry = entry.map_err(|error| format!("list {}: {error}", path.display()))?;
+        if let Some(uid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.strip_prefix(prefix))
+            .and_then(|digits| {
+                digits
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|uid| uid.to_string() == digits)
+            })
+        {
+            uids.insert(uid);
+        }
+    }
+    Ok(uids)
+}
+
+/// The uids of every `/run/user/UID`, whoever owns it.
+fn runtime_uids() -> Result<BTreeSet<u32>, String> {
+    Directory::open(Path::new("/run"), 0, 0)?.uid_entries("user", "")
+}
+
+/// The owner of `/run/user/UID`, if it exists, read without following
+/// links: an install's new account refuses one the account already owns.
+pub(crate) fn application_runtime_owner(uid: u32) -> Result<Option<(u32, u32)>, String> {
+    let run = Directory::open(Path::new("/run"), 0, 0)?;
+    match fs::symlink_metadata(run.path("user")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect /run/user: {error}")),
+    }
+    let users = run.child("user")?;
+    match fs::symlink_metadata(users.path(&uid.to_string())) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some((metadata.uid(), metadata.gid()))),
+        Ok(_) => Err(format!("/run/user/{uid} is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect /run/user/{uid}: {error}")),
+    }
 }
 
 /// Private client endpoints exist only for an installed application account.
@@ -378,6 +439,73 @@ impl Directory {
         seed(&prior, retained)
     }
 
+    /// The application account `name` holds in the published ledger, which
+    /// this allocates when it holds none; then `prepare` runs with the uid
+    /// and whether the row is new, still under the lock, so allocations and
+    /// their preparation never overlap. A new row avoids every uid a
+    /// retained reservation of any owner names, every id `outside` reads
+    /// (passwd and group, and every account cgroup and runtime directory
+    /// that exists, all read here under the lock) and every home left below
+    /// `applications`: a lost ledger forgets its allocations but never
+    /// re-issues a uid whose home, cgroup or runtime remains, so a new row's
+    /// preparation finds none of them. Before anything is published the
+    /// row must pass the admission a launch applies (`launch_uid`), so an
+    /// install refuses exactly what a launch would. An absent ledger
+    /// refuses: boot seeds it before anything can install.
+    fn allocate(
+        &self,
+        owner: u32,
+        name: &str,
+        declarations: &Declarations,
+        outside: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+        prepare: impl FnOnce(u32, bool) -> Result<(), String>,
+    ) -> Result<u32, String> {
+        let _lock = self.lock()?;
+        let text = self
+            .read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)?
+            .ok_or("the workload account ledger is absent")?;
+        let retained = self.retained()?.ok_or("principal ledger is absent")?;
+        let mut taken = outside()?;
+        taken.extend(retained.applications().map(|application| application.uid));
+        taken.extend(self.homes()?);
+        let (ledger, uid, new) = Ledger::parse(&text)?.allocate(Kind::Application, name, &taken)?;
+        let policy = crate::app_policy::Policy::join(declarations.clone(), ledger.clone());
+        if launch_uid(&retained, &policy, owner, name)? != uid {
+            return Err("application launch and allocation disagree".into());
+        }
+        if new {
+            self.publish_as(
+                workload_accounts::FILE_NAME,
+                ACCOUNTS_STAGED,
+                &ledger.encode(),
+                ACCOUNTS_MODE,
+                ACCOUNTS_LIMIT,
+            )?;
+        }
+        prepare(uid, new)?;
+        Ok(uid)
+    }
+
+    /// The uids of the homes below the child `applications`; none when it
+    /// is absent.
+    fn homes(&self) -> Result<BTreeSet<u32>, String> {
+        self.uid_entries(HOMES, "")
+    }
+
+    /// The uid every entry of the child directory `name` names after
+    /// `prefix`, in canonical decimal, read without following links; none
+    /// when the child is absent.
+    fn uid_entries(&self, name: &str, prefix: &str) -> Result<BTreeSet<u32>, String> {
+        match fs::symlink_metadata(self.path(name)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new())
+            }
+            Err(error) => return Err(format!("inspect {name}: {error}")),
+        }
+        uid_entries(&self.child(name)?.path("."), prefix)
+    }
+
     fn publish(&self, name: &str, staged: &str, text: &str) -> Result<(), String> {
         self.publish_as(name, staged, text, PRIVATE_MODE, LIMIT)
     }
@@ -491,13 +619,29 @@ fn require_no_application_rows(desired: &Registry) -> Result<(), String> {
     }
 }
 
+/// Whether `application` is one of the image's Flathub declarations, the
+/// applications td-software installs and td-authd allocates for.
+fn flathub(application: &str) -> bool {
+    crate::flathub_app::flathub_source(application).is_some()
+}
+
 /// The image build's check: the deployment's principal table reserves no
-/// application, and every application it declares (`declarations`, which a
-/// server lacks) has a carried ledger row, since nothing allocates one
-/// before an install does.
+/// application, and every application it ships in the image among those it
+/// declares (`declarations`, which a server lacks) has a carried ledger
+/// row, since nothing allocates one at boot. A `flathub` declaration may
+/// lack one: td-authd allocates it when td-software installs it.
 pub(crate) fn check_accounts(
     registry: &Registry,
     declarations: Option<&Declarations>,
+) -> Result<(), String> {
+    check_accounts_with(registry, declarations, flathub)
+}
+
+/// `check_accounts` over the given Flathub declarations.
+fn check_accounts_with(
+    registry: &Registry,
+    declarations: Option<&Declarations>,
+    flathub: fn(&str) -> bool,
 ) -> Result<(), String> {
     require_no_application_rows(registry)?;
     let carried = seed(&Ledger::default(), registry)?;
@@ -505,14 +649,74 @@ pub(crate) fn check_accounts(
         if carried
             .uid_of(Kind::Application, &row.application)
             .is_none()
+            && !flathub(&row.application)
         {
             return Err(format!(
-                "application {:?} has no carried workload account",
+                "application {:?} ships in the image without a carried workload account",
                 row.application
             ));
         }
     }
     Ok(())
+}
+
+/// What an install may allocate: an account for `name`, which the session
+/// `owner`'s deployment declares as a service application among its
+/// `flathub` declarations. A personal application runs as its owner, and an
+/// application the image ships has its carried row or none.
+fn allocatable(
+    declarations: &Declarations,
+    owner: u32,
+    name: &str,
+    flathub: fn(&str) -> bool,
+) -> Result<(), String> {
+    if declarations.owner() != owner {
+        return Err("application allocation names another session".into());
+    }
+    let row = declarations
+        .rows()
+        .iter()
+        .find(|row| row.application == name)
+        .ok_or_else(|| format!("the deployment does not declare application {name:?}"))?;
+    if row.class != crate::app_policy::Class::Service {
+        return Err(format!(
+            "application {name:?} runs as its owner and has no account of its own"
+        ));
+    }
+    if !flathub(name) {
+        return Err(format!(
+            "application {name:?} ships in the image; only a Flathub application is allocated at install"
+        ));
+    }
+    Ok(())
+}
+
+/// td-authd's allocation when td-software installs `name` (td-authd/DESIGN.md,
+/// "Workload account ledger"): with the deployment enrolled and its
+/// accounts verified, the ledger row of a declared Flathub service
+/// application, added when absent and admitted as a launch would be, and
+/// `prepare` run with its uid and whether the row is new, under the
+/// principal lock. `delegated` reads the uids of the account cgroups that
+/// exist, which a new row avoids. No caller supplies a uid.
+pub(crate) fn allocate_application(
+    owner: u32,
+    name: &str,
+    delegated: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+    prepare: impl FnOnce(u32, bool) -> Result<(), String>,
+) -> Result<u32, String> {
+    let desired = Registry::load()?;
+    let directory = state_directory()?;
+    let prior = directory.verify_enrolled(&desired)?;
+    prior.verify_installed_accounts(&desired)?;
+    let policy = crate::app_policy::load()?;
+    allocatable(policy.declarations(), owner, name, flathub)?;
+    let outside = || {
+        let mut taken = crate::principals::installed_ids()?;
+        taken.extend(runtime_uids()?);
+        taken.extend(delegated()?);
+        Ok(taken)
+    };
+    directory.allocate(owner, name, policy.declarations(), outside, prepare)
 }
 
 /// Reserve the deployment's identities and seed the workload account

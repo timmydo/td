@@ -339,6 +339,28 @@ fn no_account_or_group_speaks_for_a_workload_account() {
     }
 }
 
+/// The ids an allocation avoids: every passwd uid and gid and group gid,
+/// whatever their names; a malformed table refuses.
+#[test]
+fn installed_ids_are_every_passwd_uid_and_group_gid() {
+    let passwd = format!("{PASSWD}app::65541:2000:A:/home/app:/bin/sh\n");
+    let group = format!("{GROUP}apps:x:65542:\n");
+    assert_eq!(
+        account_ids(&passwd, &group).unwrap(),
+        BTreeSet::from([0, 10, 1000, 1001, 2000, 65541, 65542])
+    );
+    for (passwd, group) in [
+        (format!("{PASSWD}short\n"), GROUP.to_string()),
+        (PASSWD.to_string(), format!("{GROUP}g:x:065542:\n")),
+        (PASSWD.trim_end().to_string(), GROUP.to_string()),
+    ] {
+        assert!(
+            account_ids(&passwd, &group).is_err(),
+            "{passwd:?} {group:?}"
+        );
+    }
+}
+
 #[test]
 fn reservations_allow_only_unique_service_accounts_without_supplementary_authority() {
     let registry = Registry::parse(TABLE).unwrap();

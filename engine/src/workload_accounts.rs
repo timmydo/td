@@ -3,8 +3,9 @@
 //! keyed by kind and name. Rows are never removed, so no uid is reused,
 //! after an application's removal included. The file is std-only and uses
 //! no other module, so target programs include it by path: td-firstboot
-//! seeds the ledger, and `load` is the one live reader td-login and the bus
-//! policy's includers share. Parsing and seeding perform no I/O.
+//! seeds the ledger at boot and allocates in it when td-authd installs an
+//! application, and `load` is the one live reader td-login and the bus
+//! policy's includers share. Parsing, seeding and allocation perform no I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -33,6 +34,14 @@ pub const MAX_BYTES: usize = 256 * 1024;
 const MAX_ROWS: usize = 4096;
 /// Application accounts.
 pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
+/// The application block the image reserves: the carried rows, the retained
+/// reservations seeding imports (Claude Code's 65539), and the uid of any
+/// application the image will ship. Allocation never enters it, so neither
+/// a later carried row nor a reservation a rolled-back deployment retains
+/// can meet a uid an install took.
+pub const CARRIED_UIDS: RangeInclusive<u32> = 65536..=66559;
+/// The application uids an install allocates: the rest of the range.
+pub const ALLOCATED_UIDS: RangeInclusive<u32> = 66560..=98303;
 /// Sandbox and workspace accounts, which share one range. Nothing writes
 /// those kinds yet; v1 parses them so a deployment that does can roll back.
 pub const WORKLOAD_UIDS: RangeInclusive<u32> = 98304..=131071;
@@ -65,6 +74,7 @@ pub fn application_account_uid(name: &str) -> Option<u32> {
 
 /// The uids the image reserved before the ledger existed. Every seeded
 /// ledger holds them, whether or not the deployment ships the application.
+/// Each lies in `CARRIED_UIDS`, as does an application the image adds.
 const CARRIED: &[(&str, u32)] = &[
     ("firefox", 65536),
     ("mail", 65537),
@@ -100,6 +110,14 @@ impl Kind {
     pub fn uids(self) -> RangeInclusive<u32> {
         match self {
             Self::Application => APPLICATION_UIDS,
+            Self::Sandbox | Self::Workspace => WORKLOAD_UIDS,
+        }
+    }
+
+    /// The part of `uids` allocation draws from.
+    fn allocated(self) -> RangeInclusive<u32> {
+        match self {
+            Self::Application => ALLOCATED_UIDS,
             Self::Sandbox | Self::Workspace => WORKLOAD_UIDS,
         }
     }
@@ -213,6 +231,32 @@ impl Ledger {
             next.insert(Kind::Application, name, uid)?;
         }
         next.checked()
+    }
+
+    /// This ledger with `name` holding a `kind` account, that account's uid,
+    /// and whether the row is new. An existing row is returned unchanged;
+    /// otherwise the row takes the lowest uid of the kind's allocated range
+    /// (`ALLOCATED_UIDS` for an application, never the carried block) that
+    /// no row of any kind holds and `taken` does not name
+    /// (td-authd/DESIGN.md, "Workload account ledger"). No caller supplies
+    /// the uid.
+    pub fn allocate(
+        &self,
+        kind: Kind,
+        name: &str,
+        taken: &BTreeSet<u32>,
+    ) -> Result<(Self, u32, bool), String> {
+        if let Some(uid) = self.uid_of(kind, name) {
+            return Ok((self.clone(), uid, false));
+        }
+        let held: BTreeSet<u32> = self.rows.values().copied().collect();
+        let uid = kind
+            .allocated()
+            .find(|uid| !held.contains(uid) && !taken.contains(uid))
+            .ok_or_else(|| format!("no {} uid is free for {name:?}", kind.as_str()))?;
+        let mut next = self.clone();
+        next.insert(kind, name, uid)?;
+        Ok((next.checked()?, uid, true))
     }
 
     fn insert(&mut self, kind: Kind, name: &str, uid: u32) -> Result<(), String> {
@@ -468,6 +512,114 @@ mod tests {
         let over = format!("{MAGIC}{}{}", workspaces(rows, 64), last(remainder + 1));
         assert_eq!(over.len(), MAX_BYTES + 1);
         assert!(Ledger::parse(&over).is_err());
+    }
+
+    #[test]
+    fn the_carried_block_holds_every_carried_row_and_allocation_never_enters_it() {
+        for (name, uid) in CARRIED {
+            assert!(CARRIED_UIDS.contains(uid), "{name}");
+        }
+        // The two blocks split the application range exactly.
+        assert_eq!(CARRIED_UIDS.start(), APPLICATION_UIDS.start());
+        assert_eq!(*CARRIED_UIDS.end() + 1, *ALLOCATED_UIDS.start());
+        assert_eq!(ALLOCATED_UIDS.end(), APPLICATION_UIDS.end());
+        // Claude's retired 65539 and the rest of the block stay free, yet an
+        // install takes the first allocated uid.
+        let (_, uid, new) = seeded()
+            .allocate(Kind::Application, "photo", &BTreeSet::new())
+            .unwrap();
+        assert_eq!((uid, new), (66560, true));
+        // Even with every allocated uid taken, none comes from the block.
+        let allocated: BTreeSet<u32> = ALLOCATED_UIDS.collect();
+        assert!(seeded()
+            .allocate(Kind::Application, "photo", &allocated)
+            .is_err());
+    }
+
+    #[test]
+    fn allocation_takes_the_lowest_free_uid_and_keeps_existing_rows() {
+        let ledger = seeded();
+        let none = BTreeSet::new();
+        let (next, uid, new) = ledger.allocate(Kind::Application, "photo", &none).unwrap();
+        assert_eq!((uid, new), (66560, true));
+        assert_eq!(next.uid_of(Kind::Application, "photo"), Some(66560));
+        assert!(next.extends(&ledger));
+        assert_eq!(Ledger::parse(&next.encode()).unwrap(), next);
+        // Skips a uid taken outside the ledger (a retained reservation, a
+        // home left behind, passwd, group) and the rows already held.
+        let (twice, uid, _) = next.allocate(Kind::Application, "writer", &none).unwrap();
+        assert_eq!(uid, 66561);
+        let taken = BTreeSet::from([66562, 66564]);
+        let (skipped, uid, _) = twice.allocate(Kind::Application, "notes", &taken).unwrap();
+        assert_eq!(uid, 66563);
+        // An existing row is returned unchanged, even at a taken uid.
+        let (again, uid, new) = skipped
+            .allocate(Kind::Application, "notes", &BTreeSet::from([66563]))
+            .unwrap();
+        assert_eq!((uid, new), (66563, false));
+        assert_eq!(again, skipped);
+        assert_eq!(
+            ledger
+                .allocate(Kind::Application, "firefox", &BTreeSet::from([65536]))
+                .unwrap(),
+            (ledger.clone(), 65536, false)
+        );
+        // Another kind's rows hold their uids too: a workspace at 98304
+        // pushes a sandbox to 98305.
+        let workspace = Ledger::parse(&format!("{SEEDED}workspace\tagent\t98304\n")).unwrap();
+        let (_, uid, _) = workspace.allocate(Kind::Sandbox, "default", &none).unwrap();
+        assert_eq!(uid, 98305);
+        // A sandbox may share a workspace's name, never its uid.
+        let (_, uid, new) = workspace.allocate(Kind::Sandbox, "agent", &none).unwrap();
+        assert_eq!((uid, new), (98305, true));
+    }
+
+    #[test]
+    fn allocation_refuses_exhaustion_and_invalid_names() {
+        let ledger = seeded();
+        let everything: BTreeSet<u32> = APPLICATION_UIDS.collect();
+        assert!(ledger
+            .allocate(Kind::Application, "photo", &everything)
+            .is_err());
+        // Only the last uid of the range is free.
+        let last: BTreeSet<u32> = (65536..98303).collect();
+        let (_, uid, _) = ledger.allocate(Kind::Application, "photo", &last).unwrap();
+        assert_eq!(uid, 98303);
+        for name in ["", "Photo", "1photo", "photo/x", &"p".repeat(65)] {
+            assert!(
+                ledger
+                    .allocate(Kind::Application, name, &BTreeSet::new())
+                    .is_err(),
+                "{name:?}"
+            );
+        }
+        // A full ledger takes no further row.
+        let full = Ledger::parse(&format!("{MAGIC}{}", workspaces(MAX_ROWS, 8))).unwrap();
+        assert!(full
+            .allocate(Kind::Application, "photo", &BTreeSet::new())
+            .is_err());
+    }
+
+    /// A deployment that rolls back, or one that no longer declares an
+    /// installed application, seeds over a ledger holding an allocated row
+    /// and keeps it: rows are permanent.
+    #[test]
+    fn seeding_keeps_allocated_rows() {
+        let (allocated, _, _) = seeded()
+            .allocate(Kind::Application, "photo", &BTreeSet::new())
+            .unwrap();
+        assert_eq!(allocated.seed([]).unwrap(), allocated);
+        assert_eq!(
+            allocated
+                .seed([("claude", 65539)])
+                .unwrap()
+                .uid_of(Kind::Application, "photo"),
+            Some(66560)
+        );
+        // A retained reservation can never claim an allocated uid's name
+        // at another uid, nor an allocated uid for another name.
+        assert!(allocated.seed([("photo", 65541)]).is_err());
+        assert!(allocated.seed([("other", 66560)]).is_err());
     }
 
     #[test]

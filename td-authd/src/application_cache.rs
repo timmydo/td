@@ -1,10 +1,13 @@
 //! The root application and runtime cache operations (td-software/DESIGN.md
 //! §3, WORKLOADS.md "Runtimes"): root selects an installed application's
-//! account from the immutable registry and the ledger, or the compiled
-//! runtime account, and runs a fixed `/bin/td-app` verb as it. No caller
-//! supplies an executable, UID, path or ref.
+//! account from the immutable registry and the ledger, allocating it in the
+//! ledger when an install first needs it, or the compiled runtime account,
+//! and runs a fixed `/bin/td-app` verb as it. No caller supplies an
+//! executable, UID, path or ref.
 
-use crate::flathub_app::{self, FlathubRuntime, RuntimeStatus, Status, RUNTIME_ACCOUNT};
+use crate::flathub_app::{
+    self, CacheStatus, FlathubRuntime, FlathubSource, RuntimeStatus, Status, RUNTIME_ACCOUNT,
+};
 use crate::stderr_tail;
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -273,6 +276,24 @@ fn checked_runtime_status(name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(status.render().into_bytes())
 }
 
+/// The status of a declared Flathub application with no account: it was
+/// never installed here, so it is a cache with nothing in it, which root
+/// answers without td-app.
+fn not_installed_status(name: &str) -> Vec<u8> {
+    Status {
+        name: name.to_string(),
+        cache: Some(CacheStatus {
+            current: None,
+            previous: None,
+            checked: None,
+            refused: None,
+            progress: None,
+        }),
+    }
+    .render()
+    .into_bytes()
+}
+
 fn image_status(name: &str) -> Result<Vec<u8>, String> {
     let rendered = Status {
         name: name.to_string(),
@@ -286,8 +307,9 @@ fn image_status(name: &str) -> Result<Vec<u8>, String> {
 }
 
 /// What an operation reaches outside root's own code: td-app runs, the
-/// admission of an application's account, and the image's registry. The
-/// operations run on `System`; their tests on a script.
+/// admission and allocation of an application's account, whether it has
+/// one, and the image's registry. The operations run on `System`; their
+/// tests on a script.
 trait Host {
     fn td_app(
         &mut self,
@@ -297,6 +319,12 @@ trait Host {
         what: &str,
     ) -> Result<Vec<u8>, String>;
     fn admitted_uid(&mut self, name: &str) -> Result<u32, String>;
+    /// The account an install of `name` fetches as: its ledger row,
+    /// allocated when it has none.
+    fn allocate(&mut self, name: &str) -> Result<u32, String>;
+    /// The ledger account of the declared application `name`, or none
+    /// when nothing ever installed it here.
+    fn account(&mut self, name: &str) -> Result<Option<u32>, String>;
     fn registry(&mut self) -> Result<Vec<String>, String>;
 }
 
@@ -317,6 +345,28 @@ impl Host for System {
         crate::application::admitted_uid(name)
     }
 
+    fn allocate(&mut self, name: &str) -> Result<u32, String> {
+        crate::application::allocated_uid(name)
+    }
+
+    /// An undeclared name is an error, not "no account": the image builds
+    /// its software registry and its declarations from one application
+    /// list, so only an inconsistent image reaches it, and there the
+    /// runtime check keeps the runtime (`unwrap_or(true)`) rather than
+    /// guess that nothing of that application's needs it.
+    fn account(&mut self, name: &str) -> Result<Option<u32>, String> {
+        let policy = crate::app_policy::load()?;
+        if !policy
+            .declarations()
+            .rows()
+            .iter()
+            .any(|row| row.application == name)
+        {
+            return Err(format!("the deployment does not declare {name}"));
+        }
+        Ok(policy.account(name))
+    }
+
     fn registry(&mut self) -> Result<Vec<String>, String> {
         crate::software::load_registry()
     }
@@ -327,8 +377,10 @@ pub(crate) fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
     let request = Request::parse(arguments)?;
     crate::launch::require_operation_startup()
         .map_err(|e| format!("application cache startup: {e}"))?;
-    let uid = crate::application::admitted_uid(&request.name)?;
     let Some(source) = flathub_app::flathub_source(&request.name) else {
+        // An application the image ships has no cache, and its account is
+        // the one the deployment carries.
+        crate::application::admitted_uid(&request.name)?;
         return match request.verb {
             Verb::Status => image_status(&request.name),
             _ => Err(format!(
@@ -341,21 +393,31 @@ pub(crate) fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
     let deadline = Instant::now()
         .checked_add(request.verb.lifetime())
         .ok_or("application cache deadline overflow")?;
-    operate(&mut System, &request, uid, source, deadline)
+    operate(&mut System, &request, source, deadline)
 }
 
-/// An admitted Flathub application's operation. An install or update
-/// first runs the declared runtime's, as the runtime account: the
-/// application is validated against the runtime store's `current`. A
-/// removal then removes the runtime when no other installed application
-/// names it.
+/// A Flathub application's operation. An install first allocates the
+/// application's account, or finds the one an earlier install allocated,
+/// which is its admission; every other verb is admitted only for an
+/// application with an account, and one without was never installed here.
+/// An install or update then runs the declared runtime's check, as the
+/// runtime account: the application is validated against the runtime
+/// store's `current`. A removal keeps the account and its home, and
+/// removes the runtime when no other installed application names it.
 fn operate(
     host: &mut impl Host,
     request: &Request,
-    uid: u32,
-    source: flathub_app::FlathubSource,
+    source: FlathubSource,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
+    let uid = match request.verb {
+        Verb::Install => host.allocate(&request.name)?,
+        _ => match host.account(&request.name)? {
+            Some(_) => host.admitted_uid(&request.name)?,
+            None if request.verb == Verb::Status => return Ok(not_installed_status(&request.name)),
+            None => return Err(format!("{} is not installed", request.name)),
+        },
+    };
     let what = format!("{} {}", request.verb.word(), request.name);
     let command = || application_command(uid, request.verb, &request.name);
     match request.verb {
@@ -370,7 +432,13 @@ fn operate(
         }
         Verb::Remove => {
             host.td_app(command(), false, deadline, &what)?;
-            if !named_elsewhere(host, source.runtime, Some(&request.name), deadline) {
+            if !named_elsewhere(
+                host,
+                flathub_app::FLATHUB_SOURCES,
+                source.runtime,
+                Some(&request.name),
+                deadline,
+            ) {
                 host.td_app(
                     runtime_command(source.runtime, RuntimeVerb::Remove),
                     false,
@@ -420,7 +488,9 @@ fn operate_runtime(
     let runtime = request.runtime;
     let (word, _) = request.verb.td_app();
     let what = format!("runtime {word} {}", runtime.name);
-    if request.verb == RuntimeVerb::Remove && named_elsewhere(host, runtime, None, deadline) {
+    if request.verb == RuntimeVerb::Remove
+        && named_elsewhere(host, flathub_app::FLATHUB_SOURCES, runtime, None, deadline)
+    {
         return Err(format!(
             "runtime {} stays while an installed application names it",
             runtime.name
@@ -439,12 +509,13 @@ fn operate_runtime(
     Ok(Vec::new())
 }
 
-/// Whether a declared application other than `except` that names
+/// Whether an application of `sources` other than `except` that names
 /// `runtime` may need it: its account's status shows a `current`, or an
 /// operation that holds its cache's lock, an install's included. One the
-/// image's registry does not list has no account here and needs nothing;
-/// one whose registry, admission or status cannot be read counts, so a
-/// runtime is never removed on a guess.
+/// image's registry does not list, or that has no account because nothing
+/// installed it here, needs nothing; one whose registry, account,
+/// admission or status cannot be read counts, so a runtime is never
+/// removed on a guess.
 ///
 /// This is a check, then an act: an install of another application that
 /// starts after it, while its runtime half has not yet reached the
@@ -455,12 +526,13 @@ fn operate_runtime(
 /// td-app cannot, since no account reads another's cache.
 fn named_elsewhere(
     host: &mut impl Host,
+    sources: &[FlathubSource],
     runtime: FlathubRuntime,
     except: Option<&str>,
     deadline: Instant,
 ) -> bool {
     let registry = host.registry();
-    flathub_app::FLATHUB_SOURCES
+    sources
         .iter()
         .filter(|other| other.runtime.name == runtime.name && Some(other.name) != except)
         .any(|other| match &registry {
@@ -470,8 +542,12 @@ fn named_elsewhere(
         })
 }
 
-/// Whether `name`'s cache has a `current` or a writer.
+/// Whether `name`'s cache has a `current` or a writer. An application with
+/// no account has no cache.
 fn occupied(host: &mut impl Host, name: &str, deadline: Instant) -> Result<bool, String> {
+    if host.account(name)?.is_none() {
+        return Ok(false);
+    }
     let uid = host.admitted_uid(name)?;
     let record = host.td_app(
         application_command(uid, Verb::Status, name),
@@ -645,10 +721,13 @@ mod tests {
     }
 
     /// A host that records each td-app run as its account and td-app's
-    /// arguments, and answers from a script.
+    /// arguments, and each allocation as `allocate NAME`, in order, and
+    /// answers from a script.
     struct Script {
         registry: Result<Vec<String>, String>,
         admitted: Result<u32, String>,
+        allocated: Result<u32, String>,
+        account: fn(&str) -> Result<Option<u32>, String>,
         answer: fn(&[String]) -> Result<Vec<u8>, String>,
         runs: Vec<Vec<String>>,
         admissions: usize,
@@ -659,6 +738,8 @@ mod tests {
             Self {
                 registry: Ok(vec!["firefox".into(), "mail".into()]),
                 admitted: Ok(65536),
+                allocated: Ok(65536),
+                account: |_| Ok(Some(65536)),
                 answer,
                 runs: Vec::new(),
                 admissions: 0,
@@ -693,9 +774,18 @@ mod tests {
         }
 
         fn admitted_uid(&mut self, name: &str) -> Result<u32, String> {
-            assert_eq!(name, "firefox");
+            assert!(["firefox", "photo"].contains(&name), "{name}");
             self.admissions += 1;
             self.admitted.clone()
+        }
+
+        fn allocate(&mut self, name: &str) -> Result<u32, String> {
+            self.runs.push(vec!["allocate".into(), name.into()]);
+            self.allocated.clone()
+        }
+
+        fn account(&mut self, name: &str) -> Result<Option<u32>, String> {
+            (self.account)(name)
         }
 
         fn registry(&mut self) -> Result<Vec<String>, String> {
@@ -730,7 +820,7 @@ mod tests {
         };
         let source = flathub_app::flathub_source("firefox").unwrap();
         let far = Instant::now() + Duration::from_secs(60);
-        operate(host, &request, 65536, source, far)
+        operate(host, &request, source, far)
     }
 
     fn runtime_removal(host: &mut Script) -> Result<Vec<u8>, String> {
@@ -748,19 +838,23 @@ mod tests {
     /// names it (only Firefox names its runtime today).
     #[test]
     fn the_runtime_comes_first_and_goes_last() {
-        for verb in [Verb::Install, Verb::Update] {
+        for (verb, first) in [
+            (Verb::Install, &["allocate firefox"][..]),
+            (Verb::Update, &[][..]),
+        ] {
             let mut host = Script::new(ok);
             operation(verb, &mut host).unwrap();
-            assert_eq!(
-                host.runs,
-                runs(&[RUNTIME_UPDATE, "tda65536 update firefox --force"])
-            );
+            let mut wanted = first.to_vec();
+            wanted.extend([RUNTIME_UPDATE, "tda65536 update firefox --force"]);
+            assert_eq!(host.runs, runs(&wanted));
             let mut host = Script::new(|run| match verb_of(run) {
                 "runtime" => Err("offline".into()),
                 _ => Ok(Vec::new()),
             });
             assert!(operation(verb, &mut host).unwrap_err().contains("offline"));
-            assert_eq!(host.runs, runs(&[RUNTIME_UPDATE]));
+            let mut wanted = first.to_vec();
+            wanted.push(RUNTIME_UPDATE);
+            assert_eq!(host.runs, runs(&wanted));
         }
         let mut host = Script::new(ok);
         operation(Verb::Remove, &mut host).unwrap();
@@ -768,7 +862,8 @@ mod tests {
             host.runs,
             runs(&["tda65536 remove firefox", RUNTIME_REMOVE])
         );
-        assert_eq!(host.admissions, 0);
+        // Firefox's own admission; no other application names the runtime.
+        assert_eq!(host.admissions, 1);
         let mut host = Script::new(|run| match verb_of(run) {
             "remove" => Err("held".into()),
             _ => Ok(Vec::new()),
@@ -875,7 +970,7 @@ mod tests {
         runtime_removal(&mut host).unwrap();
         assert_eq!(host.runs, runs(&[RUNTIME_REMOVE]));
         assert_eq!(host.admissions, 0);
-        // A registry or admission root cannot read keeps it.
+        // A registry, account or admission root cannot read keeps it.
         let mut host = Script::new(ok);
         host.registry = Err("unreadable".into());
         assert!(runtime_removal(&mut host).is_err());
@@ -885,6 +980,134 @@ mod tests {
         assert!(runtime_removal(&mut host).is_err());
         assert!(host.runs.is_empty());
         assert_eq!(host.admissions, 1);
+        let mut host = Script::new(ok);
+        host.account = |_| Err("the account ledger is unreadable".into());
+        assert!(runtime_removal(&mut host).is_err());
+        assert!(host.runs.is_empty());
+        assert_eq!(host.admissions, 0);
+        // An application with no account was never installed here: it is
+        // neither admitted nor asked, and keeps nothing.
+        let mut host = Script::new(|run| answer(run, record(true, true)));
+        host.account = |_| Ok(None);
+        runtime_removal(&mut host).unwrap();
+        assert_eq!(host.runs, runs(&[RUNTIME_REMOVE]));
+        assert_eq!(host.admissions, 0);
+    }
+
+    /// Another Flathub application naming the same runtime keeps it only
+    /// while it has an account and its cache holds something; one with no
+    /// account is not installed, so removing the last installed
+    /// application removes the runtime.
+    #[test]
+    fn a_sibling_without_an_account_keeps_no_runtime() {
+        let firefox = flathub_app::flathub_source("firefox").unwrap();
+        let photo = FlathubSource {
+            name: "photo",
+            application: "app/org.example.Photo/x86_64/stable",
+            runtime: firefox.runtime,
+            entry: "/app/bin/photo",
+        };
+        let sources = [firefox, photo];
+        let far = Instant::now() + Duration::from_secs(60);
+        let mut host = Script::new(|_| {
+            let photo = String::from_utf8(record(true, false)).unwrap();
+            Ok(photo.replace("name=firefox", "name=photo").into_bytes())
+        });
+        host.registry = Ok(vec!["firefox".into(), "photo".into()]);
+        host.account = |name| Ok((name == "firefox").then_some(65536));
+        assert!(!named_elsewhere(
+            &mut host,
+            &sources,
+            firefox.runtime,
+            Some("firefox"),
+            far
+        ));
+        assert!(host.runs.is_empty());
+        assert_eq!(host.admissions, 0);
+        // With an account, its status decides.
+        host.account = |_| Ok(Some(66560));
+        host.admitted = Ok(66560);
+        assert!(named_elsewhere(
+            &mut host,
+            &sources,
+            firefox.runtime,
+            Some("firefox"),
+            far
+        ));
+        assert_eq!(host.runs, runs(&["tda66560 status photo"]));
+    }
+
+    /// An install allocates the account before anything runs, then fetches
+    /// the runtime and the application as it; a failed allocation runs
+    /// nothing. A removal keeps the account, so a reinstall runs as the
+    /// same one.
+    #[test]
+    fn an_install_allocates_its_account_first_and_a_reinstall_reuses_it() {
+        let mut host = Script::new(ok);
+        host.account = |_| Ok(None);
+        host.allocated = Ok(66560);
+        operation(Verb::Install, &mut host).unwrap();
+        assert_eq!(
+            host.runs,
+            runs(&[
+                "allocate firefox",
+                RUNTIME_UPDATE,
+                "tda66560 update firefox --force"
+            ])
+        );
+        assert_eq!(host.admissions, 0);
+        let mut host = Script::new(ok);
+        host.allocated = Err("td-firstboot allocate-application failed".into());
+        assert!(operation(Verb::Install, &mut host).is_err());
+        assert_eq!(host.runs, runs(&["allocate firefox"]));
+        // Remove, then install again: the row stays, the uid with it.
+        let mut host = Script::new(ok);
+        host.account = |_| Ok(Some(66560));
+        host.admitted = Ok(66560);
+        host.allocated = Ok(66560);
+        operation(Verb::Remove, &mut host).unwrap();
+        operation(Verb::Install, &mut host).unwrap();
+        assert_eq!(
+            host.runs,
+            runs(&[
+                "tda66560 remove firefox",
+                RUNTIME_REMOVE,
+                "allocate firefox",
+                RUNTIME_UPDATE,
+                "tda66560 update firefox --force"
+            ])
+        );
+    }
+
+    /// With no account a Flathub application was never installed: its
+    /// status is an empty cache's, answered without td-app, and every
+    /// other verb but install refuses without running anything.
+    #[test]
+    fn an_application_without_an_account_is_not_installed() {
+        let mut host = Script::new(ok);
+        host.account = |_| Ok(None);
+        assert_eq!(
+            operation(Verb::Status, &mut host).unwrap(),
+            b"format=1\nname=firefox\nkind=flathub\ncurrent=none\nprevious=none\n\
+              checked=never\nrefused=none\nprogress=none\n"
+        );
+        for verb in [Verb::Update, Verb::Remove, Verb::DeleteData] {
+            assert_eq!(
+                operation(verb, &mut host).unwrap_err(),
+                "firefox is not installed",
+                "{verb:?}"
+            );
+        }
+        assert!(host.runs.is_empty());
+        assert_eq!(host.admissions, 0);
+        // The record is the one an empty cache's td-app writes.
+        let empty = not_installed_status("firefox");
+        assert_eq!(checked_status("firefox", &empty).unwrap(), empty);
+        // An account root cannot read is no answer at all.
+        let mut host = Script::new(ok);
+        host.account = |_| Err("undeclared".into());
+        assert!(operation(Verb::Status, &mut host).is_err());
+        assert!(host.runs.is_empty());
     }
 
     #[test]

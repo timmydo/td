@@ -1056,7 +1056,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x805924b84e7cc79e,
+        0x55e36d8f0cda71d6,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1074,6 +1074,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
         );
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
+    // The one td-firstboot child runs one of two fixed verbs: the launch
+    // admission and an install's allocation.
+    assert!(application.contains("            .args([check.verb, &owner.to_string(), name])\n"));
+    assert_eq!(application.matches("    verb: \"").count(), 2);
+    assert!(application.contains("    verb: \"check-launch-application\",\n"));
+    assert!(application.contains("    verb: \"allocate-application\",\n"));
+    assert_eq!(application.matches("admit(&ALLOCATE, ").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
     // The admission check's stderr is root's private tail, quoted in its refusal.
@@ -1119,8 +1126,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(cache.contains(
         "Command::new(\"/bin/td-login\");\n    command\n        .args([\"exec-service-as\", account, \"--\", \"/bin/td-app\"])\n        .args(arguments);"
     ));
-    // The only two accounts td-app runs as: an admitted application's, by
-    // the UID admission selected, and the compiled runtime account.
+    // The only two accounts td-app runs as: an application's, by the UID
+    // its admission or an install's allocation selected, and the compiled
+    // runtime account.
     assert_eq!(cache.matches("\n    td_app(").count(), 2);
     assert!(cache.contains("    td_app(&format!(\"tda{uid}\"), &arguments)\n"));
     assert!(cache.contains("    td_app(RUNTIME_ACCOUNT, &arguments)\n"));
@@ -1145,7 +1153,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "crate::launch::require_operation_startup()",
         "operate_runtime(&mut System, &request, deadline)",
         // A removal asks the applications before it spawns anything.
-        "named_elsewhere(host, runtime, None, deadline)",
+        "named_elsewhere(host, flathub_app::FLATHUB_SOURCES, runtime, None, deadline)",
         "host.td_app(",
     ]
     .map(|call| runtime.find(call).unwrap());
@@ -1154,11 +1162,32 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let order = [
         "Request::parse(arguments)?",
         "crate::launch::require_operation_startup()",
+        // An application the image ships is admitted and has no cache.
         "crate::application::admitted_uid(&request.name)?",
-        "operate(&mut System, &request, uid, source, deadline)",
+        "operate(&mut System, &request, source, deadline)",
     ]
     .map(|call| application.find(call).unwrap());
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    // A Flathub application's operation selects its account before any
+    // td-app run: an install by allocating it, every other verb by
+    // admitting one the ledger holds, or none, which runs nothing.
+    let operation = application.split_once("\nfn operate(").unwrap().1;
+    let order = [
+        "Verb::Install => host.allocate(&request.name)?,",
+        "_ => match host.account(&request.name)? {",
+        "Some(_) => host.admitted_uid(&request.name)?,",
+        "None => return Err(format!(\"{} is not installed\", request.name)),",
+        "host.td_app(",
+    ]
+    .map(|call| operation.find(call).unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    assert_eq!(cache.matches("host.allocate(").count(), 1);
+    assert_eq!(
+        cache
+            .matches("crate::application::allocated_uid(name)")
+            .count(),
+        1
+    );
     // Every td-app run goes through the host, whose only production form
     // is the one spawn.
     assert_eq!(cache.matches("run_td_app(").count(), 2);
@@ -1483,7 +1512,7 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0x71cde0436d992a4f;
+const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
 const MAIN_FINGERPRINT: u64 = 0xa25ebeeebfcacca8;

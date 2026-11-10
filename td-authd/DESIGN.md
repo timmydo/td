@@ -411,7 +411,11 @@ The supervisor's independent console-start guarantee remains in force.
 All operations use safe filesystem
 I/O through retained directory and control descriptors. Startup before any
 human/application process and a root-controlled mount hierarchy are trusted.
-This is not live cgroup repair or a credential-switch authority.
+This is not live cgroup repair or a credential-switch authority. The
+one preparation outside sysinit is an install's allocation ("Workload
+account ledger"), which delegates only a cgroup that is absent or an
+interrupted root-owned creation, never again one already delegated to
+the account.
 
 The app delegation is an empty domain cgroup. Firstboot enables and reads
 back its three controllers, creates an empty domain `session` leaf without
@@ -506,6 +510,23 @@ writes. It is never renamed or removed.
 Interrupted creation may normalize missing owner mode bits on this validated
 empty lock. Root must not replace a live lock or change the mount hierarchy.
 
+Only an account of the carried block (65536 through 66559, "Workload
+account ledger") can have legacy state of the human's, written when the
+application ran as the human, so boot migrates only into one of those.
+An account allocated at install, while the human's session runs, gets
+its home from the same code with no migration source: an empty
+`.td/app/APP` and nothing of the human's, published to the account the
+same way, and boot's preparation of such an account is the same, never a
+migration, even over the install's interrupted root-owned home. A
+published home is left as it is, so a reinstall finds its state, and the
+next boot's preparation finds it published and returns. The human's
+inodes in an unpublished home, which only an interrupted migration
+leaves, are refused by a preparation that migrates nothing. A new row
+never takes a uid with a home, `td-app-UID` cgroup or `/run/user/UID`
+left ("Workload account ledger"), so its install finds none; as a
+defence, an install that added the row still refuses any existing home,
+and any cgroup or runtime directory the account owns.
+
 Each new home stays root-owned mode 0700 until its entire conversion is
 synced. Firstboot validates the existing human `.td/app/NAME` tree without writes,
 then moves its directory into
@@ -572,7 +593,14 @@ versions, then one that writes v2, which may not ship until the reader is
 the oldest deployment an install can retain as `previous`. Names follow the principal table's
 application name grammar above, under each kind; a sandbox and a workspace
 may share a name, never a uid. Application uids are 65536 through 98303;
-sandbox and workspace uids share 98304 through 131071. Both lie inside
+sandbox and workspace uids share 98304 through 131071. The application
+range's first 1024, 65536 through 66559 (`CARRIED_UIDS`), are the carried
+block: the image's carried rows, the reservations that predate the
+ledger (Claude Code's 65539) and the uid of any application a later
+image ships, which takes a carried row from the block. Allocation draws
+from 66560 through 98303 (`ALLOCATED_UIDS`) and never enters the block,
+so no carried row a later deployment adds and no reservation a
+rolled-back one retains can meet a uid an install took. Both lie inside
 the principal table's application range (65536 through 2147483647), which
 still bounds its retained rows, and clear of 65534,
 65535 and every other uid td assigns; a subordinate id range, should td
@@ -585,10 +613,11 @@ outgrows strands the rollback.
 
 Every check that a uid is an application's uses the ledger's application
 range, 65536 through 98303 (`APPLICATION_UIDS`): td-login's and td-jail's
-cgroup delegation, td-jail's private-home check, td-authd's launcher
-reply, the consent codec's credential target (a data-only copy td-authd's
-tests hold equal) and firstboot's state and runtime preparation. Only the
-principal table's parser keeps its wider range, for retained rows. No
+cgroup delegation, td-jail's private-home check, td-authd's launcher and
+allocation replies, the consent codec's credential target (a data-only
+copy td-authd's tests hold equal) and firstboot's state and runtime
+preparation. Only the principal table's parser keeps its wider range,
+for retained rows. No
 passwd or group entry may hold a uid or gid anywhere in 65536 through
 131071 (`LEDGER_UIDS`) or take the `tda<digits>` form
 (`application_account_name`); the ledger reader's file shares both with
@@ -602,17 +631,25 @@ gives one application name to two owners at different uids, therefore
 refuses the boot; serving more than one human with applications is a later
 decision. The image build's `td-firstboot check-principals` refuses an
 image table that holds any application row, and an application the image
-declares (`/etc/td-bus-applications.tsv`) without a carried row, since
-nothing allocates one before td-authd does.
+declares (`/etc/td-bus-applications.tsv`) and ships in the image without
+a carried row, since nothing allocates one at boot. A Flathub declaration
+(`flathub_app::FLATHUB_SOURCES`) needs none: td-authd allocates its row
+when td-software installs it.
 
 Rows are never removed. A removed application keeps its row, so a
-reinstall gets the same uid and no uid is ever reused. The ledger is
+reinstall gets the same uid and no uid is ever reused. A lost ledger,
+restored offline from a copy missing later rows, forgets those
+allocations, but no allocation re-issues a uid whose home remains under
+`/var/lib/td/applications`, or whose cgroup or runtime directory
+remains; the forgotten account's state stays there,
+owned by its uid, for that offline repair to restore. The ledger is
 assignment data, not authority: which workloads are installed and what
 they may do stays with their declarations and grants.
 
 `engine/src/workload_accounts.rs` holds the dependency-free parser,
-encoder and seed; td-firstboot includes it. Its `--enroll-principals`
-mode is the only writer today. Under the principal ledger's lock it merges
+encoder, seed and allocator; td-firstboot includes it and is the ledger's
+one writer, at boot and when td-authd allocates (below). Under the
+principal ledger's lock its `--enroll-principals` mode merges
 the reservations, then seeds the account ledger with the rows the image
 reserved before it existed (firefox 65536, mail 65537, news 65538, web
 65540) and every application row the retained reservations hold, a
@@ -674,15 +711,54 @@ an error, never an empty ledger:
   ledger's uid of a declared application; td-firstboot's
   `check-launch-application` selects the launch uid from the policy and
   refuses when a retained reservation names the application at another
-  uid; per-boot preparation iterates the declared service applications
-  the ledger holds.
+  uid, and `allocate-application` applies the same admission before it
+  publishes; per-boot preparation iterates the declared service
+  applications the ledger holds.
 
-td-authd's allocation when td-software installs an application follows
-(WORKLOADS.md, step 5). It will hold `.principals.lock`, return an
-existing row, and otherwise take the lowest uid in the kind's range that
-no row holds and that no retained principal row (of any owner), passwd
-entry or group names; no caller supplies a uid. Until then the carried
-rows are the only application rows a fresh install has.
+An application's row is allocated when td-software installs it.
+td-authd's `application-cache OWNER APP install` ("Application cache
+operation") first runs `/bin/td-firstboot allocate-application OWNER
+APP`, as it runs the launch check: an empty environment, `/`, null
+stdin, its stderr root's private tail, and one bounded reply line on a
+private socket, `TD-APPLICATION-ALLOCATED`, a tab and the uid, which
+must lie in the application range; 30 seconds bound it, since it syncs
+the ledger and prepares a cgroup and may wait on another allocation's
+lock. On slow storage the bound can expire mid-preparation; td-authd
+then kills the child, and every point it can stop at is recoverable:
+before publication nothing changed, and after it the row stands and the
+next install, not new, completes the root-owned remainder. td-firstboot requires root credentials, the deployment enrolled
+and its accounts verified as `check-launch-application` does, and admits
+only an application the session OWNER's deployment declares as a
+service application among its Flathub declarations: an undeclared name,
+a personal application, which runs as the human, and an application the
+image ships, which has its carried row or none, all refuse. Then, under
+`.principals.lock`, it reads the published ledger (an absent one
+refuses: boot seeds it first) and returns an existing row unchanged, or
+adds the lowest uid of 66560 through 98303 that no row of any kind holds
+and that no retained principal row (of any owner), passwd uid or gid,
+group gid, entry of `/var/lib/td/applications`, `td-app-UID` cgroup at
+the unified root or `/run/user/UID` entry names. Each directory is read
+under the lock, listed without following links, its names taken in
+canonical decimal after their prefix and bounded at 65536 entries; an
+absent directory names none, and a linked one refuses. A new uid
+therefore has no home, cgroup or runtime directory to inherit. No
+caller supplies a uid. Before
+publishing, it applies `check-launch-application`'s admission to the
+resulting ledger, so an install refuses exactly what a launch would,
+then publishes the ledger as boot does. Still under the lock, it
+prepares the account: its home with nothing of the human's migrated
+("Application state preparation"), its cgroup delegation unless one is
+already published to it, since an install or update while the
+application runs finds that delegation populated, and its
+`/run/user/UID` runtime ("Application runtime preparation"). For a row
+this install added, an existing home, or a cgroup or runtime directory
+the account owns, still refuses, as a defence: the choice above avoided
+every one that existed under the lock, so only one made since, by
+something other than an allocation, is refused. A preparation that
+fails leaves the row, and the
+next install, which finds the row, completes root's interrupted
+creation. A removed application keeps its row and home, so its
+reinstall is allocated the same uid and finds its state.
 
 ## Fixed program launch prerequisite
 
@@ -1175,16 +1251,29 @@ compositor's private channel ("Application requests" below).
 Startup requires root credentials, one thread, no controlling terminal
 and only the three standard descriptors. Unlike the launch authority's,
 any of them may be the same file, since this operation's stdin is no
-channel. Root then runs the fixed `check-launch-application OWNER APP`
-admission, which selects the active application account from the
-immutable deployment and the durable ledger, as `application-start`
-does. An application the image ships has no cache: `status` answers
+channel. An application the image ships has no cache: root runs the
+fixed `check-launch-application OWNER APP` admission, which selects the
+active application account from the immutable deployment and the
+durable ledger, as `application-start` does, and then `status` answers
 `format=1`, `name=`, `kind=image`, written by root without td-app, and
 every other verb refuses.
 
-For a Flathub declaration root runs `/bin/td-login exec-service-as
-tdaUID -- /bin/td-app VERB APP`, with td-app's verb `update APP --force`
-for both `install` and `update` (they differ only in whether a `current`
+A Flathub declaration's account comes from the workload account ledger,
+which holds its row only once an install allocated it. `install` first
+runs td-firstboot's `allocate-application OWNER APP` ("Workload account
+ledger"), which allocates the row or finds the one an earlier install
+allocated and is the operation's admission; nothing runs until it
+answers. Every other verb first reads the application policy
+(`app_policy::load`, strict) for the declared application's row: with
+one, root runs the `check-launch-application` admission as above; with
+none the application was never installed here, so `status` answers the
+record of an empty cache, `kind=flathub` with every field `none` or
+`never`, written by root without td-app, and `update`, `remove` and
+`delete-data` refuse with `APP is not installed`, running nothing. An
+undeclared name, or a policy root cannot read, fails the operation.
+
+Root then runs `/bin/td-login exec-service-as tdaUID -- /bin/td-app
+VERB APP`, with td-app's verb `update APP --force` for both `install` and `update` (they differ only in whether a `current`
 exists, which td-software shows) and the verb's own name otherwise. An
 `install` or `update` first runs the declared runtime's check as the
 runtime account, `/bin/td-login exec-service-as td-runtimes --
@@ -1199,10 +1288,17 @@ when none has a `current` or a writer holding its cache's lock (an
 install or update in flight) runs `/bin/td-app runtime remove RUNTIME`
 as the runtime account: the last installed application to go takes its
 runtime's store contents with it. A declaration the registry does not
-list has no account on this machine and keeps nothing. One whose
-registry, admission or status cannot be read counts as installed, so
-the runtime stays. A failed runtime removal fails the operation, saying
-the application is removed and its runtime is not.
+list, or one with no ledger row, has no account on this machine and
+keeps nothing; it is neither admitted nor asked. One whose registry,
+policy, admission or status cannot be read counts as installed, so the
+runtime stays: that includes a row whose install failed in preparation,
+which keeps the runtime until a retried install completes it, and a
+registry name the declarations lack, which only an inconsistent image
+holds (both come from one application list), rather than guessing that
+nothing needs the runtime. A failed runtime removal fails the operation, saying the
+application is removed and its runtime is not. A removal leaves the
+application's ledger row and home, whose jail state only `delete-data`
+deletes.
 
 That is a check, then an act. Another application's install that starts
 after the check, while its runtime half runs and before its own cache's
@@ -1216,8 +1312,8 @@ window: it runs as one account, and no account reads another's cache,
 so the runtime account cannot see who is about to need its store; only
 root could, by holding every such cache's lock across the removal. Every one of these runs
 through one command builder (`td_app`), the credential drop into exactly
-an admitted `tdaUID` or the compiled `td-runtimes`, and one spawn. The
-environment is cleared, the working directory is `/` and stdin is null;
+an admitted or allocated `tdaUID` or the compiled `td-runtimes`, and one
+spawn. The environment is cleared, the working directory is `/` and stdin is null;
 td-login supplies the account's home, its other identity variables and
 its session cgroup, as for an application's launch. For `status`
 td-app's stdout is a private socket and its stderr null; root reads at
@@ -1256,8 +1352,9 @@ launch and the forced check did before td-software's cutover
 (td-software/DESIGN.md §6.4), or the runtime account on the runtime
 store, which holds only what an application's install asked for. The
 confinement test pins the one program, the two accounts and argument
-shapes, the order of parse, startup audit, admission and spawn, and no
-environment beyond the cleared one.
+shapes, the order of parse, startup audit, admission or allocation and
+spawn, td-firstboot's two verbs, and no environment beyond the cleared
+one.
 
 ## Runtime cache operation
 
