@@ -100,6 +100,10 @@ mod der;
 pub mod ec;
 pub mod hmac;
 pub mod keccak;
+#[cfg(test)]
+mod leakage;
+#[cfg(test)]
+mod leakage_tests;
 pub mod mlkem768;
 pub mod random;
 pub mod rsa;

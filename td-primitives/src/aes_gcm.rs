@@ -658,14 +658,14 @@ pub(crate) mod tests {
         expand_key(key, u32::from_le_bytes(*last), key.len() == 32)
     }
 
-    fn software(key: &[u8]) -> AesGcm {
+    pub(crate) fn software(key: &[u8]) -> AesGcm {
         AesGcm {
             engine: software_engine(&schedule(key), key.len() == 32),
         }
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn hardware(key: &[u8]) -> Option<AesGcm> {
+    pub(crate) fn hardware(key: &[u8]) -> Option<AesGcm> {
         let cpu = crate::accel::AesClmul::detect()?;
         Some(AesGcm {
             engine: super::Engine::Hardware {
@@ -676,7 +676,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn hardware(_key: &[u8]) -> Option<AesGcm> {
+    pub(crate) fn hardware(_key: &[u8]) -> Option<AesGcm> {
         None
     }
 

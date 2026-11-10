@@ -159,7 +159,9 @@ What is **not** claimed:
   of those routines, not every build of this crate, not the routines that
   branch on loop counters, and not instruction latency.
 - Microarchitectural or physical resistance: power, EM, speculation, or
-  operand-dependent instruction latency.
+  operand-dependent instruction latency. "Timing measurement" below found no
+  |t| above 4.5 on one x86-64 machine, which is evidence for that machine,
+  that build and differences of its controls' size only.
 - Erasure. `ct::zero` and the `Drop` impls clear what they own, best effort.
   Registers, stack copies and moved values are not cleared, as `td-fido`'s
   `hmac.rs` already records for its own buffers. `Hmac`'s two hash states are
@@ -176,6 +178,90 @@ What is **not** claimed:
   itself, once per packet. `Sponge`, Blowfish's state, and ML-KEM's seeds and secret
   polynomials are cleared when done with; the `dk` and shared secret ML-KEM returns are
   the caller's.
+
+## Timing measurement
+
+`src/leakage.rs` measures timing after dudect (Reparaz, Balasch and
+Verbauwhede, "Dude, is my code constant time?", 2017): each path runs on
+inputs of two classes, chosen by a coin flip per call so the classes
+interleave, prepared a batch at a time outside the timed calls, each call
+(or a fixed run of calls, for the fastest paths) timed alone with
+`std::time::Instant`, and a first batch thrown away as warm-up. Welch's t
+between the classes is taken over all the times and over each crop that
+keeps the fastest 50, 75, 90, 95, 99 and 99.9 per cent, since interruptions
+only add time, and the largest |t| is reported. Above 4.5, the conventional
+threshold, the classes take different times. Every run first measures two
+positive controls, a comparison that returns at the first differing byte,
+on equal inputs against ones differing at the first byte: one over 256
+bytes, and one over 32 bytes at 8 calls a timing, the geometry of the
+smallest measured path, `ct::eq`'s. The run fails unless both exceed the
+threshold, so a quiet result is one the run could have contradicted, for a
+difference of a control's size; neither bounds a smaller one. It then fails
+if any path exceeds it. `TD_LEAKAGE_SAMPLES` sets the samples a path, and
+a value that is not a count refuses.
+
+`src/leakage_tests.rs` holds this crate's paths, and td-crypto reads the
+same `leakage.rs` through `#[path]` for the private-key PEM decoder it owns.
+Both are ignored tests: timing is noisy, so no gate or `ready` runs them.
+`DEVELOPMENT.md` gives the command. The classes are:
+
+| Path | Fixed class | Other class |
+|---|---|---|
+| `ct::eq`, 32 bytes, 8 calls per timing | equal inputs | first byte differs |
+| ChaCha20-Poly1305 `open`'s tag check | wrong first tag byte | wrong last tag byte |
+| ChaCha20-Poly1305 `seal` and `open`, 64 bytes | fixed key | random key |
+| AES-128-GCM `seal` and `open`, 64 bytes, key expansion included, on AES-NI and on the bitsliced path | fixed key | random key |
+| HMAC-SHA256 | fixed 32-byte key | random key |
+| P-256 ECDSA signing, RFC 6979 nonce included | fixed scalar | random scalar |
+| P-256 and P-384 ECDH, X25519 | fixed scalar | random scalar |
+| td-crypto's PEM base64 decoding of a 138-byte key | fixed content | random content |
+
+Both AES paths are measured on a CPU with AES-NI through the test-only
+constructors `aes_gcm`'s own tests already had, so the bitsliced path runs
+there although `AesGcm::new_128` would not select it.
+
+Recorded run: an AMD Ryzen 7 5700G, the run pinned to CPU 7 with `taskset
+-c 7`, the test build `crypto-cargo leakage` makes in release with the
+host's rustc 1.99.0-nightly (2026-07-22) for x86_64-unknown-linux-gnu
+(glibc), not the pinned 1.99.1 portable artifact; 1,000,000 samples a
+path, about half in each class, 1588 seconds in all. It measured the tree
+that also held the next change, the cryptographic review's answers, whose
+P-256 signing passes each nonce candidate through a test seam for its
+retries, the identity in production. Largest |t|:
+
+| Path | td-primitives' run | td-crypto's run |
+|---|---|---|
+| Control, early exit over 256 bytes | 2292.47 | 2490.97 |
+| Control, early exit over 32 bytes, 8 calls | 317.27 | 341.60 |
+| `ct::eq` | 2.26 | |
+| ChaCha20-Poly1305 `open`'s tag check | 1.41 | |
+| ChaCha20-Poly1305 `seal`, `open` | 1.10, 1.54 | |
+| AES-128-GCM on AES-NI, `seal`, `open` | 1.88, 0.54 | |
+| AES-128-GCM bitsliced, `seal`, `open` | 2.18, 1.27 | |
+| HMAC-SHA256 | 0.82 | |
+| P-256 ECDSA signing | 1.70 | |
+| P-256 ECDH | 1.51 | |
+| P-384 ECDH | 1.79 | |
+| X25519 | 1.23 | |
+| PEM decoding | | 1.17 |
+
+No measured path passes 4.5, and both controls do in both runs.
+
+What this measures and what it does not: timing differences a coarse,
+local, single-core measurement can see on this x86-64 core at this sample
+count, between these two classes, in that test build, which is not the
+pinned Rust 1.99.1 portable artifact td-crypto/PORTABLE.md produces. The
+controls show a leak of their size is seen; they bound nothing smaller.
+The tag-check path, which times a whole `open` around a 16-byte
+comparison, did not detect `ct::eq` made to return at the first
+differing byte, at 100,000 samples, where the `ct::eq` path reached
+|t| 82. A t below the threshold is not a proof
+that no difference exists; a smaller one needs more samples, and other
+classes may differ where these do not. Nothing was measured on aarch64:
+the only aarch64 here is QEMU's emulation (td-crypto/PORTABLE.md), whose
+timing says nothing of a real core. Power, electromagnetic emanation,
+cache-line and speculative leakage, and operand-dependent latency on other
+CPUs are not measured.
 
 ## Decisions on what to accept
 

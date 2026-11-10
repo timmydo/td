@@ -1195,8 +1195,14 @@ disassembly of the crypto-cargo gate's host build and of the portable td-mta
 artifacts PORTABLE.md's builds produce for x86_64-unknown-linux-musl and
 aarch64-unknown-linux-musl: pinned Rust 1.99.1 and LLD 23.1.1, the release
 profile, `target-cpu=x86-64` and `generic` respectively, `+crt-static`, frame
-pointers and `debuginfo=1`. It measured nothing: no timing, power,
-electromagnetic or microarchitectural leakage. It assumes data-independent
+pointers and `debuginfo=1`. It measured nothing itself. A separate
+dudect-style timing measurement of these paths, the private-key PEM decoder
+included (td-primitives/DESIGN.md, "Timing measurement"), found no |t| above
+4.5 at a million samples a path on one x86-64 machine, in a release test
+build by the host's rustc 1.99.0-nightly for x86_64-unknown-linux-gnu, not
+the pinned 1.99.1 portable artifact, and both its positive controls did;
+aarch64 timing, power, electromagnetic and microarchitectural leakage
+remain unmeasured. It assumes data-independent
 timing of AESENC, PCLMULQDQ, MUL and UMULH and the conditional moves and
 selects, which on aarch64 holds without PSTATE.DIT only by core
 implementation. It does not cover rustls's internals, and it holds for that

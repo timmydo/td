@@ -538,3 +538,38 @@ fn branch_free_base64_matches_the_reference_on_random_input() {
     }
     assert!(accepted > 100, "{accepted}");
 }
+
+/// The on-demand timing-leakage run over the private-key base64 decoder:
+/// fixed against random content of one length and layout. Ignored, so no
+/// gate runs it (td-primitives/DESIGN.md, "Timing measurement").
+#[test]
+#[ignore = "on demand: timing is noisy and machine-specific"]
+fn pem_timing_leakage() {
+    use crate::leakage::{conclude, controls, measure, samples};
+    use std::hint::black_box;
+    let body = |bytes: &[u8]| {
+        let mut body = Vec::new();
+        for line in encode(bytes).chunks(64) {
+            body.extend_from_slice(line);
+            body.push(b'\n');
+        }
+        body
+    };
+    let samples = samples().unwrap();
+    let controls = controls(samples);
+    let decode_path = measure(
+        "PEM private-key base64 decode, 138 bytes, fixed against random content",
+        samples,
+        1,
+        21,
+        |fixed, rng| {
+            let bytes: [u8; 138] = if fixed { [0x42; 138] } else { rng.bytes() };
+            body(&bytes)
+        },
+        |body| {
+            let mut out = [0u8; P256_PKCS8_CAPACITY];
+            black_box(decode(black_box(body), &mut out).unwrap());
+        },
+    );
+    conclude(&controls, &[decode_path]).unwrap();
+}

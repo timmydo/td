@@ -1151,6 +1151,31 @@ and `TD_MTA_PERF_JMAP_READERS` (2, at most 6) size it; the defaults take
 about six minutes. Its `td-mta-perf` lines are the report;
 td-mta/CONFORMANCE.md says what each measures.
 
+## Timing-leakage harness
+
+The timing-leakage measurement of td-primitives' secret paths and
+td-crypto's private-key PEM decoder runs on demand, never in a gate or
+`ready`:
+
+```text
+taskset -c 7 td-builder gate-crates crypto-cargo leakage --manifest-path td-crypto/Cargo.toml
+```
+
+It runs the two ignored cases, td-primitives'
+`leakage_tests::timing_leakage` and td-crypto's
+`pem::tests::pem_timing_leakage`, in release with one test thread, through
+the same bounded output and passing-summary check as the mail performance
+harness. `TD_LEAKAGE_SAMPLES` (default 1000000) sets the samples per path;
+a value that is not a count refuses.
+At the default it takes about 27 minutes on a Ryzen 7 5700G (1588 s in the
+run td-primitives/DESIGN.md records), most of it the
+public-key paths. Pin it to one otherwise idle CPU, as `taskset` does above;
+build first, unpinned, with a small `TD_LEAKAGE_SAMPLES`, so the pinned run
+only measures. A case fails when either positive control shows no leak or a
+measured path shows |t| above 4.5. Rerun a failure before believing it, and
+report it with its numbers. td-primitives/DESIGN.md says what is measured
+and records results.
+
 # Code review: two frontier models per commit
 
 Every increment receives two independent reviews of one exact commit:

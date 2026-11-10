@@ -157,4 +157,10 @@ mod p256_oracle;
 #[path = "../../engine/src/sha256.rs"]
 mod sha256_oracle;
 
+// The timing-leakage statistics td-primitives' own run uses, for the
+// private-key PEM decoder this crate owns.
+#[cfg(test)]
+#[path = "../../td-primitives/src/leakage.rs"]
+mod leakage;
+
 mod tls_hello;
