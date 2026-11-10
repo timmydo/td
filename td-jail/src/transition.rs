@@ -8324,6 +8324,18 @@ mod tests {
         assert!(in_system_tree(Path::new("/td/store"), true));
     }
 
+    /// td-builder's guard (builder/src/stage0.rs, `HostFacts`) knows a
+    /// runtime workspace on td by td's os-release beside the runtime's
+    /// `/usr`. Were the runtime's os-release taken, or the host's dropped,
+    /// it would see another system and take the runtime's `gcc`.
+    #[test]
+    fn a_runtime_workspace_keeps_the_hosts_os_release() {
+        assert!(workspace::HOST_ETC.contains(&"os-release"));
+        assert!(!WORKSPACE_RUNTIME_ETC.allowlist.contains(&"os-release"));
+        assert!(workspace_etc_name("os-release", false, Some(&[])));
+        assert!(workspace_etc_name("os-release", true, Some(&[])));
+    }
+
     /// The workspace kind's runtime aliases are the application kind's
     /// loader directories alone, and with `/usr` exactly the trees the
     /// runtime replaces; its `/etc` takes the loader's files from the

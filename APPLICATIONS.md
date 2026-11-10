@@ -3857,7 +3857,10 @@ with the kind's own departures:
   own, and not behind the application kind's D-Bus, portal or Wayland
   boundaries. td's own glibc programs in the workspace can load the
   runtime's code too (the loader boundary below), so such a workspace is
-  no host for td's control plane (AGENTS.md, "Trust zones").
+  no host for td's control plane (AGENTS.md, "Trust zones"), and
+  td-builder refuses there, as on any system whose os-release says td
+  and that has a `/usr` (td-agent/DESIGN.md §8, Runtime); `cargo` run
+  outside td-builder is not refused.
 - **Programs**, the entry first, are direct executable regular files,
   bound read-only and executable at `/opt/workspace/bin/<file name>`,
   their device and inode checked before and after the bind. The entry

@@ -12,6 +12,8 @@
 //! helpers checked with `assert_static`; selecting the native configuration
 //! grants no target-artifact provenance. The musl details below describe other
 //! hosts. See td-vm/DESIGN.md for the native development contract.
+//! A td system with a `/usr` provisions nothing: td has none, so it is a
+//! Flathub runtime a workspace named ([`HostFacts::runtime_refusal`]).
 //!
 //! - `provision_rust` / `provision_cc` — resolve the SEED build's toolchain
 //!   guix-free and return a PATH fragment (colon-joined bin dirs). Resolution
@@ -68,6 +70,8 @@ pub(crate) struct ProvisionEnv {
     pub(crate) search_path: String,
     /// The standard td system uses its installed toolchain.
     pub(crate) native_td: bool,
+    /// The host has a `/usr`: on td, a Flathub runtime's ([`HostFacts`]).
+    pub(crate) has_usr: bool,
 }
 
 impl ProvisionEnv {
@@ -75,14 +79,76 @@ impl ProvisionEnv {
         // `${VAR:-default}` semantics: an EMPTY env var falls through like an
         // unset one (the old scripts' `[ -n "${TD_RUST_HOME:-}" ]`).
         let nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let host = HostFacts::read();
         ProvisionEnv {
             rust_home: nonempty("TD_RUST_HOME"),
             cc_home: nonempty("TD_CC_HOME"),
             rust_version: nonempty("TD_RUST_VERSION").unwrap_or_else(|| "1.99.1".to_string()),
             search_path: std::env::var("PATH").unwrap_or_default(),
-            native_td: std::fs::read_to_string("/etc/os-release")
-                .is_ok_and(|text| is_td_system(&text)),
+            native_td: host.native_td,
+            has_usr: host.has_usr,
         }
+    }
+
+    fn host(&self) -> HostFacts {
+        HostFacts {
+            native_td: self.native_td,
+            has_usr: self.has_usr,
+        }
+    }
+}
+
+/// The two facts about the host that its trust zone turns on, read from the
+/// real root alone ([`HostFacts::read`]): no variable or argument names
+/// another root. That td has no `/usr` is pinned in the image: the system
+/// recipe's `the_root_has_no_usr`, its shape check over the composed root
+/// and every boot's rootcheck. That a runtime workspace keeps td's
+/// os-release is pinned in td-jail (`a_runtime_workspace_keeps_the_hosts_os_release`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostFacts {
+    /// `/etc/os-release` says td ([`is_td_system`]). A missing, unreadable
+    /// or other os-release says not, so another host is never refused.
+    pub(crate) native_td: bool,
+    /// `/usr` is there, as anything: its lstat succeeds, or fails other than
+    /// as not found, so on td a doubt about it refuses.
+    pub(crate) has_usr: bool,
+}
+
+impl HostFacts {
+    pub(crate) fn read() -> Self {
+        Self::under(Path::new("/"))
+    }
+
+    fn under(root: &Path) -> Self {
+        HostFacts {
+            native_td: std::fs::read_to_string(root.join("etc/os-release"))
+                .is_ok_and(|text| is_td_system(&text)),
+            has_usr: std::fs::symlink_metadata(root.join("usr")).map_or_else(
+                |error| error.kind() != std::io::ErrorKind::NotFound,
+                |_| true,
+            ),
+        }
+    }
+
+    /// Why td's control plane may not be built, checked or run here: td has
+    /// no `/usr`, so on td one is a Flathub runtime a workspace named
+    /// (APPLICATIONS.md §C), whose `gcc` and `ar` follow td's `/bin` on
+    /// `PATH` and from which td's glibc loads. None elsewhere.
+    pub(crate) fn runtime_refusal(self) -> Option<String> {
+        (self.native_td && self.has_usr).then(|| {
+            "this td system has a /usr, which on td only a Flathub runtime a workspace \
+             names puts there; td's control plane is not built, checked or run with its \
+             tools (AGENTS.md, \"Trust zones\")"
+                .to_string()
+        })
+    }
+}
+
+/// Every provisioning path starts here: a runtime's `/usr` supplies no tool.
+fn refuse_runtime_host(env: &ProvisionEnv) -> Result<(), ProvisionErr> {
+    match env.host().runtime_refusal() {
+        Some(why) => Err(ProvisionErr::Broken(why)),
+        None => Ok(()),
     }
 }
 
@@ -389,6 +455,7 @@ impl std::fmt::Display for ProvisionErr {
 /// A resolved but unusable toolchain is `Broken` (RED); an absent toolchain
 /// is `Unavailable`, which callers can report as a provisioning gap.
 pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
+    refuse_runtime_host(env)?;
     // 1. Explicitly provided toolchain.
     if let Some(home) = &env.rust_home {
         let b = format!("{home}/bin");
@@ -537,6 +604,7 @@ fn has_cc(bin_dir: &Path) -> bool {
 /// On td this also links the static GNU target; other hosts use musl's bundled
 /// linker for the target. Never invokes Guix.
 pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
+    refuse_runtime_host(env)?;
     // 1. Explicitly provided toolchain.
     if let Some(home) = &env.cc_home {
         let b = format!("{home}/bin");
@@ -1563,6 +1631,7 @@ mod tests {
             rust_version: "1.99.1".to_string(),
             search_path: String::new(),
             native_td: false,
+            has_usr: false,
         }
     }
 
@@ -1579,6 +1648,69 @@ mod tests {
         ] {
             assert!(!is_td_system(other));
         }
+    }
+
+    #[test]
+    fn host_facts_are_os_release_and_any_usr_under_the_root() {
+        let root = scratch("host-facts");
+        let facts = |native_td, has_usr| HostFacts { native_td, has_usr };
+        // No os-release reads as another system, as before.
+        assert_eq!(HostFacts::under(&root), facts(false, false));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/os-release"), "NAME=td\nID=td\n").unwrap();
+        assert_eq!(HostFacts::under(&root), facts(true, false));
+        // A /usr of any type counts, a dangling link among them.
+        std::os::unix::fs::symlink("nowhere", root.join("usr")).unwrap();
+        assert_eq!(HostFacts::under(&root), facts(true, true));
+        std::fs::remove_file(root.join("usr")).unwrap();
+        std::fs::write(root.join("usr"), b"").unwrap();
+        assert_eq!(HostFacts::under(&root), facts(true, true));
+        std::fs::remove_file(root.join("usr")).unwrap();
+        std::fs::create_dir(root.join("usr")).unwrap();
+        assert_eq!(HostFacts::under(&root), facts(true, true));
+        std::fs::write(root.join("etc/os-release"), "ID=debian\n").unwrap();
+        assert_eq!(HostFacts::under(&root), facts(false, true));
+        std::fs::remove_file(root.join("etc/os-release")).unwrap();
+        assert_eq!(HostFacts::under(&root), facts(false, true));
+    }
+
+    #[test]
+    fn only_a_td_system_with_a_usr_is_refused() {
+        for (native_td, has_usr, refused) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let why = HostFacts { native_td, has_usr }.runtime_refusal();
+            assert_eq!(why.is_some(), refused, "{native_td} {has_usr}");
+            if let Some(why) = why {
+                assert!(why.contains("/usr") && why.contains("Trust zones"), "{why}");
+            }
+        }
+    }
+
+    #[test]
+    fn provisioning_refuses_a_td_system_with_a_usr() {
+        let (root, mut env) = native_fixture("native-td-runtime-usr");
+        assert_eq!(provision_rust(&env).unwrap(), env.search_path);
+        assert_eq!(provision_cc(&env).unwrap(), env.search_path);
+        assert_eq!(provision_c_compiler(&env).unwrap(), env.search_path);
+        env.has_usr = true;
+        let refused = |result: Result<String, ProvisionErr>| matches!(result, Err(ProvisionErr::Broken(why)) if why.contains("Flathub runtime"));
+        assert!(refused(provision_rust(&env)));
+        assert!(refused(provision_cc(&env)));
+        assert!(refused(provision_c_compiler(&env)));
+        // A named toolchain is no way around it.
+        let home = root.join("toolchain").to_string_lossy().into_owned();
+        env.rust_home = Some(home.clone());
+        env.cc_home = Some(home);
+        assert!(refused(provision_rust(&env)));
+        assert!(refused(provision_cc(&env)));
+        // Off td a /usr is the host's own.
+        env.native_td = false;
+        assert!(!refused(provision_cc(&env)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn native_fixture(tag: &str) -> (crate::test_temp::TempDir, ProvisionEnv) {

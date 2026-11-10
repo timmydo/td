@@ -510,8 +510,13 @@ mod deployed_applet_tests {
             rust_version: "1.99.1".to_string(),
             search_path: bin.to_string_lossy().into_owned(),
             native_td: true,
+            has_usr: false,
         };
         assert_eq!(deployed_applet(&penv, "td-feed"), Some(bin.join("td-feed")));
+        // A td system with a runtime's /usr is refused, not served.
+        penv.has_usr = true;
+        assert_eq!(deployed_applet(&penv, "td-feed"), None);
+        penv.has_usr = false;
         // Only the multicall stands in for an applet.
         exec(&bin.join("td-subst"));
         assert_eq!(deployed_applet(&penv, "td-subst"), None);

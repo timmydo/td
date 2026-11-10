@@ -976,7 +976,9 @@ td-link there, as Rust's linker driver only; no td host has run it yet),
 but what needs host C fails there: the td-update,
 td-vm and td-vm-guest test fixtures that link with `-Clinker=gcc` (GNU ld,
 not bundled LLD) for want of a `gcc`; run `ready` on a host with a C
-toolchain.
+toolchain. Nor is a workspace naming a Flathub runtime one, whose `/usr`
+would supply that `gcc`: td-builder refuses to run on a td system that
+has a `/usr` (AGENTS.md, "Trust zones").
 
 ## Native compositor fixture builds
 

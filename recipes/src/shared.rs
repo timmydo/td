@@ -22,7 +22,8 @@ pub fn efi_default_cmdline() -> String {
 pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
 pub const TD_APPLICATION_STATE_ROOT: &str = ".td/app";
 pub const TD_APPLICATION_RUNTIME_ROOT: &str = "td-app";
-pub const TD_APPLICATION_CONFIG_PATH: &str = "/etc/td-app.conf";
+/// td-jail keeps the literal, which the td-jail recipe pins to this.
+pub const TD_APPLICATION_CONFIG_PATH: &str = td_engine::flathub_app::PRODUCT_CONFIG;
 pub const TD_APPLICATION_REGISTRY: &str = "/etc/td-applications.tsv";
 pub const TD_APPLICATION_LAUNCHER_TABLE: &str = "/etc/td-launcher.tsv";
 pub const TD_APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";

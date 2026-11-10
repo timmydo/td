@@ -298,7 +298,9 @@ which is td-link, as linker.
 It recognizes the exact `ID=td` system identity in `/etc/os-release`; this
 selects build configuration and grants no artifact provenance or authority.
 Missing or broken native tools fail provisioning instead of downloading a
-musl target or replacement toolchain. Other hosts retain their musl helper
+musl target or replacement toolchain. A td system with a `/usr`, which on
+td only a workspace's Flathub runtime puts there, is refused outright
+(AGENTS.md, "Trust zones"). Other hosts retain their musl helper
 configuration.
 
 The builder, evaluator, recipe test binaries, and network preparation helper

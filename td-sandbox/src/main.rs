@@ -48,9 +48,6 @@ fn system_path(path: &Path, runtime: bool) -> bool {
     .any(|p| path.starts_with(p))
         && !(runtime && flathub_app::in_workspace_runtime_tree(path))
 }
-/// td's product configuration, td-jail's `authority::CONFIG_PATH`: where it
-/// is absent, td-jail refuses every runtime.
-const TD_CONFIG: &str = "/etc/td-app.conf";
 /// `native`, or a declared runtime's td name, which only td can bind: a
 /// development host, with no product configuration at `config`, may not
 /// set one.
@@ -192,7 +189,8 @@ fn run() -> io::Result<u8> {
         }
         "runtime" => {
             state.runtime =
-                runtime_choice(&word(args.next())?, Path::new(TD_CONFIG))?.map(String::from);
+                runtime_choice(&word(args.next())?, Path::new(flathub_app::PRODUCT_CONFIG))?
+                    .map(String::from);
             if args.next().is_some() {
                 return Err(error(HELP));
             }

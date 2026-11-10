@@ -95,7 +95,14 @@ path. No Flathub byte is a zone-two tool either, so such a workspace is
 no host for the control plane: its `PATH` falls through td's `/bin` to
 the runtime's `/usr/bin` and td's glibc loads from the runtime there.
 Do not build, run or check td's control plane in a workspace that names
-a runtime (td-agent/DESIGN.md §8, Runtime); nothing enforces this yet.
+a runtime (td-agent/DESIGN.md §8, Runtime). td has no `/usr`, which
+the system recipe pins, so td-builder refuses to run on a system whose
+os-release says td and that has one (but for a few verbs that build,
+compile, link or check nothing, `affected-checks` among them, which
+reads git; its provisioning refuses again). Cargo run outside
+td-builder is not refused: by hand, or by td-recipe-eval building a
+missing td-builder; `cargo test` is refused only at its runner,
+td-builder, after it has compiled.
 
 ## Control plane
 

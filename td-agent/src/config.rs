@@ -1993,14 +1993,13 @@ pub fn load(path: Option<&Path>) -> Result<Config, String> {
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("{}: stream did not contain valid UTF-8", path.display()))?;
     let mut config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let off_td = runtimes_off_td(&config.templates, Path::new(TD_CONFIG));
+    let off_td = runtimes_off_td(
+        &config.templates,
+        Path::new(crate::flathub_app::PRODUCT_CONFIG),
+    );
     config.notes.extend(off_td);
     Ok(config)
 }
-
-/// td's product configuration, td-jail's `authority::CONFIG_PATH`: where
-/// it is absent, on a development host, td-jail refuses every runtime.
-const TD_CONFIG: &str = "/etc/td-app.conf";
 
 /// A note for each template naming a declared runtime where no product
 /// configuration is installed at `td_config`, as td-jail and td-sandbox

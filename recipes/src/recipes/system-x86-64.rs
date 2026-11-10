@@ -3188,10 +3188,15 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     // Read-only like the file it binds over, but for td-boot's unbind this would
     // fail a boot. The line names what an assembled deployment reports, for the
-    // oracles that boot one.
+    // oracles that boot one. td has no /usr, which td-builder's guard
+    // (builder/src/stage0.rs, HostFacts) relies on: on td it takes one for a
+    // Flathub runtime's, so a root that grew one would refuse its own control
+    // plane. shape_check refuses one in the composed tree too.
     s.push_str(
         "if /bin/sh -c ': >> /etc/os-release' 2>/dev/null; then \
          echo 'rootcheck: /etc/os-release accepts writes'; ok=0; fi\n\
+         if [ -e /usr ] || [ -L /usr ]; then \
+         echo 'rootcheck: /usr exists - td has none, and td-builder refuses a td system that has one'; ok=0; fi\n\
          if b=$(/bin/grep '^BUILD_ID=' /etc/os-release); then echo \"TD-OS-RELEASE $b\"; fi\n",
     );
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
@@ -6092,6 +6097,7 @@ fn shape_check(sys: &SystemDef) -> String {
      [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:td-btrfs}/bin/td-btrfs\" ] && [ -f \"$root{in:td-btrfs}/bin/td-btrfs\" ] && [ -x \"$root{in:td-btrfs}/bin/td-btrfs\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static td-btrfs a live installer formats with' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-luks\" 2>/dev/null)\" = \"{in:td-luks}/bin/td-luks\" ] && [ -f \"$root{in:td-luks}/bin/td-luks\" ] && [ -x \"$root{in:td-luks}/bin/td-luks\" ] || { echo 'root tree: /bin/td-luks must link the static td-luks a live installer formats device-bound volumes with' >&2; exit 1; }; \
      [ ! -e \"$root/bin/cryptsetup\" ] && [ ! -L \"$root/bin/cryptsetup\" ] || { echo 'root tree: retired cryptsetup present' >&2; exit 1; }; \
+     [ ! -e \"$root/usr\" ] && [ ! -L \"$root/usr\" ] || { echo 'root tree: /usr present - td has none, and td-builder refuses a td system that has one, taking it for a Flathub runtime' >&2; exit 1; }; \
      for l in \"$selector_list\" \"$init_list\"; do if printf '%s\\n' \"$l\" | grep -qE '(^|/)cryptsetup([.]static)?$'; then echo 'initramfs: retired cryptsetup present' >&2; exit 1; fi; done; \
      [ -s \"$root{in:td-luks}/lib/debug/bin/td-luks.debug\" ] || { echo 'root tree: td-luks lacks its debug companion' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-luks || { echo 'selector initramfs: bin/td-luks missing - an installed selector could not open a device-bound volume after its release' >&2; exit 1; }; \
@@ -10327,6 +10333,40 @@ mod tests {
             if path == &format!("{{root}}/real-root{ELEVATION_TABLE}")
                 && content == &build_elevation_table())
         ));
+    }
+
+    /// td has no `/usr`, which td-builder's guard relies on
+    /// (builder/src/stage0.rs, `HostFacts`): on td it takes one for a
+    /// Flathub runtime's and refuses. No root step stages one, the composed
+    /// tree's shape check refuses one, and every boot's rootcheck does.
+    #[test]
+    fn the_root_has_no_usr() {
+        let usr = "{root}/real-root/usr";
+        for sys in [&SYSTEM, &SERVER] {
+            for step in real_root_steps(sys).unwrap() {
+                let made = match &step {
+                    Step::MkDir { path } | Step::WriteFile { path, .. } => Some(path),
+                    Step::Symlink { link, .. } => Some(link),
+                    Step::CopyTree { dest, .. }
+                    | Step::CopyFiles { dest, .. }
+                    | Step::Unpack { dest, .. }
+                    | Step::StageRuntimeClosure { dest, .. } => Some(dest),
+                    Step::CopyFile { to, .. } => Some(to),
+                    _ => None,
+                };
+                assert!(
+                    !made.is_some_and(|path| path == usr || path.starts_with(&format!("{usr}/"))),
+                    "{}: {made:?}",
+                    sys.stem
+                );
+            }
+            assert!(shape_check(sys)
+                .contains("[ ! -e \"$root/usr\" ] && [ ! -L \"$root/usr\" ] || { echo 'root tree: /usr present"));
+            assert!(build_rootcheck(sys).contains(
+                "if [ -e /usr ] || [ -L /usr ]; then \
+                 echo 'rootcheck: /usr exists"
+            ));
+        }
     }
 
     #[test]

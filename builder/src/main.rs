@@ -8925,9 +8925,42 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     })
 }
 
+/// Why this invocation may not run on this host: on a td system with a
+/// `/usr`, a Flathub runtime's (`stage0::HostFacts::runtime_refusal`), every
+/// verb but the few that build nothing, and every argv0 applet. A verb or
+/// applet added later is refused there until it is listed.
+fn runtime_host_refusal(args: &[String], host: stage0::HostFacts) -> Option<String> {
+    let why = host.runtime_refusal()?;
+    let builder = args
+        .first()
+        .and_then(|argv0| Path::new(argv0).file_name())
+        .is_some_and(|name| name == "td-builder");
+    (!(builder && builds_nothing(args.get(1..).unwrap_or(&[])))).then_some(why)
+}
+
+/// The sentinel, the fingerprint, stopping a run, and a selection: none
+/// builds, compiles, links or checks anything. The selection reads git, the
+/// first `git` on `PATH`.
+fn builds_nothing(verb_args: &[String]) -> bool {
+    let Some((verb, rest)) = verb_args.split_first() else {
+        return true;
+    };
+    match verb.as_str() {
+        "engine-fingerprint" | "stop" | "check-host-stop" => true,
+        "affected-checks" => !rest
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--run" | "--self-test")),
+        _ => false,
+    }
+}
+
 #[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(why) = runtime_host_refusal(&args, stage0::HostFacts::read()) {
+        eprintln!("td-builder: refused: {why}");
+        return ExitCode::FAILURE;
+    }
     let applet = Path::new(args.first().map_or("", String::as_str))
         .file_name()
         .and_then(|n| n.to_str());
@@ -12072,6 +12105,90 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn a_td_system_with_a_usr_refuses_every_verb_that_builds() {
+        let runtime = stage0::HostFacts {
+            native_td: true,
+            has_usr: true,
+        };
+        for refused in [
+            &["td-builder", "check"][..],
+            &["td-builder", "ready"],
+            &["td-builder", "ready", "--record-only"],
+            &["td-builder", "affected-checks", "--run"],
+            &["td-builder", "affected-checks", "--committed-only", "--run"],
+            &["td-builder", "affected-checks", "--self-test"],
+            &["td-builder", "build"],
+            &["td-builder", "build-plan", "--auto"],
+            &["td-builder", "gate-crates", "fmt", "--all"],
+            &["td-builder", "gate-run"],
+            &["td-builder", "install-apps"],
+            &["td-builder", "run-capped", "/x/test-binary"],
+            &["td-builder", "stage0-place", "/x"],
+            &["td-builder", "provision-cc"],
+            &["td-builder", "main-integration", "run"],
+            &["td-builder", "no-such-verb"],
+            &["/x/td-crypto-host-linker", "-o", "out"],
+            &["/x/td-crypto-host-linker"],
+            &["/x/td-crypto-decoy", "stop"],
+            // Not verbs: they fall to the usage text, refused like any other.
+            &["td-builder", "--help"],
+            &["td-builder", "-h"],
+            &["td-builder", "help"],
+        ] {
+            let why = runtime_host_refusal(&argv(refused), runtime);
+            assert!(
+                why.as_deref()
+                    .is_some_and(|why| why.contains("Flathub runtime")),
+                "{refused:?}"
+            );
+        }
+        for admitted in [
+            &["td-builder"][..],
+            &["td-builder", "engine-fingerprint"],
+            &["td-builder", "stop"],
+            &["/td/store/x-td-builder/bin/td-builder", "stop"],
+            &["td-builder", "check-host-stop"],
+            &["td-builder", "affected-checks"],
+            &["td-builder", "affected-checks", "--committed-only"],
+            &["td-builder", "affected-checks", "--path", "AGENTS.md"],
+        ] {
+            assert_eq!(runtime_host_refusal(&argv(admitted), runtime), None);
+        }
+        // Without both facts nothing is refused.
+        for (native_td, has_usr) in [(true, false), (false, true), (false, false)] {
+            let host = stage0::HostFacts { native_td, has_usr };
+            assert_eq!(
+                runtime_host_refusal(&argv(&["td-builder", "check"]), host),
+                None
+            );
+        }
+    }
+
+    /// The refusal is main's first statement after it collects its
+    /// arguments, before an applet, `ready`, a run record or the check
+    /// host's forwarding: nothing here can call `main`.
+    #[test]
+    fn main_refuses_a_runtime_host_before_it_dispatches() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("\nfn main() -> ExitCode {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("main");
+        assert!(body.starts_with(
+            "    let args: Vec<String> = std::env::args().collect();\n    \
+             if let Some(why) = runtime_host_refusal(&args, stage0::HostFacts::read()) {\n        \
+             eprintln!(\"td-builder: refused: {why}\");\n        \
+             return ExitCode::FAILURE;\n    \
+             }\n"
+        ));
+    }
 
     #[test]
     fn daemon_budget_probe_is_test_only_and_cannot_name_a_build() {

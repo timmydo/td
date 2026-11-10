@@ -4537,17 +4537,29 @@ td's own glibc programs there can load its code. Its workspace is
 therefore no place for td's control plane (AGENTS.md, "Trust zones"):
 anything td's `/bin` lacks resolves into the runtime's `/usr/bin`
 (`gcc`, `ar`, `make`, `pkg-config`); td-builder's host provisioning on
-td, whose `cc` is td-link, takes the first `gcc` on `PATH` as the host C
-compiler when that one is not td-link, which there is the runtime's; and
-td's glibc loads its gconv modules from the runtime's `/usr`, and finds
-what a program loads or `dlopen`s by name after its `RUNPATH` through
-the runtime's loader cache.
+td, whose `cc` is td-link, would take the first `gcc` on `PATH` as the
+host C compiler when that one is not td-link, which there is the
+runtime's; and td's glibc loads its gconv modules and locale data from
+the runtime's `/usr`, and finds what a program loads or `dlopen`s by
+name after its `RUNPATH` through the runtime's loader cache.
 Building td's control-plane programs, `td-builder check`,
 `affected-checks --run`, `ready` or `./install-apps` there would make
 Flathub bytes zone-two tools. A template for td development names no
-runtime. Nothing enforces this: td-agent does not know which templates
-develop td, and td-builder does not refuse to run on a td system whose
-`/usr` exists, which only a runtime puts there.
+runtime. td-agent does not know which templates develop td, so
+td-builder enforces it: td has no `/usr` (the system recipe pins it), so
+on a system whose os-release says td and that has one, td-builder
+refuses every verb but the few that build, compile, link or check
+nothing (its sentinel, `engine-fingerprint`, `stop`, `check-host-stop`,
+and `affected-checks` without `--run` or `--self-test`, which reads git,
+the first `git` on `PATH`), and every argv0 applet, before it dispatches
+(`main.rs`, `runtime_host_refusal`); its host toolchain provisioning
+refuses again (`stage0.rs`, `HostFacts`). td-jail keeps td's os-release
+in such a workspace, which a td-jail test pins. Cargo run outside
+td-builder there is not refused: by hand, or by td-recipe-eval
+building a missing td-builder (`check_runner.rs`,
+`find_td_builder_self`); `cargo build` runs the runtime's tools before
+any td-builder, and `cargo test` is refused only at its runner,
+td-builder, once it has compiled.
 
 ## 9. Git
 

@@ -99,6 +99,13 @@ pub fn spec_source(
     Ok(Some(declared))
 }
 
+/// td's product configuration, installed on td alone: where it is absent, on
+/// a development host, td-jail refuses every runtime, and td-sandbox and
+/// td-agent say so before it does. The image compiler installs it here
+/// (`recipes/src/shared.rs`); td-jail keeps its own literal, which the
+/// td-jail recipe pins to the image's and a td-jail test holds to this.
+pub const PRODUCT_CONFIG: &str = "/etc/td-app.conf";
+
 /// The root trees a workspace's runtime replaces inside its jail: its tree
 /// at `/usr`, and `/lib` and `/lib64` links into it. td-jail binds nothing
 /// of the host's there, and a launcher names no path directory or alias

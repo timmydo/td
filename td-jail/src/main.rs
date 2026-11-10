@@ -304,6 +304,16 @@ mod confinement {
         assert!(!WORKSPACE.contains("sys::"));
     }
 
+    /// The image compiler pins the literal (the td-jail recipe's tests);
+    /// td-sandbox and td-agent read the shared copy.
+    #[test]
+    fn the_product_configuration_path_is_the_shared_one() {
+        assert_eq!(
+            crate::authority::CONFIG_PATH,
+            crate::flathub_app::PRODUCT_CONFIG
+        );
+    }
+
     #[test]
     fn host_mode_is_explicit_and_absent_from_the_product_configuration() {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
