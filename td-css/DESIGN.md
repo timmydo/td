@@ -314,3 +314,91 @@ ad-hoc HTML extraction is not an HTML5 tree-builder correctness oracle.
 Each increment is independently green, reviewed, readied and pushed on
 `td-css-rolling`. Integration into a document tree or renderer requires a
 separate workstream and design amendment.
+
+## 8. Corpus evidence
+
+The 2026-11-10 UTC capture contains the HTML and its inline and linked
+stylesheets, without scripts, imported sheets or font/image downloads.
+Wikipedia includes both MediaWiki `load.php` responses. A scratch-only
+Python HTMLParser extraction retains tags, attributes, text presence and
+parent/sibling links; it does not repair HTML as an HTML5 tree builder
+would. Inline sheets precede linked sheets in this baseline harness;
+link media attributes are not applied. These are workload measurements,
+not a rendering or stylesheet-order oracle.
+
+Counts use td-css tokenization and recursively inspect grouping at-rules
+(media, supports, layer, container and related groups); keyframe bodies
+and font-face descriptors are not style rules/declarations. Tokens include
+whitespace. All eight complete sheet sets pass syntax and compilation
+admission with the original bounds; per-input bounds do not limit the
+sum of tokens over separate sheets. The compiled count excludes skipped
+at-rules and invalid selectors, but includes rules with no valid values.
+Value acceptance below counts declarations, not expanded longhands, and
+includes values inside skipped grouping rules. No corpus bytes are tests.
+
+| Capture | CSS bytes | Tokens | Style rules / compiled | Declarations / accepted | Rules in media | Custom declarations / var() / calc() |
+|---|---:|---:|---:|---:|---:|---:|
+| [Bootstrap cheatsheet](https://getbootstrap.com/docs/5.3/examples/cheatsheet/) | 237,445 | 48,098 | 2,583 / 1,005 | 5,642 / 1,654 | 1,368 (53%) | 1,198 / 1,380 / 134 |
+| [Debian](https://www.debian.org/) | 20,075 | 5,218 | 133 / 88 | 417 / 212 | 14 (11%) | 0 / 0 / 0 |
+| [GitHub Rust README](https://github.com/rust-lang/rust) | 2,532,428 | 390,843 | 16,135 / 5,896 | 43,118 / 6,385 | 5,185 (32%) | 11,127 / 21,768 / 1,171 |
+| [kernel.org](https://www.kernel.org/) | 13,860 | 3,577 | 108 / 55 | 321 / 169 | 50 (46%) | 0 / 0 / 0 |
+| [MDN CSS](https://developer.mozilla.org/en-US/docs/Web/CSS) | 116,139 | 22,884 | 743 / 350 | 1,953 / 479 | 108 (15%) | 373 / 1,235 / 25 |
+| [The Guardian](https://www.theguardian.com/international) | 639,068 | 95,371 | 1,133 / 433 | 18,473 / 1,952 | 477 (42%) | 13,292 / 190 / 44 |
+| [Rust Book](https://doc.rust-lang.org/book/ch03-01-variables-and-mutability.html) | 50,083 | 11,116 | 272 / 221 | 917 / 238 | 13 (5%) | 252 / 137 / 16 |
+| [Wikipedia CSS](https://en.wikipedia.org/wiki/Cascading_Style_Sheets) | 252,655 | 45,142 | 1,516 / 564 | 3,585 / 1,260 | 766 (51%) | 421 / 565 / 139 |
+
+The unindexed matcher charges selector tests, hops and inspected string
+bytes. Per-element work below is median/p95/maximum; refused calls show
+consumed work before the failing charge, not their unbounded demand.
+Compute time is one release-mode whole-tree pass on the development host,
+excluding the separate work-counter pass, parsing and I/O. It is an
+observation, not a portable timing threshold. Failed parent computations
+supply no parent to later calls, so timings with refusals do not measure a
+successfully styled tree.
+
+| Capture | Elements | Match steps p50 / p95 / max | Refused elements | Compute ms |
+|---|---:|---:|---:|---:|
+| Bootstrap cheatsheet | 1,422 | 14,559 / 66,295 / 84,313 | 0 | 49.54 |
+| Debian | 267 | 525 / 1,850 / 2,587 | 0 | 1.22 |
+| GitHub Rust README | 2,246 | 99,978 / 100,000 / 100,000 | 1,465 | 390.78 |
+| kernel.org | 325 | 238 / 449 / 715 | 0 | 1.17 |
+| MDN CSS | 5,239 | 2,661 / 7,007 / 12,534 | 0 | 55.83 |
+| The Guardian | 4,831 | 5,425 / 12,627 / 46,519 | 0 | 71.64 |
+| Rust Book | 272 | 1,244 / 6,212 / 10,796 | 0 | 2.15 |
+| Wikipedia CSS | 6,404 | 10,110 / 32,086 / 99,883 | 1 | 152.88 |
+
+Both observed refusals are `MAX_MATCH_STEPS`: GitHub on 1,465 elements
+and Wikipedia on one. A synthetic 5,000 unrelated class rules against an
+element with a 33-byte class attribute reproduces that failure. The rule
+index must remove that unrelated work before considering a budget increase.
+Universal and structural rules must retain a finite refusal path.
+
+Skipped groups include media/supports on most sites, GitHub's layers and
+containers, and font-face/keyframes. Common unsupported selector names
+in the outer preludes are hover (932), before (849), after (730), focus
+(442), lang (410), active (206), focus-visible (190) and checked (145).
+These occurrence counts do not recursively enumerate logical arguments.
+Properties with high frequency outside the first set include position
+(1,356), border (694), line-height (663), border-color (551), max-width
+(425), overflow (416), opacity (328), min-width (310), vertical-align
+(239) and float (215). The layout-facing work in §7 includes these, plus
+their companion longhands, font shorthand, clear, visibility, text-indent,
+text-transform, box-sizing and letter-spacing. Relative offsets are needed
+with relative positioning; absolute/fixed/sticky positioning, flex/grid
+layout, border-radius, shadows, generated content and images remain beyond
+that property increment. Functional colors are a distinct remaining gap.
+
+Capture identities below are SHA-256. The CSS identity hashes, in capture
+order, each filename, NUL, its file SHA-256 in lowercase hex, and LF; it
+identifies the bundle without retaining downloaded bytes in git.
+
+| Capture | HTML SHA-256 | CSS bundle SHA-256 |
+|---|---|---|
+| Bootstrap cheatsheet | `01594c4e79d9a6c259ece6618555f77f683559c8a98777c5333784dd12dcf807` | `5a76551aee0901464d76b18160e0824dd57a746b69a3dba5a5be132d9d16b242` |
+| Debian | `06bdc137f5ecc3dfc8ec29ce208b46dd1e1baa82812e52c06aae1987adc1757d` | `85f29ed36e7490d65e4dfcf355f9d8dae41a60a8c9af63da7a20b5af0238e4b0` |
+| GitHub Rust README | `a1d78d00873a2803489148f478f44a4e01a2da8179d29beae35177b8586b3188` | `b20b69b4d29b7e7ac1091c280cbb80d36f1d24962e049e7579d188343a87e0c6` |
+| kernel.org | `33bf3d63d934d94a82ae68bd86985f818c2775717ab9d54c46d364c0d2cf320a` | `00ea93489686e927d119403897a53c01552283207a68f73c2b30e2623edf25a5` |
+| MDN CSS | `5900f37fc4684a75ccbc81affdcbcdd477a56983a2dacc873b4b4b97151510aa` | `558f2503a24d994262998c0d006fe74e2ef3975d1806b619f49f846e5265480b` |
+| The Guardian | `1ef64be3026b305e77e319bba9be5996d21fe7c0fae9223b04364d361ad13a59` | `d41245206e720d343d3f3c0c564f52b58bb750f885054e337ad0ba8859b141bd` |
+| Rust Book | `f06a10a850287ef35db88d0f0080d269eea9f736f0e295e22d803ab7b635b7ce` | `caba047cab8ac3c227028122608833285f7a7ba0a26bb9228bfc0664aa016802` |
+| Wikipedia CSS | `7ac5bb7612c91b2b48ba95553b1eb8b4abeaa26deef7dc3a54e11a9f82694f6d` | `60b1fc167a3aea176e67ef38396975aa953885f2df4defbc7e57b5f09a4d0873` |

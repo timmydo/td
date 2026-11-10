@@ -851,3 +851,41 @@ fn aggregate_admission_limits_and_context_are_enforced() {
         Err(Error::Limit("MAX_MATCH_STEPS"))
     );
 }
+
+#[test]
+fn realistic_class_rule_fanout_exposes_unindexed_work() {
+    // Original synthetic shape: thousands of unrelated utility classes,
+    // and a modest multi-class element. No downloaded stylesheet bytes.
+    let css: String = (0..5000)
+        .map(|i| format!(".utility-{i}{{color:red}}"))
+        .collect();
+    let mut nodes = tree();
+    nodes[3].attrs = vec![("class", "article body primary wide visible".into())];
+    let set = StyleSet::new(&[(Origin::Author, &css)]).unwrap();
+    assert_eq!(
+        set.compute(
+            &Handle {
+                nodes: &nodes,
+                index: 3
+            },
+            None,
+            16.0,
+            ""
+        ),
+        Err(Error::Limit("MAX_MATCH_STEPS"))
+    );
+}
+
+#[test]
+fn conditional_variables_do_not_masquerade_as_supported_coverage() {
+    let css = ":root { --ink:blue } @media screen { p { color:blue } } \
+               p { color:red; color:var(--ink); width:calc(100% - 2px) } \
+               p:hover { color:blue } p::before { color:blue }";
+    let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
+    assert_eq!(set.rules.len(), 2);
+    assert_eq!(compute(css, "").get(Property::Color), Some(&red()));
+    assert_eq!(
+        compute(css, "").get(Property::Width),
+        Some(&V::Length(Length::Auto))
+    );
+}
