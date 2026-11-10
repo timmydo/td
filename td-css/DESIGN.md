@@ -46,10 +46,10 @@ unknown rules. Declaration-list at-rules are consumed and ignored. Style
 compilation evaluates nested `@media` and `@supports` groups as described
 below. Other at-rules, including `@import`, `@font-face`, `@page`,
 `@namespace`, `@container` and `@layer`, are skipped whole; their contents
-never leak into the surrounding cascade. No URL is fetched. Custom properties are
-ordinary syntax but have no computed interpretation; `var()`, `calc()`,
-animations, transitions, counters and generated content are outside this
-contract. Unsupported selectors invalidate their rule, unsupported
+never leak into the surrounding cascade. No URL is fetched. Custom properties and `var()` follow the bounded
+[CSS Variables Level 1 subset](https://www.w3.org/TR/2022/CR-css-variables-1-20220616/)
+in §3. Arithmetic `calc()`, animations, transitions, counters and generated
+content are outside this contract. Unsupported selectors invalidate their rule, unsupported
 properties or values only their declaration.
 
 ## 2. Selectors and the element boundary
@@ -119,8 +119,10 @@ contributes no key because it cannot match. Keys only select candidates:
 the complete selector list still determines matching and specificity.
 Candidate rule numbers are deduplicated and visited in original order.
 
-Only valid property values enter the cascade: a later invalid declaration
-cannot erase an earlier valid one. Supported shorthands expand before
+Ordinary invalid property values are discarded before the cascade. A
+syntactically valid var() value instead defers property grammar until
+substitution: a winning value invalid then becomes unset, without
+resurrecting an earlier declaration. Supported shorthands expand before
 selection. Every implemented property accepts `initial`, `inherit` and
 `unset`; `revert` and `revert-layer` are unsupported. Inheritance uses a
 parent's computed value, never reparses the parent's specified value.
@@ -131,6 +133,49 @@ computed font size for descendant `rem` values. An absent parent identifies
 the root: its own `font-size` resolves `rem` against the initial 16px,
 then its other properties use its newly computed font size, as specified
 by [CSS Values Level 3 §5.1.1](https://www.w3.org/TR/2022/CR-css-values-3-20221201/#font-relative-lengths).
+
+### Custom properties and substitution
+
+Custom names are case-sensitive dashed identifiers other than `--`.
+Their token values inherit; `initial` is guaranteed-invalid, while
+`inherit` and `unset` use the parent's computed tokens. Empty values are
+valid and distinct from missing/invalid values. The ordinary origin,
+importance, specificity, inline and order rules also select custom
+properties. Invalid local values shadow inherited values. No registered
+custom-property syntax, animation taint or attr() is implemented.
+
+var() requires a custom name and optionally a comma followed by fallback
+tokens; the fallback may be empty or contain more commas. Its own
+top-level ! and semicolon tokens are invalid even when unused; those
+tokens remain valid inside nested fallback blocks/functions. Substitution
+copies tokens, never concatenates and retokenizes text. All references,
+including those in unused fallbacks, form the element's dependency graph;
+every member of a cyclic strongly connected component is invalid. An
+invalid dependency can use a fallback. Parent values are already resolved
+before inheritance, so a child's override cannot change their references.
+Font-relative units in inherited token values resolve when an ordinary
+property consumes them on that child.
+
+Property grammar is checked after substituting each winning pending
+longhand. Shorthands reserve all of their longhands during selection,
+including those later invalid at computed-value time. Invalid winning
+values use unset, including the inherited/initial distinction. Substitution
+may itself produce initial/inherit/unset, including on custom properties;
+custom inherit/unset then uses the same name in the parent computed map.
+Unsupported revert/revert-layer produced by substitution is invalid. Unknown properties never enter
+the cascade. Supports accepts valid custom declarations and syntactically
+valid var() on implemented properties without requiring a variable value.
+
+Computed custom maps share immutable parent data when there are no local
+changes; changed maps share token arrays. Invalid entries count toward
+the map limit so repeated invalid names cannot accumulate without bound.
+Graph visits, reference names and copied components share one substitution
+budget per compute call, including pending shorthand reparsing. Payload
+bytes count decoded token strings/numeric representations plus one byte
+per token, function-name bytes plus two, or two per block; map bytes also
+include names. These are admission units, not allocator byte estimates.
+Nested copies and fallback recursion also obey MAX_NESTING. Fatal limits
+refuse the whole compute call, distinct from an invalid CSS value.
 
 ### Conditional rules
 
@@ -266,6 +311,11 @@ it as a stylesheet matching nothing.
 | MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
 | MAX_SHEETS | 64 sheets per style set |
 | MAX_STYLE_BYTES | 4 MiB total sheet source bytes per style set |
+| MAX_CUSTOM_PROPERTIES | 8,192 distinct computed custom names per element, invalid entries included |
+| MAX_CUSTOM_BYTES | 1 MiB computed custom names and token payload admission bytes per element |
+| MAX_VARIABLE_DEPTH | 64 recursive dependency-graph or resolver levels |
+| MAX_SUBSTITUTION_COMPONENTS | 262,144 charged component/reference/graph visits per compute |
+| MAX_SUBSTITUTION_BYTES | 4 MiB cumulative charged payload/name bytes per compute |
 | MAX_FAMILIES | 32 names in a font-family value |
 | MAX_ABSOLUTE_VALUE | 1,000,000 for computed px, percentages and supplied root font size |
 
@@ -301,7 +351,7 @@ an element, optional parent `ComputedStyle`, root font size and inline
 style text. `ComputedStyle` exposes typed read-only property values.
 `compute_with_stats` has the same arguments plus a mutable `ComputeStats`.
 It resets and returns candidate-rule, matched-rule and consumed match-step
-counts even on refusal. Candidate count is zero if gathering fails before
+counts, plus substitution component and byte charges, even on refusal. Candidate count is zero if gathering fails before
 completion; consumed steps exclude the charge that refused. `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
@@ -312,7 +362,8 @@ crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
 the fixed longhand roster. `ComputedStyle::get` yields immutable typed
 values (keywords, RGBA colors, px/percentage/auto lengths, family lists,
 weights and decoration flags); `font_size` and `color` are convenient
-typed accessors. A computed style owns its values and cannot be populated
+typed accessors. `custom_property(name)` exposes an immutable computed
+token slice, or None for missing/guaranteed-invalid values. A computed style owns its values and cannot be populated
 with caller-constructed non-finite values. The crate documentation has
 a compile-checked example implementing the element boundary; runtime
 pipeline tests use the repository's ordinary Cargo test runner.
@@ -533,3 +584,30 @@ the independent visited-rule and nesting bounds. Matching stays at
 | news | 733 / 533 / 633 | 7,518 |
 | rust-book | 221 / 225 / 221 | 1,429 |
 | wikipedia | 1019 / 1084 / 664 | 49,863 |
+
+### Custom-property workload
+
+The same desktop, mobile-dark and print configurations complete every
+captured element without refusal after admitting custom properties and
+pending var() values. Largest per-element substitution charges across
+those runs are below; matching maxima remain under 108,000 steps. These
+costs include graph construction and copies, not just final value size.
+
+| Capture | Substitution bytes / component visits, maximum |
+|---|---:|
+| Bootstrap | 7,919 / 1,026 |
+| Debian | 0 / 0 |
+| GitHub | 132,742 / 8,737 |
+| kernel.org | 0 / 0 |
+| MDN | 20,837 / 1,594 |
+| The Guardian | 37,950 / 2,584 |
+| Rust Book | 3,329 / 435 |
+| Wikipedia | 15,744 / 982 |
+
+Desktop whole-tree release compute times were 24.44ms (Bootstrap),
+102.24ms (GitHub), 593.88ms (MDN), 246.00ms (Guardian), 141.13ms
+(Wikipedia), and under 2ms for the remaining three. Custom maps and
+substitution add real work, especially where many elements declare local
+variables. These host timings are observations, not thresholds or visual
+correctness claims. Functional colors and calc() still limit how many
+substituted values become implemented property values.

@@ -5,6 +5,7 @@ use crate::syntax;
 use crate::values::{
     self, ComputedStyle, Property, Specified, ValueDeclaration, MAX_ABSOLUTE_VALUE,
 };
+use crate::variables::{self, CustomDeclaration, CustomSpecified};
 use crate::{Error, MAX_DECLARATIONS};
 use std::collections::BTreeMap;
 
@@ -43,6 +44,7 @@ impl Origin {
 struct Rule {
     selectors: SelectorList,
     declarations: Vec<ValueDeclaration>,
+    custom: Vec<CustomDeclaration>,
     origin: Origin,
 }
 
@@ -58,10 +60,13 @@ pub struct ComputeStats {
     pub candidate_rules: usize,
     pub matched_rules: usize,
     pub match_steps: usize,
+    pub substitution_components: usize,
+    pub substitution_bytes: usize,
 }
 
 struct Work {
     budget: MatchBudget,
+    substitution: variables::Budget,
     stats: ComputeStats,
     #[cfg(test)]
     unindexed: bool,
@@ -71,6 +76,7 @@ impl Default for Work {
     fn default() -> Self {
         Self {
             budget: MatchBudget::new(),
+            substitution: variables::Budget::default(),
             stats: ComputeStats::default(),
             #[cfg(test)]
             unindexed: false,
@@ -148,6 +154,8 @@ impl StyleSet {
         let mut work = Work::default();
         let result = self.compute_inner(element, parent, root_font_size, inline, &mut work);
         work.stats.match_steps = work.budget.used();
+        work.stats.substitution_components = work.substitution.components;
+        work.stats.substitution_bytes = work.substitution.bytes;
         *stats = work.stats;
         result
     }
@@ -164,6 +172,7 @@ impl StyleSet {
             return Err(Error::InvalidContext);
         }
         let mut winners = BTreeMap::new();
+        let mut custom_winners = BTreeMap::new();
         #[cfg(not(test))]
         let candidates = self.index.candidates(element, &mut work.budget)?;
         #[cfg(test)]
@@ -194,11 +203,42 @@ impl StyleSet {
                     );
                     order += 1;
                 }
+                for declaration in &rule.custom {
+                    choose_custom(
+                        &mut custom_winners,
+                        declaration,
+                        Priority {
+                            rank: rule.origin.rank(declaration.important),
+                            inline: false,
+                            specificity,
+                            order,
+                        },
+                    )?;
+                    order += 1;
+                }
             }
         }
         let inline = syntax::parse_declarations(inline)?;
         let mut count = 0usize;
         for declaration in inline.value() {
+            if let Some(custom) = variables::parse(declaration) {
+                if count == MAX_DECLARATIONS {
+                    return Err(Error::Limit("MAX_DECLARATIONS"));
+                }
+                count += 1;
+                choose_custom(
+                    &mut custom_winners,
+                    &custom,
+                    Priority {
+                        rank: Origin::Author.rank(custom.important),
+                        inline: true,
+                        specificity: Specificity::default(),
+                        order,
+                    },
+                )?;
+                order += 1;
+                continue;
+            }
             for value in values::parse_declaration(declaration)? {
                 if count == MAX_DECLARATIONS {
                     return Err(Error::Limit("MAX_DECLARATIONS"));
@@ -217,7 +257,18 @@ impl StyleSet {
                 order += 1;
             }
         }
-        let mut style = ComputedStyle::default();
+        let custom = variables::compute(
+            custom_winners
+                .into_iter()
+                .map(|(name, winner)| (name, winner.value))
+                .collect(),
+            parent.map(|p| &p.custom),
+            &mut work.substitution,
+        )?;
+        let mut style = ComputedStyle {
+            custom,
+            ..ComputedStyle::default()
+        };
         // Dependency order: font size, then color, then all remaining values.
         let properties = [Property::FontSize, Property::Color].into_iter().chain(
             Property::ALL
@@ -230,9 +281,15 @@ impl StyleSet {
                 .get(&property)
                 .map(|winner: &Winner| &winner.value)
                 .unwrap_or(&Specified::Unset);
-            let value = values::compute_value(
+            let specified = values::resolve_pending(
                 property,
                 specified,
+                &style.custom,
+                &mut work.substitution,
+            )?;
+            let value = values::compute_value(
+                property,
+                &specified,
                 parent,
                 style.font_size(),
                 style.color(),
@@ -245,7 +302,7 @@ impl StyleSet {
                 } else {
                     root_font_size
                 },
-            );
+            )?;
             style.values.insert(property, value);
         }
         Ok(style)
@@ -301,7 +358,16 @@ impl Compiler<'_> {
                 Err(e) => return Err(e),
             };
             let mut declarations = Vec::new();
+            let mut custom = Vec::new();
             for declaration in rule.declarations()?.value() {
+                if let Some(value) = variables::parse(declaration) {
+                    if self.declarations == MAX_DECLARATIONS {
+                        return Err(Error::Limit("MAX_DECLARATIONS"));
+                    }
+                    self.declarations += 1;
+                    custom.push(value);
+                    continue;
+                }
                 for value in values::parse_declaration(declaration)? {
                     if self.declarations == MAX_DECLARATIONS {
                         return Err(Error::Limit("MAX_DECLARATIONS"));
@@ -319,6 +385,7 @@ impl Compiler<'_> {
             self.output.rules.push(Rule {
                 selectors,
                 declarations,
+                custom,
                 origin,
             });
         }
@@ -356,6 +423,31 @@ fn choose(
             },
         );
     }
+}
+
+struct CustomWinner {
+    priority: Priority,
+    value: CustomSpecified,
+}
+fn choose_custom(
+    winners: &mut BTreeMap<String, CustomWinner>,
+    declaration: &CustomDeclaration,
+    priority: Priority,
+) -> Result<(), Error> {
+    let old = winners.get(&declaration.name);
+    if old.is_none() && winners.len() == variables::MAX_CUSTOM_PROPERTIES {
+        return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
+    }
+    if old.is_none_or(|winner| priority >= winner.priority) {
+        winners.insert(
+            declaration.name.clone(),
+            CustomWinner {
+                priority,
+                value: declaration.value.clone(),
+            },
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

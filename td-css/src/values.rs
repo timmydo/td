@@ -1,7 +1,8 @@
 //! The first property grammar and computed-value model.
 use crate::syntax::{Component, Declaration, Token};
-use crate::Error;
+use crate::{variables, Error};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const MAX_FAMILIES: usize = 32;
 pub const MAX_ABSOLUTE_VALUE: f64 = 1_000_000.0;
@@ -200,17 +201,24 @@ pub enum ComputedValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputedStyle {
     pub(crate) values: BTreeMap<Property, ComputedValue>,
+    pub(crate) custom: variables::CustomProperties,
 }
 
 impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
             values: Property::ALL.iter().map(|p| (*p, p.initial())).collect(),
+            custom: variables::CustomProperties::default(),
         }
     }
 }
 
 impl ComputedStyle {
+    /// The inherited, substituted token value; None is missing or invalid.
+    pub fn custom_property(&self, name: &str) -> Option<&[Component]> {
+        self.custom.get(name)
+    }
+
     pub fn get(&self, property: Property) -> Option<&ComputedValue> {
         self.values.get(&property)
     }
@@ -239,6 +247,7 @@ impl ComputedStyle {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Specified {
+    Pending(variables::Pending),
     Initial,
     Inherit,
     Unset,
@@ -318,14 +327,52 @@ fn global(values: &[Component]) -> Option<Specified> {
 }
 
 pub(crate) fn parse_declaration(declaration: &Declaration) -> Result<Vec<ValueDeclaration>, Error> {
-    let name = declaration.name().to_ascii_lowercase();
-    let values = declaration.value();
+    parse_named(
+        declaration.name(),
+        declaration.value(),
+        declaration.important(),
+    )
+}
+
+fn parse_named(
+    name: &str,
+    values: &[Component],
+    important: bool,
+) -> Result<Vec<ValueDeclaration>, Error> {
+    let name = name.to_ascii_lowercase();
+    let values = crate::syntax::trim(values);
     let sides = match name.as_str() {
         "margin" => Some(MARGINS),
         "padding" => Some(PADDINGS),
         "border-width" => Some(BORDERS),
         _ => None,
     };
+    let Some(has_var) = variables::inspect(values) else {
+        return Ok(Vec::new());
+    };
+    if has_var {
+        let targets: Vec<Property> = if let Some(sides) = sides {
+            sides.to_vec()
+        } else {
+            Property::ALL
+                .iter()
+                .copied()
+                .filter(|p| p.name() == name)
+                .collect()
+        };
+        let pending = variables::Pending {
+            name,
+            tokens: Arc::from(values),
+        };
+        return Ok(targets
+            .into_iter()
+            .map(|property| ValueDeclaration {
+                property,
+                value: Specified::Pending(pending.clone()),
+                important,
+            })
+            .collect());
+    }
     if let Some(sides) = sides {
         let parsed = if let Some(value) = global(values) {
             vec![value]
@@ -362,7 +409,7 @@ pub(crate) fn parse_declaration(declaration: &Declaration) -> Result<Vec<ValueDe
             .map(|(property, value)| ValueDeclaration {
                 property,
                 value,
-                important: declaration.important(),
+                important,
             })
             .collect());
     }
@@ -373,10 +420,29 @@ pub(crate) fn parse_declaration(declaration: &Declaration) -> Result<Vec<ValueDe
         .map(|value| ValueDeclaration {
             property,
             value,
-            important: declaration.important(),
+            important,
         })
         .into_iter()
         .collect())
+}
+
+pub(crate) fn resolve_pending(
+    property: Property,
+    value: &Specified,
+    custom: &variables::CustomProperties,
+    budget: &mut variables::Budget,
+) -> Result<Specified, Error> {
+    let Specified::Pending(pending) = value else {
+        return Ok(value.clone());
+    };
+    let Some(tokens) = variables::substitute(&pending.tokens, custom, budget)? else {
+        return Ok(Specified::Unset);
+    };
+    Ok(parse_named(&pending.name, &tokens, false)?
+        .into_iter()
+        .find(|d| d.property == property)
+        .map(|d| d.value)
+        .unwrap_or(Specified::Unset))
 }
 
 fn keyword(values: &[Component], options: &'static [&'static str]) -> Option<Specified> {
@@ -723,14 +789,15 @@ pub(crate) fn compute_value(
     font_size: f64,
     color: Color,
     root_font_size: f64,
-) -> ComputedValue {
+) -> Result<ComputedValue, Error> {
     let inherited = || {
         parent
             .and_then(|style| style.get(property))
             .cloned()
             .unwrap_or_else(|| property.initial())
     };
-    match value {
+    let result = match value {
+        Specified::Pending(_) => return Err(Error::InvalidContext),
         Specified::Initial => property.initial(),
         Specified::Inherit => inherited(),
         Specified::Unset => {
@@ -792,5 +859,6 @@ pub(crate) fn compute_value(
             };
             ComputedValue::Length(length)
         }
-    }
+    };
+    Ok(result)
 }

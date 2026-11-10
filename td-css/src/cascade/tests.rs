@@ -490,7 +490,6 @@ fn unsupported_or_invalid_values_do_not_erase_valid_ones() {
     for invalid in [
         "nonsense",
         "rgb(1,2,3)",
-        "var(--x)",
         "#12",
         "red blue",
         "revert",
@@ -892,7 +891,10 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
                p:hover { color:blue } p::before { color:blue }";
     let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
     assert_eq!(set.rules.len(), 3);
-    assert_eq!(compute(css, "").get(Property::Color), Some(&red()));
+    assert_eq!(
+        compute(css, "").get(Property::Color),
+        Some(&V::Color(Color::BLACK))
+    );
     assert_eq!(
         compute(css, "").get(Property::Width),
         Some(&V::Length(Length::Auto))

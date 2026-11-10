@@ -269,7 +269,9 @@ fn atom(v: &Component, env: Option<&Environment>) -> Result<Option<Truth>, Error
     let [d] = parsed.value().as_slice() else {
         return Ok(Some(Truth::False));
     };
-    Ok(Some(Truth::from(!values::parse_declaration(d)?.is_empty())))
+    Ok(Some(Truth::from(
+        crate::variables::parse(d).is_some() || !values::parse_declaration(d)?.is_empty(),
+    )))
 }
 
 fn feature(values: &[Component], env: &Environment) -> Truth {

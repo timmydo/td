@@ -128,6 +128,8 @@ fn environment_preferences_boolean_and_print() {
 fn supports_uses_property_grammar_and_boolean_not_unknown() {
     for q in [
         "(color:red)",
+        "(color:var(--x))",
+        "(--x:red)",
         "(margin:1px 2em)",
         "(color:red!important)",
         "not (future:value)",
@@ -141,8 +143,6 @@ fn supports_uses_property_grammar_and_boolean_not_unknown() {
     for q in [
         "(color:invalid)",
         "(color:red; color:blue)",
-        "(color:var(--x))",
-        "(--x:red)",
         "(width:calc(1px + 2px))",
         "(color:red) and (display:block) or (padding:0)",
         "not not (color:red)",

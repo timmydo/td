@@ -37,6 +37,7 @@ pub mod conditions;
 pub mod selectors;
 pub mod syntax;
 pub mod values;
+pub mod variables;
 
 pub use cascade::{ComputeStats, Origin, StyleSet, HTML_UA_CSS};
 pub use values::{ComputedStyle, ComputedValue, Property};
