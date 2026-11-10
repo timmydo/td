@@ -1883,8 +1883,12 @@ fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
 }
 
-fn selected_runtime_etc(runtime_files: &Path) -> io::Result<Vec<RuntimeEtcEntry>> {
-    validate_runtime_etc_allowlist()?;
+/// The runtime's own `/etc` entries a kind admits, by its `allowlist`.
+fn selected_runtime_etc(
+    runtime_files: &Path,
+    allowlist: &'static [&'static str],
+) -> io::Result<Vec<RuntimeEtcEntry>> {
+    validate_runtime_etc_allowlist(allowlist)?;
     let root = runtime_files.join("etc");
     match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1899,7 +1903,7 @@ fn selected_runtime_etc(runtime_files: &Path) -> io::Result<Vec<RuntimeEtcEntry>
     }
 
     let mut selected = Vec::new();
-    for name in RUNTIME_ETC_ALLOWLIST {
+    for name in allowlist {
         let source = root.join(name);
         let metadata = match fs::symlink_metadata(&source) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1927,9 +1931,9 @@ fn selected_runtime_etc(runtime_files: &Path) -> io::Result<Vec<RuntimeEtcEntry>
     Ok(selected)
 }
 
-fn validate_runtime_etc_allowlist() -> io::Result<()> {
+fn validate_runtime_etc_allowlist(allowlist: &[&str]) -> io::Result<()> {
     let mut previous = None;
-    for name in RUNTIME_ETC_ALLOWLIST {
+    for name in allowlist {
         if name.is_empty()
             || name.contains('/')
             || previous.is_some_and(|prior: &str| prior >= *name)
@@ -2236,7 +2240,7 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
             "Firefox autotest CA",
         )?;
     }
-    for entry in selected_runtime_etc(&application.runtime_files)? {
+    for entry in selected_runtime_etc(&application.runtime_files, RUNTIME_ETC_ALLOWLIST)? {
         mount_runtime_etc_entry(&entry, &etc)?;
     }
     remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
@@ -2425,10 +2429,10 @@ fn prepare_mount_plan(
 
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
-        mount_application_tree(&application.runtime_files, &format!("{NEW_ROOT}/usr"))?;
-        if application.runtime_aliases {
-            install_runtime_aliases()?;
-        }
+        mount_runtime_tree(
+            &application.runtime_files,
+            application_runtime_aliases(application.runtime_aliases),
+        )?;
         prepare_etc(application)?;
         mount_private_bind(
             &application.state.home,
@@ -2544,8 +2548,25 @@ fn pulse_socket_mode(pulse: bool, host_mode: bool) -> Option<u32> {
     (pulse && !host_mode).then_some(crate::permissions::TD_AUDIO_SOCKET_MODE)
 }
 
-fn install_runtime_aliases() -> io::Result<()> {
-    for (name, target) in RUNTIME_ALIASES {
+/// The aliases an application's runtime takes: [`RUNTIME_ALIASES`] for a
+/// dynamic runtime, none for a static or empty one.
+fn application_runtime_aliases(dynamic: bool) -> &'static [(&'static str, &'static str)] {
+    if dynamic {
+        RUNTIME_ALIASES
+    } else {
+        &[]
+    }
+}
+
+/// A runtime's tree at `/usr`, read-only but executable, and the given
+/// aliases into it at the new root.
+fn mount_runtime_tree(files: &Path, aliases: &[(&str, &str)]) -> io::Result<()> {
+    mount_application_tree(files, &format!("{NEW_ROOT}{RUNTIME_ROOT}"))?;
+    install_runtime_aliases(aliases)
+}
+
+fn install_runtime_aliases(aliases: &[(&str, &str)]) -> io::Result<()> {
+    for (name, target) in aliases {
         symlink(target, format!("{NEW_ROOT}/{name}"))?;
     }
     Ok(())
@@ -3069,9 +3090,11 @@ fn grant_scaffold_names(
             .map(str::to_string)
             .collect::<BTreeSet<_>>()
     };
-    if runtime_aliases {
-        root.extend(RUNTIME_ALIASES.iter().map(|(name, _)| (*name).to_string()));
-    }
+    root.extend(
+        application_runtime_aliases(runtime_aliases)
+            .iter()
+            .map(|(name, _)| (*name).to_string()),
+    );
     if firefox_seccomp_probe {
         root.insert("opt".to_string());
     }
@@ -3119,7 +3142,7 @@ fn expected_etc_names(
     runtime_etc: &[RuntimeEtcEntry],
     etc: EtcBinding<'_>,
 ) -> io::Result<BTreeSet<String>> {
-    validate_runtime_etc_allowlist()?;
+    validate_runtime_etc_allowlist(RUNTIME_ETC_ALLOWLIST)?;
     let mut expected = TD_OWNED_ETC_NAMES
         .iter()
         .filter(|name| etc.resolv_conf || **name != "resolv.conf")
@@ -3308,7 +3331,7 @@ fn require_etc_plan(
     } = etc;
     let expected_machine_id =
         machine_id.ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
-    let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
+    let runtime_etc = selected_runtime_etc(Path::new(RUNTIME_ROOT), RUNTIME_ETC_ALLOWLIST)?;
     let expected = expected_etc_names(&runtime_etc, etc)?;
     let actual = read_dir_names("/etc")?;
     if actual != expected {
@@ -3645,9 +3668,11 @@ fn require_mount_plan(
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
-        if runtime_aliases {
-            require_runtime_aliases()?;
-        }
+        require_runtime_tree(
+            &mountinfo,
+            token,
+            application_runtime_aliases(runtime_aliases),
+        )?;
         require_etc_plan(&mountinfo, token, etc, identity)?;
         require_names("/run", required_run_names(pulse))?;
         let runtime = format!("/run/user/{}", identity.uid);
@@ -3658,15 +3683,13 @@ fn require_mount_plan(
             runtime_names.push(crate::authority::FETCH_RUNTIME_NAME);
         }
         require_names(&runtime, &runtime_names)?;
-        for path in ["/app", "/usr"] {
-            require_mount(
-                &mountinfo,
-                path,
-                None,
-                &["ro", "nosuid", "nodev"],
-                &["rw", "noexec"],
-            )?;
-        }
+        require_mount(
+            &mountinfo,
+            "/app",
+            None,
+            &["ro", "nosuid", "nodev"],
+            &["rw", "noexec"],
+        )?;
         if firefox_seccomp_probe {
             require_names("/opt", &["td-firefox-seccomp-probe"])?;
             require_mode(seccomp::FIREFOX_PROBE_PATH, 0o555)?;
@@ -3808,9 +3831,7 @@ fn require_mount_plan(
         require_mount_super_option(&mountinfo, "/run", "size=65536k")?;
         require_writable_directory(&application_runtime, token)?;
         require_writable_directory("/home/td", token)?;
-        for path in ["/app", "/usr"] {
-            require_read_only_mount(path, token)?;
-        }
+        require_read_only_mount("/app", token)?;
         for filesystem in filesystems {
             require_grant_mount_policy(&mountinfo, filesystem)?;
             match (filesystem.source_kind, filesystem.read_only) {
@@ -3868,8 +3889,25 @@ fn require_mount_plan(
     require_stage2_capabilities()
 }
 
-fn require_runtime_aliases() -> io::Result<()> {
-    for (name, expected_target) in RUNTIME_ALIASES {
+/// The readback of [`mount_runtime_tree`].
+fn require_runtime_tree(
+    mountinfo: &str,
+    token: &[u8; TOKEN_LEN],
+    aliases: &[(&str, &str)],
+) -> io::Result<()> {
+    require_runtime_aliases(aliases)?;
+    require_mount(
+        mountinfo,
+        RUNTIME_ROOT,
+        None,
+        &["ro", "nosuid", "nodev"],
+        &["rw", "noexec"],
+    )?;
+    require_read_only_mount(RUNTIME_ROOT, token)
+}
+
+fn require_runtime_aliases(aliases: &[(&str, &str)]) -> io::Result<()> {
+    for (name, expected_target) in aliases {
         let alias = PathBuf::from("/").join(name);
         let alias_error = |action: &str, error: io::Error| {
             io::Error::new(
@@ -10879,7 +10917,7 @@ mod tests {
         let fonts = fs::symlink_metadata(etc.join("fonts")).unwrap();
         let ld_so_conf = fs::symlink_metadata(etc.join("ld.so.conf")).unwrap();
 
-        let selected = selected_runtime_etc(&runtime).unwrap();
+        let selected = selected_runtime_etc(&runtime, RUNTIME_ETC_ALLOWLIST).unwrap();
         assert_eq!(
             selected,
             [
@@ -10950,7 +10988,7 @@ mod tests {
         fs::write(etc.join("ld.so.conf"), b"changed identity\n").unwrap();
         assert!(require_runtime_etc_source_identity(selected.get(1).unwrap()).is_err());
         symlink("fonts", etc.join("xdg")).unwrap();
-        assert!(selected_runtime_etc(&runtime).is_err());
+        assert!(selected_runtime_etc(&runtime, RUNTIME_ETC_ALLOWLIST).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 
