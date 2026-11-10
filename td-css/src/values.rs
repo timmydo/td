@@ -1,6 +1,6 @@
 //! The first property grammar and computed-value model.
 use crate::syntax::{Component, Declaration, Token};
-use crate::{variables, Error};
+use crate::{calc, variables, Error};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -172,7 +172,45 @@ impl Color {
 pub enum Length {
     Px(f64),
     Percent(f64),
+    /// Unresolved percentage-bearing sum; the caller supplies its basis.
+    Calc {
+        px: f64,
+        percent: f64,
+        non_negative: bool,
+    },
     Auto,
+}
+
+impl Length {
+    /// Resolve against a caller-selected percentage basis, without layout.
+    pub fn resolve(self, basis: f64) -> Option<f64> {
+        if !basis.is_finite() || !(0.0..=MAX_ABSOLUTE_VALUE).contains(&basis) {
+            return None;
+        }
+        let (n, non_negative) = match self {
+            Self::Px(n) if n.is_finite() => (n, false),
+            Self::Percent(p) if p.is_finite() => (p / 100.0 * basis, false),
+            Self::Calc {
+                px,
+                percent,
+                non_negative,
+            } if px.is_finite() && percent.is_finite() => {
+                (px + percent / 100.0 * basis, non_negative)
+            }
+            _ => return None,
+        };
+        if n.is_nan() {
+            return None;
+        }
+        Some(n.clamp(
+            if non_negative {
+                0.0
+            } else {
+                -MAX_ABSOLUTE_VALUE
+            },
+            MAX_ABSOLUTE_VALUE,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +292,7 @@ pub(crate) enum Specified {
     Ready(ComputedValue),
     CurrentColor,
     Length(f64, Unit),
+    Calculated(calc::Linear),
     RelativeWeight(bool),
 }
 
@@ -457,7 +496,7 @@ fn number(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
-fn length(value: &Component) -> Option<(f64, Unit)> {
+pub(crate) fn length(value: &Component) -> Option<(f64, Unit)> {
     match value {
         Component::Token(Token::Number(n)) if number(&n.representation)? == 0.0 => {
             Some((0.0, Unit::Px))
@@ -552,7 +591,13 @@ fn parse_value(property: Property, values: &[Component]) -> Result<Option<Specif
             decoration(values).map(|v| Specified::Ready(ComputedValue::Decoration(v)))
         }
         FontWeight => weight(values),
-        _ => parse_length_property(property, values),
+        _ => {
+            if let [value @ Component::Function { .. }] = values {
+                calc::parse(value, !property.border())?.map(Specified::Calculated)
+            } else {
+                parse_length_property(property, values)
+            }
+        }
     };
     Ok(result)
 }
@@ -829,6 +874,19 @@ pub(crate) fn compute_value(
                 }
             };
             ComputedValue::Weight(weight)
+        }
+        Specified::Calculated(value) => {
+            let em = if property == Property::FontSize {
+                parent.map(ComputedStyle::font_size).unwrap_or(16.0)
+            } else {
+                font_size
+            };
+            ComputedValue::Length(value.compute(
+                em,
+                root_font_size,
+                (property == Property::FontSize).then_some(em),
+                !property.margin(),
+            ))
         }
         Specified::Length(value, unit) => {
             let em = if property == Property::FontSize {

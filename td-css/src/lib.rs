@@ -32,6 +32,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod calc;
 pub mod cascade;
 pub mod conditions;
 pub mod selectors;

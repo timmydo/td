@@ -505,7 +505,7 @@ fn unsupported_or_invalid_values_do_not_erase_valid_ones() {
         "-1px",
         "1vw",
         "1",
-        "calc(1px + 2px)",
+        "calc(1px * 2px)",
         "1e999px",
         "NaN",
         "auto junk",
@@ -897,7 +897,11 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
     );
     assert_eq!(
         compute(css, "").get(Property::Width),
-        Some(&V::Length(Length::Auto))
+        Some(&V::Length(Length::Calc {
+            px: -2.0,
+            percent: 100.0,
+            non_negative: true
+        }))
     );
 }
 

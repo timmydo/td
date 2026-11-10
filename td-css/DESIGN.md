@@ -48,8 +48,8 @@ below. Other at-rules, including `@import`, `@font-face`, `@page`,
 `@namespace`, `@container` and `@layer`, are skipped whole; their contents
 never leak into the surrounding cascade. No URL is fetched. Custom properties and `var()` follow the bounded
 [CSS Variables Level 1 subset](https://www.w3.org/TR/2022/CR-css-variables-1-20220616/)
-in §3. Arithmetic `calc()`, animations, transitions, counters and generated
-content are outside this contract. Unsupported selectors invalidate their rule, unsupported
+in §3. Length arithmetic uses the bounded calc() subset in §4; animations,
+transitions, counters and generated content are outside this contract. Unsupported selectors invalidate their rule, unsupported
 properties or values only their declaration.
 
 ## 2. Selectors and the element boundary
@@ -235,8 +235,9 @@ cm, mm, q, em and rem; bare zero is a length. Percentages on margin,
 padding, width and height stay percentages for layout to resolve.
 Font-size percentages and em use the parent's computed font size; other
 em lengths use the element's computed font size. Unsupported units and
-functions invalidate the declaration. Negative margins are valid;
-negative font sizes, padding, border widths and dimensions are not.
+functions other than calc() invalidate the declaration. Negative margins are valid;
+negative font sizes, padding, border widths and dimensions are invalid
+as bare values; calc() clamps its result to the property range.
 
 | Property | Accepted values | Initial; inherited |
 |---|---|---|
@@ -265,6 +266,34 @@ Display computes to the selected keyword; blockification needs the later
 position/float/layout contract. Font keyword sizes are 9, 10, 13, 16,
 18, 24 and 32px; smaller/larger multiply the parent's size by 1/1.2 or
 1.2. Thin/medium/thick are 1/3/5px. These are td's UA choices.
+
+The length calc() grammar follows [CSS Values Level 3 §8.1](https://www.w3.org/TR/2024/CRD-css-values-3-20240322/#calc-notation):
+parentheses and nested calc(), left-associative + and -, and higher-priority
+* and /. Addition/subtraction require whitespace on both sides. Products
+require a number operand; division requires a nonzero number divisor.
+Unitless zero inside calc() is a number, not a length. Unsupported units,
+dimensionally invalid expressions, non-finite arithmetic, min/max/clamp
+and numeric constants are invalid. No pure-number property calc() grammar
+is claimed by this length subset. Bounds also inspect invalid tails.
+
+Absolute units combine into px; em/rem compute with the same font bases
+as ordinary lengths. Font-size percentages resolve against the parent.
+Other admitted percentages remain `Length::Calc { px, percent,
+non_negative }`, even when their coefficient cancels to zero. Border
+width arithmetic forbids percentages, including canceled ones. Negative
+results clamp to zero only where the property forbids negative lengths;
+unresolved mixed values retain that requirement until their basis is known.
+Finite magnitude is clamped to MAX_ABSOLUTE_VALUE at computation, including
+unresolved coefficients. Floating-point evaluation is deterministic, not
+exact real arithmetic; scaled summation avoids infinity-minus-infinity
+when resolving finite font coefficients.
+
+`Length::resolve(basis)` is a convenience for a caller that has determined
+the appropriate percentage basis. It accepts finite nonnegative CSS px up
+to MAX_ABSOLUTE_VALUE and returns a clamped px value, or None for auto or
+invalid caller-constructed values. It does not choose the basis, establish
+a containing block, or perform layout. The caller must apply any property's
+additional used-value rules.
 
 Recognized generic font families are serif, sans-serif, monospace,
 cursive, fantasy, system-ui, ui-serif, ui-sans-serif, ui-monospace and
@@ -311,6 +340,8 @@ it as a stylesheet matching nothing.
 | MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
 | MAX_SHEETS | 64 sheets per style set |
 | MAX_STYLE_BYTES | 4 MiB total sheet source bytes per style set |
+| MAX_CALC_PARTS | 1,024 recursive component values per calc(), root and whitespace included |
+| MAX_CALC_DEPTH | 16 nested functions/blocks per calc(), root included |
 | MAX_CUSTOM_PROPERTIES | 8,192 distinct computed custom names per element, invalid entries included |
 | MAX_CUSTOM_BYTES | 1 MiB computed custom names and token payload admission bytes per element |
 | MAX_VARIABLE_DEPTH | 64 recursive dependency-graph or resolver levels |
@@ -360,7 +391,7 @@ No filesystem, network, clock, global mutable state or thread is needed.
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
 the fixed longhand roster. `ComputedStyle::get` yields immutable typed
-values (keywords, RGBA colors, px/percentage/auto lengths, family lists,
+values (keywords, RGBA colors, px/percentage/auto and unresolved calc() lengths, family lists,
 weights and decoration flags); `font_size` and `color` are convenient
 typed accessors. `custom_property(name)` exposes an immutable computed
 token slice, or None for missing/guaranteed-invalid values. A computed style owns its values and cannot be populated
@@ -609,5 +640,15 @@ Desktop whole-tree release compute times were 24.44ms (Bootstrap),
 (Wikipedia), and under 2ms for the remaining three. Custom maps and
 substitution add real work, especially where many elements declare local
 variables. These host timings are observations, not thresholds or visual
-correctness claims. Functional colors and calc() still limit how many
+correctness claims. Functional colors and unsupported arithmetic units still limit how many
 substituted values become implemented property values.
+
+### Arithmetic workload
+
+Replaying the same three environments with length calc() enabled admits
+all sheet sets and computes every captured element without refusal.
+Candidate counts and matching work are unchanged (maximum 107,059 steps),
+as are the substitution maxima above. Desktop whole-tree compute ranged
+from 0.98ms to 749.38ms. Unsupported viewport/font-metric units, numeric
+calc() values and functional colors still discard declarations; successful
+admission does not imply complete styling coverage.
