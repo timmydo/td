@@ -15,8 +15,9 @@ The algorithm references are [CSS Syntax Level 3, 24 December 2021](https://www.
 the logical selector functions and attribute flags in
 [Selectors Level 4, 22 January 2026](https://www.w3.org/TR/2026/WD-selectors-4-20260122/),
 and [Cascade Level 4](https://www.w3.org/TR/2022/CR-css-cascade-4-20220113/).
-The dated syntax contract precedes CSS nesting. Rules inside style rules
-are not interpreted as nested selectors.
+The style-rule body uses declaration-list parsing rather than the
+style-block entry point that also admits nesting. Rules inside style
+rules are not interpreted as nested selectors.
 
 Input is already decoded UTF-8 (`&str`). Encoding sniffing and decoding
 bytes belong to the caller. Preprocessing folds CRLF, CR and form feed to
