@@ -3,6 +3,8 @@
 
 use std::fmt;
 mod lossless;
+mod vp8;
+mod vp8_tables;
 
 pub const MAX_AXIS: usize = 16384;
 pub const MAX_IMAGE_PIXELS: usize = 16 << 20;
@@ -77,6 +79,7 @@ struct Chunks<'a> {
     data: &'a [u8],
     pos: usize,
     count: usize,
+    limit: usize,
 }
 impl<'a> Chunks<'a> {
     fn next(&mut self) -> Result<Option<Chunk<'a>>, Error> {
@@ -84,7 +87,7 @@ impl<'a> Chunks<'a> {
             return Ok(None);
         }
         self.count += 1;
-        if self.count > MAX_CHUNKS {
+        if self.count > self.limit {
             return Err(Error::Limit);
         }
         let id = take(self.data, self.pos, 4)?;
@@ -116,6 +119,7 @@ fn chunks(bytes: &[u8]) -> Result<Chunks<'_>, Error> {
         data,
         pos: 0,
         count: 0,
+        limit: MAX_CHUNKS,
     })
 }
 fn coded_header(id: &[u8], data: &[u8]) -> Result<Header, Error> {
@@ -160,16 +164,22 @@ pub fn header(bytes: &[u8]) -> Result<Header, Error> {
 }
 pub fn decode(bytes: &[u8]) -> Result<Rgba8, Error> {
     let expected = header(bytes)?;
-    let mut chunks = chunks(bytes)?;
+    decode_chunks(chunks(bytes)?, expected, true)
+}
+fn decode_chunks(mut chunks: Chunks<'_>, expected: Header, extended: bool) -> Result<Rgba8, Error> {
+    let mut animated = false;
+    let mut animation_control = false;
     let mut output = None;
+    let mut alpha = None;
     while let Some((id, data)) = chunks.next()? {
         match id {
-            b"VP8X" if chunks.count == 1 => {
-                if data.first().is_some_and(|v| v & 2 != 0) {
-                    return Err(Error::Unsupported);
-                }
+            b"VP8X" if extended && chunks.count == 1 => {
+                animated = data.first().is_some_and(|v| v & 2 != 0);
             }
-            b"VP8L" if output.is_none() => {
+            b"VP8L" if output.is_none() && !animated => {
+                if alpha.is_some() {
+                    return Err(Error::Container);
+                }
                 if coded_header(id, data)? != expected {
                     return Err(Error::Container);
                 }
@@ -195,10 +205,129 @@ pub fn decode(bytes: &[u8]) -> Result<Rgba8, Error> {
                     data: rgba,
                 });
             }
-            b"VP8 " | b"ALPH" | b"ANIM" | b"ANMF" => return Err(Error::Unsupported),
-            b"VP8X" | b"VP8L" => return Err(Error::Container),
+            b"VP8 " if output.is_none() && !animated => {
+                if coded_header(id, data)? != expected {
+                    return Err(Error::Container);
+                }
+                let alpha = alpha
+                    .take()
+                    .map(|data| decode_alpha(data, expected))
+                    .transpose()?;
+                let mut image = vp8::decode(data, expected)?;
+                if let Some(alpha) = alpha {
+                    for (pixel, a) in image.data.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
+                        *pixel.get_mut(3).ok_or(Error::Bitstream)? = a;
+                    }
+                }
+                output = Some(image);
+            }
+            b"ALPH" if output.is_none() && alpha.is_none() && !animated => {
+                alpha = Some(data);
+            }
+            b"ANIM" if extended && !animated => {}
+            b"ANIM" if animated && !animation_control && data.len() == 6 => {
+                animation_control = true;
+            }
+            b"ANMF" if extended && animated && animation_control => {
+                let x = le(take(data, 0, 3)?) * 2;
+                let y = le(take(data, 3, 3)?) * 2;
+                let width = le(take(data, 6, 3)?) + 1;
+                let height = le(take(data, 9, 3)?) + 1;
+                let frame_header = dimensions(width, height)?;
+                if x + width > expected.width || y + height > expected.height {
+                    return Err(Error::Container);
+                }
+                let flags = data.get(15).copied().ok_or(Error::Truncated)?;
+                let frame = decode_chunks(
+                    Chunks {
+                        data: data.get(16..).ok_or(Error::Truncated)?,
+                        pos: 0,
+                        count: 0,
+                        limit: chunks.limit.checked_sub(chunks.count).ok_or(Error::Limit)?,
+                    },
+                    frame_header,
+                    false,
+                )?;
+                let mut canvas = Vec::new();
+                let size = expected.width * expected.height * 4;
+                canvas.try_reserve_exact(size).map_err(|_| Error::Limit)?;
+                canvas.resize(size, 0);
+                for (row, source) in frame.data.chunks_exact(width * 4).enumerate() {
+                    let start = ((y + row) * expected.width + x) * 4;
+                    let target = canvas
+                        .get_mut(start..start + source.len())
+                        .ok_or(Error::Container)?;
+                    target.copy_from_slice(source);
+                    if flags & 2 == 0 {
+                        for pixel in target.as_chunks_mut::<4>().0 {
+                            if pixel.get(3) == Some(&0) {
+                                pixel.fill(0);
+                            }
+                        }
+                    }
+                }
+                return Ok(Rgba8 {
+                    width: expected.width,
+                    height: expected.height,
+                    data: canvas,
+                });
+            }
+            b"ANIM" | b"ANMF" => return Err(Error::Container),
+            b"ALPH" => return Err(Error::Container),
+            b"VP8X" | b"VP8L" | b"VP8 " => return Err(Error::Container),
             _ => {}
         }
     }
+    if alpha.is_some() {
+        return Err(Error::Container);
+    }
     output.ok_or(Error::Container)
+}
+
+fn decode_alpha(data: &[u8], header: Header) -> Result<Vec<u8>, Error> {
+    let flags = data.first().copied().ok_or(Error::Truncated)?;
+    if (flags >> 4) & 3 > 1 {
+        return Err(Error::Unsupported);
+    }
+    let body = data.get(1..).ok_or(Error::Truncated)?;
+    let count = header.width * header.height;
+    let mut alpha = Vec::new();
+    match flags & 3 {
+        0 => {
+            if body.len() != count {
+                return Err(Error::Bitstream);
+            }
+            alpha.try_reserve_exact(count).map_err(|_| Error::Limit)?;
+            alpha.extend_from_slice(body);
+        }
+        1 => {
+            let pixels = lossless::decode(body, header.width, header.height)?;
+            alpha.try_reserve_exact(count).map_err(|_| Error::Limit)?;
+            alpha.extend(pixels.into_iter().map(|p| (p >> 8) as u8));
+        }
+        _ => return Err(Error::Unsupported),
+    }
+    let filter = (flags >> 2) & 3;
+    for pos in 0..count {
+        let (x, y) = (pos % header.width, pos / header.width);
+        let get = |offset| alpha.get(offset).copied().ok_or(Error::Bitstream);
+        let pred = if filter == 0 || pos == 0 {
+            0
+        } else if y == 0 {
+            get(pos - 1)?
+        } else if x == 0 {
+            get(pos - header.width)?
+        } else {
+            match filter {
+                1 => get(pos - 1)?,
+                2 => get(pos - header.width)?,
+                _ => (i32::from(get(pos - 1)?) + i32::from(get(pos - header.width)?)
+                    - i32::from(get(pos - header.width - 1)?))
+                .clamp(0, 255) as u8,
+            }
+        };
+        let value = alpha.get_mut(pos).ok_or(Error::Bitstream)?;
+        *value = value.wrapping_add(pred);
+    }
+    Ok(alpha)
 }
