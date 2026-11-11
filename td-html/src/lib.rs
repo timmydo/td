@@ -4292,3 +4292,6 @@ mod tests {
         }
     }
 }
+
+/// Bounded document tree.
+pub mod document;

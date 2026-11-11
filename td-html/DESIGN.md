@@ -297,6 +297,8 @@ excluded: frameset/frame start and end tags are ignored, their other
 contents processed using the current mode; no in-frameset,
 after-frameset or after-after-frameset mode is advertised.
 
+Integration-point status is cached when the immutable element is built;
+text scanning never looks up the same encoding attribute per character.
 SVG and MathML elements retain namespaces, attributes and text, with
 foreign self-closing tags and CDATA. HTML integration points and MathML
 text integration points switch back to HTML token handling; HTML breakout
@@ -319,7 +321,7 @@ repair may move a node or allocate an ancestor after its descendants.
 Node kinds are Document, DocumentFragment, Element, Text, Comment and
 Doctype. Elements expose their local name, namespace (HTML, SVG or
 MathML), attributes and optional template-content id. An attribute has a
-local name, optional prefix and namespace (none, XML, XMLNS or XLink),
+local name, optional fixed `AttributePrefix` and namespace (none, XML, XMLNS or XLink),
 and value; duplicate token attributes keep the first. Text and comment
 nodes own their contents. Doctypes retain name, optional public/system
 identifiers and force-quirks; the document reports its quirks mode.
@@ -348,10 +350,10 @@ refunded after a node is moved or parsing drops a temporary token.
 |---|---:|---|
 | `MAX_INPUT_BYTES` | 4 MiB | UTF-8 input before preprocessing/allocation |
 | `MAX_NODES` | 262,144 | All arena nodes, including document, fragments and repair clones |
-| `MAX_ATTRIBUTES` | 524,288 | Token attributes and attributes copied during repair |
+| `MAX_ATTRIBUTES` | 524,288 | Token attributes and attributes copied into tree/repair nodes |
 | `MAX_TREE_BYTES` | 128 MiB | Cumulative allocation charge described below |
 | `MAX_DEPTH` | 256 | Open elements and final parent-chain depth, fragment roots included |
-| `MAX_ATTRIBUTES_PER_TAG` | 256 | Attributes encountered on one tag, duplicates included |
+| `MAX_ATTRIBUTES_PER_TAG` | 256 | Attributes encountered on one tag (duplicates included), and attributes retained on one element |
 | `MAX_NAME_BYTES` | 1,024 | Tag, attribute and doctype names after preprocessing |
 | `MAX_ATTRIBUTE_BYTES` | 1 MiB | Each decoded attribute value |
 | `MAX_WORK` | 64 million | Tokenizer scalar transitions plus tree traversal/repair steps |
@@ -363,6 +365,7 @@ The allocation charge is `NODE_CHARGE` (256 bytes) per arena node,
 `BYTE_CHARGE` (2 bytes) per byte appended to owned strings. Token text,
 comments, names and doctype identifiers use that same string charge;
 moving a token's string into a node costs no second string charge.
+Attribute prefixes use a fixed enum rather than separately allocated strings.
 Attribute and node vector growth is covered by their fixed charges,
 parser stacks by the depth/node ceilings. The byte charge allows ordinary
 geometric string capacity growth; it is an admission model, not a promise
@@ -426,3 +429,52 @@ baseline; (2) tokenizer and references; (3) document tree and mode
 fixtures; (4) td-dom adapter and whole-page measurements. A renderer
 migration is deferred and requires its own deliberate compatibility
 proposal; it is not a fifth implementation step in this workstream.
+
+### Tree-construction coverage
+
+The immutable arena API exposes `Document::root`, checked `node`, `children`
+and allocation-order `nodes`, plus `quirks_mode`, `work`, `charged_bytes`
+and `errors`. `NodeId::index` is a document-local index for callers' tables.
+`Document::errors` combines tokenizer diagnostics with the tree builder's
+reported recoveries; it is not a full WHATWG error-code or location oracle.
+Element prefixes and namespaces are enums; ordinary attributes have no
+namespace. Repeated html/body tags cannot grow an element past the
+per-element attribute bound, even when every individual tag fits.
+
+The scratch tree oracle compares full tree shapes against html5lib-tests
+revision `9329e64694e7835d0dcff9811e22856ef6ad16f9`. Of 1,488 document
+cases run, 1,462 match. Twenty-five exercise newer select-content rules
+excluded above; one intentionally exceeds `MAX_NAME_BYTES`. Another
+192 fragment, 104 frameset and eight scripting-enabled cases are excluded
+before running. Raw fixture bytes preserve CR and trailing input newlines.
+The suite and its generated harness are not shipped.
+
+Passing cases that visit each insertion mode are listed below; one case
+may visit several modes. The mode instrumentation is scratch-only.
+These counts describe tested tree shapes, not exhaustive algorithm or
+parse-error conformance. Original small Rust fixtures hold the repair,
+foreign-content and template contracts in the crate, beside generated
+link-invariant tests and resource edges.
+
+| Insertion mode | Passing cases |
+|---|---:|
+| Initial / before html / before head / in head / after head / in body (each) | 1,462 |
+| In head noscript | 26 |
+| Text | 310 |
+| In table | 223 |
+| In table text | 45 |
+| In caption | 21 |
+| In column group | 27 |
+| In table body | 132 |
+| In row | 128 |
+| In cell | 97 |
+| In select | 37 |
+| In select in table | 22 |
+| In template | 105 |
+| After body | 54 |
+| After after body | 76 |
+
+The frameset modes are excluded, and the historical select modes are
+intentional. Template contents are separate fragment roots; no fragment
+entry point is implied by their presence. The tree destructor drops a flat
+arena, including detached formatting nodes, without following child links.
