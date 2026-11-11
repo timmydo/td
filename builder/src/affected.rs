@@ -1484,6 +1484,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-charset is a shared decoder with no recipe or consumer yet. Its
+    // standalone tests and reader closure are the whole affected surface.
+    if p.starts_with("td-charset/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-source-scan is the confinement tests' shared source reader and only
     // ever a dev-dependency: no target artifact compiles it, as the recipes
     // compile its consumers' src/ with a direct rustc and no `--test` (td-svc's
@@ -10863,6 +10870,37 @@ mod tests {
                 path_output(&root, path).contains("td-builder check"),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn charset_paths_run_standalone_without_distro_checks() {
+        let root = repo_root();
+        if !root.join("td-charset/Cargo.toml").is_file() {
+            return;
+        }
+        for path in [
+            "td-charset/src/lib.rs",
+            "td-charset/data/gb18030.bin",
+            "td-charset/Cargo.toml",
+            "td-charset/Cargo.lock",
+        ] {
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            for action in ["test", "clippy"] {
+                assert!(
+                    commands.iter().any(|command| command.contains(&format!(
+                        "cargo {action} --frozen --manifest-path td-charset/Cargo.toml"
+                    ))),
+                    "{commands:?}"
+                );
+            }
+            assert!(!path_output(&root, path).contains("td-builder check"));
+        }
+        for path in [
+            "td-charset-extra/src/lib.rs",
+            "td-charset/../td-sh/src/main.rs",
+        ] {
+            assert!(path_output(&root, path).contains("td-builder check"));
         }
     }
 

@@ -1,0 +1,21 @@
+[package]
+name = "td-charset"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND BSD-3-Clause"
+description = "Bounded WHATWG legacy text decoding and charset sniffing"
+
+# Shared source library, independently checked like the other td-* crates.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
