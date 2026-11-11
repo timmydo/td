@@ -77,7 +77,7 @@ libpng warns and decodes a stream that runs long or has bytes after its
 Adler-32; td-png refuses both, the one place it is stricter, since the
 extra is image data it cannot account for. Each refusal is a named
 `Error`; the inflater's own complaints arrive as `Error::Inflate` with
-its words.
+its allocation-free `InflateError` value.
 
 Read as libpng reads it: an ancillary chunk whose CRC fails is skipped;
 a `tRNS` of the wrong length for its colour type, in an image with an
@@ -97,6 +97,12 @@ second for a frame 8192 pixels square, from a compressed stream a few
 hundred KiB long, so a consumer showing several images budgets each with
 `header` first. A 3840x2160 RGBA frame decodes in about 170 ms in a
 release build.
+
+Decoder buffers reserve fallibly before growth, including compressed data,
+palettes, pixels and row scratch. `Error::Allocation` and
+`Error::Inflate(InflateError::Allocation)` report allocator refusal without
+allocating diagnostics. Header pass enumeration and error display do not
+allocate. The encoder is outside this guarantee.
 
 ## The encoder
 

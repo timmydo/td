@@ -60,28 +60,99 @@ fn fits(width: usize, height: usize) -> bool {
             .is_some_and(|pixels| pixels <= MAX_PICTURE_PIXELS)
 }
 
-pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
-    let name = format.name();
-    if body.len() as u64 > crate::fetch::MAX_DOCUMENT {
-        return Err(format!("The {name} is too large to read."));
+#[derive(Debug)]
+pub(crate) enum Error {
+    Resources,
+    Input(Format),
+    Size(Format, usize, usize),
+    Read(Format, Cause),
+    Decode(Format, Cause),
+    Picture(td_ui::picture::Error),
+}
+#[derive(Debug)]
+pub(crate) enum Cause {
+    Png(td_png::Error),
+    Jpeg(td_jpeg::Error),
+    Gif(td_gif::Error),
+    Webp(td_webp::Error),
+    Avif(td_avif::Error),
+}
+impl Cause {
+    fn resources(&self) -> bool {
+        matches!(
+            self,
+            Self::Png(
+                td_png::Error::Allocation
+                    | td_png::Error::Inflate(td_png::InflateError::Allocation)
+            ) | Self::Jpeg(td_jpeg::Error::Allocation)
+                | Self::Gif(td_gif::Error::Limit)
+                | Self::Webp(td_webp::Error::Limit)
+                | Self::Avif(td_avif::Error::Limit)
+        )
     }
-    let read_error = |why| format!("The {name} could not be read: {why}");
+}
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Png(e) => e.fmt(f),
+            Self::Jpeg(e) => e.fmt(f),
+            Self::Gif(e) => e.fmt(f),
+            Self::Webp(e) => e.fmt(f),
+            Self::Avif(e) => e.fmt(f),
+        }
+    }
+}
+impl Error {
+    pub(crate) fn resources(&self) -> bool {
+        match self {
+            Self::Resources => true,
+            Self::Read(_, c) | Self::Decode(_, c) => c.resources(),
+            _ => false,
+        }
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resources => f.write_str("There is not the memory to show this picture."),
+            Self::Input(format) => write!(f, "The {} is too large to read.", format.name()),
+            Self::Size(format, w, h) => write!(
+                f,
+                "The {} is {w} by {h} pixels, too large to show.",
+                format.name()
+            ),
+            Self::Read(format, cause) => {
+                write!(f, "The {} could not be read: {cause}", format.name())
+            }
+            Self::Decode(format, cause) => {
+                write!(f, "The {} could not be decoded: {cause}", format.name())
+            }
+            Self::Picture(cause) => write!(f, "The picture cannot be shown: {cause}"),
+        }
+    }
+}
+
+pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, Error> {
+    if body.len() as u64 > crate::fetch::MAX_DOCUMENT {
+        return Err(Error::Input(format));
+    }
+    let read_error = |why| Error::Read(format, why);
     let (width, height) = match format {
         Format::Png => td_png::header(body)
             .map(|h| (h.width, h.height))
-            .map_err(|e| read_error(e.to_string()))?,
+            .map_err(|e| read_error(Cause::Png(e)))?,
         Format::Jpeg => td_jpeg::header(body)
             .map(|h| (h.width, h.height))
-            .map_err(|e| read_error(e.to_string()))?,
+            .map_err(|e| read_error(Cause::Jpeg(e)))?,
         Format::Webp => td_webp::header(body)
             .map(|h| (h.width, h.height))
-            .map_err(|e| read_error(e.to_string()))?,
+            .map_err(|e| read_error(Cause::Webp(e)))?,
         Format::Avif => td_avif::header(body)
             .map(|h| (h.width, h.height))
-            .map_err(|e| read_error(e.to_string()))?,
+            .map_err(|e| read_error(Cause::Avif(e)))?,
         Format::Gif => td_gif::header(body)
             .map(|h| (h.width, h.height))
-            .map_err(|e| read_error(e.to_string()))?,
+            .map_err(|e| read_error(Cause::Gif(e)))?,
     };
     let scale = if format == Format::Jpeg {
         [
@@ -100,30 +171,30 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
     } else {
         fits(width, height).then_some(td_jpeg::Scale::Full)
     }
-    .ok_or_else(|| format!("The {name} is {width} by {height} pixels, too large to show."))?;
-    let decode_error = |why| format!("The {name} could not be decoded: {why}");
+    .ok_or(Error::Size(format, width, height))?;
+    let decode_error = |why| Error::Decode(format, why);
     let (width, height, rgba) = match format {
         Format::Png => {
-            let image = td_png::decode(body).map_err(|e| decode_error(e.to_string()))?;
+            let image = td_png::decode(body).map_err(|e| decode_error(Cause::Png(e)))?;
             (image.width, image.height, image.data)
         }
         Format::Webp => {
-            let image = td_webp::decode(body).map_err(|e| decode_error(e.to_string()))?;
+            let image = td_webp::decode(body).map_err(|e| decode_error(Cause::Webp(e)))?;
             (image.width, image.height, image.data)
         }
         Format::Avif => {
-            let image = td_avif::decode(body).map_err(|e| decode_error(e.to_string()))?;
+            let image = td_avif::decode(body).map_err(|e| decode_error(Cause::Avif(e)))?;
             (image.width, image.height, image.data)
         }
         Format::Gif => {
-            let image = td_gif::decode(body).map_err(|e| decode_error(e.to_string()))?;
+            let image = td_gif::decode(body).map_err(|e| decode_error(Cause::Gif(e)))?;
             (image.width, image.height, image.data)
         }
         Format::Jpeg => {
-            let image = td_jpeg::decode(body, scale).map_err(|e| decode_error(e.to_string()))?;
+            let image = td_jpeg::decode(body, scale).map_err(|e| decode_error(Cause::Jpeg(e)))?;
             let mut rgba = Vec::new();
             rgba.try_reserve_exact(image.data.len() / 3 * 4)
-                .map_err(|_| "There is not the memory to show the JPEG.".to_string())?;
+                .map_err(|_| Error::Resources)?;
             for pixel in image.data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(pixel);
                 rgba.push(255);
@@ -131,7 +202,7 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
             (image.width, image.height, rgba)
         }
     };
-    Picture::new(width, height, rgba).map_err(|why| format!("The picture cannot be shown: {why}"))
+    Picture::new(width, height, rgba).map_err(Error::Picture)
 }
 
 #[cfg(test)]
@@ -152,6 +223,7 @@ pub(crate) mod tests {
         bytes[6..8].copy_from_slice(&((MAX_PICTURE_AXIS + 1) as u16).to_le_bytes());
         assert!(decode(Format::Gif, &bytes)
             .unwrap_err()
+            .to_string()
             .contains("too large to show"));
         let bytes = vec![0; crate::fetch::MAX_DOCUMENT as usize + 1];
         for format in [
@@ -163,12 +235,14 @@ pub(crate) mod tests {
         ] {
             assert!(decode(format, &bytes)
                 .unwrap_err()
+                .to_string()
                 .contains("too large to read"));
         }
         let mut truncated = GIF.to_vec();
         truncated.truncate(truncated.len() - 2);
         assert!(decode(Format::Gif, &truncated)
             .unwrap_err()
+            .to_string()
             .contains("could not be decoded"));
     }
 

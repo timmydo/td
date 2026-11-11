@@ -293,6 +293,13 @@ sniff of its first bytes for `<!doctype html` or `<html`:
   No animation runs. Encoded bytes and decoded dimensions are checked by the
   shared entry point before allocating picture pixels; decoding runs on
   the existing render thread and is skipped for an already stopped reply.
+  Picture dispatch returns typed errors without formatting allocations.
+  Allocator refusal, and codec limits that share that error category, produce
+  a resource-failure document holding no allocated error page. Its notice
+  paints directly from static text. A failed fit shows the same notice and
+  is retried only after a resize or navigation. This covers picture decoding and fitting,
+  not all allocations in fetching, navigation, fonts or window management;
+  those remain separate migration work.
 - Anything else is not shown: the page names the type and size and
   says that Firefox opens it. Downloads are a later increment (§10).
 

@@ -31,7 +31,7 @@ pub(super) fn scan(data: &[u8], frame: &Frame, tables: &Tables) -> Result<Scan, 
     {
         return Err(Error::Scan);
     }
-    let mut components: Vec<ScanComponent> = Vec::with_capacity(count);
+    let mut components: Vec<ScanComponent> = buffer(count)?;
     for k in 0..count {
         let id = *data.get(1 + 2 * k).ok_or(Error::Segment)?;
         let selectors = *data.get(2 + 2 * k).ok_or(Error::Segment)?;
@@ -98,11 +98,11 @@ fn planes(frame: &Frame) -> Result<Vec<ComponentData>, Error> {
     if total > MAX_PROGRESSIVE_COEFFICIENTS {
         return Err(Error::Limit);
     }
-    let mut result = Vec::new();
+    let mut result = buffer(frame.components.len())?;
     for c in &frame.components {
         let (bh, bv) = frame.blocks(c);
         result.push(ComponentData {
-            blocks: vec![[0; 64]; mx * my * bh * bv],
+            blocks: filled(mx * my * bh * bv, [0; 64])?,
             stride: mx * bh,
             rows: my * bv,
             actual_width: if single {
@@ -459,7 +459,7 @@ fn finish(
 ) -> Result<Rgb8, Error> {
     let n = scale.n();
     for p in &mut planes {
-        p.samples = vec![0; p.stride * p.rows * n * n];
+        p.samples = filled(p.stride * p.rows * n * n, 0)?;
     }
     let (mx, my) = frame.mcu_grid();
     let mut block = [0i32; 64];

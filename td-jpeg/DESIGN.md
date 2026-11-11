@@ -115,6 +115,8 @@ its admitted output is at most 16 Mi pixels, so samples plus RGB need at most
 has released its planes. The coefficient/plane phase is the larger bound,
 192 MiB, equal to the PNG decoding allowance. The four scales reduce sample
 storage; they do not reduce the progressive coefficient-storage requirement.
+Decoder buffers reserve fallibly; allocation failures return `Error::Allocation`
+(or `None` from `Rgb8::new`) without allocating diagnostics.
 There is no incremental rendering API and no file, thread or other ambient
 access.
 

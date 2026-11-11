@@ -11,6 +11,11 @@ Zlib checks its method, window declaration, header check and Adler-32;
 preset dictionaries are unsupported. Raw decoding reports its consumed
 prefix or requires an exact size and complete input.
 
+`decompress_raw_prefix_checked` uses allocation-free `RawError` values.
+All raw-decoder buffers reserve fallibly before growth; fixed alphabets use
+stack arrays. The older String-returning entry points adapt these errors
+for existing callers and are outside the allocation-free error guarantee.
+
 Input is bounded at 257 MiB, gzip members at 4096 and DEFLATE blocks at
 2^20 per decode, shared across gzip members. Huffman lookup is bounded by
 15 code bits. Output grows only after checking its bound; gzip holds the

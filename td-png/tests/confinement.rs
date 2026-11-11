@@ -84,7 +84,7 @@ fn two_source_files_that_open_nothing_and_mount_checksums_inflate_and_deflate() 
     ] {
         assert!(!text.contains(word), "td-png's source names {word}");
     }
-    assert!(text.contains("gzip::decompress_raw_prefix("));
+    assert!(text.contains("gzip::decompress_raw_prefix_checked("));
     assert_eq!(
         names("tests"),
         set(&["confinement.rs", "decode.rs", "encode.rs", "fixtures"])

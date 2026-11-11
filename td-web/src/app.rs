@@ -180,7 +180,44 @@ struct Current {
     view: View,
     rendered: Rendered,
     rendered_for: Option<Layout>,
-    fitted: Option<Fitted>,
+    fitted: PictureFit,
+}
+
+#[derive(Default)]
+enum PictureFit {
+    #[default]
+    Empty,
+    Ready(Fitted),
+    Failed,
+}
+impl PictureFit {
+    fn get_or_fit(&mut self, fit: impl FnOnce() -> Option<Fitted>) -> Option<&Fitted> {
+        if matches!(self, Self::Empty) {
+            *self = fit().map_or(Self::Failed, Self::Ready);
+        }
+        match self {
+            Self::Ready(image) => Some(image),
+            _ => None,
+        }
+    }
+}
+
+fn picture_notice(
+    surface: Surface,
+    page: Rect,
+    bounds: Rect,
+    sink: &mut dyn FnMut(td_ui::raster::Draw),
+) {
+    fill(page, PAPER, bounds, sink);
+    td_ui::raster::text_run(
+        surface.scale,
+        "Picture unavailable: memory or decode budget exhausted.".chars(),
+        (page.x, page.y),
+        page,
+        td_ui::raster::GlyphStyle::regular(td_ui::raster::INK, PAPER),
+        bounds,
+        sink,
+    );
 }
 
 pub struct App {
@@ -280,7 +317,7 @@ impl App {
                 view: View::default(),
                 rendered: Rendered::default(),
                 rendered_for: None,
-                fitted: None,
+                fitted: PictureFit::Empty,
             },
             back: Vec::new(),
             forward: Vec::new(),
@@ -503,7 +540,7 @@ impl App {
             view: View::default(),
             rendered: Rendered::default(),
             rendered_for: None,
-            fitted: None,
+            fitted: PictureFit::Empty,
         };
         self.relayout();
         self.current.view.top = self.current.rendered.snap(&mut self.metrics, top);
@@ -1212,7 +1249,7 @@ impl Handler for App {
             }
             Input::Resize(surface) => {
                 self.surface = surface;
-                self.current.fitted = None;
+                self.current.fitted = PictureFit::Empty;
                 self.relayout();
             }
             Input::Paste(text) => {
@@ -1252,7 +1289,7 @@ impl Handler for App {
     fn paint(&mut self, raster: &mut Raster<'_, '_>, surface: Surface) -> Result<(), String> {
         if surface != self.surface {
             self.surface = surface;
-            self.current.fitted = None;
+            self.current.fitted = PictureFit::Empty;
             self.relayout();
         }
         let bounds = surface.bounds();
@@ -1271,18 +1308,19 @@ impl Handler for App {
         match self.current.doc.picture() {
             Some(picture) => {
                 fill(page, PAPER, bounds, &mut sink);
-                let fitted = match self.current.fitted.take() {
-                    Some(fitted) => Some(fitted),
-                    None => {
-                        let (width, height) =
-                            picture.fit_size(page.width as usize, page.height as usize);
-                        picture.fit(width, height)
-                    }
-                };
-                if let Some(fitted) = &fitted {
+                let fitted = self.current.fitted.get_or_fit(|| {
+                    let (width, height) =
+                        picture.fit_size(page.width as usize, page.height as usize);
+                    picture.fit(width, height)
+                });
+                if let Some(fitted) = fitted {
                     raster.image(page, page, fitted);
+                } else {
+                    picture_notice(surface, page, bounds, &mut sink);
                 }
-                self.current.fitted = fitted;
+            }
+            None if self.current.doc.picture_resources() => {
+                picture_notice(surface, page, bounds, &mut sink);
             }
             None => {
                 let rows = self.rows();
@@ -1373,6 +1411,25 @@ pub fn run(start: Option<String>) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn failed_picture_fit_is_remembered_until_reset() {
+        let mut cache = PictureFit::Empty;
+        let picture = td_ui::picture::Picture::new(1, 1, vec![255; 4]).unwrap();
+        assert!(cache.get_or_fit(|| None).is_none());
+        assert!(matches!(cache, PictureFit::Failed));
+        let mut retried = false;
+        assert!(cache
+            .get_or_fit(|| {
+                retried = true;
+                picture.fit(1, 1)
+            })
+            .is_none());
+        assert!(!retried);
+        cache = PictureFit::Empty;
+        assert!(cache.get_or_fit(|| picture.fit(1, 1)).is_some());
+    }
+
     use crate::document::tests::Laid;
     use crate::document::Wrapped;
     use crate::fetch::tests::Table;

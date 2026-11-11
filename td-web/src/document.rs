@@ -1350,6 +1350,7 @@ pub fn visible(text: &str) -> String {
 enum Body {
     Page(Arc<Page>),
     Picture(Picture),
+    PictureResources,
 }
 
 pub struct Document {
@@ -1441,7 +1442,16 @@ impl Document {
                         body: Body::Picture(picture),
                     });
                 }
-                Err(why) => (plain(&why, false, base), None, None),
+                Err(why) if why.resources() => {
+                    return Some(Self {
+                        url: Some(url),
+                        status,
+                        title: None,
+                        note: None,
+                        body: Body::PictureResources,
+                    });
+                }
+                Err(why) => (plain(&why.to_string(), false, base), None, None),
             },
             Kind::Other => {
                 let named = if media.is_empty() {
@@ -1482,10 +1492,14 @@ impl Document {
         Self::error(None, "")
     }
 
+    pub fn picture_resources(&self) -> bool {
+        matches!(self.body, Body::PictureResources)
+    }
+
     pub fn picture(&self) -> Option<&Picture> {
         match &self.body {
             Body::Picture(picture) => Some(picture),
-            Body::Page(_) => None,
+            Body::Page(_) | Body::PictureResources => None,
         }
     }
 
@@ -1495,7 +1509,7 @@ impl Document {
     pub fn render(&self, width: u32, body: TextFamily) -> Rendered {
         match &self.body {
             Body::Page(page) => Rendered::new(page, width, body),
-            Body::Picture(_) => Rendered::default(),
+            Body::Picture(_) | Body::PictureResources => Rendered::default(),
         }
     }
 }
@@ -1853,6 +1867,20 @@ fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+
+    #[test]
+    fn resource_failure_document_needs_no_error_page() {
+        let doc = super::Document {
+            url: None,
+            status: 200,
+            title: None,
+            note: None,
+            body: super::Body::PictureResources,
+        };
+        assert!(doc.picture_resources());
+        assert!(doc.picture().is_none());
+    }
+
     use super::*;
     use td_ui::raster::Scale;
     use td_ui::CELL_WIDTH;

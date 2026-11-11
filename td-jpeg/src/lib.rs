@@ -22,6 +22,19 @@ use std::fmt;
 
 mod progressive;
 
+fn buffer<T>(capacity: usize) -> Result<Vec<T>, Error> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| Error::Allocation)?;
+    Ok(out)
+}
+
+fn filled<T: Copy>(len: usize, value: T) -> Result<Vec<T>, Error> {
+    let mut out = buffer(len)?;
+    out.resize(len, value);
+    Ok(out)
+}
+
 /// The longest axis any RGB buffer here may have.
 pub const MAX_AXIS: usize = 16384;
 
@@ -40,7 +53,7 @@ pub struct Rgb8 {
 
 impl Rgb8 {
     /// A black image, or `None` for a zero axis, one past `MAX_AXIS`, or
-    /// more than `MAX_IMAGE_PIXELS`.
+    /// more than `MAX_IMAGE_PIXELS`, or unavailable buffer memory.
     pub fn new(width: usize, height: usize) -> Option<Self> {
         if width == 0
             || height == 0
@@ -53,7 +66,7 @@ impl Rgb8 {
         Some(Self {
             width,
             height,
-            data: vec![0; width * height * 3],
+            data: filled(width * height * 3, 0).ok()?,
         })
     }
 
@@ -106,6 +119,8 @@ pub enum Error {
     NotJpeg,
     /// Input, marker, scan, coefficient storage or work budget exceeded.
     Limit,
+    /// A bounded buffer could not be allocated.
+    Allocation,
     /// The data ends inside a segment or inside the entropy-coded scan.
     Truncated,
     /// A frame type this decoder does not implement, by its SOF marker.
@@ -135,6 +150,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Allocation => f.write_str("JPEG buffer allocation failed"),
             Self::Limit => f.write_str("JPEG decode budget exceeded"),
             Self::NotJpeg => f.write_str("not a JPEG stream"),
             Self::Truncated => f.write_str("JPEG data ends early"),
@@ -471,7 +487,7 @@ fn parse_frame(segment: &[u8]) -> Result<Frame, Error> {
     {
         return Err(refused);
     }
-    let mut components = Vec::with_capacity(usize::from(count));
+    let mut components = buffer(usize::from(count))?;
     for k in 0..usize::from(count) {
         let id = *segment.get(6 + 3 * k).ok_or(Error::Segment)?;
         let hv = *segment.get(7 + 3 * k).ok_or(Error::Segment)?;
@@ -548,7 +564,7 @@ fn parse_scan(segment: &[u8], frame: &Frame, tables: &Tables) -> Result<Vec<Scan
     if count != frame.components.len() {
         return Err(Error::Scan);
     }
-    let mut scan = Vec::with_capacity(count);
+    let mut scan = buffer(count)?;
     for k in 0..count {
         let id = *segment.get(1 + 2 * k).ok_or(Error::Segment)?;
         let td_ta = *segment.get(2 + 2 * k).ok_or(Error::Segment)?;
@@ -590,7 +606,7 @@ struct Lut {
 
 impl Lut {
     fn build(counts: &[u8; 16], symbols: &[u8]) -> Result<Self, Error> {
-        let mut entries = vec![0u16; 1 << 16];
+        let mut entries = filled(1 << 16, 0u16)?;
         let mut code: u32 = 0;
         let mut next = 0usize;
         for (i, count) in counts.iter().enumerate() {
@@ -1062,7 +1078,7 @@ pub fn decode_with(
     let single = frame.components.len() == 1;
     let (hmax, vmax) = frame.max_sampling();
     let (mcus_x, mcus_y) = frame.mcu_grid();
-    let mut planes: Vec<Plane<'_>> = Vec::with_capacity(parsed.scan.len());
+    let mut planes: Vec<Plane<'_>> = buffer(parsed.scan.len())?;
     for sc in &parsed.scan {
         let comp = frame.components.get(sc.index).ok_or(Error::Scan)?;
         let (bh, bv) = frame.blocks(comp);
@@ -1084,7 +1100,7 @@ pub fn decode_with(
         planes.push(Plane {
             width,
             height,
-            samples: vec![0u8; width * height],
+            samples: filled(width * height, 0u8)?,
             bh,
             bv,
             xshift: if single {
@@ -1168,10 +1184,11 @@ fn render<T>(
     sample: impl Fn(&T, usize, usize) -> u8,
 ) -> Result<Rgb8, Error> {
     let (ow, oh) = (scaled(frame.width, scale), scaled(frame.height, scale));
-    let mut image = Rgb8::new(ow, oh).ok_or(Error::Axis {
-        width: frame.width,
-        height: frame.height,
-    })?;
+    let mut image = Rgb8 {
+        width: ow,
+        height: oh,
+        data: filled(ow * oh * 3, 0)?,
+    };
     match planes {
         [grey] => {
             for (y, row) in image.data.chunks_exact_mut(ow * 3).enumerate() {
@@ -1782,6 +1799,15 @@ fn forward(basis: &[[f32; 8]; 8], samples: &[[f32; 8]; 8], table: &[u16; 64], ou
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    #[test]
+    fn buffer_capacity_failure_is_an_allocation_error() {
+        assert_eq!(
+            super::buffer::<u8>(usize::MAX),
+            Err(super::Error::Allocation)
+        );
+        assert_eq!(super::filled(3, 7u8).unwrap(), [7, 7, 7]);
+    }
 
     use super::*;
 

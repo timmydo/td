@@ -8,6 +8,38 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+/// Allocation-free errors from the hostile-input raw decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawError {
+    Message(&'static str),
+    Value(&'static str, usize),
+    OutputLimit(usize),
+    BlockLimit(usize),
+    Allocation,
+}
+impl std::fmt::Display for RawError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::Value(message, value) => write!(f, "{message} {value}"),
+            Self::OutputLimit(limit) => write!(f, "DEFLATE output exceeds {limit} byte limit"),
+            Self::BlockLimit(limit) => write!(f, "DEFLATE block count exceeds {limit} block limit"),
+            Self::Allocation => f.write_str("DEFLATE buffer allocation failed"),
+        }
+    }
+}
+impl std::error::Error for RawError {}
+impl From<&'static str> for RawError {
+    fn from(value: &'static str) -> Self {
+        Self::Message(value)
+    }
+}
+impl From<RawError> for String {
+    fn from(value: RawError) -> Self {
+        value.to_string()
+    }
+}
+
 const MAX_BITS: usize = 15;
 pub const MAX_GZIP_INPUT_BYTES: u64 = 257 * 1024 * 1024;
 pub(crate) const MAX_GZIP_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
@@ -180,6 +212,14 @@ pub fn decompress_raw_prefix(
     input: &[u8],
     max_output_bytes: usize,
 ) -> Result<(Vec<u8>, usize), String> {
+    decompress_raw_prefix_checked(input, max_output_bytes).map_err(String::from)
+}
+
+/// Raw prefix decoding with allocation-free failures.
+pub fn decompress_raw_prefix_checked(
+    input: &[u8],
+    max_output_bytes: usize,
+) -> Result<(Vec<u8>, usize), RawError> {
     let (output, consumed, _) =
         decompress_raw_prefix_bounded(input, max_output_bytes, MAX_DEFLATE_BLOCKS)?;
     Ok((output, consumed))
@@ -189,10 +229,12 @@ fn decompress_raw_prefix_bounded(
     input: &[u8],
     max_output_bytes: usize,
     max_blocks: usize,
-) -> Result<(Vec<u8>, usize, usize), String> {
-    require_input_size(input.len(), "raw DEFLATE")?;
+) -> Result<(Vec<u8>, usize, usize), RawError> {
+    if input.len() as u128 > u128::from(MAX_GZIP_INPUT_BYTES) {
+        return Err(RawError::Message("raw DEFLATE input exceeds its limit"));
+    }
     if input.is_empty() {
-        return Err("empty raw DEFLATE stream".to_string());
+        return Err(RawError::Message("empty raw DEFLATE stream"));
     }
     let mut bits = BitReader::new(input);
     let mut output = Vec::new();
@@ -212,7 +254,7 @@ pub fn decompress_raw_exact(
         ));
     }
     let (output, consumed) = match decompress_raw_prefix(input, expected_output_bytes) {
-        Err(error) if error == output_limit_error(expected_output_bytes) => {
+        Err(error) if error == output_limit_error(expected_output_bytes).to_string() => {
             return Err(format!(
                 "raw DEFLATE output exceeds declared {expected_output_bytes} bytes"
             ));
@@ -295,17 +337,15 @@ fn inflate(
     out: &mut Vec<u8>,
     max_output_bytes: usize,
     max_blocks: usize,
-) -> Result<usize, String> {
+) -> Result<usize, RawError> {
     let (fixed_lit, fixed_dist) = fixed_trees()?;
     let mut blocks = 0usize;
     loop {
         blocks = blocks
             .checked_add(1)
-            .ok_or_else(|| "DEFLATE block count overflow".to_string())?;
+            .ok_or(RawError::Message("DEFLATE block count overflow"))?;
         if blocks > max_blocks {
-            return Err(format!(
-                "DEFLATE block count exceeds {max_blocks} block limit"
-            ));
+            return Err(RawError::BlockLimit(max_blocks));
         }
         let final_block = bits.read_bits(1)? != 0;
         match bits.read_bits(2)? {
@@ -317,7 +357,7 @@ fn inflate(
                 let (lit, dist) = dynamic_trees(bits)?;
                 inflate_huffman(bits, out, &lit, &dist, max_output_bytes)?;
             }
-            _ => return Err("reserved DEFLATE block type".to_string()),
+            _ => return Err(RawError::Message("reserved DEFLATE block type")),
         }
         if final_block {
             break;
@@ -330,12 +370,14 @@ fn inflate_stored(
     bits: &mut BitReader<'_>,
     out: &mut Vec<u8>,
     max_output_bytes: usize,
-) -> Result<(), String> {
+) -> Result<(), RawError> {
     bits.align_to_byte();
     let len = bits.read_aligned_u16()?;
     let nlen = bits.read_aligned_u16()?;
     if len != !nlen {
-        return Err("stored DEFLATE block length check failed".to_string());
+        return Err(RawError::Message(
+            "stored DEFLATE block length check failed",
+        ));
     }
     for _ in 0..usize::from(len) {
         let b = bits.read_aligned_u8()?;
@@ -350,12 +392,13 @@ fn inflate_huffman(
     lit: &Huffman,
     dist: &Huffman,
     max_output_bytes: usize,
-) -> Result<(), String> {
+) -> Result<(), RawError> {
     loop {
         let sym = lit.decode(bits)?;
         match sym {
             0..=255 => {
-                let byte = u8::try_from(sym).map_err(|_| "literal did not fit u8".to_string())?;
+                let byte =
+                    u8::try_from(sym).map_err(|_| RawError::Message("literal did not fit u8"))?;
                 push_output(out, byte, max_output_bytes)?;
             }
             256 => break,
@@ -365,102 +408,112 @@ fn inflate_huffman(
                 let distance = decode_distance(dist_sym, bits)?;
                 copy_match(out, distance, len, max_output_bytes)?;
             }
-            _ => return Err(format!("invalid DEFLATE literal/length symbol {sym}")),
+            _ => {
+                return Err(RawError::Value(
+                    "invalid DEFLATE literal/length symbol",
+                    sym as usize,
+                ))
+            }
         }
     }
     Ok(())
 }
 
-fn fixed_trees() -> Result<(Huffman, Huffman), String> {
-    let mut lit_lengths = Vec::with_capacity(288);
-    for symbol in 0..288 {
+fn fixed_trees() -> Result<(Huffman, Huffman), RawError> {
+    let mut lit_lengths = [0; 288];
+    for (symbol, slot) in lit_lengths.iter_mut().enumerate() {
         let len = match symbol {
             0..=143 => 8,
             144..=255 => 9,
             256..=279 => 7,
             _ => 8,
         };
-        lit_lengths.push(len);
+        *slot = len;
     }
-    let dist_lengths = vec![5u8; 32];
+    let dist_lengths = [5u8; 32];
     Ok((
         Huffman::from_lengths(&lit_lengths)?,
         Huffman::from_lengths(&dist_lengths)?,
     ))
 }
 
-fn dynamic_trees(bits: &mut BitReader<'_>) -> Result<(Huffman, Huffman), String> {
+fn dynamic_trees(bits: &mut BitReader<'_>) -> Result<(Huffman, Huffman), RawError> {
     let hlit = usize::from(bits.read_bits(5)?)
         .checked_add(257)
-        .ok_or_else(|| "HLIT overflow".to_string())?;
+        .ok_or(RawError::Message("HLIT overflow"))?;
     if hlit > 286 {
-        return Err(format!("reserved DEFLATE HLIT value {hlit}"));
+        return Err(RawError::Value("reserved DEFLATE HLIT value", hlit));
     }
     let hdist = usize::from(bits.read_bits(5)?)
         .checked_add(1)
-        .ok_or_else(|| "HDIST overflow".to_string())?;
+        .ok_or(RawError::Message("HDIST overflow"))?;
     if hdist > 30 {
-        return Err(format!("reserved DEFLATE HDIST value {hdist}"));
+        return Err(RawError::Value("reserved DEFLATE HDIST value", hdist));
     }
     let hclen = usize::from(bits.read_bits(4)?)
         .checked_add(4)
-        .ok_or_else(|| "HCLEN overflow".to_string())?;
+        .ok_or(RawError::Message("HCLEN overflow"))?;
 
-    let mut code_lengths = vec![0u8; 19];
+    let mut code_lengths = [0u8; 19];
     for index in CODE_LENGTH_ORDER.iter().take(hclen) {
         let len = u8::try_from(bits.read_bits(3)?)
-            .map_err(|_| "code-length length did not fit u8".to_string())?;
+            .map_err(|_| RawError::Message("code-length length did not fit u8"))?;
         let slot = code_lengths
             .get_mut(*index)
-            .ok_or_else(|| "code-length order index out of bounds".to_string())?;
+            .ok_or(RawError::Message("code-length order index out of bounds"))?;
         *slot = len;
     }
     let code_tree = Huffman::from_lengths(&code_lengths)?;
     let total = hlit
         .checked_add(hdist)
-        .ok_or_else(|| "dynamic Huffman length count overflow".to_string())?;
-    let mut lengths = Vec::with_capacity(total);
+        .ok_or(RawError::Message("dynamic Huffman length count overflow"))?;
+    let mut lengths = Vec::new();
+    lengths
+        .try_reserve_exact(total)
+        .map_err(|_| RawError::Allocation)?;
     while lengths.len() < total {
         let sym = code_tree.decode(bits)?;
         match sym {
             0..=15 => {
                 let len = u8::try_from(sym)
-                    .map_err(|_| "decoded code length did not fit u8".to_string())?;
+                    .map_err(|_| RawError::Message("decoded code length did not fit u8"))?;
                 lengths.push(len);
             }
             16 => {
-                let prev = *lengths
-                    .last()
-                    .ok_or_else(|| "repeat code length without previous length".to_string())?;
+                let prev = *lengths.last().ok_or(RawError::Message(
+                    "repeat code length without previous length",
+                ))?;
                 let count = usize::from(bits.read_bits(2)?)
                     .checked_add(3)
-                    .ok_or_else(|| "repeat length overflow".to_string())?;
+                    .ok_or(RawError::Message("repeat length overflow"))?;
                 push_repeated(&mut lengths, prev, count, total)?;
             }
             17 => {
                 let count = usize::from(bits.read_bits(3)?)
                     .checked_add(3)
-                    .ok_or_else(|| "zero repeat length overflow".to_string())?;
+                    .ok_or(RawError::Message("zero repeat length overflow"))?;
                 push_repeated(&mut lengths, 0, count, total)?;
             }
             18 => {
                 let count = usize::from(bits.read_bits(7)?)
                     .checked_add(11)
-                    .ok_or_else(|| "long zero repeat length overflow".to_string())?;
+                    .ok_or(RawError::Message("long zero repeat length overflow"))?;
                 push_repeated(&mut lengths, 0, count, total)?;
             }
-            _ => return Err(format!("invalid code-length symbol {sym}")),
+            _ => return Err(RawError::Value("invalid code-length symbol", sym as usize)),
         }
     }
     let lit_lengths = lengths
         .get(..hlit)
-        .ok_or_else(|| "literal length slice out of bounds".to_string())?;
+        .ok_or(RawError::Message("literal length slice out of bounds"))?;
     if lit_lengths.get(256).copied().unwrap_or(0) == 0 {
-        return Err("dynamic Huffman literal tree lacks end-of-block code".to_string());
+        return Err(RawError::Message(
+            "dynamic Huffman literal tree lacks end-of-block code",
+        ));
     }
     let dist_lengths = lengths
         .get(hlit..)
-        .ok_or_else(|| "distance length slice out of bounds".to_string())?;
+        .ok_or(RawError::Message("distance length slice out of bounds"))?;
     Ok((
         Huffman::from_lengths(lit_lengths)?,
         Huffman::from_lengths(dist_lengths)?,
@@ -472,13 +525,15 @@ fn push_repeated(
     value: u8,
     count: usize,
     total: usize,
-) -> Result<(), String> {
+) -> Result<(), RawError> {
     let new_len = lengths
         .len()
         .checked_add(count)
-        .ok_or_else(|| "repeat count overflow".to_string())?;
+        .ok_or(RawError::Message("repeat count overflow"))?;
     if new_len > total {
-        return Err("repeat code length overran dynamic Huffman table".to_string());
+        return Err(RawError::Message(
+            "repeat code length overran dynamic Huffman table",
+        ));
     }
     for _ in 0..count {
         lengths.push(value);
@@ -486,35 +541,36 @@ fn push_repeated(
     Ok(())
 }
 
-fn decode_length(sym: u16, bits: &mut BitReader<'_>) -> Result<usize, String> {
+fn decode_length(sym: u16, bits: &mut BitReader<'_>) -> Result<usize, RawError> {
     let idx = usize::from(
         sym.checked_sub(257)
-            .ok_or_else(|| "length symbol underflow".to_string())?,
+            .ok_or(RawError::Message("length symbol underflow"))?,
     );
     let base = *LENGTH_BASE
         .get(idx)
-        .ok_or_else(|| format!("invalid length symbol {sym}"))?;
+        .ok_or(RawError::Value("invalid length symbol", sym as usize))?;
     let extra = *LENGTH_EXTRA
         .get(idx)
-        .ok_or_else(|| format!("invalid length symbol {sym}"))?;
+        .ok_or(RawError::Value("invalid length symbol", sym as usize))?;
     Ok(base + usize::from(bits.read_bits(extra)?))
 }
 
-fn decode_distance(sym: u16, bits: &mut BitReader<'_>) -> Result<usize, String> {
+fn decode_distance(sym: u16, bits: &mut BitReader<'_>) -> Result<usize, RawError> {
     let idx = usize::from(sym);
     let base = *DIST_BASE
         .get(idx)
-        .ok_or_else(|| format!("invalid distance symbol {sym}"))?;
+        .ok_or(RawError::Value("invalid distance symbol", sym as usize))?;
     let extra = *DIST_EXTRA
         .get(idx)
-        .ok_or_else(|| format!("invalid distance symbol {sym}"))?;
+        .ok_or(RawError::Value("invalid distance symbol", sym as usize))?;
     Ok(base + usize::from(bits.read_bits(extra)?))
 }
 
-fn push_output(out: &mut Vec<u8>, byte: u8, max_output_bytes: usize) -> Result<(), String> {
+fn push_output(out: &mut Vec<u8>, byte: u8, max_output_bytes: usize) -> Result<(), RawError> {
     if out.len() >= max_output_bytes {
         return Err(output_limit_error(max_output_bytes));
     }
+    out.try_reserve(1).map_err(|_| RawError::Allocation)?;
     out.push(byte);
     Ok(())
 }
@@ -524,32 +580,33 @@ fn copy_match(
     distance: usize,
     len: usize,
     max_output_bytes: usize,
-) -> Result<(), String> {
+) -> Result<(), RawError> {
     if distance == 0 || distance > out.len() {
-        return Err(format!("invalid DEFLATE distance {distance}"));
+        return Err(RawError::Value("invalid DEFLATE distance", distance));
     }
     let new_len = out
         .len()
         .checked_add(len)
-        .ok_or_else(|| "DEFLATE output length overflow".to_string())?;
+        .ok_or(RawError::Message("DEFLATE output length overflow"))?;
     if new_len > max_output_bytes {
         return Err(output_limit_error(max_output_bytes));
     }
+    out.try_reserve(len).map_err(|_| RawError::Allocation)?;
     for _ in 0..len {
         let src = out
             .len()
             .checked_sub(distance)
-            .ok_or_else(|| "DEFLATE copy distance underflow".to_string())?;
+            .ok_or(RawError::Message("DEFLATE copy distance underflow"))?;
         let b = *out
             .get(src)
-            .ok_or_else(|| "DEFLATE copy source out of bounds".to_string())?;
+            .ok_or(RawError::Message("DEFLATE copy source out of bounds"))?;
         out.push(b);
     }
     Ok(())
 }
 
-fn output_limit_error(max_output_bytes: usize) -> String {
-    format!("DEFLATE output exceeds {max_output_bytes} byte limit")
+fn output_limit_error(max_output_bytes: usize) -> RawError {
+    RawError::OutputLimit(max_output_bytes)
 }
 
 struct BitReader<'a> {
@@ -573,9 +630,9 @@ impl<'a> BitReader<'a> {
         self.pos
     }
 
-    fn read_bits(&mut self, mut n: u8) -> Result<u16, String> {
+    fn read_bits(&mut self, mut n: u8) -> Result<u16, RawError> {
         if n > 16 {
-            return Err(format!("cannot read {n} bits at once"));
+            return Err(RawError::Value("cannot read", n as usize));
         }
         let mut out = 0u32;
         let mut shift = 0u8;
@@ -585,12 +642,12 @@ impl<'a> BitReader<'a> {
                     *self
                         .input
                         .get(self.pos)
-                        .ok_or_else(|| "truncated DEFLATE stream".to_string())?,
+                        .ok_or(RawError::Message("truncated DEFLATE stream"))?,
                 );
                 self.pos = self
                     .pos
                     .checked_add(1)
-                    .ok_or_else(|| "DEFLATE byte position overflow".to_string())?;
+                    .ok_or(RawError::Message("DEFLATE byte position overflow"))?;
                 self.bit_count = 8;
             }
             let take = n.min(self.bit_count);
@@ -601,9 +658,9 @@ impl<'a> BitReader<'a> {
             n -= take;
             shift = shift
                 .checked_add(take)
-                .ok_or_else(|| "bit shift overflow".to_string())?;
+                .ok_or(RawError::Message("bit shift overflow"))?;
         }
-        u16::try_from(out).map_err(|_| "bit value did not fit u16".to_string())
+        u16::try_from(out).map_err(|_| RawError::Message("bit value did not fit u16"))
     }
 
     fn align_to_byte(&mut self) {
@@ -611,22 +668,24 @@ impl<'a> BitReader<'a> {
         self.bit_count = 0;
     }
 
-    fn read_aligned_u8(&mut self) -> Result<u8, String> {
+    fn read_aligned_u8(&mut self) -> Result<u8, RawError> {
         if self.bit_count != 0 {
-            return Err("internal error: aligned read with pending bits".to_string());
+            return Err(RawError::Message(
+                "internal error: aligned read with pending bits",
+            ));
         }
         let b = *self
             .input
             .get(self.pos)
-            .ok_or_else(|| "truncated DEFLATE stored block".to_string())?;
+            .ok_or(RawError::Message("truncated DEFLATE stored block"))?;
         self.pos = self
             .pos
             .checked_add(1)
-            .ok_or_else(|| "DEFLATE byte position overflow".to_string())?;
+            .ok_or(RawError::Message("DEFLATE byte position overflow"))?;
         Ok(b)
     }
 
-    fn read_aligned_u16(&mut self) -> Result<u16, String> {
+    fn read_aligned_u16(&mut self) -> Result<u16, RawError> {
         let lo = u16::from(self.read_aligned_u8()?);
         let hi = u16::from(self.read_aligned_u8()?);
         Ok(lo | (hi << 8))
@@ -639,19 +698,22 @@ struct Huffman {
 }
 
 impl Huffman {
-    fn from_lengths(lengths: &[u8]) -> Result<Huffman, String> {
+    fn from_lengths(lengths: &[u8]) -> Result<Huffman, RawError> {
         let mut counts = [0u16; MAX_BITS + 1];
         for len in lengths {
             if usize::from(*len) > MAX_BITS {
-                return Err(format!("Huffman code length {len} exceeds {MAX_BITS}"));
+                return Err(RawError::Value(
+                    "Huffman code length exceeds 15:",
+                    usize::from(*len),
+                ));
             }
             if *len != 0 {
                 let slot = counts
                     .get_mut(usize::from(*len))
-                    .ok_or_else(|| "Huffman length count out of bounds".to_string())?;
+                    .ok_or(RawError::Message("Huffman length count out of bounds"))?;
                 *slot = slot
                     .checked_add(1)
-                    .ok_or_else(|| "Huffman length count overflow".to_string())?;
+                    .ok_or(RawError::Message("Huffman length count overflow"))?;
             }
         }
 
@@ -661,38 +723,42 @@ impl Huffman {
             left -= i32::from(
                 *counts
                     .get(bits)
-                    .ok_or_else(|| "Huffman count index out of bounds".to_string())?,
+                    .ok_or(RawError::Message("Huffman count index out of bounds"))?,
             );
             if left < 0 {
-                return Err("oversubscribed Huffman tree".to_string());
+                return Err(RawError::Message("oversubscribed Huffman tree"));
             }
         }
 
         let symbol_count = counts.iter().try_fold(0usize, |total, count| {
             total
                 .checked_add(usize::from(*count))
-                .ok_or_else(|| "Huffman symbol count overflow".to_string())
+                .ok_or(RawError::Message("Huffman symbol count overflow"))
         })?;
         let mut offsets = [0usize; MAX_BITS + 1];
         for len in 1..MAX_BITS {
             let previous = *offsets
                 .get(len)
-                .ok_or_else(|| "Huffman offset index out of bounds".to_string())?;
+                .ok_or(RawError::Message("Huffman offset index out of bounds"))?;
             let count = usize::from(
                 *counts
                     .get(len)
-                    .ok_or_else(|| "Huffman count index out of bounds".to_string())?,
+                    .ok_or(RawError::Message("Huffman count index out of bounds"))?,
             );
             let next = previous
                 .checked_add(count)
-                .ok_or_else(|| "Huffman symbol offset overflow".to_string())?;
+                .ok_or(RawError::Message("Huffman symbol offset overflow"))?;
             let slot = offsets
                 .get_mut(len + 1)
-                .ok_or_else(|| "Huffman offset index out of bounds".to_string())?;
+                .ok_or(RawError::Message("Huffman offset index out of bounds"))?;
             *slot = next;
         }
 
-        let mut symbols = vec![0u16; symbol_count];
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(symbol_count)
+            .map_err(|_| RawError::Allocation)?;
+        symbols.resize(symbol_count, 0u16);
         for (symbol, len) in lengths.iter().enumerate() {
             if *len == 0 {
                 continue;
@@ -700,26 +766,26 @@ impl Huffman {
             let idx = usize::from(*len);
             let offset = offsets
                 .get_mut(idx)
-                .ok_or_else(|| "Huffman symbol offset out of bounds".to_string())?;
+                .ok_or(RawError::Message("Huffman symbol offset out of bounds"))?;
             let at = *offset;
             *offset = offset
                 .checked_add(1)
-                .ok_or_else(|| "Huffman symbol offset overflow".to_string())?;
-            let symbol =
-                u16::try_from(symbol).map_err(|_| "Huffman symbol did not fit u16".to_string())?;
+                .ok_or(RawError::Message("Huffman symbol offset overflow"))?;
+            let symbol = u16::try_from(symbol)
+                .map_err(|_| RawError::Message("Huffman symbol did not fit u16"))?;
             let slot = symbols
                 .get_mut(at)
-                .ok_or_else(|| "Huffman symbol table out of bounds".to_string())?;
+                .ok_or(RawError::Message("Huffman symbol table out of bounds"))?;
             *slot = symbol;
         }
         Ok(Huffman { counts, symbols })
     }
 
-    fn decode(&self, bits: &mut BitReader<'_>) -> Result<u16, String> {
+    fn decode(&self, bits: &mut BitReader<'_>) -> Result<u16, RawError> {
         self.decode_with_steps(bits).map(|(symbol, _)| symbol)
     }
 
-    fn decode_with_steps(&self, bits: &mut BitReader<'_>) -> Result<(u16, usize), String> {
+    fn decode_with_steps(&self, bits: &mut BitReader<'_>) -> Result<(u16, usize), RawError> {
         let mut code = 0u32;
         let mut first = 0u32;
         let mut symbol_base = 0usize;
@@ -729,40 +795,40 @@ impl Huffman {
                 *self
                     .counts
                     .get(len)
-                    .ok_or_else(|| "Huffman count index out of bounds".to_string())?,
+                    .ok_or(RawError::Message("Huffman count index out of bounds"))?,
             );
             let end = first
                 .checked_add(count)
-                .ok_or_else(|| "Huffman decode range overflow".to_string())?;
+                .ok_or(RawError::Message("Huffman decode range overflow"))?;
             if code < end {
                 let within = usize::try_from(
                     code.checked_sub(first)
-                        .ok_or_else(|| "Huffman decode index underflow".to_string())?,
+                        .ok_or(RawError::Message("Huffman decode index underflow"))?,
                 )
-                .map_err(|_| "Huffman decode index did not fit usize".to_string())?;
+                .map_err(|_| RawError::Message("Huffman decode index did not fit usize"))?;
                 let at = symbol_base
                     .checked_add(within)
-                    .ok_or_else(|| "Huffman symbol index overflow".to_string())?;
+                    .ok_or(RawError::Message("Huffman symbol index overflow"))?;
                 let symbol = *self
                     .symbols
                     .get(at)
-                    .ok_or_else(|| "Huffman symbol index out of bounds".to_string())?;
+                    .ok_or(RawError::Message("Huffman symbol index out of bounds"))?;
                 return Ok((symbol, len));
             }
             symbol_base = symbol_base
                 .checked_add(
                     usize::try_from(count)
-                        .map_err(|_| "Huffman length count did not fit usize".to_string())?,
+                        .map_err(|_| RawError::Message("Huffman length count did not fit usize"))?,
                 )
-                .ok_or_else(|| "Huffman symbol base overflow".to_string())?;
+                .ok_or(RawError::Message("Huffman symbol base overflow"))?;
             first = end
                 .checked_shl(1)
-                .ok_or_else(|| "Huffman first-code shift overflow".to_string())?;
+                .ok_or(RawError::Message("Huffman first-code shift overflow"))?;
             code = code
                 .checked_shl(1)
-                .ok_or_else(|| "Huffman decode shift overflow".to_string())?;
+                .ok_or(RawError::Message("Huffman decode shift overflow"))?;
         }
-        Err("invalid Huffman code".to_string())
+        Err(RawError::Message("invalid Huffman code"))
     }
 }
 

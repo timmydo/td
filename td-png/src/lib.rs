@@ -50,6 +50,7 @@ mod encode;
 
 use encode::{adler32, paeth};
 pub use encode::{encode_rgb8, EncodeError};
+pub use gzip::RawError as InflateError;
 
 use std::fmt;
 
@@ -167,6 +168,8 @@ pub enum Error {
     Axis { width: usize, height: usize },
     /// Compressed image data past what its inflated size can need.
     Budget,
+    /// A bounded buffer could not be allocated.
+    Allocation,
     /// A palette image without `PLTE`, or an index past the palette.
     Palette,
     /// No `IDAT`.
@@ -175,7 +178,7 @@ pub enum Error {
     /// past 32 KiB, a bad check or a preset dictionary).
     Zlib,
     /// The DEFLATE stream is malformed; the inflater's words.
-    Inflate(String),
+    Inflate(InflateError),
     /// The image data inflates to other than the size the header implies,
     /// or is followed by anything but its Adler-32.
     Length,
@@ -185,8 +188,8 @@ pub enum Error {
     Filter(u8),
 }
 
-fn name(kind: &[u8; 4]) -> String {
-    kind.iter().map(|b| char::from(*b)).collect()
+fn name(kind: &[u8; 4]) -> &str {
+    std::str::from_utf8(kind).unwrap_or("????")
 }
 
 impl fmt::Display for Error {
@@ -202,6 +205,7 @@ impl fmt::Display for Error {
             Self::Malformed(kind) => write!(f, "PNG chunk {} malformed", name(kind)),
             Self::Format => f.write_str("PNG bit depth, colour type or method not defined"),
             Self::Axis { width, height } => write!(f, "PNG frame {width}x{height} refused"),
+            Self::Allocation => f.write_str("PNG buffer allocation failed"),
             Self::Budget => f.write_str("PNG image data past its budget"),
             Self::Palette => f.write_str("PNG palette missing or index past it"),
             Self::NoData => f.write_str("PNG has no image data"),
@@ -354,25 +358,24 @@ fn row_bytes(head: &Header, width: usize) -> Option<usize> {
 
 /// The passes as (first column, first row, column step, row step, width,
 /// height): one whole-frame pass, or Adam7's seven, empty ones included.
-fn passes(head: &Header) -> Vec<(usize, usize, usize, usize, usize, usize)> {
-    if !head.interlaced {
-        return vec![(0, 0, 1, 1, head.width, head.height)];
-    }
-    ADAM7
-        .iter()
-        .map(|&(x0, y0, dx, dy)| {
-            let w = head.width.saturating_sub(x0).div_ceil(dx);
-            let h = head.height.saturating_sub(y0).div_ceil(dy);
-            (x0, y0, dx, dy, w, h)
-        })
-        .collect()
+fn passes(head: &Header) -> impl Iterator<Item = (usize, usize, usize, usize, usize, usize)> + '_ {
+    let layout = if head.interlaced {
+        ADAM7
+    } else {
+        &[(0, 0, 1, 1)][..]
+    };
+    layout.iter().map(|&(x0, y0, dx, dy)| {
+        let w = head.width.saturating_sub(x0).div_ceil(dx);
+        let h = head.height.saturating_sub(y0).div_ceil(dy);
+        (x0, y0, dx, dy, w, h)
+    })
 }
 
 /// What the image data inflates to: each non-empty pass's rows, a filter
 /// byte before each.
 fn inflated_size(head: &Header) -> Option<usize> {
     let mut total = 0usize;
-    for &(_, _, _, _, w, h) in &passes(head) {
+    for (_, _, _, _, w, h) in passes(head) {
         if w == 0 || h == 0 {
             continue;
         }
@@ -425,6 +428,9 @@ pub fn decode(data: &[u8]) -> Result<Rgba8, Error> {
             if image.len().saturating_add(chunk.data.len()) > budget {
                 return Err(Error::Budget);
             }
+            image
+                .try_reserve(chunk.data.len())
+                .map_err(|_| Error::Allocation)?;
             image.extend_from_slice(chunk.data);
             continue;
         }
@@ -454,13 +460,12 @@ pub fn decode(data: &[u8]) -> Result<Rgba8, Error> {
                 // palette is cut to them, as libpng cuts it.
                 let (triples, _) = chunk.data.as_chunks::<3>();
                 let most = 1usize << head.depth;
-                palette = Some(
-                    triples
-                        .iter()
-                        .take(most)
-                        .map(|&[r, g, b]| [r, g, b, 255])
-                        .collect(),
-                );
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(triples.len().min(most))
+                    .map_err(|_| Error::Allocation)?;
+                entries.extend(triples.iter().take(most).map(|&[r, g, b]| [r, g, b, 255]));
+                palette = Some(entries);
             }
             b"tRNS" => {
                 // Only a valid one before the image data, once, is read;
@@ -538,8 +543,8 @@ fn inflate(stream: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     let body = stream.get(2..).ok_or(Error::Truncated)?;
     // The inflater refuses output past its bound, so a stream that runs
     // long is refused there, by name.
-    let (raw, consumed) = gzip::decompress_raw_prefix(body, expected).map_err(|why| {
-        if why.starts_with("DEFLATE output exceeds") {
+    let (raw, consumed) = gzip::decompress_raw_prefix_checked(body, expected).map_err(|why| {
+        if matches!(why, gzip::RawError::OutputLimit(_)) {
             Error::Length
         } else {
             Error::Inflate(why)
@@ -664,10 +669,14 @@ fn expand(
             width: head.width,
             height: head.height,
         })?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(size)
+        .map_err(|_| Error::Allocation)?;
+    data.resize(size, 0);
     let mut out = Rgba8 {
         width: head.width,
         height: head.height,
-        data: vec![0; size],
+        data,
     };
     let channels = head.colour.channels();
     let bpp = (channels * usize::from(head.depth)).div_ceil(8).max(1);
@@ -680,6 +689,11 @@ fn expand(
         }
         let len = row_bytes(head, w).ok_or(Error::Length)?;
         prior.clear();
+        prior
+            .try_reserve_exact(len)
+            .map_err(|_| Error::Allocation)?;
+        row.clear();
+        row.try_reserve_exact(len).map_err(|_| Error::Allocation)?;
         prior.resize(len, 0);
         for r in 0..h {
             let kind = *raw.get(at).ok_or(Error::Length)?;
