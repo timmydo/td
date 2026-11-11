@@ -5,7 +5,7 @@
 //! enlargement, into the raster's own byte order, so drawing it is a
 //! blend and nothing more.
 
-use std::sync::Arc;
+use std::collections::TryReserveError;
 
 /// The longest axis a picture may have.
 pub const MAX_PICTURE_AXIS: usize = 8192;
@@ -32,13 +32,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Eight-bit RGBA, rows top to bottom, alpha straight; shared, so a
-/// message and its owner hold one copy.
-#[derive(Clone)]
+/// Eight-bit RGBA, rows top to bottom, alpha straight; owns the decoded
+/// buffer without allocating or copying it.
 pub struct Picture {
     width: usize,
     height: usize,
-    rgba: Arc<[u8]>,
+    rgba: Vec<u8>,
 }
 
 impl std::fmt::Debug for Picture {
@@ -48,10 +47,9 @@ impl std::fmt::Debug for Picture {
 }
 
 impl Picture {
-    /// A picture of `width` by `height` from its RGBA bytes, kept shared
-    /// as given.
-    pub fn new(width: usize, height: usize, rgba: impl Into<Arc<[u8]>>) -> Result<Self, Error> {
-        let rgba: Arc<[u8]> = rgba.into();
+    /// A picture of `width` by `height` taking ownership of its RGBA bytes
+    /// as given, without another allocation.
+    pub fn new(width: usize, height: usize, rgba: Vec<u8>) -> Result<Self, Error> {
         if width == 0 || height == 0 || width > MAX_PICTURE_AXIS || height > MAX_PICTURE_AXIS {
             return Err(Error::Size);
         }
@@ -103,49 +101,44 @@ impl Picture {
     /// size; a larger asks for its own), premultiplied, in the raster's
     /// byte order; none when its memory cannot be had.
     pub fn fit(&self, width: usize, height: usize) -> Option<Fitted> {
+        self.fit_with(width, height, Vec::try_reserve_exact)
+    }
+
+    fn fit_with(
+        &self,
+        width: usize,
+        height: usize,
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+    ) -> Option<Fitted> {
         let width = width.clamp(1, self.width);
         let height = height.clamp(1, self.height);
         let mut bgra = Vec::new();
-        bgra.try_reserve_exact(width * height * 4).ok()?;
+        reserve(&mut bgra, width * height * 4).ok()?;
         bgra.resize(width * height * 4, 0);
-        let columns = spans(width, self.width);
-        let rows = spans(height, self.height);
-        // Every output pixel's weights sum to the source's width by its
-        // height; colour sums carry a further 255 from the alpha.
         let total = (self.width * self.height) as u64;
-        let mut sums = vec![[0u64; 4]; width];
-        for (y, row_span) in rows.iter().enumerate() {
-            sums.iter_mut().for_each(|sum| *sum = [0; 4]);
-            for &(source_y, row_weight) in row_span {
-                let row = source_y * self.width * 4;
-                for (sum, column_span) in sums.iter_mut().zip(&columns) {
-                    for &(source_x, column_weight) in column_span {
+        for y in 0..height {
+            for x in 0..width {
+                let (mut blue, mut green, mut red, mut alpha) = (0u64, 0u64, 0u64, 0u64);
+                for (source_y, row_weight) in span(y, height, self.height) {
+                    let row = source_y * self.width * 4;
+                    for (source_x, column_weight) in span(x, width, self.width) {
                         let at = row + source_x * 4;
-                        let Some(&[r, g, b, a]) =
-                            self.rgba.get(at..at + 4).and_then(|p| p.first_chunk::<4>())
-                        else {
-                            continue;
-                        };
-                        let weight = row_weight * column_weight;
-                        let a64 = u64::from(a) * weight;
-                        sum[0] += u64::from(b) * a64;
-                        sum[1] += u64::from(g) * a64;
-                        sum[2] += u64::from(r) * a64;
-                        sum[3] += a64;
+                        let &[r, g, b, a] = self.rgba.get(at..at + 4)?.first_chunk::<4>()?;
+                        let a64 = u64::from(a) * row_weight * column_weight;
+                        blue += u64::from(b) * a64;
+                        green += u64::from(g) * a64;
+                        red += u64::from(r) * a64;
+                        alpha += a64;
                     }
                 }
-            }
-            for (x, sum) in sums.iter().enumerate() {
+                let colour = |s: u64| ((s + total * 255 / 2) / (total * 255)) as u8;
                 let at = (y * width + x) * 4;
-                if let Some(out) = bgra.get_mut(at..at + 4) {
-                    let colour = |s: u64| ((s + total * 255 / 2) / (total * 255)) as u8;
-                    out.copy_from_slice(&[
-                        colour(sum[0]),
-                        colour(sum[1]),
-                        colour(sum[2]),
-                        ((sum[3] + total / 2) / total) as u8,
-                    ]);
-                }
+                bgra.get_mut(at..at + 4)?.copy_from_slice(&[
+                    colour(blue),
+                    colour(green),
+                    colour(red),
+                    ((alpha + total / 2) / total) as u8,
+                ]);
             }
         }
         Some(Fitted {
@@ -156,28 +149,19 @@ impl Picture {
     }
 }
 
-/// Each of `out` output pixels' source pixels along an axis of `from`,
-/// with the length of each one's overlap: output pixel `i` covers
-/// `[i * from, (i + 1) * from)` and source pixel `s` covers
-/// `[s * out, (s + 1) * out)`, so the weights are exact and each output
-/// pixel's sum to `from`.
-fn spans(out: usize, from: usize) -> Vec<Vec<(usize, u64)>> {
-    (0..out)
-        .map(|i| {
-            let (lo, hi) = (i * from, (i + 1) * from);
-            (lo / out..hi.div_ceil(out).min(from))
-                .filter_map(|s| {
-                    let overlap = hi.min((s + 1) * out).saturating_sub(lo.max(s * out));
-                    (overlap > 0).then_some((s, overlap as u64))
-                })
-                .collect()
-        })
-        .collect()
+/// Exact overlap weights for one output pixel. Computing them on demand
+/// avoids a heap allocation for every output row and column.
+fn span(i: usize, out: usize, from: usize) -> impl Iterator<Item = (usize, u64)> {
+    let (lo, hi) = (i * from, (i + 1) * from);
+    (lo / out..hi.div_ceil(out).min(from)).filter_map(move |s| {
+        let overlap = hi.min((s + 1) * out).saturating_sub(lo.max(s * out));
+        (overlap > 0).then_some((s, overlap as u64))
+    })
 }
 
 /// A picture fitted to the size it is drawn at: premultiplied, in the
 /// raster's byte order (blue, green, red, alpha).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Fitted {
     pub width: usize,
     pub height: usize,
@@ -192,5 +176,22 @@ impl Fitted {
         }
         let at = (y * self.width + x) * 4;
         self.bgra.get(at..at + 4)?.first_chunk::<4>().copied()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_fit_allocation_keeps_the_picture_usable() {
+        let image = Picture::new(1, 1, vec![10, 20, 30, 255]).unwrap();
+        let refused = image.fit_with(1, 1, |out, _| out.try_reserve_exact(usize::MAX));
+        assert!(refused.is_none());
+        assert_eq!(
+            image.fit(1, 1).unwrap().pixel(0, 0),
+            Some([30, 20, 10, 255])
+        );
     }
 }

@@ -73,11 +73,16 @@ pub fn filter(
     mi_rows: usize,
     mi_cols: usize,
     skip: impl Fn(usize, usize) -> bool,
-) {
+) -> Result<(), std::collections::TryReserveError> {
     if strengths.is_off() {
-        return;
+        return Ok(());
     }
-    let sources: Vec<Vec<u8>> = planes.iter().map(|p| p.data.to_vec()).collect();
+    let [y, u, v] = &planes;
+    let sources = [
+        crate::memory::copy(y.data)?,
+        crate::memory::copy(u.data)?,
+        crate::memory::copy(v.data)?,
+    ];
     let [mut y, mut u, mut v] = planes;
     let view = |plane: usize, p: &Plane<'_>| View {
         data: sources.get(plane).map_or(&[], |s| s.as_slice()),
@@ -124,6 +129,7 @@ pub fn filter(
             }
         }
     }
+    Ok(())
 }
 
 /// A coded secondary strength's value: 3 means 4.

@@ -53,16 +53,21 @@ const MAX_TILE_ROWS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     /// An axis of zero, or past `MAX_AXIS`.
-    Axis { width: usize, height: usize },
+    Axis {
+        width: usize,
+        height: usize,
+    },
     /// Rows fed that are not whole, or more than the height, or fewer
     /// at the finish.
     Rows,
+    Allocation,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Axis { width, height } => write!(f, "AV1 refuses a {width}x{height} frame"),
+            Self::Allocation => f.write_str("AV1 buffer allocation failed"),
             Self::Rows => f.write_str("rows fed to the AV1 encoder do not fit its frame"),
         }
     }
@@ -763,7 +768,10 @@ impl Geometry {
         let min_log2_tiles = min_log2_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
         let tile_cols_log2 = min_log2_cols.max(cols_log2.min(max_log2_cols));
         let tile_width_sb = sb_cols.div_ceil(1 << tile_cols_log2);
-        let mut tile_col_starts: Vec<usize> = (0..sb_cols).step_by(tile_width_sb).collect();
+        let mut tile_col_starts = Vec::new();
+        crate::memory::reserve(&mut tile_col_starts, sb_cols.div_ceil(tile_width_sb) + 1)
+            .map_err(|_| Error::Allocation)?;
+        tile_col_starts.extend((0..sb_cols).step_by(tile_width_sb));
         tile_col_starts.push(sb_cols);
         let min_log2_rows = min_log2_tiles.saturating_sub(tile_cols_log2);
         let mut tile_rows_log2 = min_log2_rows.max(rows_log2).min(max_log2_rows);
@@ -776,7 +784,10 @@ impl Geometry {
             tile_rows_log2 += 1;
         }
         let tile_height_sb = sb_rows.div_ceil(1 << tile_rows_log2);
-        let mut tile_row_starts: Vec<usize> = (0..sb_rows).step_by(tile_height_sb).collect();
+        let mut tile_row_starts = Vec::new();
+        crate::memory::reserve(&mut tile_row_starts, sb_rows.div_ceil(tile_height_sb) + 1)
+            .map_err(|_| Error::Allocation)?;
+        tile_row_starts.extend((0..sb_rows).step_by(tile_height_sb));
         tile_row_starts.push(sb_rows);
         Ok(Geometry {
             width,
@@ -1047,12 +1058,12 @@ struct Band {
 }
 
 impl Band {
-    fn new(stride: usize, rows: usize) -> Band {
-        Band {
+    fn new(stride: usize, rows: usize) -> Result<Band, Error> {
+        Ok(Band {
             stride,
             rows,
-            data: vec![0; stride * rows],
-        }
+            data: crate::memory::filled(stride * rows, 0).map_err(|_| Error::Allocation)?,
+        })
     }
 
     fn at(&self, x: usize, y: usize) -> u8 {
@@ -1101,24 +1112,24 @@ struct Contexts {
 const DECODED: usize = SB_MI + 3;
 
 impl Contexts {
-    fn new(mi_width: usize) -> Contexts {
-        let cols = || vec![0u8; mi_width];
-        let rows = || vec![0u8; SB_MI];
-        Contexts {
-            above_level: [cols(), cols(), cols()],
-            above_dc: [cols(), cols(), cols()],
-            left_level: [rows(), rows(), rows()],
-            left_dc: [rows(), rows(), rows()],
-            above_skip: cols(),
-            left_skip: rows(),
-            above_mode: cols(),
-            left_mode: rows(),
-            above_uv_mode: cols(),
-            left_uv_mode: rows(),
-            above_width_log2: cols(),
-            left_height_log2: rows(),
+    fn new(mi_width: usize) -> Result<Contexts, Error> {
+        let cols = || crate::memory::filled(mi_width, 0u8).map_err(|_| Error::Allocation);
+        let rows = || crate::memory::filled(SB_MI, 0u8).map_err(|_| Error::Allocation);
+        Ok(Contexts {
+            above_level: [cols()?, cols()?, cols()?],
+            above_dc: [cols()?, cols()?, cols()?],
+            left_level: [rows()?, rows()?, rows()?],
+            left_dc: [rows()?, rows()?, rows()?],
+            above_skip: cols()?,
+            left_skip: rows()?,
+            above_mode: cols()?,
+            left_mode: rows()?,
+            above_uv_mode: cols()?,
+            left_uv_mode: rows()?,
+            above_width_log2: cols()?,
+            left_height_log2: rows()?,
             decoded: [[false; DECODED * DECODED]; 3],
-        }
+        })
     }
 
     /// `clear_left_context()` at a superblock row's start.
@@ -1648,6 +1659,7 @@ impl Wave {
         (mi_row_start, mi_row_end): (usize, usize),
         geometry: &Geometry,
         qindex: u8,
+        buffers: TileBuffers,
     ) -> Wave {
         Wave {
             x0,
@@ -1661,7 +1673,15 @@ impl Wave {
             }),
             moved: Condvar::new(),
             coding: Mutex::new(Coding {
-                tile: Tile::new(x0, width, mi_row_start, mi_row_end, geometry, qindex),
+                tile: Tile::new(
+                    x0,
+                    width,
+                    mi_row_start,
+                    mi_row_end,
+                    geometry,
+                    qindex,
+                    buffers,
+                ),
                 next: mi_row_start / SB_MI,
                 ready: Vec::new(),
             }),
@@ -1720,7 +1740,7 @@ impl Wave {
         geometry: &Geometry,
         qindex: u8,
         kept: &Mutex<Option<Kept>>,
-    ) {
+    ) -> Result<(), Error> {
         // However the search ends, the rows below stop waiting on it, so
         // a panic ends the scope rather than hanging it.
         struct Release<'a>(&'a Wave, usize);
@@ -1737,6 +1757,7 @@ impl Wave {
             self.mi_row_end,
             geometry,
             qindex,
+            TileBuffers::new(self.width)?,
         );
         let band_mi_row = sb_row * SB_MI;
         tile.band_mi_row = band_mi_row;
@@ -1747,6 +1768,7 @@ impl Wave {
             kept.take(&tile, geometry);
         }
         lock(&self.coding).add(sb_row, nodes);
+        Ok(())
     }
 }
 
@@ -1818,6 +1840,36 @@ fn unpack_size(packed: u8, vertical: bool) -> u32 {
     u32::from(if vertical { packed & 15 } else { packed >> 4 })
 }
 
+// Reserve the small buffer state before constructing the large CDF state.
+struct TileBuffers {
+    source: [Band; 3],
+    recon: [Band; 3],
+    contexts: Contexts,
+    sizes: Vec<u8>,
+    skips: Vec<bool>,
+}
+impl TileBuffers {
+    fn new(width: usize) -> Result<Self, Error> {
+        Ok(Self {
+            source: [
+                Band::new(width, SB)?,
+                Band::new(width / 2, SB / 2)?,
+                Band::new(width / 2, SB / 2)?,
+            ],
+            recon: [
+                Band::new(width, SB + 1)?,
+                Band::new(width / 2, SB / 2 + 1)?,
+                Band::new(width / 2, SB / 2 + 1)?,
+            ],
+            contexts: Contexts::new(width / MI)?,
+            sizes: crate::memory::filled(SB_MI * (width / MI), pack_size(3, 3))
+                .map_err(|_| Error::Allocation)?,
+            skips: crate::memory::filled(SB_MI * (width / MI), true)
+                .map_err(|_| Error::Allocation)?,
+        })
+    }
+}
+
 impl Tile {
     fn new(
         x0: usize,
@@ -1826,6 +1878,7 @@ impl Tile {
         mi_row_end: usize,
         geometry: &Geometry,
         qindex: u8,
+        buffers: TileBuffers,
     ) -> Tile {
         let q = u64::try_from(transform::dc_q(qindex)).unwrap_or(4);
         let rdmult = (q * q * 11 / 3).max(1);
@@ -1838,25 +1891,17 @@ impl Tile {
             mi_cols: geometry.mi_cols,
             mi_rows: geometry.mi_rows,
             band_mi_row: 0,
-            source: [
-                Band::new(width, SB),
-                Band::new(width / 2, SB / 2),
-                Band::new(width / 2, SB / 2),
-            ],
-            recon: [
-                Band::new(width, SB + 1),
-                Band::new(width / 2, SB / 2 + 1),
-                Band::new(width / 2, SB / 2 + 1),
-            ],
-            contexts: Contexts::new(width / MI),
+            source: buffers.source,
+            recon: buffers.recon,
+            contexts: buffers.contexts,
             cdfs: Cdfs::new(qindex),
             coder: Coder::new(),
             qindex,
             rdmult,
             screen_weight: 16 * (rdmult * 128).isqrt(),
             scratch: Scratch::default(),
-            sizes: vec![pack_size(3, 3); SB_MI * (width / MI)],
-            skips: vec![true; SB_MI * (width / MI)],
+            sizes: buffers.sizes,
+            skips: buffers.skips,
             mags: Magnitudes::default(),
             spare_segments: Vec::new(),
             spare_pixels: Vec::new(),
@@ -4477,7 +4522,7 @@ impl<R: Runner> Encoder<R> {
         let pending = std::mem::take(&mut self.pending);
         let mut bands = pending.chunks_exact(row_bytes * SB);
         for band in &mut bands {
-            self.code_band(band, SB);
+            self.code_band(band, SB)?;
         }
         self.pending = bands.remainder().to_vec();
         Ok(())
@@ -4498,9 +4543,9 @@ impl<R: Runner> Encoder<R> {
         let rows = self.pending.len() / row_bytes;
         if rows > 0 {
             let band = std::mem::take(&mut self.pending);
-            self.code_band(&band, rows);
+            self.code_band(&band, rows)?;
         }
-        self.flush();
+        self.flush()?;
         self.close_tile_row();
         let mut out = Vec::new();
         obu(
@@ -4523,13 +4568,17 @@ impl<R: Runner> Encoder<R> {
             frame.extend_from_slice(data);
         }
         obu(&mut out, OBU_FRAME, &frame);
-        let reconstruction = self.kept.take().map(|kept| self.reconstruct(kept));
+        let reconstruction = self
+            .kept
+            .take()
+            .map(|kept| self.reconstruct(kept))
+            .transpose()?;
         Ok((out, reconstruction))
     }
 
     /// The kept frame filtered as a decoder filters it, deblocking then
     /// CDEF, then cropped to the picture.
-    fn reconstruct(&self, kept: Kept) -> Reconstruction {
+    fn reconstruct(&self, kept: Kept) -> Result<Reconstruction, Error> {
         let Kept {
             mut planes,
             sizes,
@@ -4583,38 +4632,43 @@ impl<R: Runner> Encoder<R> {
                     .iter()
                     .all(|&k| skips.get(k).copied().unwrap_or(true))
             },
-        );
-        let crop = |padded: &[u8], sub: usize| -> Vec<u8> {
+        )
+        .map_err(|_| Error::Allocation)?;
+        let crop = |padded: &[u8], sub: usize| -> Result<Vec<u8>, Error> {
             let (w, h) = (width.div_ceil(1 << sub), height.div_ceil(1 << sub));
-            padded
-                .chunks_exact(stride >> sub)
-                .take(h)
-                .flat_map(|row| row.get(..w).unwrap_or(&[]))
-                .copied()
-                .collect()
+            let mut out = Vec::new();
+            crate::memory::reserve(&mut out, w * h).map_err(|_| Error::Allocation)?;
+            out.extend(
+                padded
+                    .chunks_exact(stride >> sub)
+                    .take(h)
+                    .flat_map(|row| row.get(..w).unwrap_or(&[]))
+                    .copied(),
+            );
+            Ok(out)
         };
-        Reconstruction {
+        Ok(Reconstruction {
             width,
             height,
-            planes: [crop(y, 0), crop(u, 1), crop(v, 1)],
-        }
+            planes: [crop(y, 0)?, crop(u, 1)?, crop(v, 1)?],
+        })
     }
 
     /// Converts a band of `rows` RGB rows into the planes, padded, as
     /// one superblock row of the batch, and codes the batch when it is
     /// full.
-    fn code_band(&mut self, band: &[u8], rows: usize) {
+    fn code_band(&mut self, band: &[u8], rows: usize) -> Result<(), Error> {
         if let Some(tile_row) = self.geometry.tile_row_starting(self.sb_row) {
-            self.flush();
+            self.flush()?;
             self.close_tile_row();
-            self.open_tile_row(tile_row);
+            self.open_tile_row(tile_row)?;
         }
         let width = self.geometry.width;
         let stride = self.geometry.sb_cols * SB;
         let mut planes = [
-            Band::new(stride, SB),
-            Band::new(stride / 2, SB / 2),
-            Band::new(stride / 2, SB / 2),
+            Band::new(stride, SB)?,
+            Band::new(stride / 2, SB / 2)?,
+            Band::new(stride / 2, SB / 2)?,
         ];
         let rgb_at = |x: usize, y: usize| -> (i32, i32, i32) {
             let x = x.min(width - 1);
@@ -4658,14 +4712,15 @@ impl<R: Runner> Encoder<R> {
         self.batch.push(planes);
         self.sb_row += 1;
         if self.batch.len() >= WAVE_ROWS * self.threads {
-            self.flush();
+            self.flush()?;
         }
+        Ok(())
     }
 
     /// Codes the batch: each tile's rows searched in a wavefront, all
     /// the tiles' rows over the threads in order, so the row a row
     /// waits for is always under way.
-    fn flush(&mut self) {
+    fn flush(&mut self) -> Result<(), Error> {
         let rows = std::mem::take(&mut self.batch);
         let first = self.sb_row - rows.len();
         for wave in &mut self.waves {
@@ -4677,15 +4732,22 @@ impl<R: Runner> Encoder<R> {
             .flat_map(|row| self.waves.iter().rev().map(move |wave| (row, wave)))
             .collect();
         let (geometry, qindex) = (&self.geometry, self.qindex);
+        let failure = Mutex::new(None);
         R::run(jobs, self.threads, |(row, wave)| {
             if let Some(planes) = rows.get(row) {
-                wave.search(row, first + row, planes, geometry, qindex, &kept);
+                if let Err(error) = wave.search(row, first + row, planes, geometry, qindex, &kept) {
+                    *lock(&failure) = Some(error);
+                }
             }
         });
         self.kept = kept.into_inner().unwrap_or_else(PoisonError::into_inner);
+        failure
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Ok(()), Err)
     }
 
-    fn open_tile_row(&mut self, tile_row: usize) {
+    fn open_tile_row(&mut self, tile_row: usize) -> Result<(), Error> {
         let g = &self.geometry;
         let mi_row_start = g.tile_row_starts.get(tile_row).copied().unwrap_or(0) * SB_MI;
         let mi_row_end = g
@@ -4695,19 +4757,23 @@ impl<R: Runner> Encoder<R> {
             .unwrap_or(g.sb_rows)
             * SB_MI;
         let mi_row_end = mi_row_end.min(g.mi_rows);
-        self.waves = (0..g.tile_cols())
-            .map(|col| {
-                let start = g.tile_col_starts.get(col).copied().unwrap_or(0);
-                let end = g.tile_col_starts.get(col + 1).copied().unwrap_or(g.sb_cols);
-                Wave::new(
-                    start * SB,
-                    (end - start) * SB,
-                    (mi_row_start, mi_row_end),
-                    g,
-                    self.qindex,
-                )
-            })
-            .collect();
+        self.waves.clear();
+        crate::memory::reserve(&mut self.waves, g.tile_cols()).map_err(|_| Error::Allocation)?;
+        for col in 0..g.tile_cols() {
+            let start = g.tile_col_starts.get(col).copied().unwrap_or(0);
+            let end = g.tile_col_starts.get(col + 1).copied().unwrap_or(g.sb_cols);
+            let width = (end - start) * SB;
+            let buffers = TileBuffers::new(width)?;
+            self.waves.push(Wave::new(
+                start * SB,
+                width,
+                (mi_row_start, mi_row_end),
+                g,
+                self.qindex,
+                buffers,
+            ));
+        }
+        Ok(())
     }
 
     fn close_tile_row(&mut self) {
@@ -5526,11 +5592,19 @@ mod tests {
         let g = Geometry::new(64, 128).unwrap();
         // Two rows of ramps, searched in order.
         let rows = || {
-            let mut wave = Wave::new(0, 64, (0, g.mi_rows), &g, 120);
+            let mut wave = Wave::new(
+                0,
+                64,
+                (0, g.mi_rows),
+                &g,
+                120,
+                TileBuffers::new(64).unwrap(),
+            );
             wave.begin(2);
             (0..2)
                 .map(|row| {
-                    let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+                    let mut tile =
+                        Tile::new(0, 64, 0, g.mi_rows, &g, 120, TileBuffers::new(64).unwrap());
                     tile.band_mi_row = row * SB_MI;
                     for (i, v) in tile.source[0].data.iter_mut().enumerate() {
                         *v = ((i % 64) * (row + 1) * 3 + i / 64) as u8;
@@ -5542,7 +5616,7 @@ mod tests {
         };
         let write = |order: [usize; 2]| {
             let mut coding = Coding {
-                tile: Tile::new(0, 64, 0, g.mi_rows, &g, 120),
+                tile: Tile::new(0, 64, 0, g.mi_rows, &g, 120, TileBuffers::new(64).unwrap()),
                 next: 0,
                 ready: Vec::new(),
             };
@@ -5566,7 +5640,7 @@ mod tests {
         // a mode left over from the superblock row before is no
         // neighbour where the left edge is unavailable.
         let g = Geometry::new(64, 64).unwrap();
-        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120, TileBuffers::new(64).unwrap());
         let region = At::square(2, 0, 3);
         for (own, past, want) in [(SMOOTH_PRED, DC_PRED, false), (DC_PRED, SMOOTH_PRED, true)] {
             tile.contexts.above_uv_mode[0] = own;
@@ -5590,7 +5664,7 @@ mod tests {
         // with the coefficient's sign, drops some, and returns the end of
         // block its levels have: nonzero before it, zero from it on.
         let g = Geometry::new(64, 64).unwrap();
-        let tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120, TileBuffers::new(64).unwrap());
         let q = transform::ac_q(120);
         let mut rng = Lcg(11);
         let mut mags = Magnitudes::default();
@@ -5653,7 +5727,7 @@ mod tests {
         // counts for the block, over random levels of every size, both
         // plane types and levels past the Golomb threshold.
         let g = Geometry::new(64, 64).unwrap();
-        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120, TileBuffers::new(64).unwrap());
         let mut rng = Lcg(7);
         for round in 0..400 {
             let (at, plane) = (LUMA_SHAPES[round % 10], round / 10 % 2);
@@ -5778,7 +5852,7 @@ mod tests {
             let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
             encoder.keep_reconstruction();
             encoder.encode_rows(&rgb).unwrap();
-            encoder.flush();
+            encoder.flush().unwrap();
             let kept = encoder.kept.as_ref().unwrap();
             let (mut whole, mut coded) = (0, 0);
             for (&s, &skip) in kept.sizes.iter().zip(&kept.skips) {
@@ -5805,7 +5879,7 @@ mod tests {
             let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
             encoder.keep_reconstruction();
             encoder.encode_rows(&bands(width, height, 16)).unwrap();
-            encoder.flush();
+            encoder.flush().unwrap();
             let kept = encoder.kept.as_ref().unwrap();
             let (mi_cols, _) = encoder.geometry.mi_grid();
             let stride = encoder.geometry.sb_grid().0 * SB_MI;
@@ -5833,7 +5907,7 @@ mod tests {
             let mut encoder = Encoder::new(width, height, 97, 1).unwrap();
             encoder.keep_reconstruction();
             encoder.encode_rows(&bands(width, height, band)).unwrap();
-            encoder.flush();
+            encoder.flush().unwrap();
             let kept = encoder.kept.as_ref().unwrap();
             let mut shapes = [0usize; 3];
             for &s in &kept.sizes {

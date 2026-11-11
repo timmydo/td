@@ -28,7 +28,8 @@ module names for its existing consumers.
 - `cdef` filters those planes under one strength set, reading the deblocked
   samples and the supplied skip map. Its source copies are bounded by the
   caller's admitted plane buffers. It covers one CDEF preset and eight-bit
-  4:2:0 geometry.
+  4:2:0 geometry. It reserves all source copies before modifying any plane,
+  returning `TryReserveError` if a copy cannot be allocated.
 
 Plane dimensions, strides and allocation extents must agree, be positive,
 and fit the caller's image budget. The photo caller admits at most 16384
@@ -258,12 +259,17 @@ Decoder bounds:
   at most 4096 samples. Golomb lengths and dequantization keep arithmetic
   bounded, including hostile coefficient magnitudes.
 
-Frame and growing block buffers reserve fallibly. Existing bounded tile
-constructors and reconstruction filters retain their shared std allocation
-behavior; an allocator exhausting the process can still abort. The bounds
+Every decoder-owned buffer reserves fallibly, including tile contexts,
+geometry, reconstruction copies and crops. Allocation failure returns
+`DecodeError::Limit` without allocating an error message. The encoder also
+propagates failures from these shared helpers as `intra::Error::Allocation`;
+its other allocations remain outside the decoder guarantee. The bounds
 limit simultaneously live codec buffers to less than 80 MiB at the largest
 admitted picture, excluding caller-owned input and allocator bookkeeping.
-`header` does not allocate pixel planes.
+`header` does not allocate pixel planes. Unit tests fail each reservation
+in representative single-tile and tiled decodes, then verify recovery and
+unchanged pixels. This exercises reservation failures without a global
+allocator override; it cannot simulate a kernel OOM kill.
 
 Fixtures include td-encoded pictures independently decoded by dav1d 1.5.1
 and libaom 3.8.0 pictures decoded by dav1d. Tests pin exact YUV planes,

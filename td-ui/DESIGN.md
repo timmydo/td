@@ -3521,8 +3521,10 @@ A section may show a picture (`Message::picture`): a
 decoded (td-agent's from td-png and td-jpeg), with the text a copy of it
 takes, its alternative text or a reference to it. The toolkit decodes
 nothing. A picture is at most `MAX_PICTURE_AXIS` (8192) on an axis and
-`MAX_PICTURE_PIXELS` (16 Mi) in all, its pixels shared, so a message and
-its owner hold one copy; the list counts every picture's bytes, a clone
+`MAX_PICTURE_PIXELS` (16 Mi) in all. `Picture::new` takes ownership of
+the decoded Vec without allocating or copying it. Picture and Fitted
+do not expose infallible pixel-buffer cloning. Message clones share their
+existing picture section; the list counts every picture's bytes, a clone
 too, against `MAX_PICTURE_BYTES` (256 MiB), a budget apart from its
 text's, and frees them as messages go.
 
@@ -3542,8 +3544,8 @@ changes, so a resize fits it again and a repaint does not; the raster
 blends the fit over what is drawn (`Raster::image`). A fit is never
 larger than its picture nor than the columns by `MAX_PICTURE_ROWS` rows,
 so the fits a list keeps are bounded by its pictures' budget; a fit's
-pixels are reserved fallibly, and a picture whose fit cannot be had is
-not drawn. A fit walks every source pixel, so it costs the picture's size
+pixels are reserved fallibly, with all overlap weights and sums computed
+on the stack; a picture whose fit cannot be had is not drawn. A fit walks every source pixel, so it costs the picture's size
 whatever it is shrunk to, paid on the first paint at a size. A theme
 leaves a picture's colours its own. An id names its list too: the owner
 of two lists tags each (`set_picture_tag`), and `picture` answers only

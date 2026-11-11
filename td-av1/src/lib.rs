@@ -7,6 +7,7 @@ pub mod cdef;
 pub mod cdf;
 pub mod deblock;
 pub mod intra;
+mod memory;
 pub mod transform;
 
 pub use intra::decode::{
@@ -21,6 +22,7 @@ mod tests {
     fn arithmetic_modules_have_no_ambient_io_or_threads() {
         for source in [
             include_str!("cdef.rs"),
+            include_str!("memory.rs"),
             include_str!("cdf.rs"),
             include_str!("deblock.rs"),
             include_str!("intra.rs"),

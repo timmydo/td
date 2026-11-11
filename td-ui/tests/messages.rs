@@ -3113,20 +3113,21 @@ fn a_picture_copies_as_its_text_and_holds_no_text_to_change() {
 #[test]
 fn pictures_have_a_budget_of_their_own() {
     let mut list = list(1, 40, 300);
-    // 8192 x 2048 is 64 MiB; clones share their pixels but each counts.
+    // 8192 x 2048 is 64 MiB; message clones share their pixels but each counts.
     let big = picture(8192, 2048, [1, 2, 3, 255]);
     let count = MAX_PICTURE_BYTES / big.bytes();
+    let big = pictured("a", big, "");
     for _ in 0..count {
-        list.push(pictured("a", big.clone(), "")).unwrap();
+        list.push(big.clone()).unwrap();
     }
-    assert_eq!(list.push(pictured("a", big.clone(), "")), Err(Error::Limit));
+    assert_eq!(list.push(big.clone()), Err(Error::Limit));
     // Text still has its own room.
     list.push(text("t", "words")).unwrap();
     list.remove_first(1);
-    list.push(pictured("a", big.clone(), "")).unwrap();
+    list.push(big.clone()).unwrap();
     // A replace counts what it takes away.
     list.replace(0, text("t", "words")).unwrap();
-    list.replace(0, pictured("a", big, "")).unwrap();
+    list.replace(0, big).unwrap();
 }
 
 #[test]

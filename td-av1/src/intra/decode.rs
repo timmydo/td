@@ -472,7 +472,7 @@ pub fn decode(data: &[u8]) -> Result<Decoded> {
 
 fn zeroes<T: Default + Clone>(len: usize) -> Result<Vec<T>> {
     let mut out = Vec::new();
-    out.try_reserve_exact(len).map_err(|_| DecodeError::Limit)?;
+    crate::memory::reserve(&mut out, len).map_err(|_| DecodeError::Limit)?;
     out.resize(len, T::default());
     Ok(out)
 }
@@ -528,7 +528,15 @@ fn decode_frame(data: &[u8], frame: Frame, seq: &Sequence) -> Result<Decoded> {
                 * SB_MI)
                 .min(g.mi_rows);
             // Tile scratch is at most 4096 columns by 65 rows, independent of image height.
-            let mut tile = Tile::new(x0, width, start, end, g, frame.qindex);
+            let mut tile = Tile::new(
+                x0,
+                width,
+                start,
+                end,
+                g,
+                frame.qindex,
+                TileBuffers::new(width).map_err(|_| DecodeError::Limit)?,
+            );
             let mut symbols = Symbols::new(tile_data, &mut work, frame.adapt)?;
             for row in (start..end).step_by(SB_MI) {
                 tile.band_mi_row = row;
@@ -561,7 +569,7 @@ fn decode_frame(data: &[u8], frame: Frame, seq: &Sequence) -> Result<Decoded> {
         Encoder::<InOrder>::with_geometry(frame.geometry, 50, 1).map_err(|_| DecodeError::Limit)?;
     encoder.levels = frame.levels;
     encoder.strengths = frame.strengths;
-    let image = encoder.reconstruct(kept);
+    let image = encoder.reconstruct(kept).map_err(|_| DecodeError::Limit)?;
     Ok(Decoded {
         header: seq.header,
         planes: image.planes,
@@ -1134,8 +1142,7 @@ fn filter_prediction(mode: usize, edges: &Edges, out: &mut [u8]) -> Result<()> {
 }
 
 fn clear_buffer<T: Default + Clone>(buffer: &mut Vec<T>, len: usize) -> Result<()> {
-    buffer
-        .try_reserve_exact(len.saturating_sub(buffer.len()))
+    crate::memory::reserve(buffer, len.saturating_sub(buffer.len()))
         .map_err(|_| DecodeError::Limit)?;
     buffer.resize(len, T::default());
     buffer.fill(T::default());
@@ -1298,6 +1305,31 @@ mod tests {
         ] {
             let image = decode(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(image.planes.concat(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_decoder_reservation_can_fail_and_a_later_decode_succeeds() {
+        for bytes in [
+            include_bytes!("../../tests/fixtures/noise.obu").as_slice(),
+            include_bytes!("../../tests/fixtures/tiles.obu").as_slice(),
+        ] {
+            let expected = decode(bytes).unwrap();
+            let mut succeeded = false;
+            for after in 0..1024 {
+                match crate::memory::failing(after, || decode(bytes)) {
+                    Err(DecodeError::Limit) => {}
+                    Err(other) => panic!("reservation {after}: {other}"),
+                    Ok(image) => {
+                        assert_eq!(image.planes, expected.planes);
+                        assert!(after > 30);
+                        succeeded = true;
+                        break;
+                    }
+                }
+            }
+            assert!(succeeded);
+            assert_eq!(decode(bytes).unwrap().planes, expected.planes);
         }
     }
 
