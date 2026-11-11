@@ -109,7 +109,8 @@ for a future painter; no display list or pixel buffer is allocated here.
 
 FontMetrics has two operations: advance(style, scalar), returning an
 advance in 1/64 CSS px, and line(style), returning height and baseline in
-the same units. Calls may populate a caller-bounded metrics cache. Font
+the same units. Values must stay stable within a layout call. Calls may populate a
+caller-bounded metrics cache. Font
 selection uses the computed family, size, weight and style. A deterministic
 test provider makes layout tests independent of installed fonts.
 
@@ -134,18 +135,27 @@ ligatures, bidi, hyphenation, grapheme shaping or Unicode line-break table
 is claimed. NBSP is not an ordinary breakable space.
 
 The intentional preprocessing differences are CSS white-space: normal and
-nowrap collapse HTML ASCII whitespace across inline nodes; pre-line
-preserves newlines but collapses spaces; pre and pre-wrap preserve spaces
+nowrap collapse HTML ASCII whitespace across inline nodes and drop an
+initial collapsed space; pre-line also drops collapsed spaces after a
+newline, preserves newlines and collapses other spaces; pre and pre-wrap preserve spaces
 and newlines. nowrap and pre suppress soft wrapping. Tabs use one space,
-as prose does, not CSS tab stops. Other control scalars display U+FFFD.
+as prose does, not CSS tab stops. In preserving modes, CR and CRLF in
+DOM text become one newline; prose instead displays a literal CR as
+U+FFFD. Other control scalars display U+FFFD.
 Preformatted trailing spaces are still dropped to preserve the prose
 contract: this differs from CSS pre/pre-wrap. A bare empty inline sequence
 does not generate a line; an explicit newline does, and preserves the
 following empty line. This differs from prose's empty-input one-line rule.
 Text-transform is retained in the style but initially not applied.
 
+`inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
+StyleId for the line strut. It returns bounded lines and byte/work charges.
+The same internal flow can measure without retaining lines. Vec growth is
+charged before reserve, including doubled capacity and allocation overhead.
+
 Line height uses the largest participating font ascent/descent and CSS
-line-height, with half-leading around the baseline. Inline replaced elements
+line-height, with half-leading around the baseline. A preserved newline
+contributes its own metrics to the line it ends, without a text fragment. Inline replaced elements
 align to the baseline. Initial text-align supports left/start, right/end
 and center; justify uses left. Vertical-align other than baseline is
 deferred. Letter spacing contributes to scalar advances, clamped so an
