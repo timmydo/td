@@ -684,6 +684,7 @@ mod tests {
                 "td-firstboot",
                 "td-fs",
                 "td-html",
+                "td-inflate",
                 "td-install",
                 "td-jpeg",
                 "td-json",

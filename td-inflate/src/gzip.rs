@@ -1,7 +1,7 @@
-//! Minimal gzip and raw-DEFLATE reader shared by td's control plane.
+//! Bounded gzip, zlib and raw-DEFLATE reader shared by td's programs.
 //!
 //! Kept in-tree and std-only for the same reason as `tar.rs`: source seed
-//! preparation should not require host unpackers or a Rust crate dependency.
+//! preparation should not require host unpackers or an external dependency.
 
 use crate::crc32::crc32;
 use std::fs::File;
@@ -80,7 +80,10 @@ pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
     decompress_bytes_with_limit(input, MAX_GZIP_OUTPUT_BYTES)
 }
 
-fn decompress_bytes_with_limit(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>, String> {
+pub fn decompress_bytes_with_limit(
+    input: &[u8],
+    max_output_bytes: usize,
+) -> Result<Vec<u8>, String> {
     require_input_size(input.len(), "gzip")?;
     if input.is_empty() {
         return Err("empty gzip stream".to_string());
@@ -141,6 +144,30 @@ fn decompress_bytes_with_limit(input: &[u8], max_output_bytes: usize) -> Result<
         pos = trailer_pos
             .checked_add(8)
             .ok_or_else(|| "gzip trailer offset overflow".to_string())?;
+    }
+    Ok(out)
+}
+
+/// Decode the zlib framing used by HTTP's `deflate` content coding.
+/// Preset dictionaries, corrupt checksums and trailing bytes are refused.
+pub fn decompress_zlib_with_limit(input: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    require_input_size(input.len(), "zlib")?;
+    let cmf = byte(input, 0)?;
+    let flg = byte(input, 1)?;
+    if cmf & 15 != 8 || cmf >> 4 > 7 || (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0 {
+        return Err("invalid zlib header".into());
+    }
+    if flg & 32 != 0 {
+        return Err("zlib preset dictionary is unsupported".into());
+    }
+    let body = range_from(input, 2)?;
+    let (out, consumed) = decompress_raw_prefix(body, limit)?;
+    let trailer = range_from(body, consumed)?;
+    let bytes: [u8; 4] = trailer
+        .try_into()
+        .map_err(|_| "zlib requires exactly four trailer bytes".to_string())?;
+    if u32::from_be_bytes(bytes) != crate::crc32::adler32(&out) {
+        return Err("zlib Adler-32 mismatch".into());
     }
     Ok(out)
 }
@@ -790,6 +817,37 @@ fn skip_zero_terminated(input: &[u8], pos: usize, what: &str) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zlib_checks_framing_checksum_limits_and_every_truncated_prefix() {
+        let bytes = hex_bytes("789ccb48cdc9c957c84027b90070be08bb");
+        assert_eq!(
+            decompress_zlib_with_limit(&bytes, 24).unwrap(),
+            b"hello hello hello hello\n"
+        );
+        assert!(decompress_zlib_with_limit(&bytes, 23).is_err());
+        for end in 0..bytes.len() {
+            assert!(decompress_zlib_with_limit(&bytes[..end], 24).is_err());
+        }
+        for at in [0, 1, bytes.len() - 1] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 1;
+            assert!(decompress_zlib_with_limit(&bad, 24).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decompress_zlib_with_limit(&trailing, 24).is_err());
+        let mut dictionary = bytes;
+        dictionary[1] = 0x20;
+        assert!(decompress_zlib_with_limit(&dictionary, 24)
+            .unwrap_err()
+            .contains("dictionary"));
+        assert!(decompress_zlib_with_limit(&hex_bytes("cb48cdc9c957c84027b900"), 24).is_err());
+        assert_eq!(
+            decompress_zlib_with_limit(&hex_bytes("789c030000000001"), 0).unwrap(),
+            b""
+        );
+    }
 
     #[test]
     fn decompresses_stored_gzip_member() {

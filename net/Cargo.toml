@@ -39,6 +39,7 @@ ureq = { version = "=3.5.1", default-features = false, features = ["rustls-no-pr
 rustls = { version = "0.23.46", default-features = false, features = ["custom-provider", "logging", "std", "tls12"] }
 sha2 = "0.11"
 webpki-roots = "=1.0.11"
+td-inflate = { path = "../td-inflate" }
 td-engine = { path = "../engine" }
 td-fs = { path = "../td-fs" }
 td-primitives = { path = "../td-primitives" }

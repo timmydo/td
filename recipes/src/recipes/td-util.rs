@@ -128,8 +128,8 @@ const ENGINE: &[(&str, &str, &str)] = &[
     ),
     (
         "gzip",
-        "{src}/engine/src/gzip.rs",
-        include_str!("../../../engine/src/gzip.rs"),
+        "{src}/td-inflate/src/gzip.rs",
+        include_str!("../../../td-inflate/src/gzip.rs"),
     ),
     (
         "tar_write",
@@ -389,21 +389,23 @@ mod tests {
             let on_disk = std::fs::read_to_string(civil.join(file)).unwrap();
             assert_eq!(*source, on_disk, "the embedded td-civil {file} must match");
         }
-        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/src");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         for (name, path, source) in ENGINE {
-            assert_eq!(*path, format!("{{src}}/engine/src/{name}.rs"));
-            let on_disk =
-                std::fs::read_to_string(engine.join(format!("{name}.rs"))).unwrap_or_default();
-            assert!(!on_disk.is_empty(), "engine/src/{name}.rs must be readable");
-            assert_eq!(
-                *source, on_disk,
-                "the embedded engine '{name}' is not engine/src/{name}.rs"
-            );
-            let attr = format!("#[path = \"../../engine/src/{name}.rs\"]");
+            let tree = if *name == "gzip" {
+                "td-inflate"
+            } else {
+                "engine"
+            };
+            let relative = format!("{tree}/src/{name}.rs");
+            assert_eq!(*path, format!("{{src}}/{relative}"));
+            let on_disk = std::fs::read_to_string(repo.join(&relative)).unwrap();
+            assert!(!on_disk.is_empty(), "{relative} must be readable");
+            assert_eq!(*source, on_disk, "the embedded '{name}' is not {relative}");
+            let attr = format!("#[path = \"../../{relative}\"]");
             assert_eq!(
                 MAIN_RS.matches(&attr).count(),
                 1,
-                "main.rs must reach engine/src/{name}.rs by exactly one #[path]"
+                "main.rs must reach {relative} by exactly one #[path]"
             );
         }
     }

@@ -70,6 +70,24 @@ fn table() -> &'static [u32; 256] {
     })
 }
 
+/// Adler-32 (RFC 1950 §9), summed in runs short enough that neither sum
+/// can overflow before its reduction; the decoder's too.
+pub fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    // The most bytes summed before s2 could pass u32 (zlib's NMAX).
+    const RUN: usize = 5552;
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for run in data.chunks(RUN) {
+        for &b in run {
+            s1 += u32::from(b);
+            s2 += s1;
+        }
+        s1 %= MOD;
+        s2 %= MOD;
+    }
+    (s2 << 16) | s1
+}
+
 #[cfg(test)]
 mod tests {
     use super::{crc32, Crc32};

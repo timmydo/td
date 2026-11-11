@@ -4,7 +4,7 @@ use crate::types::Recipe;
 /// `web` application packages. Built as the other toolkit consumers are: a
 /// static Cargo build of its own tree with its path dependencies staged
 /// beside it, td-compositor for the font and wire sources td-ui mounts,
-/// engine for td-png's CRC and inflater, and td-util for td-png's DEFLATE
+/// engine for td-png's checksums, td-inflate for its decoder and td-util for its DEFLATE
 /// encoder, the `td-web-source` seed pinned by the compiled local-source
 /// roster, and the crate's committed lock naming itself and those crates.
 pub fn recipe() -> Recipe {
@@ -20,6 +20,7 @@ pub fn recipe() -> Recipe {
             "td-util",
             "td-compositor",
             "engine",
+            "td-inflate",
         ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
@@ -51,6 +52,7 @@ mod tests {
                 "td-util".into(),
                 "td-compositor".into(),
                 "engine".into(),
+                "td-inflate".into(),
             ])
         );
         assert_eq!(r.cargo_subdir.as_deref(), Some("td-web"));

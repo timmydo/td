@@ -33,9 +33,9 @@
 // shared stack and the grant must not reach them. The address policy sits in
 // the resolver ureq itself calls before every connection, the redirected ones
 // included, so the destination checked is the destination connected to; no
-// URL is parsed twice by two parsers that could disagree. It asks for identity
-// encoding since the tier's closure has no decoder; follows up to five
-// redirects for GET, fewer when the client's `redirects N` asks, none for
+// URL is parsed twice by two parsers that could disagree. Counted requests
+// negotiate gzip and deflate; streaming requests use identity. It follows
+// up to five redirects for GET, fewer when the client's `redirects N` asks, none for
 // POST, dropping `authorization` and `cookie` on the way as ureq does, so a
 // client that must carry a credential across a redirect asks for none and
 // follows the `location` it is handed itself, a relative one joined against
@@ -91,10 +91,11 @@ const MAX_RESPONSE_BODY: u64 = 64 * 1024 * 1024;
 /// different request.
 const MAX_REDIRECTS: u32 = 5;
 /// Requests read and counted requests served at once; the rest wait in the
-/// listen queue. Each holds one body in memory at a time, the request's
-/// until the origin has it and then the response's, so this bounds the
-/// counted requests' memory at four times the larger body cap as well as
-/// their sockets. A streamed request gives its worker's place back once it
+/// listen queue. The request body is dropped before reading the response.
+/// This bounds counted requests' sockets and memory. Decoding may hold the compressed
+/// body, the decoded aggregate and one gzip member simultaneously, each
+/// bounded by the response cap (plus Vec capacity and decoder tables).
+/// A streamed request gives its worker's place back once it
 /// holds one of the `STREAM_ORIGINS`, which bound streams on their own.
 const WORKERS: usize = 4;
 /// The client's whole head and body must arrive within this, and its whole
@@ -1051,16 +1052,33 @@ fn perform_with_pool(
     let lease = pool.acquire(&request, policy, origin, Instant::now(), || {
         build_agent(&request, policy, Timing::Whole(origin), unix_sockets)
     })?;
-    let ((status, headers), response) = send_origin(request, lease.agent())?;
+    let ((status, mut headers), response) = send_origin(request, lease.agent())?;
+    let coding = content_coding(status, &headers)?;
+    let wire_limit = if coding == Coding::Identity {
+        limit
+    } else {
+        MAX_RESPONSE_BODY
+    };
     let mut body = Vec::new();
     response
         .into_body()
         .into_reader()
-        .take(limit.saturating_add(1))
+        .take(wire_limit.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|e| Fault::Transport(format!("read body: {e}")))?;
-    if body.len() as u64 > limit {
-        return Err(Fault::Refused(format!("response over {limit} bytes")));
+    if body.len() as u64 > wire_limit {
+        return Err(Fault::Refused(format!("response over {wire_limit} bytes")));
+    }
+    if coding != Coding::Identity {
+        let decoded_limit = usize::try_from(limit)
+            .map_err(|_| Fault::Refused("response limit does not fit usize".into()))?;
+        body = match coding {
+            Coding::Gzip => td_inflate::decompress_bytes_with_limit(&body, decoded_limit),
+            Coding::Deflate => td_inflate::decompress_zlib_with_limit(&body, decoded_limit),
+            Coding::Identity => Ok(body),
+        }
+        .map_err(|e| Fault::Refused(format!("content decoding: {e}")))?;
+        headers.retain(|(name, _)| name != "content-encoding" && name != "content-length");
     }
     pool.completed(lease, Instant::now());
     Ok(Reply {
@@ -1068,6 +1086,37 @@ fn perform_with_pool(
         headers,
         body,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Coding {
+    Identity,
+    Gzip,
+    Deflate,
+}
+
+fn content_coding(status: u16, headers: &[(String, String)]) -> Result<Coding, Fault> {
+    // These statuses describe a representation but carry no encoded body.
+    if status == 204 || status == 304 {
+        return Ok(Coding::Identity);
+    }
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name == "content-encoding");
+    let Some((_, value)) = values.next() else {
+        return Ok(Coding::Identity);
+    };
+    if values.next().is_some() {
+        return Err(Fault::Refused(
+            "multiple content encodings are unsupported".into(),
+        ));
+    }
+    match value.trim().to_ascii_lowercase().as_str() {
+        "identity" => Ok(Coding::Identity),
+        "gzip" => Ok(Coding::Gzip),
+        "deflate" => Ok(Coding::Deflate),
+        _ => Err(Fault::Refused("unsupported content encoding".into())),
+    }
 }
 
 /// rustls on td-primitives, both TLS 1.2 and 1.3 (ureq's `ALL_VERSIONS`), over the
@@ -1240,13 +1289,13 @@ fn send_origin(
         headers,
         limit: _,
         redirects: _,
-        stream: _,
+        stream,
         public: _,
         body: request_body,
     } = request;
     let response = match method {
-        Method::Get => with_headers(agent.get(&url), &headers).call(),
-        Method::Post => with_headers(agent.post(&url), &headers).send(&request_body[..]),
+        Method::Get => with_headers(agent.get(&url), &headers, stream).call(),
+        Method::Post => with_headers(agent.post(&url), &headers, stream).send(&request_body[..]),
     };
     // The origin has the request body; a worker holds it or the response's,
     // never both.
@@ -1275,6 +1324,15 @@ fn send_origin(
             continue;
         }
         let values = response.headers().get_all(name).iter();
+        if name == "content-encoding"
+            && response
+                .headers()
+                .get_all(name)
+                .iter()
+                .any(|value| std::str::from_utf8(value.as_bytes()).is_err())
+        {
+            return Err(Fault::Refused("invalid content encoding".into()));
+        }
         for value in values.filter_map(|value| std::str::from_utf8(value.as_bytes()).ok()) {
             if headers.len() >= MAX_HEADERS {
                 return Err(Fault::Refused(format!(
@@ -1293,12 +1351,13 @@ fn send_origin(
     Ok(((status, headers), response))
 }
 
-/// The application's headers, then identity encoding. ureq 2's `set`
-/// replaced a name given twice; ureq 3's `header` appends, so only the
+/// The application's headers, then the service's content-coding negotiation.
+/// ureq 2's `set` replaced a name given twice; ureq 3's `header` appends, so only the
 /// last value given for a name is sent.
 fn with_headers<B>(
     mut call: ureq::RequestBuilder<B>,
     headers: &[(String, String)],
+    stream: bool,
 ) -> ureq::RequestBuilder<B> {
     for (index, (name, value)) in headers.iter().enumerate() {
         let repeated = headers
@@ -1308,7 +1367,10 @@ fn with_headers<B>(
             call = call.header(name, value);
         }
     }
-    call.header("accept-encoding", "identity")
+    call.header(
+        "accept-encoding",
+        if stream { "identity" } else { "gzip, deflate" },
+    )
 }
 
 /// What a relay hears of its origin process before the body: the reply head
@@ -1902,6 +1964,16 @@ fn stream_from_origin(
         Ok(opened) => opened,
         Err(fault) => return write_fault(output, &fault),
     };
+    match content_coding(status, &headers) {
+        Ok(Coding::Identity) => {}
+        Ok(_) => {
+            return write_fault(
+                output,
+                &Fault::Refused("compressed streaming response is unsupported".into()),
+            )
+        }
+        Err(fault) => return write_fault(output, &fault),
+    }
     let mut head = reply_head(status, &headers);
     head.push_str("stream\n\n");
     output.write_all(head.as_bytes())?;
@@ -2867,6 +2939,19 @@ mod tests {
         connections: usize,
         responses: Vec<(&'static str, String)>,
     ) -> Option<(u16, std::thread::JoinHandle<Vec<Vec<u8>>>)> {
+        origin_bytes(
+            connections,
+            responses
+                .into_iter()
+                .map(|(path, text)| (path, text.into_bytes()))
+                .collect(),
+        )
+    }
+
+    fn origin_bytes(
+        connections: usize,
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> Option<(u16, std::thread::JoinHandle<Vec<Vec<u8>>>)> {
         let listener = TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
         listener.set_nonblocking(true).ok()?;
@@ -2899,16 +2984,245 @@ mod tests {
                     .find(|(p, _)| *p == path)
                     .map(|(_, r)| r.clone())
                     .unwrap_or_else(|| {
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .into()
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
                     });
-                let _ = conn.write_all(body.as_bytes());
+                let _ = conn.write_all(&body);
                 let _ = conn.flush();
                 seen.push(raw);
             }
             seen
         });
         Some((port, handle))
+    }
+
+    // Independent Python zlib/gzip fixtures: "hello hello hello hello\n".
+    fn compressed(coding: &str) -> Vec<u8> {
+        let hex = match coding {
+            "gzip" => "1f8b0800000000000203cb48cdc9c957c84027b9000088590b18000000",
+            _ => "789ccb48cdc9c957c84027b90070be08bb",
+        };
+        hex.as_bytes()
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn encoded_response(headers: &str, body: &[u8], chunked: bool) -> Vec<u8> {
+        let mut bytes = if chunked {
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n{headers}\r\n").into_bytes()
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n",
+                body.len()
+            )
+            .into_bytes()
+        };
+        if chunked {
+            bytes.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        }
+        bytes.extend_from_slice(body);
+        if chunked {
+            bytes.extend_from_slice(b"\r\n0\r\n\r\n");
+        }
+        bytes
+    }
+
+    fn encoded_fetch(
+        headers: &str,
+        body: &[u8],
+        limit: usize,
+        chunked: bool,
+    ) -> (Result<Reply, Fault>, String) {
+        let (port, server) =
+            origin_bytes(1, vec![("/", encoded_response(headers, body, chunked))]).unwrap();
+        let request = parse(&request_bytes(
+            &format!("method GET\nurl http://127.0.0.1:{port}/\nlimit {limit}\n"),
+            b"",
+        ))
+        .unwrap();
+        let reply = perform(request, LENIENT, Duration::from_secs(5));
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        (
+            reply,
+            String::from_utf8(seen[0].clone())
+                .unwrap()
+                .to_ascii_lowercase(),
+        )
+    }
+
+    #[test]
+    fn compressed_counted_replies_are_decoded_and_headers_describe_decoded_bytes() {
+        for coding in ["gzip", "deflate"] {
+            for chunked in [false, true] {
+                let (reply, seen) = encoded_fetch(
+                    &format!("Content-Encoding: {coding}\r\nContent-Type: text/plain\r\n"),
+                    &compressed(coding),
+                    24,
+                    chunked,
+                );
+                let reply = reply.unwrap();
+                assert_eq!(reply.body, b"hello hello hello hello\n");
+                assert!(seen.contains("accept-encoding: gzip, deflate"));
+                assert!(reply
+                    .headers
+                    .iter()
+                    .any(|(n, v)| n == "content-type" && v == "text/plain"));
+                assert!(!reply
+                    .headers
+                    .iter()
+                    .any(|(n, _)| n == "content-encoding" || n == "content-length"));
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_counted_replies_refuse_corruption_expansion_and_unsupported_codings() {
+        for coding in ["gzip", "deflate"] {
+            let body = compressed(coding);
+            assert!(
+                encoded_fetch(&format!("Content-Encoding: {coding}\r\n"), &body, 23, false)
+                    .0
+                    .is_err()
+            );
+            for len in 0..body.len() {
+                assert!(encoded_fetch(
+                    &format!("Content-Encoding: {coding}\r\n"),
+                    &body[..len],
+                    24,
+                    false
+                )
+                .0
+                .is_err());
+            }
+            let mut corrupt = body.clone();
+            let end = corrupt.len() - 1;
+            corrupt[end] ^= 1;
+            assert!(encoded_fetch(
+                &format!("Content-Encoding: {coding}\r\n"),
+                &corrupt,
+                24,
+                false
+            )
+            .0
+            .is_err());
+        }
+        for header in [
+            "Content-Encoding: br\r\n",
+            "Content-Encoding: gzip, deflate\r\n",
+            "Content-Encoding: gzip\r\nContent-Encoding: gzip\r\n",
+            "Content-Encoding: \r\n",
+        ] {
+            assert!(encoded_fetch(header, &compressed("gzip"), 100, false)
+                .0
+                .is_err());
+        }
+        let mut members = compressed("gzip");
+        members.extend_from_slice(&compressed("gzip"));
+        assert_eq!(
+            encoded_fetch("Content-Encoding: GZip\r\n", &members, 48, false)
+                .0
+                .unwrap()
+                .body
+                .len(),
+            48
+        );
+        assert!(
+            encoded_fetch("Content-Encoding: gzip\r\n", &members, 47, false)
+                .0
+                .is_err()
+        );
+        assert_eq!(
+            encoded_fetch("", b"plain", 5, false).0.unwrap().body,
+            b"plain"
+        );
+    }
+
+    #[test]
+    fn compressed_wire_input_has_its_own_cap() {
+        let body = vec![0; MAX_RESPONSE_BODY as usize + 1];
+        let (reply, _) = encoded_fetch("Content-Encoding: gzip\r\n", &body, 24, false);
+        assert_eq!(
+            reply.err().unwrap().line(),
+            format!("error refused: response over {MAX_RESPONSE_BODY} bytes")
+        );
+    }
+
+    #[test]
+    fn bodyless_statuses_preserve_representation_metadata_without_decoding() {
+        for status in [204, 304] {
+            let response = format!(
+                "HTTP/1.1 {status} Empty\r\nConnection: close\r\nContent-Encoding: gzip\r\n\r\n"
+            )
+            .into_bytes();
+            let (port, server) = origin_bytes(1, vec![("/", response)]).unwrap();
+            let request = parse(&request_bytes(
+                &format!("method GET\nurl http://127.0.0.1:{port}/\n"),
+                b"",
+            ))
+            .unwrap();
+            let reply = perform(request, LENIENT, Duration::from_secs(5)).unwrap();
+            assert_eq!(reply.status, status);
+            assert!(reply.body.is_empty());
+            assert!(reply
+                .headers
+                .iter()
+                .any(|(n, v)| n == "content-encoding" && v == "gzip"));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn streaming_bodyless_statuses_keep_encoding_metadata() {
+        for status in [204, 304] {
+            let response = format!(
+                "HTTP/1.1 {status} Empty\r\nConnection: close\r\nContent-Encoding: gzip\r\n\r\n"
+            )
+            .into_bytes();
+            let (port, server) = origin_bytes(1, vec![("/", response)]).unwrap();
+            let request = parse(&request_bytes(
+                &format!("method GET\nurl http://127.0.0.1:{port}/\nstream\n"),
+                b"",
+            ))
+            .unwrap();
+            let mut output = Vec::new();
+            stream_from_origin(request, LENIENT, Duration::from_secs(5), &mut output).unwrap();
+            assert_eq!(server.join().unwrap().len(), 1);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(&format!("status {status}\n")), "{output}");
+            assert!(output.contains("header content-encoding: gzip\n"));
+            assert!(output.ends_with("stream\n\nend\n"));
+        }
+    }
+
+    #[test]
+    fn streaming_requests_keep_identity_and_refuse_unsolicited_compression() {
+        let (port, server) = origin_bytes(
+            1,
+            vec![(
+                "/",
+                encoded_response("Content-Encoding: gzip\r\n", &compressed("gzip"), false),
+            )],
+        )
+        .unwrap();
+        let request = parse(&request_bytes(
+            &format!("method GET\nurl http://127.0.0.1:{port}/\nstream\n"),
+            b"",
+        ))
+        .unwrap();
+        let mut output = Vec::new();
+        stream_from_origin(request, LENIENT, Duration::from_secs(5), &mut output).unwrap();
+        let seen = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&seen[0])
+            .to_ascii_lowercase()
+            .contains("accept-encoding: identity"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("error refused: compressed streaming response"),
+            "{output}"
+        );
+        assert!(!output.contains("chunk "));
     }
 
     fn read_http_request(conn: &mut TcpStream) -> Vec<u8> {
@@ -3060,7 +3374,7 @@ mod tests {
         );
         assert_eq!(lines.last().map(String::as_str), Some("body 6"));
         assert_eq!(body, b"<rss/>");
-        // POST: the body and the headers reach the origin, identity encoding asked.
+        // POST: the body and the headers reach the origin, compression negotiated.
         let (lines, body) = ask(
             &socket,
             &format!("method POST\nurl {base}/post\nheader content-type: text/plain\nbody 5\n"),
@@ -3198,7 +3512,7 @@ mod tests {
         let first = String::from_utf8_lossy(&seen[0]).to_ascii_lowercase();
         assert!(first.starts_with("get /feed http/1.1"), "{first}");
         assert!(first.contains("accept: text/xml"), "{first}");
-        assert!(first.contains("accept-encoding: identity"), "{first}");
+        assert!(first.contains("accept-encoding: gzip, deflate"), "{first}");
         assert!(first.contains("user-agent: td-fetchd/1"), "{first}");
         let second = String::from_utf8_lossy(&seen[1]).to_ascii_lowercase();
         assert!(second.starts_with("post /post http/1.1"), "{second}");

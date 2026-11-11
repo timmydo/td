@@ -2139,7 +2139,7 @@ served the repository client:
 | `builder/src/elf.rs` | **never** — see §G. Its debug handling stays in the builder; the read-only half (header parser, `PT_INTERP`, run-path and `DT_NEEDED` readers, the bounded link search, executable and static assertions) is `engine/src/elf.rs`, shared with the image build |
 | `engine/src/rust_dist.rs`, `engine/src/elf_edit.rs`, `engine/src/tar.rs` | **reuse for pinned Rust downloads only** — §G; application admission never invokes the ELF writer |
 | `engine/src/dynamic_application.rs`, `engine/src/ostree_deploy.rs`, `engine/src/elf.rs` | **reuse on the target for §W.9 alone** — the dynamic validator, the deploy materializer and the read-only ELF inspection they use, moved from the builder (the ELF readers lose their panicking indexing, nothing else) so `td-app` runs the implementation the image build ran on the pinned path; the materializer's no-replace publication is a parameter, so td-engine gains no syscall |
-| `engine/src/gzip.rs` | **reuse in the control plane, and on the target for §W.9 alone** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; on the target only `td-app` decompresses, and only Flathub objects it has authenticated |
+| `td-inflate/src/gzip.rs` | **shared bounded inflater in the control plane and target** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; target callers also include td-util, PNG consumers and td-fetchd; the deploy importer decodes only authenticated Flathub objects |
 | `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` and `td-app`** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's network clients are the same tier's fetch service (§W.8) and td-app's bounded Flathub reader (§W.9), and there is no target repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
@@ -10838,7 +10838,7 @@ AGENTS.md foresees the control-plane programs rebuilt as
 target recipes once the target toolchain exists, and the td-net tier is
 the one tier with an external closure; it already carries a bounded
 HTTPS client, `net/src/http.rs`, ureq over rustls, `td-primitives` and
-webpki-roots, and no decoder. So:
+webpki-roots, plus td-inflate for content decoding. So:
 
 1. `td-fetchd`, an applet of the td-net multicall, built as a target
    recipe through the Cargo runner from the checkout's `net/`, `engine/`,
@@ -10898,8 +10898,17 @@ webpki-roots, and no decoder. So:
    does, so a client that carries a credential across a redirect asks
    for none, is handed the `3xx` with its `location`, and follows it
    itself, a relative one joined against the URL it asked for; sends
-   `Accept-Encoding: identity` because the tier's closure has no
-   decoder and principle 2 makes one a sign-off; and gives the whole
+   `Accept-Encoding: gzip, deflate` for counted requests. td-inflate
+   decodes gzip (including concatenated members) and zlib-framed deflate;
+   raw deflate, unknown or stacked encodings, corrupt streams and trailing
+   data are refused. The client's limit, capped at 64 MiB, bounds decoded
+   bytes before each expansion; compressed input has its own 64 MiB cap.
+   Decoded replies omit `content-encoding` and the wire `content-length`,
+   with `body N` naming the decoded length. Bodyless 204/304 responses keep
+   their metadata without decoding. Streaming keeps identity negotiation
+   and refuses unsolicited compressed responses before sending a body.
+   This is the same in-tree inflater used for source archives and PNG,
+   with no new external dependency. The service gives the whole
    exchange with the origin, redirects included, five minutes over
    `http.rs`'s connect deadline: ureq's whole-exchange deadline, which
    starts when the exchange is called and bounds every read and write
@@ -11043,8 +11052,10 @@ webpki-roots, and no decoder. So:
    most six of a stream's frames are in the service at once: four
    waiting, one being read from the process and one being written. A
    client slow to read holds the process back rather than growing the
-   service. In all, the service holds at most four counted requests'
-   bodies, each up to the larger cap, and eight streams' request bodies
+   service. In all, the service holds at most four counted requests.
+   While decoding, each can hold a compressed body, decoded aggregate and
+   one gzip member, each bounded at 64 MiB, plus allocation capacity and
+   decoder tables. It also holds eight streams' request bodies
    of up to 32 MiB with their frames; the eight processes hold up to
    their bound each, and what one look lets past it. The client module
    carries `get_stream` and `post_stream`, whose `Stream` hands over a

@@ -69,7 +69,7 @@ const MODULES: &[(&str, &str)] = &[
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
-    ("gzip", include_str!("../../../engine/src/gzip.rs")),
+    ("gzip", include_str!("../../../td-inflate/src/gzip.rs")),
     (
         "headless",
         include_str!("../../../td-compositor/src/headless.rs"),

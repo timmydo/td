@@ -29,12 +29,12 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
-fn two_source_files_that_open_nothing_and_mount_the_engines_two_and_deflate() {
+fn two_source_files_that_open_nothing_and_mount_checksums_inflate_and_deflate() {
     assert!(!root().join("build.rs").exists(), "no build script");
     assert_eq!(names("src"), set(&["encode.rs", "lib.rs"]));
     let lib = read("src/lib.rs");
     assert!(lib.starts_with("#![forbid(unsafe_code)]"));
-    // Exactly the two engine files and td-util's DEFLATE encoder, each by
+    // Exactly the checksum and inflater files and td-util's DEFLATE encoder, each by
     // its relative path.
     let mounts: Vec<&str> = lib
         .lines()
@@ -44,7 +44,7 @@ fn two_source_files_that_open_nothing_and_mount_the_engines_two_and_deflate() {
         mounts,
         [
             "#[path = \"../../engine/src/crc32.rs\"]",
-            "#[path = \"../../engine/src/gzip.rs\"]",
+            "#[path = \"../../td-inflate/src/gzip.rs\"]",
             "#[path = \"../../td-util/src/deflate.rs\"]",
         ]
     );

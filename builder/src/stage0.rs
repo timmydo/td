@@ -1338,6 +1338,7 @@ const BUILDER_FP_ROOTS: &[&str] = &[
     "td-review/src/reviewer.rs",
     "td-civil/src/tzif.rs",
     "engine/src",
+    "td-inflate/src/gzip.rs",
     "engine/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",

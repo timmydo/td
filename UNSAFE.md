@@ -1260,9 +1260,10 @@ Every other applet td-util serves is safe `std`: `/proc`, `/sys` and
 read, write and spawn through `std::fs` and `std::process`. That is what
 keeps the surface at one syscall.
 
-Three modules are not td-util's own: `main.rs` reaches the engine's CRC,
-inflater and tar extractor by `#[path = "../../engine/src/crc32.rs"]`,
-`#[path = "../../engine/src/gzip.rs"]` and
+Three modules are not td-util's own: `main.rs` reaches the engine's CRC
+and tar extractor and td-inflate's decoder by
+`#[path = "../../engine/src/crc32.rs"]`,
+`#[path = "../../td-inflate/src/gzip.rs"]` and
 `#[path = "../../engine/src/tar_extract.rs"]`. Those three attributes are the
 only decoupling constructs the confinement scan admits, each pinned
 verbatim and removed exactly once before the scan refuses the rest,

@@ -19,6 +19,7 @@ pub fn recipe() -> Recipe {
         .local_source("net")
         .local_source_trees(&[
             "engine",
+            "td-inflate",
             "td-fs",
             "td-civil",
             "td-primitives",
@@ -45,6 +46,7 @@ mod tests {
             recipe.local_source_trees,
             Some(vec![
                 "engine".to_string(),
+                "td-inflate".to_string(),
                 "td-fs".to_string(),
                 "td-civil".to_string(),
                 "td-primitives".to_string(),

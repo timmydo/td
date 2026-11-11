@@ -226,6 +226,10 @@ name = "td-fs"
 version = "0.1.0"
 
 [[package]]
+name = "td-inflate"
+version = "0.1.0"
+
+[[package]]
 name = "td-net"
 version = "0.1.0"
 dependencies = [
@@ -233,6 +237,7 @@ dependencies = [
  "sha2",
  "td-engine",
  "td-fs",
+ "td-inflate",
  "td-primitives",
  "td-tls-provider",
  "ureq",

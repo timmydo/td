@@ -73,7 +73,7 @@ mod free;
 mod gen_init_cpio;
 mod glob;
 mod gz;
-#[path = "../../engine/src/gzip.rs"]
+#[path = "../../td-inflate/src/gzip.rs"]
 #[allow(dead_code)]
 // The engine file's own tests, held to the engine's lints rather than these.
 #[cfg_attr(
@@ -376,7 +376,7 @@ mod confinement {
         ),
         (
             "gzip.rs",
-            concat!("#[", "path=\"../../engine/src/gzip.rs\"]"),
+            concat!("#[", "path=\"../../td-inflate/src/gzip.rs\"]"),
         ),
         (
             "tar_write.rs",
@@ -391,7 +391,16 @@ mod confinement {
         let main = squeeze(&source("main.rs"));
         for (file, attr) in ENGINE {
             assert_eq!(main.matches(attr).count(), 1, "{file}'s #[path] attribute");
-            let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../engine/src")).join(file);
+            let tree = if *file == "gzip.rs" {
+                "td-inflate"
+            } else {
+                "engine"
+            };
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(tree)
+                .join("src")
+                .join(file);
             let text = scan::strip_comments(&std::fs::read_to_string(&path).unwrap());
             assert!(!text.contains(concat!("un", "safe")), "{file} names unsafe");
             for construct in scan::DECOUPLING {

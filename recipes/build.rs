@@ -793,6 +793,7 @@ fn evaluator_source_fingerprint(
         "recipes/build.rs",
         "recipes/Cargo.toml",
         "engine/Cargo.toml",
+        "td-inflate/src/gzip.rs",
         "Cargo.toml",
         "Cargo.lock",
         "tests/recipe-eval-tool.sh",

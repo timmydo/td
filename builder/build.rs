@@ -170,6 +170,7 @@ fn engine_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Erro
     walk_sources(&src, &src, &host_only, &mut files)?;
     let engine_src = root.join("engine/src");
     walk_sources(&engine_src, &engine_src, &|_, _| false, &mut files)?;
+    files.push(root.join("td-inflate/src/gzip.rs"));
     files.sort();
     let mut h = sha256::Sha256::new();
     for file in &files {

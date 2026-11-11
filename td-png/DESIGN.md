@@ -8,10 +8,10 @@ output), the compositor can write its screenshots, and any later td
 program can read and write PNG the same way. Nothing here reads a file,
 the environment or a clock.
 
-The inflater and the CRC are the engine's (`engine/src/gzip.rs`'s raw
-DEFLATE reader and `engine/src/crc32.rs`), mounted by `#[path]` as
-td-util mounts them rather than copied: the one inflater td trusts for
-source preparation is the one that reads image data. `gzip.rs` carries a
+The inflater is td-inflate's (`td-inflate/src/gzip.rs`'s raw
+DEFLATE reader), and the checksums are the engine's (`engine/src/crc32.rs`),
+mounted by `#[path]` as td-util mounts them rather than copied: the one
+inflater td trusts for source preparation is the one that reads image data. `gzip.rs` carries a
 file entry point td-png never calls; td-png's own source opens nothing.
 The DEFLATE encoder is td-util's (`td-util/src/deflate.rs`, its gzip
 applet's), mounted the same way; its gzip framing is unused here.
@@ -112,12 +112,13 @@ desktop encodes in about 170 ms at the compositor's `opt-level = "s"`,
 to about a sixteenth of its RGB bytes; noise falls back to stored
 blocks, a few bytes a block past its size. It refuses only what PNG
 cannot name; a frame past the decoder's budgets encodes, and the
-decoder refuses it. Paeth's predictor and Adler-32 live here and the
-decoder uses them. `encode.rs` reaches only the crate root's `deflate`
+decoder refuses it. Paeth's predictor lives here; Adler-32 lives beside
+the engine's CRC and both PNG and zlib use it. `encode.rs` reaches only
+the crate root's `deflate`
 and `crc32`, so a consumer mounts it beside those two and carries no
 decoder, as the compositor does for Print's screenshots
 (td-compositor/DESIGN.md, "Screenshots"); one that runs its tests also
-mounts the engine's `gzip.rs` under `cfg(test)`, which `deflate.rs`'s
+mounts td-inflate's `gzip.rs` under `cfg(test)`, which `deflate.rs`'s
 own tests read back through.
 
 ## Test contract
@@ -159,7 +160,8 @@ observable tie order, and `lib.rs`'s holds each filter to the decoder's
 Python's zlib when the encoder landed.
 
 `tests/confinement.rs` pins two source files of td-png's own that open
-nothing, the two engine mounts and td-util's encoder and nothing else,
+nothing, the checksum and td-inflate mounts and td-util's encoder and
+nothing else,
 the encoder reaching only `crate::deflate` and `crate::crc32` (and no
 `super::` outside its tests), a manifest of no
 dependencies, the bounds above, the fixture inventory, `shapes.png`'s

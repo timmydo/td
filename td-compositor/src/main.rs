@@ -58,7 +58,7 @@ mod png_encode;
         clippy::panic
     )
 )]
-#[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/gzip.rs")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-inflate/src/gzip.rs")]
 mod gzip;
 // td-fs's fixture guard, for tests that own a directory.
 #[cfg(test)]
@@ -1259,7 +1259,7 @@ mod confinement {
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
-        ("gzip.rs", include_str!("../../engine/src/gzip.rs")),
+        ("gzip.rs", include_str!("../../td-inflate/src/gzip.rs")),
         ("headless.rs", include_str!("headless.rs")),
         ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),

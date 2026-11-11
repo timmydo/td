@@ -13,7 +13,7 @@
 //! image. Nothing here reads a file, the environment or a clock
 //! (DESIGN.md).
 //!
-//! The inflater and the CRC are the engine's, mounted as source rather
+//! The inflater is td-inflate's and the CRC is the engine's, mounted rather
 //! than copied. `encode_rgb8` writes eight-bit RGB over td-util's DEFLATE
 //! encoder, mounted the same way (`encode.rs`).
 
@@ -30,7 +30,7 @@
     )
 )]
 mod crc32;
-#[path = "../../engine/src/gzip.rs"]
+#[path = "../../td-inflate/src/gzip.rs"]
 #[allow(dead_code)]
 #[cfg_attr(
     test,

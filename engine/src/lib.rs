@@ -19,12 +19,12 @@
 //! installer `#[path]`-includes them (together with `crc32`) exactly as
 //! td-boot includes `sha256`. Neither bin uses `gpt` or `fat`.
 //!
-//! The `gzip` module holds the one std-only DEFLATE implementation shared
+//! The `gzip` module mounts td-inflate's one std-only implementation shared
 //! by builder source extraction, `td-net`'s bounded OSTree acquisition
 //! (on the target only through `td-app`) and the `ostree_deploy`
 //! materializer; `xz` is its LZMA2
 //! counterpart, shared by builder source extraction and `td-net`'s Debian
-//! index resolution. No target binary `#[path]`-includes either.
+//! index resolution. td-util and PNG consumers mount td-inflate as source.
 //!
 //! `elf` (the read-only ELF inspection), `dynamic_application` (the
 //! offline loader-graph validator) and `ostree_deploy` moved here from the
@@ -73,6 +73,7 @@ pub mod exit;
 pub mod fat;
 pub mod flathub_app;
 pub mod gpt;
+#[path = "../../td-inflate/src/gzip.rs"]
 pub mod gzip;
 pub mod host_path;
 pub mod image_chunks;
