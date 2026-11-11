@@ -12,19 +12,19 @@
 //! `settings` the export settings' grammar, `transform`, `cdf`, `deblock`,
 //! `cdef` and `av1` the AV1 still picture encoder (the transforms and
 //! quantizers, the default symbol probabilities, the deblocking and directional
-//! filters, and the coder), `avif` its container, `exif` the Exif it carries,
+//! filters shared through td-av1, and the coder), `avif` its container,
+//! `exif` the Exif it carries,
 //! and `ui` the cull controller
 //! over td-ui's driven seam. None of these reads a file, the environment, a
 //! clock or a descriptor: `main` owns I/O. DESIGN.md is the contract.
+
+pub use td_av1::{cdef, cdf, deblock, transform};
 
 pub mod auto;
 pub mod av1;
 pub mod avif;
 pub mod camera;
-pub mod cdef;
-pub mod cdf;
 pub mod color;
-pub mod deblock;
 pub mod develop;
 pub mod exif;
 pub mod histogram;
@@ -36,5 +36,4 @@ pub mod matching;
 pub mod nef;
 pub mod settings;
 pub mod tiff;
-pub mod transform;
 pub mod ui;

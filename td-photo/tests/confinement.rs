@@ -33,10 +33,7 @@ const PURE: &[&str] = &[
     "av1.rs",
     "avif.rs",
     "camera.rs",
-    "cdef.rs",
-    "cdf.rs",
     "color.rs",
-    "deblock.rs",
     "develop.rs",
     "exif.rs",
     "histogram.rs",
@@ -48,7 +45,6 @@ const PURE: &[&str] = &[
     "nef.rs",
     "settings.rs",
     "tiff.rs",
-    "transform.rs",
     "ui.rs",
 ];
 
@@ -113,12 +109,12 @@ fn the_crate_forbids_unsafe_and_includes_nothing() {
 fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
-    // The three siblings, in the one spelling the lock guard admits.
+    // The four siblings, in the one spelling the lock guard admits.
     assert!(
         manifest.contains(
-            "\n[dependencies]\ntd-civil = { path = \"../td-civil\" }\ntd-jpeg = { path = \"../td-jpeg\" }\ntd-ui = { path = \"../td-ui\" }\n"
+            "\n[dependencies]\ntd-av1 = { path = \"../td-av1\" }\ntd-civil = { path = \"../td-civil\" }\ntd-jpeg = { path = \"../td-jpeg\" }\ntd-ui = { path = \"../td-ui\" }\n"
         ),
-        "the civil calendar, the JPEG decoder and the toolkit by path"
+        "the AV1 arithmetic, civil calendar, JPEG decoder and toolkit by path"
     );
     // And the file helpers and the native harness, for the tests alone.
     assert!(
@@ -127,7 +123,7 @@ fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_
         ),
         "the file helpers and the native harness by path, for the tests"
     );
-    assert_eq!(manifest.matches("path =").count(), 5, "five dependencies");
+    assert_eq!(manifest.matches("path =").count(), 6, "six dependencies");
     assert_eq!(manifest.matches("[dependencies]").count(), 1);
     assert_eq!(manifest.matches("[dev-dependencies]").count(), 1);
     assert!(!manifest.contains("[build-dependencies]"));
@@ -152,7 +148,8 @@ fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 6);
+    assert_eq!(lock.matches("[[package]]").count(), 7);
+    assert!(lock.contains("name = \"td-av1\""));
     assert!(lock.contains("name = \"td-civil\""));
     assert!(lock.contains("name = \"td-fs\""));
     assert!(lock.contains("name = \"td-jpeg\""));

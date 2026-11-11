@@ -1549,6 +1549,7 @@ pub const AC_Q: [u16; 256] = [
 ];
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

@@ -670,6 +670,7 @@ mod tests {
                 "net",
                 "td-agent",
                 "td-authd",
+                "td-av1",
                 "td-btrfs",
                 "td-busd",
                 "td-civil",

@@ -33,7 +33,7 @@ runs in row bands (`develop`), the PPM writer and reader over td-jpeg's
 RGB buffer (`image`), the thumbnail rule over td-jpeg's preview decoder
 and the pool td-jpeg's baseline encoder spreads its transform over as
 export writes through it (`jpeg`), the AV1
-still-picture encoder (`av1` over `transform`, `cdf`, `deblock` and
+still-picture encoder (`av1` over td-av1's `transform`, `cdf`, `deblock` and
 `cdef`) and the AVIF container (`avif`) export writes through instead
 when asked, the thumbnail rule and the thumbnail cache, the library's
 sidecar grammar, roll rules and dating rule (`library`), the cull and
@@ -64,7 +64,7 @@ palette; the `export` verb and the window's `export` action are in,
 `delete-rejected` with them, and the export view with its settings and
 the picks' export close the export increment, AVIF included. The crate
 is packaged: the `td-photo` target recipe builds it static over the
-staged td-civil, td-jpeg, td-ui and td-compositor trees, the image
+staged td-av1, td-civil, td-jpeg, td-ui and td-compositor trees, the image
 copies its output and links `/bin/td-photo`, and `td-photo-test` runs
 the built binary's verbs over a synthetic frame (Packaging below).
 
@@ -93,7 +93,8 @@ unbounded read.
 Production code has no `unwrap`, `expect`, panics or panicking indexing;
 the crate root forbids `unsafe`, and its confinement tests pin that
 td-ui, td-civil (the calendar the EXIF date is checked against) and
-td-jpeg (the preview decoder and the export encoder) are its only
+td-jpeg (the preview decoder and the export encoder), and td-av1 (shared
+AV1 arithmetic) are its only
 dependencies and which files name which of td-ui's modules.
 
 ## Workflow
@@ -1734,7 +1735,7 @@ whatever the band or thread count, which `tests/jpeg.rs` pins against
 the encoder run on the caller's thread alone.
 
 The AVIF export codes the frame with the crate's own AV1 encoder
-(`av1::Encoder`, over `transform`, `cdf`, `deblock` and `cdef`), pure
+(`av1::Encoder`, over td-av1's `transform`, `cdf`, `deblock` and `cdef`), pure
 `std`:
 a still picture (`still_picture` and `reduced_still_picture_header`
 set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +

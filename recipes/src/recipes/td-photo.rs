@@ -7,7 +7,7 @@ use crate::types::Recipe;
 /// embeds the licence notices under `td-compositor/assets`, so those
 /// trees are staged beside td-photo and cargo compiles exactly what the
 /// crate names: the td-editor and td-taskmgr shape. Its lock lists only
-/// itself, td-civil, td-jpeg, td-ui and the dev-only td-fs and
+/// itself, td-av1, td-civil, td-jpeg, td-ui and the dev-only td-fs and
 /// td-test-compositor, each staged too, so the closure is std and the
 /// vendor set is empty; the binary is linked fully static, as every
 /// td-owned program in the system tree is. The image copies the complete
@@ -17,6 +17,7 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-photo", "0.1.0")
         .local_source("td-photo")
         .local_source_trees(&[
+            "td-av1",
             "td-civil",
             "td-fs",
             "td-jpeg",
@@ -44,6 +45,7 @@ mod tests {
         assert_eq!(
             r.local_source_trees,
             Some(vec![
+                "td-av1".into(),
                 "td-civil".into(),
                 "td-fs".into(),
                 "td-jpeg".into(),
