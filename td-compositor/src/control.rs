@@ -28,8 +28,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::authority::{
-    CacheAnswer, CacheRecord, CacheVerb, GrantAccess, GrantAnswer, GrantOutcome, GrantRequest,
-    GrantVerb, GRANT_PATH_BYTES,
+    CacheAnswer, CacheRecord, CacheVerb, GrantAccess, GrantAnswer, GrantKind, GrantNetwork,
+    GrantOutcome, GrantRequest, GrantVerb, GRANT_PATH_BYTES,
 };
 use crate::layout::{Command, Direction, Presentation, Rect, FINAL_WORKSPACE, INITIAL_WORKSPACE};
 use crate::reportable::reportable;
@@ -165,21 +165,32 @@ pub enum Request {
     /// Raise the named application's window, or ask root to start it, as
     /// its card entry does.
     Launch(ApplicationName),
-    /// `grants application NAME`: the application account's directory
-    /// grants, as root's table holds them (td-authd/DESIGN.md, "Grant
-    /// requests").
-    Grants(ApplicationName),
-    /// `grant application NAME ro|rw PATH`: grant it one of the human's
+    /// `grants KIND NAME`: the application's or sandbox's directory
+    /// grants, and a sandbox's network, as root's table holds them
+    /// (td-authd/DESIGN.md, "Grant requests").
+    Grants {
+        kind: GrantKind,
+        name: ApplicationName,
+    },
+    /// `grant KIND NAME ro|rw PATH`: grant it one of the human's
     /// directories.
     Grant {
+        kind: GrantKind,
         name: ApplicationName,
         access: GrantAccess,
         path: GrantPath,
     },
-    /// `revoke application NAME PATH`: take that grant back.
+    /// `revoke KIND NAME PATH`: take that grant back.
     Revoke {
+        kind: GrantKind,
         name: ApplicationName,
         path: GrantPath,
+    },
+    /// `network sandbox NAME off|host`: give that sandbox no network or
+    /// the host's. An application's network is its declaration's.
+    Network {
+        name: ApplicationName,
+        network: GrantNetwork,
     },
 }
 
@@ -220,23 +231,70 @@ impl GrantPath {
     }
 }
 
-/// The account kind a grant request names: only `application` takes
-/// grants until sandbox and workspace launches go through root
-/// (WORKLOADS.md, "Landing order", step 7).
-fn grant_kind(word: Option<&str>, verb: &str) -> Result<(), String> {
+/// The account kind a grant request names: `application` or `sandbox`;
+/// a workspace takes no grants until its launches go through root
+/// (WORKLOADS.md, "Landing order", step 8).
+fn grant_kind(word: Option<&str>, verb: &str) -> Result<GrantKind, String> {
     match word {
-        Some("application") => Ok(()),
-        Some(kind @ ("sandbox" | "workspace")) => Err(format!(
-            "{kind} accounts take no grants until their launches go through root"
+        Some("application") => Ok(GrantKind::Application),
+        Some("sandbox") => Ok(GrantKind::Sandbox),
+        Some("workspace") => {
+            Err("workspace accounts take no grants until their launches go through root".into())
+        }
+        Some(other) => Err(format!(
+            "'{other}' is not an account kind; try application or sandbox"
         )),
-        Some(other) => Err(format!("'{other}' is not an account kind; try application")),
-        None => Err(format!("'{verb}' needs an account kind: application")),
+        None => Err(format!(
+            "'{verb}' needs an account kind: application or sandbox"
+        )),
     }
+}
+
+/// The name of the `kind` account a grant request names, in the
+/// registry's grammar, which the ledger's shares.
+fn account_name(
+    kind: GrantKind,
+    word: Option<&str>,
+    verb: &str,
+) -> Result<ApplicationName, String> {
+    let whose = match kind {
+        GrantKind::Application => "an application",
+        GrantKind::Sandbox => "a sandbox",
+    };
+    ApplicationName::parse_named(word, verb, whose)
 }
 
 /// What `grant` or `revoke` alone is told.
 fn grant_operands(verb: &str) -> String {
-    format!("'{verb}' needs an account kind, an application and a directory")
+    format!("'{verb}' needs an account kind, its name and a directory")
+}
+
+/// `network KIND NAME off|host`, whose kind can only be `sandbox`.
+fn network_request<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    verb: &str,
+) -> Result<Request, String> {
+    match grant_kind(words.next(), verb)? {
+        GrantKind::Sandbox => {}
+        GrantKind::Application => {
+            return Err(
+                "an application's network is its declaration's; only a sandbox's is set".into(),
+            )
+        }
+    }
+    let name = account_name(GrantKind::Sandbox, words.next(), verb)?;
+    let network = words
+        .next()
+        .and_then(GrantNetwork::from_word)
+        .ok_or("'network' needs off or host")?;
+    if let Some(extra) = words.next() {
+        // Refused, the message is empty, which needs no allocation.
+        return Err(crate::allocation::format(format_args!(
+            "'{verb}' takes no argument '{extra}'"
+        ))
+        .unwrap_or_default());
+    }
+    Ok(Request::Network { name, network })
 }
 
 /// `grant` and `revoke`, whose directory is the rest of the line after
@@ -249,18 +307,23 @@ fn grant_change(line: &str) -> Option<Result<Request, String>> {
             _ => rest.splitn(3, ' ').collect(),
         };
         let mut fields = fields.into_iter();
-        grant_kind(fields.next(), verb)?;
-        let name = ApplicationName::parse(fields.next(), verb)?;
+        let kind = grant_kind(fields.next(), verb)?;
+        let name = account_name(kind, fields.next(), verb)?;
         if verb == "grant" {
             let access = fields
                 .next()
                 .and_then(GrantAccess::from_word)
                 .ok_or("'grant' needs ro or rw before the directory")?;
             let path = GrantPath::parse(fields.next().unwrap_or_default())?;
-            return Ok(Request::Grant { name, access, path });
+            return Ok(Request::Grant {
+                kind,
+                name,
+                access,
+                path,
+            });
         }
         let path = GrantPath::parse(fields.next().unwrap_or_default())?;
-        Ok(Request::Revoke { name, path })
+        Ok(Request::Revoke { kind, name, path })
     };
     match verb {
         "grant" | "revoke" => Some(parse(verb)),
@@ -269,7 +332,9 @@ fn grant_change(line: &str) -> Option<Result<Request, String>> {
 }
 
 /// An application name as a request carries it: the registry's grammar,
-/// at most 64 bytes, held by value so a request stays `Copy`.
+/// at most 64 bytes, held by value so a request stays `Copy`. A sandbox's
+/// name in a grant request is held the same way, since the ledger's
+/// grammar is the registry's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationName {
     bytes: [u8; 64],
@@ -278,9 +343,15 @@ pub struct ApplicationName {
 
 impl ApplicationName {
     fn parse(word: Option<&str>, verb: &str) -> Result<Self, String> {
-        let word = word.ok_or_else(|| format!("'{verb}' needs an application name"))?;
+        Self::parse_named(word, verb, "an application")
+    }
+
+    /// A name in the registry's grammar, called `whose` name, such as "a
+    /// sandbox", in what a caller is told.
+    fn parse_named(word: Option<&str>, verb: &str, whose: &str) -> Result<Self, String> {
+        let word = word.ok_or_else(|| format!("'{verb}' needs {whose} name"))?;
         if !crate::authority::consent::application_name(word) {
-            return Err(format!("'{word}' is not an application name"));
+            return Err(format!("'{word}' is not {whose} name"));
         }
         let mut bytes = [0; 64];
         bytes
@@ -410,16 +481,20 @@ pub const USAGE: &[(&str, &str)] = &[
         "raise that application's window, or have root start it if installed",
     ),
     (
-        "grants application <application>",
-        "list the directories of your home that application is granted",
+        "grants <application|sandbox> <name>",
+        "list the directories of your home that application or sandbox is granted, and a sandbox's network",
     ),
     (
-        "grant application <application> <ro|rw> <directory>",
+        "grant <application|sandbox> <name> <ro|rw> <directory>",
         "grant it that directory below your home, read-only or writable, from its next launch",
     ),
     (
-        "revoke application <application> <directory>",
-        "take that grant back, from the application's next launch",
+        "revoke <application|sandbox> <name> <directory>",
+        "take that grant back, from its next launch",
+    ),
+    (
+        "network sandbox <name> <off|host>",
+        "give that sandbox no network or the host's, from its next launch",
     ),
 ];
 
@@ -495,9 +570,13 @@ impl Request {
             },
             "launch" => Request::Launch(ApplicationName::parse(words.next(), verb)?),
             "grants" => {
-                grant_kind(words.next(), verb)?;
-                Request::Grants(ApplicationName::parse(words.next(), verb)?)
+                let kind = grant_kind(words.next(), verb)?;
+                Request::Grants {
+                    kind,
+                    name: account_name(kind, words.next(), verb)?,
+                }
             }
+            "network" => return network_request(words, verb),
             // With operands these are `grant_change`'s.
             "grant" | "revoke" => return Err(grant_operands(verb)),
             other => return Err(format!("no such request '{other}'; try 'help'")),
@@ -569,31 +648,52 @@ impl Request {
             }
             Request::Application { verb, name } => format!("{} {}", verb.word(), name.as_str()),
             Request::Launch(name) => format!("launch {}", name.as_str()),
-            Request::Grants(name) => format!("grants application {}", name.as_str()),
-            Request::Grant { name, access, path } => format!(
-                "grant application {} {} {}",
+            Request::Grants { kind, name } => format!("grants {} {}", kind.word(), name.as_str()),
+            Request::Grant {
+                kind,
+                name,
+                access,
+                path,
+            } => format!(
+                "grant {} {} {} {}",
+                kind.word(),
                 name.as_str(),
                 access.word(),
                 path.as_str()
             ),
-            Request::Revoke { name, path } => {
-                format!("revoke application {} {}", name.as_str(), path.as_str())
+            Request::Revoke { kind, name, path } => {
+                format!("revoke {} {} {}", kind.word(), name.as_str(), path.as_str())
             }
+            // Refused, the line is empty, which the compositor's own
+            // `Request::parse` refuses.
+            Request::Network { name, network } => crate::allocation::format(format_args!(
+                "network sandbox {} {}",
+                name.as_str(),
+                network.word()
+            ))
+            .unwrap_or_default(),
         }
     }
 
     /// A grant request's form for the authority worker.
     fn grant_request(&self) -> Option<GrantRequest> {
-        let (verb, name, path) = match self {
-            Request::Grants(name) => (GrantVerb::List, name, ""),
-            Request::Grant { name, access, path } => {
-                (GrantVerb::Grant(*access), name, path.as_str())
+        let (verb, kind, name, path) = match self {
+            Request::Grants { kind, name } => (GrantVerb::List, *kind, name, ""),
+            Request::Grant {
+                kind,
+                name,
+                access,
+                path,
+            } => (GrantVerb::Grant(*access), *kind, name, path.as_str()),
+            Request::Revoke { kind, name, path } => (GrantVerb::Revoke, *kind, name, path.as_str()),
+            Request::Network { name, network } => {
+                (GrantVerb::Network(*network), GrantKind::Sandbox, name, "")
             }
-            Request::Revoke { name, path } => (GrantVerb::Revoke, name, path.as_str()),
             _ => return None,
         };
         Some(GrantRequest {
             verb,
+            kind,
             name: name.as_str().to_string(),
             path: path.to_string(),
         })
@@ -1111,9 +1211,10 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
         // Answered beside the authority, which this path does not have.
         Request::Application { .. }
         | Request::Launch(_)
-        | Request::Grants(_)
+        | Request::Grants { .. }
         | Request::Grant { .. }
-        | Request::Revoke { .. } => return Ok(Answer::ApplicationsDisabled),
+        | Request::Revoke { .. }
+        | Request::Network { .. } => return Ok(Answer::ApplicationsDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -1487,9 +1588,10 @@ fn converse(
         Ok(
             request @ (Request::Application { .. }
             | Request::Launch(_)
-            | Request::Grants(_)
+            | Request::Grants { .. }
             | Request::Grant { .. }
-            | Request::Revoke { .. }),
+            | Request::Revoke { .. }
+            | Request::Network { .. }),
         ),
         Some(authority),
     ) = (request, authority)
@@ -1571,12 +1673,17 @@ fn application_answer(
 }
 
 /// Root's answer to a grant request as the control socket gives it: a
-/// listing's `ACCESS<TAB>DIRECTORY` lines, or what a change did, one word;
-/// the writer's refusal is an `error` with its reason.
+/// listing's `network<TAB>off|host` line for a sandbox, then its
+/// `ACCESS<TAB>DIRECTORY` lines, or what a change did, one word; the
+/// writer's refusal is an `error` with its reason.
 pub(crate) fn grant_answer(answer: GrantAnswer) -> String {
     match answer {
-        GrantAnswer::Listed(rows) => {
-            let mut body = String::from("ok\n");
+        GrantAnswer::Listed { network, rows } => {
+            let mut body = String::from(match network {
+                None => "ok\n",
+                Some(GrantNetwork::Off) => "ok\nnetwork\toff\n",
+                Some(GrantNetwork::Host) => "ok\nnetwork\thost\n",
+            });
             for (access, path) in rows {
                 body.push_str(&format!("{}\t{path}\n", access.word()));
             }
@@ -1788,7 +1895,7 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
     if let Some(grant) = request.grant_request() {
         let line = format!("{}\n", request.render());
         let answer = ask_bounded(path, line.as_bytes(), GRANTS_LIMIT)?;
-        return decode_grant_answer(&answer, grant.verb);
+        return decode_grant_answer(&answer, grant.kind, grant.verb);
     }
     if let Request::Application {
         verb: CacheVerb::Status,
@@ -1828,16 +1935,31 @@ const APPLICATION_STATUS_LIMIT: usize = 8192;
 /// longest path, with room.
 const GRANTS_LIMIT: usize = 40 * 1024;
 
-/// A grant answer's body: a listing's `ro|rw<TAB>DIRECTORY` lines, or the
-/// one word saying what a change did; an `error` is the writer's refusal.
-fn decode_grant_answer(answer: &[u8], verb: GrantVerb) -> Result<String, ControlFailure> {
+/// A grant answer's body: a listing's `network<TAB>off|host` line for a
+/// sandbox and none for an application, then its `ro|rw<TAB>DIRECTORY`
+/// lines, or the one word saying what a change did; an `error` is the
+/// writer's refusal.
+fn decode_grant_answer(
+    answer: &[u8],
+    kind: GrantKind,
+    verb: GrantVerb,
+) -> Result<String, ControlFailure> {
     let bad = || ControlFailure::Unreachable("malformed grant answer".into());
     let text = std::str::from_utf8(answer).map_err(|_| bad())?;
     let Some(body) = text.strip_prefix("ok\n") else {
         return split_answer(text, false).and_then(|_| Err(bad()));
     };
+    // A sandbox's listing begins with its network, whose line is shown as
+    // it came; an application's has none.
+    let (network, rows) = match (kind, verb) {
+        (GrantKind::Sandbox, GrantVerb::List) => ["network\toff\n", "network\thost\n"]
+            .into_iter()
+            .find_map(|line| Some(line).zip(body.strip_prefix(line)))
+            .ok_or_else(bad)?,
+        _ => ("", body),
+    };
     let shaped = match verb {
-        GrantVerb::List => body.split_terminator('\n').all(|line| {
+        GrantVerb::List => rows.split_terminator('\n').all(|line| {
             ["ro\t", "rw\t"].iter().any(|access| {
                 line.strip_prefix(access)
                     .is_some_and(|path| !path.is_empty())
@@ -1845,8 +1967,9 @@ fn decode_grant_answer(answer: &[u8], verb: GrantVerb) -> Result<String, Control
         }),
         GrantVerb::Grant(_) => ["added\n", "changed\n", "unchanged\n"].contains(&body),
         GrantVerb::Revoke => body == "revoked\n",
+        GrantVerb::Network(_) => ["changed\n", "unchanged\n"].contains(&body),
     };
-    if !shaped || !(body.is_empty() || body.ends_with('\n')) {
+    if !shaped || !(rows.is_empty() || rows.ends_with('\n')) {
         return Err(bad());
     }
     if verb != GrantVerb::List {
@@ -1856,7 +1979,9 @@ fn decode_grant_answer(answer: &[u8], verb: GrantVerb) -> Result<String, Control
     // one; each line, tab and newline aside, is shown as td-software
     // shows it (td-software/src/grants.rs, `shown`).
     let mut shown = String::with_capacity(body.len());
-    for line in body.split_terminator('\n') {
+    crate::allocation::push_str(&mut shown, network)
+        .map_err(|_| ControlFailure::Unreachable(String::new()))?;
+    for line in rows.split_terminator('\n') {
         let (access, path) = line.split_once('\t').ok_or_else(bad)?;
         shown.push_str(access);
         shown.push('\t');
@@ -2809,7 +2934,25 @@ mod tests {
             ]
             .map(|verb| Request::Application { verb, name })
             .into_iter()
-            .chain([Request::Launch(name), Request::Grants(name)]),
+            .chain([
+                Request::Launch(name),
+                Request::Grants {
+                    kind: GrantKind::Application,
+                    name,
+                },
+                Request::Grants {
+                    kind: GrantKind::Sandbox,
+                    name,
+                },
+                Request::Network {
+                    name,
+                    network: GrantNetwork::Off,
+                },
+                Request::Network {
+                    name,
+                    network: GrantNetwork::Host,
+                },
+            ]),
         );
         let paths = [
             "Pictures",
@@ -2819,20 +2962,29 @@ mod tests {
             "Téléchargements",
         ]
         .map(|path| GrantPath::parse(path).unwrap());
+        let kinds = [GrantKind::Application, GrantKind::Sandbox];
         let every = every.chain(paths.iter().flat_map(|path| {
-            [
-                Request::Grant {
-                    name,
-                    access: GrantAccess::ReadOnly,
-                    path: *path,
-                },
-                Request::Grant {
-                    name,
-                    access: GrantAccess::ReadWrite,
-                    path: *path,
-                },
-                Request::Revoke { name, path: *path },
-            ]
+            kinds.into_iter().flat_map(|kind| {
+                [
+                    Request::Grant {
+                        kind,
+                        name,
+                        access: GrantAccess::ReadOnly,
+                        path: *path,
+                    },
+                    Request::Grant {
+                        kind,
+                        name,
+                        access: GrantAccess::ReadWrite,
+                        path: *path,
+                    },
+                    Request::Revoke {
+                        kind,
+                        name,
+                        path: *path,
+                    },
+                ]
+            })
         }));
         for request in every {
             let line = request.render();
@@ -3179,6 +3331,7 @@ mod tests {
             "grants",
             "grant",
             "revoke",
+            "network",
         ] {
             assert!(help.contains(verb), "help text does not name '{verb}'");
         }
@@ -5524,18 +5677,30 @@ mod tests {
         drop(queued);
     }
 
-    /// A grant names the application kind, an application, the access
-    /// and the directory as the rest of the line; anything short of that,
-    /// another kind or a directory past the table's bound is refused here.
+    /// A grant names the application or sandbox kind, its name, the
+    /// access and the directory as the rest of the line; anything short of
+    /// that, a workspace or another kind or a directory past the table's
+    /// bound is refused here.
     #[test]
     fn grant_requests_parse_whole_and_refuse_other_kinds() {
         let parsed = Request::parse("grant application firefox ro My Pictures/2026").unwrap();
-        let Request::Grant { name, access, path } = parsed else {
+        let Request::Grant {
+            kind,
+            name,
+            access,
+            path,
+        } = parsed
+        else {
             panic!("{parsed:?}");
         };
         assert_eq!(
-            (name.as_str(), access, path.as_str()),
-            ("firefox", GrantAccess::ReadOnly, "My Pictures/2026")
+            (kind, name.as_str(), access, path.as_str()),
+            (
+                GrantKind::Application,
+                "firefox",
+                GrantAccess::ReadOnly,
+                "My Pictures/2026"
+            )
         );
         assert_eq!(
             Request::parse("revoke application firefox My Pictures")
@@ -5543,6 +5708,7 @@ mod tests {
                 .grant_request(),
             Some(GrantRequest {
                 verb: GrantVerb::Revoke,
+                kind: GrantKind::Application,
                 name: "firefox".into(),
                 path: "My Pictures".into(),
             })
@@ -5553,10 +5719,42 @@ mod tests {
                 .grant_request(),
             Some(GrantRequest {
                 verb: GrantVerb::List,
+                kind: GrantKind::Application,
                 name: "web".into(),
                 path: String::new(),
             })
         );
+        // A sandbox takes the same three verbs, and its network.
+        for (line, verb, path) in [
+            ("grants sandbox default", GrantVerb::List, ""),
+            (
+                "grant sandbox default rw src/td",
+                GrantVerb::Grant(GrantAccess::ReadWrite),
+                "src/td",
+            ),
+            ("revoke sandbox default src/td", GrantVerb::Revoke, "src/td"),
+            (
+                "network sandbox default host",
+                GrantVerb::Network(GrantNetwork::Host),
+                "",
+            ),
+            (
+                "network sandbox default off",
+                GrantVerb::Network(GrantNetwork::Off),
+                "",
+            ),
+        ] {
+            assert_eq!(
+                Request::parse(line).unwrap().grant_request(),
+                Some(GrantRequest {
+                    verb,
+                    kind: GrantKind::Sandbox,
+                    name: "default".into(),
+                    path: path.into(),
+                }),
+                "{line}"
+            );
+        }
         let longest = "a".repeat(GRANT_PATH_BYTES);
         assert!(Request::parse(&format!("grant application firefox rw {longest}")).is_ok());
         for (line, expected) in [
@@ -5572,19 +5770,41 @@ mod tests {
             ("grant application firefox ro ", "a grant needs a directory"),
             ("revoke application firefox", "a grant needs a directory"),
             ("grant application Firefox ro Pictures", "'Firefox' is not"),
+            ("grant sandbox", "'grant' needs a sandbox name"),
+            ("grants sandbox Default", "'Default' is not a sandbox name"),
             (
-                "grant sandbox default ro src",
-                "sandbox accounts take no grants",
+                "grant workspace agent-1 ro src",
+                "workspace accounts take no grants",
             ),
             (
                 "revoke workspace agent-1 src",
                 "workspace accounts take no grants",
             ),
-            ("grants sandbox default", "sandbox accounts take no grants"),
+            (
+                "grants workspace agent-1",
+                "workspace accounts take no grants",
+            ),
             ("grants service firefox", "'service' is not an account kind"),
             ("grants", "'grants' needs an account kind"),
             (
                 "grants application firefox extra",
+                "takes no argument 'extra'",
+            ),
+            // Only a sandbox's network is set here.
+            (
+                "network application firefox host",
+                "an application's network is its declaration's",
+            ),
+            (
+                "network workspace agent-1 host",
+                "workspace accounts take no grants",
+            ),
+            ("network", "'network' needs an account kind"),
+            ("network sandbox", "'network' needs a sandbox name"),
+            ("network sandbox default", "'network' needs off or host"),
+            ("network sandbox default on", "'network' needs off or host"),
+            (
+                "network sandbox default host extra",
                 "takes no argument 'extra'",
             ),
         ] {
@@ -5619,13 +5839,40 @@ mod tests {
 
     #[test]
     fn grant_answers_carry_rows_one_word_or_the_writers_reason() {
-        assert_eq!(grant_answer(GrantAnswer::Listed(Vec::new())), "ok\n");
+        let rows = || {
+            vec![
+                (GrantAccess::ReadOnly, "My Pictures".to_string()),
+                (GrantAccess::ReadWrite, "Downloads".to_string()),
+            ]
+        };
         assert_eq!(
-            grant_answer(GrantAnswer::Listed(vec![
-                (GrantAccess::ReadOnly, "My Pictures".into()),
-                (GrantAccess::ReadWrite, "Downloads".into()),
-            ])),
+            grant_answer(GrantAnswer::Listed {
+                network: None,
+                rows: Vec::new()
+            }),
+            "ok\n"
+        );
+        assert_eq!(
+            grant_answer(GrantAnswer::Listed {
+                network: None,
+                rows: rows()
+            }),
             "ok\nro\tMy Pictures\nrw\tDownloads\n"
+        );
+        // A sandbox's listing begins with its network.
+        assert_eq!(
+            grant_answer(GrantAnswer::Listed {
+                network: Some(GrantNetwork::Host),
+                rows: rows()
+            }),
+            "ok\nnetwork\thost\nro\tMy Pictures\nrw\tDownloads\n"
+        );
+        assert_eq!(
+            grant_answer(GrantAnswer::Listed {
+                network: Some(GrantNetwork::Off),
+                rows: Vec::new()
+            }),
+            "ok\nnetwork\toff\n"
         );
         for (outcome, word) in [
             (GrantOutcome::Added, "added"),
@@ -5651,46 +5898,100 @@ mod tests {
         }
         assert!(grant_answer(GrantAnswer::Live).starts_with("error "));
         // td-ctl reads exactly those shapes back.
+        let application = GrantKind::Application;
+        let sandbox = GrantKind::Sandbox;
         assert_eq!(
-            decode_grant_answer(b"ok\nro\tMy Pictures\nrw\tDownloads\n", GrantVerb::List).unwrap(),
+            decode_grant_answer(
+                b"ok\nro\tMy Pictures\nrw\tDownloads\n",
+                application,
+                GrantVerb::List
+            )
+            .unwrap(),
             "ro\tMy Pictures\nrw\tDownloads\n"
         );
-        assert_eq!(decode_grant_answer(b"ok\n", GrantVerb::List).unwrap(), "");
+        assert_eq!(
+            decode_grant_answer(b"ok\n", application, GrantVerb::List).unwrap(),
+            ""
+        );
+        assert_eq!(
+            decode_grant_answer(b"ok\nnetwork\thost\nrw\tsrc\n", sandbox, GrantVerb::List).unwrap(),
+            "network\thost\nrw\tsrc\n"
+        );
+        assert_eq!(
+            decode_grant_answer(b"ok\nnetwork\toff\n", sandbox, GrantVerb::List).unwrap(),
+            "network\toff\n"
+        );
         // An inert row root wrote can hold what reorders or hides text;
         // td-ctl shows each such character as `?`, as td-software does.
         assert_eq!(
             decode_grant_answer(
                 "ok\nro\tMusic/\u{202E}x\u{2028}\u{200B}\u{2066}\u{FEFF}\u{061C}\u{85}é\nrw\tDownloads\n"
                     .as_bytes(),
+                application,
                 GrantVerb::List
             )
             .unwrap(),
             "ro\tMusic/?x??????é\nrw\tDownloads\n"
         );
         assert_eq!(
-            decode_grant_answer(b"ok\nadded\n", GrantVerb::Grant(GrantAccess::ReadOnly)).unwrap(),
+            decode_grant_answer(
+                b"ok\nadded\n",
+                application,
+                GrantVerb::Grant(GrantAccess::ReadOnly)
+            )
+            .unwrap(),
             "added\n"
         );
         assert_eq!(
-            decode_grant_answer(b"ok\nrevoked\n", GrantVerb::Revoke).unwrap(),
+            decode_grant_answer(b"ok\nrevoked\n", application, GrantVerb::Revoke).unwrap(),
             "revoked\n"
         );
+        for word in ["changed\n", "unchanged\n"] {
+            assert_eq!(
+                decode_grant_answer(
+                    format!("ok\n{word}").as_bytes(),
+                    sandbox,
+                    GrantVerb::Network(GrantNetwork::Host)
+                )
+                .unwrap(),
+                word
+            );
+        }
         assert!(matches!(
-            decode_grant_answer(b"error ~/x does not exist\n", GrantVerb::Revoke),
+            decode_grant_answer(b"error ~/x does not exist\n", application, GrantVerb::Revoke),
             Err(ControlFailure::Refused(reason)) if reason == "~/x does not exist"
         ));
-        for (answer, verb) in [
-            (&b"ok\nrx\tPictures\n"[..], GrantVerb::List),
-            (b"ok\nro\t\n", GrantVerb::List),
-            (b"ok\nro\tPictures", GrantVerb::List),
-            (b"ok\nrevoked\n", GrantVerb::Grant(GrantAccess::ReadWrite)),
-            (b"ok\nadded\n", GrantVerb::Revoke),
-            (b"ok\n", GrantVerb::Revoke),
-            (b"ok", GrantVerb::List),
+        let host = GrantVerb::Network(GrantNetwork::Host);
+        for (answer, kind, verb) in [
+            (&b"ok\nrx\tPictures\n"[..], application, GrantVerb::List),
+            (b"ok\nro\t\n", application, GrantVerb::List),
+            (b"ok\nro\tPictures", application, GrantVerb::List),
+            (
+                b"ok\nrevoked\n",
+                application,
+                GrantVerb::Grant(GrantAccess::ReadWrite),
+            ),
+            (b"ok\nadded\n", application, GrantVerb::Revoke),
+            (b"ok\n", application, GrantVerb::Revoke),
+            (b"ok", application, GrantVerb::List),
+            // A network line only a sandbox's listing has, and has first.
+            (b"ok\nnetwork\thost\n", application, GrantVerb::List),
+            (b"ok\n", sandbox, GrantVerb::List),
+            (b"ok\nrw\tsrc\n", sandbox, GrantVerb::List),
+            (b"ok\nrw\tsrc\nnetwork\thost\n", sandbox, GrantVerb::List),
+            (b"ok\nnetwork\ton\n", sandbox, GrantVerb::List),
+            (
+                b"ok\nnetwork\toff\nnetwork\thost\n",
+                sandbox,
+                GrantVerb::List,
+            ),
+            (b"ok\nadded\n", sandbox, host),
+            (b"ok\nrevoked\n", sandbox, host),
+            (b"ok\n", sandbox, host),
         ] {
             assert!(
                 matches!(
-                    decode_grant_answer(answer, verb),
+                    decode_grant_answer(answer, kind, verb),
                     Err(ControlFailure::Unreachable(_))
                 ),
                 "{answer:?}"
@@ -5714,6 +6015,7 @@ mod tests {
                 request,
                 GrantRequest {
                     verb: GrantVerb::Grant(GrantAccess::ReadOnly),
+                    kind: GrantKind::Application,
                     name: "firefox".into(),
                     path: "My Pictures".into(),
                 }
@@ -5742,6 +6044,8 @@ mod tests {
             "grants application firefox",
             "grant application firefox rw Pictures",
             "revoke application firefox Pictures",
+            "grants sandbox default",
+            "network sandbox default host",
         ] {
             let request = Request::parse(line).unwrap();
             assert!(matches!(

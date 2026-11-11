@@ -3,7 +3,7 @@
 use crate::app_policy::Declarations;
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::workload_accounts::{self, Kind, Ledger};
-use crate::workload_grants::{self, Access, Change, Table};
+use crate::workload_grants::{self, Access, Change, Network, Table};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{Read, Write};
@@ -43,14 +43,30 @@ pub(crate) enum GrantVerb {
     List,
     Grant(Access, String),
     Revoke(String),
+    /// A sandbox's network, which its one network row holds.
+    Network(Network),
 }
 
 /// What it found or did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GrantReply {
-    List(Vec<workload_grants::Directory>),
+    /// The account's directory rows, and a sandbox's network; an
+    /// application's is its declaration's, not the table's.
+    List {
+        directories: Vec<workload_grants::Directory>,
+        network: Option<Network>,
+    },
     Granted(Change),
     Revoked,
+    Networked(NetworkChange),
+}
+
+/// What setting a sandbox's network did: it changes or stands, never adds
+/// or revokes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NetworkChange {
+    Changed,
+    Unchanged,
 }
 /// How many entries an allocation reads in any directory it lists, the
 /// homes below `/var/lib/td/applications` and `/var/lib/td/workloads`
@@ -434,14 +450,18 @@ impl Directory {
     }
 
     /// A grant request (td-authd/DESIGN.md, "Grant requests") on the
-    /// `kind` account `name`'s directory rows: listed from the table as
-    /// published, or changed under the lock, waited for until `wait` has
-    /// passed, and published as boot publishes the seed. Only application
-    /// accounts take grants yet. A grant first passes `admit`, the
-    /// deployment's declaration and the source's early check; a listing
-    /// and a revocation name any account, so a row an image no longer
-    /// declares can still be seen and removed. An absent table refuses:
-    /// boot seeds it.
+    /// `kind` account `name`'s directory rows, or a sandbox's network:
+    /// listed from the table as published, or changed under the lock,
+    /// waited for until `wait` has passed, and published as boot publishes
+    /// the seed. Application and sandbox accounts take grants; a
+    /// workspace's waits for its launches to go through root, and an
+    /// application's network is its declaration's. A grant, and a
+    /// sandbox's network set to the host's, first pass `admit`, the
+    /// session owner, an application's declaration and the source's early
+    /// check, and a sandbox's then needs its ledger row, which allocation
+    /// makes and a grant never does; a listing, a revocation and a network
+    /// set off name any account, so a row an image no longer declares can
+    /// still be seen and removed. An absent table refuses: boot seeds it.
     fn grants(
         &self,
         kind: Kind,
@@ -450,11 +470,19 @@ impl Directory {
         admit: impl FnOnce() -> Result<(), String>,
         wait: Duration,
     ) -> Result<GrantReply, String> {
-        if kind != Kind::Application {
-            return Err(format!(
-                "{} accounts take no grants until their launches go through root",
-                kind.as_str()
-            ));
+        match (kind, verb) {
+            (Kind::Workspace, _) => {
+                return Err(
+                    "workspace accounts take no grants until their launches go through root".into(),
+                )
+            }
+            (Kind::Application, GrantVerb::Network(_)) => {
+                return Err(
+                    "an application's network is its declaration's; only a sandbox's is set here"
+                        .into(),
+                )
+            }
+            _ => {}
         }
         if !workload_accounts::valid_name(name) {
             return Err("invalid grant account name".into());
@@ -470,6 +498,10 @@ impl Directory {
                 .ok_or("the workload grant table is absent")?;
             Table::parse(&text)
         };
+        let listing = |table: &Table| GrantReply::List {
+            directories: table.held(kind, name),
+            network: (kind == Kind::Sandbox).then(|| table.network(kind, name)),
+        };
         // The writer checks its own operands: a grant names a path this
         // deployment publishes; a revoke any row the table can hold, so a
         // row a later validator refuses can still be taken back.
@@ -478,26 +510,44 @@ impl Directory {
                 // A renamed table is read whole; a listing takes no lock,
                 // so the table it opened may be one a publish just
                 // replaced.
-                return Ok(GrantReply::List(read(self, true)?.held(kind, name)));
+                return Ok(listing(&read(self, true)?));
             }
             GrantVerb::Grant(_, path) => {
                 workload_grants::validate_path(path.as_bytes())?;
                 admit()?;
             }
+            GrantVerb::Network(Network::Host) => admit()?,
+            GrantVerb::Network(Network::Off) => {}
             GrantVerb::Revoke(path) => workload_grants::table_path(path.as_bytes())?,
         }
         let deadline = Instant::now()
             .checked_add(wait)
             .ok_or("grant lock deadline overflow")?;
         let _lock = self.lock_until(Some(deadline))?;
+        // Under the lock allocation also takes, so the row read here is
+        // the published ledger's while this change is made.
+        if kind == Kind::Sandbox
+            && matches!(
+                verb,
+                GrantVerb::Grant(..) | GrantVerb::Network(Network::Host)
+            )
+        {
+            self.sandbox_account(name)?;
+        }
         let table = read(self, false)?;
         let (next, reply) = match verb {
-            GrantVerb::List => return Ok(GrantReply::List(table.held(kind, name))),
+            GrantVerb::List => return Ok(listing(&table)),
             GrantVerb::Grant(access, path) => match table.grant(kind, name, *access, path)? {
                 (_, Change::Unchanged) => return Ok(GrantReply::Granted(Change::Unchanged)),
                 (next, change) => (next, GrantReply::Granted(change)),
             },
             GrantVerb::Revoke(path) => (table.revoke(kind, name, path)?, GrantReply::Revoked),
+            GrantVerb::Network(network) => match table.set_network(kind, name, *network)? {
+                (_, Change::Unchanged) => {
+                    return Ok(GrantReply::Networked(NetworkChange::Unchanged))
+                }
+                (next, _) => (next, GrantReply::Networked(NetworkChange::Changed)),
+            },
         };
         self.publish_as(
             workload_grants::FILE_NAME,
@@ -507,6 +557,23 @@ impl Directory {
             GRANTS_LIMIT,
         )?;
         Ok(reply)
+    }
+
+    /// The sandbox `name`'s account, which the published ledger must hold
+    /// before the sandbox is granted anything: allocation makes it, when
+    /// td-sandbox creates the sandbox, and a grant never does, so a grant
+    /// cannot spend a ledger row.
+    fn sandbox_account(&self, name: &str) -> Result<u32, String> {
+        let text = self
+            .read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)?
+            .ok_or("the workload account ledger is absent")?;
+        Ledger::parse(&text)?
+            .uid_of(Kind::Sandbox, name)
+            .ok_or_else(|| {
+                format!(
+                    "sandbox {name:?} has no account yet; create it before granting it anything"
+                )
+            })
     }
 
     fn retained(&self) -> Result<Option<Registry>, String> {
@@ -1045,9 +1112,25 @@ fn grant_source(home: &Path, path: &str, owner: (u32, u32)) -> Result<(), String
     Ok(())
 }
 
+/// What a sandbox's grant may name: a sandbox of the primary human's
+/// session, which the deployment's principal table names. A grant's
+/// source is always that human's home and a row names no owner, so no
+/// other session owner may make one. Its account must also be in the
+/// ledger, which `Directory::grants` checks under the lock; there is no
+/// declaration, since a sandbox's policy is the grants the human made.
+fn sandbox_grantable(registry: &Registry, owner: u32) -> Result<(), String> {
+    if owner != crate::principals::primary_account::UID
+        || !registry.sessions().any(|session| session.owner == owner)
+    {
+        return Err("the grant request names another session".into());
+    }
+    Ok(())
+}
+
 /// A grant request from td-authd (td-authd/DESIGN.md, "Grant requests"):
-/// as root, the human's `kind` account `name`'s directory rows listed, or
-/// one granted or revoked under the principal lock. No caller names a
+/// as root, the human's `kind` account `name`'s directory rows and a
+/// sandbox's network listed, or a directory granted or revoked or a
+/// sandbox's network set under the principal lock. No caller names a
 /// table, an owner of a source or a uid.
 pub(crate) fn grant_table(
     owner: u32,
@@ -1057,8 +1140,12 @@ pub(crate) fn grant_table(
 ) -> Result<GrantReply, String> {
     let directory = state_directory()?;
     let admit = || {
-        let policy = crate::app_policy::load()?;
-        grantable(policy.declarations(), owner, name)?;
+        if kind == Kind::Application {
+            let policy = crate::app_policy::load()?;
+            grantable(policy.declarations(), owner, name)?;
+        } else {
+            sandbox_grantable(&Registry::load()?, owner)?;
+        }
         if let GrantVerb::Grant(_, path) = verb {
             let account =
                 crate::principals::primary_account::load().map_err(|error| error.to_string())?;

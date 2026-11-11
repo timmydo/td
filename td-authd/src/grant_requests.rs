@@ -1,12 +1,14 @@
 //! The human's grant requests, root's serving half (td-authd/DESIGN.md,
 //! "Grant requests"): request `2c` runs td-firstboot's `grant-table`, the
-//! grant table's one writer, for one validated account and directory,
-//! waits for it within a bound, and answers with the account's directory
-//! rows or what the request changed. Nothing here elevates: a grant
-//! delegates the human's authority over the human's own files.
+//! grant table's one writer, for one validated account and directory or
+//! a sandbox's network, waits for it within a bound, and answers with the
+//! account's directory rows and a sandbox's network, or what the request
+//! changed. Nothing here elevates: a grant delegates the human's
+//! authority over the human's own files.
 
 use crate::stderr_tail;
-use crate::workload_grants::{self, Access};
+use crate::workload_accounts::Kind;
+use crate::workload_grants::{self, Access, Network};
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -38,8 +40,12 @@ const OUTCOMES: &[(&str, u8)] = &[
     ("TD-GRANT-UNCHANGED\n", 2),
     ("TD-GRANT-REVOKED\n", 3),
 ];
+/// A listing's network byte for an application, whose network its
+/// declaration sets, not the table.
+const NETWORK_DECLARED: u8 = 0xff;
 
-/// What a request asks of an application account's directory rows.
+/// What a request asks of an account's directory rows, or of a sandbox's
+/// network.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Verb {
     /// Its rows from the `start`th on, as many as one answer holds.
@@ -48,25 +54,35 @@ pub(crate) enum Verb {
     },
     Grant(Access, Vec<u8>),
     Revoke(Vec<u8>),
+    /// A sandbox's network, off or the host's.
+    Network(Network),
 }
 
-/// One request: a verb and an application name in the registry grammar.
-/// The kind is always `application`: only application accounts take
-/// grants until sandbox and workspace launches go through root.
+/// One request: a verb, and an account by kind, `application` or
+/// `sandbox`, and a name in the registry grammar. A workspace's account
+/// takes no grants until its launches go through root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub verb: Verb,
+    pub kind: Kind,
     pub name: String,
 }
 
 impl Request {
-    /// `2c`'s operands: a verb byte, the kind byte `00`, the name's length
-    /// and the name, then a list's start index or a path of one to 1024
-    /// bytes. The path's rules are the table's, answered as a refusal.
+    /// `2c`'s operands: a verb byte, the kind byte, `00` application or
+    /// `01` sandbox, the name's length and the name, then a list's start
+    /// index, a path of one to 1024 bytes, or a sandbox's network byte,
+    /// `00` off or `01` host. The path's rules are the table's, answered
+    /// as a refusal.
     pub(crate) fn decode(operands: &[u8]) -> Result<Self, String> {
         let invalid = || "invalid grant request".to_string();
-        let [verb, 0, length, rest @ ..] = operands else {
+        let [verb, kind, length, rest @ ..] = operands else {
             return Err(invalid());
+        };
+        let kind = match kind {
+            0 => Kind::Application,
+            1 => Kind::Sandbox,
+            _ => return Err(invalid()),
         };
         let (name, tail) = rest
             .split_at_checked(usize::from(*length))
@@ -87,23 +103,27 @@ impl Request {
             (1, _) => Verb::Grant(Access::ReadOnly, path()?),
             (2, _) => Verb::Grant(Access::ReadWrite, path()?),
             (3, _) => Verb::Revoke(path()?),
+            // An application's network is its declaration's.
+            (4, [0]) if kind == Kind::Sandbox => Verb::Network(Network::Off),
+            (4, [1]) if kind == Kind::Sandbox => Verb::Network(Network::Host),
             _ => return Err(invalid()),
         };
         Ok(Self {
             verb,
+            kind,
             name: name.to_string(),
         })
     }
 }
 
 /// The writer's run for `request`, or the refusal its path earns without
-/// one: the fixed program, the owner, and the peer's verb, name, access
-/// and path, validated, as its arguments.
+/// one: the fixed program, the owner, and the peer's verb, kind, name,
+/// access or network and path, validated, as its arguments.
 fn writer(owner: u32, request: &Request) -> Result<Command, Vec<u8>> {
     // A grant names a path this deployment publishes; a revoke any row the
     // table can hold, so one a later validator refuses can be taken back.
     let path = match &request.verb {
-        Verb::List { .. } => None,
+        Verb::List { .. } | Verb::Network(_) => None,
         Verb::Grant(_, path) => Some(path),
         Verb::Revoke(path) => {
             workload_grants::table_path(path).map_err(|why| refusal(&why))?;
@@ -119,22 +139,22 @@ fn writer(owner: u32, request: &Request) -> Result<Command, Vec<u8>> {
         }
         None => None,
     };
-    let verb = match &request.verb {
-        Verb::List { .. } => "list",
-        Verb::Grant(..) => "grant",
-        Verb::Revoke(_) => "revoke",
+    let (verb, word) = match &request.verb {
+        Verb::List { .. } => ("list", None),
+        Verb::Grant(access, _) => ("grant", Some(access.as_str())),
+        Verb::Revoke(_) => ("revoke", None),
+        Verb::Network(network) => ("network", Some(network.as_str())),
     };
     let mut command = Command::new("/bin/td-firstboot");
     command.args([
         "grant-table",
         &owner.to_string(),
         verb,
-        "application",
+        request.kind.as_str(),
         &request.name,
     ]);
-    if let Verb::Grant(access, _) = &request.verb {
-        command.args([access.as_str()]);
-    }
+    // A grant's access or a sandbox's network, one fixed word.
+    command.args(word);
     command.args(path);
     Ok(command)
 }
@@ -193,7 +213,7 @@ fn answer_with(
                 line.strip_prefix("td-firstboot: ").unwrap_or(&line),
             ));
         }
-        interpret(&request.verb, &ran.output)
+        interpret(request, &ran.output)
     });
     interpreted.unwrap_or_else(|why| {
         let _ = std::io::Write::write_all(
@@ -204,29 +224,50 @@ fn answer_with(
     })
 }
 
-/// The answer a successful writer's exact `output` makes for `verb`.
-fn interpret(verb: &Verb, output: &[u8]) -> Result<Vec<u8>, String> {
+/// The answer a successful writer's exact `output` makes for `request`.
+fn interpret(request: &Request, output: &[u8]) -> Result<Vec<u8>, String> {
     let malformed = || "td-firstboot grant-table answered malformed".to_string();
     let text = std::str::from_utf8(output).map_err(|_| malformed())?;
-    let start = match verb {
+    let start = match &request.verb {
         Verb::List { start } => *start,
-        Verb::Grant(..) | Verb::Revoke(_) => {
+        verb => {
             let outcome = OUTCOMES
                 .iter()
                 .find(|(line, _)| *line == text)
                 .map(|(_, byte)| *byte)
                 .ok_or_else(malformed)?;
-            // A grant never revokes, nor a revoke grants.
-            if (outcome == 3) != matches!(verb, Verb::Revoke(_)) {
+            // A grant never revokes, nor a revoke grants, and a network
+            // is changed or stands.
+            let fits = match verb {
+                Verb::Grant(..) => outcome <= 2,
+                Verb::Revoke(_) => outcome == 3,
+                Verb::Network(_) => matches!(outcome, 1 | 2),
+                Verb::List { .. } => false,
+            };
+            if !fits {
                 return Err(malformed());
             }
             return Ok(vec![0x8a, outcome]);
         }
     };
-    let (count, rows) = text
+    let (head, rows) = text
         .strip_prefix(LISTED)
         .and_then(|rest| rest.split_once('\n'))
         .ok_or_else(malformed)?;
+    // A sandbox's count is followed by its network; an application's
+    // network is its declaration's, which no listing carries.
+    let (count, network) = match request.kind {
+        Kind::Sandbox => {
+            let (count, network) = head.split_once('\t').ok_or_else(malformed)?;
+            match Network::parse(network).ok_or_else(malformed)? {
+                Network::Off => (count, 0),
+                Network::Host => (count, 1),
+            }
+        }
+        Kind::Application => (head, NETWORK_DECLARED),
+        // `decode` admits no workspace.
+        Kind::Workspace => return Err(malformed()),
+    };
     let total = count
         .parse::<usize>()
         .ok()
@@ -243,7 +284,7 @@ fn interpret(verb: &Verb, output: &[u8]) -> Result<Vec<u8>, String> {
     if listed.len() != total || !(rows.is_empty() || rows.ends_with('\n')) {
         return Err(malformed());
     }
-    let mut answer = vec![0x89, u8::try_from(total).map_err(|_| malformed())?];
+    let mut answer = vec![0x89, u8::try_from(total).map_err(|_| malformed())?, network];
     // The whole listing's digest, so pages read from two tables of one
     // count do not pass for one listing.
     answer.extend_from_slice(&listing_digest(rows.as_bytes()).to_be_bytes());
@@ -370,21 +411,50 @@ mod tests {
     }
 
     fn operands(verb: u8, name: &str, tail: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![verb, 0, name.len() as u8];
+        account(verb, 0, name, tail)
+    }
+
+    /// `2c`'s operands for the account of kind byte `kind`.
+    fn account(verb: u8, kind: u8, name: &str, tail: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![verb, kind, name.len() as u8];
         bytes.extend_from_slice(name.as_bytes());
         bytes.extend_from_slice(tail);
         bytes
     }
 
     #[test]
-    fn a_request_is_one_verb_the_application_kind_one_name_and_its_operand() {
+    fn a_request_is_one_verb_one_account_and_its_operand() {
         assert_eq!(
             request(&operands(0, "firefox", &[0])).unwrap(),
             Request {
                 verb: Verb::List { start: 0 },
+                kind: Kind::Application,
                 name: "firefox".into()
             }
         );
+        // A sandbox takes every verb an application does, and its network.
+        for (bytes, verb) in [
+            (account(0, 1, "default", &[2]), Verb::List { start: 2 }),
+            (
+                account(2, 1, "default", b"src/td"),
+                Verb::Grant(Access::ReadWrite, b"src/td".to_vec()),
+            ),
+            (
+                account(3, 1, "default", b"src/td"),
+                Verb::Revoke(b"src/td".to_vec()),
+            ),
+            (account(4, 1, "default", &[0]), Verb::Network(Network::Off)),
+            (account(4, 1, "default", &[1]), Verb::Network(Network::Host)),
+        ] {
+            assert_eq!(
+                request(&bytes).unwrap(),
+                Request {
+                    verb,
+                    kind: Kind::Sandbox,
+                    name: "default".into()
+                }
+            );
+        }
         assert_eq!(
             request(&operands(0, "firefox", &[31])).unwrap().verb,
             Verb::List { start: 31 }
@@ -407,8 +477,6 @@ mod tests {
         assert!(request(&operands(1, "firefox", b".ssh")).is_ok());
         let longest = vec![b'a'; PATH_BYTES];
         assert!(request(&operands(1, "firefox", &longest)).is_ok());
-        let mut sandbox = operands(0, "firefox", &[0]);
-        sandbox[1] = 1;
         let mut short = operands(0, "firefox", &[0]);
         short[2] = 3;
         let mut long = operands(0, "firefox", &[0]);
@@ -418,7 +486,20 @@ mod tests {
             vec![0],
             vec![0, 0],
             vec![0, 0, 0, 0],
-            sandbox,
+            // A workspace takes no grants; no other kind exists.
+            account(0, 2, "agent", &[0]),
+            account(1, 2, "agent", b"src"),
+            account(0, 3, "firefox", &[0]),
+            account(0, 0xff, "firefox", &[0]),
+            // An application's network is its declaration's.
+            account(4, 0, "firefox", &[1]),
+            account(4, 0, "firefox", &[0]),
+            account(4, 1, "default", &[]),
+            account(4, 1, "default", &[2]),
+            account(4, 1, "default", &[1, 0]),
+            account(4, 1, "default", b"host"),
+            account(5, 1, "default", &[0]),
+            account(0, 1, "Default", &[0]),
             short,
             long,
             operands(0, "firefox", &[]),
@@ -479,6 +560,35 @@ mod tests {
                 "Downloads"
             ]
         );
+        // A sandbox's request names its kind; its network is one fixed
+        // word, without a path.
+        for (bytes, expected) in [
+            (
+                account(0, 1, "default", &[0]),
+                &["list", "sandbox", "default"][..],
+            ),
+            (
+                account(2, 1, "default", b"src/td"),
+                &["grant", "sandbox", "default", "rw", "src/td"],
+            ),
+            (
+                account(3, 1, "default", b"src/td"),
+                &["revoke", "sandbox", "default", "src/td"],
+            ),
+            (
+                account(4, 1, "default", &[1]),
+                &["network", "sandbox", "default", "host"],
+            ),
+            (
+                account(4, 1, "default", &[0]),
+                &["network", "sandbox", "default", "off"],
+            ),
+        ] {
+            let request = Request::decode(&bytes).unwrap();
+            let mut argv = vec!["grant-table".to_string(), "1000".into()];
+            argv.extend(expected.iter().map(|arg| (*arg).to_string()));
+            assert_eq!(args(&writer(1000, &request).unwrap()), argv);
+        }
         // A grant names only a path this deployment publishes; a revoke
         // any the table can hold, so a row a later validator refuses can
         // be taken back.
@@ -492,8 +602,8 @@ mod tests {
             (b"a\x07b", false),
             (b"a\xffb", false),
         ] {
-            for verb in [1, 3] {
-                let request = Request::decode(&operands(verb, "firefox", path)).unwrap();
+            for (verb, kind) in [(1, 0), (3, 0), (2, 1), (3, 1)] {
+                let request = Request::decode(&account(verb, kind, "firefox", path)).unwrap();
                 let answer = writer(1000, &request);
                 if verb == 3 && revocable {
                     assert!(answer.is_ok(), "{path:?}");
@@ -579,16 +689,40 @@ mod tests {
             said: Vec::new(),
         });
         assert_eq!(answered(&grant, killed), [0xff, 2]);
+        // A sandbox's network is changed or stands; it is never added or
+        // revoked.
+        let network = account(4, 1, "default", &[1]);
+        for (line, answer) in [
+            ("TD-GRANT-CHANGED\n", &[0x8a, 1][..]),
+            ("TD-GRANT-UNCHANGED\n", &[0x8a, 2]),
+            ("TD-GRANT-ADDED\n", &[0xff, 2]),
+            ("TD-GRANT-REVOKED\n", &[0xff, 2]),
+            ("TD-GRANTS\t0\toff\n", &[0xff, 2]),
+        ] {
+            assert_eq!(answered(&network, ran(true, line, "")), answer, "{line}");
+        }
+        let refused = answered(
+            &network,
+            ran(
+                false,
+                "",
+                "td-firstboot: sandbox \"default\" has no account yet\n",
+            ),
+        );
+        assert_eq!(refused, b"\x8bsandbox \"default\" has no account yet");
+    }
+
+    /// An `89` page's head: the count, the network byte and the digest.
+    fn page_head(total: u8, network: u8, rows: &str) -> Vec<u8> {
+        let mut head = vec![0x89, total, network];
+        head.extend_from_slice(&listing_digest(rows.as_bytes()).to_be_bytes());
+        head
     }
 
     #[test]
     fn a_listing_is_counted_exact_and_paged_to_the_frame() {
         let list = |start: u8| operands(0, "firefox", &[start]);
-        let head = |total: u8, rows: &str| {
-            let mut head = vec![0x89, total];
-            head.extend_from_slice(&listing_digest(rows.as_bytes()).to_be_bytes());
-            head
-        };
+        let head = |total: u8, rows: &str| page_head(total, NETWORK_DECLARED, rows);
         assert_eq!(
             answered(&list(0), ran(true, "TD-GRANTS\t0\n", "")),
             head(0, "")
@@ -629,9 +763,46 @@ mod tests {
             "TD-GRANTS\t1\nro\ta\textra\n",
             "TD-GRANTS 1\nro\ta\n",
             "TD-GRANT-ADDED\n",
+            // An application's listing carries no network.
+            "TD-GRANTS\t0\toff\n",
+            "TD-GRANTS\t1\thost\nro\ta\n",
         ] {
             assert_eq!(
                 answered(&list(0), ran(true, output, "")),
+                [0xff, 2],
+                "{output:?}"
+            );
+        }
+        // A sandbox's carries its network, which the page's head holds.
+        let sandbox = |start: u8| account(0, 1, "default", &[start]);
+        assert_eq!(
+            answered(&sandbox(0), ran(true, "TD-GRANTS\t0\toff\n", "")),
+            page_head(0, 0, "")
+        );
+        assert_eq!(
+            answered(&sandbox(0), ran(true, "TD-GRANTS\t1\thost\nrw\tsrc\n", "")),
+            [&page_head(1, 1, "rw\tsrc\n")[..], b"\x01\x00\x03src"].concat()
+        );
+        // A later page repeats the network beside the count and digest.
+        let two = "ro\ta\nrw\tsrc\n";
+        let output = format!("TD-GRANTS\t2\thost\n{two}");
+        assert_eq!(
+            answered(&sandbox(1), ran(true, &output, "")),
+            [&page_head(2, 1, two)[..], b"\x01\x00\x03src"].concat()
+        );
+        assert_eq!(
+            answered(&sandbox(2), ran(true, &output, "")),
+            page_head(2, 1, two)
+        );
+        for output in [
+            "TD-GRANTS\t0\n",
+            "TD-GRANTS\t0\ton\n",
+            "TD-GRANTS\t0\toff\thost\n",
+            "TD-GRANTS\t0\t\n",
+            "TD-GRANTS\toff\t0\n",
+        ] {
+            assert_eq!(
+                answered(&sandbox(0), ran(true, output, "")),
                 [0xff, 2],
                 "{output:?}"
             );
@@ -650,8 +821,8 @@ mod tests {
         while seen.len() < long.len() {
             let page = answered(&list(seen.len() as u8), ran(true, &output, ""));
             assert!(page.len() <= FRAME_BYTES);
-            assert_eq!(&page[..2], [0x89, 8]);
-            let mut rest = &page[10..];
+            assert_eq!(&page[..3], [0x89, 8, NETWORK_DECLARED]);
+            let mut rest = &page[11..];
             let before = seen.len();
             while let [1, high, low, tail @ ..] = rest {
                 let length = usize::from(u16::from_be_bytes([*high, *low]));

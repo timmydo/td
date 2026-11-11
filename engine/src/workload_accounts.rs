@@ -135,6 +135,8 @@ pub struct DelegationName {
 
 impl std::fmt::Display for DelegationName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Through the parts' own Display: td-authd's confinement holds this
+        // file's production text free of the word for writing files.
         std::fmt::Display::fmt(self.prefix, f)?;
         std::fmt::Display::fmt(&self.uid, f)
     }

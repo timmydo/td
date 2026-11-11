@@ -1412,7 +1412,10 @@ fn read_only(path: &str) -> GrantVerb {
 /// The account's directory rows as a listing names them.
 fn listed(directory: &Directory) -> Vec<String> {
     match grant(directory, &GrantVerb::List) {
-        Ok(GrantReply::List(rows)) => rows
+        Ok(GrantReply::List {
+            directories,
+            network: None,
+        }) => directories
             .into_iter()
             .map(|row| format!("{}\t{}", row.access.as_str(), row.path))
             .collect(),
@@ -1475,8 +1478,8 @@ fn grant_requests_list_add_replace_and_revoke_rows() {
 }
 
 /// What the table refuses a grant refuses and publishes nothing: a
-/// reserved, deceptive or overlapping path; a sandbox or workspace
-/// account; an admission that refuses; and a missing table.
+/// reserved, deceptive or overlapping path; a workspace account; an
+/// application's network; an admission that refuses; and a missing table.
 #[test]
 fn grant_requests_refuse_and_change_nothing() {
     let (temp, directory) = grant_fixture();
@@ -1491,13 +1494,27 @@ fn grant_requests_refuse_and_change_nothing() {
     ] {
         assert!(grant(&directory, &read_only(refused)).is_err(), "{refused}");
     }
-    for kind in [Kind::Sandbox, Kind::Workspace] {
-        for verb in [GrantVerb::List, read_only("Pictures")] {
-            let error = directory
-                .grants(kind, "default", &verb, || Ok(()), Duration::from_secs(1))
-                .unwrap_err();
-            assert!(error.contains("take no grants"), "{error}");
-        }
+    for verb in [
+        GrantVerb::List,
+        read_only("Pictures"),
+        GrantVerb::Revoke("Pictures".into()),
+        GrantVerb::Network(Network::Host),
+    ] {
+        let error = directory
+            .grants(
+                Kind::Workspace,
+                "default",
+                &verb,
+                || Ok(()),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(error.contains("take no grants"), "{error}");
+    }
+    // An application's network is its declaration's, never the table's.
+    for network in [Network::Host, Network::Off] {
+        let error = grant(&directory, &GrantVerb::Network(network)).unwrap_err();
+        assert!(error.contains("declaration"), "{error}");
     }
     let error = directory
         .grants(
@@ -1540,6 +1557,205 @@ fn grant_requests_refuse_and_change_nothing() {
     }
     assert!(!path.exists());
     temp.cleanup().unwrap();
+}
+
+fn sandbox(
+    directory: &Directory,
+    name: &str,
+    verb: &GrantVerb,
+    admit: impl FnOnce() -> Result<(), String>,
+) -> Result<GrantReply, String> {
+    directory.grants(Kind::Sandbox, name, verb, admit, Duration::from_secs(1))
+}
+
+/// A sandbox's listing: its directory rows and its network.
+fn sandbox_listed(directory: &Directory, name: &str) -> (Vec<String>, Option<Network>) {
+    match sandbox(directory, name, &GrantVerb::List, || Err("admitted".into())) {
+        Ok(GrantReply::List {
+            directories,
+            network,
+        }) => (
+            directories
+                .into_iter()
+                .map(|row| format!("{}\t{}", row.access.as_str(), row.path))
+                .collect(),
+            network,
+        ),
+        other => (vec![format!("{other:?}")], None),
+    }
+}
+
+/// A sandbox the ledger holds takes directory grants as an application
+/// does, home-relative, under the same validator, and its network, which
+/// one row holds: host is written, off is no row. A listing names both. No
+/// grant adds a ledger row, so none spends the 2048 sandbox and
+/// workspace rows allocation alone hands out.
+#[test]
+fn a_sandbox_the_ledger_holds_takes_grants_and_its_network() {
+    let (temp, directory) = grant_fixture();
+    allocate_sandbox(&directory, "default", BTreeSet::new(), &mut Vec::new()).unwrap();
+    let ledger = account_ledger(&directory);
+    let path = directory.path(workload_grants::FILE_NAME);
+    assert_eq!(
+        sandbox_listed(&directory, "default"),
+        (vec![], Some(Network::Off))
+    );
+    assert_eq!(
+        sandbox(&directory, "default", &read_only("src/td"), || Ok(())).unwrap(),
+        GrantReply::Granted(Change::Added)
+    );
+    assert_eq!(
+        sandbox(
+            &directory,
+            "default",
+            &GrantVerb::Grant(Access::ReadWrite, "src/td".into()),
+            || Ok(())
+        )
+        .unwrap(),
+        GrantReply::Granted(Change::Changed)
+    );
+    assert_eq!(
+        sandbox(
+            &directory,
+            "default",
+            &GrantVerb::Network(Network::Host),
+            || Ok(())
+        )
+        .unwrap(),
+        GrantReply::Networked(NetworkChange::Changed)
+    );
+    assert_eq!(
+        grant_table(&directory).unwrap(),
+        format!("{GRANTS_SEED}sandbox\tdefault\tdirectory\trw\tsrc/td\nsandbox\tdefault\tnetwork\thost\n")
+    );
+    assert_eq!(
+        sandbox_listed(&directory, "default"),
+        (vec!["rw\tsrc/td".to_string()], Some(Network::Host))
+    );
+    // The same network again writes nothing.
+    let published = fs::metadata(&path).unwrap();
+    assert_eq!(
+        sandbox(
+            &directory,
+            "default",
+            &GrantVerb::Network(Network::Host),
+            || Ok(())
+        )
+        .unwrap(),
+        GrantReply::Networked(NetworkChange::Unchanged)
+    );
+    assert_eq!(fs::metadata(&path).unwrap().ino(), published.ino());
+    // An application's listing is untouched by the sandbox's rows.
+    assert_eq!(listed(&directory), ["rw\tDownloads"]);
+    // What the table refuses an application it refuses a sandbox.
+    for refused in [".ssh", ".local", "src/td/a", "Down\u{202E}loads"] {
+        assert!(
+            sandbox(&directory, "default", &read_only(refused), || Ok(())).is_err(),
+            "{refused}"
+        );
+    }
+    // Off removes the row and needs no admission, as a revoke does.
+    assert_eq!(
+        sandbox(
+            &directory,
+            "default",
+            &GrantVerb::Network(Network::Off),
+            || Err("admitted".into())
+        )
+        .unwrap(),
+        GrantReply::Networked(NetworkChange::Changed)
+    );
+    assert_eq!(
+        sandbox(
+            &directory,
+            "default",
+            &GrantVerb::Revoke("src/td".into()),
+            || Err("admitted".into())
+        )
+        .unwrap(),
+        GrantReply::Revoked
+    );
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    assert_eq!(account_ledger(&directory), ledger);
+    temp.cleanup().unwrap();
+}
+
+/// A sandbox without a ledger row is granted nothing, its network
+/// included, and the table is not written: a grant never allocates. Its
+/// admission runs first, so another session's request is refused before
+/// the ledger is read. A listing, a revoke and network off name any
+/// sandbox.
+#[test]
+fn a_sandbox_without_an_account_is_granted_nothing() {
+    let (temp, directory) = grant_fixture();
+    allocate_sandbox(&directory, "default", BTreeSet::new(), &mut Vec::new()).unwrap();
+    let ledger = account_ledger(&directory);
+    let path = directory.path(workload_grants::FILE_NAME);
+    let before = fs::metadata(&path).unwrap();
+    for verb in [read_only("src"), GrantVerb::Network(Network::Host)] {
+        let error = sandbox(&directory, "tools", &verb, || Ok(())).unwrap_err();
+        assert!(error.contains("has no account"), "{error}");
+        let error = sandbox(&directory, "default", &verb, || {
+            Err("the grant request names another session".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("another session"), "{error}");
+    }
+    assert_eq!(
+        sandbox_listed(&directory, "tools"),
+        (vec![], Some(Network::Off))
+    );
+    assert_eq!(
+        sandbox(
+            &directory,
+            "tools",
+            &GrantVerb::Network(Network::Off),
+            || Err("admitted".into())
+        )
+        .unwrap(),
+        GrantReply::Networked(NetworkChange::Unchanged)
+    );
+    let error = sandbox(
+        &directory,
+        "tools",
+        &GrantVerb::Revoke("src".into()),
+        || Err("admitted".into()),
+    )
+    .unwrap_err();
+    assert!(error.contains("holds no grant"), "{error}");
+    // An application's row is no sandbox's: the ledger holds `mail` as an
+    // application, not a sandbox.
+    let held = Ledger::parse(&ledger.clone().unwrap()).unwrap();
+    assert!(held.uid_of(Kind::Application, "mail").is_some());
+    let error = sandbox(&directory, "mail", &read_only("src"), || Ok(())).unwrap_err();
+    assert!(error.contains("has no account"), "{error}");
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (before.ino(), before.mtime(), before.mtime_nsec())
+    );
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    assert_eq!(account_ledger(&directory), ledger);
+    temp.cleanup().unwrap();
+}
+
+/// A sandbox's grant names the primary human's session, which the
+/// principal table holds: a grant's source is that human's home, so a
+/// second session owner, even one the table names, is refused.
+#[test]
+fn a_sandbox_grant_names_the_primary_session() {
+    let registry = Registry::parse(SESSION).unwrap();
+    sandbox_grantable(&registry, 1000).unwrap();
+    let error = sandbox_grantable(&registry, 1001).unwrap_err();
+    assert!(error.contains("another session"), "{error}");
+    let second = Registry::parse(&format!("{SESSION}session\t1001\t990\t989\t988\n")).unwrap();
+    assert!(second.sessions().any(|session| session.owner == 1001));
+    sandbox_grantable(&second, 1000).unwrap();
+    let error = sandbox_grantable(&second, 1001).unwrap_err();
+    assert!(error.contains("another session"), "{error}");
+    // Nor is the primary admitted where the table names no such session.
+    let other = Registry::parse("td-principals-v1\nsession\t1001\t990\t989\t988\n").unwrap();
+    assert!(sandbox_grantable(&other, 1000).is_err());
 }
 
 /// A change waits for the principal lock only so long, then answers that

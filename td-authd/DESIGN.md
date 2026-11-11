@@ -825,7 +825,9 @@ workspace rows together hold fewer than `WORKLOAD_ROWS`, then publishes
 the ledger as boot does. Rows are keyed by kind and name, not by human
 owner, as applications' are: a second session owner would share them.
 There is no launch admission to agree with: a sandbox's policy is the
-grants the human made for it, not a declaration.
+grants the human made for it, not a declaration, and a grant request
+admits a sandbox's grant only once this row exists and never allocates
+one ("Grant requests").
 Still under the lock it prepares the account. Its home is
 `/var/lib/td/workloads/UID`, made below a root-owned mode-0755
 `workloads` created when absent, as `applications` is: an empty directory
@@ -878,12 +880,35 @@ KIND<TAB>name<TAB>socket<TAB>SOCKET
 KIND<TAB>name<TAB>network<TAB>off|host
 ```
 
-Only `directory` rows take effect today. v1 parses socket and network
-rows already, for the same reason the ledger parses kinds it does not
-yet write, and rejects malformed ones; a later format is `td-grants-v2`,
-landed as the ledger's would be. An account holds at most 32 directory
-rows, 16 socket rows and one network row; the table at most 4096 rows and
-1 MiB. `PATH` is relative to the human's home: at most 1024 bytes, 16
+Only an application's `directory` rows take effect today: a sandbox's
+directory and network rows are written ("Grant requests") but neither
+published nor applied until its launches go through root (WORKLOADS.md
+step 7). An account without a network row has no network; the writer
+writes only `host` and removes the row to set `off`, and an `off` row an
+edit by hand left means the same. v1 parses socket rows, which nothing
+writes yet, for the same reason the ledger parses kinds it does not yet
+write, and rejects malformed rows of every form; a later format is
+`td-grants-v2`, landed as the ledger's would be. An account holds at
+most 32 directory rows, 16 socket rows and one network row; the table at
+most 4096 rows and 1 MiB.
+
+Sandbox and workspace rows together, directory and network alike, keep
+to half of that (`WORKLOAD_GRANT_ROWS`, 2048 rows, and
+`WORKLOAD_GRANT_BYTES`, 512 KiB of rows as the table writes them), and
+applications keep the rest. Any program running as the human can grant
+a sandbox the human's directories and, once sandbox creation goes
+through root (WORKLOADS.md step 7), name new sandboxes to grant, so
+without this budget it could fill the table and leave every later
+application grant, Firefox's included, refused. The writer applies it
+in `Table::grant` and `Table::set_network` to a sandbox's or
+workspace's change that would grow those rows past it, refusing with
+"revoke some first"; a change that does not grow them (an equal grant,
+the other access, `off`, a revoke) stands, and the parser applies
+neither bound, so a table a later deployment or an edit by hand took
+past it stays readable and every row in it revocable. The human
+recovers by revoking sandbox rows.
+
+`PATH` is relative to the human's home: at most 1024 bytes, 16
 names of at most 255 bytes, no empty, `.` or `..` name, and UTF-8 with no
 control character (C0, DEL or C1) and none of the format characters that
 reorder or hide what a path shows (U+061C, U+200B to U+200F, U+2028 to
@@ -958,34 +983,41 @@ in place, harmless: nothing there reads them.
 
 ## Grant requests
 
-The human lists, adds and revokes an application account's directory
-rows through the compositor control socket (`grants`, `grant`, `revoke`;
+The human lists, adds and revokes an application's or a sandbox's
+directory rows, and sets a sandbox's network, through the compositor
+control socket (`grants`, `grant`, `revoke`, `network`;
 td-compositor/DESIGN.md §15), which the compositor forwards on its
 private channel as request `2c`, queued to its authority worker as
 request `24` is. A grant is not elevation (WORKLOADS.md, "Grants"): it
-delegates the human's own authority over the human's own files, so the
-request needs the human's kernel credentials at the control socket, not
-secure attention or consent. Any program running as the human can
-therefore grant a non-reserved directory to any application account the
-human owns, a networked one included (td-login/THREAT-MODEL.md).
+delegates the human's own authority over the human's own files and
+network, so the request needs the human's kernel credentials at the
+control socket, not secure attention or consent. Any program running as
+the human can therefore grant a non-reserved directory to any
+application account the human owns, a networked one included, or to any
+sandbox with an account, and give such a sandbox the host's network
+(td-login/THREAT-MODEL.md).
 
 ```
-2c VERB 00 LEN NAME TAIL
+2c VERB KIND LEN NAME TAIL
 ```
 
-`VERB` is `00` list, `01` grant read-only, `02` grant writable or `03`
-revoke; the kind byte is `00`, application, the only kind that takes
-requests until sandbox and workspace launches go through root
-(WORKLOADS.md step 7). `NAME` is 1 to 64 bytes in the registry grammar.
-A list's `TAIL` is one start row below 32; a grant's or revoke's is the
-path, 1 to 1024 bytes. Before anything else root runs `validate_path` on
-a grant's path and `table_path` on a revoke's, so a revoke can name an
-inert row ("Workload grant table"), and refuses a path that fails by its
-reason. Nothing else is admitted, and a malformed request ends the
-generation as every malformed request does.
+`VERB` is `00` list, `01` grant read-only, `02` grant writable, `03`
+revoke or `04` network. `KIND` is `00` application or `01` sandbox; a
+workspace's account takes no requests until its launches go through
+root (WORKLOADS.md step 8). `NAME` is 1 to 64 bytes in the registry
+grammar, which the ledger's shares. A list's `TAIL` is one start row
+below 32; a grant's or revoke's is the path, 1 to 1024 bytes; a
+network's is one byte, `00` off or `01` host, and only a sandbox's
+network is set, since an application's is its declaration's. Before
+anything else root runs `validate_path` on a grant's path and
+`table_path` on a revoke's, so a revoke can name an inert row ("Workload
+grant table"), and refuses a path that fails by its reason. Nothing else
+is admitted, and a malformed request, a network for an application
+included, ends the generation as every malformed request does.
 
 Root runs the table's one writer, `td-firstboot grant-table OWNER VERB
-application NAME [ro|rw] PATH`, as every authority child runs (null
+KIND NAME [ro|rw|off|host] [PATH]`, the kind and the access or network
+one of root's fixed words, as every authority child runs (null
 stdin, `/`, no environment, its output on private sockets root drains
 without blocking), and waits for it at most three seconds in the serving
 loop, reading at most 64 KiB; it is killed and reaped past that, which
@@ -1002,49 +1034,83 @@ since it began (td-compositor/DESIGN.md §15), so with the page then in
 flight it holds the worker at most about seven. A program running as
 the human that floods the control socket with grants therefore delays
 physical work by at most one such request a turn, and other grant and
-application requests by a turn each. A writer that exits 2, the usage status, or is ended by a signal
-is root's failure, `ff 02`, so td-firstboot's usage text is never shown
+application requests by a turn each. A writer that exits 2, the usage
+status, or is ended by a signal is root's failure, `ff 02`, so
+td-firstboot's usage text is never shown
 as a reason. The writer checks its own operands as root did (a grant's
-path by `validate_path`, a revoke's by `table_path`), then:
+path by `validate_path`, a revoke's by `table_path`), refuses a
+workspace and an application's network itself, then:
 
 - lists without the lock, reading the table as it is published (a table
   renamed over while it read is still taken, "Workload grant table");
-  every row is listed, an inert one too; an absent table refuses;
-- for a grant, first admits the request: the application must be one the
-  image declares, owned by OWNER, with an account of its own (one that
-  runs as the human is refused by name), and the source must exist below
-  the human's home, reached name by name without links, each name a
-  directory of 1000:1000 writable by neither group nor others. That check
-  is early refusal for the human's sake; the launch's publication
-  ("Application filesystem grants") remains the boundary and checks the
-  source again;
+  every directory row is listed, an inert one too, and a sandbox's
+  network with them, `off` without a row; an absent table refuses;
+- for a grant, and for a sandbox's network set to `host`, first admits
+  the request: an application must be one the image declares, owned by
+  OWNER, with an account of its own (one that runs as the human is
+  refused by name); a sandbox's OWNER must be the primary human, uid
+  1000, whose session the deployment's principal table names, since a
+  grant's source is always that human's home and a row names no owner,
+  so another session owner is refused. A grant's source
+  must exist below the human's home, reached name by name without links,
+  each name a directory of 1000:1000 writable by neither group nor
+  others. That check is early refusal for the human's sake; the launch's
+  publication ("Application filesystem grants") remains the boundary and
+  checks the source again;
 - then waits at most a second for the principal state lock the ledger
-  and seeding use, refusing "the grant table is busy" past it, rereads
-  the table, and applies the change through `Table::grant` or
-  `Table::revoke` in `engine/src/workload_grants.rs`, which re-validate
-  the whole result through the one parser: a reserved path, a nested or
-  equal row, one nested with an inert row and a 33rd directory are
-  refused there. An equal grant
-  changes nothing and writes nothing; one of the other access replaces
-  the row; revoking a row the account does not hold is refused. A change
-  is published staged, synced and renamed at 0600, as boot writes it.
-  Socket and network rows are kept as they are and never listed.
+  and seeding use, refusing "the grant table is busy" past it. A
+  sandbox's grant or `host` then needs the sandbox's row in the published
+  ledger, refused as having no account without one: allocation, when
+  td-sandbox creates the sandbox ("Workload account ledger"), makes the
+  row, and a grant never does, so no grant spends one of the
+  `WORKLOAD_ROWS`. It rereads the table and applies the change through
+  `Table::grant`, `Table::revoke` or `Table::set_network` in
+  `engine/src/workload_grants.rs`, which re-validate the whole result
+  through the one parser: a reserved path, a nested or equal row, one
+  nested with an inert row, a 33rd directory and a sandbox's row past
+  the sandbox and workspace budget ("Workload grant table") are refused
+  there. An
+  equal grant changes nothing and writes nothing; one of the other
+  access replaces the row; revoking a row the account does not hold is
+  refused. A network set to what the sandbox has changes nothing and
+  writes nothing, so an `off` row an edit by hand left stays; `host`
+  adds or replaces its one network row, and `off` removes a `host` row.
+  A change is published staged, synced and renamed at 0600, as boot
+  writes it. Socket rows, and the network rows of applications and
+  workspaces, which only an edit by hand writes, are kept as they are,
+  never listed and not removable through these requests.
+
+A listing, a revoke and a network set to `off` admit nothing and need
+no ledger row, so a directory row an image no longer declares, or one
+an edit by hand left, and a sandbox's `host` row can still be seen and
+removed.
+
+Rows are keyed by the account's kind and name and stay until revoked:
+nothing removes them when the account goes. A sandbox deleted and then
+created again under the same name therefore inherits the earlier one's
+directory grants and host network. Deleting a sandbox through root
+(WORKLOADS.md step 7) revokes its grant rows, while its ledger row
+stays; until then the human revokes them.
 
 The answers:
 
 | Answer | Meaning |
 | --- | --- |
-| `89 TOTAL DIGEST (ACCESS LEN_HI LEN_LO PATH)*` | a page of the account's directory rows from the start row, `ACCESS` `00` ro or `01` rw, as many as fit a frame; `DIGEST` is 8 bytes, FNV-1a over the account's whole listing as the writer printed it; the compositor asks from the next row until it holds `TOTAL`, and reports the listing moved if `TOTAL` or `DIGEST` changes between pages |
-| `8a OUTCOME` | `00` added, `01` changed access, `02` unchanged, `03` revoked |
+| `89 TOTAL NETWORK DIGEST (ACCESS LEN_HI LEN_LO PATH)*` | a page of the account's directory rows from the start row, `ACCESS` `00` ro or `01` rw, as many as fit a frame; `NETWORK` is a sandbox's `00` off or `01` host, and `ff` for an application, whose network is its declaration's; `DIGEST` is 8 bytes, FNV-1a over the account's directory rows as the writer printed them; the compositor asks from the next row until it holds `TOTAL`, and reports the listing moved if `TOTAL`, `NETWORK` or `DIGEST` changes between pages |
+| `8a OUTCOME` | `00` added, `01` changed access, `02` unchanged, `03` revoked; a network's is `01` changed or `02` unchanged |
 | `8b REASON` | the writer's refusal, 1 to 200 printable ASCII bytes |
 | `ff 02` | the writer could not run, outran its bound or printed something root cannot read; the table may or may not have changed, and a listing says |
 | `ff 03` | the live medium: nothing is granted there |
 
-The compositor ends the generation on an answer its verb cannot have.
+The compositor ends the generation on an answer its verb cannot have,
+and on a listing whose `NETWORK` is not one the account's kind has.
 Revocation is not live: the running jail keeps its view until the
 account's next launch or shutdown releases it ("Application filesystem
-grants"). td-software shows an account's rows and asks for these changes
-from its folders panel (td-software/DESIGN.md §4.3).
+grants"). A sandbox's rows change only what root publishes and applies
+once its launches go through root (WORKLOADS.md step 7); until then
+nothing reads them. td-software shows an application's rows and asks for
+these changes from its folders panel (td-software/DESIGN.md §4.3); a
+sandbox's are td-ctl's.
 
 ## Fixed program launch prerequisite
 

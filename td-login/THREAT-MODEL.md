@@ -190,6 +190,26 @@ hostile application can turn a writable grant into code running as the
 human. Same-UID isolation is not claimed, as for `.ssh/authorized_keys`
 above.
 
+The same holds for a sandbox's account (`tdw<uid>`) once the ledger
+holds it: any program running as UID 1000 can grant it any such
+directory, read-only or writable, and give it the host's network
+namespace, which reaches the network, every service listening on the
+host's loopback, abstract-namespace AF_UNIX sockets and netlink,
+through the same socket, credentials and writer. That is the same
+trust class: the program already holds the human's files and the
+host's network itself, and a grant adds a second party holding them,
+with the writable grant's way back into what the human runs. Only the
+primary human's session may ask, since a grant's source is that
+human's home. A grant does not make the account, which allocation
+alone does, so grants spend none of the ledger's sandbox rows; they
+spend the grant table's sandbox and workspace budget instead, half its
+rows and bytes (td-authd/DESIGN.md, "Workload grant table"), so such a
+program can use it up, refusing further sandbox grants until the human
+revokes some, but cannot crowd out an application's. Nor can a request
+set an application's network, which the application's declaration
+fixes. A sandbox's grants and network take effect only once its launches
+go through root (WORKLOADS.md step 7); until then nothing applies them.
+
 Which workloads can ask is narrower than "anything but the human", and
 not yet by account. Firefox and td-web run as accounts of their own,
 which the control socket refuses. Mail and news, td-sandbox profiles

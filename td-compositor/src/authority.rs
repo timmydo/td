@@ -98,21 +98,83 @@ impl GrantAccess {
     }
 }
 
-/// What a grant request asks of an application account's directories.
+/// The kind of account a grant request names. A workspace's takes no
+/// grants until its launches go through root (WORKLOADS.md step 8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantKind {
+    Application,
+    Sandbox,
+}
+
+impl GrantKind {
+    /// The control socket's and the table's word.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Application => "application",
+            Self::Sandbox => "sandbox",
+        }
+    }
+
+    /// `2c`'s kind byte.
+    fn byte(self) -> u8 {
+        match self {
+            Self::Application => 0,
+            Self::Sandbox => 1,
+        }
+    }
+}
+
+/// A sandbox's network: none, or the host's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantNetwork {
+    Off,
+    Host,
+}
+
+impl GrantNetwork {
+    /// The control socket's and the table's word.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Host => "host",
+        }
+    }
+
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "off" => Some(Self::Off),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
+
+    /// `2c`'s network byte, a set's operand and a sandbox's listing's.
+    fn byte(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Host => 1,
+        }
+    }
+}
+
+/// What a grant request asks of an account's directories, or of a
+/// sandbox's network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GrantVerb {
     List,
     Grant(GrantAccess),
     Revoke,
+    Network(GrantNetwork),
 }
 
-/// A grant request (td-authd/DESIGN.md, "Grant requests"): its verb, an
-/// application name in the registry grammar and, but for a listing, a
-/// directory below the human's home of one to 1024 bytes, whose rules
-/// root holds.
+/// A grant request (td-authd/DESIGN.md, "Grant requests"): its verb, the
+/// account's kind and its name in the registry grammar and, for a grant
+/// or a revoke, a directory below the human's home of one to 1024 bytes,
+/// whose rules root holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GrantRequest {
     pub(crate) verb: GrantVerb,
+    pub(crate) kind: GrantKind,
     pub(crate) name: String,
     pub(crate) path: String,
 }
@@ -134,8 +196,12 @@ pub(crate) enum GrantOutcome {
 /// Root's answer to a grant request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GrantAnswer {
-    /// Every directory row, from `89` pages.
-    Listed(Vec<(GrantAccess, String)>),
+    /// Every directory row, from `89` pages, and a sandbox's network; an
+    /// application's is its declaration's.
+    Listed {
+        network: Option<GrantNetwork>,
+        rows: Vec<(GrantAccess, String)>,
+    },
     Done(GrantOutcome),
     /// `8b`: the writer refused, for this reason.
     Refused(String),
@@ -1175,11 +1241,15 @@ impl Launcher {
     pub(crate) fn grants(&self, request: GrantRequest) -> Result<Receiver<GrantAnswer>, String> {
         // Root ends the generation on a malformed request; refused here.
         if !consent::application_name(&request.name) {
-            return Err("invalid application name".into());
+            return Err("invalid account name".into());
         }
-        let listing = request.verb == GrantVerb::List;
-        if listing != request.path.is_empty() || request.path.len() > GRANT_PATH_BYTES {
+        let pathless = matches!(request.verb, GrantVerb::List | GrantVerb::Network(_));
+        if pathless != request.path.is_empty() || request.path.len() > GRANT_PATH_BYTES {
             return Err("invalid grant path".into());
+        }
+        // An application's network is its declaration's.
+        if matches!(request.verb, GrantVerb::Network(_)) && request.kind != GrantKind::Sandbox {
+            return Err("only a sandbox's network is set".into());
         }
         let (reply, answer) = mpsc::sync_channel(1);
         match self.control.try_send(ControlWork::Grants(request, reply)) {
@@ -1558,23 +1628,33 @@ fn cache(wire: &mut impl Exchange, verb: CacheVerb, name: &str) -> Result<CacheA
     CacheAnswer::decode(verb, &wire.exchange(&request)?)
 }
 
-/// `2c`'s first operands: the verb byte, the application kind `00`, and
-/// the name's length and bytes.
-fn grant_head(verb: u8, name: &str) -> Result<Vec<u8>, String> {
-    let length = u8::try_from(name.len()).map_err(|_| "invalid application name")?;
-    let mut request = vec![0x2c, verb, 0, length];
+/// `2c`'s first operands: the verb byte, the account's kind byte, and the
+/// name's length and bytes.
+fn grant_head(verb: u8, kind: GrantKind, name: &str) -> Result<Vec<u8>, String> {
+    let length = u8::try_from(name.len()).map_err(|_| "invalid account name")?;
+    let mut request = vec![0x2c, verb, kind.byte(), length];
     request.extend_from_slice(name.as_bytes());
     Ok(request)
 }
 
-/// One `89` page: the account's row count and its whole listing's digest,
-/// which every page of one listing repeats, and the rows it carries.
-type GrantPage = ((usize, u64), Vec<(GrantAccess, String)>);
+/// A listing's network byte for an application, whose network its
+/// declaration sets.
+const NETWORK_DECLARED: u8 = 0xff;
 
-/// Root's answer to `2c`, exactly: a page for a listing, an outcome the
-/// verb can have for a change, or a refusal; anything else ends the
-/// paired generation.
-fn decode_grant(verb: GrantVerb, answer: &[u8]) -> Result<Result<GrantPage, GrantAnswer>, String> {
+/// What one listing's every page repeats: the account's row count, a
+/// sandbox's network and the whole listing's digest.
+type GrantListing = (usize, Option<GrantNetwork>, u64);
+/// One `89` page: what its listing states, and the rows it carries.
+type GrantPage = (GrantListing, Vec<(GrantAccess, String)>);
+
+/// Root's answer to `2c`, exactly: a page for a listing, its network byte
+/// the one the account's kind has, an outcome the verb can have for a
+/// change, or a refusal; anything else ends the paired generation.
+fn decode_grant(
+    kind: GrantKind,
+    verb: GrantVerb,
+    answer: &[u8],
+) -> Result<Result<GrantPage, GrantAnswer>, String> {
     let invalid = || "invalid grant request answer".to_string();
     let printable = |bytes: &[u8]| bytes.iter().all(|b| (b' '..=b'~').contains(b));
     match (verb, answer) {
@@ -1594,11 +1674,23 @@ fn decode_grant(verb: GrantVerb, answer: &[u8]) -> Result<Result<GrantPage, Gran
             return Ok(Err(GrantAnswer::Done(GrantOutcome::Unchanged)))
         }
         (GrantVerb::Revoke, [0x8a, 3]) => return Ok(Err(GrantAnswer::Done(GrantOutcome::Revoked))),
+        (GrantVerb::Network(_), [0x8a, 1]) => {
+            return Ok(Err(GrantAnswer::Done(GrantOutcome::Changed)))
+        }
+        (GrantVerb::Network(_), [0x8a, 2]) => {
+            return Ok(Err(GrantAnswer::Done(GrantOutcome::Unchanged)))
+        }
         (GrantVerb::List, [0x89, _, ..]) => {}
         _ => return Err(invalid()),
     }
-    let [_, total, d0, d1, d2, d3, d4, d5, d6, d7, rows @ ..] = answer else {
+    let [_, total, network, d0, d1, d2, d3, d4, d5, d6, d7, rows @ ..] = answer else {
         return Err(invalid());
+    };
+    let network = match (kind, *network) {
+        (GrantKind::Application, NETWORK_DECLARED) => None,
+        (GrantKind::Sandbox, 0) => Some(GrantNetwork::Off),
+        (GrantKind::Sandbox, 1) => Some(GrantNetwork::Host),
+        _ => return Err(invalid()),
     };
     let digest = u64::from_be_bytes([*d0, *d1, *d2, *d3, *d4, *d5, *d6, *d7]);
     let mut rest: &[u8] = rows;
@@ -1628,7 +1720,7 @@ fn decode_grant(verb: GrantVerb, answer: &[u8]) -> Result<Result<GrantPage, Gran
     if !rest.is_empty() {
         return Err(invalid());
     }
-    Ok(Ok(((total, digest), rows)))
+    Ok(Ok(((total, network, digest), rows)))
 }
 
 /// One grant request: a change is one exchange; a listing asks page after
@@ -1644,12 +1736,17 @@ fn grants(
         GrantVerb::Grant(GrantAccess::ReadOnly) => 1,
         GrantVerb::Grant(GrantAccess::ReadWrite) => 2,
         GrantVerb::Revoke => 3,
+        GrantVerb::Network(_) => 4,
     };
-    let head = grant_head(verb, &request.name)?;
+    let head = grant_head(verb, request.kind, &request.name)?;
     if request.verb != GrantVerb::List {
         let mut bytes = head;
+        if let GrantVerb::Network(network) = request.verb {
+            // A refusal is the empty error, which needs no allocation.
+            crate::allocation::push(&mut bytes, network.byte()).map_err(|_| String::new())?;
+        }
         bytes.extend_from_slice(request.path.as_bytes());
-        return match decode_grant(request.verb, &wire.exchange(&bytes)?)? {
+        return match decode_grant(request.kind, request.verb, &wire.exchange(&bytes)?)? {
             Err(answer) => Ok(answer),
             Ok(_) => Err("invalid grant request answer".into()),
         };
@@ -1660,16 +1757,17 @@ fn grants(
         let start = u8::try_from(rows.len()).map_err(|_| "invalid grant listing")?;
         let mut bytes = head.clone();
         bytes.push(start);
-        let (stated, page) = match decode_grant(request.verb, &wire.exchange(&bytes)?)? {
-            Ok(page) => page,
-            Err(answer) => return Ok(answer),
-        };
+        let (stated, page) =
+            match decode_grant(request.kind, request.verb, &wire.exchange(&bytes)?)? {
+                Ok(page) => page,
+                Err(answer) => return Ok(answer),
+            };
         // Pages of two tables, of one count or not, are no one listing.
         if listing.is_some_and(|listing| listing != stated) {
             return Ok(GrantAnswer::Moved);
         }
         listing = Some(stated);
-        let (total, _) = stated;
+        let (total, network, _) = stated;
         // A page short of the count carries at least one row.
         if page.is_empty() && rows.len() < total {
             return Err("invalid grant listing".into());
@@ -1679,7 +1777,7 @@ fn grants(
             return Err("invalid grant listing".into());
         }
         if rows.len() == total {
-            return Ok(GrantAnswer::Listed(rows));
+            return Ok(GrantAnswer::Listed { network, rows });
         }
         if Instant::now() >= deadline {
             return Ok(GrantAnswer::Unfinished);
@@ -3020,9 +3118,101 @@ checked=never\nrefused=none\nprogress=none\n";
     fn grant_request(verb: GrantVerb, path: &str) -> GrantRequest {
         GrantRequest {
             verb,
+            kind: GrantKind::Application,
             name: "firefox".into(),
             path: path.into(),
         }
+    }
+
+    fn sandbox_request(verb: GrantVerb, path: &str) -> GrantRequest {
+        GrantRequest {
+            verb,
+            kind: GrantKind::Sandbox,
+            name: "default".into(),
+            path: path.into(),
+        }
+    }
+
+    /// A sandbox's request names kind `01`; its network is one exchange
+    /// whose operand is the network byte, answered changed or unchanged.
+    #[test]
+    fn a_sandbox_request_names_its_kind_and_sets_its_network() {
+        let host = sandbox_request(GrantVerb::Network(GrantNetwork::Host), "");
+        let mut script = wire(vec![vec![0x8a, 1]]);
+        assert_eq!(
+            grants(&mut script, &host, later()).unwrap(),
+            GrantAnswer::Done(GrantOutcome::Changed)
+        );
+        assert_eq!(script.requests, [b"\x2c\x04\x01\x07default\x01".to_vec()]);
+        let off = sandbox_request(GrantVerb::Network(GrantNetwork::Off), "");
+        let mut script = wire(vec![vec![0x8a, 2]]);
+        assert_eq!(
+            grants(&mut script, &off, later()).unwrap(),
+            GrantAnswer::Done(GrantOutcome::Unchanged)
+        );
+        assert_eq!(script.requests, [b"\x2c\x04\x01\x07default\x00".to_vec()]);
+        for answer in [vec![0x8a, 0], vec![0x8a, 3], page(0, 7, b"")] {
+            assert!(
+                grants(&mut wire(vec![answer.clone()]), &host, later()).is_err(),
+                "{answer:?}"
+            );
+        }
+        let grant = sandbox_request(GrantVerb::Grant(GrantAccess::ReadWrite), "src");
+        let mut script = wire(vec![vec![0x8a, 0]]);
+        assert_eq!(
+            grants(&mut script, &grant, later()).unwrap(),
+            GrantAnswer::Done(GrantOutcome::Added)
+        );
+        assert_eq!(script.requests, [b"\x2c\x02\x01\x07defaultsrc".to_vec()]);
+        // A sandbox's listing carries its network in every page's head;
+        // an application's carries the declared byte, and neither the
+        // other's.
+        let list = sandbox_request(GrantVerb::List, "");
+        let mut script = wire(vec![sandbox_page(1, 1, 7, b"\x01\x00\x03src")]);
+        assert_eq!(
+            grants(&mut script, &list, later()).unwrap(),
+            GrantAnswer::Listed {
+                network: Some(GrantNetwork::Host),
+                rows: vec![(GrantAccess::ReadWrite, "src".into())],
+            }
+        );
+        assert_eq!(script.requests, [b"\x2c\x00\x01\x07default\x00".to_vec()]);
+        let mut script = wire(vec![sandbox_page(0, 0, 7, b"")]);
+        assert_eq!(
+            grants(&mut script, &list, later()).unwrap(),
+            GrantAnswer::Listed {
+                network: Some(GrantNetwork::Off),
+                rows: vec![],
+            }
+        );
+        // The network changing between pages is a listing that moved.
+        let mut moved = wire(vec![
+            sandbox_page(2, 0, 7, b"\x00\x00\x01a"),
+            sandbox_page(2, 1, 7, b"\x01\x00\x01b"),
+        ]);
+        assert_eq!(
+            grants(&mut moved, &list, later()).unwrap(),
+            GrantAnswer::Moved
+        );
+        for answer in [page(0, 7, b""), sandbox_page(0, 2, 7, b"")] {
+            assert!(grants(&mut wire(vec![answer]), &list, later()).is_err());
+        }
+        let application = grant_request(GrantVerb::List, "");
+        for network in [0, 1] {
+            let answer = sandbox_page(0, network, 7, b"");
+            assert!(grants(&mut wire(vec![answer]), &application, later()).is_err());
+        }
+        // An application's network is never asked of root.
+        let (launcher, _queued) = Queued::launcher();
+        for network in [GrantNetwork::Host, GrantNetwork::Off] {
+            assert!(launcher
+                .grants(grant_request(GrantVerb::Network(network), ""))
+                .is_err());
+        }
+        assert!(launcher
+            .grants(sandbox_request(GrantVerb::Network(GrantNetwork::Host), "x"))
+            .is_err());
+        assert!(launcher.grants(host).is_ok());
     }
 
     /// A change is one `2c` and its exact outcome; a refusal carries the
@@ -3089,9 +3279,15 @@ checked=never\nrefused=none\nprogress=none\n";
         }
     }
 
-    /// An `89` page: the count, the listing's digest, then the rows.
+    /// An application's `89` page: the count, the declared network byte,
+    /// the listing's digest, then the rows.
     fn page(total: u8, digest: u64, rows: &[u8]) -> Vec<u8> {
-        let mut page = vec![0x89, total];
+        sandbox_page(total, NETWORK_DECLARED, digest, rows)
+    }
+
+    /// An `89` page with the network byte `network`.
+    fn sandbox_page(total: u8, network: u8, digest: u64, rows: &[u8]) -> Vec<u8> {
+        let mut page = vec![0x89, total, network];
         page.extend_from_slice(&digest.to_be_bytes());
         page.extend_from_slice(rows);
         page
@@ -3105,7 +3301,10 @@ checked=never\nrefused=none\nprogress=none\n";
         let mut script = wire(vec![page(0, 7, b"")]);
         assert_eq!(
             grants(&mut script, &list, later()).unwrap(),
-            GrantAnswer::Listed(vec![])
+            GrantAnswer::Listed {
+                network: None,
+                rows: vec![]
+            }
         );
         assert_eq!(script.requests, [b"\x2c\x00\x00\x07firefox\x00".to_vec()]);
         let mut script = wire(vec![
@@ -3114,10 +3313,13 @@ checked=never\nrefused=none\nprogress=none\n";
         ]);
         assert_eq!(
             grants(&mut script, &list, later()).unwrap(),
-            GrantAnswer::Listed(vec![
-                (GrantAccess::ReadOnly, "My Pictures".into()),
-                (GrantAccess::ReadWrite, "Downloads".into()),
-            ])
+            GrantAnswer::Listed {
+                network: None,
+                rows: vec![
+                    (GrantAccess::ReadOnly, "My Pictures".into()),
+                    (GrantAccess::ReadWrite, "Downloads".into()),
+                ]
+            }
         );
         assert_eq!(
             script.requests,
@@ -3159,7 +3361,8 @@ checked=never\nrefused=none\nprogress=none\n";
             vec![page(1, 7, b"\x00\x00\x01\n")],
             vec![page(1, 7, b"\x00\x00\x01\xff")],
             vec![vec![0x89, 0]],
-            vec![b"\x89\x00\x00\x00\x00".to_vec()],
+            vec![vec![0x89, 0, NETWORK_DECLARED]],
+            vec![b"\x89\x00\xff\x00\x00\x00\x00".to_vec()],
             vec![vec![0x8a, 0]],
         ] {
             assert!(
@@ -3194,7 +3397,10 @@ checked=never\nrefused=none\nprogress=none\n";
         let mut whole = wire(vec![page(1, 7, b"\x00\x00\x01a")]);
         assert_eq!(
             grants(&mut whole, &list, passed).unwrap(),
-            GrantAnswer::Listed(vec![(GrantAccess::ReadOnly, "a".into())])
+            GrantAnswer::Listed {
+                network: None,
+                rows: vec![(GrantAccess::ReadOnly, "a".into())]
+            }
         );
         let mut changed = wire(vec![vec![0x8a, 1]]);
         let rw = grant_request(GrantVerb::Grant(GrantAccess::ReadWrite), "a");
@@ -3317,6 +3523,7 @@ checked=never\nrefused=none\nprogress=none\n";
         ] {
             let request = GrantRequest {
                 verb,
+                kind: GrantKind::Application,
                 name: name.into(),
                 path: path.into(),
             };

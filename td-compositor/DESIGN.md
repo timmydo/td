@@ -5810,15 +5810,20 @@ that program.
 ### Grant requests
 
 The human lists, adds and revokes the directories of the home an
-application account is granted (WORKLOADS.md, "Grants") here, and the
-compositor forwards each over its private channel as request `2c`
-(td-authd/DESIGN.md, "Grant requests"):
+application's or a sandbox's account is granted, and sets a sandbox's
+network (WORKLOADS.md, "Grants"), here, and the compositor forwards each
+over its private channel as request `2c` (td-authd/DESIGN.md, "Grant
+requests"). `KIND` is `application` or `sandbox`:
 
-- `grants application NAME`: the account's directory rows, `ok` and one
+- `grants KIND NAME`: the account's directory rows, `ok` and, for a
+  sandbox, a first `network<TAB>off|host` line, then one
   `ro|rw<TAB>DIRECTORY` line each, in the table's order;
-- `grant application NAME ro|rw DIRECTORY`: add the row, or change its
-  access, `ok` and `added`, `changed` or `unchanged`;
-- `revoke application NAME DIRECTORY`: remove it, `ok` and `revoked`.
+- `grant KIND NAME ro|rw DIRECTORY`: add the row, or change its access,
+  `ok` and `added`, `changed` or `unchanged`;
+- `revoke KIND NAME DIRECTORY`: remove it, `ok` and `revoked`;
+- `network sandbox NAME off|host`: give the sandbox no network or the
+  host's, `ok` and `changed` or `unchanged`. An application's network is
+  its declaration's: `network application` is refused by name.
 
 `DIRECTORY` is the rest of the line after the single space that ends
 the access or the name, spaces and all, one to 1024 bytes, relative to
@@ -5826,20 +5831,23 @@ the home, with no control character: one is refused before anything is
 sent, td-ctl's own parse included, so a newline cannot end the
 directory early. A line that begins `grant ` or `revoke ` may therefore
 be up to 2048 bytes; every other request keeps the socket's 1024.
-`application` is the only kind: `sandbox` and `workspace` are
-refused by name until their launches go through root (WORKLOADS.md
-step 7). The compositor checks the grammar and bounds alone; the path's
-rules, the application's admission and the source's checks are root's,
-whose refusal is an `error` carrying its reason. A grant changes what
-the account's next launch publishes, never a running jail.
+`workspace` is refused by name until its launches go through root
+(WORKLOADS.md step 8). The compositor checks the grammar and bounds
+alone, and that a listing's network byte is the one its kind has; the
+path's rules, the account's admission (an application's declaration, a
+sandbox's ledger row) and the source's checks are root's, whose refusal
+is an `error` carrying its reason. A grant changes what the account's
+next launch publishes, never a running jail; a sandbox's grants and
+network take effect only once its launches go through root (WORKLOADS.md
+step 7).
 
 They travel the application requests' capacity-one queue, one a turn
 after the physical queue, and wait for the worker's answer at most four
 seconds, root's three-second bound on the table's writer and a margin,
 inside the conversation's five less half a second. A listing longer
 than one frame is paged: the worker asks from the next row until it
-holds the count root stated, and a page whose count or listing digest
-differs from the first's is an `unavailable` to ask again. The worker
+holds the count root stated, and a page whose count, network or listing
+digest differs from the first's is an `unavailable` to ask again. The worker
 carries physical requests over the same wire, so a listing asks no
 further page once four seconds have passed since its first, when its
 caller has stopped waiting, and is an `unavailable` too: with the page
@@ -5852,11 +5860,12 @@ and without the paired authority every grant request is one too.
 `td-ctl` prints the body, read to at most 40 KiB, with any control
 character, or one that reorders or hides text, in a listed directory
 shown as `?`, as td-software shows it: only a row root's validator
-refuses, held inert, can carry one. A grant is not
-elevation: it delegates the human's authority over the human's own
-files, so it takes the human's credentials at this socket and no secure
-attention, and any program running as the human can make one
-(td-login/THREAT-MODEL.md).
+refuses, held inert, can carry one. It refuses a sandbox's listing
+without its network line first, and an application's with one. A grant
+is not elevation: it delegates the human's authority over the human's
+own files and network, so it takes the human's credentials at this
+socket and no secure attention, and any program running as the human
+can make one (td-login/THREAT-MODEL.md).
 
 ### What it deliberately is not
 

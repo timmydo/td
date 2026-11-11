@@ -45,9 +45,8 @@ mod crc32;
 mod deflate;
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-png/src/encode.rs")]
 mod png_encode;
-// `deflate.rs`'s own tests read their output back through the engine's
-// inflater.
-#[cfg(test)]
+// td-alloc's fallible growth: the grant requests' text, and the engine
+// inflater `deflate.rs`'s own tests read their output back through.
 #[allow(dead_code)]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-alloc/src/lib.rs")]
 mod allocation;
@@ -1212,7 +1211,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x34e40f6a1fbd2912;
+    const AUTHORITY_FINGERPRINT: u64 = 0x4c43f5d30694d8ae;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");

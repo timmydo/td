@@ -1318,10 +1318,25 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
                 crate::workload_grants::Access::ReadOnly,
                 b"Pictures".to_vec()
             ),
+            kind: crate::workload_accounts::Kind::Application,
             name: "firefox".into(),
         })
     );
-    for bad in [&[0x2c][..], &[0x2c, 0, 0, 0], &[0x2c, 0, 1, 7], &[0x2d]] {
+    assert_eq!(
+        request(&[&[0x2c, 4, 1, 7][..], b"default\x01"].concat())?,
+        Request::Grants(crate::grant_requests::Request {
+            verb: crate::grant_requests::Verb::Network(crate::workload_grants::Network::Host),
+            kind: crate::workload_accounts::Kind::Sandbox,
+            name: "default".into(),
+        })
+    );
+    for bad in [
+        &[0x2c][..],
+        &[0x2c, 0, 0, 0],
+        &[0x2c, 0, 1, 7],
+        &[0x2c, 0, 2, 5, b'a', b'g', b'e', b'n', b't', 0],
+        &[0x2d],
+    ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }
     Ok(())

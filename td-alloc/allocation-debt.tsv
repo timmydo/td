@@ -307,9 +307,9 @@ engine/src/workload_accounts.rs	allocating-conversion	10
 engine/src/workload_accounts.rs	allocation-macro	13
 engine/src/workload_accounts.rs	unchecked-growth-or-clone	9
 engine/src/workload_grants.rs	allocating-constructor	1
-engine/src/workload_grants.rs	allocating-conversion	15
-engine/src/workload_grants.rs	allocation-macro	16
-engine/src/workload_grants.rs	unchecked-growth-or-clone	10
+engine/src/workload_grants.rs	allocating-conversion	16
+engine/src/workload_grants.rs	allocation-macro	15
+engine/src/workload_grants.rs	unchecked-growth-or-clone	12
 engine/src/xz.rs	allocating-constructor	1
 engine/src/xz.rs	allocating-conversion	58
 engine/src/xz.rs	allocation-macro	34
@@ -1151,7 +1151,7 @@ td-authd/src/inspection.rs	allocating-conversion	5
 td-authd/src/inspection.rs	allocation-macro	3
 td-authd/src/inspection.rs	unchecked-growth-or-clone	1
 td-authd/src/launch.rs	allocating-constructor	1
-td-authd/src/launch.rs	allocating-conversion	31
+td-authd/src/launch.rs	allocating-conversion	32
 td-authd/src/launch.rs	allocation-macro	39
 td-authd/src/launch.rs	unchecked-growth-or-clone	6
 td-authd/src/login.rs	allocating-constructor	1
@@ -1407,7 +1407,7 @@ td-compositor/src/conn.rs	allocation-macro	35
 td-compositor/src/conn.rs	unchecked-growth-or-clone	4
 td-compositor/src/control.rs	allocating-constructor	1
 td-compositor/src/control.rs	allocating-conversion	35
-td-compositor/src/control.rs	allocation-macro	104
+td-compositor/src/control.rs	allocation-macro	103
 td-compositor/src/control.rs	direct-reservation	1
 td-compositor/src/control.rs	heap-owner	2
 td-compositor/src/control.rs	unchecked-growth-or-clone	19
@@ -1856,9 +1856,9 @@ td-firstboot/src/principal_store.rs	allocating-conversion	15
 td-firstboot/src/principal_store.rs	allocation-macro	46
 td-firstboot/src/principal_store.rs	heap-owner	1
 td-firstboot/src/principal_store.rs	unchecked-growth-or-clone	10
-td-firstboot/src/principal_store_tests.rs	allocating-conversion	43
-td-firstboot/src/principal_store_tests.rs	allocation-macro	16
-td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	8
+td-firstboot/src/principal_store_tests.rs	allocating-conversion	45
+td-firstboot/src/principal_store_tests.rs	allocation-macro	24
+td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	9
 td-firstboot/src/principals.rs	allocating-conversion	24
 td-firstboot/src/principals.rs	allocation-macro	20
 td-firstboot/src/principals.rs	unchecked-growth-or-clone	12

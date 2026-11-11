@@ -5,7 +5,8 @@
 //! human's. The file is std-only, uses only `workload_accounts` beside it
 //! and performs no I/O, so target programs include it by path: td-firstboot
 //! seeds the table and is its one writer at the human's request
-//! (`Table::grant`, `Table::revoke`), td-authd publishes a launching
+//! (`Table::grant`, `Table::revoke`, `Table::set_network`), td-authd
+//! publishes a launching
 //! account's views from
 //! it and lists them in that account's manifest, and td-jail admits the
 //! views the manifest lists. Every directory a row or a manifest names is
@@ -22,6 +23,14 @@ pub const MODE: u32 = 0o600;
 /// must still read what a later one wrote, so the v1 bounds are generous.
 pub const MAX_BYTES: usize = 1024 * 1024;
 const MAX_ROWS: usize = 4096;
+/// What sandbox and workspace rows together may take of the table: half
+/// its rows and half its bytes as rows are written. Any program running
+/// as the human can name new sandboxes and grant them, so without this
+/// they could fill the table and leave no application a row. The writer
+/// applies it where a change grows those rows, never the parser, so a
+/// table past it stays readable and every row in it revocable.
+pub const WORKLOAD_GRANT_ROWS: usize = MAX_ROWS / 2;
+pub const WORKLOAD_GRANT_BYTES: usize = MAX_BYTES / 2;
 /// Directory rows one account may hold, and so views one launch lists.
 pub const MAX_DIRECTORIES: usize = 32;
 /// View indices: a launch publishes a replacement beside the view it
@@ -72,9 +81,10 @@ impl Access {
     }
 }
 
-/// What a row grants. Only directories are published; v1 parses the socket
-/// and network forms, which no v1 writer adds, so the deployment that
-/// starts writing them (WORKLOADS.md step 7) can roll back to this one.
+/// What a row grants. Only directories are published. v1 parses the socket
+/// form, which no writer adds yet, and the network form, which the writer
+/// sets for a sandbox (`Table::set_network`), so a deployment that rolls
+/// back still reads what a later one wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Grant {
     Directory { access: Access, path: String },
@@ -93,10 +103,29 @@ pub enum Change {
     Unchanged,
 }
 
+/// An account's network: none, or the host's namespace. An account
+/// without a network row has none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Off,
     Host,
+}
+
+impl Network {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Host => "host",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,8 +143,7 @@ impl Row {
                 format!("{account}\tdirectory\t{}\t{path}\n", access.as_str())
             }
             Grant::Socket(socket) => format!("{account}\tsocket\t{socket}\n"),
-            Grant::Network(Network::Off) => format!("{account}\tnetwork\toff\n"),
-            Grant::Network(Network::Host) => format!("{account}\tnetwork\thost\n"),
+            Grant::Network(network) => format!("{account}\tnetwork\t{}\n", network.as_str()),
         }
     }
 
@@ -152,8 +180,11 @@ impl Row {
                 }
                 (kind, name, Grant::Socket((*socket).to_string()))
             }
-            [kind, name, "network", "off"] => (kind, name, Grant::Network(Network::Off)),
-            [kind, name, "network", "host"] => (kind, name, Grant::Network(Network::Host)),
+            [kind, name, "network", network] => (
+                kind,
+                name,
+                Grant::Network(Network::parse(network).ok_or("unknown network grant")?),
+            ),
             _ => return Err("invalid grant row shape".into()),
         };
         let kind = Kind::parse(kind).ok_or("unknown grant account kind")?;
@@ -307,19 +338,49 @@ impl Table {
                 path: path.to_string(),
             },
         });
-        Ok((Self::of_rows(rows)?, change))
+        let next = Self::of_rows(rows)?;
+        self.within_workload_budget(kind, &next)?;
+        Ok((next, change))
+    }
+
+    /// Sandbox and workspace rows together: how many, and their bytes as
+    /// the table writes them.
+    fn workload_share(&self) -> (usize, usize) {
+        self.rows
+            .iter()
+            .filter(|row| row.kind != Kind::Application)
+            .fold((0, 0), |(rows, bytes), row| {
+                (rows + 1, bytes + row.line().len())
+            })
+    }
+
+    /// Refuses `next` when a change for a `kind` account grows the sandbox
+    /// and workspace rows past `WORKLOAD_GRANT_ROWS` or
+    /// `WORKLOAD_GRANT_BYTES`. A change that does not grow them, such as
+    /// a directory's other access, stands even past the budget.
+    fn within_workload_budget(&self, kind: Kind, next: &Self) -> Result<(), String> {
+        if kind == Kind::Application {
+            return Ok(());
+        }
+        let (held_rows, held_bytes) = self.workload_share();
+        let (rows, bytes) = next.workload_share();
+        if (rows > WORKLOAD_GRANT_ROWS && rows > held_rows)
+            || (bytes > WORKLOAD_GRANT_BYTES && bytes > held_bytes)
+        {
+            return Err(
+                "sandboxes and workspaces already hold all the grants the table keeps for them; \
+                 revoke some first"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// The table without the `kind` account `name`'s grant of `path`,
     /// whatever its access. A grant the account does not hold refuses, so a
     /// mistyped path is reported rather than taken for done.
     pub fn revoke(&self, kind: Kind, name: &str, path: &str) -> Result<Self, String> {
-        let rows: Vec<Row> = self
-            .rows
-            .iter()
-            .filter(|row| row.directory_of(kind, name, path).is_none())
-            .cloned()
-            .collect();
+        let rows = self.kept(|row| row.directory_of(kind, name, path).is_none());
         if rows.len() == self.rows.len() {
             return Err(format!(
                 "the {} {name} holds no grant of {path:?}",
@@ -329,10 +390,61 @@ impl Table {
         Self::of_rows(rows)
     }
 
+    /// The rows `keep` keeps, copied: what a change that takes rows away
+    /// starts from.
+    fn kept(&self, keep: impl Fn(&Row) -> bool) -> Vec<Row> {
+        self.rows.iter().filter(|row| keep(row)).cloned().collect()
+    }
+
     /// `rows` in canonical order, checked as a table read back.
     fn of_rows(mut rows: Vec<Row>) -> Result<Self, String> {
         rows.sort_by_cached_key(Row::line);
         Self::parse(&Self { rows }.encode())
+    }
+
+    /// The `kind` account `name`'s network: its network row's, or none
+    /// without one.
+    pub fn network(&self, kind: Kind, name: &str) -> Network {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == kind && row.name == name)
+            .find_map(|row| match row.grant {
+                Grant::Network(network) => Some(network),
+                _ => None,
+            })
+            .unwrap_or(Network::Off)
+    }
+
+    /// The table with the `kind` account `name`'s network set to
+    /// `network`, and what that changed. Absent means off, so this never
+    /// adds an `off` row: setting off removes a `host` row, and setting
+    /// what the account already has, an `off` row an edit by hand left
+    /// included, leaves the table as it is.
+    pub fn set_network(
+        &self,
+        kind: Kind,
+        name: &str,
+        network: Network,
+    ) -> Result<(Self, Change), String> {
+        if !valid_name(name) {
+            return Err("invalid grant account name".into());
+        }
+        if self.network(kind, name) == network {
+            return Ok((self.clone(), Change::Unchanged));
+        }
+        let mut rows = self.kept(|row| {
+            !(row.kind == kind && row.name == name && matches!(row.grant, Grant::Network(_)))
+        });
+        if network == Network::Host {
+            rows.push(Row {
+                kind,
+                name: name.to_string(),
+                grant: Grant::Network(Network::Host),
+            });
+        }
+        let next = Self::of_rows(rows)?;
+        self.within_workload_budget(kind, &next)?;
+        Ok((next, Change::Changed))
     }
 
     /// Every directory row the `kind` account `name` holds, publishable or
@@ -1070,6 +1182,147 @@ mod tests {
         assert!(emptied
             .encode()
             .contains("application\tfirefox\tnetwork\thost\n"));
+    }
+
+    /// An account's network is its one network row's, off without one.
+    /// Setting host adds or replaces the row, setting off removes it, and
+    /// setting what the account has changes nothing, a hand-written `off`
+    /// row included; no other row moves.
+    #[test]
+    fn a_network_is_set_by_one_row_and_off_is_no_row() {
+        let base = Table::parse(
+            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\nsandbox\tdefault\tdirectory\tro\tsrc\nsandbox\tdefault\tsocket\tfetch\n",
+        )
+        .unwrap();
+        assert_eq!(base.network(Kind::Sandbox, "default"), Network::Off);
+        let (same, change) = base
+            .set_network(Kind::Sandbox, "default", Network::Off)
+            .unwrap();
+        assert_eq!((same.clone(), change), (base.clone(), Change::Unchanged));
+        let (host, change) = base
+            .set_network(Kind::Sandbox, "default", Network::Host)
+            .unwrap();
+        assert_eq!(change, Change::Changed);
+        assert_eq!(
+            host.encode(),
+            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\nsandbox\tdefault\tdirectory\tro\tsrc\nsandbox\tdefault\tnetwork\thost\nsandbox\tdefault\tsocket\tfetch\n"
+        );
+        assert_eq!(host.network(Kind::Sandbox, "default"), Network::Host);
+        assert_eq!(host.network(Kind::Sandbox, "tools"), Network::Off);
+        assert_eq!(host.network(Kind::Workspace, "default"), Network::Off);
+        let (again, change) = host
+            .set_network(Kind::Sandbox, "default", Network::Host)
+            .unwrap();
+        assert_eq!((again, change), (host.clone(), Change::Unchanged));
+        let (off, change) = host
+            .set_network(Kind::Sandbox, "default", Network::Off)
+            .unwrap();
+        assert_eq!((off, change), (base.clone(), Change::Changed));
+        // An `off` row an edit by hand wrote means what no row means: off
+        // again leaves it, host replaces it.
+        let written = Table::parse("td-grants-v1\nsandbox\tdefault\tnetwork\toff\n").unwrap();
+        assert_eq!(written.network(Kind::Sandbox, "default"), Network::Off);
+        let (kept, change) = written
+            .set_network(Kind::Sandbox, "default", Network::Off)
+            .unwrap();
+        assert_eq!((kept, change), (written.clone(), Change::Unchanged));
+        let (replaced, change) = written
+            .set_network(Kind::Sandbox, "default", Network::Host)
+            .unwrap();
+        assert_eq!(change, Change::Changed);
+        assert_eq!(
+            replaced.encode(),
+            "td-grants-v1\nsandbox\tdefault\tnetwork\thost\n"
+        );
+        assert!(base
+            .set_network(Kind::Sandbox, "Default", Network::Host)
+            .is_err());
+        for word in ["off", "host"] {
+            assert_eq!(Network::parse(word).unwrap().as_str(), word);
+        }
+        assert!(Network::parse("on").is_none());
+    }
+
+    /// Sandbox and workspace rows together stop at half the table's rows
+    /// and half its bytes when a change would add to them; applications
+    /// keep the rest. The parser applies neither, so a table past them
+    /// stays readable; an equal grant, another access and a revoke stand.
+    #[test]
+    fn sandbox_and_workspace_rows_keep_to_their_half_of_the_table() {
+        // The row budget, reached by one directory row per sandbox.
+        let rows: String = (0..WORKLOAD_GRANT_ROWS)
+            .map(|index| format!("sandbox\ts{index:05}\tdirectory\tro\td\n"))
+            .collect();
+        let full = Table::parse(&format!("{MAGIC}{rows}")).unwrap();
+        assert_eq!(full.workload_share().0, WORKLOAD_GRANT_ROWS);
+        for kind in [Kind::Sandbox, Kind::Workspace] {
+            let error = full
+                .grant(kind, "fresh", Access::ReadOnly, "d")
+                .unwrap_err();
+            assert!(error.contains("revoke some first"), "{error}");
+            assert!(full.set_network(kind, "fresh", Network::Host).is_err());
+        }
+        // A sandbox already holding a row cannot add a network row either.
+        assert!(full
+            .set_network(Kind::Sandbox, "s00000", Network::Host)
+            .is_err());
+        // What does not grow them stands: an equal grant, the other access,
+        // off, a revoke; and an application is still granted.
+        assert_eq!(
+            full.grant(Kind::Sandbox, "s00000", Access::ReadOnly, "d")
+                .unwrap()
+                .1,
+            Change::Unchanged
+        );
+        assert_eq!(
+            full.grant(Kind::Sandbox, "s00000", Access::ReadWrite, "d")
+                .unwrap()
+                .1,
+            Change::Changed
+        );
+        assert_eq!(
+            full.set_network(Kind::Sandbox, "s00000", Network::Off)
+                .unwrap()
+                .1,
+            Change::Unchanged
+        );
+        let revoked = full.revoke(Kind::Sandbox, "s00000", "d").unwrap();
+        revoked
+            .grant(Kind::Sandbox, "fresh", Access::ReadOnly, "d")
+            .unwrap();
+        assert_eq!(
+            full.grant(Kind::Application, "firefox", Access::ReadOnly, "d")
+                .unwrap()
+                .1,
+            Change::Added
+        );
+        // Past the budget, as an older or hand-written table may be, the
+        // table still parses and its rows revoke.
+        let past: String = (0..=WORKLOAD_GRANT_ROWS)
+            .map(|index| format!("sandbox\ts{index:05}\tdirectory\tro\td\n"))
+            .collect();
+        let over = Table::parse(&format!("{MAGIC}{past}")).unwrap();
+        over.revoke(Kind::Sandbox, "s00000", "d").unwrap();
+        // The byte budget, reached by long directories long before the row
+        // budget is.
+        let path = vec!["a".repeat(250); 4].join("/");
+        let line = |index: usize| format!("sandbox\tl{index:05}\tdirectory\tro\t{path}\n");
+        let count = WORKLOAD_GRANT_BYTES / line(0).len();
+        assert!(count < WORKLOAD_GRANT_ROWS);
+        let rows: String = (0..count).map(line).collect();
+        let wide = Table::parse(&format!("{MAGIC}{rows}")).unwrap();
+        assert!(wide.workload_share().1 <= WORKLOAD_GRANT_BYTES);
+        let error = wide
+            .grant(Kind::Sandbox, "zfresh", Access::ReadOnly, &path)
+            .unwrap_err();
+        assert!(error.contains("revoke some first"), "{error}");
+        wide.grant(Kind::Application, "firefox", Access::ReadOnly, &path)
+            .unwrap();
+        // A row that still fits in the bytes left is added.
+        let network = "sandbox\tzfresh\tnetwork\thost\n".len();
+        assert!(wide.workload_share().1 + network <= WORKLOAD_GRANT_BYTES);
+        wide.set_network(Kind::Sandbox, "zfresh", Network::Host)
+            .unwrap();
     }
 
     /// A grant refuses what a table read back refuses: a reserved,

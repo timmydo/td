@@ -66,11 +66,13 @@ Already built and reused by this design:
   compared with the identity td-authd published it by, one derivation
   (`engine/src/mount_identity.rs`) for both: the mount covering the
   human's home, the home's path below it and the row's path;
-- the request path that lists, adds and revokes an application
-  account's directory rows: the human's `grants`, `grant` and `revoke`
-  on the compositor control socket (td-ctl, and td-software's folders
-  panel), forwarded as td-authd's private request `2c` to td-firstboot's
-  `grant-table`, the table's one writer (td-authd/DESIGN.md, "Grant
+- the request path that lists, adds and revokes an application's or a
+  sandbox's directory rows and sets a sandbox's network row: the human's
+  `grants`, `grant`, `revoke` and `network` on the compositor control
+  socket (td-ctl, and for applications td-software's folders panel),
+  forwarded as td-authd's private request `2c` to td-firstboot's
+  `grant-table`, the table's one writer, which admits a sandbox only
+  once the ledger holds its account (td-authd/DESIGN.md, "Grant
   requests");
 - the portal's fixed read-only Downloads view (1000→991), present while
   Firefox holds the Downloads grant;
@@ -90,13 +92,15 @@ NAME` allocates in the ledger with an empty home under
 `/var/lib/td/workloads` and a `td-workload-UID` delegation, and which
 td-login resolves from the ledger alone (td-authd/DESIGN.md, "Workload
 account ledger"); nothing calls it until td-sandbox's launches go through
-root.
+root. Nor does anything read a sandbox's directory and network rows,
+which grant requests write once it has an account, until root launches
+it.
 
 Not built: subordinate accounts, workspace accounts and their
 allocation, the `map-subuid` operation `APPLICATIONS.md` names, grant
-requests for sandbox and workspace accounts (step 7), and socket and
-network grants, whose rows the table already parses and no request
-writes.
+requests for workspace accounts (step 8), socket grants, whose rows the
+table already parses and no request writes, and the launch that applies
+a sandbox's grants and network (step 7).
 
 ## A launch
 
@@ -230,7 +234,10 @@ Everything a workload reaches outside its runtime and home is a grant:
   later deployment's rules refuse is kept inert, listed and revocable but
   never published, rather than failing the whole table;
 - **a socket**: Wayland, the fetch service, and others named per grant;
-- **network**: `off` or `host`, as td-sandbox's policy has today.
+- **network**: `off` or `host`, as td-sandbox's policy has today: one
+  row per sandbox or workspace account, which the human sets as a
+  directory is granted, and no row for none. An application's network
+  is its reviewed declaration's, never a grant.
 
 The human requests a grant through the compositor control socket, as
 td-software's install requests arrive. A grant is not elevation: it
@@ -326,9 +333,8 @@ account.
    td-firstboot's `grant-table` writer under the principal state lock,
    with a VM oracle that grants a directory to Firefox before its launch,
    checks the read-only idmapped view the launch publishes, and revokes
-   it (td-authd/DESIGN.md, "Grant requests"). Only application accounts
-   take requests until step 7; a revoke takes effect at the account's
-   next launch.
+   it (td-authd/DESIGN.md, "Grant requests"). A revoke takes effect at
+   the account's next launch.
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request. In four landings:
    sandbox accounts, with nothing launched as one yet (landed: one name
@@ -339,15 +345,24 @@ account.
    98304 up, avoiding every kind's leftovers, and prepares its empty
    `/var/lib/td/workloads/UID` home and its delegation, but no
    `/run/user/UID`, td-authd/DESIGN.md, "Workload account ledger"); grant
-   requests that admit the sandbox kind; the root workspace launch,
+   requests that admit the sandbox kind (landed: `grants`, `grant` and
+   `revoke` name a sandbox, and `network sandbox NAME off|host` sets its
+   one network row, `host` written and `off` no row, which `grants`
+   lists; a sandbox's grant or `host` needs its ledger row and the
+   primary human's session, and never allocates a row; sandbox and
+   workspace rows together keep to half the grant table, 2048 rows and
+   512 KiB; a workspace and an application's network are refused,
+   td-authd/DESIGN.md, "Grant requests"); the root workspace launch,
    through a root intake socket whose connection becomes the jail's
    channel, which prepares the account's delegation again each boot and
-   inherits the 2048-row bound on sandbox and workspace rows, with
-   td-jail's workspace kind admitting a ledger caller; then td-sandbox's
-   cutover, in which old profile homes are left untouched and accounts
-   start fresh, and shares outside the home and profile names that are
+   inherits the ledger's 2048-row bound on sandbox and workspace rows,
+   with td-jail's workspace kind admitting a ledger caller; then
+   td-sandbox's cutover, in which old profile homes are left untouched
+   and accounts start fresh, shares outside the home and profile names that are
    not ledger names (one beginning with a digit or a hyphen) are
-   reported and dropped.
+   reported and dropped, and deleting a profile revokes its account's
+   grant rows, which are keyed by name and until then pass to a profile
+   created again under the same name.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is
    retired.
 9. mail and news on their reserved rows, with fetch services of their

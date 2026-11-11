@@ -1306,9 +1306,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
         assert!(!software.contains(forbidden), "software.rs: {forbidden}");
     }
     // Request `2c` runs the grant table's one writer, td-firstboot, with
-    // the owner, a fixed verb and kind, and the peer's validated name,
-    // access and path: one fixed program, null stdin, no environment, no
-    // credential change, waited for within its bound by one sleep loop.
+    // the owner, a fixed verb, the kind the peer's byte selects from two
+    // fixed words, and the peer's validated name, access or network and
+    // path: one fixed program, null stdin, no environment, no credential
+    // change, waited for within its bound by one sleep loop.
     let grants = include_str!("../src/grant_requests.rs")
         .split("#[cfg(test)]")
         .next()
@@ -1344,9 +1345,17 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(grants.matches("Command::new(").count(), 1);
     assert!(grants.contains(
-        "Command::new(\"/bin/td-firstboot\");\n    command.args([\n        \"grant-table\",\n        &owner.to_string(),\n        verb,\n        \"application\",\n        &request.name,\n    ]);"
+        "Command::new(\"/bin/td-firstboot\");\n    command.args([\n        \"grant-table\",\n        &owner.to_string(),\n        verb,\n        request.kind.as_str(),\n        &request.name,\n    ]);"
     ));
-    assert!(grants.contains("        command.args([access.as_str()]);\n"));
+    // The kind is application or sandbox, a workspace's waits for its
+    // launches to go through root, and only a sandbox's network is set.
+    assert!(grants.contains(
+        "let kind = match kind {\n            0 => Kind::Application,\n            1 => Kind::Sandbox,\n            _ => return Err(invalid()),\n        };"
+    ));
+    assert!(grants.contains(
+        "            (4, [0]) if kind == Kind::Sandbox => Verb::Network(Network::Off),\n            (4, [1]) if kind == Kind::Sandbox => Verb::Network(Network::Host),\n"
+    ));
+    assert!(grants.contains("    command.args(word);\n"));
     assert!(grants.contains("    command.args(path);\n"));
     assert_eq!(grants.matches("command.args(").count(), 3);
     // The path reaches the writer only once the table's validator took it:
@@ -1616,7 +1625,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
-const GRANT_REQUESTS_FINGERPRINT: u64 = 0xff1ed2342d1bfa24;
+const GRANT_REQUESTS_FINGERPRINT: u64 = 0x10849a59813c63f1;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f5b8f042bdbb6c2;
 
 fn fingerprint(source: &str) -> u64 {
@@ -1631,7 +1640,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
-const LAUNCH_FINGERPRINT: u64 = 0x7311f592da8c8724;
+const LAUNCH_FINGERPRINT: u64 = 0x33d421b9691fb2fb;
 const MAIN_FINGERPRINT: u64 = 0x62f0cc4717b69cc5;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
