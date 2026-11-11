@@ -1,6 +1,6 @@
 # td-jpeg
 
-A bounded baseline JPEG decoder, std only, held to an independent
+A bounded baseline and progressive JPEG decoder, std only, held to an independent
 oracle's hashes rather than a tolerance, and the baseline encoder that
 shares its basis and zigzag order. td-photo decodes its camera's
 embedded previews with it (`td-photo/DESIGN.md`, "Embedded previews")
@@ -32,15 +32,15 @@ environment or a clock, or starts a thread.
 
 ## The decoder
 
-The decoder is a baseline JPEG decoder: 8-bit, one or three
+The baseline path accepts: 8-bit, one or three
 components, horizontal and vertical sampling factors 1 or 2, Huffman DC/AC
 tables and restart intervals, one interleaved scan, component planes of at
 most 128 Mi samples together with their block padding
 (`MAX_PREVIEW_SAMPLES`, what a decode allocates), axes within `MAX_AXIS`,
 pixels within `MAX_IMAGE_PIXELS` and at most 32 table definitions
-(`MAX_TABLE_DEFINITIONS`), refusing progressive, arithmetic, lossless,
+(`MAX_TABLE_DEFINITIONS`), refusing arithmetic, lossless,
 hierarchical (a DHP, EXP or DAC marker anywhere before the scan), 12-bit and
-multi-scan streams by name. SOF1 at 8 bits and 16-bit quantisers in an SOF0
+sequential multi-scan streams by name. SOF1 at 8 bits and 16-bit quantisers in an SOF0
 stream are read as baseline; a lone component's sampling factors are
 ignored, one block per MCU, as T.81 A.2.2 codes it and libjpeg reads it. It
 decodes at 1/1, 1/2, 1/4 or 1/8 scale by a reduced inverse DCT over the
@@ -68,10 +68,55 @@ that ends early decodes to its end on zero bits and is reported as
 truncated after the MCU row it ran out in, so a cut file is an error and
 not a partial picture.
 
-What it does not do, so a consumer can say so: progressive streams,
-common on the web, are refused by name rather than decoded; CMYK and
+What it does not do, so a consumer can say so: CMYK and
 YCCK (four components) are refused; application segments are skipped,
 so an EXIF orientation is not applied and an Adobe transform not read.
+
+### Progressive streams
+
+SOF2 uses the same `header`, `decode`, `decode_with`, scales, RGB layout,
+transform and colour conversion. The baseline encoder remains baseline.
+The progressive decoder implements Huffman DC first/refinement and AC
+spectral selection/refinement, including signed correction bits, newly
+nonzero coefficients, ZRL, EOB runs and restart intervals (T.81 Annex G,
+<https://www.w3.org/Graphics/JPEG/itu-t81.pdf>). DC scans may interleave
+components; an AC scan has one component. Noninterleaved scans traverse
+only real component blocks, while interleaved DC scans include MCU padding.
+The callback receives final dequantised blocks once, in the baseline MCU,
+component, block order, including padding.
+
+Each component captures its quantiser on its first scan. A later DQT may
+serve a component not yet started, without changing earlier components.
+Per-coefficient history rejects repeated first scans, AC before DC,
+refinement before first transmission, skipped refinement bits, and
+inconsistent overlapping bands. Spectral ranges, component order and
+selectors are checked. Successive approximation is at most 13; quantised
+coefficients must fit signed 16 bits, so dequantisation fits signed 32 bits.
+EOB runs may not cross a restart boundary or scan end. EOI requires DC for
+every component; unsent AC bands and remaining low bits are zero, allowing
+intentionally abbreviated progressive quality. Truncation is still an
+error, never a returned partial image. Arithmetic/hierarchical markers and
+new frames after a scan are refused.
+
+Both entry points cap input at `MAX_INPUT_BYTES` (64 MiB) and marker segments
+at `MAX_SEGMENTS` (4096), including skipped metadata. The table-definition
+budget remains 32 across the entire progressive stream. Progressive-only
+limits are `MAX_SCANS` (256), `MAX_PROGRESSIVE_COEFFICIENTS` (64 Mi
+coefficients, 128 MiB), and `MAX_PROGRESSIVE_WORK` (256 Mi coefficient
+visits, charged before each scan from its block count and spectral width).
+All limit failures use `Error::Limit`, except the existing table and frame
+bounds which retain their errors. Component planes are bounded as before;
+coefficients are released before allocating the final RGB buffer. Peak
+bulk allocation is at most 192 MiB for coefficients plus sample planes,
+or 256 MiB for sample planes plus RGB, with bounded table/scratch overhead.
+The smaller coefficient cap also preserves td-web's PNG-based decode budget:
+its admitted output is at most 16 Mi pixels, so samples plus RGB need at most
+112 MiB, and the RGB-to-RGBA conversion at most 112 MiB after decode
+has released its planes. The coefficient/plane phase is the larger bound,
+192 MiB, equal to the PNG decoding allowance. The four scales reduce sample
+storage; they do not reduce the progressive coefficient-storage requirement.
+There is no incremental rendering API and no file, thread or other ambient
+access.
 
 ## The encoder
 
@@ -147,7 +192,15 @@ scaling at its ends, the clamp, and the magnitude coding.
 refused), and `is_consistent` and `pixel` refusing a buffer whose public
 fields disagree, overflow or are out of range.
 
-`tests/confinement.rs` pins one pure source file that opens nothing and
+`tests/progressive.rs` compares libjpeg-turbo coefficient-preserving
+progressive transcodes against baseline at every scale: grey, 4:4:4,
+4:2:0, 4:2:2, vertical subsampling and chroma finer than luma, with and
+without restarts. It also checks callback coefficients/order, every
+truncation of the grey fixtures and sampled cuts of the colour fixtures,
+deterministic mutations, progression errors and scan/segment limits.
+The fixture generator and provenance live under `tests/fixtures/progressive`.
+
+`tests/confinement.rs` pins the two pure decoder source files that opens nothing and
 names no thread, a manifest of no dependencies, the bounds above, and
 the fixture (its length and markers) and the hashes its README records,
 and the oracle's contract stated in `src/lib.rs`.

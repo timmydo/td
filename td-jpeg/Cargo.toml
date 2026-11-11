@@ -3,7 +3,7 @@ name = "td-jpeg"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bounded baseline JPEG decoder held to an independent oracle's hashes"
+description = "Bounded baseline and progressive JPEG decoder and baseline encoder"
 
 [workspace]
 

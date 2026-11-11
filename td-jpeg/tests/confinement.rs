@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-//! What the compiler cannot say about td-jpeg: one pure source file that
+//! What the compiler cannot say about td-jpeg: pure source files that
 //! opens nothing, a manifest of no dependencies, the bounds DESIGN.md
 //! names, and the fixture and oracle the decoder is held to.
 
@@ -24,12 +24,15 @@ fn names(dir: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn one_pure_source_file_that_opens_nothing() {
+fn pure_source_files_that_open_nothing() {
     assert!(!root().join("build.rs").exists(), "no build script");
-    assert_eq!(names("src"), BTreeSet::from(["lib.rs".to_string()]));
+    assert_eq!(
+        names("src"),
+        BTreeSet::from(["lib.rs".to_string(), "progressive.rs".to_string()])
+    );
     let lib = read("src/lib.rs");
     assert!(lib.starts_with("#![forbid(unsafe_code)]"));
-    let text = lib.replace("#![forbid(unsafe_code)]", "");
+    let text = lib.replace("#![forbid(unsafe_code)]", "") + &read("src/progressive.rs");
     for word in [
         "unsafe",
         "include!",
@@ -52,12 +55,13 @@ fn one_pure_source_file_that_opens_nothing() {
         "decode.rs",
         "encode.rs",
         "fixtures",
+        "progressive.rs",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     assert_eq!(names("tests"), tests);
-    let fixtures: BTreeSet<String> = ["README.md", "jpeg_ref.py", "z8-thumb.jpg"]
+    let fixtures: BTreeSet<String> = ["README.md", "jpeg_ref.py", "z8-thumb.jpg", "progressive"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -94,6 +98,11 @@ fn the_bounds_are_the_ones_the_design_names() {
     assert_eq!(td_jpeg::MAX_PREVIEW_SAMPLES, 128 << 20);
     assert_eq!(td_jpeg::MAX_TABLE_DEFINITIONS, 32);
     assert_eq!(td_jpeg::MAX_EXIF, 65527);
+    assert_eq!(td_jpeg::MAX_INPUT_BYTES, 64 << 20);
+    assert_eq!(td_jpeg::MAX_SEGMENTS, 4096);
+    assert_eq!(td_jpeg::MAX_SCANS, 256);
+    assert_eq!(td_jpeg::MAX_PROGRESSIVE_COEFFICIENTS, 64 << 20);
+    assert_eq!(td_jpeg::MAX_PROGRESSIVE_WORK, 256 << 20);
 }
 
 #[test]

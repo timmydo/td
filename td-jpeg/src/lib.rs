@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
-//! Baseline JPEG decoder: 8-bit, one or three components with sampling
+//! Baseline and progressive JPEG decoder: 8-bit, one or three components with sampling
 //! factors 1 or 2, Huffman DC and AC tables, restart intervals, one
-//! interleaved scan. Progressive, arithmetic, lossless, hierarchical,
-//! 12-bit and multi-scan streams are refused by name. It decodes at 1/1,
+//! interleaved baseline scan or bounded progressive scans. Arithmetic,
+//! lossless, hierarchical, 12-bit and sequential multi-scan streams are refused. It decodes at 1/1,
 //! 1/2, 1/4 or 1/8 scale with a reduced inverse DCT over the first N
 //! coefficients of each axis, into an owned RGB buffer (`Rgb8`); and the
 //! baseline encoder that shares its transform (`Encoder`), YCbCr 4:4:4
@@ -19,6 +19,8 @@
 //! file, the environment or a clock.
 
 use std::fmt;
+
+mod progressive;
 
 /// The longest axis any RGB buffer here may have.
 pub const MAX_AXIS: usize = 16384;
@@ -87,10 +89,23 @@ pub const MAX_PREVIEW_SAMPLES: usize = 128 << 20;
 /// carry, so a stream of table segments costs bounded work.
 pub const MAX_TABLE_DEFINITIONS: usize = 32;
 
+/// Maximum input length, including metadata, for either decoder entry point.
+pub const MAX_INPUT_BYTES: usize = 64 << 20;
+/// Maximum marker segments, including skipped metadata.
+pub const MAX_SEGMENTS: usize = 4096;
+/// Maximum progressive scans.
+pub const MAX_SCANS: usize = 256;
+/// Maximum stored progressive coefficients (two bytes each).
+pub const MAX_PROGRESSIVE_COEFFICIENTS: usize = 64 << 20;
+/// Maximum coefficient visits across progressive scans.
+pub const MAX_PROGRESSIVE_WORK: usize = 256 << 20;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// No SOI marker, or a byte where a marker should be.
     NotJpeg,
+    /// Input, marker, scan, coefficient storage or work budget exceeded.
+    Limit,
     /// The data ends inside a segment or inside the entropy-coded scan.
     Truncated,
     /// A frame type this decoder does not implement, by its SOF marker.
@@ -120,9 +135,10 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Limit => f.write_str("JPEG decode budget exceeded"),
             Self::NotJpeg => f.write_str("not a JPEG stream"),
             Self::Truncated => f.write_str("JPEG data ends early"),
-            Self::Unsupported(m) => write!(f, "JPEG frame type {m:#04x} is not baseline"),
+            Self::Unsupported(m) => write!(f, "JPEG frame type {m:#04x} is unsupported"),
             Self::Precision(p) => write!(f, "JPEG precision {p} is not 8"),
             Self::Components(n) => write!(f, "JPEG component layout {n} is not 1 or 3 distinct"),
             Self::Sampling => f.write_str("JPEG sampling factor is not 1 or 2"),
@@ -130,7 +146,7 @@ impl fmt::Display for Error {
             Self::Huffman => f.write_str("JPEG code not in its table"),
             Self::Segment => f.write_str("JPEG segment malformed"),
             Self::Axis { width, height } => write!(f, "JPEG frame {width}x{height} refused"),
-            Self::Scan => f.write_str("JPEG scan is not one interleaved baseline scan"),
+            Self::Scan => f.write_str("JPEG scan parameters or progression invalid"),
             Self::Restart => f.write_str("JPEG restart marker missing"),
             Self::Run => f.write_str("JPEG coefficient run past its block"),
         }
@@ -186,7 +202,7 @@ pub struct Header {
     pub sampling: (u8, u8),
 }
 
-/// Reads the frame header of a baseline stream.
+/// Reads the frame header of a baseline or progressive stream.
 pub fn header(data: &[u8]) -> Result<Header, Error> {
     let parsed = parse(data, true)?;
     let frame = parsed.frame;
@@ -216,6 +232,7 @@ struct Component {
 
 #[derive(Clone, Debug)]
 struct Frame {
+    progressive: bool,
     width: usize,
     height: usize,
     components: Vec<Component>,
@@ -241,6 +258,9 @@ struct Parsed {
     scan: Vec<ScanComponent>,
     /// Where the entropy-coded data begins.
     data_start: usize,
+    progression: Option<progressive::Scan>,
+    definitions: usize,
+    segments: usize,
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, Error> {
@@ -254,6 +274,9 @@ fn u16_at(data: &[u8], at: usize) -> Result<u16, Error> {
 /// Walks the marker segments up to the frame header (`header_only`) or the
 /// start of scan.
 fn parse(data: &[u8], header_only: bool) -> Result<Parsed, Error> {
+    if data.len() > MAX_INPUT_BYTES {
+        return Err(Error::Limit);
+    }
     if !data.starts_with(&[0xFF, 0xD8]) {
         return Err(Error::NotJpeg);
     }
@@ -266,7 +289,12 @@ fn parse(data: &[u8], header_only: bool) -> Result<Parsed, Error> {
     };
     let mut restart = 0usize;
     let mut definitions = 0usize;
+    let mut segments = 0usize;
     loop {
+        segments += 1;
+        if segments > MAX_SEGMENTS {
+            return Err(Error::Limit);
+        }
         if *data.get(pos).ok_or(Error::Truncated)? != 0xFF {
             return Err(Error::NotJpeg);
         }
@@ -293,11 +321,12 @@ fn parse(data: &[u8], header_only: bool) -> Result<Parsed, Error> {
         match marker {
             0xDB => parse_quant(segment, &mut tables, &mut definitions)?,
             0xC4 => parse_huffman(segment, &mut tables, &mut definitions)?,
-            0xC0 | 0xC1 => {
+            0xC0..=0xC2 => {
                 if frame.is_some() {
                     return Err(Error::Segment);
                 }
-                let parsed = parse_frame(segment)?;
+                let mut parsed = parse_frame(segment)?;
+                parsed.progressive = marker == 0xC2;
                 if header_only {
                     return Ok(Parsed {
                         frame: parsed,
@@ -305,6 +334,9 @@ fn parse(data: &[u8], header_only: bool) -> Result<Parsed, Error> {
                         restart,
                         scan: Vec::new(),
                         data_start: end,
+                        progression: None,
+                        definitions,
+                        segments,
                     });
                 }
                 frame = Some(parsed);
@@ -312,19 +344,29 @@ fn parse(data: &[u8], header_only: bool) -> Result<Parsed, Error> {
             // Other frame types, arithmetic conditioning (DAC) and the
             // hierarchical markers (DHP, EXP) name a stream this decoder
             // does not implement, whatever frame follows them.
-            0xC2 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCC..=0xCF | 0xDE | 0xDF => {
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCC..=0xCF | 0xDE | 0xDF => {
                 return Err(Error::Unsupported(marker));
             }
             0xDD => restart = usize::from(u16_at(segment, 0)?),
             0xDA => {
                 let frame = frame.ok_or(Error::Segment)?;
-                let scan = parse_scan(segment, &frame, &tables)?;
+                let (scan, progression) = if frame.progressive {
+                    (
+                        Vec::new(),
+                        Some(progressive::scan(segment, &frame, &tables)?),
+                    )
+                } else {
+                    (parse_scan(segment, &frame, &tables)?, None)
+                };
                 return Ok(Parsed {
                     frame,
                     tables,
                     restart,
                     scan,
                     data_start: end,
+                    progression,
+                    definitions,
+                    segments,
                 });
             }
             // APPn, COM, DNL and the rest carry nothing this decoder needs.
@@ -447,6 +489,7 @@ fn parse_frame(segment: &[u8]) -> Result<Frame, Error> {
         components.push(Component { id, h, v, tq });
     }
     let frame = Frame {
+        progressive: false,
         width,
         height,
         components,
@@ -1011,6 +1054,9 @@ pub fn decode_with(
     sink: &mut dyn FnMut(&[i32; 64]),
 ) -> Result<Rgb8, Error> {
     let parsed = parse(data, false)?;
+    if parsed.frame.progressive {
+        return progressive::decode(data, parsed, scale, sink);
+    }
     let frame = &parsed.frame;
     let n = scale.n();
     let single = frame.components.len() == 1;
@@ -1104,12 +1150,7 @@ pub fn decode_with(
         }
     }
     bits.finish()?;
-    let (ow, oh) = (scaled(frame.width, scale), scaled(frame.height, scale));
-    let mut image = Rgb8::new(ow, oh).ok_or(Error::Axis {
-        width: frame.width,
-        height: frame.height,
-    })?;
-    let sample = |plane: &Plane<'_>, x: usize, y: usize| -> u8 {
+    render(frame, scale, &planes, |plane, x, y| {
         let px = (x >> plane.xshift).min(plane.width.saturating_sub(1));
         let py = (y >> plane.yshift).min(plane.height.saturating_sub(1));
         plane
@@ -1117,8 +1158,21 @@ pub fn decode_with(
             .get(py * plane.width + px)
             .copied()
             .unwrap_or(0)
-    };
-    match planes.as_slice() {
+    })
+}
+
+fn render<T>(
+    frame: &Frame,
+    scale: Scale,
+    planes: &[T],
+    sample: impl Fn(&T, usize, usize) -> u8,
+) -> Result<Rgb8, Error> {
+    let (ow, oh) = (scaled(frame.width, scale), scaled(frame.height, scale));
+    let mut image = Rgb8::new(ow, oh).ok_or(Error::Axis {
+        width: frame.width,
+        height: frame.height,
+    })?;
+    match planes {
         [grey] => {
             for (y, row) in image.data.chunks_exact_mut(ow * 3).enumerate() {
                 for (x, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {

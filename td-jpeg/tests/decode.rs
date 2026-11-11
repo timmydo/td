@@ -900,10 +900,10 @@ fn every_named_refusal_is_reported() {
     );
 
     let mut s = good.clone();
-    s.sof = 0xC2;
+    s.sof = 0xC3;
     assert_eq!(
         jpeg::header(&s.encode()).unwrap_err(),
-        Error::Unsupported(0xC2)
+        Error::Unsupported(0xC3)
     );
     let mut s = good.clone();
     s.precision = 12;
@@ -1258,7 +1258,7 @@ fn every_named_refusal_is_reported() {
     for e in [
         Error::NotJpeg,
         Error::Truncated,
-        Error::Unsupported(0xC2),
+        Error::Unsupported(0xC3),
         Error::Precision(12),
         Error::Components(2),
         Error::Sampling,
