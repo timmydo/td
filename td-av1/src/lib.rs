@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 //! Shared AV1 arithmetic used by td's picture codecs.
-//! These primitives operate on caller-validated geometry, not bitstreams.
+//! The encoder and arithmetic operate on caller-validated geometry.
 
 pub mod cdef;
 pub mod cdf;
 pub mod deblock;
+pub mod intra;
 pub mod transform;
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ mod tests {
             include_str!("cdef.rs"),
             include_str!("cdf.rs"),
             include_str!("deblock.rs"),
+            include_str!("intra.rs"),
             include_str!("transform.rs"),
         ] {
             for name in [

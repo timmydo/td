@@ -1,0 +1,5891 @@
+//! An AV1 still-picture encoder for the AVIF export: one key frame,
+//! 8-bit 4:2:0, intra prediction only, written the way the AV1 bitstream
+//! specification (version 1.0.0 with errata) reads it back, so any
+//! decoder reconstructs exactly the picture the encoder reconstructs for
+//! itself. The stream is a sequence header OBU and a frame OBU; `avif`
+//! wraps them. Fed rows like `td_jpeg::Encoder`, a superblock row at a time.
+//!
+//! What the encoder uses of AV1: 64x64 superblocks coded whole or split down to
+//! square blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8
+//! by rate-distortion choice; every intra mode, angle deltas, the intra edge
+//! filter and chroma from luma included, but palette and filter-intra; for luma
+//! with no side of 32 or more the best of the reduced set's four DCT and ADST
+//! pairs, for chroma the mode's default; one transform per plane per block, its
+//! levels a dead-zone quantizer's refined by a trellis; the multi-symbol
+//! arithmetic coder with adapting CDFs from the defaults; the fewest tiles the
+//! frame's size allows, each tile's superblock rows searched in a wavefront
+//! over the threads and written in order by its coder. The deblocking filter
+//! and CDEF are on at strengths from the quantizer; restoration, superres, film
+//! grain and screen-content tools stay off. `transform` holds the transforms,
+//! quantizers and scans, `cdf` the default CDFs, `deblock` and `cdef` the
+//! filters.
+
+use std::fmt;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+
+use crate::cdef;
+use crate::cdf;
+use crate::deblock;
+use crate::transform::{self, Size, TxType};
+
+/// The longest axis: what `image::MAX_AXIS` allows, which the level
+/// rules and the 16-bit frame size fields also hold.
+pub const MAX_AXIS: usize = 16384;
+
+/// The encoder bounds the number of concurrent wavefront rows.
+pub const MAX_THREADS: usize = 16;
+
+/// Superblock side in luma pixels.
+const SB: usize = 64;
+/// A mode-info unit: the spec's `MI_SIZE`.
+const MI: usize = 4;
+/// Superblock side in mode-info units.
+const SB_MI: usize = SB / MI;
+/// The spec's `MAX_TILE_WIDTH`, `MAX_TILE_AREA`, `MAX_TILE_COLS/ROWS`.
+const MAX_TILE_WIDTH: usize = 4096;
+const MAX_TILE_AREA: usize = 4096 * 2304;
+const MAX_TILE_COLS: usize = 64;
+const MAX_TILE_ROWS: usize = 64;
+
+/// Why the encoder refuses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// An axis of zero, or past `MAX_AXIS`.
+    Axis { width: usize, height: usize },
+    /// Rows fed that are not whole, or more than the height, or fewer
+    /// at the finish.
+    Rows,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Axis { width, height } => write!(f, "AV1 refuses a {width}x{height} frame"),
+            Self::Rows => f.write_str("rows fed to the AV1 encoder do not fit its frame"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+// ------------------------------------------------------------ modes
+
+/// The spec's intra modes by number.
+const DC_PRED: u8 = 0;
+const V_PRED: u8 = 1;
+const H_PRED: u8 = 2;
+const D45_PRED: u8 = 3;
+const D135_PRED: u8 = 4;
+const D113_PRED: u8 = 5;
+const D157_PRED: u8 = 6;
+const D203_PRED: u8 = 7;
+const D67_PRED: u8 = 8;
+const SMOOTH_PRED: u8 = 9;
+const SMOOTH_V_PRED: u8 = 10;
+const SMOOTH_H_PRED: u8 = 11;
+const PAETH_PRED: u8 = 12;
+/// Chroma's prediction from the block's luma, a chroma mode only.
+const UV_CFL_PRED: u8 = 13;
+/// How many of the screened modes are coded in full, luma and chroma;
+/// chroma from luma is coded beside chroma's too.
+const LUMA_TRIALS: usize = 3;
+const CHROMA_TRIALS: usize = 2;
+/// Luma's under 8x8, where a third bought 0.1% for 3% of the time.
+const SUB8X8_LUMA_TRIALS: usize = 2;
+/// How many of the screen's closest directional modes have their angle
+/// deltas screened too, luma and chroma.
+const ANGLE_MODES: usize = 2;
+const UV_ANGLE_MODES: usize = 1;
+/// A node's halves are tried unless its split costs less than this
+/// fraction of it whole, `(numerator, denominator)`: where the split
+/// wins by that much the halves seldom beat it. With `RECT_MARGIN` it
+/// kept five sixths of what trying both halvings gained at 16x16 and
+/// 32x32 on the bench's noisy picture, for two fifths of the trials.
+const RECT_GATE: (u64, u64) = (92, 100);
+/// A direction's halves are left untried when the other's hold the
+/// luma's variance under this fraction of what its own do.
+const RECT_MARGIN: (i64, i64) = (9, 10);
+
+/// The nonzero angle deltas, in steps of three degrees.
+const DELTAS: [i8; 6] = [-3, -2, -1, 1, 2, 3];
+/// Every mode the encoder tries, luma and chroma alike.
+const MODES: [u8; 13] = [
+    DC_PRED,
+    V_PRED,
+    H_PRED,
+    D45_PRED,
+    D135_PRED,
+    D113_PRED,
+    D157_PRED,
+    D203_PRED,
+    D67_PRED,
+    SMOOTH_PRED,
+    SMOOTH_V_PRED,
+    SMOOTH_H_PRED,
+    PAETH_PRED,
+];
+// Chroma from luma takes its DC prediction from the first mode's slot.
+const _: () = assert!(MODES[0] == DC_PRED);
+
+/// The spec's `Mode_To_Angle`.
+fn mode_angle(mode: u8) -> i32 {
+    match mode {
+        V_PRED => 90,
+        H_PRED => 180,
+        D45_PRED => 45,
+        D135_PRED => 135,
+        D113_PRED => 113,
+        D157_PRED => 157,
+        D203_PRED => 203,
+        D67_PRED => 67,
+        _ => 0,
+    }
+}
+
+fn is_directional(mode: u8) -> bool {
+    (V_PRED..=D67_PRED).contains(&mode)
+}
+
+/// The spec's `is_smooth`, a luma or chroma mode alike.
+fn is_smooth(mode: u8) -> bool {
+    matches!(mode, SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED)
+}
+
+/// The spec's `Intra_Mode_Context`.
+fn mode_context(mode: u8) -> usize {
+    match mode {
+        DC_PRED | SMOOTH_PRED | PAETH_PRED => 0,
+        V_PRED | SMOOTH_V_PRED => 1,
+        H_PRED | SMOOTH_H_PRED => 2,
+        D45_PRED | D67_PRED => 3,
+        _ => 4,
+    }
+}
+
+/// The luma transform types a block below 32x32 may signal
+/// (`TX_SET_INTRA_2` without `IDTX`).
+const TX_TYPES: [TxType; 4] = [
+    TxType::DctDct,
+    TxType::AdstDct,
+    TxType::DctAdst,
+    TxType::AdstAdst,
+];
+
+/// The spec's `Mode_To_Txfm`, the transform a mode's residual gets
+/// when the size admits one other than DCT.
+fn mode_tx_type(mode: u8, size: Size) -> TxType {
+    if dct_only(size) {
+        return TxType::DctDct;
+    }
+    match mode {
+        V_PRED | D113_PRED | D67_PRED | SMOOTH_V_PRED => TxType::AdstDct,
+        H_PRED | D157_PRED | D203_PRED | SMOOTH_H_PRED => TxType::DctAdst,
+        D135_PRED | SMOOTH_PRED | PAETH_PRED => TxType::AdstAdst,
+        _ => TxType::DctDct,
+    }
+}
+
+/// Whether a transform's set is `TX_SET_DCTONLY`: a 32- or 64-point
+/// side.
+fn dct_only(size: Size) -> bool {
+    size.width().max(size.height()) >= 32
+}
+
+/// The spec's `Tx_Size_Sqr`, the square of the shorter side, which
+/// picks the transform type's CDFs.
+fn size_sqr(size: Size) -> usize {
+    (size.width().min(size.height()).ilog2() - 2) as usize
+}
+
+/// The spec's `txSzCtx`, which picks the coefficients' CDFs: a
+/// rectangle's between the squares of its sides, rounded up.
+fn size_ctx(size: Size) -> usize {
+    let up = (size.width().max(size.height()).ilog2() - 2) as usize;
+    (size_sqr(size) + up).div_ceil(2)
+}
+
+/// The spec's `Dr_Intra_Derivative` by angle.
+#[rustfmt::skip]
+const DR_INTRA_DERIVATIVE: [i32; 90] = [
+    0, 0, 0, 1023, 0, 0, 547, 0, 0, 372, 0, 0, 0, 0, 273, 0, 0, 215, 0, 0,
+    178, 0, 0, 151, 0, 0, 132, 0, 0, 116, 0, 0, 102, 0, 0, 0, 90, 0, 0, 80,
+    0, 0, 71, 0, 0, 64, 0, 0, 57, 0, 0, 51, 0, 0, 45, 0, 0, 0, 40, 0, 0, 35,
+    0, 0, 31, 0, 0, 27, 0, 0, 23, 0, 0, 19, 0, 0, 15, 0, 0, 0, 0, 11, 0, 0,
+    7, 0, 0, 3, 0, 0,
+];
+
+fn derivative(angle: i32) -> i32 {
+    usize::try_from(angle)
+        .ok()
+        .and_then(|a| DR_INTRA_DERIVATIVE.get(a))
+        .copied()
+        .unwrap_or(1)
+}
+
+/// The spec's `Sm_Weights` by block side.
+#[rustfmt::skip]
+const SM_WEIGHTS: [u8; 124] = [
+    255, 149, 85, 64,
+    255, 197, 146, 105, 73, 50, 37, 32,
+    255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16,
+    255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83,
+    74, 66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8,
+    255, 248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156,
+    150, 144, 138, 133, 127, 121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73,
+    69, 65, 61, 57, 54, 50, 47, 44, 41, 38, 35, 32, 29, 27, 25, 22, 20, 18,
+    16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
+];
+
+fn sm_weights(n: usize) -> &'static [u8] {
+    let start = match n {
+        4 => 0,
+        8 => 4,
+        16 => 12,
+        32 => 28,
+        64 => 60,
+        _ => return &[],
+    };
+    SM_WEIGHTS.get(start..start + n).unwrap_or(&[])
+}
+
+// -------------------------------------------------------------- CDFs
+
+/// One cumulative distribution in the spec's form: `v[i]` is 32768
+/// times the probability of a symbol up to `i`, `v[n - 1]` 32768, and
+/// `v[n]` the adaptation count.
+#[derive(Clone, Copy)]
+struct Cdf {
+    n: usize,
+    v: [u16; 17],
+}
+
+impl Cdf {
+    fn new<const M: usize>(values: &[u16; M]) -> Cdf {
+        let mut v = [0u16; 17];
+        for (slot, value) in v.iter_mut().zip(values.iter()) {
+            *slot = *value;
+        }
+        if let Some(top) = v.get_mut(M) {
+            *top = 32768;
+        }
+        Cdf { n: M + 1, v }
+    }
+
+    fn at(&self, i: usize) -> u32 {
+        u32::from(self.v.get(i).copied().unwrap_or(32768))
+    }
+
+    /// The spec's symbol adaptation process.
+    fn adapt(&mut self, symbol: usize) {
+        let n = self.n;
+        let count = self.at(n);
+        let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + (n.ilog2()).min(2);
+        let mut tmp = 0u32;
+        for i in 0..n - 1 {
+            if i == symbol {
+                tmp = 32768;
+            }
+            let Some(slot) = self.v.get_mut(i) else {
+                break;
+            };
+            let value = u32::from(*slot);
+            *slot = if tmp < value {
+                (value - ((value - tmp) >> rate)) as u16
+            } else {
+                (value + ((tmp - value) >> rate)) as u16
+            };
+        }
+        if let Some(slot) = self.v.get_mut(n) {
+            *slot += u16::from(count < 32);
+        }
+    }
+
+    /// The bits a symbol costs, in 1/512 bit, from libaom's table.
+    fn cost(&self, symbol: usize) -> u32 {
+        let low = if symbol == 0 { 0 } else { self.at(symbol - 1) };
+        let p = self.at(symbol).saturating_sub(low).clamp(1, 32767);
+        let shift = 14 - p.ilog2();
+        let prob = (p << shift) >> 7;
+        PROB_COST
+            .get((prob as usize).saturating_sub(128))
+            .map_or(0, |c| u32::from(*c))
+            + shift * 512
+    }
+}
+
+/// `round(-log2(i / 256) * 512)` for `i` of 128 to 255.
+#[rustfmt::skip]
+const PROB_COST: [u16; 128] = [
+    512, 506, 501, 495, 489, 484, 478, 473, 467, 462, 456, 451, 446, 441, 435,
+    430, 425, 420, 415, 410, 405, 400, 395, 390, 385, 380, 375, 371, 366, 361,
+    356, 352, 347, 343, 338, 333, 329, 324, 320, 316, 311, 307, 302, 298, 294,
+    289, 285, 281, 277, 273, 268, 264, 260, 256, 252, 248, 244, 240, 236, 232,
+    228, 224, 220, 216, 212, 209, 205, 201, 197, 194, 190, 186, 182, 179, 175,
+    171, 168, 164, 161, 157, 153, 150, 146, 143, 139, 136, 132, 129, 125, 122,
+    119, 115, 112, 109, 105, 102, 99, 95, 92, 89, 86, 82, 79, 76, 73,
+    70, 66, 63, 60, 57, 54, 51, 48, 45, 42, 38, 35, 32, 29, 26,
+    23, 20, 18, 15, 12, 9, 6, 3,
+];
+
+/// Every CDF a tile adapts, from the defaults of the frame's quantizer
+/// band.
+#[derive(Clone)]
+struct Cdfs {
+    y_mode: [[Cdf; 5]; 5],
+    uv_mode: [Cdf; 13],
+    /// Where chroma from luma is not allowed.
+    uv_mode_no_cfl: [Cdf; 13],
+    cfl_sign: Cdf,
+    cfl_alpha: [Cdf; 6],
+    angle_delta: [Cdf; 8],
+    partition_8: [Cdf; 4],
+    partition: [[Cdf; 4]; 3],
+    skip: [Cdf; 3],
+    tx_type: [[Cdf; 13]; 4],
+    txb_skip: [[Cdf; 13]; 5],
+    eob_extra: [[[Cdf; 9]; 2]; 5],
+    dc_sign: [[Cdf; 3]; 2],
+    base_eob: [[[Cdf; 4]; 2]; 5],
+    base: [[[Cdf; 42]; 2]; 5],
+    br: [[[Cdf; 21]; 2]; 5],
+    /// By the transform's area, 16 to 1024 points, then plane type.
+    eob_pt: [[Cdf; 2]; 7],
+}
+
+fn table<const M: usize, const K: usize>(source: &[[u16; M]; K]) -> [Cdf; K] {
+    let mut out = [Cdf::new(&[0u16; M]); K];
+    for (o, s) in out.iter_mut().zip(source.iter()) {
+        *o = Cdf::new(s);
+    }
+    out
+}
+
+fn table2<const M: usize, const K: usize, const J: usize>(
+    source: &[[[u16; M]; K]; J],
+) -> [[Cdf; K]; J] {
+    let mut out = [[Cdf::new(&[0u16; M]); K]; J];
+    for (o, s) in out.iter_mut().zip(source.iter()) {
+        *o = table(s);
+    }
+    out
+}
+
+fn table3<const M: usize, const K: usize, const J: usize, const I: usize>(
+    source: &[[[[u16; M]; K]; J]; I],
+) -> [[[Cdf; K]; J]; I] {
+    let mut out = [[[Cdf::new(&[0u16; M]); K]; J]; I];
+    for (o, s) in out.iter_mut().zip(source.iter()) {
+        *o = table2(s);
+    }
+    out
+}
+
+impl Cdfs {
+    /// The defaults for a `base_q_idx` (spec `get_q_ctx`).
+    fn new(qindex: u8) -> Cdfs {
+        let band = match qindex {
+            0..=20 => 0,
+            21..=60 => 1,
+            61..=120 => 2,
+            _ => 3,
+        };
+        let uv: [Cdf; 13] = table(&cdf::UV_MODE_CFL);
+        Cdfs {
+            y_mode: table2(&cdf::KF_Y_MODE),
+            uv_mode: uv,
+            uv_mode_no_cfl: table(&cdf::UV_MODE),
+            cfl_sign: Cdf::new(&cdf::CFL_SIGN),
+            cfl_alpha: table(&cdf::CFL_ALPHA),
+            angle_delta: table(&cdf::ANGLE_DELTA),
+            partition_8: table(&cdf::PARTITION_8),
+            partition: table2(&cdf::PARTITION),
+            skip: table(&cdf::SKIP),
+            tx_type: table2(&cdf::INTRA_TX_SET2),
+            txb_skip: table2(cdf::TXB_SKIP.get(band).unwrap_or(&cdf::TXB_SKIP[0])),
+            eob_extra: table3(cdf::EOB_EXTRA.get(band).unwrap_or(&cdf::EOB_EXTRA[0])),
+            dc_sign: table2(cdf::DC_SIGN.get(band).unwrap_or(&cdf::DC_SIGN[0])),
+            base_eob: table3(
+                cdf::COEFF_BASE_EOB
+                    .get(band)
+                    .unwrap_or(&cdf::COEFF_BASE_EOB[0]),
+            ),
+            base: table3(cdf::COEFF_BASE.get(band).unwrap_or(&cdf::COEFF_BASE[0])),
+            br: table3(cdf::COEFF_BR.get(band).unwrap_or(&cdf::COEFF_BR[0])),
+            eob_pt: [
+                eob_class(cdf::EOB_PT_16.get(band).unwrap_or(&cdf::EOB_PT_16[0])),
+                eob_class(cdf::EOB_PT_32.get(band).unwrap_or(&cdf::EOB_PT_32[0])),
+                eob_class(cdf::EOB_PT_64.get(band).unwrap_or(&cdf::EOB_PT_64[0])),
+                eob_class(cdf::EOB_PT_128.get(band).unwrap_or(&cdf::EOB_PT_128[0])),
+                eob_class(cdf::EOB_PT_256.get(band).unwrap_or(&cdf::EOB_PT_256[0])),
+                eob_class(cdf::EOB_PT_512.get(band).unwrap_or(&cdf::EOB_PT_512[0])),
+                eob_class(cdf::EOB_PT_1024.get(band).unwrap_or(&cdf::EOB_PT_1024[0])),
+            ],
+        }
+    }
+}
+
+/// The 2D-class entry of an `eob_pt` table, per plane type.
+fn eob_class<const M: usize>(source: &[[[u16; M]; 2]; 2]) -> [Cdf; 2] {
+    [Cdf::new(&source[0][0]), Cdf::new(&source[1][0])]
+}
+
+// ------------------------------------------------------------- coder
+
+/// The spec's multi-symbol arithmetic coder, written from libaom's
+/// encoder: a 16-bit range, a carry-propagated byte queue and the
+/// terminating bit `exit_symbol` requires.
+struct Coder {
+    low: u64,
+    rng: u32,
+    cnt: i32,
+    precarry: Vec<u16>,
+}
+
+impl Coder {
+    fn new() -> Coder {
+        Coder {
+            low: 0,
+            rng: 0x8000,
+            cnt: -9,
+            precarry: Vec::new(),
+        }
+    }
+
+    /// One symbol of `nsyms` with the inverse cumulative bounds `fl`
+    /// (32768 for the first symbol) and `fh`.
+    fn encode(&mut self, fl: u32, fh: u32, s: usize, nsyms: usize) {
+        let mut l = self.low;
+        let r = self.rng;
+        let n = (nsyms - 1) as u32;
+        let s = s as u32;
+        let scaled = |f: u32| ((r >> 8) * (f >> 6)) >> 1;
+        let r = if fl < 32768 {
+            let u = scaled(fl) + 4 * (n + 1 - s);
+            let v = scaled(fh) + 4 * (n - s);
+            l += u64::from(r - u);
+            u - v
+        } else {
+            r - (scaled(fh) + 4 * (n - s))
+        };
+        self.normalize(l, r);
+    }
+
+    fn normalize(&mut self, mut low: u64, rng: u32) {
+        let d = 16 - (32 - rng.leading_zeros()) as i32;
+        let mut c = self.cnt;
+        let mut s = c + d;
+        if s >= 0 {
+            c += 16;
+            let mut m = (1u64 << c) - 1;
+            if s >= 8 {
+                self.precarry.push((low >> c) as u16);
+                low &= m;
+                c -= 8;
+                m >>= 8;
+            }
+            self.precarry.push((low >> c) as u16);
+            s = c + d - 24;
+            low &= m;
+        }
+        self.low = low << d;
+        self.rng = rng << d;
+        self.cnt = s;
+    }
+
+    /// One symbol under an adapting CDF.
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize) {
+        let fl = if s == 0 { 32768 } else { 32768 - cdf.at(s - 1) };
+        let fh = 32768 - cdf.at(s);
+        self.encode(fl, fh, s, cdf.n);
+        cdf.adapt(s);
+    }
+
+    /// One equiprobable bit (spec `L(1)`).
+    fn bit(&mut self, bit: bool) {
+        if bit {
+            self.encode(16384, 0, 1, 2);
+        } else {
+            self.encode(32768, 16384, 0, 2);
+        }
+    }
+
+    /// The bytes, with the terminating one bit and zero padding.
+    fn finish(mut self) -> Vec<u8> {
+        let mut c = self.cnt;
+        let m = 0x3FFFu64;
+        let mut e = ((self.low + m) & !m) | (m + 1);
+        let mut s = 10 + c;
+        if s > 0 {
+            let mut n = (1u64 << (c + 16)) - 1;
+            loop {
+                self.precarry.push((e >> (c + 16)) as u16);
+                e &= n;
+                s -= 8;
+                c -= 8;
+                n >>= 8;
+                if s <= 0 {
+                    break;
+                }
+            }
+        }
+        let mut out = vec![0u8; self.precarry.len()];
+        let mut carry = 0u32;
+        for (o, p) in out.iter_mut().zip(self.precarry.iter()).rev() {
+            let v = u32::from(*p) + carry;
+            *o = v as u8;
+            carry = v >> 8;
+        }
+        out
+    }
+}
+
+/// Where symbols go: the coder, or a counter that prices them.
+trait Sink {
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize);
+    fn bit(&mut self, bit: bool);
+}
+
+impl Sink for Coder {
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize) {
+        Coder::symbol(self, cdf, s);
+    }
+
+    fn bit(&mut self, bit: bool) {
+        Coder::bit(self, bit);
+    }
+}
+
+/// The CDFs adapted to what passes, nothing written: a superblock
+/// row's search keeping its probabilities live.
+struct Adapter;
+
+impl Sink for Adapter {
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize) {
+        cdf.adapt(s);
+    }
+
+    fn bit(&mut self, _bit: bool) {}
+}
+
+/// The rate of what passes, in 1/512 bit, the CDFs left as they are.
+struct Counter(u64);
+
+impl Sink for Counter {
+    fn symbol(&mut self, cdf: &mut Cdf, s: usize) {
+        self.0 += u64::from(cdf.cost(s));
+    }
+
+    fn bit(&mut self, _bit: bool) {
+        self.0 += 512;
+    }
+}
+
+// --------------------------------------------------------- bit writer
+
+/// Header bits, most significant first (spec `f(n)`).
+struct Bits {
+    bytes: Vec<u8>,
+    used: u32,
+}
+
+impl Bits {
+    fn new() -> Bits {
+        Bits {
+            bytes: Vec::new(),
+            used: 0,
+        }
+    }
+
+    fn put(&mut self, n: u32, value: u32) {
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            if self.used == 0 {
+                self.bytes.push(0);
+            }
+            if let Some(last) = self.bytes.last_mut() {
+                *last |= bit << (7 - self.used);
+            }
+            self.used = (self.used + 1) % 8;
+        }
+    }
+
+    fn flag(&mut self, on: bool) {
+        self.put(1, u32::from(on));
+    }
+
+    /// `byte_alignment()`: zero bits to the boundary.
+    fn align(&mut self) {
+        while self.used != 0 {
+            self.put(1, 0);
+        }
+    }
+
+    /// `trailing_bits()`: a one then zeros to the boundary.
+    fn trailing(&mut self) {
+        self.put(1, 1);
+        self.align();
+    }
+}
+
+fn leb128(out: &mut Vec<u8>, mut value: usize) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// One OBU with a size field: the header byte, `leb128` size, payload.
+fn obu(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    out.push((kind << 3) | 2);
+    leb128(out, payload.len());
+    out.extend_from_slice(payload);
+}
+
+const OBU_SEQUENCE_HEADER: u8 = 1;
+const OBU_FRAME: u8 = 6;
+
+// ---------------------------------------------------------- geometry
+
+/// The frame's grid and its tiling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Geometry {
+    width: usize,
+    height: usize,
+    /// Mode-info columns and rows: the frame rounded up to 8 pixels.
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_cols: usize,
+    sb_rows: usize,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    /// Tile edges in superblocks, the last entry the frame's extent.
+    tile_col_starts: Vec<usize>,
+    tile_row_starts: Vec<usize>,
+}
+
+/// A level's limits (spec Annex A.3): its index, the picture's pixels,
+/// width and height, and the tiles and tile columns.
+struct Level {
+    idx: u32,
+    max_pixels: usize,
+    max_width: usize,
+    max_height: usize,
+    max_tiles: usize,
+    max_cols: usize,
+}
+
+impl Level {
+    fn admits(&self, width: usize, height: usize) -> bool {
+        width * height <= self.max_pixels && width <= self.max_width && height <= self.max_height
+    }
+}
+
+const fn level(
+    idx: u32,
+    max_pixels: usize,
+    max_width: usize,
+    max_height: usize,
+    max_tiles: usize,
+    max_cols: usize,
+) -> Level {
+    Level {
+        idx,
+        max_pixels,
+        max_width,
+        max_height,
+        max_tiles,
+        max_cols,
+    }
+}
+
+/// Levels 2.0 to 6.0, the ones a still picture is measured by.
+const LEVELS: [Level; 7] = [
+    level(0, 147456, 2048, 1152, 8, 4),
+    level(1, 278784, 2816, 1584, 8, 4),
+    level(4, 665856, 4352, 2448, 16, 6),
+    level(5, 1065024, 5504, 3096, 16, 6),
+    level(8, 2359296, 6144, 3456, 32, 8),
+    level(12, 8912896, 8192, 4352, 64, 8),
+    level(16, 35651584, 16384, 8704, 128, 16),
+];
+/// The `seq_level_idx` past every level's limits.
+const UNCONSTRAINED: u32 = 31;
+
+/// `tile_log2(blk, target)`: the least `k` with `blk << k >= target`.
+fn tile_log2(blk: usize, target: usize) -> u32 {
+    let mut k = 0;
+    while (blk << k) < target {
+        k += 1;
+    }
+    k
+}
+
+impl Geometry {
+    /// The frame's grid, tiled uniformly by the fewest tiles the spec
+    /// allows (`tile_info`, Annex A.3): the columns a tile's width
+    /// needs (the last, the remainder, may be narrower), then the rows
+    /// its area needs. The grid is the frame's alone, so the bytes are
+    /// the same on any host; threads spread over a tile's superblock
+    /// rows.
+    pub fn new(width: usize, height: usize) -> Result<Geometry, Error> {
+        Self::tiled(width, height, 0, 0)
+    }
+
+    /// `new`, with at least `cols_log2` tile columns and `rows_log2`
+    /// tile rows where the limits allow them: the way to exercise
+    /// tiles on a small frame.
+    pub fn tiled(
+        width: usize,
+        height: usize,
+        cols_log2: u32,
+        rows_log2: u32,
+    ) -> Result<Geometry, Error> {
+        if width == 0 || height == 0 || width > MAX_AXIS || height > MAX_AXIS {
+            return Err(Error::Axis { width, height });
+        }
+        let mi_cols = 2 * width.div_ceil(8);
+        let mi_rows = 2 * height.div_ceil(8);
+        let sb_cols = mi_cols.div_ceil(SB_MI);
+        let sb_rows = mi_rows.div_ceil(SB_MI);
+        let sb_shift = 4;
+        let max_tile_width_sb = MAX_TILE_WIDTH >> (sb_shift + 2);
+        let max_tile_area_sb = MAX_TILE_AREA >> (2 * (sb_shift + 2));
+        let min_log2_cols = tile_log2(max_tile_width_sb, sb_cols);
+        let max_log2_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+        let max_log2_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
+        let min_log2_tiles = min_log2_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
+        let tile_cols_log2 = min_log2_cols.max(cols_log2.min(max_log2_cols));
+        let tile_width_sb = sb_cols.div_ceil(1 << tile_cols_log2);
+        let mut tile_col_starts: Vec<usize> = (0..sb_cols).step_by(tile_width_sb).collect();
+        tile_col_starts.push(sb_cols);
+        let min_log2_rows = min_log2_tiles.saturating_sub(tile_cols_log2);
+        let mut tile_rows_log2 = min_log2_rows.max(rows_log2).min(max_log2_rows);
+        // The count was chosen for the frame's area; a column the level
+        // capped wide and rounded up to whole superblocks can pass the
+        // tile area, so the rows split again (past level 6 alone).
+        while tile_rows_log2 < max_log2_rows
+            && tile_width_sb * sb_rows.div_ceil(1 << tile_rows_log2) > max_tile_area_sb
+        {
+            tile_rows_log2 += 1;
+        }
+        let tile_height_sb = sb_rows.div_ceil(1 << tile_rows_log2);
+        let mut tile_row_starts: Vec<usize> = (0..sb_rows).step_by(tile_height_sb).collect();
+        tile_row_starts.push(sb_rows);
+        Ok(Geometry {
+            width,
+            height,
+            mi_cols,
+            mi_rows,
+            sb_cols,
+            sb_rows,
+            tile_cols_log2,
+            tile_rows_log2,
+            tile_col_starts,
+            tile_row_starts,
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// The mode-info grid: the frame rounded up to 8 pixels, in 4s.
+    pub fn mi_grid(&self) -> (usize, usize) {
+        (self.mi_cols, self.mi_rows)
+    }
+
+    /// The superblock grid.
+    pub fn sb_grid(&self) -> (usize, usize) {
+        (self.sb_cols, self.sb_rows)
+    }
+
+    pub fn tile_cols(&self) -> usize {
+        self.tile_col_starts.len() - 1
+    }
+
+    pub fn tile_rows(&self) -> usize {
+        self.tile_row_starts.len() - 1
+    }
+
+    /// Where each tile column starts, in superblocks, then the frame's
+    /// extent.
+    pub fn tile_col_starts(&self) -> &[usize] {
+        &self.tile_col_starts
+    }
+
+    /// Where each tile row starts, in superblocks, then the frame's
+    /// extent.
+    pub fn tile_row_starts(&self) -> &[usize] {
+        &self.tile_row_starts
+    }
+
+    /// The tile row an SB row begins, if it begins one.
+    fn tile_row_starting(&self, sb_row: usize) -> Option<usize> {
+        self.tile_row_starts
+            .iter()
+            .take(self.tile_rows())
+            .position(|&start| start == sb_row)
+    }
+
+    /// The least `seq_level_idx` whose picture size and tile limits
+    /// admit the frame and its grid (spec Annex A.3), or 31
+    /// (unconstrained) past level 6.
+    pub fn level(&self) -> u32 {
+        let tiles = self.tile_cols() * self.tile_rows();
+        LEVELS
+            .iter()
+            .find(|level| {
+                level.admits(self.width, self.height)
+                    && tiles <= level.max_tiles
+                    && self.tile_cols() <= level.max_cols
+            })
+            .map_or(UNCONSTRAINED, |level| level.idx)
+    }
+
+    /// The bits of `tile_info()` after the uniform spacing flag.
+    fn write_tile_info(&self, bits: &mut Bits) {
+        let sb_cols = self.sb_cols;
+        let sb_rows = self.sb_rows;
+        let min_log2_cols = tile_log2(MAX_TILE_WIDTH >> 6, sb_cols);
+        let max_log2_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+        let max_log2_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
+        bits.flag(true);
+        let mut log2 = min_log2_cols;
+        while log2 < max_log2_cols {
+            let more = log2 < self.tile_cols_log2;
+            bits.flag(more);
+            if !more {
+                break;
+            }
+            log2 += 1;
+        }
+        let min_log2_tiles = min_log2_cols.max(tile_log2(MAX_TILE_AREA >> 12, sb_rows * sb_cols));
+        let mut log2 = min_log2_tiles.saturating_sub(self.tile_cols_log2);
+        while log2 < max_log2_rows {
+            let more = log2 < self.tile_rows_log2;
+            bits.flag(more);
+            if !more {
+                break;
+            }
+            log2 += 1;
+        }
+        if self.tile_cols_log2 > 0 || self.tile_rows_log2 > 0 {
+            bits.put(self.tile_rows_log2 + self.tile_cols_log2, 0);
+            bits.put(2, 3);
+        }
+    }
+}
+
+/// The `base_q_idx` a quality asks for: 100 the finest step AV1 codes
+/// short of lossless, 1 the coarsest.
+pub fn qindex(quality: u8) -> u8 {
+    let quality = u32::from(quality.clamp(1, 100));
+    (255 - ((quality - 1) * 254 + 49) / 99) as u8
+}
+
+// ------------------------------------------------------------ headers
+
+/// `seq_profile`: main, 8-bit 4:2:0.
+const PROFILE: u32 = 0;
+/// The colour the stream declares: BT.709 primaries, the sRGB transfer
+/// and the BT.601 matrix `code_band` applies, full range.
+pub const COLOUR_PRIMARIES: u8 = 1;
+pub const TRANSFER_CHARACTERISTICS: u8 = 13;
+pub const MATRIX_COEFFICIENTS: u8 = 6;
+pub const FULL_RANGE: bool = true;
+
+/// The `AV1CodecConfigurationRecord` bytes the AVIF container repeats
+/// from the sequence header: marker and version, the profile with the
+/// level, the tier, depth and subsampling, and no presentation delay.
+/// The configuration OBUs are left out; the item's data carries the
+/// sequence header.
+pub fn av1c(geometry: &Geometry) -> [u8; 4] {
+    [
+        0x81,
+        ((PROFILE << 5) | (geometry.level() & 0x1f)) as u8,
+        // seq_tier 0, high_bitdepth 0, twelve_bit 0, mono_chrome 0,
+        // subsampling 1 and 1, chroma_sample_position 0.
+        0b0000_1100,
+        0,
+    ]
+}
+
+/// The sequence header OBU's payload for a frame.
+fn sequence_header(geometry: &Geometry) -> Vec<u8> {
+    let mut b = Bits::new();
+    b.put(3, PROFILE);
+    b.flag(true);
+    b.flag(true);
+    b.put(5, geometry.level());
+    b.put(4, 15);
+    b.put(4, 15);
+    b.put(16, (geometry.width - 1) as u32);
+    b.put(16, (geometry.height - 1) as u32);
+    // enable_superblock_128x128 and _filter_intra off,
+    // enable_intra_edge_filter on, enable_superres off, enable_cdef on,
+    // enable_restoration off.
+    b.flag(false);
+    b.flag(false);
+    b.flag(true);
+    b.flag(false);
+    b.flag(true);
+    b.flag(false);
+    // color_config: 8-bit, colour, the declared colour, chroma position
+    // unknown, one chroma delta q.
+    b.flag(false);
+    b.flag(false);
+    b.flag(true);
+    b.put(8, u32::from(COLOUR_PRIMARIES));
+    b.put(8, u32::from(TRANSFER_CHARACTERISTICS));
+    b.put(8, u32::from(MATRIX_COEFFICIENTS));
+    b.flag(FULL_RANGE);
+    b.put(2, 0);
+    b.flag(false);
+    b.flag(false);
+    b.trailing();
+    b.bytes
+}
+
+/// The frame OBU's header bits, to the byte alignment before the tile
+/// group.
+fn frame_header(
+    geometry: &Geometry,
+    qindex: u8,
+    levels: deblock::Levels,
+    strengths: cdef::Strengths,
+) -> Bits {
+    let mut b = Bits::new();
+    b.flag(false);
+    b.flag(false);
+    b.flag(false);
+    geometry.write_tile_info(&mut b);
+    b.put(8, u32::from(qindex));
+    b.flag(false);
+    b.flag(false);
+    b.flag(false);
+    b.flag(false);
+    b.flag(false);
+    b.flag(false);
+    // loop_filter_params: luma's two levels, the chroma ones when luma
+    // filters at all, no sharpness and no deltas.
+    b.put(6, u32::from(levels.luma[0]));
+    b.put(6, u32::from(levels.luma[1]));
+    if levels.luma != [0, 0] {
+        b.put(6, u32::from(levels.u));
+        b.put(6, u32::from(levels.v));
+    }
+    b.put(3, 0);
+    b.flag(false);
+    // cdef_params: one strength set for the frame (cdef_bits 0).
+    b.put(2, u32::from(strengths.damping.saturating_sub(3)));
+    b.put(2, 0);
+    b.put(4, u32::from(strengths.y_pri));
+    b.put(2, u32::from(strengths.y_sec));
+    b.put(4, u32::from(strengths.uv_pri));
+    b.put(2, u32::from(strengths.uv_sec));
+    b.flag(false);
+    b.flag(true);
+    b.align();
+    b
+}
+
+/// The deblocking level of a frame from its quantizer, every plane and
+/// direction alike: libaom's for an 8-bit key frame (`LPF_PICK_FROM_Q`,
+/// a linear fit of the AC step to the levels its search chose) half
+/// again, which measured better on a photo than the fit at every rate
+/// and as well as double it but for RGB fidelity.
+fn filter_levels(qindex: u8) -> deblock::Levels {
+    let q = i64::from(transform::ac_q(qindex));
+    let fit = (q * 17563 - 421574 + (1 << 17)) >> 18;
+    let level = (fit * 3 / 2).clamp(0, 63) as u8;
+    deblock::Levels {
+        luma: [level, level],
+        u: level,
+        v: level,
+    }
+}
+
+/// The CDEF strengths of a key frame from its quantizer: libaom's
+/// (`av1_pick_cdef_from_qp` for an intra frame, quadratic fits of the
+/// AC step to what its search chose) in fixed point, the damping
+/// rising a step every 64 of `qindex`, chroma's at half the fit, which
+/// measured better on a photo than the fit or none.
+fn cdef_strengths(qindex: u8) -> cdef::Strengths {
+    let q = i64::from(transform::ac_q(qindex));
+    // Each fit's coefficients in units of 2^-30, rounded to nearest.
+    let fit = |[c2, c1, c0]: [i64; 3], max: i64| -> u8 {
+        let v = (c2 * q * q + c1 * q + c0 + (1 << 29)) >> 30;
+        v.clamp(0, max) as u8
+    };
+    cdef::Strengths {
+        damping: 3 + (qindex >> 6),
+        y_pri: fit([3622, 8_665_734, 20_147_047], 15),
+        y_sec: fit([3132, 2_984_855, 8_526_047], 3),
+        uv_pri: fit([-7022, 6_921_557, -4_017_878], 15),
+        uv_sec: fit([1753, 190_698, 1_224_560], 3),
+    }
+}
+
+// ------------------------------------------------------------ planes
+
+/// One plane's band: `stride` wide, the row above the band first.
+struct Band {
+    stride: usize,
+    rows: usize,
+    data: Vec<u8>,
+}
+
+impl Band {
+    fn new(stride: usize, rows: usize) -> Band {
+        Band {
+            stride,
+            rows,
+            data: vec![0; stride * rows],
+        }
+    }
+
+    fn at(&self, x: usize, y: usize) -> u8 {
+        self.data.get(y * self.stride + x).copied().unwrap_or(128)
+    }
+
+    fn row(&self, y: usize) -> &[u8] {
+        self.data
+            .get(y * self.stride..(y + 1) * self.stride)
+            .unwrap_or(&[])
+    }
+
+    fn row_mut(&mut self, y: usize) -> &mut [u8] {
+        let stride = self.stride;
+        self.data
+            .get_mut(y * stride..(y + 1) * stride)
+            .unwrap_or(&mut [])
+    }
+}
+
+// --------------------------------------------------------- contexts
+
+/// The above and left context arrays of one tile: level and DC sign
+/// contexts per plane in 4-pixel units, the skip flags, luma and chroma
+/// modes and block sizes of the mode-info neighbours.
+#[derive(Clone)]
+struct Contexts {
+    above_level: [Vec<u8>; 3],
+    above_dc: [Vec<u8>; 3],
+    left_level: [Vec<u8>; 3],
+    left_dc: [Vec<u8>; 3],
+    above_skip: Vec<u8>,
+    left_skip: Vec<u8>,
+    above_mode: Vec<u8>,
+    left_mode: Vec<u8>,
+    /// The chroma modes of the blocks with chroma, where they are.
+    above_uv_mode: Vec<u8>,
+    left_uv_mode: Vec<u8>,
+    above_width_log2: Vec<u8>,
+    left_height_log2: Vec<u8>,
+    /// Per plane, the superblock's decoded 4x4 units with a border of
+    /// one: `(SB_MI + 3)` square, offset by one.
+    decoded: [[bool; DECODED * DECODED]; 3],
+}
+
+const DECODED: usize = SB_MI + 3;
+
+impl Contexts {
+    fn new(mi_width: usize) -> Contexts {
+        let cols = || vec![0u8; mi_width];
+        let rows = || vec![0u8; SB_MI];
+        Contexts {
+            above_level: [cols(), cols(), cols()],
+            above_dc: [cols(), cols(), cols()],
+            left_level: [rows(), rows(), rows()],
+            left_dc: [rows(), rows(), rows()],
+            above_skip: cols(),
+            left_skip: rows(),
+            above_mode: cols(),
+            left_mode: rows(),
+            above_uv_mode: cols(),
+            left_uv_mode: rows(),
+            above_width_log2: cols(),
+            left_height_log2: rows(),
+            decoded: [[false; DECODED * DECODED]; 3],
+        }
+    }
+
+    /// `clear_left_context()` at a superblock row's start.
+    fn clear_left(&mut self) {
+        for plane in 0..3 {
+            if let Some(v) = self.left_level.get_mut(plane) {
+                v.fill(0);
+            }
+            if let Some(v) = self.left_dc.get_mut(plane) {
+                v.fill(0);
+            }
+        }
+    }
+
+    /// `clear_block_decoded_flags()` for a superblock with `mi_width_left`
+    /// and `mi_height_left` mode-info units of the tile from its corner:
+    /// the row above and the column left count as decoded that far, the
+    /// corner too, the unit below the superblock's left column never.
+    fn clear_decoded(&mut self, mi_width_left: usize, mi_height_left: usize) {
+        for (plane, decoded) in self.decoded.iter_mut().enumerate() {
+            let sub = usize::from(plane > 0);
+            let sb_width4 = mi_width_left >> sub;
+            let sb_height4 = mi_height_left >> sub;
+            let size4 = SB_MI >> sub;
+            for y in 0..DECODED {
+                for x in 0..DECODED {
+                    let on = if y == 0 {
+                        x <= sb_width4
+                    } else if x == 0 {
+                        y <= sb_height4
+                    } else {
+                        false
+                    };
+                    if let Some(slot) = decoded.get_mut(y * DECODED + x) {
+                        *slot = on;
+                    }
+                }
+            }
+            if let Some(slot) = decoded.get_mut((size4 + 1) * DECODED) {
+                *slot = false;
+            }
+        }
+    }
+
+    /// The above context columns over a superblock column: what the
+    /// row below reads there.
+    fn above_of(&mut self, sb: usize) -> [&mut [u8]; 10] {
+        let Contexts {
+            above_level,
+            above_dc,
+            above_skip,
+            above_mode,
+            above_uv_mode,
+            above_width_log2,
+            ..
+        } = self;
+        let mut out: [&mut [u8]; 10] = Default::default();
+        let mut slots = out.iter_mut();
+        let luma = [above_skip, above_mode, above_uv_mode, above_width_log2];
+        for (plane, above) in above_level
+            .iter_mut()
+            .chain(above_dc.iter_mut())
+            .enumerate()
+            .map(|(k, above)| (k % 3, above))
+            .chain(luma.into_iter().map(|above| (0, above)))
+        {
+            let n = SB_MI >> usize::from(plane > 0);
+            if let Some(slot) = slots.next() {
+                *slot = above.get_mut(sb * n..(sb + 1) * n).unwrap_or(&mut []);
+            }
+        }
+        out
+    }
+
+    /// A plane's level and DC contexts: above level, above DC, left
+    /// level, left DC.
+    fn plane(&self, plane: usize) -> (&[u8], &[u8], &[u8], &[u8]) {
+        fn get(v: &[Vec<u8>; 3], plane: usize) -> &[u8] {
+            v.get(plane).map_or(&[], Vec::as_slice)
+        }
+        (
+            get(&self.above_level, plane),
+            get(&self.above_dc, plane),
+            get(&self.left_level, plane),
+            get(&self.left_dc, plane),
+        )
+    }
+
+    fn plane_mut(&mut self, plane: usize) -> (&mut [u8], &mut [u8], &mut [u8], &mut [u8]) {
+        fn get(v: &mut [Vec<u8>; 3], plane: usize) -> &mut [u8] {
+            v.get_mut(plane).map_or(&mut [], Vec::as_mut_slice)
+        }
+        let Contexts {
+            above_level,
+            above_dc,
+            left_level,
+            left_dc,
+            ..
+        } = self;
+        (
+            get(above_level, plane),
+            get(above_dc, plane),
+            get(left_level, plane),
+            get(left_dc, plane),
+        )
+    }
+
+    fn is_decoded(&self, plane: usize, x4: isize, y4: isize) -> bool {
+        let (x, y) = (x4 + 1, y4 + 1);
+        if x < 0 || y < 0 || x >= DECODED as isize || y >= DECODED as isize {
+            return false;
+        }
+        self.decoded
+            .get(plane)
+            .and_then(|d| d.get(y as usize * DECODED + x as usize))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn mark_decoded(&mut self, plane: usize, x4: usize, y4: usize, w4: usize, h4: usize) {
+        if let Some(d) = self.decoded.get_mut(plane) {
+            for y in y4..y4 + h4 {
+                for x in x4..x4 + w4 {
+                    if let Some(slot) = d.get_mut((y + 1) * DECODED + x + 1) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------- tile
+
+/// A block's place: its mode-info position in the tile and the log2 of
+/// its luma width and height (2 to 6), which a partition's square node
+/// has equal.
+#[derive(Clone, Copy)]
+struct At {
+    mi_row: usize,
+    mi_col: usize,
+    w_log2: u32,
+    h_log2: u32,
+}
+
+impl At {
+    fn square(mi_row: usize, mi_col: usize, log2: u32) -> At {
+        At {
+            mi_row,
+            mi_col,
+            w_log2: log2,
+            h_log2: log2,
+        }
+    }
+
+    fn width(self) -> usize {
+        1 << self.w_log2
+    }
+
+    fn height(self) -> usize {
+        1 << self.h_log2
+    }
+
+    /// Mode-info units across and down.
+    fn w_units(self) -> usize {
+        self.width() / MI
+    }
+
+    fn h_units(self) -> usize {
+        self.height() / MI
+    }
+
+    /// A plane's width and height, chroma's half luma's.
+    fn plane_dims(self, plane: usize) -> (usize, usize) {
+        let sub = usize::from(plane > 0);
+        (self.width() >> sub, self.height() >> sub)
+    }
+
+    /// The block whose chroma this one codes, if any (spec `HasChroma`,
+    /// 4:2:0): a block 4 luma pixels on a side carries none unless it
+    /// is the last along that side of its 8x8, and then the 8x8's.
+    fn chroma(self) -> Option<At> {
+        let (odd_row, odd_col) = (self.mi_row % 2 == 1, self.mi_col % 2 == 1);
+        let (thin_rows, thin_cols) = (self.h_log2 == 2, self.w_log2 == 2);
+        if (thin_rows && !odd_row) || (thin_cols && !odd_col) {
+            return None;
+        }
+        Some(At {
+            mi_row: self.mi_row - usize::from(thin_rows),
+            mi_col: self.mi_col - usize::from(thin_cols),
+            w_log2: self.w_log2.max(3),
+            h_log2: self.h_log2.max(3),
+        })
+    }
+
+    /// Whether a side is 4 pixels (spec `MiSize < BLOCK_8X8`).
+    fn is_sub8x8(self) -> bool {
+        self.w_log2 < 3 || self.h_log2 < 3
+    }
+
+    /// Whether the block's directional modes code an angle delta.
+    fn has_angle_deltas(self) -> bool {
+        !self.is_sub8x8()
+    }
+
+    /// The spec's `CflAllowed`: no side past 32.
+    fn cfl_allowed(self) -> bool {
+        self.w_log2.max(self.h_log2) <= 5
+    }
+
+    /// The position's row within its superblock, in mode-info units.
+    fn sb_row(self) -> usize {
+        self.mi_row % SB_MI
+    }
+
+    /// A quadrant of a split.
+    fn quarter(self, dr: usize, dc: usize) -> At {
+        At::square(self.mi_row + dr, self.mi_col + dc, self.w_log2 - 1)
+    }
+
+    /// The two blocks of a horizontal partition, top then bottom, or a
+    /// vertical one, left then right.
+    fn halves(self, vertical: bool) -> [At; 2] {
+        let (dr, dc) = if vertical {
+            (0, self.w_units() / 2)
+        } else {
+            (self.h_units() / 2, 0)
+        };
+        let (w_log2, h_log2) = if vertical {
+            (self.w_log2 - 1, self.h_log2)
+        } else {
+            (self.w_log2, self.h_log2 - 1)
+        };
+        [(0, 0), (dr, dc)].map(|(dr, dc)| At {
+            mi_row: self.mi_row + dr,
+            mi_col: self.mi_col + dc,
+            w_log2,
+            h_log2,
+        })
+    }
+}
+
+/// One plane of a block, coded under a mode: the rate-distortion cost,
+/// the transform type, the levels, the end of block and the
+/// reconstructed pixels.
+struct Coded {
+    cost: u64,
+    tx: TxType,
+    levels: Vec<i32>,
+    eob: usize,
+    recon: Vec<u8>,
+}
+
+impl Default for Coded {
+    fn default() -> Coded {
+        Coded {
+            cost: u64::MAX,
+            tx: TxType::DctDct,
+            levels: Vec::new(),
+            eob: 0,
+            recon: Vec::new(),
+        }
+    }
+}
+
+/// The buffers a tile's trials reuse from block to block: every
+/// screened mode's prediction, `MODES` in order end to end, the
+/// transform's working blocks, and per plane the trial's coding and the
+/// best so far, swapped when the trial wins. They only grow, so a block
+/// after a smaller one clears nothing.
+#[derive(Default)]
+struct Scratch {
+    preds: Vec<u8>,
+    work: Work,
+    trial: [Coded; 3],
+    best: [Coded; 3],
+}
+
+/// A transform's residual, coefficients and dequantized levels, each
+/// written whole before it is read, and the trellis's magnitudes; empty
+/// until the first trial, so the placeholder `best_leaf` leaves in the
+/// tile allocates nothing.
+#[derive(Default)]
+struct Work {
+    residual: Vec<i32>,
+    coeffs: Vec<i32>,
+    dequant: Vec<i32>,
+    mags: Magnitudes,
+    /// Chroma from luma's luma, less its average.
+    ac: Vec<i32>,
+}
+
+/// One plane's quantized levels in the transform's row-major layout,
+/// and their end of block in scan order (0 for none).
+#[derive(Clone, Copy)]
+struct Levels<'a> {
+    levels: &'a [i32],
+    eob: usize,
+}
+
+/// One transform's level CDFs, looked up once for its size and plane
+/// type.
+struct LevelCdfs<'a> {
+    base: &'a [Cdf; 42],
+    base_eob: &'a [Cdf; 4],
+    br: &'a [Cdf; 21],
+}
+
+impl LevelCdfs<'_> {
+    /// The rate of a zero short of the end of block in its base
+    /// context, in 1/512 bit.
+    fn zero_rate(&self, base: usize) -> u64 {
+        self.base.get(base).map_or(0, |cdf| u64::from(cdf.cost(0)))
+    }
+
+    /// The rate of a nonzero level, less its sign, in 1/512 bit: its base
+    /// symbol (the end of block's when it is the last), its range symbols
+    /// and its Golomb remainder, as `coefficient_symbols` codes them.
+    fn rate(&self, ctx: LevelCtx, level: u32) -> u64 {
+        let base = level.min(3) as usize;
+        let mut rate = match ctx.eob {
+            Some(eob) => self
+                .base_eob
+                .get(eob)
+                .map_or(0, |cdf| cdf.cost(base.saturating_sub(1))),
+            None => self.base.get(ctx.base).map_or(0, |cdf| cdf.cost(base)),
+        };
+        if level > 2 {
+            let br = self.br.get(ctx.br);
+            let base_range = (level - 3) as usize;
+            for idx in (0..12).step_by(3) {
+                let k = base_range.saturating_sub(idx).min(3);
+                rate += br.map_or(0, |cdf| cdf.cost(k));
+                if k < 3 {
+                    break;
+                }
+            }
+        }
+        if level > 14 {
+            let length = 32 - (level - 14).leading_zeros();
+            rate += 512 * (2 * length - 1);
+        }
+        u64::from(rate)
+    }
+}
+
+/// A level's contexts: its base symbol's, the end of block's in its
+/// place when it is the last, and its range symbols'.
+#[derive(Clone, Copy)]
+struct LevelCtx {
+    eob: Option<usize>,
+    base: usize,
+    br: usize,
+}
+
+/// A coded block: what the symbols say and the levels they carry.
+struct Leaf {
+    at: At,
+    skip: bool,
+    y_mode: u8,
+    uv_mode: u8,
+    /// The directional modes' angle deltas, luma and chroma, in steps of
+    /// three degrees.
+    deltas: [i8; 2],
+    /// The chroma-from-luma alphas of U and V in eighths, when `uv_mode`
+    /// is `UV_CFL_PRED`.
+    cfl: [i8; 2],
+    tx_type: TxType,
+    /// Per plane: quantized levels in the transform's row-major layout
+    /// and the end of block in scan order (0 for none).
+    levels: [Vec<i32>; 3],
+    eob: [usize; 3],
+}
+
+/// The best trial of a node so far: its cost, nodes and the state it
+/// left.
+struct Best {
+    cost: u64,
+    nodes: Vec<Node>,
+    state: Option<Saved>,
+}
+
+/// A square node's partition (spec `PARTITION_NONE` to
+/// `PARTITION_SPLIT`, its symbol's order).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Partition {
+    None,
+    Horz,
+    Vert,
+    Split,
+}
+
+/// A superblock's decided tree in coding order: a node partitioned
+/// into more than one block followed by its blocks' nodes, or a node
+/// coded whole.
+enum Node {
+    Parts(Partition),
+    Block(Leaf),
+}
+
+/// The state saved before a trial: the context columns and rows a block
+/// touches, the decoded flags, and optionally its reconstruction.
+struct Saved {
+    at: At,
+    /// The context segments, in `Contexts::segments` order, end to end.
+    segments: Vec<u8>,
+    decoded: [[bool; DECODED * DECODED]; 3],
+    /// The three planes' pixels, end to end.
+    pixels: Option<Vec<u8>>,
+}
+
+/// The context slices a block writes: the level and DC columns and rows
+/// of the three planes, then the skip, luma and chroma mode and size
+/// columns and rows.
+const SEGMENTS: usize = 20;
+
+impl Contexts {
+    /// Every context slice a block at the position writes.
+    fn segments<'a>(&'a mut self, at: At) -> [&'a mut [u8]; SEGMENTS] {
+        let (w4, h4) = (at.w_units(), at.h_units());
+        let sb_row = at.sb_row();
+        let mi_col = at.mi_col;
+        let Contexts {
+            above_level,
+            above_dc,
+            left_level,
+            left_dc,
+            above_skip,
+            left_skip,
+            above_mode,
+            left_mode,
+            above_uv_mode,
+            left_uv_mode,
+            above_width_log2,
+            left_height_log2,
+            ..
+        } = self;
+        let mut out: [&'a mut [u8]; SEGMENTS] = Default::default();
+        let mut slots = out.iter_mut();
+        let mut push = |segment: &'a mut [u8]| {
+            if let Some(slot) = slots.next() {
+                *slot = segment;
+            }
+        };
+        for (plane, (above, left)) in above_level
+            .iter_mut()
+            .chain(above_dc.iter_mut())
+            .zip(left_level.iter_mut().chain(left_dc.iter_mut()))
+            .enumerate()
+        {
+            let sub = usize::from(plane % 3 > 0);
+            let (x4, y4) = (mi_col >> sub, sb_row >> sub);
+            push(above.get_mut(x4..x4 + (w4 >> sub)).unwrap_or(&mut []));
+            push(left.get_mut(y4..y4 + (h4 >> sub)).unwrap_or(&mut []));
+        }
+        for above in [above_skip, above_mode, above_uv_mode, above_width_log2] {
+            push(above.get_mut(mi_col..mi_col + w4).unwrap_or(&mut []));
+        }
+        for left in [left_skip, left_mode, left_uv_mode, left_height_log2] {
+            push(left.get_mut(sb_row..sb_row + h4).unwrap_or(&mut []));
+        }
+        out
+    }
+}
+
+/// What a superblock row leaves over one of its superblocks for the
+/// row below: the above contexts, and the reconstruction's last row of
+/// each plane, end to end.
+#[derive(Default)]
+struct Above {
+    contexts: Vec<u8>,
+    floor: Vec<u8>,
+}
+
+/// One tile's superblock rows in flight: each row is searched two
+/// superblocks behind the row above, from what that row left over each
+/// superblock and from its probabilities after its second, and the
+/// tile's coder writes the rows' decisions in order. The rows come in
+/// batches, the row before a batch done.
+struct Wave {
+    x0: usize,
+    width: usize,
+    mi_row_start: usize,
+    mi_row_end: usize,
+    above: Vec<Mutex<Above>>,
+    progress: Mutex<Progress>,
+    moved: Condvar,
+    coding: Mutex<Coding>,
+}
+
+/// The superblocks each row of the batch has searched, and the
+/// probabilities the next row starts from.
+struct Progress {
+    done: Vec<usize>,
+    seed: Cdfs,
+}
+
+/// The tile's coder, the superblock row it writes next and the rows
+/// searched before it.
+struct Coding {
+    tile: Tile,
+    next: usize,
+    ready: Vec<(usize, Vec<Node>)>,
+}
+
+impl Coding {
+    /// Takes a searched superblock row and writes whatever rows are next
+    /// in order.
+    fn add(&mut self, sb_row: usize, nodes: Vec<Node>) {
+        self.ready.push((sb_row, nodes));
+        while let Some(at) = self.ready.iter().position(|(r, _)| *r == self.next) {
+            let (next, nodes) = self.ready.swap_remove(at);
+            self.tile.write_row(next * SB_MI, &nodes);
+            self.next += 1;
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Wave {
+    fn new(
+        x0: usize,
+        width: usize,
+        (mi_row_start, mi_row_end): (usize, usize),
+        geometry: &Geometry,
+        qindex: u8,
+    ) -> Wave {
+        Wave {
+            x0,
+            width,
+            mi_row_start,
+            mi_row_end,
+            above: (0..width / SB).map(|_| Mutex::default()).collect(),
+            progress: Mutex::new(Progress {
+                done: Vec::new(),
+                seed: Cdfs::new(qindex),
+            }),
+            moved: Condvar::new(),
+            coding: Mutex::new(Coding {
+                tile: Tile::new(x0, width, mi_row_start, mi_row_end, geometry, qindex),
+                next: mi_row_start / SB_MI,
+                ready: Vec::new(),
+            }),
+        }
+    }
+
+    /// Starts a batch of `rows` superblock rows.
+    fn begin(&mut self, rows: usize) {
+        let progress = self
+            .progress
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        progress.done.clear();
+        progress.done.resize(rows, 0);
+    }
+
+    /// Waits until the row above the batch's `row` has searched `need`
+    /// superblocks.
+    fn wait(&self, row: usize, need: usize) -> MutexGuard<'_, Progress> {
+        let mut progress = lock(&self.progress);
+        while row
+            .checked_sub(1)
+            .and_then(|above| progress.done.get(above))
+            .is_some_and(|&done| done < need)
+        {
+            progress = self
+                .moved
+                .wait(progress)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        progress
+    }
+
+    /// Records a row's searched superblocks, and the probabilities
+    /// the row below starts from once it has them.
+    fn advance(&self, row: usize, done: usize, seed: Option<Cdfs>) {
+        let mut progress = lock(&self.progress);
+        if let Some(seed) = seed {
+            progress.seed = seed;
+        }
+        if let Some(slot) = progress.done.get_mut(row) {
+            *slot = done;
+        }
+        drop(progress);
+        self.moved.notify_all();
+    }
+
+    /// Searches the batch's `row`, superblock row `sb_row` of the
+    /// frame, from its converted planes, keeps its reconstruction if
+    /// asked, and writes whatever rows are next in order.
+    fn search(
+        &self,
+        row: usize,
+        sb_row: usize,
+        [y, u, v]: &[Band; 3],
+        geometry: &Geometry,
+        qindex: u8,
+        kept: &Mutex<Option<Kept>>,
+    ) {
+        // However the search ends, the rows below stop waiting on it, so
+        // a panic ends the scope rather than hanging it.
+        struct Release<'a>(&'a Wave, usize);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.advance(self.1, usize::MAX, None);
+            }
+        }
+        let _release = Release(self, row);
+        let mut tile = Tile::new(
+            self.x0,
+            self.width,
+            self.mi_row_start,
+            self.mi_row_end,
+            geometry,
+            qindex,
+        );
+        let band_mi_row = sb_row * SB_MI;
+        tile.band_mi_row = band_mi_row;
+        tile.take_source(y, u, v);
+        tile.cdfs = self.wait(row, (self.width / SB).min(2)).seed.clone();
+        let nodes = tile.search_row(self, row);
+        if let Some(kept) = lock(kept).as_mut() {
+            kept.take(&tile, geometry);
+        }
+        lock(&self.coding).add(sb_row, nodes);
+    }
+}
+
+/// One tile's encoder: its share of the source and reconstruction bands,
+/// its contexts, CDFs and coder.
+struct Tile {
+    /// The tile's first pixel column and its width, luma.
+    x0: usize,
+    width: usize,
+    /// The tile's first and last-plus-one mode-info rows, and its
+    /// last-plus-one mode-info column in tile units: the frame's edge
+    /// where the padded width passes it.
+    mi_row_start: usize,
+    mi_row_end: usize,
+    mi_col_end: usize,
+    /// The frame's mode-info extent, for the clamps.
+    mi_cols: usize,
+    mi_rows: usize,
+    /// The band's first mode-info row.
+    band_mi_row: usize,
+    source: [Band; 3],
+    recon: [Band; 3],
+    contexts: Contexts,
+    cdfs: Cdfs,
+    coder: Coder,
+    qindex: u8,
+    rdmult: u64,
+    /// `screen`'s rate weight, `16 isqrt(rdmult * 128)`.
+    screen_weight: u64,
+    scratch: Scratch,
+    /// The band's block sizes, a luma 4x4 each (`pack_size`), `width /
+    /// MI` to a row: what the deblocking filter reads.
+    sizes: Vec<u8>,
+    /// Whether each luma 4x4's block coded no coefficient, laid out as
+    /// `sizes`: what CDEF reads.
+    skips: Vec<bool>,
+    /// `coefficient_symbols`'s magnitudes, kept for their buffer.
+    mags: Magnitudes,
+    /// Saved states' context and pixel copies, returned by `restore` and
+    /// `recycle`.
+    spare_segments: Vec<Vec<u8>>,
+    spare_pixels: Vec<Vec<u8>>,
+}
+
+/// A plane's transform, the block's size in the plane (4x4 for a size
+/// without one, which `code_plane` refuses).
+fn plane_size(at: At, plane: usize) -> Size {
+    let (w, h) = at.plane_dims(plane);
+    Size::of(w, h).unwrap_or(Size::S4)
+}
+
+/// Where a block codes a plane: luma in place, chroma over its chroma
+/// region if it carries one.
+fn plane_at(at: At, plane: usize) -> Option<At> {
+    if plane == 0 {
+        Some(at)
+    } else {
+        at.chroma()
+    }
+}
+
+/// A block's luma width and height log2 in one byte, the width low.
+fn pack_size(w_log2: u32, h_log2: u32) -> u8 {
+    ((h_log2.min(15) << 4) | w_log2.min(15)) as u8
+}
+
+/// A packed size's log2 across (for vertical edges) or down.
+fn unpack_size(packed: u8, vertical: bool) -> u32 {
+    u32::from(if vertical { packed & 15 } else { packed >> 4 })
+}
+
+impl Tile {
+    fn new(
+        x0: usize,
+        width: usize,
+        mi_row_start: usize,
+        mi_row_end: usize,
+        geometry: &Geometry,
+        qindex: u8,
+    ) -> Tile {
+        let q = u64::try_from(transform::dc_q(qindex)).unwrap_or(4);
+        let rdmult = (q * q * 11 / 3).max(1);
+        Tile {
+            x0,
+            width,
+            mi_row_start,
+            mi_row_end,
+            mi_col_end: (width / MI).min(geometry.mi_cols.saturating_sub(x0 / MI)),
+            mi_cols: geometry.mi_cols,
+            mi_rows: geometry.mi_rows,
+            band_mi_row: 0,
+            source: [
+                Band::new(width, SB),
+                Band::new(width / 2, SB / 2),
+                Band::new(width / 2, SB / 2),
+            ],
+            recon: [
+                Band::new(width, SB + 1),
+                Band::new(width / 2, SB / 2 + 1),
+                Band::new(width / 2, SB / 2 + 1),
+            ],
+            contexts: Contexts::new(width / MI),
+            cdfs: Cdfs::new(qindex),
+            coder: Coder::new(),
+            qindex,
+            rdmult,
+            screen_weight: 16 * (rdmult * 128).isqrt(),
+            scratch: Scratch::default(),
+            sizes: vec![pack_size(3, 3); SB_MI * (width / MI)],
+            skips: vec![true; SB_MI * (width / MI)],
+            mags: Magnitudes::default(),
+            spare_segments: Vec::new(),
+            spare_pixels: Vec::new(),
+        }
+    }
+
+    /// Fills the source bands from the frame band's converted planes.
+    fn take_source(&mut self, y: &Band, u: &Band, v: &Band) {
+        for (plane, src) in [y, u, v].into_iter().enumerate() {
+            let sub = usize::from(plane > 0);
+            let x0 = self.x0 >> sub;
+            if let Some(band) = self.source.get_mut(plane) {
+                for row in 0..band.rows {
+                    let to = band.row_mut(row);
+                    if let Some(from) = src.row(row).get(x0..x0 + to.len()) {
+                        to.copy_from_slice(from);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Searches the wave's superblock row `row` of the batch, each
+    /// superblock once the row above has searched the one past it, and
+    /// returns the decisions in coding order.
+    fn search_row(&mut self, wave: &Wave, row: usize) -> Vec<Node> {
+        let count = self.width / SB;
+        let mut nodes = Vec::new();
+        for sb in 0..count {
+            // The row above left the contexts over this superblock and
+            // the pixels over the next, which the one here reads above
+            // and to the right; the pixels over this one came as the
+            // superblock before's, before this row wrote its own there.
+            drop(wave.wait(row, (sb + 2).min(count)));
+            for (k, above) in wave.above.iter().enumerate().take(sb + 2).skip(sb) {
+                let above = lock(above);
+                if k == sb {
+                    self.take_contexts(sb, &above.contexts);
+                }
+                if k > sb || k == 0 {
+                    self.take_floor(k, &above.floor);
+                }
+            }
+            let mi_col = sb * SB_MI;
+            let mi_width_left = self.mi_col_end.saturating_sub(mi_col);
+            let mi_height_left = self.mi_row_end - self.band_mi_row;
+            self.contexts.clear_decoded(mi_width_left, mi_height_left);
+            let at = At::square(self.band_mi_row, mi_col, 6);
+            let before = self.save(at, false);
+            let start = nodes.len();
+            self.decide(at, &mut nodes);
+            // The decisions left the contexts where the superblock ends;
+            // the probabilities follow its symbols from where it began.
+            self.restore(before);
+            self.contexts.clear_decoded(mi_width_left, mi_height_left);
+            self.emit(
+                &mut Adapter,
+                at,
+                &mut nodes.get(start..).unwrap_or(&[]).iter(),
+            );
+            if let Some(above) = wave.above.get(sb) {
+                let mut above = lock(above);
+                let Above { contexts, floor } = &mut *above;
+                self.give_contexts(sb, contexts);
+                self.give_floor(sb, floor);
+            }
+            let seed = (sb + 1 == count.min(2)).then(|| self.cdfs.clone());
+            wave.advance(row, sb + 1, seed);
+        }
+        nodes
+    }
+
+    /// Writes a searched superblock row's decisions.
+    fn write_row(&mut self, band_mi_row: usize, nodes: &[Node]) {
+        self.band_mi_row = band_mi_row;
+        self.contexts.clear_left();
+        let mut coder = std::mem::replace(&mut self.coder, Coder::new());
+        let mut nodes = nodes.iter();
+        for sb in 0..self.width / SB {
+            let mi_col = sb * SB_MI;
+            self.contexts.clear_decoded(
+                self.mi_col_end.saturating_sub(mi_col),
+                self.mi_row_end - band_mi_row,
+            );
+            self.emit(&mut coder, At::square(band_mi_row, mi_col, 6), &mut nodes);
+        }
+        self.coder = coder;
+    }
+
+    fn take_contexts(&mut self, sb: usize, from: &[u8]) {
+        let mut rest = from;
+        for slot in self.contexts.above_of(sb) {
+            let Some((copy, tail)) = rest.split_at_checked(slot.len()) else {
+                break;
+            };
+            slot.copy_from_slice(copy);
+            rest = tail;
+        }
+    }
+
+    fn give_contexts(&mut self, sb: usize, to: &mut Vec<u8>) {
+        to.clear();
+        for slot in self.contexts.above_of(sb) {
+            to.extend_from_slice(slot);
+        }
+    }
+
+    /// Takes the row above's last row of pixels over a superblock into
+    /// the band's first.
+    fn take_floor(&mut self, sb: usize, from: &[u8]) {
+        let mut rest = from;
+        for (plane, band) in self.recon.iter_mut().enumerate() {
+            let n = SB >> usize::from(plane > 0);
+            let (Some((copy, tail)), Some(slot)) = (
+                rest.split_at_checked(n),
+                band.row_mut(0).get_mut(sb * n..(sb + 1) * n),
+            ) else {
+                break;
+            };
+            slot.copy_from_slice(copy);
+            rest = tail;
+        }
+    }
+
+    fn give_floor(&self, sb: usize, to: &mut Vec<u8>) {
+        to.clear();
+        for (plane, band) in self.recon.iter().enumerate() {
+            let n = SB >> usize::from(plane > 0);
+            to.extend_from_slice(
+                band.row(band.rows - 1)
+                    .get(sb * n..(sb + 1) * n)
+                    .unwrap_or(&[]),
+            );
+        }
+    }
+
+    /// The frame's mode-info column of a tile-local one.
+    fn frame_mi_col(&self, mi_col: usize) -> usize {
+        self.x0 / MI + mi_col
+    }
+
+    fn avail_up(&self, mi_row: usize) -> bool {
+        mi_row > self.mi_row_start
+    }
+
+    fn avail_left(&self, mi_col: usize) -> bool {
+        mi_col > 0
+    }
+
+    // ------------------------------------------------------ decisions
+
+    /// Whether a block at the position is inside the frame at all, and
+    /// whether its lower and right halves begin inside it (spec
+    /// `decode_partition`'s `hasRows` and `hasCols`).
+    fn edges(&self, at: At) -> Option<(bool, bool)> {
+        if at.mi_row >= self.mi_row_end || self.frame_mi_col(at.mi_col) >= self.mi_cols {
+            return None;
+        }
+        let half = at.w_units() / 2;
+        Some((
+            at.mi_row + half < self.mi_rows,
+            self.frame_mi_col(at.mi_col) + half < self.mi_cols,
+        ))
+    }
+
+    /// Decides the partition under the square node at the position,
+    /// leaving reconstruction and contexts as if coded, and returns the
+    /// rate-distortion cost: the node whole, split, or halved either
+    /// way, whichever costs least. Each is cut short once it costs more
+    /// than the best so far, and the halves are tried only where
+    /// `RECT_GATE` and `rect_directions` let them. A 64x64 is tried
+    /// whole only where `whole_64` lets it, and never halved.
+    fn decide(&mut self, at: At, out: &mut Vec<Node>) -> u64 {
+        let Some((has_rows, has_cols)) = self.edges(at) else {
+            return 0;
+        };
+        let half = at.w_units() / 2;
+        if at.w_log2 == 2 {
+            let (leaf, cost) = self.best_leaf(at);
+            out.push(Node::Block(leaf));
+            return cost;
+        }
+        let split_rate = self.partition_rate(at, Partition::Split);
+        if !(has_rows && has_cols) {
+            out.push(Node::Parts(Partition::Split));
+            let mut cost = self.rd(0, split_rate);
+            for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+                cost += self.decide(at.quarter(dr, dc), out);
+            }
+            return cost;
+        }
+        let before = self.save(at, true);
+        let mut best = Best {
+            cost: u64::MAX,
+            nodes: Vec::new(),
+            state: None,
+        };
+        let mut nodes = Vec::new();
+        let mut none_cost = u64::MAX;
+        if at.w_log2 < 6 || self.whole_64(at) {
+            none_cost = self.try_none(at, &mut nodes, &mut best);
+        }
+        self.reset(&before);
+        nodes.clear();
+        nodes.push(Node::Parts(Partition::Split));
+        let mut split_cost = self.rd(0, split_rate);
+        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+            if split_cost >= best.cost {
+                break;
+            }
+            split_cost += self.decide(at.quarter(dr, dc), &mut nodes);
+        }
+        self.keep_if_best(at, split_cost, &mut nodes, &mut best);
+        // A split cut short cost at least the node whole, so only a
+        // split that won can close the gate.
+        let (keep, of) = RECT_GATE;
+        let [horz, vert] =
+            if at.w_log2 == 6 || split_cost.saturating_mul(of) < none_cost.saturating_mul(keep) {
+                [false; 2]
+            } else {
+                self.rect_directions(at)
+            };
+        let kinds = [(Partition::Horz, horz), (Partition::Vert, vert)];
+        for kind in kinds.into_iter().filter_map(|(k, on)| on.then_some(k)) {
+            nodes.clear();
+            self.reset(&before);
+            let rate = self.partition_rate(at, kind);
+            let mut cost = self.rd(0, rate);
+            nodes.push(Node::Parts(kind));
+            for block in at.halves(kind == Partition::Vert) {
+                if cost >= best.cost {
+                    break;
+                }
+                let (leaf, leaf_cost) = self.best_leaf(block);
+                cost += leaf_cost;
+                nodes.push(Node::Block(leaf));
+            }
+            self.keep_if_best(at, cost, &mut nodes, &mut best);
+        }
+        self.recycle(before);
+        if let Some(state) = best.state {
+            self.restore(state);
+        }
+        out.append(&mut best.nodes);
+        best.cost
+    }
+
+    /// The node coded whole: its cost, kept if it is the best so far.
+    fn try_none(&mut self, at: At, nodes: &mut Vec<Node>, best: &mut Best) -> u64 {
+        let none_rate = self.partition_rate(at, Partition::None);
+        let (leaf, leaf_cost) = self.best_leaf(at);
+        let none_cost = leaf_cost + self.rd(0, none_rate);
+        nodes.clear();
+        nodes.push(Node::Block(leaf));
+        self.keep_if_best(at, none_cost, nodes, best);
+        none_cost
+    }
+
+    /// Keeps a trial's nodes and state if it costs less than the best.
+    fn keep_if_best(&mut self, at: At, cost: u64, nodes: &mut Vec<Node>, best: &mut Best) {
+        if cost < best.cost {
+            best.cost = cost;
+            std::mem::swap(nodes, &mut best.nodes);
+            let state = self.save(at, true);
+            if let Some(old) = best.state.replace(state) {
+                self.recycle(old);
+            }
+        }
+    }
+
+    /// Whether a 64x64 is worth trying whole: its source luma's variance
+    /// within twice the DC step's square over 64. On a photo that tried
+    /// a quarter to seven tenths of them at 0.3 to 3 bits a pixel and
+    /// nearly all below, for nearly all of what trying every one gained.
+    fn whole_64(&self, at: At) -> bool {
+        let x = at.mi_col * MI;
+        let y = (at.mi_row - self.band_mi_row) * MI;
+        let Some(source) = self.source.first() else {
+            return true;
+        };
+        let (mut sum, mut squares) = (0i64, 0i64);
+        for r in 0..SB {
+            for &v in source.row(y + r).get(x..x + SB).unwrap_or(&[]) {
+                sum += i64::from(v);
+                squares += i64::from(v) * i64::from(v);
+            }
+        }
+        // The variance times the area squared, against the bound's.
+        let n = (SB * SB) as i64;
+        let dc = i64::from(transform::dc_q(self.qindex));
+        (squares * n - sum * sum) * 32 <= dc * dc * n * n
+    }
+
+    /// Which halves of a node, horizontal and vertical, are worth
+    /// trying: those whose halves hold the source luma's variance the
+    /// tighter, both when neither does by `RECT_MARGIN`.
+    fn rect_directions(&self, at: At) -> [bool; 2] {
+        let n = at.width();
+        let x = at.mi_col * MI;
+        let y = (at.mi_row - self.band_mi_row) * MI;
+        let Some(source) = self.source.first() else {
+            return [true; 2];
+        };
+        // Per quadrant, raster order: the sum and the sum of squares.
+        let mut quads = [(0i64, 0i64); 4];
+        for r in 0..n {
+            let row = source.row(y + r).get(x..x + n).unwrap_or(&[]);
+            for (c, &v) in row.iter().enumerate() {
+                let v = i64::from(v);
+                if let Some(q) =
+                    quads.get_mut(usize::from(r >= n / 2) * 2 + usize::from(c >= n / 2))
+                {
+                    q.0 += v;
+                    q.1 += v * v;
+                }
+            }
+        }
+        // Each half's squared deviation from its mean, times its area.
+        let area = (n * n / 2) as i64;
+        let deviation = |a: (i64, i64), b: (i64, i64)| {
+            let (sum, squares) = (a.0 + b.0, a.1 + b.1);
+            area * squares - sum * sum
+        };
+        let [q0, q1, q2, q3] = quads;
+        let horz = deviation(q0, q1) + deviation(q2, q3);
+        let vert = deviation(q0, q2) + deviation(q1, q3);
+        let (keep, of) = RECT_MARGIN;
+        [!(vert * of < horz * keep), !(horz * of < vert * keep)]
+    }
+
+    /// A screening score of a prediction's SATD and its mode's rate in
+    /// 1/512 bit, `2^18` times `SATD + 16 sqrt(rdmult / 2048) bits`:
+    /// sixteen times the root of the multiplier per squared error. The
+    /// root alone undervalues the rate, a block's SATD summing what the
+    /// error's root does not; eight to thirty-two times it measured alike
+    /// on a photo.
+    fn screen(&self, satd: u64, rate: u64) -> u64 {
+        (satd << 18) + rate * self.screen_weight
+    }
+
+    /// libaom's `RDCOST` of a squared error and a rate in 1/512 bit. Its
+    /// distortion is sixteen times the pixels' squared error
+    /// (`dist_block_px_domain`), the scale its `rdmult` assumes.
+    fn rd(&self, distortion: u64, rate: u64) -> u64 {
+        (distortion << (4 + 7)) + ((rate * self.rdmult) >> 9)
+    }
+
+    /// The rate of a node's partition symbol.
+    fn partition_rate(&mut self, at: At, partition: Partition) -> u64 {
+        let mut counter = Counter(0);
+        self.partition_symbol(&mut counter, at, partition);
+        counter.0
+    }
+
+    /// The partition symbol of a node (spec `decode_partition`), none
+    /// under 8x8. At the frame's edges only a split is coded.
+    fn partition_symbol(&mut self, sink: &mut impl Sink, at: At, partition: Partition) {
+        let Some((has_rows, has_cols)) = self.edges(at) else {
+            return;
+        };
+        if at.w_log2 < 3 {
+            return;
+        }
+        let (mi_row, mi_col) = (at.mi_row, at.mi_col);
+        let bsl = at.w_log2 - 2;
+        let above = self.avail_up(mi_row)
+            && self
+                .contexts
+                .above_width_log2
+                .get(mi_col)
+                .is_some_and(|&w| u32::from(w) < bsl);
+        let left = self.avail_left(mi_col)
+            && self
+                .contexts
+                .left_height_log2
+                .get(mi_row % SB_MI)
+                .is_some_and(|&h| u32::from(h) < bsl);
+        let ctx = usize::from(left) * 2 + usize::from(above);
+        let cdf = if bsl == 1 {
+            self.cdfs.partition_8.get_mut(ctx)
+        } else {
+            bsl.checked_sub(2)
+                .and_then(|i| self.cdfs.partition.get_mut(i as usize))
+                .and_then(|row| row.get_mut(ctx))
+        };
+        let Some(cdf) = cdf else {
+            return;
+        };
+        if has_rows && has_cols {
+            sink.symbol(cdf, partition as usize);
+        } else if has_cols || has_rows {
+            // split_or_horz / split_or_vert: a bool from the kinds that
+            // split the half inside the frame the other way (the top
+            // half vertically, the left half horizontally); never
+            // adapted.
+            let kinds: &[usize] = if has_cols {
+                &[2, 3, 4, 6, 7, 9]
+            } else {
+                &[1, 3, 4, 5, 6, 8]
+            };
+            let mut psum = 0u32;
+            for &k in kinds {
+                if k < cdf.n {
+                    let low = if k == 0 { 0 } else { cdf.at(k - 1) };
+                    psum += cdf.at(k) - low;
+                }
+            }
+            let mut derived = Cdf { n: 2, v: [0; 17] };
+            derived.v[0] = (32768 - psum.min(32767)) as u16;
+            derived.v[1] = 32768;
+            sink.symbol(&mut derived, usize::from(partition == Partition::Split));
+        }
+    }
+
+    /// Saves what a trial at the block may change.
+    fn save(&mut self, at: At, pixels: bool) -> Saved {
+        let mut segments = self.spare_segments.pop().unwrap_or_default();
+        segments.clear();
+        let spare = pixels.then(|| self.spare_pixels.pop().unwrap_or_default());
+        let pixels = spare.map(|mut copy| {
+            copy.clear();
+            for (plane, band) in self.recon.iter().enumerate() {
+                let sub = usize::from(plane > 0);
+                let (w, h) = at.plane_dims(plane);
+                let x = (at.mi_col * MI) >> sub;
+                let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
+                for r in 0..h {
+                    copy.extend_from_slice(band.row(y + 1 + r).get(x..x + w).unwrap_or(&[]));
+                }
+            }
+            copy
+        });
+        for segment in self.contexts.segments(at) {
+            segments.extend_from_slice(segment);
+        }
+        Saved {
+            at,
+            segments,
+            decoded: self.contexts.decoded,
+            pixels,
+        }
+    }
+
+    fn restore(&mut self, saved: Saved) {
+        self.reset(&saved);
+        self.recycle(saved);
+    }
+
+    /// Returns to a saved state, keeping it.
+    fn reset(&mut self, saved: &Saved) {
+        let mut rest = saved.segments.as_slice();
+        for slot in self.contexts.segments(saved.at) {
+            let Some((copy, tail)) = rest.split_at_checked(slot.len()) else {
+                break;
+            };
+            slot.copy_from_slice(copy);
+            rest = tail;
+        }
+        self.contexts.decoded = saved.decoded;
+        if let Some(pixels) = &saved.pixels {
+            let mut rest = pixels.as_slice();
+            'planes: for (plane, band) in self.recon.iter_mut().enumerate() {
+                let sub = usize::from(plane > 0);
+                let (w, h) = saved.at.plane_dims(plane);
+                let x = (saved.at.mi_col * MI) >> sub;
+                let y = ((saved.at.mi_row - self.band_mi_row) * MI) >> sub;
+                for r in 0..h {
+                    let Some((src, tail)) = rest.split_at_checked(w) else {
+                        break 'planes;
+                    };
+                    rest = tail;
+                    if let Some(dst) = band.row_mut(y + 1 + r).get_mut(x..x + w) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns a saved state's buffers to the pools.
+    fn recycle(&mut self, saved: Saved) {
+        self.spare_segments.push(saved.segments);
+        self.spare_pixels.extend(saved.pixels);
+    }
+
+    // ---------------------------------------------------------- leaves
+
+    /// The best-coded block at the position: modes chosen by
+    /// rate-distortion cost, reconstruction and contexts applied.
+    fn best_leaf(&mut self, at: At) -> (Leaf, u64) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let chosen = self.best_leaf_in(at, &mut scratch);
+        self.scratch = scratch;
+        chosen
+    }
+
+    /// `best_leaf` with the tile's scratch taken out of it.
+    fn best_leaf_in(&mut self, at: At, scratch: &mut Scratch) -> (Leaf, u64) {
+        let mut leaf = Leaf {
+            at,
+            skip: false,
+            y_mode: DC_PRED,
+            uv_mode: DC_PRED,
+            deltas: [0; 2],
+            cfl: [0; 2],
+            tx_type: TxType::DctDct,
+            levels: [Vec::new(), Vec::new(), Vec::new()],
+            eob: [0; 3],
+        };
+        let Scratch {
+            preds,
+            work,
+            trial,
+            best,
+        } = scratch;
+        let [trial_y, trial_u, trial_v] = trial;
+        let [best_y, best_u, best_v] = best;
+        // Luma: every mode screened by its residual's SATD and its rate,
+        // the closest few coded in full.
+        let edges = self.pred_edges(0, at);
+        let area = at.width() * at.height();
+        let luma = grown(preds, (MODES.len() + ANGLE_MODES * DELTAS.len()) * area);
+        let mut screened =
+            [(u64::MAX, DC_PRED, 0i8, 0usize); MODES.len() + ANGLE_MODES * DELTAS.len()];
+        for (k, ((slot, &mode), pred)) in screened
+            .iter_mut()
+            .zip(&MODES)
+            .zip(luma.chunks_exact_mut(area))
+            .enumerate()
+        {
+            predict_block(mode, 0, &edges, false, pred);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode, 0);
+            *slot = (self.screen(self.satd(0, at, pred), counter.0), mode, 0, k);
+        }
+        // The closest directional modes' other angles.
+        let mut ranked = screened;
+        ranked.sort_unstable();
+        let angled = ranked
+            .iter()
+            .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
+            .take(if at.has_angle_deltas() && at.w_log2 < 6 {
+                ANGLE_MODES
+            } else {
+                0
+            })
+            .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
+        for (k, (mode, delta)) in (MODES.len()..).zip(angled) {
+            let (Some(pred), Some(slot)) =
+                (luma.get_mut(k * area..(k + 1) * area), screened.get_mut(k))
+            else {
+                break;
+            };
+            predict_block(mode, delta, &edges, false, pred);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode, delta);
+            *slot = (
+                self.screen(self.satd(0, at, pred), counter.0),
+                mode,
+                delta,
+                k,
+            );
+        }
+        screened.sort_unstable();
+        let size = plane_size(at, 0);
+        let mut y_mode = None;
+        let mut best_score = u64::MAX;
+        for &(_, mode, delta, k) in screened
+            .iter()
+            .filter(|&&(score, ..)| score != u64::MAX)
+            .take(if at.is_sub8x8() {
+                SUB8X8_LUMA_TRIALS
+            } else {
+                LUMA_TRIALS
+            })
+        {
+            // The screen's estimate made exact: the edges filtered.
+            if let (true, Some(pred)) =
+                (is_directional(mode), luma.get_mut(k * area..(k + 1) * area))
+            {
+                predict_block(mode, delta, &edges, true, pred);
+            }
+            let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
+            self.code_plane(0, at, mode, mode_tx_type(mode, size), pred, work, trial_y);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode, delta);
+            let score = trial_y.cost.saturating_add(self.rd(0, counter.0));
+            if y_mode.is_none() || score < best_score {
+                std::mem::swap(trial_y, best_y);
+                y_mode = Some((mode, delta, k));
+                best_score = score;
+            }
+        }
+        let Some((y_mode, y_delta, k)) = y_mode else {
+            return (leaf, 0);
+        };
+        // The chosen mode under the other types its size signals: the
+        // mode's rate is the same under each, so the trials' costs alone
+        // compare.
+        if !dct_only(size) && best_y.eob > 0 {
+            let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
+            let coded = mode_tx_type(y_mode, size);
+            for tx in TX_TYPES {
+                if tx == coded {
+                    continue;
+                }
+                self.code_plane(0, at, y_mode, tx, pred, work, trial_y);
+                if trial_y.cost < best_y.cost {
+                    std::mem::swap(trial_y, best_y);
+                }
+            }
+        }
+        let y_cost = best_y.cost;
+        leaf.y_mode = y_mode;
+        leaf.deltas[0] = y_delta;
+        leaf.tx_type = best_y.tx;
+        self.write_recon(0, at, &best_y.recon);
+        leaf.levels[0] = std::mem::take(&mut best_y.levels);
+        leaf.eob[0] = best_y.eob;
+        // Chroma, when the block carries it, over its chroma region: both
+        // planes share a mode, each mode's u then v.
+        let uv_cost = 'chroma: {
+            let Some(uv_at) = at.chroma() else {
+                break 'chroma 0;
+            };
+            let (chroma_w, chroma_h) = uv_at.plane_dims(1);
+            let area = chroma_w * chroma_h;
+            let (edges_u, edges_v) = (self.pred_edges(1, uv_at), self.pred_edges(2, uv_at));
+            const UV_SLOTS: usize = MODES.len() + 1 + UV_ANGLE_MODES * DELTAS.len();
+            let chroma = grown(preds, UV_SLOTS * area * 2);
+            let mut screened_uv = [(u64::MAX, DC_PRED, 0i8, 0usize); UV_SLOTS];
+            for (k, ((slot, &mode), pred)) in screened_uv
+                .iter_mut()
+                .zip(&MODES)
+                .zip(chroma.chunks_exact_mut(area * 2))
+                .enumerate()
+            {
+                let (u, v) = pred.split_at_mut(area);
+                predict_block(mode, 0, &edges_u, false, u);
+                predict_block(mode, 0, &edges_v, false, v);
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, 0, [0; 2]);
+                let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                *slot = (self.screen(satd, counter.0), mode, 0, k);
+            }
+            // The closest directional modes' other angles, after the slot
+            // chroma from luma takes.
+            let mut ranked = screened_uv;
+            ranked.sort_unstable();
+            let angled = ranked
+                .iter()
+                .filter(|&&(score, mode, ..)| score != u64::MAX && is_directional(mode))
+                .take(if at.has_angle_deltas() {
+                    UV_ANGLE_MODES
+                } else {
+                    0
+                })
+                .flat_map(|&(_, mode, ..)| DELTAS.map(|delta| (mode, delta)));
+            for (k, (mode, delta)) in (MODES.len() + 1..).zip(angled) {
+                let (Some(pred), Some(slot)) = (
+                    chroma.get_mut(k * area * 2..(k + 1) * area * 2),
+                    screened_uv.get_mut(k),
+                ) else {
+                    break;
+                };
+                let (u, v) = pred.split_at_mut(area);
+                predict_block(mode, delta, &edges_u, false, u);
+                predict_block(mode, delta, &edges_v, false, v);
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, delta, [0; 2]);
+                let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                *slot = (self.screen(satd, counter.0), mode, delta, k);
+            }
+            // Chroma from luma: each plane's DC prediction, the first of the
+            // modes, and its alpha against the luma just reconstructed.
+            let k = MODES.len();
+            let mut cfl = [0i8; 2];
+            if at.cfl_allowed() {
+                self.cfl_ac(uv_at, &mut work.ac);
+            }
+            if let (true, Some((dc, rest)), Some(slot)) = (
+                at.cfl_allowed(),
+                chroma.split_at_mut_checked(area * 2),
+                screened_uv.get_mut(k),
+            ) {
+                let out = rest
+                    .get_mut((k - 1) * area * 2..k * area * 2)
+                    .unwrap_or(&mut []);
+                if out.len() == area * 2 {
+                    let (dc_u, dc_v) = dc.split_at(area);
+                    let (u, v) = out.split_at_mut(area);
+                    cfl = [
+                        self.cfl_alpha(1, uv_at, dc_u, &work.ac, u),
+                        self.cfl_alpha(2, uv_at, dc_v, &work.ac, v),
+                    ];
+                    if cfl != [0, 0] {
+                        cfl_predict(dc_u, &work.ac, cfl[0], u);
+                        cfl_predict(dc_v, &work.ac, cfl[1], v);
+                        let mut counter = Counter(0);
+                        self.uv_mode_symbols(&mut counter, at, y_mode, UV_CFL_PRED, 0, cfl);
+                        let satd = self.satd(1, uv_at, u) + self.satd(2, uv_at, v);
+                        *slot = (self.screen(satd, counter.0), UV_CFL_PRED, 0, k);
+                    }
+                }
+            }
+            screened_uv.sort_unstable();
+            let mut uv_mode = None;
+            let mut best_score = u64::MAX;
+            // The closest few and chroma from luma, which the screen ranks
+            // below what coding it measures.
+            for (i, &(score, mode, delta, k)) in screened_uv.iter().enumerate() {
+                if score == u64::MAX || (i >= CHROMA_TRIALS && mode != UV_CFL_PRED) {
+                    continue;
+                }
+                let exact = chroma.get_mut(k * area * 2..(k + 1) * area * 2);
+                if let (true, Some((u, v))) =
+                    (is_directional(mode), exact.map(|p| p.split_at_mut(area)))
+                {
+                    predict_block(mode, delta, &edges_u, true, u);
+                    predict_block(mode, delta, &edges_v, true, v);
+                }
+                let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
+                let (pu, pv) = pred.split_at(area.min(pred.len()));
+                let tx = mode_tx_type(mode, plane_size(uv_at, 1));
+                self.code_plane(1, uv_at, mode, tx, pu, work, trial_u);
+                self.code_plane(2, uv_at, mode, tx, pv, work, trial_v);
+                let alphas = if mode == UV_CFL_PRED { cfl } else { [0; 2] };
+                let mut counter = Counter(0);
+                self.uv_mode_symbols(&mut counter, at, y_mode, mode, delta, alphas);
+                let score = trial_u
+                    .cost
+                    .saturating_add(trial_v.cost)
+                    .saturating_add(self.rd(0, counter.0));
+                if uv_mode.is_none() || score < best_score {
+                    std::mem::swap(trial_u, best_u);
+                    std::mem::swap(trial_v, best_v);
+                    uv_mode = Some((mode, delta));
+                    best_score = score;
+                }
+            }
+            let Some((uv_mode, uv_delta)) = uv_mode else {
+                return (leaf, y_cost);
+            };
+            let uv_cost = best_u.cost.saturating_add(best_v.cost);
+            leaf.uv_mode = uv_mode;
+            leaf.deltas[1] = uv_delta;
+            if uv_mode == UV_CFL_PRED {
+                leaf.cfl = cfl;
+            }
+            self.write_recon(1, uv_at, &best_u.recon);
+            self.write_recon(2, uv_at, &best_v.recon);
+            leaf.levels[1] = std::mem::take(&mut best_u.levels);
+            leaf.levels[2] = std::mem::take(&mut best_v.levels);
+            leaf.eob[1] = best_u.eob;
+            leaf.eob[2] = best_v.eob;
+            uv_cost
+        };
+        leaf.skip = leaf.eob.iter().all(|&e| e == 0);
+        // The mode symbols' rate, then the block is applied.
+        let mut counter = Counter(0);
+        self.mode_symbols(&mut counter, &leaf);
+        let cost = y_cost
+            .saturating_add(uv_cost)
+            .saturating_add(self.rd(0, counter.0));
+        self.apply_contexts(&leaf);
+        (leaf, cost)
+    }
+
+    /// The sum of absolute Hadamard-transformed differences of a
+    /// prediction against the source, 4x4 by 4x4: closer to what the
+    /// residual costs to code than the plain differences.
+    fn satd(&self, plane: usize, at: At, pred: &[u8]) -> u64 {
+        let sub = usize::from(plane > 0);
+        let (w, _) = at.plane_dims(plane);
+        let x = (at.mi_col * MI) >> sub;
+        let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
+        let Some(source) = self.source.get(plane) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for (by, prows) in pred.chunks_exact(w * 4).enumerate() {
+            for bx in 0..w / 4 {
+                let mut d = [[0i32; 4]; 4];
+                let col = bx * 4;
+                for (r, row) in d.iter_mut().enumerate() {
+                    let p = prows.get(r * w + col..r * w + col + 4).unwrap_or(&[]);
+                    let s = source
+                        .row(y + by * 4 + r)
+                        .get(x + col..x + col + 4)
+                        .unwrap_or(&[]);
+                    for ((slot, p), s) in row.iter_mut().zip(p).zip(s) {
+                        *slot = i32::from(*s) - i32::from(*p);
+                    }
+                }
+                total += hadamard4(&d);
+            }
+        }
+        total
+    }
+
+    /// Codes one plane of a block under a mode and transform type from
+    /// its prediction into `out`: transform, quantization,
+    /// reconstruction; nothing is written to the tile.
+    #[allow(clippy::too_many_arguments)]
+    fn code_plane(
+        &mut self,
+        plane: usize,
+        at: At,
+        mode: u8,
+        tx: TxType,
+        pred: &[u8],
+        work: &mut Work,
+        out: &mut Coded,
+    ) {
+        let sub = usize::from(plane > 0);
+        let (w, h) = at.plane_dims(plane);
+        let size = plane_size(at, plane);
+        let x = (at.mi_col * MI) >> sub;
+        let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
+        out.tx = tx;
+        out.recon.clear();
+        out.recon.extend_from_slice(pred);
+        // The work blocks hold the last trial's values: every row of the
+        // residual is written and the transforms write every output, so
+        // a prediction or transform of another size is refused.
+        if pred.len() != w * h || (size.width(), size.height()) != (w, h) {
+            out.cost = u64::MAX;
+            out.levels.clear();
+            out.eob = 0;
+            return;
+        }
+        let coded = size.coded().area();
+        let (residual, coeffs, dequant) = (
+            grown(&mut work.residual, w * h),
+            grown(&mut work.coeffs, coded),
+            grown(&mut work.dequant, coded),
+        );
+        let source = self.source.get(plane);
+        for (r, (res, prow)) in residual
+            .chunks_exact_mut(w)
+            .zip(pred.chunks_exact(w))
+            .enumerate()
+        {
+            match source.and_then(|band| band.row(y + r).get(x..x + w)) {
+                Some(srow) => {
+                    for ((d, p), s) in res.iter_mut().zip(prow).zip(srow) {
+                        *d = i32::from(*s) - i32::from(*p);
+                    }
+                }
+                None => res.fill(0),
+            }
+        }
+        transform::forward(size, tx, residual, coeffs);
+        let eob = self.quantize(size, coeffs, &mut out.levels);
+        let eob = self.trellis(plane, at, coeffs, &mut out.levels, eob, &mut work.mags);
+        out.eob = eob;
+        if eob > 0 {
+            self.dequantize(size, &out.levels, dequant);
+            let back = residual;
+            transform::inverse(size, tx, dequant, back);
+            for (rec, b) in out.recon.iter_mut().zip(back.iter()) {
+                *rec = (i32::from(*rec) + b).clamp(0, 255) as u8;
+            }
+        }
+        let mut distortion = 0u64;
+        if let Some(source) = self.source.get(plane) {
+            for (r, rrow) in out.recon.chunks_exact(w).enumerate() {
+                let srow = source.row(y + r).get(x..x + w).unwrap_or(&[]);
+                for (rec, s) in rrow.iter().zip(srow) {
+                    let d = i64::from(*rec) - i64::from(*s);
+                    distortion += (d * d) as u64;
+                }
+            }
+        }
+        let mut counter = Counter(0);
+        let coded = Levels {
+            levels: &out.levels,
+            eob,
+        };
+        self.coefficient_symbols(&mut counter, plane, at, mode, tx, coded);
+        out.cost = self.rd(distortion, counter.0);
+    }
+
+    /// Levels by a dead-zone quantizer into `levels`, and the end of
+    /// block.
+    fn quantize(&self, size: Size, coeffs: &[i32], levels: &mut Vec<i32>) -> usize {
+        let dc = i64::from(transform::dc_q(self.qindex));
+        let ac = i64::from(transform::ac_q(self.qindex));
+        let shift = size.dequant_shift();
+        levels.clear();
+        levels.resize(coeffs.len(), 0);
+        let mut eob = 0;
+        for (c, &pos) in size.scan().iter().enumerate() {
+            let pos = usize::from(pos);
+            let Some(&coeff) = coeffs.get(pos) else {
+                continue;
+            };
+            let q = if pos == 0 { dc } else { ac };
+            let round = if pos == 0 { q / 2 } else { q * 3 / 8 };
+            let magnitude = (i64::from(coeff.unsigned_abs()) << shift) + round;
+            // Most fall under a step: no division for a zero level.
+            if magnitude >= q {
+                let level = (magnitude / q).min(0xFFFF) as i32;
+                eob = c + 1;
+                if let Some(slot) = levels.get_mut(pos) {
+                    *slot = if coeff < 0 { -level } else { level };
+                }
+            }
+        }
+        eob
+    }
+
+    /// The spec's dequantization of levels (7.12.3) into `out`.
+    fn dequantize(&self, size: Size, levels: &[i32], out: &mut [i32]) {
+        let dc = transform::dc_q(self.qindex);
+        let ac = transform::ac_q(self.qindex);
+        let shift = size.dequant_shift();
+        for (pos, (slot, &level)) in out.iter_mut().zip(levels).enumerate() {
+            let q = if pos == 0 { dc } else { ac };
+            let dq = ((level.unsigned_abs() * q as u32) & 0xFFFFFF) >> shift;
+            let dq = dq.min(0x8000) as i32;
+            *slot = if level < 0 { -dq } else { dq.min(0x7FFF) };
+        }
+    }
+
+    fn write_recon(&mut self, plane: usize, at: At, pixels: &[u8]) {
+        let sub = usize::from(plane > 0);
+        let (w, _) = at.plane_dims(plane);
+        let x = (at.mi_col * MI) >> sub;
+        let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
+        let Some(band) = self.recon.get_mut(plane) else {
+            return;
+        };
+        for (r, src) in pixels.chunks_exact(w).enumerate() {
+            if let Some(dst) = band.row_mut(y + 1 + r).get_mut(x..x + w) {
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+
+    // ------------------------------------------------------ prediction
+
+    /// The edges the spec's intra prediction (7.11.2) of a plane of the
+    /// block reads from the reconstruction so far, which every mode
+    /// shares.
+    fn pred_edges(&self, plane: usize, at: At) -> Edges {
+        let sub = usize::from(plane > 0);
+        let (w, h) = at.plane_dims(plane);
+        let (mi_row, mi_col) = (at.mi_row, at.mi_col);
+        let x = (mi_col * MI) >> sub;
+        let y = ((mi_row - self.band_mi_row) * MI) >> sub;
+        let have_left = self.avail_left(mi_col);
+        let have_above = self.avail_up(mi_row);
+        // The spec's `get_filter_type`: whether the block above or left
+        // is smooth; for chroma, of the 8x8 the region is, the block
+        // with chroma past its above-right or below-left corner.
+        let (above_modes, left_modes, col, row) = if plane == 0 {
+            (
+                &self.contexts.above_mode,
+                &self.contexts.left_mode,
+                mi_col,
+                mi_row,
+            )
+        } else {
+            (
+                &self.contexts.above_uv_mode,
+                &self.contexts.left_uv_mode,
+                mi_col + 1,
+                mi_row + 1,
+            )
+        };
+        let smooth_at = |modes: &[u8], i: usize| modes.get(i).copied().is_some_and(is_smooth);
+        let smooth = (have_above && smooth_at(above_modes, col))
+            || (have_left && smooth_at(left_modes, row % SB_MI));
+        let mut edges = Edges {
+            have_above,
+            have_left,
+            n_above: 0,
+            n_left: 0,
+            smooth,
+            ..Edges::new(w, h, [128; EDGE], [128; EDGE])
+        };
+        let Some(band) = self.recon.get(plane) else {
+            return edges;
+        };
+        let sb_x4 = ((mi_col % SB_MI) >> sub) as isize;
+        let sb_y4 = ((mi_row % SB_MI) >> sub) as isize;
+        let have_above_right =
+            self.contexts
+                .is_decoded(plane, sb_x4 + (w / MI) as isize, sb_y4 - 1);
+        let have_below_left = self
+            .contexts
+            .is_decoded(plane, sb_x4 - 1, sb_y4 + (h / MI) as isize);
+        let max_x = ((self.mi_cols * MI) >> sub)
+            .saturating_sub(self.x0 >> sub)
+            .min(self.width >> sub)
+            - 1;
+        let max_y = ((self.mi_rows * MI) >> sub) - 1 - ((self.band_mi_row * MI) >> sub);
+        if have_above {
+            edges.n_above = w.min(max_x + 1 - x);
+        }
+        if have_left {
+            edges.n_left = h.min(max_y + 1 - y);
+        }
+        // Band rows are the plane's rows plus one: row 0 is the row above.
+        let px = |xx: usize, band_row: usize| band.at(xx, band_row);
+        let Edges { above, left, .. } = &mut edges;
+        let base = 1 << (8 - 1);
+        if !have_above && have_left {
+            above.fill(px(x - 1, y + 1));
+        } else if !have_above && !have_left {
+            above.fill(base - 1);
+        } else {
+            let limit = max_x.min(x + if have_above_right { 2 * w } else { w } - 1);
+            for (i, slot) in above.iter_mut().enumerate().skip(1) {
+                *slot = px(limit.min(x + i - 1), y);
+            }
+        }
+        if !have_left && have_above {
+            left.fill(px(x, y));
+        } else if !have_left && !have_above {
+            left.fill(base + 1);
+        } else {
+            let limit = max_y.min(y + if have_below_left { 2 * h } else { h } - 1);
+            for (i, slot) in left.iter_mut().enumerate().skip(1) {
+                *slot = px(x - 1, limit.min(y + i - 1) + 1);
+            }
+        }
+        let corner = if have_above && have_left {
+            px(x - 1, y)
+        } else if have_above {
+            px(x, y)
+        } else if have_left {
+            px(x - 1, y + 1)
+        } else {
+            base
+        };
+        above[0] = corner;
+        left[0] = corner;
+        edges
+    }
+
+    // --------------------------------------------------------- symbols
+
+    /// The mode-info symbols of a block (spec `intra_frame_mode_info`).
+    fn mode_symbols(&mut self, sink: &mut impl Sink, leaf: &Leaf) {
+        let mi_row = leaf.at.mi_row;
+        let mi_col = leaf.at.mi_col;
+        let above_skip = if self.avail_up(mi_row) {
+            self.contexts.above_skip.get(mi_col).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let left_skip = if self.avail_left(mi_col) {
+            self.contexts
+                .left_skip
+                .get(mi_row % SB_MI)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if let Some(cdf) = self.cdfs.skip.get_mut(usize::from(above_skip + left_skip)) {
+            sink.symbol(cdf, usize::from(leaf.skip));
+        }
+        let [y_delta, uv_delta] = leaf.deltas;
+        self.y_mode_symbols(sink, leaf.at, leaf.y_mode, y_delta);
+        if leaf.at.chroma().is_some() {
+            self.uv_mode_symbols(sink, leaf.at, leaf.y_mode, leaf.uv_mode, uv_delta, leaf.cfl);
+        }
+    }
+
+    /// The luma mode's symbols of a block at the position: `y_mode` under
+    /// its neighbours' modes and, for a directional one, its angle delta.
+    fn y_mode_symbols(&mut self, sink: &mut impl Sink, at: At, y_mode: u8, delta: i8) {
+        let (mi_row, mi_col) = (at.mi_row, at.mi_col);
+        let above_mode = if self.avail_up(mi_row) {
+            self.contexts
+                .above_mode
+                .get(mi_col)
+                .copied()
+                .unwrap_or(DC_PRED)
+        } else {
+            DC_PRED
+        };
+        let left_mode = if self.avail_left(mi_col) {
+            self.contexts
+                .left_mode
+                .get(mi_row % SB_MI)
+                .copied()
+                .unwrap_or(DC_PRED)
+        } else {
+            DC_PRED
+        };
+        if let Some(cdf) = self
+            .cdfs
+            .y_mode
+            .get_mut(mode_context(above_mode))
+            .and_then(|row| row.get_mut(mode_context(left_mode)))
+        {
+            sink.symbol(cdf, usize::from(y_mode));
+        }
+        self.angle_delta_symbol(sink, at, y_mode, delta);
+    }
+
+    /// The chroma mode's symbols of a block at the position under its
+    /// luma mode: `uv_mode` and, for a directional one, its angle delta.
+    fn uv_mode_symbols(
+        &mut self,
+        sink: &mut impl Sink,
+        at: At,
+        y_mode: u8,
+        uv_mode: u8,
+        delta: i8,
+        cfl: [i8; 2],
+    ) {
+        let cdfs = if at.cfl_allowed() {
+            &mut self.cdfs.uv_mode
+        } else {
+            &mut self.cdfs.uv_mode_no_cfl
+        };
+        if let Some(cdf) = cdfs.get_mut(usize::from(y_mode)) {
+            sink.symbol(cdf, usize::from(uv_mode));
+        }
+        if uv_mode == UV_CFL_PRED {
+            // read_cfl_alphas: the joint sign (0 zero, 1 negative, 2
+            // positive, never both zero), then each nonzero magnitude
+            // under its own sign and the other's.
+            let sign = |a: i8| -> usize {
+                match a.signum() {
+                    -1 => 1,
+                    1 => 2,
+                    _ => 0,
+                }
+            };
+            let (sign_u, sign_v) = (sign(cfl[0]), sign(cfl[1]));
+            sink.symbol(
+                &mut self.cdfs.cfl_sign,
+                (sign_u * 3 + sign_v).saturating_sub(1),
+            );
+            for (alpha, own, other) in [(cfl[0], sign_u, sign_v), (cfl[1], sign_v, sign_u)] {
+                if own == 0 {
+                    continue;
+                }
+                if let Some(cdf) = self.cfl_alpha_cdf(own, other) {
+                    sink.symbol(cdf, usize::from(alpha.unsigned_abs()).saturating_sub(1));
+                }
+            }
+        }
+        self.angle_delta_symbol(sink, at, uv_mode, delta);
+    }
+
+    /// A directional mode's angle delta, `-3..=3` coded from 0, in a
+    /// block that has them.
+    fn angle_delta_symbol(&mut self, sink: &mut impl Sink, at: At, mode: u8, delta: i8) {
+        if at.has_angle_deltas() && is_directional(mode) {
+            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(mode - V_PRED)) {
+                sink.symbol(cdf, u8::try_from(delta + 3).map_or(3, usize::from));
+            }
+        }
+    }
+
+    /// The `cfl_alpha` CDF of an alpha with a nonzero sign under the
+    /// other's sign.
+    fn cfl_alpha_cdf(&mut self, own: usize, other: usize) -> Option<&mut Cdf> {
+        self.cdfs.cfl_alpha.get_mut(own.checked_sub(1)? * 3 + other)
+    }
+
+    /// The block's luma reconstruction as chroma-from-luma reads it
+    /// (spec 7.11.5, 4:2:0): each 2x2 summed and doubled, eight times
+    /// the mean, less the block's average, into `ac`. The block's luma,
+    /// under 8x8 its 8x8's, is decoded whole, each transform starting in
+    /// the picture, so no edge is padded.
+    fn cfl_ac(&self, at: At, ac: &mut Vec<i32>) {
+        let (w, h) = at.plane_dims(1);
+        let x = at.mi_col * MI;
+        let y = (at.mi_row - self.band_mi_row) * MI;
+        ac.clear();
+        let Some(luma) = self.recon.first() else {
+            return;
+        };
+        for r in 0..h {
+            let top = luma.row(y + 1 + 2 * r);
+            let bottom = luma.row(y + 2 + 2 * r);
+            for c in 0..w {
+                let at =
+                    |row: &[u8], k: usize| i32::from(row.get(x + 2 * c + k).copied().unwrap_or(0));
+                ac.push((at(top, 0) + at(top, 1) + at(bottom, 0) + at(bottom, 1)) << 1);
+            }
+        }
+        let log2 = w.ilog2() + h.ilog2();
+        let sum: i32 = ac.iter().sum();
+        let average = (sum + ((1 << log2) >> 1)) >> log2;
+        for a in ac.iter_mut() {
+            *a -= average;
+        }
+    }
+
+    /// The alpha, in eighths within 16, whose prediction from `dc` and
+    /// `ac` is closest to the plane's source: the least-squares fit
+    /// rounded, then it and its neighbours by squared error, the smaller
+    /// magnitude, which usually codes in fewer bits, on a tie.
+    fn cfl_alpha(&self, plane: usize, at: At, dc: &[u8], ac: &[i32], pred: &mut [u8]) -> i8 {
+        let (w, _) = at.plane_dims(plane);
+        let x = (at.mi_col * MI) >> 1;
+        let y = ((at.mi_row - self.band_mi_row) * MI) >> 1;
+        let Some(source) = self.source.get(plane) else {
+            return 0;
+        };
+        let (mut num, mut den) = (0i64, 0i64);
+        for (r, (drow, arow)) in dc.chunks_exact(w).zip(ac.chunks_exact(w)).enumerate() {
+            let srow = source.row(y + r).get(x..x + w).unwrap_or(&[]);
+            for ((&s, &d), &a) in srow.iter().zip(drow).zip(arow) {
+                num += i64::from(a) * (i64::from(s) - i64::from(d));
+                den += i64::from(a) * i64::from(a);
+            }
+        }
+        if den == 0 {
+            return 0;
+        }
+        // scaled = alpha * ac / 64, so the fit is 64 num / den.
+        let fit = ((num * 128 / den) + (num * 128 / den).signum()) / 2;
+        let fit = fit.clamp(-16, 16) as i8;
+        let mut best = (u64::MAX, 0i8);
+        for alpha in [fit - 1, fit, fit + 1] {
+            if !(-16..=16).contains(&alpha) {
+                continue;
+            }
+            cfl_predict(dc, ac, alpha, pred);
+            let mut sse = 0u64;
+            for (r, prow) in pred.chunks_exact(w).enumerate() {
+                let srow = source.row(y + r).get(x..x + w).unwrap_or(&[]);
+                for (&s, &p) in srow.iter().zip(prow) {
+                    let d = i64::from(s) - i64::from(p);
+                    sse += (d * d) as u64;
+                }
+            }
+            if (sse, alpha.unsigned_abs()) < (best.0, best.1.unsigned_abs()) {
+                best = (sse, alpha);
+            }
+        }
+        best.1
+    }
+
+    /// The `dc_sign` context of one plane of a block: which way the DC
+    /// signs above and left of it lean.
+    fn dc_sign_ctx(&self, plane: usize, at: At) -> usize {
+        let sub = usize::from(plane > 0);
+        let (w, h) = at.plane_dims(plane);
+        let x4 = at.mi_col >> sub;
+        let y4 = at.sb_row() >> sub;
+        let max_x4 = (self.mi_cols >> sub).saturating_sub((self.x0 / MI) >> sub);
+        let max_y4 = (self.mi_rows >> sub).saturating_sub(self.band_mi_row >> sub);
+        let (_, above_dc, _, left_dc) = self.contexts.plane(plane);
+        let lean = |category: Option<&u8>| match category {
+            Some(1) => -1,
+            Some(2) => 1,
+            _ => 0,
+        };
+        let mut dc_sign = 0i32;
+        for k in (0..w / MI).filter(|k| x4 + k < max_x4) {
+            dc_sign += lean(above_dc.get(x4 + k));
+        }
+        for k in (0..h / MI).filter(|k| y4 + k < max_y4) {
+            dc_sign += lean(left_dc.get(y4 + k));
+        }
+        match dc_sign.signum() {
+            -1 => 1,
+            1 => 2,
+            _ => 0,
+        }
+    }
+
+    /// A transform's level CDFs, for its size and plane type.
+    fn level_cdfs(&self, size: Size, ptype: usize) -> Option<LevelCdfs<'_>> {
+        let size_ctx = size_ctx(size);
+        Some(LevelCdfs {
+            base: self.cdfs.base.get(size_ctx)?.get(ptype)?,
+            base_eob: self.cdfs.base_eob.get(size_ctx)?.get(ptype)?,
+            br: self.cdfs.br.get(size_ctx.min(3))?.get(ptype)?,
+        })
+    }
+
+    /// The rate of an end of block's symbols, in 1/512 bit: its class,
+    /// the class's first extra bit and the plain bits after it.
+    fn eob_rate(&self, size: Size, ptype: usize, eob: usize) -> u64 {
+        if eob == 0 {
+            return 0;
+        }
+        let (eob_pt, extra_bits) = eob_position(eob);
+        let class = (size.coded().area().ilog2() - 4) as usize;
+        let mut rate = self
+            .cdfs
+            .eob_pt
+            .get(class)
+            .and_then(|row| row.get(ptype))
+            .map_or(0, |cdf| cdf.cost(eob_pt - 1));
+        if extra_bits > 0 {
+            let extra = eob - eob_group_start(eob_pt);
+            let top = (extra >> (extra_bits - 1)) & 1 == 1;
+            rate += self
+                .cdfs
+                .eob_extra
+                .get(size_ctx(size))
+                .and_then(|row| row.get(ptype))
+                .and_then(|row| row.get(eob_pt - 3))
+                .map_or(0, |cdf| cdf.cost(usize::from(top)));
+            rate += 512 * (extra_bits as u32 - 1);
+        }
+        u64::from(rate)
+    }
+
+    /// Trellis quantization, libaom's `av1_optimize_txb` in kind: from
+    /// the end of block back, each nonzero level stays or drops by one,
+    /// whichever costs less -- the squared error in the transform domain
+    /// (the coefficients are eight times orthonormal at the dequantizer's
+    /// shift, so 64 of it is a pixel's) and the rate in the context the
+    /// later levels, already final, give it. A last level dropped to zero
+    /// moves the end of block back to the next nonzero one: its end of
+    /// block symbols and the zeros between are priced against the new
+    /// end's. Left out are the next level's change of base symbol and,
+    /// when no level is left, the transform's all-zero and type symbols,
+    /// so a lone level can still zero a transform. Returns the end of
+    /// block.
+    fn trellis(
+        &self,
+        plane: usize,
+        at: At,
+        coeffs: &[i32],
+        levels: &mut [i32],
+        eob: usize,
+        mags: &mut Magnitudes,
+    ) -> usize {
+        if eob == 0 {
+            return 0;
+        }
+        let size = plane_size(at, plane);
+        let coded = size.coded();
+        let w = coded.width();
+        mags.fill(levels, size);
+        let (row_shift, col_mask) = (w.ilog2(), w - 1);
+        let ptype = usize::from(plane > 0);
+        // libaom's `plane_rd_mult` for intra, in sixteenths.
+        let mult = if plane > 0 { 13 } else { 17 };
+        let shift = size.dequant_shift();
+        let (dc, ac) = (
+            i64::from(transform::dc_q(self.qindex)),
+            i64::from(transform::ac_q(self.qindex)),
+        );
+        let dc_sign = self
+            .cdfs
+            .dc_sign
+            .get(ptype)
+            .and_then(|r| r.get(self.dc_sign_ctx(plane, at)));
+        let Some(cdfs) = self.level_cdfs(size, ptype) else {
+            return eob;
+        };
+        let scan = size.scan();
+        let mut eob = eob;
+        for c in (0..eob).rev() {
+            let pos = usize::from(scan.get(c).copied().unwrap_or(0));
+            let (Some(&coeff), Some(&level)) = (coeffs.get(pos), levels.get(pos)) else {
+                continue;
+            };
+            let level = level.unsigned_abs();
+            let last = c + 1 == eob;
+            if level == 0 {
+                if last {
+                    eob = c;
+                }
+                continue;
+            }
+            let (row, col) = (pos >> row_shift, pos & col_mask);
+            let ctx = LevelCtx {
+                eob: last.then(|| base_eob_ctx(c, coded.area())),
+                base: mags.base_ctx(row, col),
+                br: mags.br_ctx(row, col),
+            };
+            let sign = if c == 0 {
+                dc_sign.map_or(0, |cdf| u64::from(cdf.cost(usize::from(coeff < 0))))
+            } else {
+                512
+            };
+            let q = if pos == 0 { dc } else { ac };
+            let target = i64::from(coeff.unsigned_abs()) << shift;
+            let (eob_kept, eob_moved) = if last {
+                // The zeros before the next nonzero level are coded only
+                // while this one is.
+                let mut gap = 0;
+                let mut next = 0;
+                for k in (0..c).rev() {
+                    let pos = usize::from(scan.get(k).copied().unwrap_or(0));
+                    if levels.get(pos).is_some_and(|&l| l != 0) {
+                        next = k + 1;
+                        break;
+                    }
+                    gap += cdfs.zero_rate(mags.base_ctx(pos >> row_shift, pos & col_mask));
+                }
+                (
+                    self.eob_rate(size, ptype, c + 1) + gap,
+                    self.eob_rate(size, ptype, next),
+                )
+            } else {
+                (0, 0)
+            };
+            let cost = |l: u32| -> u64 {
+                // The decoder's dequantized level, at the target's scale.
+                let e = target - (((i64::from(l) * q) >> shift) << shift);
+                let rate = match (l, ctx.eob) {
+                    (0, Some(_)) => eob_moved,
+                    (0, None) => cdfs.zero_rate(ctx.base),
+                    _ => cdfs.rate(ctx, l) + sign + eob_kept,
+                };
+                (((e * e) as u64) << 5) + ((rate * self.rdmult * mult) >> 13)
+            };
+            if cost(level - 1) < cost(level) {
+                let lower = (level - 1) as i32;
+                if let Some(slot) = levels.get_mut(pos) {
+                    *slot = if coeff < 0 { -lower } else { lower };
+                }
+                mags.set(row, col, level - 1);
+                if lower == 0 && last {
+                    eob = c;
+                }
+            }
+        }
+        eob
+    }
+
+    /// The coefficient symbols of one plane of a block (spec `coeffs`),
+    /// from the contexts as they stand.
+    fn coefficient_symbols(
+        &mut self,
+        sink: &mut impl Sink,
+        plane: usize,
+        at: At,
+        y_mode: u8,
+        tx: TxType,
+        coded: Levels<'_>,
+    ) {
+        let Levels { levels, eob } = coded;
+        let sub = usize::from(plane > 0);
+        let size = plane_size(at, plane);
+        let w = size.width();
+        let x4 = at.mi_col >> sub;
+        let y4 = at.sb_row() >> sub;
+        let ptype = usize::from(plane > 0);
+        let size_ctx = size_ctx(size);
+        let max_x4 = (self.mi_cols >> sub).saturating_sub((self.x0 / MI) >> sub);
+        let max_y4 = (self.mi_rows >> sub).saturating_sub(self.band_mi_row >> sub);
+        let (above_level, above_dc, left_level, left_dc) = self.contexts.plane(plane);
+        // all_zero
+        let ctx = if plane == 0 {
+            0
+        } else {
+            let mut above = 0u8;
+            let mut left = 0u8;
+            for k in (0..w / MI).filter(|k| x4 + k < max_x4) {
+                above |= above_level.get(x4 + k).copied().unwrap_or(0);
+                above |= above_dc.get(x4 + k).copied().unwrap_or(0);
+            }
+            for k in (0..size.height() / MI).filter(|k| y4 + k < max_y4) {
+                left |= left_level.get(y4 + k).copied().unwrap_or(0);
+                left |= left_dc.get(y4 + k).copied().unwrap_or(0);
+            }
+            7 + usize::from(above != 0) + usize::from(left != 0)
+        };
+        if let Some(cdf) = self
+            .cdfs
+            .txb_skip
+            .get_mut(size_ctx)
+            .and_then(|row| row.get_mut(ctx))
+        {
+            sink.symbol(cdf, usize::from(eob == 0));
+        }
+        if eob == 0 {
+            return;
+        }
+        if plane == 0 && !dct_only(size) {
+            if let Some(cdf) = self
+                .cdfs
+                .tx_type
+                .get_mut(size_sqr(size))
+                .and_then(|row| row.get_mut(usize::from(y_mode)))
+            {
+                sink.symbol(cdf, tx.symbol());
+            }
+        }
+        // eob_pt and its extra bits
+        let (eob_pt, extra_bits) = eob_position(eob);
+        let coded = size.coded();
+        let class = (coded.area().ilog2() - 4) as usize;
+        if let Some(cdf) = self
+            .cdfs
+            .eob_pt
+            .get_mut(class)
+            .and_then(|row| row.get_mut(ptype))
+        {
+            sink.symbol(cdf, eob_pt - 1);
+        }
+        if extra_bits > 0 {
+            let extra = eob - eob_group_start(eob_pt);
+            let top = (extra >> (extra_bits - 1)) & 1 == 1;
+            if let Some(cdf) = self
+                .cdfs
+                .eob_extra
+                .get_mut(size_ctx)
+                .and_then(|row| row.get_mut(ptype))
+                .and_then(|row| row.get_mut(eob_pt - 3))
+            {
+                sink.symbol(cdf, usize::from(top));
+            }
+            for i in 1..extra_bits {
+                let shift = extra_bits - 1 - i;
+                sink.bit((extra >> shift) & 1 == 1);
+            }
+        }
+        // Levels in reverse scan order.
+        let scan = size.scan();
+        let coded_w = coded.width();
+        let (row_shift, col_mask) = (coded_w.ilog2(), coded_w - 1);
+        let mut mags = std::mem::take(&mut self.mags);
+        mags.fill(levels, size);
+        for c in (0..eob).rev() {
+            let pos = usize::from(scan.get(c).copied().unwrap_or(0));
+            let (row, col) = (pos >> row_shift, pos & col_mask);
+            let level = levels.get(pos).map_or(0, |l| l.abs());
+            if c == eob - 1 {
+                let ctx = base_eob_ctx(c, coded.area());
+                if let Some(cdf) = self
+                    .cdfs
+                    .base_eob
+                    .get_mut(size_ctx)
+                    .and_then(|r| r.get_mut(ptype))
+                    .and_then(|r| r.get_mut(ctx))
+                {
+                    sink.symbol(cdf, level.min(3) as usize - 1);
+                }
+            } else {
+                let ctx = mags.base_ctx(row, col);
+                if let Some(cdf) = self
+                    .cdfs
+                    .base
+                    .get_mut(size_ctx)
+                    .and_then(|r| r.get_mut(ptype))
+                    .and_then(|r| r.get_mut(ctx))
+                {
+                    sink.symbol(cdf, level.min(3) as usize);
+                }
+            }
+            if level > 2 {
+                let ctx = mags.br_ctx(row, col);
+                let base_range = (level - 3) as usize;
+                for idx in (0..12).step_by(3) {
+                    let k = (base_range - idx).min(3);
+                    if let Some(cdf) = self
+                        .cdfs
+                        .br
+                        .get_mut(size_ctx.min(3))
+                        .and_then(|r| r.get_mut(ptype))
+                        .and_then(|r| r.get_mut(ctx))
+                    {
+                        sink.symbol(cdf, k);
+                    }
+                    if k < 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        self.mags = mags;
+        // Signs and the Golomb remainders in scan order.
+        let dc_sign = self.dc_sign_ctx(plane, at);
+        for c in 0..eob {
+            let pos = usize::from(scan.get(c).copied().unwrap_or(0));
+            let Some(&level) = levels.get(pos) else {
+                continue;
+            };
+            if level == 0 {
+                continue;
+            }
+            let negative = level < 0;
+            if c == 0 {
+                if let Some(cdf) = self
+                    .cdfs
+                    .dc_sign
+                    .get_mut(ptype)
+                    .and_then(|r| r.get_mut(dc_sign))
+                {
+                    sink.symbol(cdf, usize::from(negative));
+                }
+            } else {
+                sink.bit(negative);
+            }
+            let magnitude = level.unsigned_abs();
+            if magnitude > 14 {
+                let x = magnitude - 14;
+                let length = 32 - x.leading_zeros();
+                for _ in 0..length - 1 {
+                    sink.bit(false);
+                }
+                for i in (0..length).rev() {
+                    sink.bit((x >> i) & 1 == 1);
+                }
+            }
+        }
+    }
+
+    /// Records a coded block in the contexts, as the decoder would.
+    fn apply_contexts(&mut self, leaf: &Leaf) {
+        let at = leaf.at;
+        let (w4, h4) = (at.w_units(), at.h_units());
+        let sb_row = at.sb_row();
+        for (plane, (levels, &eob)) in leaf.levels.iter().zip(leaf.eob.iter()).enumerate() {
+            let Some(pat) = plane_at(at, plane) else {
+                continue;
+            };
+            let sub = usize::from(plane > 0);
+            let x4 = pat.mi_col >> sub;
+            let y4 = pat.sb_row() >> sub;
+            let (pw4, ph4) = (pat.w_units() >> sub, pat.h_units() >> sub);
+            let (cul, dc) = if leaf.skip || eob == 0 {
+                (0, 0)
+            } else {
+                let cul = levels.iter().map(|l| l.unsigned_abs()).sum::<u32>().min(63) as u8;
+                let dc = match levels.first().copied().unwrap_or(0).signum() {
+                    -1 => 1,
+                    1 => 2,
+                    _ => 0,
+                };
+                (cul, dc)
+            };
+            let (above_level, above_dc, left_level, left_dc) = self.contexts.plane_mut(plane);
+            for (level, sign) in above_level
+                .iter_mut()
+                .zip(above_dc.iter_mut())
+                .skip(x4)
+                .take(pw4)
+                .chain(
+                    left_level
+                        .iter_mut()
+                        .zip(left_dc.iter_mut())
+                        .skip(y4)
+                        .take(ph4),
+                )
+            {
+                *level = cul;
+                *sign = dc;
+            }
+            self.contexts
+                .mark_decoded(plane, (pat.mi_col % SB_MI) >> sub, y4, pw4, ph4);
+        }
+        let mi_col = at.mi_col;
+        let Contexts {
+            above_skip,
+            above_mode,
+            above_uv_mode,
+            above_width_log2,
+            left_skip,
+            left_mode,
+            left_uv_mode,
+            left_height_log2,
+            ..
+        } = &mut self.contexts;
+        for ((skip, mode), width) in above_skip
+            .iter_mut()
+            .zip(above_mode.iter_mut())
+            .zip(above_width_log2.iter_mut())
+            .skip(mi_col)
+            .take(w4)
+        {
+            *skip = u8::from(leaf.skip);
+            *mode = leaf.y_mode;
+            *width = (at.w_log2 - 2) as u8;
+        }
+        for ((skip, mode), height) in left_skip
+            .iter_mut()
+            .zip(left_mode.iter_mut())
+            .zip(left_height_log2.iter_mut())
+            .skip(sb_row)
+            .take(h4)
+        {
+            *skip = u8::from(leaf.skip);
+            *mode = leaf.y_mode;
+            *height = (at.h_log2 - 2) as u8;
+        }
+        if at.chroma().is_some() {
+            above_uv_mode
+                .iter_mut()
+                .skip(mi_col)
+                .take(w4)
+                .chain(left_uv_mode.iter_mut().skip(sb_row).take(h4))
+                .for_each(|mode| *mode = leaf.uv_mode);
+        }
+    }
+
+    /// Writes a decided tree's symbols in coding order.
+    fn emit<'a>(
+        &mut self,
+        sink: &mut impl Sink,
+        at: At,
+        nodes: &mut impl Iterator<Item = &'a Node>,
+    ) {
+        if self.edges(at).is_none() {
+            return;
+        }
+        let half = at.w_units() / 2;
+        let Some(node) = nodes.next() else {
+            return;
+        };
+        let partition = match node {
+            Node::Parts(partition) => *partition,
+            Node::Block(_) => Partition::None,
+        };
+        self.partition_symbol(sink, at, partition);
+        match node {
+            Node::Parts(Partition::Split) => {
+                for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+                    self.emit(sink, at.quarter(dr, dc), nodes);
+                }
+            }
+            Node::Parts(_) => {
+                for _ in 0..2 {
+                    if let Some(Node::Block(leaf)) = nodes.next() {
+                        self.emit_block(sink, leaf);
+                    }
+                }
+            }
+            Node::Block(leaf) => self.emit_block(sink, leaf),
+        }
+    }
+
+    /// Writes a block's mode and coefficient symbols.
+    fn emit_block(&mut self, sink: &mut impl Sink, leaf: &Leaf) {
+        self.mode_symbols(sink, leaf);
+        if !leaf.skip {
+            for (plane, (levels, &eob)) in leaf.levels.iter().zip(leaf.eob.iter()).enumerate() {
+                let Some(pat) = plane_at(leaf.at, plane) else {
+                    continue;
+                };
+                self.coefficient_symbols(
+                    sink,
+                    plane,
+                    pat,
+                    leaf.y_mode,
+                    leaf.tx_type,
+                    Levels { levels, eob },
+                );
+            }
+        }
+        self.apply_contexts(leaf);
+        self.record_block(leaf.at, leaf.skip);
+    }
+
+    /// Records a coded block's size and skip over the 4x4s it covers in
+    /// the band.
+    fn record_block(&mut self, at: At, skip: bool) {
+        let cols = self.width / MI;
+        for r in 0..at.h_units() {
+            let row = at.mi_row - self.band_mi_row + r;
+            let start = row * cols + at.mi_col;
+            let end = (start + at.w_units()).min((row + 1) * cols);
+            if let Some(slots) = self.sizes.get_mut(start..end) {
+                slots.fill(pack_size(at.w_log2, at.h_log2));
+            }
+            if let Some(slots) = self.skips.get_mut(start..end) {
+                slots.fill(skip);
+            }
+        }
+    }
+}
+
+/// libaom's `av1_get_eob_pos_token`: the class of an end of block and
+/// the count of extra bits it carries.
+fn eob_position(eob: usize) -> (usize, usize) {
+    let t = match eob {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        9..=16 => 5,
+        17..=32 => 6,
+        33..=64 => 7,
+        65..=128 => 8,
+        129..=256 => 9,
+        257..=512 => 10,
+        _ => 11,
+    };
+    (t, t.saturating_sub(2))
+}
+
+/// The first end of block of a class.
+fn eob_group_start(t: usize) -> usize {
+    match t {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => (1 << (t - 2)) + 1,
+    }
+}
+
+// ------------------------------------------------ coefficient contexts
+
+/// A block's level magnitudes (at most 63) row-major at a stride four
+/// wider than the block, with four zero rows under it, so the neighbours
+/// a context sums are always in the buffer: libaom's padded `levels`.
+#[derive(Default)]
+struct Magnitudes {
+    v: Vec<u8>,
+    stride: usize,
+    /// The block's shape's `Coeff_Base_Ctx_Offset`.
+    offsets: [[u8; 5]; 5],
+}
+
+/// The spec's `Coeff_Base_Ctx_Offset` of a square, a wide rectangle and
+/// a tall one, by row and column up to 4: the same for every size of a
+/// shape.
+#[rustfmt::skip]
+const BASE_CTX_OFFSETS: [[[u8; 5]; 5]; 3] = [
+    [[0, 1, 6, 6, 21], [1, 6, 6, 21, 21], [6, 6, 21, 21, 21], [6, 21, 21, 21, 21], [21; 5]],
+    [[0, 16, 6, 6, 21], [16, 16, 6, 21, 21], [16, 16, 21, 21, 21], [16, 16, 21, 21, 21],
+     [16, 16, 21, 21, 21]],
+    [[0, 11, 11, 11, 11], [11; 5], [6, 6, 21, 21, 21], [6, 21, 21, 21, 21], [21; 5]],
+];
+
+impl Magnitudes {
+    /// Fills from a transform's levels, row-major at its coded size;
+    /// the offsets follow its full size's shape, as the spec's do.
+    fn fill(&mut self, levels: &[i32], size: Size) {
+        let (w, h) = (size.coded().width(), size.coded().height());
+        self.stride = w + 4;
+        let shape = match size.width().cmp(&size.height()) {
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Less => 2,
+        };
+        self.offsets = BASE_CTX_OFFSETS.get(shape).copied().unwrap_or_default();
+        self.v.clear();
+        self.v.resize(self.stride * (h + 4), 0);
+        for (row, line) in levels.chunks_exact(w.max(1)).take(h).enumerate() {
+            let start = row * self.stride;
+            if let Some(out) = self.v.get_mut(start..start + w) {
+                for (m, &l) in out.iter_mut().zip(line) {
+                    *m = l.unsigned_abs().min(63) as u8;
+                }
+            }
+        }
+    }
+
+    fn set(&mut self, row: usize, col: usize, level: u32) {
+        if let Some(m) = self.v.get_mut(row * self.stride + col) {
+            *m = level.min(63) as u8;
+        }
+    }
+
+    /// The magnitudes right of and below a position, each capped: the
+    /// two beside it, the diagonal, then the two a step further.
+    fn neighbours(&self, row: usize, col: usize, cap: u8) -> [u8; 5] {
+        let at = row * self.stride + col;
+        let get = |k: usize| self.v.get(at + k).map_or(0, |&m| m.min(cap));
+        [
+            get(1),
+            get(self.stride),
+            get(self.stride + 1),
+            get(2),
+            get(2 * self.stride),
+        ]
+    }
+
+    /// The `coeff_base` context of a position short of the end of block
+    /// (spec `get_coeff_base_ctx`, 2D): the magnitudes right of and below
+    /// it, which the reverse scan has coded, and its place by the shape.
+    fn base_ctx(&self, row: usize, col: usize) -> usize {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        let mag: u32 = self
+            .neighbours(row, col, 3)
+            .iter()
+            .map(|&m| u32::from(m))
+            .sum();
+        let ctx = ((mag + 1) >> 1).min(4) as usize;
+        let offset = self
+            .offsets
+            .get(row.min(4))
+            .and_then(|r| r.get(col.min(4)))
+            .copied()
+            .unwrap_or(21);
+        ctx + usize::from(offset)
+    }
+
+    /// The `coeff_br` context of a position (spec `get_br_ctx`, 2D).
+    fn br_ctx(&self, row: usize, col: usize) -> usize {
+        let [right, below, diagonal, _, _] = self.neighbours(row, col, 15);
+        let mag = u32::from(right) + u32::from(below) + u32::from(diagonal);
+        let mag = ((mag + 1) >> 1).min(6) as usize;
+        if row == 0 && col == 0 {
+            mag
+        } else if row < 2 && col < 2 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    }
+}
+
+/// The `coeff_base_eob` context of the end of block's scan index in a
+/// transform of `area` points.
+fn base_eob_ctx(c: usize, area: usize) -> usize {
+    if c == 0 {
+        0
+    } else if c <= area / 8 {
+        1
+    } else if c <= area / 4 {
+        2
+    } else {
+        3
+    }
+}
+
+// --------------------------------------------------- prediction kernels
+
+/// Chroma from luma's prediction (spec 7.11.5): the DC prediction plus
+/// the alpha, in eighths, of the luma's AC, eight times the luma.
+fn cfl_predict(dc: &[u8], ac: &[i32], alpha: i8, out: &mut [u8]) {
+    for ((o, &d), &a) in out.iter_mut().zip(dc).zip(ac) {
+        let scaled = i32::from(alpha) * a;
+        let scaled = if scaled < 0 {
+            -((-scaled + 32) >> 6)
+        } else {
+            (scaled + 32) >> 6
+        };
+        *o = (i32::from(d) + scaled).clamp(0, 255) as u8;
+    }
+}
+
+/// The first `len` of a buffer that only grows.
+fn grown<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) -> &mut [T] {
+    if buffer.len() < len {
+        buffer.resize(len, T::default());
+    }
+    buffer.get_mut(..len).unwrap_or(&mut [])
+}
+
+/// The sum of the absolute values of a 4x4's Hadamard transform, halved
+/// as x264 does.
+fn hadamard4(d: &[[i32; 4]; 4]) -> u64 {
+    let mut m = [[0i32; 4]; 4];
+    for (row, out) in d.iter().zip(m.iter_mut()) {
+        let (a, b) = (row[0] + row[1], row[0] - row[1]);
+        let (c, e) = (row[2] + row[3], row[2] - row[3]);
+        *out = [a + c, b + e, a - c, b - e];
+    }
+    let mut total = 0u64;
+    for (((&r0, &r1), &r2), &r3) in m[0].iter().zip(&m[1]).zip(&m[2]).zip(&m[3]) {
+        let (a, b) = (r0 + r1, r0 - r1);
+        let (c, e) = (r2 + r3, r2 - r3);
+        for v in [a + c, b + e, a - c, b - e] {
+            total += u64::from(v.unsigned_abs());
+        }
+    }
+    total / 2
+}
+
+/// A plane's prediction edges for a `w` by `h` block: `above[1 + i]` is
+/// the spec's `AboveRow[i]`, `above[0]` its `AboveRow[-1]`, the corner;
+/// the same for the left column. Each holds `w + h` past the corner.
+struct Edges {
+    w: usize,
+    h: usize,
+    have_above: bool,
+    have_left: bool,
+    /// How many of the block's `w` above and `h` left pixels are inside
+    /// the mode-info grid, none where the edge is unavailable: where the
+    /// spec's edge filter stops (`numPx`).
+    n_above: usize,
+    n_left: usize,
+    /// The spec's `filterType`: a neighbour is smooth.
+    smooth: bool,
+    above: [u8; EDGE],
+    left: [u8; EDGE],
+}
+
+/// An edge's pixels, the corner and a 64-pixel block's `w + h`.
+const EDGE: usize = 129;
+
+impl Edges {
+    fn new(w: usize, h: usize, above: [u8; EDGE], left: [u8; EDGE]) -> Edges {
+        Edges {
+            w,
+            h,
+            have_above: true,
+            have_left: true,
+            n_above: w,
+            n_left: h,
+            smooth: false,
+            above,
+            left,
+        }
+    }
+}
+
+/// A directional mode's edges, filtered and upsampled (spec 7.11.2.4
+/// with `enable_intra_edge_filter`), those its key changes:
+/// `above[2 + i]` is `AboveRow[i]`, down to the upsampled
+/// `AboveRow[-2]`, the same for the left column.
+struct DrEdges {
+    above: [u8; EDGE + 1],
+    left: [u8; EDGE + 1],
+}
+
+/// The spec's `Intra_Edge_Kernel`, by strength less one.
+const EDGE_KERNELS: [[u16; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+
+/// The spec's `intra_edge_filter_strength_selection` for a block whose
+/// sides sum to `wh`, its angle `delta` degrees from the edge's normal.
+fn edge_strength(wh: usize, delta: i32, smooth: bool) -> usize {
+    let d = delta.abs();
+    let steps: &[(i32, usize)] = match (smooth, wh) {
+        (false, ..=8) => &[(56, 1)],
+        (false, ..=16) => &[(40, 1)],
+        (false, ..=24) => &[(8, 1), (16, 2), (32, 3)],
+        (false, ..=32) => &[(1, 1), (4, 2), (32, 3)],
+        (false, _) => &[(1, 3)],
+        (true, ..=8) => &[(40, 1), (64, 2)],
+        (true, ..=16) => &[(20, 1), (48, 2)],
+        (true, ..=24) => &[(4, 3)],
+        (true, _) => &[(1, 3)],
+    };
+    steps
+        .iter()
+        .take_while(|&&(from, _)| d >= from)
+        .last()
+        .map_or(0, |&(_, strength)| strength)
+}
+
+/// The spec's `intra_edge_upsample_selection`.
+fn edge_upsamples(wh: usize, delta: i32, smooth: bool) -> bool {
+    let d = delta.abs();
+    d > 0 && d < 40 && wh <= if smooth { 8 } else { 16 }
+}
+
+/// The spec's intra edge filter (7.11.2.12) over `edge[..len]`, the
+/// corner first, which it keeps.
+fn filter_edge(edge: &mut [u8], len: usize, strength: usize) {
+    let Some(&[k0, k1, k2, k3, k4]) = strength.checked_sub(1).and_then(|k| EDGE_KERNELS.get(k))
+    else {
+        return;
+    };
+    let len = len.min(edge.len());
+    let (Some(&first), Some(&last)) = (edge.first(), len.checked_sub(1).and_then(|i| edge.get(i)))
+    else {
+        return;
+    };
+    // The edge with each end twice more, so that every tap reads in it.
+    let mut padded = [0u16; EDGE + 4];
+    let values = [first; 2]
+        .into_iter()
+        .chain(edge.iter().take(len).copied())
+        .chain([last; 2]);
+    for (slot, v) in padded.iter_mut().zip(values) {
+        *slot = u16::from(v);
+    }
+    // Tap `j` of pixel `i` reads `padded[i + j]`: five shifted runs.
+    let run = |j: usize| padded.get(j + 1..).unwrap_or(&[]).iter();
+    let taps = run(0).zip(run(1)).zip(run(2)).zip(run(3)).zip(run(4));
+    for (slot, ((((a, b), c), d), e)) in edge.iter_mut().take(len).skip(1).zip(taps) {
+        *slot = ((k0 * a + k1 * b + k2 * c + k3 * d + k4 * e + 8) >> 4) as u8;
+    }
+}
+
+/// The spec's intra edge upsample (7.11.2.11) of an edge's `n` pixels
+/// past its corner, `edge[1]`, into `2 * n` from `edge[0]`.
+fn upsample_edge(edge: &mut [u8; EDGE + 1], n: usize) {
+    let at = |edge: &[u8; EDGE + 1], i: usize| i32::from(edge.get(i).copied().unwrap_or(0));
+    // `edge_upsamples` keeps `n` to 16.
+    let mut dup = [0i32; 19];
+    let corner = at(edge, 1);
+    for (i, slot) in dup.iter_mut().enumerate().take(n + 3) {
+        *slot = match i {
+            0 | 1 => corner,
+            _ if i == n + 2 => at(edge, n + 1),
+            _ => at(edge, i),
+        };
+    }
+    if let Some(slot) = edge.get_mut(0) {
+        *slot = corner as u8;
+    }
+    for i in 0..n {
+        let d = |k: usize| dup.get(i + k).copied().unwrap_or(0);
+        let s = (-d(0) + 9 * d(1) + 9 * d(2) - d(3) + 8) >> 4;
+        if let Some(slot) = edge.get_mut(2 * i + 1) {
+            *slot = s.clamp(0, 255) as u8;
+        }
+        if let Some(slot) = edge.get_mut(2 * i + 2) {
+            *slot = d(2) as u8;
+        }
+    }
+}
+
+/// What a directional angle does to a block's edges (spec 7.11.2.4):
+/// whether it filters the corner, each edge's filter strength and the
+/// pixels it filters from the corner, and how many each upsamples.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct DrKey {
+    corner: bool,
+    filter_above: (u8, u8),
+    filter_left: (u8, u8),
+    up_above: u8,
+    up_left: u8,
+}
+
+impl DrKey {
+    fn changes_above(self) -> bool {
+        self.corner || self.filter_above.0 > 0 || self.up_above > 0
+    }
+
+    fn changes_left(self) -> bool {
+        self.corner || self.filter_left.0 > 0 || self.up_left > 0
+    }
+
+    /// The angle's, the default where the edges stay the block's own.
+    fn new(edges: &Edges, angle: i32) -> DrKey {
+        if angle == 90 || angle == 180 {
+            return DrKey::default();
+        }
+        let (w, h, smooth) = (edges.w, edges.h, edges.smooth);
+        let (need_above, need_left) = (angle < 180, angle > 90);
+        let filter = |need: bool, n: usize, delta: i32, extra: usize| {
+            let strength = if need && n > 0 {
+                edge_strength(w + h, delta, smooth)
+            } else {
+                0
+            };
+            if strength > 0 {
+                (strength as u8, (n + 1 + extra) as u8)
+            } else {
+                (0, 0)
+            }
+        };
+        let up = |need: bool, delta: i32, n: usize| {
+            if need && edge_upsamples(w + h, delta, smooth) {
+                n as u8
+            } else {
+                0
+            }
+        };
+        DrKey {
+            corner: need_above && need_left && w + h >= 24,
+            filter_above: filter(
+                need_above,
+                edges.n_above,
+                angle - 90,
+                if angle < 90 { h } else { 0 },
+            ),
+            filter_left: filter(
+                need_left,
+                edges.n_left,
+                angle - 180,
+                if angle > 180 { w } else { 0 },
+            ),
+            up_above: up(need_above, angle - 90, w + if angle < 90 { h } else { 0 }),
+            up_left: up(need_left, angle - 180, h + if angle > 180 { w } else { 0 }),
+        }
+    }
+}
+
+impl DrEdges {
+    /// The block's edges as the key has them, those it changes.
+    fn new(edges: &Edges, key: DrKey) -> DrEdges {
+        let mut dr = DrEdges {
+            above: [0; EDGE + 1],
+            left: [0; EDGE + 1],
+        };
+        let (above, left) = (&edges.above, &edges.left);
+        // What a prediction reads: to `AboveRow[w + h - 1]` from the
+        // corner.
+        for (changed, to, from) in [
+            (key.changes_above(), &mut dr.above, above),
+            (key.changes_left(), &mut dr.left, left),
+        ] {
+            if changed {
+                for (slot, &v) in to
+                    .iter_mut()
+                    .skip(1)
+                    .zip(from.iter())
+                    .take(edges.w + edges.h + 1)
+                {
+                    *slot = v;
+                }
+            }
+        }
+        if key.corner {
+            let px = |edge: &[u8; EDGE], i: usize| u32::from(edge.get(i).copied().unwrap_or(0));
+            let s = (5 * px(left, 1) + 6 * px(above, 0) + 5 * px(above, 1) + 8) >> 4;
+            for edge in [&mut dr.above, &mut dr.left] {
+                if let Some(corner) = edge.get_mut(1) {
+                    *corner = s as u8;
+                }
+            }
+        }
+        for ((strength, len), edge) in [
+            (key.filter_above, &mut dr.above),
+            (key.filter_left, &mut dr.left),
+        ] {
+            filter_edge(
+                edge.get_mut(1..).unwrap_or(&mut []),
+                usize::from(len),
+                usize::from(strength),
+            );
+        }
+        for (n, edge) in [(key.up_above, &mut dr.above), (key.up_left, &mut dr.left)] {
+            if n > 0 {
+                upsample_edge(edge, usize::from(n));
+            }
+        }
+        dr
+    }
+}
+
+/// Fills a block `w` across row by row with `value(i, j)`, clamped to a
+/// pixel.
+fn fill(out: &mut [u8], w: usize, value: impl Fn(usize, usize) -> i32) {
+    for (i, row) in out.chunks_exact_mut(w).enumerate() {
+        for (j, slot) in row.iter_mut().enumerate() {
+            *slot = value(i, j).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// The spec's prediction of a `w` by `h` block from the edges, a
+/// directional mode's angle moved by `delta` steps of three degrees and,
+/// unless `filtered` is false, its edges through the intra edge filter:
+/// the screen's cheaper estimate, which a trial predicts again exactly.
+fn predict_block(mode: u8, delta: i8, edges: &Edges, filtered: bool, out: &mut [u8]) {
+    if is_directional(mode) {
+        predict_directional(mode, delta, edges, filtered, out);
+        return;
+    }
+    let Edges {
+        w,
+        h,
+        have_above,
+        have_left,
+        ref above,
+        ref left,
+        ..
+    } = *edges;
+    let a = |i: isize| i32::from(above.get((i + 1) as usize).copied().unwrap_or(128));
+    let l = |i: isize| i32::from(left.get((i + 1) as usize).copied().unwrap_or(128));
+    match mode {
+        DC_PRED => {
+            let above_sum = || (0..w as isize).map(a).sum::<i32>();
+            let left_sum = || (0..h as isize).map(l).sum::<i32>();
+            let v = if have_above && have_left {
+                let count = (w + h) as i32;
+                (above_sum() + left_sum() + count / 2) / count
+            } else if have_left {
+                (left_sum() + h as i32 / 2) / h as i32
+            } else if have_above {
+                (above_sum() + w as i32 / 2) / w as i32
+            } else {
+                128
+            };
+            out.fill(v.clamp(0, 255) as u8);
+        }
+        SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED => {
+            let (across, down) = (sm_weights(w), sm_weights(h));
+            let weight_x = |j: usize| i32::from(across.get(j).copied().unwrap_or(0));
+            let weight_y = |i: usize| i32::from(down.get(i).copied().unwrap_or(0));
+            let below = l(h as isize - 1);
+            let right = a(w as isize - 1);
+            match mode {
+                SMOOTH_PRED => fill(out, w, |i, j| {
+                    let s = weight_y(i) * a(j as isize)
+                        + (256 - weight_y(i)) * below
+                        + weight_x(j) * l(i as isize)
+                        + (256 - weight_x(j)) * right;
+                    (s + 256) >> 9
+                }),
+                SMOOTH_V_PRED => fill(out, w, |i, j| {
+                    let s = weight_y(i) * a(j as isize) + (256 - weight_y(i)) * below;
+                    (s + 128) >> 8
+                }),
+                _ => fill(out, w, |i, j| {
+                    let s = weight_x(j) * l(i as isize) + (256 - weight_x(j)) * right;
+                    (s + 128) >> 8
+                }),
+            }
+        }
+        PAETH_PRED => {
+            let corner = a(-1);
+            fill(out, w, |i, j| {
+                let (top, side) = (a(j as isize), l(i as isize));
+                let base = top + side - corner;
+                let (p_left, p_top, p_corner) = (
+                    (base - side).abs(),
+                    (base - top).abs(),
+                    (base - corner).abs(),
+                );
+                if p_left <= p_top && p_left <= p_corner {
+                    side
+                } else if p_top <= p_corner {
+                    top
+                } else {
+                    corner
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// `predict_block` for a directional mode, from the edges its angle
+/// filters and upsamples.
+fn predict_directional(mode: u8, delta: i8, edges: &Edges, filtered: bool, out: &mut [u8]) {
+    /// The edge from the entry `lead` past `k`, where `lead` is the
+    /// entry of `AboveRow[0]` or `LeftCol[0]`.
+    fn from(edge: &[u8], lead: i32, k: i32) -> &[u8] {
+        usize::try_from(k + lead)
+            .ok()
+            .and_then(|i| edge.get(i..))
+            .unwrap_or(&[])
+    }
+    let (w, h) = (edges.w, edges.h);
+    let angle = mode_angle(mode) + 3 * i32::from(delta);
+    if angle == 90 {
+        if let Some(top) = edges.above.get(1..=w) {
+            for row in out.chunks_exact_mut(w) {
+                row.copy_from_slice(top);
+            }
+        }
+        return;
+    }
+    if angle == 180 {
+        for (row, &side) in out.chunks_exact_mut(w).zip(edges.left.iter().skip(1)) {
+            row.fill(side);
+        }
+        return;
+    }
+    let key = if filtered {
+        DrKey::new(edges, angle)
+    } else {
+        DrKey::default()
+    };
+    let dr = (key != DrKey::default()).then(|| DrEdges::new(edges, key));
+    // Each edge, the entry of its pixel 0, and whether it is upsampled:
+    // then a pixel's step along it is two entries, a position's
+    // fraction a 32nd, and its extent twice as far.
+    let (above, lead_above, ua): (&[u8], i32, i32) = match &dr {
+        Some(dr) if key.changes_above() => (&dr.above, 2, i32::from(key.up_above > 0)),
+        _ => (&edges.above, 1, 0),
+    };
+    let (left, lead_left, ul): (&[u8], i32, i32) = match &dr {
+        Some(dr) if key.changes_left() => (&dr.left, 2, i32::from(key.up_left > 0)),
+        _ => (&edges.left, 1, 0),
+    };
+    // Past the edge's last pixel, `AboveRow[w + h - 1]` or
+    // `LeftCol[w + h - 1]`, a line holds it.
+    let max_base = (w + h) as i32 - 1;
+    // How many of a line's `n` pixels from `base` fall before the edge's
+    // last, at steps of `1 << up`.
+    let inside = |base: i32, up: i32, n: usize| {
+        (((max_base << up) - base + (1 << up) - 1) >> up).clamp(0, n as i32) as usize
+    };
+    let last = |edge: &[u8], lead: i32, up: i32| {
+        from(edge, lead, max_base << up)
+            .first()
+            .copied()
+            .unwrap_or(128)
+    };
+    if angle < 90 {
+        // Row by row from the above edge: the step between two
+        // pixels is the row's.
+        let dx = derivative(angle);
+        let last = last(above, lead_above, ua);
+        for (i, row) in out.chunks_exact_mut(w).enumerate() {
+            let x = (i as i32 + 1) * dx;
+            let base = x >> (6 - ua);
+            let (inner, outer) = row.split_at_mut(inside(base, ua, w));
+            blend(
+                inner,
+                from(above, lead_above, base),
+                ((x << ua) & 0x3F) >> 1,
+                ua,
+            );
+            outer.fill(last);
+        }
+    } else if angle < 180 {
+        // Each row reads the above edge from the column where its
+        // projection meets it, at one step, and the left edge
+        // before that.
+        let dx = derivative(180 - angle);
+        let dy = derivative(angle - 90);
+        for (i, row) in out.chunks_exact_mut(w).enumerate() {
+            let back = -(i as i32 + 1) * dx;
+            let first = (-1 - (back >> 6)).clamp(0, w as i32);
+            let (by_left, by_above) = row.split_at_mut(first as usize);
+            // The above part begins at or just past the corner.
+            let x = (first << 6) + back;
+            let shift = ((x << ua) & 0x3F) >> 1;
+            blend(by_above, from(above, lead_above, x >> (6 - ua)), shift, ua);
+            for (j, slot) in by_left.iter_mut().enumerate() {
+                let y = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                // One pixel reads one pair, whatever the edge's step.
+                let pair = from(left, lead_left, y >> (6 - ul));
+                blend(std::slice::from_mut(slot), pair, ((y << ul) & 0x3F) >> 1, 0);
+            }
+        }
+    } else {
+        // Column by column from the left edge, as rows are from
+        // the above one.
+        let dy = derivative(270 - angle);
+        let last = last(left, lead_left, ul);
+        let mut column = [0u8; 64];
+        for j in 0..w {
+            let y = (j as i32 + 1) * dy;
+            let base = y >> (6 - ul);
+            let line = column.get_mut(..h).unwrap_or(&mut []);
+            let (inner, outer) = line.split_at_mut(inside(base, ul, h));
+            blend(
+                inner,
+                from(left, lead_left, base),
+                ((y << ul) & 0x3F) >> 1,
+                ul,
+            );
+            outer.fill(last);
+            for (slot, &v) in out.iter_mut().skip(j).step_by(w).zip(column.iter()) {
+                *slot = v;
+            }
+        }
+    }
+}
+
+/// `out[j]` the edge's `edge[j << up]` and the entry after it mixed
+/// `32 - shift` to `shift` in 32nds, rounded: a directional prediction's
+/// line, along an edge upsampled (`up` 1) or not.
+fn blend(out: &mut [u8], edge: &[u8], shift: i32, up: i32) {
+    let mix = |p: u8, q: u8| ((i32::from(p) * (32 - shift) + i32::from(q) * shift + 16) >> 5) as u8;
+    if up == 0 {
+        for (slot, (&p, &q)) in out.iter_mut().zip(edge.iter().zip(edge.iter().skip(1))) {
+            *slot = mix(p, q);
+        }
+    } else {
+        for (slot, &[p, q]) in out.iter_mut().zip(edge.as_chunks::<2>().0) {
+            *slot = mix(p, q);
+        }
+    }
+}
+
+// ------------------------------------------------------------ encoder
+
+/// The frame as the encoder reconstructed it, which is what every
+/// decoder shows: 4:2:0 planes, the chroma ones half the size rounded
+/// up.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Reconstruction {
+    pub width: usize,
+    pub height: usize,
+    pub planes: [Vec<u8>; 3],
+}
+
+/// A streaming encoder: fed interleaved 8-bit RGB rows in any number at
+/// a time, it converts and codes a superblock row whenever one is
+/// complete, and `finish` returns the OBUs.
+/// Executes a wavefront job queue. Start jobs from the end of `items`:
+/// a job can wait on jobs after it. Run each exactly once and join all
+/// workers before returning. The encoder itself starts no threads.
+pub trait Runner {
+    fn run<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) + Sync);
+}
+
+/// Runs the queue on the calling thread, in dependency order.
+pub struct InOrder;
+impl Runner for InOrder {
+    fn run<T: Send>(items: Vec<T>, _threads: usize, work: impl Fn(T) + Sync) {
+        for item in items.into_iter().rev() {
+            work(item);
+        }
+    }
+}
+
+pub struct Encoder<R: Runner = InOrder> {
+    runner: std::marker::PhantomData<R>,
+    geometry: Geometry,
+    qindex: u8,
+    threads: usize,
+    taken: usize,
+    /// Rows received and not yet converted, at most a superblock row.
+    pending: Vec<u8>,
+    /// The converted planes of the superblock rows not yet coded,
+    /// frame-wide padded, up to `WAVE_ROWS` a thread.
+    batch: Vec<[Band; 3]>,
+    /// The tiles of the current tile row, by column.
+    waves: Vec<Wave>,
+    /// Coded tiles' bytes in tile order.
+    coded: Vec<Vec<u8>>,
+    /// The superblock rows converted.
+    sb_row: usize,
+    /// The frame's deblocking levels and CDEF strengths.
+    levels: deblock::Levels,
+    strengths: cdef::Strengths,
+    /// The reconstruction as a decoder holds it before the filter,
+    /// gathered when asked for.
+    kept: Option<Kept>,
+}
+
+/// The reconstruction before the filters: the planes padded to whole
+/// superblocks, which hold every pixel the filters read, and each luma
+/// 4x4's block size (`pack_size`) and skip, `sb_cols * SB_MI`
+/// to a row.
+struct Kept {
+    planes: [Vec<u8>; 3],
+    sizes: Vec<u8>,
+    skips: Vec<bool>,
+}
+
+/// The superblock rows a batch holds per thread: enough that a tile's
+/// wavefront fills the threads between batches, whose first row waits
+/// for the last before.
+const WAVE_ROWS: usize = 4;
+
+impl Kept {
+    /// Copies a searched superblock row of a tile in.
+    fn take(&mut self, tile: &Tile, geometry: &Geometry) {
+        let stride = geometry.sb_cols * SB;
+        let mi_stride = geometry.sb_cols * SB_MI;
+        let y0 = tile.band_mi_row * MI;
+        for (plane, band) in tile.recon.iter().enumerate() {
+            let sub = usize::from(plane > 0);
+            let (w, x0) = (tile.width >> sub, tile.x0 >> sub);
+            let Some(out) = self.planes.get_mut(plane) else {
+                continue;
+            };
+            for r in 0..(SB >> sub) {
+                let at = ((y0 >> sub) + r) * (stride >> sub) + x0;
+                if let (Some(src), Some(dst)) = (band.row(r + 1).get(..w), out.get_mut(at..at + w))
+                {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        let cols = tile.width / MI;
+        for (r, (sizes, skips)) in tile
+            .sizes
+            .chunks_exact(cols)
+            .zip(tile.skips.chunks_exact(cols))
+            .enumerate()
+        {
+            let at = (tile.band_mi_row + r) * mi_stride + tile.x0 / MI;
+            if let Some(dst) = self.sizes.get_mut(at..at + cols) {
+                dst.copy_from_slice(sizes);
+            }
+            if let Some(dst) = self.skips.get_mut(at..at + cols) {
+                dst.copy_from_slice(skips);
+            }
+        }
+    }
+}
+
+impl<R: Runner> Encoder<R> {
+    /// Begins a `width` by `height` frame at `quality` (1..=100).
+    pub fn new(width: usize, height: usize, quality: u8, threads: usize) -> Result<Self, Error> {
+        Self::with_geometry(Geometry::new(width, height)?, quality, threads)
+    }
+
+    /// `new` over a grid `Geometry` chose for the caller.
+    pub fn with_geometry(geometry: Geometry, quality: u8, threads: usize) -> Result<Self, Error> {
+        Ok(Encoder {
+            runner: std::marker::PhantomData,
+            geometry,
+            qindex: qindex(quality),
+            threads: threads.clamp(1, MAX_THREADS),
+            taken: 0,
+            pending: Vec::new(),
+            batch: Vec::new(),
+            waves: Vec::new(),
+            coded: Vec::new(),
+            sb_row: 0,
+            levels: filter_levels(qindex(quality)),
+            strengths: cdef_strengths(qindex(quality)),
+            kept: None,
+        })
+    }
+
+    /// Asks for the reconstruction to be kept for `finish_with`.
+    pub fn keep_reconstruction(&mut self) {
+        let (w, h) = (self.geometry.sb_cols * SB, self.geometry.sb_rows * SB);
+        let cells = self.geometry.sb_cols * SB_MI * self.geometry.sb_rows * SB_MI;
+        self.kept = Some(Kept {
+            planes: [vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]],
+            sizes: vec![pack_size(3, 3); cells],
+            skips: vec![true; cells],
+        });
+    }
+
+    pub fn geometry(&self) -> &Geometry {
+        &self.geometry
+    }
+
+    /// Feeds whole rows of interleaved RGB: their length must be a
+    /// multiple of the row's, and the rows so far must not pass the
+    /// height.
+    pub fn encode_rows(&mut self, rows: &[u8]) -> Result<(), Error> {
+        let row_bytes = self.geometry.width * 3;
+        if row_bytes == 0 || !rows.len().is_multiple_of(row_bytes) {
+            return Err(Error::Rows);
+        }
+        let count = rows.len() / row_bytes;
+        if self.taken.saturating_add(count) > self.geometry.height {
+            return Err(Error::Rows);
+        }
+        self.taken += count;
+        self.pending.extend_from_slice(rows);
+        // The whole bands go, and what is left of a band is copied once
+        // per call, not once per band.
+        let pending = std::mem::take(&mut self.pending);
+        let mut bands = pending.chunks_exact(row_bytes * SB);
+        for band in &mut bands {
+            self.code_band(band, SB);
+        }
+        self.pending = bands.remainder().to_vec();
+        Ok(())
+    }
+
+    /// Codes the bottom rows and closes the stream: the sequence header
+    /// OBU and the frame OBU.
+    pub fn finish(self) -> Result<Vec<u8>, Error> {
+        self.finish_with().map(|(obus, _)| obus)
+    }
+
+    /// `finish`, with the reconstruction if it was kept.
+    pub fn finish_with(mut self) -> Result<(Vec<u8>, Option<Reconstruction>), Error> {
+        if self.taken != self.geometry.height {
+            return Err(Error::Rows);
+        }
+        let row_bytes = self.geometry.width * 3;
+        let rows = self.pending.len() / row_bytes;
+        if rows > 0 {
+            let band = std::mem::take(&mut self.pending);
+            self.code_band(&band, rows);
+        }
+        self.flush();
+        self.close_tile_row();
+        let mut out = Vec::new();
+        obu(
+            &mut out,
+            OBU_SEQUENCE_HEADER,
+            &sequence_header(&self.geometry),
+        );
+        let mut frame =
+            frame_header(&self.geometry, self.qindex, self.levels, self.strengths).bytes;
+        let tiles = self.geometry.tile_cols() * self.geometry.tile_rows();
+        if tiles > 1 {
+            // tile_start_and_end_present_flag, then the alignment.
+            frame.push(0);
+        }
+        for (index, data) in self.coded.iter().enumerate() {
+            if index + 1 < tiles {
+                let size = (data.len() - 1) as u32;
+                frame.extend_from_slice(&size.to_le_bytes());
+            }
+            frame.extend_from_slice(data);
+        }
+        obu(&mut out, OBU_FRAME, &frame);
+        let reconstruction = self.kept.take().map(|kept| self.reconstruct(kept));
+        Ok((out, reconstruction))
+    }
+
+    /// The kept frame filtered as a decoder filters it, deblocking then
+    /// CDEF, then cropped to the picture.
+    fn reconstruct(&self, kept: Kept) -> Reconstruction {
+        let Kept {
+            mut planes,
+            sizes,
+            skips,
+        } = kept;
+        let (width, height) = (self.geometry.width, self.geometry.height);
+        let stride = self.geometry.sb_cols * SB;
+        let mi_stride = self.geometry.sb_cols * SB_MI;
+        let [y, u, v] = &mut planes;
+        // Each filter's view of a padded plane: `sub` its subsampling.
+        fn plane(
+            data: &mut [u8],
+            stride: usize,
+            (w, h): (usize, usize),
+            sub: usize,
+        ) -> deblock::Plane<'_> {
+            deblock::Plane {
+                data,
+                stride: stride >> sub,
+                width: w.div_ceil(1 << sub),
+                height: h.div_ceil(1 << sub),
+            }
+        }
+        let size = (width, height);
+        deblock::filter(
+            [
+                plane(y, stride, size, 0),
+                plane(u, stride, size, 1),
+                plane(v, stride, size, 1),
+            ],
+            self.levels,
+            |mi_row, mi_col, vertical| {
+                sizes
+                    .get(mi_row * mi_stride + mi_col)
+                    .map_or(3, |&s| unpack_size(s, vertical))
+            },
+        );
+        let (mi_cols, mi_rows) = (self.geometry.mi_cols, self.geometry.mi_rows);
+        cdef::filter(
+            [
+                plane(y, stride, size, 0),
+                plane(u, stride, size, 1),
+                plane(v, stride, size, 1),
+            ],
+            self.strengths,
+            mi_rows,
+            mi_cols,
+            |row, col| {
+                let at = 2 * row * mi_stride + 2 * col;
+                [at, at + 1, at + mi_stride, at + mi_stride + 1]
+                    .iter()
+                    .all(|&k| skips.get(k).copied().unwrap_or(true))
+            },
+        );
+        let crop = |padded: &[u8], sub: usize| -> Vec<u8> {
+            let (w, h) = (width.div_ceil(1 << sub), height.div_ceil(1 << sub));
+            padded
+                .chunks_exact(stride >> sub)
+                .take(h)
+                .flat_map(|row| row.get(..w).unwrap_or(&[]))
+                .copied()
+                .collect()
+        };
+        Reconstruction {
+            width,
+            height,
+            planes: [crop(y, 0), crop(u, 1), crop(v, 1)],
+        }
+    }
+
+    /// Converts a band of `rows` RGB rows into the planes, padded, as
+    /// one superblock row of the batch, and codes the batch when it is
+    /// full.
+    fn code_band(&mut self, band: &[u8], rows: usize) {
+        if let Some(tile_row) = self.geometry.tile_row_starting(self.sb_row) {
+            self.flush();
+            self.close_tile_row();
+            self.open_tile_row(tile_row);
+        }
+        let width = self.geometry.width;
+        let stride = self.geometry.sb_cols * SB;
+        let mut planes = [
+            Band::new(stride, SB),
+            Band::new(stride / 2, SB / 2),
+            Band::new(stride / 2, SB / 2),
+        ];
+        let rgb_at = |x: usize, y: usize| -> (i32, i32, i32) {
+            let x = x.min(width - 1);
+            let y = y.min(rows - 1);
+            let at = (y * width + x) * 3;
+            let px = band.get(at..at + 3).unwrap_or(&[0, 0, 0]);
+            (
+                i32::from(px.first().copied().unwrap_or(0)),
+                i32::from(px.get(1).copied().unwrap_or(0)),
+                i32::from(px.get(2).copied().unwrap_or(0)),
+            )
+        };
+        for y in 0..SB {
+            for x in 0..stride {
+                let (r, g, b) = rgb_at(x, y);
+                let luma = (77 * r + 150 * g + 29 * b + 128) >> 8;
+                if let Some(slot) = planes[0].data.get_mut(y * stride + x) {
+                    *slot = luma.clamp(0, 255) as u8;
+                }
+            }
+        }
+        for y in 0..SB / 2 {
+            for x in 0..stride / 2 {
+                let mut cb = 0;
+                let mut cr = 0;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (r, g, b) = rgb_at(2 * x + dx, 2 * y + dy);
+                    cb += -43 * r - 85 * g + 128 * b;
+                    cr += 128 * r - 107 * g - 21 * b;
+                }
+                let cb = 128 + ((cb + 512) >> 10);
+                let cr = 128 + ((cr + 512) >> 10);
+                if let Some(slot) = planes[1].data.get_mut(y * (stride / 2) + x) {
+                    *slot = cb.clamp(0, 255) as u8;
+                }
+                if let Some(slot) = planes[2].data.get_mut(y * (stride / 2) + x) {
+                    *slot = cr.clamp(0, 255) as u8;
+                }
+            }
+        }
+        self.batch.push(planes);
+        self.sb_row += 1;
+        if self.batch.len() >= WAVE_ROWS * self.threads {
+            self.flush();
+        }
+    }
+
+    /// Codes the batch: each tile's rows searched in a wavefront, all
+    /// the tiles' rows over the threads in order, so the row a row
+    /// waits for is always under way.
+    fn flush(&mut self) {
+        let rows = std::mem::take(&mut self.batch);
+        let first = self.sb_row - rows.len();
+        for wave in &mut self.waves {
+            wave.begin(rows.len());
+        }
+        let kept = Mutex::new(self.kept.take());
+        let jobs: Vec<(usize, &Wave)> = (0..rows.len())
+            .rev()
+            .flat_map(|row| self.waves.iter().rev().map(move |wave| (row, wave)))
+            .collect();
+        let (geometry, qindex) = (&self.geometry, self.qindex);
+        R::run(jobs, self.threads, |(row, wave)| {
+            if let Some(planes) = rows.get(row) {
+                wave.search(row, first + row, planes, geometry, qindex, &kept);
+            }
+        });
+        self.kept = kept.into_inner().unwrap_or_else(PoisonError::into_inner);
+    }
+
+    fn open_tile_row(&mut self, tile_row: usize) {
+        let g = &self.geometry;
+        let mi_row_start = g.tile_row_starts.get(tile_row).copied().unwrap_or(0) * SB_MI;
+        let mi_row_end = g
+            .tile_row_starts
+            .get(tile_row + 1)
+            .copied()
+            .unwrap_or(g.sb_rows)
+            * SB_MI;
+        let mi_row_end = mi_row_end.min(g.mi_rows);
+        self.waves = (0..g.tile_cols())
+            .map(|col| {
+                let start = g.tile_col_starts.get(col).copied().unwrap_or(0);
+                let end = g.tile_col_starts.get(col + 1).copied().unwrap_or(g.sb_cols);
+                Wave::new(
+                    start * SB,
+                    (end - start) * SB,
+                    (mi_row_start, mi_row_end),
+                    g,
+                    self.qindex,
+                )
+            })
+            .collect();
+    }
+
+    fn close_tile_row(&mut self) {
+        for wave in self.waves.drain(..) {
+            let coding = wave
+                .coding
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.coded.push(coding.tile.coder.finish());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    type Encoder = super::Encoder<InOrder>;
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+    }
+
+    /// The spec's symbol decoder (8.2), written from the text: what any
+    /// decoder does with the coder's bytes.
+    struct Decoder<'a> {
+        data: &'a [u8],
+        bit: usize,
+        value: u32,
+        range: u32,
+        max_bits: i64,
+    }
+
+    impl<'a> Decoder<'a> {
+        fn new(data: &'a [u8]) -> Decoder<'a> {
+            let mut d = Decoder {
+                data,
+                bit: 0,
+                value: 0,
+                range: 1 << 15,
+                max_bits: 8 * data.len() as i64 - 15,
+            };
+            let num_bits = (data.len() * 8).min(15);
+            let buf = d.f(num_bits);
+            let padded = buf << (15 - num_bits);
+            d.value = ((1 << 15) - 1) ^ padded;
+            d
+        }
+
+        fn f(&mut self, n: usize) -> u32 {
+            let mut v = 0;
+            for _ in 0..n {
+                let byte = self.data.get(self.bit / 8).copied().unwrap_or(0);
+                let bit = (byte >> (7 - self.bit % 8)) & 1;
+                v = (v << 1) | u32::from(bit);
+                self.bit += 1;
+            }
+            v
+        }
+
+        fn read(&mut self, cdf: &mut Cdf, adapt: bool) -> usize {
+            let n = cdf.n;
+            let mut cur = self.range;
+            let mut symbol = 0;
+            loop {
+                let prev = cur;
+                let f = (1 << 15) - cdf.at(symbol);
+                cur = (((self.range >> 8) * (f >> 6)) >> 1) + 4 * (n as u32 - symbol as u32 - 1);
+                if self.value >= cur {
+                    self.range = prev - cur;
+                    self.value -= cur;
+                    break;
+                }
+                symbol += 1;
+            }
+            let bits = 15 - (31 - self.range.leading_zeros());
+            self.range <<= bits;
+            let num_bits = (bits as i64).min(self.max_bits.max(0)) as usize;
+            let new_data = self.f(num_bits);
+            let padded = new_data << (bits as usize - num_bits);
+            self.value = padded ^ (((self.value + 1) << bits) - 1);
+            self.max_bits -= i64::from(bits);
+            if adapt {
+                cdf.adapt(symbol);
+            }
+            symbol
+        }
+
+        fn bool(&mut self) -> bool {
+            let mut cdf = Cdf::new(&[16384]);
+            self.read(&mut cdf, false) == 1
+        }
+    }
+
+    #[test]
+    fn the_coder_writes_what_the_specs_decoder_reads() {
+        let mut rng = Lcg(3);
+        for round in 0..20 {
+            let sizes = [2usize, 3, 4, 5, 7, 10, 13, 14, 16];
+            let mut encoder_cdfs: Vec<Cdf> = sizes
+                .iter()
+                .map(|&n| {
+                    let mut values = [0u16; 16];
+                    for (i, v) in values.iter_mut().enumerate().take(n - 1) {
+                        *v = ((i + 1) * 32768 / n) as u16;
+                    }
+                    let mut cdf = Cdf::new(&values);
+                    cdf.n = n;
+                    for slot in cdf.v.iter_mut().skip(n - 1) {
+                        *slot = 32768;
+                    }
+                    cdf.v[n] = 0;
+                    cdf
+                })
+                .collect();
+            let mut decoder_cdfs = encoder_cdfs.clone();
+            let count = 1 + round * 50;
+            let mut symbols = Vec::new();
+            let mut coder = Coder::new();
+            for _ in 0..count {
+                let which = rng.next() as usize % sizes.len();
+                match rng.next() % 3 {
+                    0 => {
+                        let bit = rng.next() & 1 == 1;
+                        coder.bit(bit);
+                        symbols.push((usize::MAX, usize::from(bit)));
+                    }
+                    _ => {
+                        let n = encoder_cdfs[which].n;
+                        let s = if rng.next().is_multiple_of(4) {
+                            rng.next() as usize % n
+                        } else {
+                            (rng.next() as usize % n).min(1)
+                        };
+                        Sink::symbol(&mut coder, &mut encoder_cdfs[which], s);
+                        symbols.push((which, s));
+                    }
+                }
+            }
+            let bytes = coder.finish();
+            let mut decoder = Decoder::new(&bytes);
+            for (i, &(which, s)) in symbols.iter().enumerate() {
+                let got = if which == usize::MAX {
+                    usize::from(decoder.bool())
+                } else {
+                    decoder.read(&mut decoder_cdfs[which], true)
+                };
+                assert_eq!(got, s, "round {round} symbol {i}");
+            }
+            // Spec 8.2.4: the bit at `trailingBitPosition` is one and
+            // every bit after it zero (libaom's decoder checks).
+            let at = decoder.bit as i64 - (15i64).min(decoder.max_bits + 15);
+            let bit_at = |i: i64| (bytes[i as usize / 8] >> (7 - i as usize % 8)) & 1;
+            assert!(at >= 0, "round {round}: trailing bit before the data");
+            assert_eq!(bit_at(at), 1, "round {round}: {bytes:?}");
+            for i in at + 1..8 * bytes.len() as i64 {
+                assert_eq!(bit_at(i), 0, "round {round}: bit {i} of {bytes:?}");
+            }
+        }
+        // An empty coder still terminates.
+        assert_eq!(Coder::new().finish(), vec![0x80]);
+    }
+
+    #[test]
+    fn the_adaptation_is_the_specs() {
+        let mut cdf = Cdf::new(&[8192, 16384, 24576]);
+        assert_eq!(cdf.n, 4);
+        cdf.adapt(0);
+        // rate 3 + 0 + 0 + min(2, 2) = 5: entries at and past the symbol
+        // move towards 32768, earlier ones towards 0.
+        assert_eq!(
+            &cdf.v[..4],
+            &[
+                8192 + (24576 >> 5),
+                16384 + (16384 >> 5),
+                24576 + (8192 >> 5),
+                32768
+            ]
+        );
+        assert_eq!(cdf.v[4], 1);
+        let mut cdf = Cdf::new(&[8192, 16384, 24576]);
+        cdf.adapt(3);
+        assert_eq!(
+            &cdf.v[..4],
+            &[
+                8192 - (8192 >> 5),
+                16384 - (16384 >> 5),
+                24576 - (24576 >> 5),
+                32768
+            ]
+        );
+        // The count saturates at 32 and the rate rises with it.
+        for _ in 0..40 {
+            cdf.adapt(1);
+        }
+        assert_eq!(cdf.v[4], 32);
+        // Costs: an even split of two symbols is one bit each.
+        let even = Cdf::new(&[16384]);
+        assert_eq!(even.cost(0), 512);
+        assert_eq!(even.cost(1), 512);
+        let skewed = Cdf::new(&[32000]);
+        assert!(skewed.cost(0) < 64);
+        assert!(skewed.cost(1) > 5 * 512);
+    }
+
+    #[test]
+    fn the_default_cdfs_have_the_documented_shapes() {
+        let cdfs = Cdfs::new(0);
+        assert_eq!(cdfs.y_mode[0][0].n, 13);
+        assert_eq!(cdfs.uv_mode[0].n, 14);
+        assert_eq!(cdfs.angle_delta[0].n, 7);
+        assert_eq!(cdfs.partition_8[0].n, 4);
+        assert_eq!(cdfs.partition[2][3].n, 10);
+        assert_eq!(cdfs.skip[0].n, 2);
+        assert_eq!(cdfs.tx_type[2][12].n, 5);
+        assert_eq!(cdfs.txb_skip[4][12].n, 2);
+        assert_eq!(cdfs.eob_extra[4][1][8].n, 2);
+        assert_eq!(cdfs.dc_sign[1][2].n, 2);
+        assert_eq!(cdfs.base_eob[4][1][3].n, 3);
+        assert_eq!(cdfs.base[4][1][41].n, 4);
+        assert_eq!(cdfs.br[4][1][20].n, 4);
+        assert_eq!(cdfs.eob_pt[0][0].n, 5);
+        assert_eq!(cdfs.eob_pt[1][0].n, 6);
+        assert_eq!(cdfs.eob_pt[6][1].n, 11);
+        // Every CDF is monotone up to 32768 with a zero count.
+        for cdf in [
+            &cdfs.y_mode[4][4],
+            &cdfs.uv_mode[12],
+            &cdfs.base[0][0][0],
+            &cdfs.br[3][1][7],
+        ] {
+            for i in 1..cdf.n {
+                assert!(cdf.at(i) >= cdf.at(i - 1));
+            }
+            assert_eq!(cdf.at(cdf.n - 1), 32768);
+            assert_eq!(cdf.at(cdf.n), 0);
+        }
+        // The bands differ.
+        assert_ne!(Cdfs::new(0).base[1][0][5].v, Cdfs::new(200).base[1][0][5].v);
+    }
+
+    #[test]
+    fn the_bit_writer_and_leb128_are_the_specs() {
+        let mut b = Bits::new();
+        b.put(3, 5);
+        b.flag(true);
+        b.put(6, 0);
+        b.trailing();
+        assert_eq!(b.bytes, vec![0b1011_0000, 0b0010_0000]);
+        let mut b = Bits::new();
+        b.put(8, 0xAB);
+        b.align();
+        assert_eq!(b.bytes, vec![0xAB]);
+        let mut out = Vec::new();
+        leb128(&mut out, 0);
+        leb128(&mut out, 127);
+        leb128(&mut out, 128);
+        leb128(&mut out, 300);
+        assert_eq!(out, vec![0, 127, 0x80, 0x01, 0xAC, 0x02]);
+        let mut out = Vec::new();
+        obu(&mut out, OBU_SEQUENCE_HEADER, &[1, 2, 3]);
+        assert_eq!(out, vec![0x0A, 3, 1, 2, 3]);
+    }
+
+    #[test]
+    fn the_eob_classes_partition_the_ends_of_block() {
+        for eob in 1..=1024usize {
+            let (t, bits) = eob_position(eob);
+            let start = eob_group_start(t);
+            assert!(start <= eob, "{eob}");
+            assert!(eob - start < (1 << bits), "{eob}");
+            if t < 11 {
+                assert!(eob < eob_group_start(t + 1), "{eob}");
+            }
+        }
+        assert_eq!(eob_position(1), (1, 0));
+        assert_eq!(eob_position(3), (3, 1));
+        assert_eq!(eob_position(1024), (11, 9));
+    }
+
+    /// Every transform shape a block reaches, width by height.
+    const SHAPES: [(usize, usize); 11] = [
+        (4, 4),
+        (8, 8),
+        (16, 16),
+        (32, 32),
+        (64, 64),
+        (4, 8),
+        (8, 4),
+        (8, 16),
+        (16, 8),
+        (16, 32),
+        (32, 16),
+    ];
+
+    /// Every luma block below a superblock, square or halved, those
+    /// under 8x8 placed last along their short sides, where they carry
+    /// their 8x8's chroma.
+    const LUMA_SHAPES: [At; 10] = [
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 3,
+            h_log2: 3,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 4,
+            h_log2: 4,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 5,
+            h_log2: 5,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 4,
+            h_log2: 3,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 3,
+            h_log2: 4,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 5,
+            h_log2: 4,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 0,
+            w_log2: 4,
+            h_log2: 5,
+        },
+        At {
+            mi_row: 1,
+            mi_col: 1,
+            w_log2: 2,
+            h_log2: 2,
+        },
+        At {
+            mi_row: 1,
+            mi_col: 0,
+            w_log2: 3,
+            h_log2: 2,
+        },
+        At {
+            mi_row: 0,
+            mi_col: 1,
+            w_log2: 2,
+            h_log2: 3,
+        },
+    ];
+
+    /// libaom's directional prediction as written (`reconintra.c`:
+    /// `build_directional_and_filter_intra_predictors` from its edges on,
+    /// then `dr_prediction_z1` to `z3`), pixel by pixel, to hold
+    /// `predict_block` to. It keeps libaom's shape, repeated branches
+    /// and copies too.
+    #[allow(clippy::if_same_then_else, clippy::manual_memcpy)]
+    fn libaom_directional(angle: i32, edges: &Edges, (n_top_px, n_left_px): (i32, i32)) -> Vec<u8> {
+        let (w, h) = (edges.w as i32, edges.h as i32);
+        let smooth = i32::from(edges.smooth);
+        let strength = |bs0: i32, bs1: i32, delta: i32, ty: i32| {
+            let d = delta.abs();
+            let mut strength = 0;
+            let blk_wh = bs0 + bs1;
+            if ty == 0 {
+                if blk_wh <= 8 {
+                    if d >= 56 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 12 {
+                    if d >= 40 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 16 {
+                    if d >= 40 {
+                        strength = 1;
+                    }
+                } else if blk_wh <= 24 {
+                    if d >= 8 {
+                        strength = 1;
+                    }
+                    if d >= 16 {
+                        strength = 2;
+                    }
+                    if d >= 32 {
+                        strength = 3;
+                    }
+                } else if blk_wh <= 32 {
+                    if d >= 1 {
+                        strength = 1;
+                    }
+                    if d >= 4 {
+                        strength = 2;
+                    }
+                    if d >= 32 {
+                        strength = 3;
+                    }
+                } else if d >= 1 {
+                    strength = 3;
+                }
+            } else if blk_wh <= 8 {
+                if d >= 40 {
+                    strength = 1;
+                }
+                if d >= 64 {
+                    strength = 2;
+                }
+            } else if blk_wh <= 16 {
+                if d >= 20 {
+                    strength = 1;
+                }
+                if d >= 48 {
+                    strength = 2;
+                }
+            } else if blk_wh <= 24 {
+                if d >= 4 {
+                    strength = 3;
+                }
+            } else if d >= 1 {
+                strength = 3;
+            }
+            strength
+        };
+        let use_upsample = |bs0: i32, bs1: i32, delta: i32, ty: i32| {
+            let d = delta.abs();
+            let blk_wh = bs0 + bs1;
+            if d == 0 || d >= 40 {
+                return false;
+            }
+            if ty != 0 {
+                blk_wh <= 8
+            } else {
+                blk_wh <= 16
+            }
+        };
+        let filter = |p: &mut [i32], at: usize, sz: i32, strength: i32| {
+            if strength == 0 {
+                return;
+            }
+            let kernel = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]][strength as usize - 1];
+            let edge: Vec<i32> = p[at..at + sz as usize].to_vec();
+            for i in 1..sz {
+                let mut s = 0;
+                for j in 0..5 {
+                    let k = (i - 2 + j).clamp(0, sz - 1);
+                    s += edge[k as usize] * kernel[j as usize];
+                }
+                p[at + i as usize] = (s + 8) >> 4;
+            }
+        };
+        let upsample = |p: &mut [i32], at: usize, sz: i32| {
+            let sz = sz as usize;
+            let mut input = vec![0; sz + 3];
+            input[0] = p[at - 1];
+            input[1] = p[at - 1];
+            for i in 0..sz {
+                input[i + 2] = p[at + i];
+            }
+            input[sz + 2] = p[at + sz - 1];
+            p[at - 2] = input[0];
+            for i in 0..sz {
+                let s = -input[i] + 9 * input[i + 1] + 9 * input[i + 2] - input[i + 3];
+                p[at + 2 * i - 1] = ((s + 8) >> 4).clamp(0, 255);
+                p[at + 2 * i] = input[i + 2];
+            }
+        };
+        const AT: usize = 16;
+        let mut above = vec![0i32; AT + 160];
+        let mut left = vec![0i32; AT + 160];
+        for i in 0..EDGE {
+            above[AT - 1 + i] = i32::from(edges.above[i]);
+            left[AT - 1 + i] = i32::from(edges.left[i]);
+        }
+        let need_above = angle < 180;
+        let need_left = angle > 90;
+        let (mut upsample_above, mut upsample_left) = (0, 0);
+        let need_right = angle < 90;
+        let need_bottom = angle > 180;
+        if angle != 90 && angle != 180 {
+            if need_above && need_left && w + h >= 24 {
+                let s = (left[AT] * 5 + above[AT - 1] * 6 + above[AT] * 5 + 8) >> 4;
+                above[AT - 1] = s;
+                left[AT - 1] = s;
+            }
+            if need_above && n_top_px > 0 {
+                let strength = strength(w, h, angle - 90, smooth);
+                let n_px = n_top_px + 1 + if need_right { h } else { 0 };
+                filter(&mut above, AT - 1, n_px, strength);
+            }
+            if need_left && n_left_px > 0 {
+                let strength = strength(h, w, angle - 180, smooth);
+                let n_px = n_left_px + 1 + if need_bottom { w } else { 0 };
+                filter(&mut left, AT - 1, n_px, strength);
+            }
+        }
+        if use_upsample(w, h, angle - 90, smooth) && need_above {
+            upsample_above = 1;
+            upsample(&mut above, AT, w + if need_right { h } else { 0 });
+        }
+        if use_upsample(h, w, angle - 180, smooth) && need_left {
+            upsample_left = 1;
+            upsample(&mut left, AT, h + if need_bottom { w } else { 0 });
+        }
+        let a = |i: i32| above[(AT as i32 + i) as usize];
+        let l = |i: i32| left[(AT as i32 + i) as usize];
+        let mut out = vec![0u8; (w * h) as usize];
+        for r in 0..h {
+            for c in 0..w {
+                let val = if angle == 90 {
+                    a(c)
+                } else if angle == 180 {
+                    l(r)
+                } else if angle < 90 {
+                    let max_base_x = (w + h - 1) << upsample_above;
+                    let x = (r + 1) * derivative(angle);
+                    let base = (x >> (6 - upsample_above)) + (c << upsample_above);
+                    let shift = ((x << upsample_above) & 0x3F) >> 1;
+                    if base < max_base_x {
+                        (a(base) * (32 - shift) + a(base + 1) * shift + 16) >> 5
+                    } else {
+                        a(max_base_x)
+                    }
+                } else if angle < 180 {
+                    let x = (c << 6) - (r + 1) * derivative(180 - angle);
+                    let base_x = x >> (6 - upsample_above);
+                    if base_x >= -(1 << upsample_above) {
+                        let shift = ((x * (1 << upsample_above)) & 0x3F) >> 1;
+                        (a(base_x) * (32 - shift) + a(base_x + 1) * shift + 16) >> 5
+                    } else {
+                        let y = (r << 6) - (c + 1) * derivative(angle - 90);
+                        let base_y = y >> (6 - upsample_left);
+                        let shift = ((y * (1 << upsample_left)) & 0x3F) >> 1;
+                        (l(base_y) * (32 - shift) + l(base_y + 1) * shift + 16) >> 5
+                    }
+                } else {
+                    let max_base_y = (w + h - 1) << upsample_left;
+                    let y = (c + 1) * derivative(270 - angle);
+                    let base = (y >> (6 - upsample_left)) + (r << upsample_left);
+                    let shift = ((y << upsample_left) & 0x3F) >> 1;
+                    if base < max_base_y {
+                        (l(base) * (32 - shift) + l(base + 1) * shift + 16) >> 5
+                    } else {
+                        l(max_base_y)
+                    }
+                };
+                out[(r * w + c) as usize] = val as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_directional_predictions_are_libaoms() {
+        let mut rng = Lcg(7);
+        let mut upsampled = 0;
+        for (w, h) in SHAPES {
+            for round in 0..24 {
+                let mut above = [0u8; EDGE];
+                let mut left = [0u8; EDGE];
+                for v in above.iter_mut().chain(left.iter_mut()) {
+                    *v = rng.next() as u8;
+                }
+                left[0] = above[0];
+                // Every availability, neighbours smooth or not, and edges
+                // the frame cuts short, past which `pred_edges` repeats
+                // the last pixel and libaom filters none.
+                let (have_above, have_left) = (round % 4 != 1, round % 4 != 2);
+                let mut short = |have: bool, n: usize, edge: &mut [u8; EDGE]| {
+                    let inside = match (have, round % 3) {
+                        (false, _) => 0,
+                        (true, 0) => 1 + rng.next() as usize % n,
+                        _ => n,
+                    };
+                    if (1..n).contains(&inside) {
+                        let last = edge[inside];
+                        edge[inside + 1..].fill(last);
+                    }
+                    inside as i32
+                };
+                let inside = (
+                    short(have_above, w, &mut above),
+                    short(have_left, h, &mut left),
+                );
+                let edges = Edges {
+                    have_above,
+                    have_left,
+                    n_above: inside.0 as usize,
+                    n_left: inside.1 as usize,
+                    smooth: round % 2 == 1,
+                    ..Edges::new(w, h, above, left)
+                };
+                let mut out = vec![0; w * h];
+                for mode in V_PRED..=D67_PRED {
+                    for delta in -3..=3 {
+                        let angle = mode_angle(mode) + 3 * i32::from(delta);
+                        predict_block(mode, delta, &edges, true, &mut out);
+                        let want = libaom_directional(angle, &edges, inside);
+                        assert_eq!(out, want, "{w}x{h} {mode} {delta} round {round}");
+                        let key = DrKey::new(&edges, angle);
+                        upsampled += usize::from(key.up_above + key.up_left > 0);
+                    }
+                }
+            }
+        }
+        assert!(upsampled > 0);
+    }
+
+    #[test]
+    fn the_predictors_follow_the_edges() {
+        let mut above = [0u8; EDGE];
+        let mut left = [0u8; EDGE];
+        for i in 0..65 {
+            above[i] = (10 + i * 3) as u8;
+            left[i] = (200 - i * 2) as u8;
+        }
+        above[0] = 77;
+        left[0] = 77;
+        let edges = |have_above: bool, have_left: bool| Edges {
+            have_above,
+            have_left,
+            n_above: if have_above { 4 } else { 0 },
+            n_left: if have_left { 4 } else { 0 },
+            ..Edges::new(4, 4, above, left)
+        };
+        let mut out = [0u8; 16];
+        predict_block(V_PRED, 0, &edges(true, true), true, &mut out);
+        assert_eq!(&out[..4], &above[1..5]);
+        assert_eq!(&out[12..], &above[1..5]);
+        predict_block(H_PRED, 0, &edges(true, true), true, &mut out);
+        assert_eq!(out[0], left[1]);
+        assert_eq!(out[15], left[4]);
+        predict_block(DC_PRED, 0, &edges(true, true), true, &mut out);
+        let sum: u32 = above[1..5]
+            .iter()
+            .chain(&left[1..5])
+            .map(|&v| u32::from(v))
+            .sum();
+        assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
+        predict_block(DC_PRED, 0, &edges(false, false), true, &mut out);
+        assert!(out.iter().all(|&v| v == 128));
+        predict_block(DC_PRED, 0, &edges(false, true), true, &mut out);
+        let sum: u32 = left[1..5].iter().map(|&v| u32::from(v)).sum();
+        assert!(out.iter().all(|&v| u32::from(v) == (sum + 2) / 4));
+        // D45 walks up and right: row i, column j is AboveRow[i + j + 1].
+        predict_block(D45_PRED, 0, &edges(true, true), true, &mut out);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(out[i * 4 + j], above[i + j + 2], "{i} {j}");
+            }
+        }
+        // D135 walks down and right from the corner.
+        predict_block(D135_PRED, 0, &edges(true, true), true, &mut out);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if j >= i { above[j - i] } else { left[i - j] };
+                assert_eq!(out[i * 4 + j], want, "{i} {j}");
+            }
+        }
+        // Paeth picks the neighbour closest to the gradient guess.
+        predict_block(PAETH_PRED, 0, &edges(true, true), true, &mut out);
+        let (top, side, corner) = (i32::from(above[1]), i32::from(left[1]), 77);
+        let base = top + side - corner;
+        let want = if (base - side).abs() <= (base - top).abs()
+            && (base - side).abs() <= (base - corner).abs()
+        {
+            side
+        } else if (base - top).abs() <= (base - corner).abs() {
+            top
+        } else {
+            corner
+        };
+        assert_eq!(i32::from(out[0]), want);
+        // Smooth blends towards the far edges.
+        predict_block(SMOOTH_PRED, 0, &edges(true, true), true, &mut out);
+        // The weight at the first of four is 255; the rest of 256 goes
+        // to the far edge.
+        let want = (255 * i32::from(above[1])
+            + i32::from(left[4])
+            + 255 * i32::from(left[1])
+            + i32::from(above[4])
+            + 256)
+            >> 9;
+        assert_eq!(i32::from(out[0]), want);
+        // A rectangle's DC averages both edges over their sum of lengths,
+        // and its smooth weights follow each side's own length.
+        let wide = |have_above, have_left| Edges {
+            w: 8,
+            h: 4,
+            ..edges(have_above, have_left)
+        };
+        let mut out = [0u8; 32];
+        predict_block(DC_PRED, 0, &wide(true, true), true, &mut out);
+        let sum: u32 = above[1..9]
+            .iter()
+            .chain(&left[1..5])
+            .map(|&v| u32::from(v))
+            .sum();
+        assert!(out.iter().all(|&v| u32::from(v) == (sum + 6) / 12));
+        predict_block(DC_PRED, 0, &wide(true, false), true, &mut out);
+        let sum: u32 = above[1..9].iter().map(|&v| u32::from(v)).sum();
+        assert!(out.iter().all(|&v| u32::from(v) == (sum + 4) / 8));
+        predict_block(SMOOTH_V_PRED, 0, &wide(true, true), true, &mut out);
+        // Row 3 of 4 weighs the above edge 64 of 256, the below-left 192.
+        let want = (64 * i32::from(above[8]) + 192 * i32::from(left[4]) + 128) >> 8;
+        assert_eq!(i32::from(out[3 * 8 + 7]), want);
+        predict_block(SMOOTH_H_PRED, 0, &wide(true, true), true, &mut out);
+        // Column 7 of 8 weighs the left edge 32 of 256, the above-right
+        // 224.
+        let want = (32 * i32::from(left[1]) + 224 * i32::from(above[8]) + 128) >> 8;
+        assert_eq!(i32::from(out[7]), want);
+        assert_eq!(mode_tx_type(V_PRED, Size::S8), TxType::AdstDct);
+        assert_eq!(mode_tx_type(H_PRED, Size::S16), TxType::DctAdst);
+        assert_eq!(mode_tx_type(V_PRED, Size::S32), TxType::DctDct);
+        assert_eq!(mode_tx_type(V_PRED, Size::S16x32), TxType::DctDct);
+        assert_eq!(mode_tx_type(V_PRED, Size::S16x8), TxType::AdstDct);
+        assert_eq!(mode_tx_type(D45_PRED, Size::S4), TxType::DctDct);
+    }
+
+    #[test]
+    fn the_size_contexts_are_the_specs() {
+        // txSzCtx: a rectangle's between its squares', rounded up; the
+        // transform type's CDFs by the shorter side's square.
+        let ctx = |size| (size_ctx(size), size_sqr(size));
+        assert_eq!(ctx(Size::S4), (0, 0));
+        assert_eq!(ctx(Size::S32), (3, 3));
+        assert_eq!(ctx(Size::S4x8), (1, 0));
+        assert_eq!(ctx(Size::S8x4), (1, 0));
+        assert_eq!(ctx(Size::S8x16), (2, 1));
+        assert_eq!(ctx(Size::S32x16), (3, 2));
+        assert!(dct_only(Size::S16x32) && !dct_only(Size::S16x8));
+    }
+
+    #[test]
+    fn the_halves_and_quarters_tile_their_node() {
+        let node = At::square(8, 16, 5);
+        let [top, bottom] = node.halves(false);
+        assert_eq!(
+            (top.mi_row, top.mi_col, top.w_log2, top.h_log2),
+            (8, 16, 5, 4)
+        );
+        assert_eq!((bottom.mi_row, bottom.mi_col), (12, 16));
+        let [left, right] = node.halves(true);
+        assert_eq!((left.w_log2, left.h_log2), (4, 5));
+        assert_eq!((right.mi_row, right.mi_col), (8, 20));
+        assert_eq!(right.plane_dims(1), (8, 16));
+        assert_eq!(plane_size(right, 1), Size::S8x16);
+        assert_eq!(plane_size(top, 0), Size::S32x16);
+        let q = node.quarter(4, 4);
+        assert_eq!((q.mi_row, q.mi_col, q.w_log2, q.h_log2), (12, 20, 4, 4));
+        // Under 8x8 only the last block along a 4-pixel side carries
+        // chroma, its 8x8's, and none codes an angle delta.
+        let small = |mi_row, mi_col, w_log2, h_log2| At {
+            mi_row,
+            mi_col,
+            w_log2,
+            h_log2,
+        };
+        let region = |at: At| {
+            at.chroma()
+                .map(|c| (c.mi_row, c.mi_col, c.w_log2, c.h_log2))
+        };
+        assert_eq!(region(small(2, 4, 2, 2)), None);
+        assert_eq!(region(small(3, 4, 2, 2)), None);
+        assert_eq!(region(small(2, 5, 2, 2)), None);
+        assert_eq!(region(small(3, 5, 2, 2)), Some((2, 4, 3, 3)));
+        assert_eq!(region(small(2, 4, 3, 2)), None);
+        assert_eq!(region(small(3, 4, 3, 2)), Some((2, 4, 3, 3)));
+        assert_eq!(region(small(2, 4, 2, 3)), None);
+        assert_eq!(region(small(2, 5, 2, 3)), Some((2, 4, 3, 3)));
+        assert_eq!(region(q), Some((12, 20, 4, 4)));
+        assert!(small(3, 5, 2, 2).is_sub8x8() && !small(3, 5, 2, 2).has_angle_deltas());
+        assert!(!q.is_sub8x8() && q.has_angle_deltas());
+        let [a, b] = At::square(2, 4, 3).halves(false);
+        assert_eq!((a.chroma().is_some(), b.chroma().is_some()), (false, true));
+        let [a, b] = At::square(2, 4, 3).halves(true);
+        assert_eq!((a.chroma().is_some(), b.chroma().is_some()), (false, true));
+        assert_eq!(unpack_size(pack_size(5, 4), true), 5);
+        assert_eq!(unpack_size(pack_size(5, 4), false), 4);
+    }
+
+    #[test]
+    fn chroma_from_luma_scales_the_ac_by_eighths_and_rounds_away_from_zero() {
+        // Round2Signed(alpha * ac, 6) on the DC: halves round away from
+        // zero alike for either sign, and the sum clips to the pixel.
+        let dc = [100u8; 6];
+        let ac = [32, -32, 31, -31, 400, -400];
+        let mut out = [0u8; 6];
+        cfl_predict(&dc, &ac, 1, &mut out);
+        assert_eq!(out, [101, 99, 100, 100, 106, 94]);
+        cfl_predict(&dc, &ac, -16, &mut out);
+        assert_eq!(out, [92, 108, 92, 108, 0, 200]);
+        cfl_predict(&[250; 6], &ac, 16, &mut out);
+        assert_eq!(out[4], 255);
+    }
+
+    #[test]
+    fn the_coder_writes_the_rows_in_order_whatever_order_they_finish() {
+        let g = Geometry::new(64, 128).unwrap();
+        // Two rows of ramps, searched in order.
+        let rows = || {
+            let mut wave = Wave::new(0, 64, (0, g.mi_rows), &g, 120);
+            wave.begin(2);
+            (0..2)
+                .map(|row| {
+                    let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+                    tile.band_mi_row = row * SB_MI;
+                    for (i, v) in tile.source[0].data.iter_mut().enumerate() {
+                        *v = ((i % 64) * (row + 1) * 3 + i / 64) as u8;
+                    }
+                    tile.cdfs = wave.wait(row, 1).seed.clone();
+                    tile.search_row(&wave, row)
+                })
+                .collect::<Vec<Vec<Node>>>()
+        };
+        let write = |order: [usize; 2]| {
+            let mut coding = Coding {
+                tile: Tile::new(0, 64, 0, g.mi_rows, &g, 120),
+                next: 0,
+                ready: Vec::new(),
+            };
+            let mut nodes = rows();
+            for (k, row) in order.into_iter().enumerate() {
+                coding.add(row, std::mem::take(&mut nodes[row]));
+                // Row 1 alone waits; row 0 brings it along.
+                let written = if k == 0 { usize::from(row == 0) } else { 2 };
+                assert_eq!(coding.next, written, "{order:?}");
+            }
+            assert!(coding.ready.is_empty(), "{order:?}");
+            coding.tile.coder.finish()
+        };
+        assert_eq!(write([1, 0]), write([0, 1]));
+    }
+
+    #[test]
+    fn the_edge_filter_reads_the_neighbours_the_spec_names() {
+        // Chroma's smooth neighbour above is the block with chroma past its
+        // 8x8's above-right corner, not the one above the corner itself;
+        // a mode left over from the superblock row before is no
+        // neighbour where the left edge is unavailable.
+        let g = Geometry::new(64, 64).unwrap();
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let region = At::square(2, 0, 3);
+        for (own, past, want) in [(SMOOTH_PRED, DC_PRED, false), (DC_PRED, SMOOTH_PRED, true)] {
+            tile.contexts.above_uv_mode[0] = own;
+            tile.contexts.above_uv_mode[1] = past;
+            assert_eq!(tile.pred_edges(1, region).smooth, want, "{own} {past}");
+        }
+        tile.contexts.above_uv_mode.fill(DC_PRED);
+        tile.contexts.left_uv_mode.fill(SMOOTH_PRED);
+        tile.contexts.left_mode.fill(SMOOTH_H_PRED);
+        assert!(!tile.pred_edges(1, region).smooth);
+        assert!(!tile.pred_edges(0, region).smooth);
+        let inside = At::square(2, 2, 3);
+        assert!(tile.pred_edges(1, inside).smooth);
+        assert!(tile.pred_edges(0, inside).smooth);
+    }
+
+    #[test]
+    fn the_trellis_only_lowers_levels_and_keeps_its_end_of_block() {
+        // Over random coefficients of every size and both plane types,
+        // the trellis leaves each level at the quantizer's or one below it
+        // with the coefficient's sign, drops some, and returns the end of
+        // block its levels have: nonzero before it, zero from it on.
+        let g = Geometry::new(64, 64).unwrap();
+        let tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let q = transform::ac_q(120);
+        let mut rng = Lcg(11);
+        let mut mags = Magnitudes::default();
+        let mut dropped = 0;
+        for round in 0..300 {
+            let (at, plane) = (LUMA_SHAPES[round % 10], round / 10 % 2);
+            let at = plane_at(at, plane).unwrap();
+            let size = plane_size(at, plane);
+            let coeffs: Vec<i32> = (0..size.area())
+                .map(|_| {
+                    let r = rng.next();
+                    let magnitude = match r % 4 {
+                        0 | 1 => 0,
+                        2 => (r / 4) as i32 % q,
+                        _ => (r / 4) as i32 % (4 * q),
+                    };
+                    if r & 1 << 30 != 0 {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                })
+                .collect();
+            let mut levels = Vec::new();
+            let eob = tile.quantize(size, &coeffs, &mut levels);
+            let quantized = levels.clone();
+            let out = tile.trellis(plane, at, &coeffs, &mut levels, eob, &mut mags);
+            assert!(out <= eob, "round {round}");
+            for (c, &pos) in size.scan().iter().enumerate() {
+                let pos = usize::from(pos);
+                let (was, now) = (quantized[pos], levels[pos]);
+                assert!(
+                    now.abs() <= was.abs() && now.abs() + 1 >= was.abs(),
+                    "round {round}"
+                );
+                assert!(
+                    now == 0 || now.signum() == coeffs[pos].signum(),
+                    "round {round}"
+                );
+                dropped += usize::from(now != was);
+                if c >= out {
+                    assert_eq!(now, 0, "round {round}: a level past the end of block");
+                }
+            }
+            if out > 0 {
+                assert_ne!(
+                    levels[usize::from(size.scan()[out - 1])],
+                    0,
+                    "round {round}"
+                );
+            }
+        }
+        assert!(dropped > 100, "the trellis dropped only {dropped} levels");
+    }
+
+    #[test]
+    fn the_trellis_prices_levels_as_the_coder_codes_them() {
+        // Each level's rate as the trellis prices it, with the end of
+        // block's and the block's own symbols, sums to what the coder
+        // counts for the block, over random levels of every size, both
+        // plane types and levels past the Golomb threshold.
+        let g = Geometry::new(64, 64).unwrap();
+        let mut tile = Tile::new(0, 64, 0, g.mi_rows, &g, 120);
+        let mut rng = Lcg(7);
+        for round in 0..400 {
+            let (at, plane) = (LUMA_SHAPES[round % 10], round / 10 % 2);
+            let at = plane_at(at, plane).unwrap();
+            let size = plane_size(at, plane);
+            let (w, area) = (size.width(), size.area());
+            let eob = 1 + rng.next() as usize % area;
+            let mut levels = vec![0i32; area];
+            for &pos in size.scan().iter().take(eob) {
+                let r = rng.next();
+                let magnitude = match r % 8 {
+                    0..=3 => 0,
+                    4 | 5 => 1 + r / 8 % 2,
+                    6 => 3 + r / 8 % 12,
+                    _ => 15 + r / 8 % 300,
+                } as i32;
+                levels[usize::from(pos)] = if r & 1 << 20 != 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                };
+            }
+            let last = usize::from(size.scan()[eob - 1]);
+            if levels[last] == 0 {
+                levels[last] = 1;
+            }
+            let mut counter = Counter(0);
+            let coded = Levels {
+                levels: &levels,
+                eob,
+            };
+            tile.coefficient_symbols(&mut counter, plane, at, DC_PRED, TxType::DctDct, coded);
+            let ptype = usize::from(plane > 0);
+            let skip_ctx = if plane == 0 { 0 } else { 7 };
+            let mut model = u64::from(tile.cdfs.txb_skip[size_ctx(size)][skip_ctx].cost(0));
+            if plane == 0 && !dct_only(size) {
+                let tx = &tile.cdfs.tx_type[size_sqr(size)][usize::from(DC_PRED)];
+                model += u64::from(tx.cost(TxType::DctDct.symbol()));
+            }
+            model += tile.eob_rate(size, ptype, eob);
+            let dc_ctx = tile.dc_sign_ctx(plane, at);
+            let mut mags = Magnitudes::default();
+            mags.fill(&levels, size);
+            for c in 0..eob {
+                let pos = usize::from(size.scan()[c]);
+                let (row, col) = (pos / w, pos % w);
+                let level = levels[pos].unsigned_abs();
+                let ctx = LevelCtx {
+                    eob: (c + 1 == eob).then(|| base_eob_ctx(c, area)),
+                    base: mags.base_ctx(row, col),
+                    br: mags.br_ctx(row, col),
+                };
+                if level == 0 {
+                    let base = &tile.cdfs.base[size_ctx(size)][ptype][ctx.base];
+                    model += u64::from(base.cost(0));
+                    continue;
+                }
+                model += tile.level_cdfs(size, ptype).unwrap().rate(ctx, level);
+                model += if c == 0 {
+                    let negative = usize::from(levels[pos] < 0);
+                    u64::from(tile.cdfs.dc_sign[ptype][dc_ctx].cost(negative))
+                } else {
+                    512
+                };
+            }
+            assert_eq!(
+                model, counter.0,
+                "round {round}: {size:?} plane {plane} eob {eob}"
+            );
+        }
+    }
+
+    /// Bands a block high or wide, alternating by 64x64, each a ramp of
+    /// its own: content the halvings win on. `tests/av1.rs`'s `bands` is
+    /// the same, where dav1d decodes it.
+    fn bands(width: usize, height: usize, band: usize) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let (row, col) = ((y / band) as i32, (x / band) as i32);
+                let across = 40 + (row * 57) % 150 + x as i32 * (row % 5 - 2) / 3;
+                let down = 40 + (col * 37) % 150 + y as i32 * (col % 5 - 2) / 3;
+                let v = if (x / 64 + y / 64) % 2 == 0 {
+                    across
+                } else {
+                    down
+                };
+                let v = v.clamp(0, 255) as u8;
+                rgb.extend([v, v / 2 + 60, 255 - v]);
+            }
+        }
+        rgb
+    }
+
+    /// A smooth curved ramp in every plane: content a 64x64 is coded whole
+    /// on, with a residual its prediction leaves.
+    fn ramp(width: usize, height: usize) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let (x, y) = (x as i32, y as i32);
+                let v = 30 + x / 2 + (x - 96) * (x - 96) / 200 + y / 3;
+                let v = v.clamp(0, 255) as u8;
+                rgb.extend([v, 255 - v / 2, v / 3 + 50]);
+            }
+        }
+        rgb
+    }
+    #[test]
+    fn smooth_64x64s_are_coded_whole_with_coefficients() {
+        // What `tests/av1.rs` holds to dav1d covers whole 64x64s, their
+        // 64-point transforms carrying coefficients and their chroma's
+        // modes without CfL, whatever the search's tuning; busy ones
+        // are only ever split.
+        for (quality, smooth) in [(20, true), (50, true), (97, false)] {
+            let (width, height) = (192, 128);
+            let rgb = if smooth {
+                ramp(width, height)
+            } else {
+                bands(width, height, 4)
+            };
+            let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
+            encoder.keep_reconstruction();
+            encoder.encode_rows(&rgb).unwrap();
+            encoder.flush();
+            let kept = encoder.kept.as_ref().unwrap();
+            let (mut whole, mut coded) = (0, 0);
+            for (&s, &skip) in kept.sizes.iter().zip(&kept.skips) {
+                if (unpack_size(s, true), unpack_size(s, false)) == (6, 6) {
+                    whole += 1;
+                    coded += usize::from(!skip);
+                }
+            }
+            if smooth {
+                assert!(coded > 0, "q{quality}: {whole} 4x4s whole, {coded} coded");
+            } else {
+                assert_eq!(whole, 0, "q{quality}");
+            }
+        }
+    }
+
+    #[test]
+    fn halvings_are_chosen_and_cross_the_right_edge() {
+        // What `tests/av1.rs` holds to dav1d covers halved blocks, some
+        // past the frame's right edge (118 is 30 mode-info columns, a
+        // 32x32 node at 96 halved still), whatever the search's tuning.
+        for quality in [20, 40] {
+            let (width, height) = (118, 128);
+            let mut encoder = Encoder::new(width, height, quality, 1).unwrap();
+            encoder.keep_reconstruction();
+            encoder.encode_rows(&bands(width, height, 16)).unwrap();
+            encoder.flush();
+            let kept = encoder.kept.as_ref().unwrap();
+            let (mi_cols, _) = encoder.geometry.mi_grid();
+            let stride = encoder.geometry.sb_grid().0 * SB_MI;
+            let (mut halved, mut past_edge) = (0, 0);
+            for (i, &s) in kept.sizes.iter().enumerate() {
+                if unpack_size(s, true) != unpack_size(s, false) {
+                    halved += 1;
+                    past_edge += usize::from(i % stride >= mi_cols);
+                }
+            }
+            assert!(
+                halved > 0 && past_edge > 0,
+                "q{quality}: {halved} halved 4x4s, {past_edge} past the edge"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_under_8x8_are_chosen_in_every_shape() {
+        // What `tests/av1.rs` holds to dav1d covers 4x4s, 8x4s and 4x8s,
+        // whatever the search's tuning: bands four and eight pixels wide
+        // at a high quality.
+        let (width, height) = (128, 128);
+        for band in [4, 8] {
+            let mut encoder = Encoder::new(width, height, 97, 1).unwrap();
+            encoder.keep_reconstruction();
+            encoder.encode_rows(&bands(width, height, band)).unwrap();
+            encoder.flush();
+            let kept = encoder.kept.as_ref().unwrap();
+            let mut shapes = [0usize; 3];
+            for &s in &kept.sizes {
+                match (unpack_size(s, true), unpack_size(s, false)) {
+                    (2, 2) => shapes[0] += 1,
+                    (3, 2) => shapes[1] += 1,
+                    (2, 3) => shapes[2] += 1,
+                    _ => {}
+                }
+            }
+            assert!(
+                shapes.iter().all(|&n| n > 0),
+                "band {band}: 4x4, 8x4, 4x8 {shapes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_headers_are_the_documented_bits() {
+        let g = Geometry::new(64, 48).unwrap();
+        let seq = sequence_header(&g);
+        assert_eq!(seq.len(), 12);
+        let strengths = cdef_strengths(21);
+        let header = frame_header(&g, 21, deblock::Levels::default(), strengths);
+        // Nine flags and a byte of quantizer, six-bit filter levels, the
+        // CDEF strengths' sixteen bits and the rest: the header is
+        // byte-aligned at a known length.
+        assert_eq!(header.used, 0);
+        assert_eq!(header.bytes.len(), 7);
+        // A filtering frame adds the two chroma levels' twelve bits.
+        let levels = deblock::Levels {
+            luma: [5, 6],
+            u: 7,
+            v: 8,
+        };
+        assert_eq!(frame_header(&g, 21, levels, strengths).bytes.len(), 8);
+        assert_eq!(qindex(92), 22);
+        // The from-quantizer levels: none at the finest steps, the
+        // most at the coarsest, rising with the step between.
+        assert_eq!(filter_levels(qindex(100)), deblock::Levels::default());
+        assert_eq!(filter_levels(255).luma, [63, 63]);
+        let steps: Vec<u8> = [92, 60, 30].map(|q| filter_levels(qindex(q)).u).to_vec();
+        assert!(steps.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+        // The CDEF strengths: off at the finest steps, luma's strongest
+        // and the damping's most at the coarsest, where chroma's fit has
+        // turned back down.
+        assert!(cdef_strengths(qindex(100)).is_off());
+        let coarsest = cdef_strengths(255);
+        assert_eq!(
+            (coarsest.damping, coarsest.y_pri, coarsest.y_sec),
+            (6, 15, 3)
+        );
+        assert_eq!(coarsest.uv_pri, 0);
+        let mid = cdef_strengths(qindex(30));
+        assert!(mid.y_pri > 0 && mid.uv_pri > 0, "{mid:?}");
+    }
+}

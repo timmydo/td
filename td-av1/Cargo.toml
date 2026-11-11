@@ -3,7 +3,7 @@ name = "td-av1"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Shared AV1 transforms, probability tables and filters"
+description = "Shared AV1 still-picture encoder and arithmetic"
 
 [workspace]
 
