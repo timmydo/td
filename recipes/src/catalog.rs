@@ -683,6 +683,7 @@ mod tests {
                 "td-fido",
                 "td-firstboot",
                 "td-fs",
+                "td-gif",
                 "td-html",
                 "td-inflate",
                 "td-install",

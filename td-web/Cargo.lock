@@ -7,6 +7,10 @@ name = "td-fetch-client"
 version = "0.1.0"
 
 [[package]]
+name = "td-gif"
+version = "0.1.0"
+
+[[package]]
 name = "td-html"
 version = "0.1.0"
 
@@ -31,6 +35,7 @@ name = "td-web"
 version = "0.1.0"
 dependencies = [
  "td-fetch-client",
+ "td-gif",
  "td-html",
  "td-jpeg",
  "td-png",

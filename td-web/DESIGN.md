@@ -35,7 +35,7 @@ crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
 and td's own crates by path: `td-ui` for the window, `td-html` for
 markup, `td-fetch-client` for the network, `td-url` for URLs, and the
-shared decoders (`td-png`, `td-jpeg`) for pictures. It adds no external
+shared decoders (`td-png`, `td-jpeg`, `td-gif`) for pictures. It adds no external
 dependency and no `unsafe`: it declares `#![forbid(unsafe_code)]`; the
 only raw syscall surface in its closure is td-ui's Wayland transport,
 already recorded in UNSAFE.md, and td-fetch-client forbids `unsafe` as
@@ -44,7 +44,7 @@ rules (no panicking calls or indexing; bounded inputs).
 
 Web content is hostile input. Every parser td-web feeds is bounded by
 the limits below and by its crate's own (td-html's depth and element
-caps and output budget, td-png's and td-jpeg's pixel caps), and a
+caps and output budget, the picture decoders' pixel caps), and a
 refused or malformed document is shown as an error page, never a
 crash.
 
@@ -227,11 +227,11 @@ by who chose them:
 too; a larger body is refused by the service and shown as an error. A
 picture is shown within td-ui's bounds (8192 pixels an axis, 16 Mi
 pixels): a larger JPEG is decoded at the largest of td-jpeg's scales
-that fits, a larger PNG is refused. Markup past `MAX_MARKUP` (2 MiB)
+that fits, a larger PNG or GIF is refused. Markup past `MAX_MARKUP` (2 MiB)
 and text past `MAX_TEXT` (4 MiB) are not rendered, and the page says
 so (§5). Requests carry
 `accept: text/html, application/xhtml+xml, text/plain;q=0.9,
-image/png;q=0.8, image/jpeg;q=0.8, */*;q=0.1` and td-web's
+image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, */*;q=0.1` and td-web's
 `user-agent`; the service sends `accept-encoding: identity` itself.
 
 ## 5. Documents
@@ -277,8 +277,16 @@ sniff of its first bytes for `<!doctype html` or `<html`:
 - `text/*` is shown as it is, its tabs expanded every eight
   characters, wrapped at the pane's width in the monospace face on
   prose lines.
-- `image/png` and `image/jpeg` reached by navigation are decoded and
-  shown fitted to the pane, never enlarged.
+- `image/png`, `image/jpeg` (`image/pjpeg` included) and `image/gif`
+  reached by navigation use one `picture` dispatch module and are shown
+  fitted to the pane, never enlarged. With no type or
+  `application/octet-stream`, PNG, JPEG, GIF87a and GIF89a signatures select
+  that same decoder. An explicit different type remains authoritative.
+  JPEG includes progressive scans; GIF shows only its first image, with
+  the transparent canvas and palette policy of td-gif/DESIGN.md. No
+  animation runs. Encoded bytes and decoded dimensions are checked by the
+  shared entry point before allocating picture pixels; decoding runs on
+  the existing render thread and is skipped for an already stopped reply.
 - Anything else is not shown: the page names the type and size and
   says that Firefox opens it. Downloads are a later increment (§10).
 
@@ -646,7 +654,7 @@ order; each is its own design amendment when it starts:
   computed values) and a layout engine (block and inline flow, tables,
   then flexbox) replacing the rich-output producer of §5.
 - **Pictures.** Inline images through `public` subresource fetches;
-  progressive JPEG in td-jpeg; GIF; then WebP and an SVG subset.
+  WebP, AVIF and an SVG subset.
 - **Downloads** to `~/Downloads`, through a directory grant of
   WORKLOADS.md ("Grants") or td-portal's FileChooser, which today admits
   Firefox alone; td-web's account owns no file of the human's.

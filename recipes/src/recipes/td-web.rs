@@ -12,6 +12,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-web")
         .local_source_trees(&[
             "td-fetch-client",
+            "td-gif",
             "td-html",
             "td-jpeg",
             "td-png",
@@ -44,6 +45,7 @@ mod tests {
             r.local_source_trees,
             Some(vec![
                 "td-fetch-client".into(),
+                "td-gif".into(),
                 "td-html".into(),
                 "td-jpeg".into(),
                 "td-png".into(),
@@ -80,6 +82,7 @@ mod tests {
             names,
             [
                 "td-fetch-client",
+                "td-gif",
                 "td-html",
                 "td-jpeg",
                 "td-png",

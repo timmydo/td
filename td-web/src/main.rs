@@ -1,18 +1,19 @@
 //! td-web, td's own document browser (td-web/DESIGN.md): HTML, text,
-//! PNG and JPEG over `http` and `https`, fetched through td's fetch
+//! PNG, JPEG and GIF over `http` and `https`, fetched through td's fetch
 //! service and shown in a td-ui window. No script runs.
 #![forbid(unsafe_code)]
 
 mod app;
 mod document;
 mod fetch;
+mod picture;
 mod view;
 
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: td-web [URL]
 
-td's document browser: HTML, text, PNG and JPEG over http and https,
+td's document browser: HTML, text, PNG, JPEG and GIF over http and https,
 fetched through td's fetch service. No script runs. An address without
 a scheme is taken as https.
 ";

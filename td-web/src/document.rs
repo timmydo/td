@@ -1,6 +1,6 @@
 //! A response as td-web shows it (DESIGN.md §5): HTML rendered once
 //! through td-html's rich output into logical lines, text as it is, a
-//! PNG or JPEG decoded, anything else named and not shown, all of it on
+//! PNG, JPEG or GIF decoded, anything else named and not shown, all of it on
 //! the render thread; and the rendering, those lines wrapped by pixel
 //! width into lines of styled pieces with link targets, on the window's
 //! thread, a few at a time near the ones shown, for each width and body
@@ -10,7 +10,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
-use td_ui::picture::{Picture, MAX_PICTURE_AXIS, MAX_PICTURE_PIXELS};
+use td_ui::picture::Picture;
+
+use crate::picture::{self, Format};
+#[cfg(test)]
+use td_ui::picture::{MAX_PICTURE_AXIS, MAX_PICTURE_PIXELS};
 use td_ui::prose::{self, Metrics};
 use td_ui::raster::{GlyphStyle, TextFamily, INK, PAPER};
 use td_url::{Reference, Url};
@@ -1393,18 +1397,18 @@ impl Document {
             .unwrap_or_default();
         let kind = match media.as_str() {
             "text/html" | "application/xhtml+xml" => Kind::Html,
-            "image/png" => Kind::Png,
-            "image/jpeg" | "image/pjpeg" => Kind::Jpeg,
             "" | "application/octet-stream" => sniff(&body),
             _ if media.starts_with("text/") => Kind::Text,
-            _ => Kind::Other,
+            _ => Format::from_mime(&media)
+                .map(Kind::Picture)
+                .unwrap_or(Kind::Other),
         };
         // td-html would show a byte order mark as text.
         let body = match body.strip_prefix(b"\xef\xbb\xbf") {
             Some(rest) if matches!(kind, Kind::Html | Kind::Text) => rest,
             _ => body.as_slice(),
         };
-        let heavy = matches!(kind, Kind::Html | Kind::Png | Kind::Jpeg);
+        let heavy = matches!(kind, Kind::Html | Kind::Picture(_));
         if heavy && stopped.load(Ordering::SeqCst) {
             return None;
         }
@@ -1427,7 +1431,7 @@ impl Document {
                 let text = String::from_utf8_lossy(shown);
                 (plain(&text, true, base), None, cut(MAX_TEXT))
             }
-            Kind::Png | Kind::Jpeg => match picture(kind, body) {
+            Kind::Picture(format) => match picture::decode(format, body) {
                 Ok(picture) => {
                     return Some(Self {
                         url: Some(url),
@@ -1446,8 +1450,8 @@ impl Document {
                     visible(&media)
                 };
                 let said = format!(
-                    "This is {named}, {size} bytes.\n\ntd-web shows HTML, text, PNG and \
-                     JPEG; Firefox opens the rest."
+                    "This is {named}, {size} bytes.\n\ntd-web shows HTML, text, PNG, \
+                     JPEG and GIF; Firefox opens the rest."
                 );
                 (plain(&said, false, base), None, None)
             }
@@ -1588,8 +1592,7 @@ compile_error!("td-web's render thread catches a rendering's panic: its build mu
 enum Kind {
     Html,
     Text,
-    Png,
-    Jpeg,
+    Picture(Format),
     Other,
 }
 
@@ -1604,10 +1607,8 @@ fn sniff(body: &[u8]) -> Kind {
         .collect();
     if start.starts_with(b"<!doctype html") || start.starts_with(b"<html") {
         Kind::Html
-    } else if body.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Kind::Png
-    } else if body.starts_with(&[0xff, 0xd8, 0xff]) {
-        Kind::Jpeg
+    } else if let Some(format) = Format::sniff(body) {
+        Kind::Picture(format)
     } else if !body.contains(&0) && std::str::from_utf8(body).is_ok() {
         Kind::Text
     } else {
@@ -1847,67 +1848,6 @@ fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
     }
     page.lines.shrink_to_fit();
     page
-}
-
-/// Whether a picture this size is within td-ui's bounds.
-fn fits(width: usize, height: usize) -> bool {
-    width <= MAX_PICTURE_AXIS
-        && height <= MAX_PICTURE_AXIS
-        && width.saturating_mul(height) <= MAX_PICTURE_PIXELS
-}
-
-/// `body` decoded as `kind`, a PNG or a JPEG, within td-ui's picture
-/// bounds, judged from the header before anything is decoded: a JPEG too
-/// large is decoded at the largest of td-jpeg's scales that fits; a PNG
-/// too large is refused.
-fn picture(kind: Kind, body: &[u8]) -> Result<Picture, String> {
-    let (width, height, rgba) = if kind == Kind::Png {
-        let header =
-            td_png::header(body).map_err(|why| format!("The PNG could not be read: {why}"))?;
-        if !fits(header.width, header.height) {
-            return Err(format!(
-                "The PNG is {} by {} pixels, too large to show.",
-                header.width, header.height
-            ));
-        }
-        let image =
-            td_png::decode(body).map_err(|why| format!("The PNG could not be decoded: {why}"))?;
-        (image.width, image.height, image.data)
-    } else {
-        let header =
-            td_jpeg::header(body).map_err(|why| format!("The JPEG could not be read: {why}"))?;
-        let scale = [
-            td_jpeg::Scale::Full,
-            td_jpeg::Scale::Half,
-            td_jpeg::Scale::Quarter,
-            td_jpeg::Scale::Eighth,
-        ]
-        .into_iter()
-        .find(|&scale| {
-            fits(
-                td_jpeg::scaled(header.width, scale),
-                td_jpeg::scaled(header.height, scale),
-            )
-        })
-        .ok_or_else(|| {
-            format!(
-                "The JPEG is {} by {} pixels, too large to show.",
-                header.width, header.height
-            )
-        })?;
-        let image = td_jpeg::decode(body, scale)
-            .map_err(|why| format!("The JPEG could not be decoded: {why}"))?;
-        let mut rgba = Vec::new();
-        rgba.try_reserve_exact(image.data.len() / 3 * 4)
-            .map_err(|_| "There is not the memory to show the JPEG.".to_string())?;
-        let (pixels, _) = image.data.as_chunks::<3>();
-        for pixel in pixels {
-            rgba.extend_from_slice(pixel);
-            rgba.push(0xff);
-        }
-        (image.width, image.height, rgba)
-    };
-    Picture::new(width, height, rgba).map_err(|why| format!("The picture cannot be shown: {why}"))
 }
 
 #[cfg(test)]
@@ -2539,6 +2479,7 @@ pub(crate) mod tests {
         for (kind, body) in [
             ("text/html", b"<p>x".to_vec()),
             ("image/png", td_png::encode_rgb8(1, 1, &[0, 0, 0]).unwrap()),
+            ("image/gif", picture::tests::GIF.to_vec()),
         ] {
             let doc = Document::from_reply_unless(base(), 200, Some(kind), body, &stopped);
             assert!(doc.is_none(), "{kind}");
@@ -3054,5 +2995,33 @@ pub(crate) mod tests {
         assert_eq!(page.line_up(at(0, 1, 3)), at(0, 0, 0));
         assert_eq!(page.line_up(at(2, 0, 0)), at(1, 0, 0));
         assert_eq!(page.line_up(at(0, 0, 0)), at(0, 0, 0));
+    }
+
+    #[test]
+    fn gif_mime_sniffing_and_errors_use_the_same_picture_path() {
+        for version in [b"GIF87a", b"GIF89a"] {
+            let mut gif = picture::tests::GIF.to_vec();
+            gif[..6].copy_from_slice(version);
+            for media in [
+                None,
+                Some("application/octet-stream"),
+                Some("IMAGE/GIF; x=y"),
+            ] {
+                let doc = Document::from_reply(base(), 200, media, gif.clone());
+                let fitted = doc.picture().unwrap().fit(2, 1).unwrap();
+                assert_eq!(fitted.pixel(0, 0), Some([0, 0, 0, 0]));
+                assert_eq!(fitted.pixel(1, 0), Some([0, 0, 255, 255]));
+            }
+        }
+        let doc = Document::from_reply(
+            base(),
+            200,
+            Some("application/pdf"),
+            picture::tests::GIF.to_vec(),
+        );
+        assert!(doc.picture().is_none());
+        let doc = Document::from_reply(base(), 200, Some("image/gif"), b"not GIF".to_vec());
+        assert!(doc.picture().is_none());
+        assert!(text_of(&cells(&doc, 80))[0].starts_with("The GIF could not be read"));
     }
 }
