@@ -816,6 +816,31 @@ fn process_mutation_via_queue(
     my_email_regex: &UserRegex,
     cache: Option<&Cache>,
 ) -> Result<(), String> {
+    process_online_mutation(
+        client,
+        op,
+        cached_mailboxes,
+        rules,
+        custom_headers,
+        my_email_regex,
+        cache,
+        true,
+    )
+    .map(|_| ())
+}
+
+/// None confirms the remote result; Some retains durable intent and its refusal.
+#[allow(clippy::too_many_arguments)]
+fn process_online_mutation(
+    client: &JmapClient,
+    op: &QueuedMutation,
+    cached_mailboxes: &mut Vec<Mailbox>,
+    rules: &[CompiledRule],
+    custom_headers: &[String],
+    my_email_regex: &UserRegex,
+    cache: Option<&Cache>,
+    optimistic: bool,
+) -> Result<Option<String>, String> {
     client
         .require_writable()
         .map_err(|error| error.to_string())?;
@@ -832,10 +857,13 @@ fn process_mutation_via_queue(
             custom_headers,
             my_email_regex,
             None,
-        );
+        )
+        .map(|()| None);
     };
     let seq = queue_mutation(Some(cache), op)?;
-    apply_local_mutation(Some(cache), op);
+    if optimistic {
+        apply_local_mutation(Some(cache), op);
+    }
 
     match execute_queued_mutation(
         seq,
@@ -848,7 +876,11 @@ fn process_mutation_via_queue(
         Some(cache),
     ) {
         Ok(()) => {
+            if !optimistic {
+                apply_local_mutation(Some(cache), op);
+            }
             let _ = cache.remove_queued_operation(seq);
+            Ok(None)
         }
         Err(e) => {
             log_warn!(
@@ -857,9 +889,9 @@ fn process_mutation_via_queue(
                 op,
                 e
             );
+            Ok(Some(e))
         }
     }
-    Ok(())
 }
 
 /// Spawns the account's backend thread and returns the command sender and
@@ -1685,6 +1717,16 @@ fn replay_queued_mutations(
 
         match result {
             Ok(()) => {
+                if matches!(
+                    op,
+                    QueuedMutation::MoveEmail { .. }
+                        | QueuedMutation::MarkRead { .. }
+                        | QueuedMutation::MarkUnread { .. }
+                        | QueuedMutation::SetFlagged { .. }
+                        | QueuedMutation::DestroyEmail { .. }
+                ) {
+                    apply_local_mutation(Some(cache), &op);
+                }
                 let _ = cache.remove_queued_operation(seq);
             }
             Err(e) => {
@@ -2094,6 +2136,7 @@ fn backend_loop(
                     }
                 }
 
+                let mut rule_failure = None;
                 let query_started = std::time::Instant::now();
                 let result = (|| {
                     let query = client
@@ -2115,9 +2158,23 @@ fn backend_loop(
                         .find(|m| m.id.as_str() == mailbox_id.as_str())
                         .map(|m| m.name.clone())
                         .unwrap_or_default();
-                    let apply_rules = !client.is_read_only()
+                    let rule_scope = !client.is_read_only()
                         && !rules.is_empty()
                         && rules_mailbox_regex.is_match(&mailbox_name);
+                    let pending_writes = cache
+                        .as_ref()
+                        .is_some_and(|cache| !cache.queued_operations().is_empty());
+                    if rule_scope && pending_writes {
+                        rule_failure = Some(
+                            "Automatic filing paused: pending changes need reconnect replay"
+                                .to_string(),
+                        );
+                    }
+                    let apply_rules = rule_scope
+                        && !pending_writes
+                        && cache
+                            .as_ref()
+                            .is_none_or(|cache| !cache.filter_unprocessed(&query.ids).is_empty());
                     let mut emails = if query.ids.is_empty() {
                         Ok(Vec::new())
                     } else {
@@ -2216,6 +2273,11 @@ fn backend_loop(
                             };
 
                             emails_for_rules.retain(|email| !email.is_unreadable());
+                            let readable_ids: Vec<String> = emails_for_rules
+                                .iter()
+                                .map(|email| email.id.clone())
+                                .collect();
+                            let mut durable = true;
                             if !emails_for_rules.is_empty() {
                                 let scorer = SpamScorer {
                                     config: &spam_config,
@@ -2247,10 +2309,7 @@ fn backend_loop(
                                     );
                                     let mut removed_ids = HashSet::new();
                                     for op in &ops {
-                                        if let QueuedMutation::MoveEmail { id, .. } = op {
-                                            removed_ids.insert(id.clone());
-                                        }
-                                        if let Err(e) = process_mutation_via_queue(
+                                        match process_online_mutation(
                                             client,
                                             op,
                                             &mut cached_mailboxes,
@@ -2258,13 +2317,22 @@ fn backend_loop(
                                             &custom_headers,
                                             &my_email_regex,
                                             cache.as_ref(),
+                                            false,
                                         ) {
-                                            log_warn!(
-                                                "[Rules] queued mutation failed for mailbox '{}' op={:?}: {}",
-                                                mailbox_name,
-                                                op,
-                                                e
-                                            );
+                                            Ok(None) => {
+                                                if let QueuedMutation::MoveEmail { id, .. } = op {
+                                                    removed_ids.insert(id.clone());
+                                                }
+                                            }
+                                            Ok(Some(error)) => {
+                                                rule_failure.get_or_insert(format!("Automatic filing pending; reconnect to retry: {error}"));
+                                            }
+                                            Err(error) => {
+                                                durable = false;
+                                                rule_failure.get_or_insert(format!(
+                                                    "Automatic filing failed: {error}"
+                                                ));
+                                            }
                                         }
                                     }
                                     if !removed_ids.is_empty() {
@@ -2277,14 +2345,11 @@ fn backend_loop(
                                 }
                             }
 
-                            // Unreadable messages remain eligible after a later successful read.
-                            if let Some(ref cache) = cache {
-                                let readable_ids: Vec<String> = emails
-                                    .iter()
-                                    .filter(|email| !email.is_unreadable())
-                                    .map(|email| email.id.clone())
-                                    .collect();
-                                cache.mark_rules_processed(&readable_ids);
+                            // Pending actions are durable; do not classify or plan them again.
+                            if durable {
+                                if let Some(ref cache) = cache {
+                                    cache.mark_rules_processed(&readable_ids);
+                                }
                             }
                         } else {
                             log_debug!(
@@ -2376,13 +2441,23 @@ fn backend_loop(
                         || received_after.is_some()
                         || received_before.is_some(),
                     search_skipped,
-                    mailbox_id,
+                    mailbox_id: mailbox_id.clone(),
                     emails,
                     total,
                     position,
                     loaded,
                     thread_counts,
                 });
+                if let Some(error) = rule_failure {
+                    log_warn!("[Rules] {}", error);
+                    if !origin.starts_with("cli") {
+                        let _ = resp_tx.send(BackendResponse::RulesRun {
+                            mailbox_id,
+                            mailbox_name: String::new(),
+                            result: Err(error),
+                        });
+                    }
+                }
             }
             BackendCommand::QueryThreadEmails { thread_id } => {
                 let result = client
@@ -4022,6 +4097,137 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn failed_automatic_move_keeps_server_membership_and_durable_intent() {
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-auto-rule-refusal").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let cache = Cache::open("rule-refusal").unwrap();
+        let email = Email::from_json(&td_json::json!({
+            "id":"message", "keywords":{}, "mailboxIds":{"inbox":true}
+        }))
+        .unwrap();
+        cache.put_emails(&[email]);
+        cache.put_mailbox_index("inbox", &["message".into()]);
+        let op = QueuedMutation::MoveEmail {
+            op_id: 1,
+            id: "message".into(),
+            to_mailbox_id: "archive".into(),
+        };
+        let pattern = UserRegex::compile(".*").unwrap();
+        let result = process_online_mutation(
+            &JmapClient::unreachable_for_tests(),
+            &op,
+            &mut Vec::new(),
+            &[],
+            &[],
+            &pattern,
+            Some(&cache),
+            false,
+        )
+        .unwrap();
+        assert!(result.is_some(), "queued is not remotely confirmed");
+        assert_eq!(cache.queued_operations().len(), 1);
+        assert!(cache
+            .get_email("message")
+            .unwrap()
+            .mailbox_ids
+            .contains_key("inbox"));
+        assert!(!cache
+            .get_email("message")
+            .unwrap()
+            .mailbox_ids
+            .contains_key("archive"));
+        assert_eq!(cache.get_mailbox_emails("inbox").unwrap().len(), 1);
+        cache.mark_rules_processed(&["message".into()]);
+        assert!(cache.filter_unprocessed(&["message".into()]).is_empty());
+        assert_eq!(
+            cache.queued_operations().len(),
+            1,
+            "classification never retires intent"
+        );
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        std::fs::create_dir(dir.join("td-fetch")).unwrap();
+        let listener = UnixListener::bind(dir.join("td-fetch/socket")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("body ") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut bytes = vec![0; length.unwrap()];
+            reader.read_exact(&mut bytes).unwrap();
+            let request = td_json::parse_slice(&bytes).unwrap();
+            let call = &request["methodCalls"][0];
+            assert_eq!(call[0].as_str(), Some("Email/set"));
+            assert_eq!(
+                call[1]["update"]["message"]["mailboxIds"],
+                td_json::json!({"archive":true})
+            );
+            let reply = td_json::json!({"methodResponses":[["Email/set",{
+                "accountId":"account", "updated":{"message":null}
+            },call[2].clone()]]})
+            .to_string();
+            write!(
+                socket,
+                "td-fetch 1\nstatus 200\nbody {}\n\n{}",
+                reply.len(),
+                reply
+            )
+            .unwrap();
+        });
+        replay_queued_mutations(
+            &JmapClient::unreachable_for_tests(),
+            &mut Vec::new(),
+            &[],
+            &[],
+            &pattern,
+            &cache,
+        );
+        server.join().unwrap();
+        assert!(cache.queued_operations().is_empty());
+        assert!(cache
+            .get_email("message")
+            .unwrap()
+            .mailbox_ids
+            .contains_key("archive"));
+        assert!(!cache
+            .get_email("message")
+            .unwrap()
+            .mailbox_ids
+            .contains_key("inbox"));
+        assert!(cache.get_mailbox_emails("inbox").unwrap().is_empty());
+        assert_eq!(cache.get_mailbox_emails("archive").unwrap().len(), 1);
+    }
 
     #[test]
     fn read_only_connection_does_not_queue_project_or_replay_mutations() {

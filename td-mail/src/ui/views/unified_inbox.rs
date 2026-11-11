@@ -692,6 +692,20 @@ impl View for UnifiedInboxView {
             return changed;
         }
         match response {
+            BackendResponse::RulesRun {
+                mailbox_id,
+                result: Err(error),
+                ..
+            } => {
+                let Some(part) = self.parts.get(index) else {
+                    return false;
+                };
+                if part.id.as_deref() != Some(mailbox_id.as_str()) {
+                    return false;
+                }
+                self.status_message = Some(format!("{}: {error}", part.inbox.name));
+                true
+            }
             // A listing names the inbox; a changed one (the account set
             // up anew) starts the part over.
             BackendResponse::Mailboxes(result) => {
@@ -917,6 +931,33 @@ mod tests {
             loaded: 0,
             thread_counts: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn automatic_filing_refusal_names_only_the_matching_account_inbox() {
+        let (home, _rx) = inbox(0, "home", vec![folder("h-in", "Inbox", Some("inbox"))]);
+        let mut view =
+            UnifiedInboxView::new(vec![home], 50, None, "home".into(), "me@home.test".into());
+        let warning = BackendResponse::RulesRun {
+            mailbox_id: "h-in".into(),
+            mailbox_name: String::new(),
+            result: Err("Automatic filing pending; reconnect to retry".into()),
+        };
+        assert!(!view.on_account_response(1, &warning));
+        assert!(view.on_account_response(0, &warning));
+        assert!(view
+            .scene()
+            .status
+            .contains("home: Automatic filing pending"));
+        assert!(!view.on_account_response(
+            0,
+            &BackendResponse::RulesRun {
+                mailbox_id: "other".into(),
+                mailbox_name: String::new(),
+                result: Err("wrong folder".into()),
+            }
+        ));
+        assert!(!view.scene().status.contains("wrong folder"));
     }
 
     fn labels(view: &UnifiedInboxView) -> Vec<String> {

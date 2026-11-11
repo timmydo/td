@@ -877,3 +877,15 @@ lines and adds a marker. This also bounds an oversized old log on its next
 write. Compaction keeps the inode shared by running writers; it is not an
 audit archive or crash-durable storage. Copy logs before reproducing a problem
 if older history needs preservation.
+
+Automatic filing keeps a message in its server-observed folder until its move
+is confirmed. A refused online rule action remains durably queued without an
+optimistic folder change, and the folder view reports that filing is pending.
+Successfully queued rule plans count as processed even when their messages
+remain visible, preventing repeated spam downloads and replacement plans.
+While any durable write remains queued, automatic filing pauses until reconnect
+replay resolves it; new messages remain eligible afterward. User-initiated
+mutations retain their existing optimistic display and durable queue policy.
+Interactive folder refreshes use summary reads when no unprocessed rule input
+remains. A first classification pass still fetches full rule input and may
+occupy the account worker; this does not introduce background rule execution.
