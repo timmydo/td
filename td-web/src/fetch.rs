@@ -13,7 +13,7 @@ pub const MAX_DOCUMENT: u64 = 16 << 20;
 /// What a navigation asks for: a page, else text, else a picture td-web
 /// shows, else whatever there is.
 pub const ACCEPT: &str = "text/html, application/xhtml+xml, text/plain;q=0.9, \
-image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, */*;q=0.1";
+image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, image/webp;q=0.8, */*;q=0.1";
 pub const USER_AGENT: &str = concat!("td-web/", env!("CARGO_PKG_VERSION"));
 /// The statuses that redirect; any other is the document, a 304 or a 300
 /// with a `location` included.

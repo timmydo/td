@@ -18,6 +18,7 @@ pub fn recipe() -> Recipe {
             "td-png",
             "td-ui",
             "td-url",
+            "td-webp",
             "td-util",
             "td-compositor",
             "engine",
@@ -51,6 +52,7 @@ mod tests {
                 "td-png".into(),
                 "td-ui".into(),
                 "td-url".into(),
+                "td-webp".into(),
                 "td-util".into(),
                 "td-compositor".into(),
                 "engine".into(),
@@ -89,6 +91,7 @@ mod tests {
                 "td-ui",
                 "td-url",
                 "td-web",
+                "td-webp",
             ]
         );
         assert!(!lock.contains("source = "));

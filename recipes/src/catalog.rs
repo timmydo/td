@@ -723,6 +723,7 @@ mod tests {
                 "td-url",
                 "td-util",
                 "td-web",
+                "td-webp",
             ]
         );
         lone.sort_unstable();

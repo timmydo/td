@@ -7,6 +7,7 @@ pub(crate) enum Format {
     Png,
     Jpeg,
     Gif,
+    Webp,
 }
 
 impl Format {
@@ -15,6 +16,7 @@ impl Format {
             "image/png" => Some(Self::Png),
             "image/jpeg" | "image/pjpeg" => Some(Self::Jpeg),
             "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::Webp),
             _ => None,
         }
     }
@@ -26,6 +28,8 @@ impl Format {
             Some(Self::Jpeg)
         } else if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") {
             Some(Self::Gif)
+        } else if body.starts_with(b"RIFF") && body.get(8..12) == Some(b"WEBP") {
+            Some(Self::Webp)
         } else {
             None
         }
@@ -36,6 +40,7 @@ impl Format {
             Self::Png => "PNG",
             Self::Jpeg => "JPEG",
             Self::Gif => "GIF",
+            Self::Webp => "WebP",
         }
     }
 }
@@ -61,6 +66,9 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
             .map(|h| (h.width, h.height))
             .map_err(|e| read_error(e.to_string()))?,
         Format::Jpeg => td_jpeg::header(body)
+            .map(|h| (h.width, h.height))
+            .map_err(|e| read_error(e.to_string()))?,
+        Format::Webp => td_webp::header(body)
             .map(|h| (h.width, h.height))
             .map_err(|e| read_error(e.to_string()))?,
         Format::Gif => td_gif::header(body)
@@ -91,6 +99,10 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
             let image = td_png::decode(body).map_err(|e| decode_error(e.to_string()))?;
             (image.width, image.height, image.data)
         }
+        Format::Webp => {
+            let image = td_webp::decode(body).map_err(|e| decode_error(e.to_string()))?;
+            (image.width, image.height, image.data)
+        }
         Format::Gif => {
             let image = td_gif::decode(body).map_err(|e| decode_error(e.to_string()))?;
             (image.width, image.height, image.data)
@@ -115,6 +127,8 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, String> {
 pub(crate) mod tests {
     use super::*;
 
+    pub(crate) const WEBP: &[u8] = include_bytes!("../../td-webp/tests/fixtures/palette.webp");
+
     pub(crate) const GIF: &[u8] = b"GIF89a\x02\0\x01\0\x80\0\0\0\0\0\xff\0\0\x21\xf9\x04\x01\0\0\0\0\x2c\0\0\0\0\x02\0\x01\0\0\x02\x02\x44\x0a\0\x3b";
 
     #[test]
@@ -125,7 +139,7 @@ pub(crate) mod tests {
             .unwrap_err()
             .contains("too large to show"));
         let bytes = vec![0; crate::fetch::MAX_DOCUMENT as usize + 1];
-        for format in [Format::Png, Format::Jpeg, Format::Gif] {
+        for format in [Format::Png, Format::Jpeg, Format::Gif, Format::Webp] {
             assert!(decode(format, &bytes)
                 .unwrap_err()
                 .contains("too large to read"));

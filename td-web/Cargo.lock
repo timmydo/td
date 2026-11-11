@@ -41,4 +41,9 @@ dependencies = [
  "td-png",
  "td-ui",
  "td-url",
+ "td-webp",
 ]
+
+[[package]]
+name = "td-webp"
+version = "0.1.0"
