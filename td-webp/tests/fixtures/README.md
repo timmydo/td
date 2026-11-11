@@ -1,0 +1,20 @@
+# Synthetic lossless WebP fixtures
+
+These images were generated for td's tests. libwebp 1.3.2's
+`WebPEncodeLosslessRGBA` encoded the source pixels; its `WebPDecodeRGBA`
+produced the committed straight-alpha `.rgba` oracles. No external code
+is linked or executed by the tests. Dimensions are held in `decode.rs`.
+
+Pixel recipes, in row-major order:
+
+- single: RGBA (31, 95, 127, 192).
+- palette: index `(x / 3 + y / 5) % 4` into opaque red, half-alpha green
+  (alpha 128), quarter-alpha blue (alpha 64), and transparent white.
+- gradient, vertical, horizontal: RGBA `(7*x, 11*y, 3*x+5*y, 13*x+19*y)`,
+  each channel reduced modulo 256.
+- noise: starting at seed 1234, advance the wrapping u32 recurrence
+  `seed = seed * 1664525 + 1013904223` before each pixel; use the seed's
+  four little-endian bytes as RGBA.
+
+The oracle is the independently decoded output, because an encoder may
+replace the invisible RGB values of pixels whose alpha is zero.
