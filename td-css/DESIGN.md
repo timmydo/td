@@ -3,9 +3,11 @@
 td-css is td's CSS engine: owned syntax, selector matching and computed
 styles, without layout, painting, fetching or a document tree. It is a
 standalone, std-only library, with no dependencies, no unsafe code and no
-production panics or unchecked indexing. It has no consumer yet. In
-particular it neither depends on nor changes td-html, td-web, td-news,
-td-mail or td-ui. A later td-web layout engine may consume its values.
+production panics or unchecked indexing. The standalone
+[td-dom adapter](../td-dom/DESIGN.md) connects its Element boundary to
+td-html documents; no application consumes it yet. td-css itself has no
+dependency on td-html, td-web, td-news, td-mail or td-ui. A later td-web
+layout engine may consume its values.
 
 ## 1. Scope and standards
 

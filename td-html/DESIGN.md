@@ -386,12 +386,17 @@ admission rules.
 ### Styling boundary
 
 A separate std-only `td-dom` crate depends on `td-html` and `td-css` and
-owns the adapter. td-html has no CSS dependency; existing consumers gain
+owns the adapter described in [td-dom/DESIGN.md](../td-dom/DESIGN.md).
+td-html has no CSS dependency; existing consumers gain
 no CSS closure. The adapter borrows an immutable Document and exposes
 HTML elements through `td_css::Element`, with element-only parent, child
 and sibling traversal and text-child detection excluding comments.
 Foreign elements and template fragments do not become HTML selector
-subjects or leak their descendants into that tree. HTML a/area elements
+subjects or leak their descendants into that tree. Structural selectors
+observe this projection, so an element with only foreign children is empty.
+Navigation and direct-text presence are indexed once under td-dom's own
+node, byte and traversal ceilings; CSS callbacks do not scan comments.
+HTML a/area elements
 with href are links. Caller-supplied hover/focus/checked state remains
 stable during a cascade; visited history is never exposed.
 
