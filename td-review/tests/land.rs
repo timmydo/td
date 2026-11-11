@@ -9,34 +9,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use td_fs::TempDir;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_td-review");
-
-/// Scratch directory removed when the test ends.
-struct TempDir(PathBuf);
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-impl TempDir {
-    fn new(tag: &str) -> Res<TempDir> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("td-review-{tag}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&path)?;
-        Ok(TempDir(path))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
 
 /// The fixtures must not inherit the developer's git config: a global
 /// `commit.gpgsign`, `merge.tool`, hook path or alias would otherwise decide
@@ -3471,5 +3448,43 @@ fn a_headless_mode_saves_no_repository() -> Res<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!config.path().join("td-review").exists());
+    Ok(())
+}
+
+#[test]
+fn preview_uses_reviewed_attributes_even_when_main_has_none() -> Res<()> {
+    for conflict in [false, true] {
+        let s = scenario("preview-attributes")?;
+        git(
+            &s.work,
+            &[
+                "checkout",
+                "-b",
+                "work-0001-feature",
+                "origin/work-0001-feature",
+            ],
+        )?;
+        fs::write(s.work.join(".gitattributes"), "*.yuv binary\n")?;
+        fs::write(s.work.join("noise.yuv"), "raw-samples-must-not-appear\n")?;
+        fs::write(s.work.join("README"), "branch version\n")?;
+        git(&s.work, &["add", ".gitattributes", "noise.yuv", "README"])?;
+        git(&s.work, &["commit", "-m", "pictures: add binary fixture"])?;
+        git(&s.work, &["push", "origin", "work-0001-feature"])?;
+        git(&s.work, &["checkout", "main"])?;
+        if conflict {
+            fs::write(s.work.join("README"), "base-side conflict\n")?;
+            git(&s.work, &["add", "README"])?;
+            git(&s.work, &["commit", "-m", "main: divergent edit"])?;
+        }
+        assert!(!s.work.join(".gitattributes").exists());
+        let (ok, output) = review(&s.work, &["--preview", "origin/work-0001-feature"])?;
+        assert!(ok, "{output}");
+        assert!(
+            output.contains("Binary files /dev/null and b/noise.yuv differ"),
+            "{output}"
+        );
+        assert!(!output.contains("raw-samples-must-not-appear"), "{output}");
+        assert!(!s.work.join(".gitattributes").exists());
+    }
     Ok(())
 }

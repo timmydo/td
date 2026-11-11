@@ -98,6 +98,18 @@ fn log_output(log: &mut Vec<Line>, run: &crate::git::Run) {
     }
 }
 
+fn attribute_diff_args(source: Option<&str>, args: &[&str]) -> Vec<String> {
+    source
+        .map(|tree| format!("--attr-source={tree}"))
+        .into_iter()
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect()
+}
+fn diff_with_attributes(git: &Git, source: Option<&str>, args: &[&str]) -> io::Result<String> {
+    let args = attribute_diff_args(source, args);
+    git.run_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 /// Read everything needed to review `branch` against `base`. Every range below
 /// names object ids: worktrees share refs, so a concurrent fetch could otherwise
 /// give the preview a diff and a message from different commits.
@@ -125,19 +137,37 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
     // (the pane compares this against `commits`), rather than refusing the diff.
     let records = git.commit_records(&range).unwrap_or_default();
 
+    // The option was introduced in Git 2.41; retain older hosts' previews.
+    let attributes = git.run(&["--attr-source=HEAD", "--version"])?.ok;
     // The landing is a three-way squash onto the base, NOT the branch's own
     // diff: with a base-side rename the two name different paths.
-    let (stat, diff, note) = match git.merge_tree(&base_oid, &branch_oid)? {
+    let (stat, diff, mut note) = match git.merge_tree(&base_oid, &branch_oid)? {
         MergeResult::Clean(tree) => (
-            git.run_ok(&["diff", "--stat", &base_oid, &tree, "--"])?,
-            git.run_ok(&["diff", &base_oid, &tree, "--"])?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(tree.as_str()),
+                &["diff", "--stat", &base_oid, &tree, "--"],
+            )?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(tree.as_str()),
+                &["diff", &base_oid, &tree, "--"],
+            )?,
             None,
         ),
         // No mergeable tree to show: fall back to the branch's own changes and
         // say so, rather than passing them off as the landing.
         MergeResult::Conflicted => (
-            git.run_ok(&["diff", "--stat", &range, "--"])?,
-            git.run_ok(&["diff", &range, "--"])?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(branch_oid.as_str()),
+                &["diff", "--stat", &range, "--"],
+            )?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(branch_oid.as_str()),
+                &["diff", &range, "--"],
+            )?,
             Some(format!(
                 "{branch} does not merge cleanly onto {base} — a squash (s) will stop at \
                  the conflict and a replay (r) refuses, having no reviewed tree to hold \
@@ -145,14 +175,29 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
             )),
         ),
         MergeResult::Unavailable(why) => (
-            git.run_ok(&["diff", "--stat", &range, "--"])?,
-            git.run_ok(&["diff", &range, "--"])?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(branch_oid.as_str()),
+                &["diff", "--stat", &range, "--"],
+            )?,
+            diff_with_attributes(
+                git,
+                attributes.then_some(branch_oid.as_str()),
+                &["diff", &range, "--"],
+            )?,
             Some(format!(
                 "the merge result could not be computed ({why}) — shown below is the \
                  BRANCH's own diff, which can differ from what a landing takes"
             )),
         ),
     };
+    if !attributes {
+        let warning = "Git lacks reviewed-tree attributes; binary/text classification uses checkout attributes.";
+        note = Some(match note {
+            Some(note) => format!("{note}\n{warning}"),
+            None => warning.to_string(),
+        });
+    }
     Ok(Preview {
         branch_oid,
         base_oid,
@@ -1340,6 +1385,19 @@ mod tests {
                 .map(|t| t.remote.as_str())
                 .collect::<Vec<_>>(),
             vec!["backup"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    #[test]
+    fn older_git_gets_the_original_diff_arguments() {
+        let args = ["diff", "base", "tree", "--"];
+        assert_eq!(super::attribute_diff_args(None, &args), args);
+        assert_eq!(
+            super::attribute_diff_args(Some("tree"), &args),
+            ["--attr-source=tree", "diff", "base", "tree", "--"]
         );
     }
 }
