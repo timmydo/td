@@ -1157,23 +1157,25 @@ td-mta/CONFORMANCE.md says what each measures.
 
 The timing-leakage measurement of td-primitives' secret paths and
 td-crypto's private-key PEM decoder runs on demand, never in a gate or
-`ready`:
+`ready`, from the executables an x86-64 portable build publishes, so it
+measures the pinned toolchain's code (td-crypto/PORTABLE.md):
 
 ```text
-taskset -c 7 td-builder gate-crates crypto-cargo leakage --manifest-path td-crypto/Cargo.toml
+td-builder gate-crates crypto-portable-build --archives DIRECTORY
+taskset -c 7 td-builder gate-crates crypto-portable-leakage --artifact .td-build-cache/crypto-artifact-<NAR-sha256>
 ```
 
-It runs the two ignored cases, td-primitives'
+The second command runs the two ignored cases, td-primitives'
 `leakage_tests::timing_leakage` and td-crypto's
-`pem::tests::pem_timing_leakage`, in release with one test thread, through
-the same bounded output and passing-summary check as the mail performance
+`pem::tests::pem_timing_leakage`, with one test thread, through the same
+bounded output and passing-summary check as the mail performance
 harness. `TD_LEAKAGE_SAMPLES` (default 1000000) sets the samples per path;
 a value that is not a count refuses.
-At the default it takes about 27 minutes on a Ryzen 7 5700G (1588 s in the
-run td-primitives/DESIGN.md records), most of it the
-public-key paths. Pin it to one otherwise idle CPU, as `taskset` does above;
-build first, unpinned, with a small `TD_LEAKAGE_SAMPLES`, so the pinned run
-only measures. A case fails when either positive control shows no leak or a
+At the default it takes about half an hour on a Ryzen 7 5700G
+(td-primitives/DESIGN.md records each run's time), most of it the
+public-key paths. Pin it to one otherwise idle CPU, as `taskset` does
+above; the build runs first and unpinned, so the pinned run only
+measures. A case fails when either positive control shows no leak or a
 measured path shows |t| above 4.5. Rerun a failure before believing it, and
 report it with its numbers. td-primitives/DESIGN.md says what is measured
 and records results.

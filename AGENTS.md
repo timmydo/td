@@ -640,9 +640,11 @@ message.
   its exact manifest, lock and active features are pinned in the same policy.
   `td-crypto` depends on rustls with no built-in backend and on local
   `td-tls-provider` and `td-primitives`, which supply all its cryptography.
-  All eleven local manifests and locks are pinned, `td-primitives` among
-  them. No roster crate outside the admission may depend on `td-crypto`,
-  `td-mta` or `td-tls-provider`, directly or transitively; `td-header`,
+  All twelve local manifests and locks are pinned, `td-primitives` among
+  them, and `td-source-scan`, which the portable builds stage only so
+  Cargo can compile td-primitives' tests. No roster crate outside the
+  admission may depend on `td-crypto`, `td-mta` or `td-tls-provider`,
+  directly or transitively; `td-header`,
   `td-civil`, `td-html`, `td-json`, `td-mime`, `td-nfc` and
   `td-primitives` remain ordinary std-only shared crates.
   `td-crypto/DESIGN.md` owns offline preparation and crypto confinement;

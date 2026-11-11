@@ -17,6 +17,9 @@ const BINARIES: &[&str] = &[
     "td-mta-transport-smoke",
     "td-mta-rust-allocation-probe",
     "td-mta-rss-probe",
+    "td-primitives-smoke",
+    "td-primitives-vectors",
+    "td-primitives-ssh-vectors",
 ];
 const ARM_BINARIES: &[&str] = &[
     "td-mta",
@@ -24,6 +27,40 @@ const ARM_BINARIES: &[&str] = &[
     "td-mta-config-smoke",
     "td-mta-format-smoke",
     "td-mta-transport-smoke",
+    "td-primitives-smoke",
+    "td-primitives-vectors",
+    "td-primitives-ssh-vectors",
+];
+
+/// One of td-primitives' test executables the portable builds produce.
+struct PrimitiveSuite {
+    installed: &'static str,
+    cargo_name: &'static str,
+    target: &'static [&'static str],
+    kind: ArtifactKind,
+}
+
+/// td-primitives' unit tests and its two known-answer suites.
+/// tests/confinement.rs is left out: it reads the crate's source at run time.
+const PRIMITIVE_SUITES: &[PrimitiveSuite] = &[
+    PrimitiveSuite {
+        installed: "td-primitives-smoke",
+        cargo_name: "td_primitives",
+        target: &["--lib"],
+        kind: ArtifactKind::LibraryTest,
+    },
+    PrimitiveSuite {
+        installed: "td-primitives-vectors",
+        cargo_name: "vectors",
+        target: &["--test", "vectors"],
+        kind: ArtifactKind::IntegrationTest,
+    },
+    PrimitiveSuite {
+        installed: "td-primitives-ssh-vectors",
+        cargo_name: "ssh_vectors",
+        target: &["--test", "ssh_vectors"],
+        kind: ArtifactKind::IntegrationTest,
+    },
 ];
 
 fn binary_names(architecture: Architecture) -> &'static [&'static str] {
@@ -950,6 +987,13 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "rss-probe-build", &mut receipt)?;
     let output = bounded_output(&mut command, "rss-probe-build", 8 * 1024 * 1024, 1200)?;
     let rss = executable(&output, "rss_probe", ArtifactKind::IntegrationTest)?;
+    let mut primitives = Vec::new();
+    for suite in PRIMITIVE_SUITES {
+        primitives.push((
+            suite.installed,
+            primitive_suite(suite, architecture, &mut receipt)?,
+        ));
+    }
     for (index, (binary, probe)) in [
         (&mail, false),
         (&cli, false),
@@ -993,6 +1037,9 @@ pub(crate) fn build_inner() -> Result<()> {
         Path::new("/output/artifacts/td-mta-rust-allocation-probe"),
     )?;
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
+    for (installed, binary) in &primitives {
+        copy_binary(binary, &Path::new("/output/artifacts").join(installed))?;
+    }
     branch_free_routines(&mut receipt, architecture)?;
     split_mail_debug(&mut receipt)?;
     crate::crypto_api::qualify(&mut receipt, architecture)?;
@@ -1103,6 +1150,13 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         rss_symbols(&symbols, false)?;
         copy_binary(&binary, &Path::new("/output/artifacts").join(installed))?;
     }
+    for suite in PRIMITIVE_SUITES {
+        let binary = primitive_suite(suite, architecture, &mut receipt)?;
+        copy_binary(
+            &binary,
+            &Path::new("/output/artifacts").join(suite.installed),
+        )?;
+    }
     refuse_decoy(Path::new("/output"))?;
     branch_free_routines(&mut receipt, architecture)?;
     split_mail_debug_architecture(&mut receipt, architecture)?;
@@ -1110,6 +1164,180 @@ pub(crate) fn cross_build_inner() -> Result<()> {
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
+}
+
+/// Builds one of td-primitives' test executables and checks its symbols as the
+/// mail artifacts' are.
+fn primitive_suite(
+    suite: &PrimitiveSuite,
+    architecture: Architecture,
+    receipt: &mut String,
+) -> Result<PathBuf> {
+    let installed = suite.installed;
+    let mut command = cargo("test", "td-primitives", architecture);
+    command
+        .args([
+            "--release",
+            "--no-run",
+            "--message-format=json-render-diagnostics",
+        ])
+        .args(suite.target);
+    let label = format!("{installed}-build");
+    command_record(&command, &label, receipt)?;
+    let output = bounded_output(&mut command, &label, 8 * 1024 * 1024, 1200)?;
+    let binary = executable_for(&output, suite.cargo_name, suite.kind, architecture)?;
+    let mut symbols = Command::new(tools(architecture).nm);
+    symbols
+        .arg("--defined-only")
+        .arg(&binary)
+        .env_clear()
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut symbols);
+    let label = format!("{installed}-symbols");
+    command_record(&symbols, &label, receipt)?;
+    let symbols = bounded_output(&mut symbols, &label, 8 * 1024 * 1024, 30)?;
+    allocation_symbols(&symbols, false)?;
+    foreign_symbols(&symbols)?;
+    rss_symbols(&symbols, false)?;
+    Ok(binary)
+}
+
+/// The tests a libtest `--list` names.
+fn listed_tests(listing: &str) -> usize {
+    listing
+        .lines()
+        .filter(|line| line.ends_with(": test"))
+        .count()
+}
+
+/// The summary a whole run of a suite listing `all` tests, `ignored` of them
+/// ignored, must print: every other test ran and passed, so a filtered or
+/// truncated run fails rather than passing on less.
+fn suite_summary(all: usize, ignored: usize) -> Result<String> {
+    let passing = all
+        .checked_sub(ignored)
+        .filter(|n| *n > 0)
+        .ok_or("the suite lists no test to run")?;
+    Ok(format!(
+        "test result: ok. {passing} passed; 0 failed; {ignored} ignored; 0 measured; 0 filtered out;"
+    ))
+}
+
+/// Runs a whole td-primitives suite, under `emulator` when one is named.
+fn primitive_suite_run(binary: &str, emulator: Option<&str>, timeout: u64) -> Result<String> {
+    let command = |args: &[&str]| {
+        let mut command = match emulator {
+            Some(emulator) => {
+                let mut command = Command::new(emulator);
+                command.arg(format!("/artifacts/{binary}"));
+                command
+            }
+            None => Command::new(format!("/artifacts/{binary}")),
+        };
+        command.args(args).env_clear().stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        command
+    };
+    let all = listed_tests(&bounded_output(
+        &mut command(&["--list"]),
+        &format!("{binary}-list"),
+        64 * 1024,
+        timeout,
+    )?);
+    let ignored = listed_tests(&bounded_output(
+        &mut command(&["--list", "--ignored"]),
+        &format!("{binary}-list-ignored"),
+        64 * 1024,
+        timeout,
+    )?);
+    let summary = suite_summary(all, ignored).map_err(|e| format!("{binary}: {e}"))?;
+    let name = format!("{binary}-suite");
+    let output = bounded_output(
+        &mut command(&["--test-threads=1"]),
+        &name,
+        64 * 1024,
+        timeout,
+    )
+    .inspect_err(|_| {
+        let path = Path::new("/output").join(format!("{name}.log"));
+        if let Ok(log) = read_output(&path, &name, 64 * 1024) {
+            eprintln!("portable td-primitives failure in {binary}:\n{log}");
+        }
+    })?;
+    if !suite_passed(&output, &summary) {
+        eprintln!("portable td-primitives summary mismatch in {binary}:\n{output}");
+        return Err(format!("{binary} did not pass every test it lists"));
+    }
+    Ok(format!(
+        "{binary}: {} of {all} listed tests passed, {ignored} ignored",
+        all - ignored
+    ))
+}
+
+/// One libtest summary, and it is the required one.
+fn suite_passed(output: &str, summary: &str) -> bool {
+    let mut summaries = output
+        .lines()
+        .filter(|line| line.starts_with("test result:"));
+    summaries
+        .next()
+        .is_some_and(|line| line.starts_with(summary))
+        && summaries.next().is_none()
+}
+
+/// Which of td-primitives' hardware backends this machine selected, as its
+/// `hardware_backends_exercised` test reports them on stderr.
+fn primitive_backends(emulator: Option<&str>, timeout: u64) -> Result<Vec<String>> {
+    let binary = "/artifacts/td-primitives-smoke";
+    let mut command = match emulator {
+        Some(emulator) => {
+            let mut command = Command::new(emulator);
+            command.arg(binary);
+            command
+        }
+        None => Command::new(binary),
+    };
+    let name = "td-primitives-backends";
+    let errors = Path::new("/output").join(format!("{name}.err"));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&errors)
+        .map_err(|e| format!("create backend report: {e}"))?;
+    command
+        .args([
+            "--exact",
+            "test_corpus::hardware_backends_exercised",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(file);
+    crate::host_bin::arm_check_child(&mut command);
+    let report = || read_output(&errors, name, 64 * 1024);
+    let output = bounded_output(&mut command, name, 64 * 1024, timeout).inspect_err(|_| {
+        if let Ok(log) = report() {
+            eprintln!("td-primitives backend report failure:\n{log}");
+        }
+    })?;
+    if !suite_passed(&output, "test result: ok. 1 passed; 0 failed;") {
+        eprintln!("td-primitives backend report:\n{output}");
+        return Err("td-primitives backend report did not run".into());
+    }
+    backend_lines(&report()?)
+}
+
+fn backend_lines(report: &str) -> Result<Vec<String>> {
+    let lines: Vec<String> = report
+        .lines()
+        .filter(|line| line.starts_with("td-primitives backend "))
+        .map(str::to_owned)
+        .collect();
+    if lines.len() != 3 {
+        return Err("td-primitives backend report must name its three backends".into());
+    }
+    Ok(lines)
 }
 
 fn tls_allocation_evidence(output: &str) -> Result<()> {
@@ -2066,6 +2294,9 @@ pub(crate) fn emulated_runtime_inner() -> Result<()> {
         "/artifacts/td-mta-config-smoke",
         "/artifacts/td-mta-format-smoke",
         "/artifacts/td-mta-transport-smoke",
+        "/artifacts/td-primitives-smoke",
+        "/artifacts/td-primitives-vectors",
+        "/artifacts/td-primitives-ssh-vectors",
     ])?;
     let mut command = Command::new(EMULATOR);
     command
@@ -2117,8 +2348,24 @@ pub(crate) fn emulated_runtime_inner() -> Result<()> {
             started.elapsed().as_secs_f64()
         );
     }
+    for PrimitiveSuite {
+        installed: binary, ..
+    } in PRIMITIVE_SUITES
+    {
+        let started = Instant::now();
+        let result = primitive_suite_run(binary, Some(EMULATOR), 900).inspect_err(|_| {
+            println!("aarch64 emulated: FAIL {binary}");
+        })?;
+        println!(
+            "aarch64 emulated: PASS {result} ({:.2}s)",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    for line in primitive_backends(Some(EMULATOR), 900)? {
+        println!("aarch64 emulated: {line}");
+    }
     println!(
-        "aarch64 emulated runtime: version and all {passed} named functional cases passed under user-mode emulation; the x86-64 stack, allocation and RSS probes were not run"
+        "aarch64 emulated runtime: version, all {passed} named functional cases and the three td-primitives suites passed under user-mode emulation; the x86-64 stack, allocation and RSS probes were not run"
     );
     Ok(())
 }
@@ -2133,6 +2380,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-transport-smoke",
         "/artifacts/td-mta-rust-allocation-probe",
         "/artifacts/td-mta-rss-probe",
+        "/artifacts/td-primitives-smoke",
+        "/artifacts/td-primitives-vectors",
+        "/artifacts/td-primitives-ssh-vectors",
         "/output",
     ])?;
     // Deadline enforcement stays outside the CLI namespace; its init is a helper.
@@ -2215,6 +2465,18 @@ pub(crate) fn runtime_inner() -> Result<()> {
             let bytes = stack_evidence(&output, prefix, ceiling)?;
             println!("portable runtime: {prefix}{bytes}");
         }
+    }
+    for PrimitiveSuite {
+        installed: binary, ..
+    } in PRIMITIVE_SUITES
+    {
+        println!(
+            "portable runtime: {}",
+            primitive_suite_run(binary, None, 120)?
+        );
+    }
+    for line in primitive_backends(None, 30)? {
+        println!("portable runtime: {line}");
     }
     let mut command = Command::new("/artifacts/td-mta-rust-allocation-probe");
     command.env_clear().stdin(Stdio::null());
@@ -2365,6 +2627,91 @@ fn portable_helper(root: &Path) -> Result<PathBuf> {
 const EMULATOR: &str = "/emulator/qemu-aarch64";
 const EMULATOR_NAME: &str = "qemu-aarch64";
 const ARM_ARTIFACT_PREFIX: &str = "crypto-artifact-aarch64-cross-";
+const ARTIFACT_PREFIX: &str = "crypto-artifact-";
+
+/// A published portable artifact: a directory directly in .td-build-cache
+/// named by `prefix` and the NAR hash it still has.
+fn published_artifact(root: &Path, artifact: &Path, prefix: &str) -> Result<PathBuf> {
+    let cache = root
+        .join(".td-build-cache")
+        .canonicalize()
+        .map_err(|e| format!("portable cache: {e}"))?;
+    let artifact = artifact
+        .canonicalize()
+        .map_err(|e| format!("portable artifact: {e}"))?;
+    let digest = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(prefix))
+        // So the x86-64 prefix does not also take an aarch64 artifact.
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .filter(|_| artifact.parent() == Some(cache.as_path()))
+        .ok_or(format!(
+            "name a published {prefix}<hash> directory in .td-build-cache"
+        ))?;
+    let actual = crate::sandbox::nar_hash_of(&artifact)
+        .map_err(|e| format!("hash portable artifact: {e}"))?;
+    if actual.strip_prefix("sha256:") != Some(digest) {
+        return Err("portable artifact differs from its published hash".into());
+    }
+    Ok(artifact)
+}
+
+/// The timing-leakage cases (td-primitives/DESIGN.md, "Timing measurement")
+/// by executable: td-primitives' paths and td-crypto's PEM decoder.
+const LEAKAGE_CASES: &[(&str, &str)] = &[
+    ("td-primitives-smoke", "leakage_tests::timing_leakage"),
+    ("td-crypto-smoke", "pem::tests::pem_timing_leakage"),
+];
+
+/// Runs the timing-leakage cases from a published x86-64 portable artifact,
+/// so what is measured is the pinned toolchain's code built with the portable
+/// flags. On demand only, never in a gate; the caller pins the CPU, which the
+/// cases inherit.
+pub(crate) fn leakage(root: &Path, artifact: &Path) -> Result<()> {
+    if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
+        return Err("the leakage run measures the x86-64 artifact on x86-64 Linux only".into());
+    }
+    let artifact = published_artifact(root, artifact, ARTIFACT_PREFIX)?;
+    // The hash proves the directory unchanged, not which tree built it: name
+    // both, so a recorded run cites what it measured.
+    let inputs = read_output(&artifact.join("BUILD-INPUTS"), "build inputs", 256 * 1024)?;
+    let source = inputs
+        .lines()
+        .find(|line| line.starts_with("source sha256:"))
+        .ok_or("portable artifact records no staged source hash")?;
+    println!("leakage artifact: {}", artifact.display());
+    println!("leakage artifact {source}");
+    let scratch = Scratch::new(root)?;
+    for (binary, case) in LEAKAGE_CASES {
+        let path = scratch.0.join(binary);
+        copy_binary(&artifact.join(binary), &path)?;
+        qualify_binary_architecture(&path, Architecture::X86_64)?;
+        let mut command = Command::new(&path);
+        command
+            .args([
+                "--exact",
+                case,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        if let Some(samples) = std::env::var_os("TD_LEAKAGE_SAMPLES") {
+            command.env("TD_LEAKAGE_SAMPLES", samples);
+        }
+        crate::host_bin::arm_check_child(&mut command);
+        crate::native_tests::run_cases(command)?;
+    }
+    Ok(())
+}
 
 /// The host's QEMU user-mode emulator for aarch64, the first `qemu-aarch64`
 /// on PATH. It is a host tool of this qualification, mounted read-only into
@@ -2505,26 +2852,7 @@ pub(crate) fn emulated_runtime(root: &Path, artifact: &Path) -> Result<()> {
         return Err("the emulated aarch64 runtime currently runs on x86-64 Linux only".into());
     }
     let emulator = host_emulator()?;
-    let cache = root
-        .join(".td-build-cache")
-        .canonicalize()
-        .map_err(|e| format!("portable cache: {e}"))?;
-    let artifact = artifact
-        .canonicalize()
-        .map_err(|e| format!("aarch64 artifact: {e}"))?;
-    let digest = artifact
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(ARM_ARTIFACT_PREFIX))
-        .filter(|_| artifact.parent() == Some(cache.as_path()))
-        .ok_or(
-            "name a published crypto-artifact-aarch64-cross-<hash> directory in .td-build-cache",
-        )?;
-    let actual = crate::sandbox::nar_hash_of(&artifact)
-        .map_err(|e| format!("hash aarch64 artifact: {e}"))?;
-    if actual.strip_prefix("sha256:") != Some(digest) {
-        return Err("aarch64 artifact differs from its published hash".into());
-    }
+    let artifact = published_artifact(root, artifact, ARM_ARTIFACT_PREFIX)?;
     let scratch = Scratch::new(root)?;
     let artifacts = scratch.0.join("artifacts");
     fs::create_dir(&artifacts).map_err(|e| format!("create emulated artifacts: {e}"))?;
@@ -3550,6 +3878,128 @@ Disassembly of section .text:\n\n\
         ] {
             assert!(cli_evidence(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn primitive_suites_must_run_every_listed_test() {
+        let listing = "a::one: test\na::two: test\nb::slow: test\n\n3 tests, 0 benchmarks\n";
+        assert_eq!(listed_tests(listing), 3);
+        assert_eq!(listed_tests("b::slow: test\n\n1 test, 0 benchmarks\n"), 1);
+        assert_eq!(listed_tests("0 tests, 0 benchmarks\n"), 0);
+        let summary = suite_summary(3, 1).unwrap();
+        assert_eq!(
+            summary,
+            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out;"
+        );
+        let good = format!("{summary} finished in 0.92s");
+        assert!(good.starts_with(&summary));
+        for bad in [
+            good.replace("2 passed", "1 passed"),
+            good.replace("1 ignored", "0 ignored"),
+            good.replace("0 filtered out", "1 filtered out"),
+            good.replace("0 failed", "1 failed"),
+            good.replace("ok.", "FAILED."),
+        ] {
+            assert!(!bad.starts_with(&summary), "{bad}");
+        }
+        assert!(suite_summary(1, 1).is_err());
+        assert!(suite_summary(0, 0).is_err());
+        assert!(suite_summary(1, 2).is_err());
+        let run = format!("running 3 tests\ntest a::one ... ok\n\n{good}\n");
+        assert!(suite_passed(&run, &summary));
+        assert!(!suite_passed(&format!("{run}{good}\n"), &summary));
+        assert!(!suite_passed("running 0 tests\n", &summary));
+        let partial = good.replace("2 passed", "1 passed");
+        assert!(!suite_passed(&format!("{partial}\n{good}\n"), &summary));
+    }
+
+    #[test]
+    fn backend_reports_name_all_three_backends() {
+        let report = "td-primitives backend AES-NI and PCLMULQDQ (AES-GCM): exercised\n\
+                      td-primitives backend AVX2 (ChaCha20): exercised\n\
+                      td-primitives backend SHA-NI (SHA-256): absent\n";
+        assert_eq!(backend_lines(report).unwrap().len(), 3);
+        let short: String = report.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(backend_lines(&short).is_err());
+        assert!(backend_lines(&format!("{report}{report}")).is_err());
+        assert!(backend_lines("").is_err());
+    }
+
+    #[test]
+    fn leakage_cases_name_portable_executables() {
+        for (binary, case) in LEAKAGE_CASES {
+            assert!(BINARIES.contains(binary), "{binary}");
+            assert!(case.contains("timing_leakage"), "{case}");
+        }
+        for suite in PRIMITIVE_SUITES {
+            assert!(BINARIES.contains(&suite.installed), "{}", suite.installed);
+            assert!(
+                ARM_BINARIES.contains(&suite.installed),
+                "{}",
+                suite.installed
+            );
+            assert_eq!(
+                matches!(suite.kind, ArtifactKind::LibraryTest),
+                suite.target == ["--lib"]
+            );
+        }
+    }
+
+    #[test]
+    fn published_artifacts_are_named_by_their_own_hash_and_architecture() {
+        let root = crate::test_temp::TempDir::new("td-crypto-published").unwrap();
+        let cache = root.path().join(".td-build-cache");
+        fs::create_dir(&cache).unwrap();
+        let source = root.path().join("artifact");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("binary"), b"same").unwrap();
+        let hash = crate::sandbox::nar_hash_of(&source).unwrap();
+        let x86 = crate::crypto_portable::publish_tree(&source, &cache, "artifact", &hash).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("binary"), b"same").unwrap();
+        let arm =
+            crate::crypto_portable::publish_tree(&source, &cache, "artifact-aarch64-cross", &hash)
+                .unwrap();
+        assert_eq!(
+            published_artifact(root.path(), &x86, ARTIFACT_PREFIX).unwrap(),
+            x86.canonicalize().unwrap()
+        );
+        assert!(published_artifact(root.path(), &arm, ARM_ARTIFACT_PREFIX).is_ok());
+        // Each command takes only its own architecture's artifact.
+        assert!(published_artifact(root.path(), &arm, ARTIFACT_PREFIX).is_err());
+        assert!(published_artifact(root.path(), &x86, ARM_ARTIFACT_PREFIX).is_err());
+        // A directory outside the cache is refused even when its hash matches.
+        let outside = root
+            .path()
+            .join(x86.file_name().and_then(|name| name.to_str()).unwrap());
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("binary"), b"same").unwrap();
+        assert!(published_artifact(root.path(), &outside, ARTIFACT_PREFIX).is_err());
+        // A name whose digest is not 64 lowercase hex digits names nothing.
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        for name in [
+            format!("crypto-artifact-{}", &digest[..63]),
+            format!("crypto-artifact-{}", digest.to_uppercase()),
+            format!("crypto-artifact-{digest}0"),
+        ] {
+            let path = cache.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("binary"), b"same").unwrap();
+            // Refused by the name check, before any hash is compared.
+            assert!(published_artifact(root.path(), &path, ARTIFACT_PREFIX)
+                .unwrap_err()
+                .contains("name a published"));
+        }
+        // A link in the cache resolves to its target, which must itself be
+        // the published directory.
+        let link = cache.join("crypto-artifact-link");
+        symlink(&outside, &link).unwrap();
+        assert!(published_artifact(root.path(), &link, ARTIFACT_PREFIX).is_err());
+        // Changed bytes no longer match the name.
+        fs::write(x86.join("binary"), b"evil").unwrap();
+        assert!(published_artifact(root.path(), &x86, ARTIFACT_PREFIX)
+            .unwrap_err()
+            .contains("differs from its published hash"));
     }
 
     #[test]

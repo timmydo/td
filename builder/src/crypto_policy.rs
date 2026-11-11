@@ -16,6 +16,7 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-mta",
     "td-nfc",
     "td-primitives",
+    "td-source-scan",
     "td-tls-provider",
 ];
 
@@ -42,6 +43,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
         "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
         "td-primitives" => "056b2c47072b8e101730f86e33fbe79a00917aaa91a12aa17a7a801070bd4b85",
+        "td-source-scan" => "a380afb246633ec088b69078cd005c4d86fbccc442fac738bce8aa2519abd3c1",
         "td-tls-provider" => "b6c4742d6c92c053f6d1595dbb29ff11a8396775e23e30e0317bb6ee72f10298",
         _ => {
             return Err(format!(
@@ -64,6 +66,7 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
         "td-mime" => "72893a76d9ecfaad70a4bcf8447386fa5a0d2127ec5c4c770c9ac14438c0a7ed",
         "td-primitives" => "388616b0ea8bc440730c90424f57a66dd8921b6c6b08ab2518d51d6da561fd13",
+        "td-source-scan" => "1b14eed16717e72e43ad4e8bbc33976a11fc3039bff763852ca1cb1a23010542",
         "td-tls-provider" => "46e710a0aaab04b17090c56ce3c7dcb46de35c18b4016ef2091f9969328cb389",
         _ => {
             return Err(format!(
@@ -417,6 +420,7 @@ mod tests {
             "td-mime",
             "td-nfc",
             "td-primitives",
+            "td-source-scan",
         ] {
             if !root.join(name).join("Cargo.toml").exists() {
                 continue;

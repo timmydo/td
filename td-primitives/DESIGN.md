@@ -208,7 +208,10 @@ a value that is not a count refuses.
 `src/leakage_tests.rs` holds this crate's paths, and td-crypto reads the
 same `leakage.rs` through `#[path]` for the private-key PEM decoder it owns.
 Both are ignored tests: timing is noisy, so no gate or `ready` runs them.
-`DEVELOPMENT.md` gives the command. The classes are:
+They run from the test executables an x86-64 portable build of td-crypto
+publishes (td-crypto/PORTABLE.md, "Timing-leakage run"), so what is
+measured is the code the pinned Rust toolchain makes with the portable
+flags; `DEVELOPMENT.md` gives the command. The classes are:
 
 | Path | Fixed class | Other class |
 |---|---|---|
@@ -225,38 +228,50 @@ Both AES paths are measured on a CPU with AES-NI through the test-only
 constructors `aes_gcm`'s own tests already had, so the bitsliced path runs
 there although `AesGcm::new_128` would not select it.
 
-Recorded run: an AMD Ryzen 7 5700G, the run pinned to CPU 7 with `taskset
--c 7`, the test build `crypto-cargo leakage` makes in release with the
-host's rustc 1.99.0-nightly (2026-07-22) for x86_64-unknown-linux-gnu
-(glibc), not the pinned 1.99.1 portable artifact; 1,000,000 samples a
-path, about half in each class, 1588 seconds in all. It measured the tree
-that also held the next change, the cryptographic review's answers, whose
-P-256 signing passes each nonce candidate through a test seam for its
-retries, the identity in production. Largest |t|:
+Recorded run: `td-primitives-smoke` and `td-crypto-smoke` from the
+portable artifact
+`crypto-artifact-3179e221cbe5660788e3dbb69d2c41066e8901c871491fa0495c5dcbf1a251c8`
+(staged source `sha256:0d1b6fa4ce9021abb0a4bd39d6a9cd839fa95cfc75e7331f9a1f6e0b1ec4d797`):
+pinned Rust 1.99.1 and its LLD, release profile, x86_64-unknown-linux-musl
+static PIE, `target-cpu=x86-64`, frame pointers, `debuginfo=1`. The
+artifact of the tree that records this run,
+`crypto-artifact-5a85caafc44c53d315875580da8cb4e8e8506ef07185bf4d4266d9b7b35c7d8f`,
+which adds a third td-primitives suite, holds both executables, and
+`td-mta`, byte-identical. An AMD Ryzen 7 5700G, which has AES-NI and
+PCLMULQDQ, AVX2 and SHA-NI, so the public paths ran those backends and ChaCha20's and
+SHA-256's software paths were not measured; the run pinned to CPU 7 with
+`taskset -c 7` while other builds held the machine's load average near 19
+on its 16 CPUs, which the interleaved classes share and the controls show
+did not hide a leak of their size. 1,000,000 samples a path, about half in
+each class, 1562 seconds in all. Largest |t|:
 
 | Path | td-primitives' run | td-crypto's run |
 |---|---|---|
-| Control, early exit over 256 bytes | 2292.47 | 2490.97 |
-| Control, early exit over 32 bytes, 8 calls | 317.27 | 341.60 |
-| `ct::eq` | 2.26 | |
-| ChaCha20-Poly1305 `open`'s tag check | 1.41 | |
-| ChaCha20-Poly1305 `seal`, `open` | 1.10, 1.54 | |
-| AES-128-GCM on AES-NI, `seal`, `open` | 1.88, 0.54 | |
-| AES-128-GCM bitsliced, `seal`, `open` | 2.18, 1.27 | |
-| HMAC-SHA256 | 0.82 | |
-| P-256 ECDSA signing | 1.70 | |
-| P-256 ECDH | 1.51 | |
-| P-384 ECDH | 1.79 | |
-| X25519 | 1.23 | |
-| PEM decoding | | 1.17 |
+| Control, early exit over 256 bytes | 2880.38 | 1844.52 |
+| Control, early exit over 32 bytes, 8 calls | 410.50 | 283.54 |
+| `ct::eq` | 1.00 | |
+| ChaCha20-Poly1305 `open`'s tag check | 1.24 | |
+| ChaCha20-Poly1305 `seal`, `open` | 1.80, 2.26 | |
+| AES-128-GCM on AES-NI, `seal`, `open` | 0.98, 1.74 | |
+| AES-128-GCM bitsliced, `seal`, `open` | 0.62, 0.77 | |
+| HMAC-SHA256 | 1.26 | |
+| P-256 ECDSA signing | 1.95 | |
+| P-256 ECDH | 2.05 | |
+| P-384 ECDH | 0.97 | |
+| X25519 | 0.62 | |
+| PEM decoding | | 1.14 |
 
-No measured path passes 4.5, and both controls do in both runs.
+No measured path passes 4.5, and both controls do in both runs. An earlier
+run of the same cases on a host test build (rustc 1.99.0-nightly, glibc)
+found the same: no path above 2.26.
 
 What this measures and what it does not: timing differences a coarse,
 local, single-core measurement can see on this x86-64 core at this sample
-count, between these two classes, in that test build, which is not the
-pinned Rust 1.99.1 portable artifact td-crypto/PORTABLE.md produces. The
-controls show a leak of their size is seen; they bound nothing smaller.
+count, between these two classes, in these libtest executables, which the
+pinned toolchain built with the portable flags but which are not the
+`td-mta` binary: inlining and layout there may differ, and rustls's and
+td-tls-provider's calls into these paths are not exercised. The controls
+show a leak of their size is seen; they bound nothing smaller.
 The tag-check path, which times a whole `open` around a 16-byte
 comparison, did not detect `ct::eq` made to return at the first
 differing byte, at 100,000 samples, where the `ct::eq` path reached

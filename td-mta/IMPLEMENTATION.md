@@ -2921,11 +2921,14 @@ code and its direct dependency do not change with backend selection.
    no secret-dependent branch, secret-indexed load or nonce flaw;
    td-crypto/DESIGN.md states its scope and assumptions. A dudect-style
    timing measurement of these paths (td-primitives/DESIGN.md, "Timing
-   measurement") found no |t| above 4.5 at a million samples a path, in a
-   release test build by the host's rustc 1.99.0-nightly rather than the
-   pinned 1.99.1 portable artifact, on x86-64 only: not on aarch64, whose
-   only runs here are emulated, and not for power, EM or microarchitectural
-   leakage. Both portable builds assert
+   measurement") found no |t| above 4.5 at a million samples a path, in the
+   test executables of the x86-64 portable artifact, which the pinned Rust
+   1.99.1 builds with the portable flags but which are not the `td-mta`
+   binary itself; on x86-64 only: not on aarch64, whose only runs here are
+   emulated, and not for power, EM or microarchitectural leakage. Both
+   portable builds also run td-primitives' own suites, its unit tests and
+   both known-answer suites, on x86-64 and under emulation on aarch64.
+   Both portable builds assert
    that the out-of-line bodies of routines it found branch-free (point
    addition, the bitsliced AES rounds and GHASH, kept out of line for it)
    still compile with no conditional branch; point addition's

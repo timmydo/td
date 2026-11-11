@@ -79,12 +79,15 @@ checkout's root `.cargo/config.toml` is required. Ancestor
 `.cargo/config.toml` files are accepted only when each matches that same
 compiled pin, allowing nested worktrees to use their own runner. Legacy
 `.cargo/config` files remain refused at every level. Automatic build.rs
-files are refused for all eleven local source packages: td-civil,
+files are refused for all twelve local source packages: td-civil,
 td-crypto, td-fs, td-header, td-html, td-json, td-mime, td-nfc, td-mta,
-td-primitives and td-tls-provider. Their exact manifests and locks are
-pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime, td-nfc and
-td-primitives remain std-only roster crates. td-primitives' dev-dependency
-td-source-scan is compiled into no admitted graph and is not pinned.
+td-primitives, td-source-scan and td-tls-provider. Their exact manifests
+and locks are pinned; td-civil, td-fs, td-header, td-html, td-json,
+td-mime, td-nfc, td-primitives and td-source-scan remain std-only roster
+crates. td-source-scan is td-primitives' dev-dependency: it is pinned
+because the portable builds compile td-primitives' test executables
+(PORTABLE.md), for which Cargo compiles it, and it is in no admitted
+crate's selected graph and linked into no published executable.
 td-crypto depends on td-tls-provider and td-primitives by path; td-crypto's
 and td-mta's selected graphs contain both. td-tls-provider (its DESIGN.md) is
 admitted with its own pinned Rustls line, which td-crypto's matches, and
@@ -1206,11 +1209,11 @@ profile, `target-cpu=x86-64` and `generic` respectively, `+crt-static`, frame
 pointers and `debuginfo=1`. It measured nothing itself. A separate
 dudect-style timing measurement of these paths, the private-key PEM decoder
 included (td-primitives/DESIGN.md, "Timing measurement"), found no |t| above
-4.5 at a million samples a path on one x86-64 machine, in a release test
-build by the host's rustc 1.99.0-nightly for x86_64-unknown-linux-gnu, not
-the pinned 1.99.1 portable artifact, and both its positive controls did;
-aarch64 timing, power, electromagnetic and microarchitectural leakage
-remain unmeasured. It assumes data-independent
+4.5 at a million samples a path on one x86-64 machine, in the x86-64
+portable artifact's test executables, which the same pinned toolchain
+builds with the same flags but which are not the `td-mta` binary, and both
+its positive controls did; aarch64 timing, power, electromagnetic and
+microarchitectural leakage remain unmeasured. It assumes data-independent
 timing of AESENC, PCLMULQDQ, MUL and UMULH and the conditional moves and
 selects, which on aarch64 holds without PSTATE.DIT only by core
 implementation. It does not cover rustls's internals, and it holds for that

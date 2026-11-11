@@ -1,6 +1,6 @@
 //! The on-demand timing-leakage run over this crate's secret paths
 //! (DESIGN.md, "Timing measurement"). Ignored, so no gate runs it:
-//! `td-builder gate-crates crypto-cargo leakage --manifest-path td-crypto/Cargo.toml`.
+//! `td-builder gate-crates crypto-portable-leakage --artifact DIRECTORY`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 

@@ -10,8 +10,10 @@ license = "MIT"
 # crate under a bare [dev-dependencies] as
 # `td-source-scan = { path = "../td-source-scan" }`, the one sibling spelling
 # the lock guard admits (AGENTS.md 'Rust code'); no shipped binary links it, and
-# only td-ssh's recipe stages it, for cargo to resolve that lock. It depends on
-# nothing but `std`.
+# only td-ssh's recipe stages it, for cargo to resolve that lock. td-crypto's
+# host portable builds also stage it, to compile td-primitives' tests, so this
+# manifest and the lock are pinned in builder/src/crypto_policy.rs. It depends
+# on nothing but `std`.
 [workspace]
 
 [lib]

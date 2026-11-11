@@ -211,9 +211,11 @@ compiler and archiver selection points to the refusal decoy.
 
 The output name is `crypto-artifact-aarch64-cross-<NAR-sha256>`, distinct
 from the x86-64 runtime-qualified artifact. It contains `td-mta`, its
-matching `td-mta.debug`, and four test
-executables: `td-crypto-smoke`, `td-mta-config-smoke`, `td-mta-format-smoke`
-and `td-mta-transport-smoke`. Every executable must be an aarch64 static PIE;
+matching `td-mta.debug`, and seven test executables:
+`td-crypto-smoke`, `td-mta-config-smoke`, `td-mta-format-smoke`,
+`td-mta-transport-smoke`, `td-primitives-smoke`, `td-primitives-vectors`
+and `td-primitives-ssh-vectors`. Every executable must be an aarch64 static
+PIE;
 x86-64 objects fail validation. The runtime/debug pairing, notices and input
 receipt use the same checks and publication rules as the x86-64 artifact.
 
@@ -237,7 +239,7 @@ namespace, no artifact and no receipt, and nothing it does reaches the
 target graph. The argument must name a
 `crypto-artifact-aarch64-cross-<NAR-sha256>` directory directly under the
 worktree's `.td-build-cache` whose NAR hash still matches its name. The
-command copies its five executables and the debug companion into private
+command copies its eight executables and the debug companion into private
 scratch, repeats the aarch64 static-PIE and debug-pair checks, and runs
 them in a fresh namespace holding only those copies, the static td-builder
 helper, the emulator at `/emulator/qemu-aarch64` and, for a dynamically
@@ -270,14 +272,33 @@ the same emulator (`TD_MTA_TEST_PEER_EMULATOR`, a test-only variable that
 allocation and RSS suites are not run: they measure x86-64 resources, and
 the ARM build does not produce the last three.
 
+The three td-primitives suites then run whole, with one test thread:
+`td-primitives-smoke`, the crate's unit tests, `td-primitives-vectors`, its
+independent known answers (`tests/vectors.rs`), and
+`td-primitives-ssh-vectors`, those of the primitives td-ssh uses
+(`tests/ssh_vectors.rs`). `tests/confinement.rs` is not built: it reads the
+crate's source at run time. Each suite is asked to `--list` its tests and
+its ignored ones and then run, three emulated processes with a 900-second
+deadline each, and the run's one summary must report every listed test that
+is not ignored as passed, none failed and none filtered out, so a suite
+that runs fewer tests than it holds fails rather than passing on less. No
+count is pinned here; td-primitives' suites state their own row counts. The
+ignored test is the timing-leakage case, which no runtime runs (below).
+Each prints `aarch64 emulated: PASS` with its counts and time. Last,
+`hardware_backends_exercised` runs alone with its output shown, and its
+three lines, which name each hardware backend and whether it ran, are
+printed: all three are x86-64's, so here they say absent, and the suites
+ran td-primitives' software paths only.
+
 Emulation is functional evidence only. It translates aarch64 instructions
 to the host's, so it says nothing of aarch64 timing, of a real core's memory
 ordering, alignment or PSTATE.DIT behavior, or of a minimum kernel version,
 and it leaves no resource evidence.
 
-A run qualifies an artifact only when `td-mta --version` and all 203
-named cases pass. The emulator's version line is printed first; the
-commit that changes the artifact or this qualification records its run.
+A run qualifies an artifact only when `td-mta --version`, all 203
+named cases and the three td-primitives suites pass. The emulator's version
+line is printed first; the commit that changes the artifact or this
+qualification records its run.
 
 These cases cover crypto, configuration, stored row formats and the
 SMTP/TLS adapter; they do not launch the installed receiver. Follow DEPLOYMENT.md's
@@ -299,7 +320,7 @@ The ordinary Cargo preflight still qualifies the host build; it does not
 silently claim to have run this separately provisioned portable command.
 
 The driver stages manifests, locks, `src/` and optional `tests/` for
-every pinned local source package (DESIGN.md names the eleven), plus the
+every pinned local source package (DESIGN.md names the twelve), plus the
 three test-only
 oracle files listed below. It refuses symlinks and special files. It
 rechecks staged manifest/lock pins, reconstructs the verified vendor tree,
@@ -349,7 +370,7 @@ establish frame-pointer coverage for the upstream prebuilt std/libc. [DEPLOYMENT
 layout and receiver operations.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All eight results must be
+must select exactly one expected binary/test profile. All eleven results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
@@ -389,7 +410,7 @@ output quota. M07 owns TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: eight binaries and the inner
+requires an exact regular-file output inventory: eleven binaries and the inner
 command record plus the receiver debug companion. It rejects output
 directory/file symlinks and additional files, then copies these checked inputs
 into a fresh private directory outside the compiler's writable mount. Only this directory receives host-written metadata
@@ -417,6 +438,25 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   compiled from their staged trees, including the known-answer tests over
   the committed AWS-LC fixtures (DESIGN.md); the clean runtime runs its 135
   named cases.
+- `td-primitives-smoke`, `td-primitives-vectors` and
+  `td-primitives-ssh-vectors`: td-primitives' unit tests (`--lib`) and its
+  two known-answer suites (`--test vectors`, `--test ssh_vectors`), built
+  by the same pinned toolchain with the same flags as `td-mta`, so the
+  primitives' own suites run on the code this compiler makes of them. They
+  are libtest builds of the crate, not the `td-mta` binary: inlining and
+  layout may differ from the code linked there. The build stages
+  td-source-scan, td-primitives' std-only dev-dependency, as a pinned local
+  source, because Cargo compiles a crate's dev-dependencies for any of its
+  test targets; none of these three uses it. The clean runtime runs each
+  suite whole with one test thread and a 120-second deadline per process
+  and requires every listed test that is not ignored to pass, as the
+  emulated runtime does, then prints `hardware_backends_exercised`'s three
+  lines: which of the AES-NI and PCLMULQDQ, AVX2 and SHA-NI paths this
+  machine selected, and so which the suites ran. A build host without one
+  of them runs that primitive's software path only, and its line says so.
+  They are qualification executables, never service dependencies;
+  `td-primitives-smoke` also carries the timing-leakage case below, which
+  no runtime runs.
 - `td-mta-config-smoke`: integration test linked to the production td-mta
   library for the bounded configuration stack checks in td-mta/CONFIG.md.
   Generic loader/materializer/writer functions compile in the test crate;
@@ -572,6 +612,36 @@ holds the compiled form of what was reviewed against a later compiler,
 flag or source change, which must then fail here or pass a renewed review.
 The build log's counts for a run are recorded by the commit that changes
 the check or the routines.
+
+## Timing-leakage run
+
+```text
+taskset -c 7 td-builder gate-crates crypto-portable-leakage --artifact .td-build-cache/crypto-artifact-<NAR-sha256>
+```
+
+This on-demand measurement, never run by a gate or `ready`, takes a
+published x86-64 artifact, which must be a `crypto-artifact-<NAR-sha256>`
+directory directly under the worktree's `.td-build-cache` whose NAR hash
+still matches its name (an aarch64 artifact is refused). That check
+proves the directory unchanged since it was published, not which tree
+built it, so the command first prints the artifact's path and the staged
+source hash its `BUILD-INPUTS` records, and a recorded run cites both. It
+copies `td-primitives-smoke` and `td-crypto-smoke` into private scratch,
+repeats their static-PIE checks, and runs the two ignored timing-leakage
+cases, td-primitives' `leakage_tests::timing_leakage` and td-crypto's
+`pem::tests::pem_timing_leakage`, one process each with one test thread
+and a cleared environment that keeps only `TD_LEAKAGE_SAMPLES`. Their
+output streams to the caller; each, selected by `--exact`, must report a
+passing test. So what is measured is the code the pinned toolchain makes
+with the portable flags, in these libtest executables rather than the
+`td-mta` binary, whose inlining and layout may differ. The cases inherit
+the caller's CPU affinity, so `taskset` pins them. They run without a
+namespace of their own: they are td's own test executables from pinned
+sources, as the host test builds the command replaced were, and a
+namespace would neither change their timing source (`Instant`, through
+the vDSO) nor add a boundary the measurement needs.
+td-primitives/DESIGN.md ("Timing measurement") says what is measured and
+records results, and DEVELOPMENT.md gives the procedure.
 
 ## Private gateway process peer
 

@@ -1480,7 +1480,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // the reader closure every consumer's confinement tests. td-ssh's cargo recipe
     // alone stages it, to resolve its lock, so an edit changes that source input
     // and takes the target gates with it, as td-test-compositor's does.
-    // `source_scan_reaches_only_the_td_ssh_recipe` holds the premise.
+    // `source_scan_reaches_only_the_td_ssh_recipe` holds the premise. Outside
+    // the recipe graph, td-crypto's host portable builds stage it too, its
+    // manifest and lock pinned in crypto_policy.rs, to compile td-primitives'
+    // tests; the cargo-test preflight's crypto validation refuses an edit to
+    // either until that pin moves.
     if p.starts_with("td-source-scan/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -3295,9 +3299,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 return fail(&e);
             }
             // The gates warm before calling; the on-demand harness warms itself.
-            if (action == "perf" && manifest == "td-mta/Cargo.toml")
-                || (action == "leakage" && manifest == "td-crypto/Cargo.toml")
-            {
+            if action == "perf" && manifest == "td-mta/Cargo.toml" {
                 if let Err(e) = crate::check_loop::warm_mail_sources(&root) {
                     return fail(&e);
                 }
@@ -3344,6 +3346,12 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         }
         [op] if op == "crypto-portable-emulated-runtime-inner" => {
             match crate::crypto_isolated::emulated_runtime_inner() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op, flag, artifact] if op == "crypto-portable-leakage" && flag == "--artifact" => {
+            match crate::crypto_isolated::leakage(&root, Path::new(artifact)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e),
             }
@@ -3444,9 +3452,6 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 "       td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml"
             );
             eprintln!(
-                "       td-builder gate-crates crypto-cargo leakage --manifest-path td-crypto/Cargo.toml"
-            );
-            eprintln!(
                 "       td-builder gate-crates crypto-musl-notice --archive musl-1.2.5.tar.gz"
             );
             eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY [--arch x86_64|aarch64]");
@@ -3457,6 +3462,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!(
                 "       td-builder gate-crates crypto-portable-emulated-runtime --artifact DIRECTORY"
             );
+            eprintln!("       td-builder gate-crates crypto-portable-leakage --artifact DIRECTORY");
             eprintln!(concat!(
                 "       td-builder gate-crates native-compositor ",
                 "--manifest-path CRATE/Cargo.toml"
@@ -12290,7 +12296,8 @@ mod tests {
         .unwrap();
         // The admitted sources and every sibling their manifests name, dev
         // ones included (td-primitives' td-source-scan), which the roster
-        // check requires to exist though no admitted graph compiles them.
+        // check requires to exist though no admitted crate's selected graph
+        // contains them.
         let mut pending: Vec<String> = crate::crypto_policy::LOCAL_SOURCES
             .iter()
             .map(|name| name.to_string())

@@ -74,8 +74,8 @@ pub(crate) fn release(root: &Path) -> Result<Release> {
 }
 
 fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release>> {
-    if !matches!(action, "test" | "clippy" | "build" | "perf" | "leakage") {
-        return Err("crypto-cargo accepts only test, clippy, build, perf or leakage".into());
+    if !matches!(action, "test" | "clippy" | "build" | "perf") {
+        return Err("crypto-cargo accepts only test, clippy, build or perf".into());
     }
     let name = match manifest {
         "td-crypto/Cargo.toml" => "td-crypto",
@@ -85,9 +85,6 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     };
     if action == "perf" && name != "td-mta" {
         return Err("crypto-cargo perf measures only td-mta".into());
-    }
-    if action == "leakage" && name != "td-crypto" {
-        return Err("crypto-cargo leakage measures td-crypto's primitives only".into());
     }
     validate(root)?;
     let home = Scratch::create(root)?;
@@ -207,29 +204,6 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             ])
             .stdout(Stdio::piped());
         return crate::native_tests::run_cases(cmd).map(|()| None);
-    }
-    if action == "leakage" {
-        // On demand only: timing is noisy, so no gate selects it. Release,
-        // one test thread; td-primitives/DESIGN.md records the runs.
-        for (manifest, case) in [
-            ("td-primitives/Cargo.toml", "leakage_tests::timing_leakage"),
-            ("td-crypto/Cargo.toml", "pem::tests::pem_timing_leakage"),
-        ] {
-            let mut cmd = command("test", manifest);
-            cmd.args([
-                "--release",
-                "--lib",
-                "--",
-                "--exact",
-                case,
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .stdout(Stdio::piped());
-            crate::native_tests::run_cases(cmd)?;
-        }
-        return Ok(None);
     }
     let mut cmd = command(action, manifest);
     if action == "build" {
@@ -450,12 +424,12 @@ mod tests {
                 .as_deref(),
             Some("crypto-cargo perf measures only td-mta")
         );
-        for manifest in ["td-mta/Cargo.toml", "td-tls-provider/Cargo.toml"] {
-            assert_eq!(
-                run_inner(root, "leakage", manifest).err().as_deref(),
-                Some("crypto-cargo leakage measures td-crypto's primitives only")
-            );
-        }
+        assert_eq!(
+            run_inner(root, "leakage", "td-crypto/Cargo.toml")
+                .err()
+                .as_deref(),
+            Some("crypto-cargo accepts only test, clippy, build or perf")
+        );
         assert_eq!(
             run_inner(root, "test", "td-primitives/Cargo.toml")
                 .err()
@@ -466,7 +440,7 @@ mod tests {
             run_inner(root, "bench", "td-mta/Cargo.toml")
                 .err()
                 .as_deref(),
-            Some("crypto-cargo accepts only test, clippy, build, perf or leakage")
+            Some("crypto-cargo accepts only test, clippy, build or perf")
         );
     }
 
