@@ -67,14 +67,15 @@ be made bounded by this library. Hostile pages can be refused; accepting
 every possible 2 MiB input is not promised.
 
 The previous td-dom corpus peaked at **131.9 MiB (about 132 MiB)** RSS,
-with a full ComputedStyle retained per element. That is the comparison
-baseline, not a result for shared styles. The validation increment must
-restate this figure beside the measured shared-style peak, style counts,
-charged storage and process RSS; it must not infer a saving from interning
-alone. It also measures 2 MiB text and many-element shapes, including the
-transient candidate and resize overlap. Any measured violation of the
-working allowance requires a smaller admission limit or a bounded
-allocation change before this workstream is complete.
+with a full ComputedStyle retained per element. After shared styles and
+layout, the new corpus peak is **37.9 MiB**, including compiled sheets,
+input strings and resize overlap probes. MDN, the former peak, is now
+**9.4 MiB** with byte-identical HTML and CSS. This is a whole-pipeline
+comparison: interning, custom-map reuse and suppression of hidden subtrees
+all contribute; it does not isolate the saving from interning alone.
+Section 6 records the workload, capture identities and limits of this
+measurement. The 2 MiB many-block case peaks at 93.3 MiB RSS and charges
+167.4 MiB for one retained page, below the 224 MiB admission ceiling.
 
 ## 3. Public data and source identity
 
@@ -245,11 +246,14 @@ Resizing width reuses the DOM and shared styles when the caller's media
 environment is unchanged. Changed media queries require a new StyleSet
 and recascade. Exact block heights require an O(nodes + text scalars)
 measurement pass on every width change. This is **not** td-web's current
-viewport-only resize cost. The validation increment measures release-mode
-2 MiB prose, a 2 MiB word and many short blocks at two widths, reporting
-wall time, work, peak RSS and the cost of retaining the old result while
-building the new one. Numerical latency is deliberately not claimed before
-that experiment; these measurements are a completion requirement.
+viewport-only resize cost. In the release-mode 2 MiB fixtures below,
+a width-only resize from 1280 to 832 px took median **105–194 ms** with
+synthetic font metrics; individual runs ranged from **82 to 226 ms** on
+the measured host. These figures exclude HTML parsing, cascade and the
+release of the previous output. A full recascade is much more expensive
+for many-element pages. This is synchronous O(page) work, not a guarantee
+of an interactive frame time; cancellation and scheduling belong to the
+future consumer.
 
 Line boxes can be emitted lazily for a half-open vertical window: measure
 the whole flow, retain block geometry, emit only intersecting logical line
@@ -276,6 +280,104 @@ across changing widths, node boundaries and fractional advances. Windowed
 output must equal filtering a full layout. No live network test enters the
 gate. Corpus HTML/CSS remains under agent scratch, never committed; only
 small synthetic reproductions enter the repository.
+
+### Measured corpus and 2 MiB cases
+
+Measured on an AMD Ryzen 7 5700G Linux host, with release optimization,
+three fresh processes per page/configuration. Timings below are medians,
+RSS is the largest Linux VmHWM across those processes, and MiB means
+2^20 bytes. Other host checks ran concurrently: these are observations,
+not portable latency thresholds. File reading is outside timed stages;
+source strings and compiled sheets remain alive for RSS measurement.
+
+The deterministic font provider returns 0.5 em advances for scalars through
+U+00FF and 1 em for other scalars, a 1.25 em line box and a 0.9375 em
+baseline, rounded to 1/64 px. It does not measure TrueType parsing, glyph
+rasterization or font-cache growth. Separately, 3,500 generated text/width
+cases passed against actual td-ui prose::wrap through the scale-one,
+16 px metrics adapter. The committed independent word-wrap oracle and
+synthetic corpus shapes run without a td-ui dependency or installed fonts.
+
+The eight URLs are the td-dom corpus in td-dom/DESIGN.md, captured again
+2026-11-11 05:19 UTC. Each page includes inline and linked stylesheets in
+source order, with link/style media attributes wrapped as @media. No
+@import, font, image or script is fetched. The four environments match
+that earlier experiment: screen 1280x720 light; screen 390x844 dark;
+print 1280x720; and desktop interaction with the first link focused and
+hovered through its ancestors, plus checked/selected state from attributes.
+All 32 page/configuration combinations complete with zero refusals in all
+three trials, including full layout, resize and window retention. This
+is a workload check, not a visual browser-equivalence claim. Unsupported
+CSS and the fallback formatting in §5 still apply.
+
+The table shows desktop values except peak RSS, which spans all four
+configurations and all layout passes. Setup is parse + stylesheet compile
++ cascade; layout excludes setup. Charged page storage includes DOM,
+original input, shared styles, full output and conservative capacities.
+It can exceed process RSS because it deliberately overcharges allocations.
+
+| Page | HTML bytes | Nodes / styles | Charged page MiB | Setup ms | Layout ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wikipedia | 635,870 | 12,607 / 335 | 17.1 | 409.5 | 8.5 | 14.1 |
+| MDN | 328,385 | 8,164 / 118 | 9.4 | 1101.9 | 6.4 | 9.4 |
+| Bootstrap | 96,197 | 3,770 / 365 | 11.1 | 83.3 | 2.4 | 11.3 |
+| Debian | 15,863 | 713 / 45 | 1.1 | 5.8 | 0.4 | 3.8 |
+| kernel.org | 20,436 | 857 / 46 | 1.2 | 3.7 | 0.4 | 3.7 |
+| Rust Book | 34,512 | 696 / 34 | 1.1 | 7.6 | 1.0 | 4.3 |
+| Guardian | 1,498,839 | 5,745 / 836 | 37.8 | 471.6 | 3.2 | 26.5 |
+| GitHub | 320,585 | 3,099 / 205 | 11.3 | 297.2 | 1.4 | 37.9 |
+
+For Wikipedia, MDN, Bootstrap, Debian, kernel.org and Rust Book, both HTML
+and raw CSS bundle hashes equal the earlier td-dom capture. The latter
+hash concatenates fetched sheets without media wrappers. Guardian and
+GitHub changed; their new identities are below. No fetched bytes enter
+the repository. MDN's exact-match comparison supports the reduction from
+131.9 to 9.4 MiB; the overall 37.9 MiB peak comes from GitHub's retained
+stylesheet inputs, not a claim that every page uses less than 38 MiB.
+
+| Page | HTML SHA-256 | Raw CSS bundle SHA-256 |
+| --- | --- | --- |
+| Guardian | `0ccd62832c437c3fe14c593d77a666ffe5246c37d83805c174e03f3609490690` | `bf9390636879592cbf11920faecf320cb622fd48dcb7cefac319c87c1c6750bc` |
+| GitHub | `4a2e1770d3de492ad9e66a6fb89dd258bc1541251504475cc88c611c8190c3cc` | `8ac92b79d9f97b8b98fd27509a2e848a54f9590f57e0a7e7eb89e783fc7697d5` |
+
+The synthetic HTML inputs are exactly 2,097,152 bytes. Prose starts with
+`<p>` and repeats `words here `; word starts with `<p>` and repeats `x`;
+blocks starts with `<body>` and repeats `<p>abcdefghijklmnop</p>`. Each
+repetition stops before exceeding the input ceiling and remaining bytes
+are filled with `x`. They use HTML_UA_CSS alone. All have three interned
+styles; prose and word have six DOM nodes, blocks has 182,365. Desktop
+full layout is followed by a 1280-to-832 px resize with frozen styles and
+a 1000..1800 px vertical window at the resized width.
+
+| Shape | Parse / cascade ms | Full / resize / window ms | Full / window lines | Full / resized / window charged MiB | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose | 55.3 / 0.1 | 110.1 / 106.7 / 94.5 | 13,618 / 41 | 14.2 / 17.6 / 10.1 | 12.8 |
+| Word | 67.4 / 0.1 | 136.0 / 105.0 / 102.9 | 13,274 / 41 | 14.2 / 17.5 / 10.1 | 12.6 |
+| Blocks | 102.8 / 764.1 | 203.1 / 194.3 / 162.0 | 91,181 / 23 | 167.4 / 167.4 / 136.3 | 93.3 |
+
+Resized full line counts are 21,184, 20,561 and 91,181 respectively.
+Resized layout work is 6,333,820, 6,291,454 and 4,650,203 visits; windowed
+work is identical, confirming that line retention is lazy but measurement
+is not. Window output alone is 17,472 bytes for each text case and
+56,176,704 bytes for blocks, whose whole-page box geometry remains.
+These figures do not justify promising viewport-only CPU cost.
+
+The overlap probe keeps the old full layout while constructing the new
+one. It succeeds for prose and word at 21.8 and 21.7 MiB charged. Blocks
+correctly refuses MAX_PAGE_BYTES: its 84.7 MiB old output plus a new full
+page would exceed 224 MiB. After releasing that output, resize succeeds
+at 167.4 MiB; the table times only this successful pass. The rejected
+probe separately costs median 112.6 ms. A caller should release or budget
+old output before choosing this path rather than routinely retrying it.
+Even the largest accepted case plus the 64 MiB working allowance is
+231.4 MiB, within the roughly 300 MB target; observed RSS does not exhaust
+that allowance. This is measured coverage, not a worst-case RSS proof.
+
+Committed synthetic regressions exercise the exact 2 MiB prose/word
+shapes, DOM byte-range validity and window equivalence, a smaller dense
+block shape that refuses overlapping output under a lowered page budget,
+and repeated global custom properties shared by differently colored
+siblings. Timing and RSS are deliberately not assertions in the gate.
 
 ## 7. Independently landable increments
 
