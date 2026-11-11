@@ -203,6 +203,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/tests/grant_views.rs"),
     ),
     (
+        "src/grant_requests.rs",
+        include_str!("../../../td-authd/src/grant_requests.rs"),
+    ),
+    (
         "src/portal_files.rs",
         include_str!("../../../td-authd/src/portal_files.rs"),
     ),

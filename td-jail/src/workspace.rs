@@ -1417,6 +1417,65 @@ mod tests {
     }
 
     #[test]
+    fn no_jail_reaches_the_compositor_control_socket() {
+        // The control socket admits the human's kernel credentials and
+        // answers with launches and directory grants (td-authd/DESIGN.md,
+        // "Grant requests"); a workload that still runs as the human is
+        // kept from it only because no jail binds it. `/run`'s reservation
+        // refuses the socket and its directory to every workspace, by
+        // path and by alias, and no jail source names it, so neither an
+        // application's fixed sockets nor a profile's can be it.
+        let home = &[PathBuf::from("/home/u")];
+        for refused in [
+            "/run/td-compositor",
+            "/run/td-compositor/1000",
+            "/run/td-compositor/1000/td-control",
+        ] {
+            assert!(
+                refuse_reserved(Path::new(refused), home, RESERVED).is_err(),
+                "{refused}"
+            );
+        }
+        for (name, source) in [
+            ("authority.rs", include_str!("authority.rs")),
+            ("bus.rs", include_str!("bus.rs")),
+            ("cgroup.rs", include_str!("cgroup.rs")),
+            ("firefox.rs", include_str!("firefox.rs")),
+            ("flathub.rs", include_str!("flathub.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("seccomp.rs", include_str!("seccomp.rs")),
+            ("sys.rs", include_str!("sys.rs")),
+            ("transition.rs", include_str!("transition.rs")),
+            ("workspace.rs", include_str!("workspace.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for named in ["td-control", "TD_CONTROL_SOCKET"] {
+                assert!(!production.contains(named), "{name} names {named}");
+            }
+        }
+        assert!(
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
+                .unwrap()
+                .all(|entry| {
+                    let name = entry.unwrap().file_name();
+                    [
+                        "authority.rs",
+                        "bus.rs",
+                        "cgroup.rs",
+                        "firefox.rs",
+                        "flathub.rs",
+                        "main.rs",
+                        "seccomp.rs",
+                        "sys.rs",
+                        "transition.rs",
+                        "workspace.rs",
+                    ]
+                    .contains(&name.to_str().unwrap_or_default())
+                })
+        );
+    }
+
+    #[test]
     fn reserved_trees_and_the_home_are_refused() {
         let home = &[PathBuf::from("/home/u"), PathBuf::from("/var/home/u")];
         for refused in [

@@ -28,10 +28,11 @@ use crate::shared::{
     SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER,
     TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
-    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_APPLICATION_FILTER_PROBE_MARKER,
-    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
-    TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
-    TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_GRANT_REQUEST_MARKER, TD_INIT_RUNTIME_MARKER,
+    TD_JAIL_APPLICATION_FILTER_PROBE_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
+    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER,
     TD_WEB_ENTRY, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
@@ -392,8 +393,17 @@ const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 = FIREFOX_EVIDENCE_WAIT_ITERAT
 // An oracle's Firefox starts once its install from the host's feed and
 // td-software's request-path evidence have finished (APPLICATIONS.md §W.9),
 // bounded by those two units' timeouts.
-const FIREFOX_FETCH_WAIT_SECS: u16 =
-    (svc_timeouts::APPLICATION_FETCH + svc_timeouts::SOFTWARE_EVIDENCE) as u16;
+const FIREFOX_FETCH_WAIT_SECS: u16 = (svc_timeouts::APPLICATION_FETCH
+    + svc_timeouts::SOFTWARE_EVIDENCE
+    + svc_timeouts::GRANT_REQUEST) as u16;
+/// grant-request asks for its grant at most this many times, a second
+/// apart, each answer bounded at 5 seconds, inside its unit's bound.
+const GRANT_REQUEST_ATTEMPTS: u32 = 8;
+/// The directory of the human's grant-request grants Firefox, read-only,
+/// and grant-evidence revokes.
+const GRANT_EVIDENCE_DIRECTORY: &str = "Pictures";
+/// Firefox's account's published grant views and their manifest.
+const FIREFOX_GRANT_VIEWS: &str = "/var/lib/td/grant-views/65536";
 /// software-evidence polls until this many seconds of uptime have passed,
 /// leaving the last poll (a control-socket answer is bounded at 5 seconds)
 /// and its report inside the unit's bound.
@@ -1591,6 +1601,8 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox",
     "firefox-fetch",
     "software-evidence",
+    "grant-request",
+    "grant-evidence",
     "firefox-evidence",
     "terminal-authority-evidence",
     "firefox-input",
@@ -1671,6 +1683,12 @@ mod svc_timeouts {
     /// socket and root: a check against the host's feed that finds both
     /// refs where they are, polled a second at a time.
     pub const SOFTWARE_EVIDENCE: u32 = 120;
+    /// A directory made as the human, then grant-request's bounded
+    /// attempts at its grant through the control socket and root's
+    /// writer, and one listing.
+    pub const GRANT_REQUEST: u32 = 60;
+    /// Two reads, a revoke through the control socket and a listing.
+    pub const GRANT_EVIDENCE: u32 = 30;
     /// An oracle's first fetch of an application or runtime from the host's
     /// feed: about a gigabyte over QEMU's user network, materialized and
     /// validated in the VM.
@@ -2478,7 +2496,7 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
-         after=audio,busd,portal,wayland,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence\n\
+         after=audio,busd,portal,wayland,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence,grant-request\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
@@ -2524,6 +2542,35 @@ fn build_desktop_td_svc_conf() -> String {
          after=firefox-fetch,wayland,firefox-tls-setup\n\
          requires=wayland\n\
          timeout={software_evidence}\n\
+         \n\
+         # The grant request path (td-authd/DESIGN.md, \"Grant requests\"),\n\
+         # before Firefox starts so its launch publishes what it adds: as\n\
+         # the human, a private directory in the home, then the control\n\
+         # socket's `grant` of it read-only to Firefox's account, which the\n\
+         # compositor forwards as private request `2c` and root's one writer\n\
+         # adds to the grant table, then `grants` listing it. An answer short\n\
+         # of `added` or `unchanged` is asked again, a second apart, a bounded\n\
+         # number of times. grant-evidence checks what the launch published.\n\
+         [grant-request]\n\
+         type=oneshot\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; /bin/td-login exec-primary -- /bin/mkdir -p -m 0700 \"$home/{grant_directory}\" || exit 1; n=0; granted=; while [ \"$n\" -lt {grant_request_attempts} ]; do granted=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} grant application {firefox_name} ro {grant_directory} 2>&1); case \"$granted\" in added|unchanged) break;; esac; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {grant_request_attempts} ] || {{ /bin/td-util printf \"grant-request: the grant was not made: %s\\n\" \"$granted\"; exit 1; }}; listed=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} grants application {firefox_name} 2>&1); case \"$listed\" in *\"ro\"?\"{grant_directory}\"*) exit 0;; esac; /bin/td-util printf \"grant-request: the listing lacks the grant: %s\\n\" \"$listed\"; exit 1'\n\
+         after=software-evidence,wayland\n\
+         requires=wayland\n\
+         timeout={grant_request}\n\
+         \n\
+         # What Firefox's launch made of grant-request's row: root's manifest\n\
+         # for its account lists the directory read-only, and the view it\n\
+         # names is mounted read-only and idmapped. Then, as the human, the\n\
+         # control socket's `revoke`, answered `revoked`, and a listing\n\
+         # without it that keeps the seeded `Downloads`. The running Firefox\n\
+         # keeps its view; its next launch publishes none.\n\
+         [grant-evidence]\n\
+         type=oneshot\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; view=$(/bin/rg -o -r \"\\$1\" \"^([0-9]+)\\tro\\t{grant_directory}$\" {firefox_grant_views}/manifest) || {{ /bin/td-util printf \"grant-evidence: the manifest lists no read-only view: %s\\n\" \"$(/bin/td-util cat {firefox_grant_views}/manifest 2>&1)\"; exit 1; }}; /bin/rg -q \"^[0-9]+ [0-9]+ [0-9]+:[0-9]+ [^ ]+ {firefox_grant_views}/$view ro,[^ ]*idmapped\" /proc/self/mountinfo || {{ /bin/td-util printf \"grant-evidence: view %s is not mounted read-only and idmapped\\n\" \"$view\"; exit 1; }}; revoked=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} revoke application {firefox_name} {grant_directory} 2>&1); [ \"$revoked\" = revoked ] || {{ /bin/td-util printf \"grant-evidence: the revoke was not made: %s\\n\" \"$revoked\"; exit 1; }}; listed=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} grants application {firefox_name} 2>&1); case \"$listed\" in *\"{grant_directory}\"*) :;; *\"rw\"?\"Downloads\"*) /bin/echo {grant_marker}; exit 0;; esac; /bin/td-util printf \"grant-evidence: the listing after the revoke: %s\\n\" \"$listed\"; exit 1'\n\
+         after=firefox\n\
+         timeout={grant_evidence}\n\
          \n\
          # This application is test evidence, not deployment health. The exact\n\
          # compositor, live-cgroup and Firefox support probes must succeed before\n\
@@ -2723,6 +2770,12 @@ fn build_desktop_td_svc_conf() -> String {
         software_evidence = svc_timeouts::SOFTWARE_EVIDENCE,
         software_evidence_wait = SOFTWARE_EVIDENCE_WAIT_SECS,
         software_marker = TD_SOFTWARE_INSTALL_MARKER,
+        grant_request = svc_timeouts::GRANT_REQUEST,
+        grant_request_attempts = GRANT_REQUEST_ATTEMPTS,
+        grant_evidence = svc_timeouts::GRANT_EVIDENCE,
+        grant_directory = GRANT_EVIDENCE_DIRECTORY,
+        firefox_grant_views = FIREFOX_GRANT_VIEWS,
+        grant_marker = TD_GRANT_REQUEST_MARKER,
         firefox_runtime = FIREFOX_RUNTIME,
         firefox_deploys = FIREFOX_DEPLOYS,
         placed_marker = TD_APPLICATIONS_PLACED_MARKER,
@@ -8016,7 +8069,9 @@ mod tests {
         );
         assert_eq!(
             u32::from(FIREFOX_FETCH_WAIT_SECS),
-            svc_timeouts::APPLICATION_FETCH + svc_timeouts::SOFTWARE_EVIDENCE
+            svc_timeouts::APPLICATION_FETCH
+                + svc_timeouts::SOFTWARE_EVIDENCE
+                + svc_timeouts::GRANT_REQUEST
         );
         assert_eq!(
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS,
@@ -9560,6 +9615,8 @@ mod tests {
                                 "firefox"
                                     | "firefox-fetch"
                                     | "software-evidence"
+                                    | "grant-request"
+                                    | "grant-evidence"
                                     | "applications-workspace"
                                     | "mail"
                                     | "news"
@@ -9593,6 +9650,8 @@ mod tests {
             "placement-evidence",
             "shell-workspace",
             "software-evidence",
+            "grant-request",
+            "grant-evidence",
             "terminal",
             "web",
             "web-evidence",
@@ -9917,6 +9976,7 @@ mod tests {
                     "placement-evidence",
                     "firefox-fetch",
                     "software-evidence",
+                    "grant-request",
                 ],
             ),
             ("firefox-fetch", vec!["td-firstboot", "netup"]),
@@ -9924,6 +9984,8 @@ mod tests {
                 "software-evidence",
                 vec!["firefox-fetch", "wayland", "firefox-tls-setup"],
             ),
+            ("grant-request", vec!["software-evidence", "wayland"]),
+            ("grant-evidence", vec!["firefox"]),
             ("firefox-evidence", vec!["firefox", "netup"]),
             (
                 "terminal-authority-evidence",
@@ -13745,6 +13807,67 @@ mod tests {
         assert!(software.contains(&format!(
             "read up rest </proc/uptime; end=$((${{up%%.*}}+{SOFTWARE_EVIDENCE_WAIT_SECS}));"
         )));
+        // The grant request path: a grant asked as the human through the
+        // control socket before Firefox's launch, which publishes it; its
+        // view checked after, then revoked and listed without it.
+        let request = unit_key("grant-request", "exec").unwrap_or_default();
+        let evidence = unit_key("grant-evidence", "exec").unwrap_or_default();
+        for exec in [&request, &evidence] {
+            assert!(exec.contains(&format!(
+                "*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac;"
+            )));
+            assert!(!exec.contains("/dev/null"));
+        }
+        assert!(request.contains(&format!(
+            "/bin/td-login exec-primary -- /bin/mkdir -p -m 0700 \"$home/{GRANT_EVIDENCE_DIRECTORY}\""
+        )));
+        assert!(request.contains(&format!(
+            "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} grant application {FIREFOX_NAME} ro {GRANT_EVIDENCE_DIRECTORY} 2>&1); case \"$granted\" in added|unchanged) break;;"
+        )));
+        assert!(request.contains(&format!(
+            "while [ \"$n\" -lt {GRANT_REQUEST_ATTEMPTS} ]; do"
+        )));
+        assert!(request.contains(&format!(
+            "case \"$listed\" in *\"ro\"?\"{GRANT_EVIDENCE_DIRECTORY}\"*) exit 0;; esac;"
+        )));
+        // Each attempt is bounded at the control socket's 5 seconds and a
+        // second's sleep; then the final listing, another 5, and a second
+        // for the home's lookup and the directory.
+        assert!(GRANT_REQUEST_ATTEMPTS * 6 + 5 + 1 <= svc_timeouts::GRANT_REQUEST);
+        // grant-evidence: two local reads, then a revoke and a listing at 5
+        // seconds each.
+        assert!(5 + 5 + 5 <= svc_timeouts::GRANT_EVIDENCE);
+        assert!(evidence.contains(&format!(
+            "\"^([0-9]+)\\tro\\t{GRANT_EVIDENCE_DIRECTORY}$\" {FIREFOX_GRANT_VIEWS}/manifest"
+        )));
+        assert!(evidence.contains(&format!(
+            "{FIREFOX_GRANT_VIEWS}/$view ro,[^ ]*idmapped\" /proc/self/mountinfo"
+        )));
+        assert!(evidence.contains(&format!(
+            "td-ctl --socket {CONTROL_SOCKET} revoke application {FIREFOX_NAME} {GRANT_EVIDENCE_DIRECTORY} 2>&1); [ \"$revoked\" = revoked ]"
+        )));
+        assert!(evidence.contains(&format!(
+            "case \"$listed\" in *\"{GRANT_EVIDENCE_DIRECTORY}\"*) :;; *\"rw\"?\"Downloads\"*) /bin/echo {TD_GRANT_REQUEST_MARKER}; exit 0;; esac;"
+        )));
+        assert_eq!(
+            FIREFOX_GRANT_VIEWS,
+            format!("{}/65536", td_engine::workload_grants::VIEW_ROOT)
+        );
+        assert!(
+            td_engine::workload_grants::validate_path(GRANT_EVIDENCE_DIRECTORY.as_bytes()).is_ok()
+        );
+        for (unit, timeout) in [
+            ("grant-request", svc_timeouts::GRANT_REQUEST),
+            ("grant-evidence", svc_timeouts::GRANT_EVIDENCE),
+        ] {
+            assert_eq!(
+                unit_key(unit, "unless-exists").as_deref(),
+                Some(APPLICATIONS_ON_DEMAND)
+            );
+            assert_eq!(unit_key(unit, "timeout"), Some(timeout.to_string()));
+        }
+        assert!(unit_after("firefox").contains(&"grant-request".to_string()));
+        assert_eq!(unit_after("grant-evidence"), ["firefox"]);
     }
 
     /// The first pass must select through td-boot. The selected pass must bind

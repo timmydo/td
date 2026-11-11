@@ -157,3 +157,70 @@ fn a_compositor_that_never_answers_is_a_timeout_not_an_os_error() {
     );
     silent.join().unwrap();
 }
+
+/// A grant request is the control socket's line, the directory the rest
+/// of it; a listing's rows and a change's word come back typed, and an
+/// unreadable answer to a change leaves it open.
+#[test]
+fn grant_requests_are_one_line_and_their_answers_typed() {
+    use td_software::grants::{Access, Grant};
+    let dir = td_fs::TempDir::new("td-software-worker").unwrap();
+    let socket = dir.path().join("control");
+    let compositor = serve_each(
+        &socket,
+        vec![
+            b"ok\nro\tMy Pictures\n".to_vec(),
+            b"ok\nadded\n".to_vec(),
+            b"error ~/Nope does not exist\n".to_vec(),
+            b"ok\nadded\n".to_vec(),
+            b"ok\nrx\tPictures\n".to_vec(),
+        ],
+    );
+    let listed = worker::run(Some(&socket), Job::Grants("firefox".into()));
+    assert_eq!(
+        listed,
+        Reply::Grants(
+            "firefox".into(),
+            Ok(vec![Grant {
+                access: Access::ReadOnly,
+                path: "My Pictures".into()
+            }])
+        )
+    );
+    let granted = worker::run(
+        Some(&socket),
+        Job::Grant("firefox".into(), Access::ReadWrite, "My Pictures".into()),
+    );
+    assert_eq!(granted, Reply::Changed("firefox".into(), Ok("added")));
+    let refused = worker::run(Some(&socket), Job::Revoke("firefox".into(), "Nope".into()));
+    assert_eq!(
+        refused,
+        Reply::Changed(
+            "firefox".into(),
+            Err(Failure {
+                reason: "~/Nope does not exist".into(),
+                definite: true
+            })
+        )
+    );
+    let Reply::Changed(_, Err(failure)) = worker::run(
+        Some(&socket),
+        Job::Revoke("firefox".into(), "Pictures".into()),
+    ) else {
+        panic!("a revoke answered `added` was taken");
+    };
+    assert!(!failure.definite);
+    let Reply::Grants(_, Err(_)) = worker::run(Some(&socket), Job::Grants("firefox".into())) else {
+        panic!("a malformed listing was taken");
+    };
+    assert_eq!(
+        compositor.join().unwrap(),
+        [
+            "grants application firefox\n",
+            "grant application firefox rw My Pictures\n",
+            "revoke application firefox Nope\n",
+            "revoke application firefox Pictures\n",
+            "grants application firefox\n",
+        ]
+    );
+}

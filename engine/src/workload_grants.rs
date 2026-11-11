@@ -4,7 +4,9 @@
 //! account ledger keys it, and what that account may reach of the
 //! human's. The file is std-only, uses only `workload_accounts` beside it
 //! and performs no I/O, so target programs include it by path: td-firstboot
-//! seeds the table, td-authd publishes a launching account's views from
+//! seeds the table and is its one writer at the human's request
+//! (`Table::grant`, `Table::revoke`), td-authd publishes a launching
+//! account's views from
 //! it and lists them in that account's manifest, and td-jail admits the
 //! views the manifest lists. Every directory a row or a manifest names is
 //! checked by `validate_path`, the one byte validator all three share.
@@ -54,7 +56,7 @@ pub enum Access {
 }
 
 impl Access {
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "ro" => Some(Self::ReadOnly),
             "rw" => Some(Self::ReadWrite),
@@ -78,6 +80,17 @@ pub enum Grant {
     Directory { access: Access, path: String },
     Socket(String),
     Network(Network),
+}
+
+/// What a grant request did to the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A new row.
+    Added,
+    /// The row of the same path at the other access, replaced.
+    Changed,
+    /// An equal row stood already; nothing is written.
+    Unchanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,12 +119,24 @@ impl Row {
         }
     }
 
+    /// This row's access when it is the `kind` account `name`'s grant of
+    /// the directory `path`.
+    fn directory_of(&self, kind: Kind, name: &str, path: &str) -> Option<Access> {
+        match &self.grant {
+            Grant::Directory {
+                access,
+                path: granted,
+            } if self.kind == kind && self.name == name && granted == path => Some(*access),
+            _ => None,
+        }
+    }
+
     fn parse(line: &str) -> Result<Self, String> {
         let fields: Vec<&str> = line.split('\t').take(6).collect();
         let (kind, name, grant) = match fields.as_slice() {
             [kind, name, "directory", access, path] => {
                 let access = Access::parse(access).ok_or("unknown grant access")?;
-                validate_path(path.as_bytes())?;
+                table_path(path.as_bytes())?;
                 (
                     kind,
                     name,
@@ -152,6 +177,22 @@ fn socket_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// A directory as the table holds it, whatever this deployment's
+/// `validate_path` says of it: one to 1024 bytes of UTF-8 without a control
+/// character, so a row stays one line wherever it is listed. Only this
+/// fails a table whole; a later deployment that reserves more of the home
+/// or refuses more characters leaves a row it now refuses in place, inert
+/// (`Table::refused`): listed, revocable and never published.
+pub fn table_path(relative: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(relative).map_err(|_| "grant directory is not UTF-8")?;
+    if text.is_empty() || text.len() > MAX_PATH_BYTES || text.chars().any(char::is_control) {
+        return Err(format!(
+            "grant directory {text:?} is empty, too long or holds a control character"
+        ));
+    }
+    Ok(())
 }
 
 /// One directory grant of an account.
@@ -219,8 +260,84 @@ impl Table {
         text
     }
 
-    /// The directory grants of the `kind` account `name`.
-    pub fn directories(&self, kind: Kind, name: &str) -> Vec<Directory> {
+    /// The table with the `kind` account `name` granted `path` at `access`,
+    /// and what that changed: an equal row leaves the table as it is, and a
+    /// row of the same path at the other access is replaced. The result
+    /// passes `parse` whole, so a reserved or invalid path, an overlap with
+    /// another of the account's directories and every bound refuse here as
+    /// they would in a table read back; so does a path nested with one of
+    /// the account's inert rows, which `parse` admits.
+    pub fn grant(
+        &self,
+        kind: Kind,
+        name: &str,
+        access: Access,
+        path: &str,
+    ) -> Result<(Self, Change), String> {
+        validate_path(path.as_bytes())?;
+        if !valid_name(name) {
+            return Err("invalid grant account name".into());
+        }
+        let mut change = Change::Added;
+        let mut rows = Vec::with_capacity(self.rows.len().saturating_add(1));
+        for row in &self.rows {
+            match row.directory_of(kind, name, path) {
+                Some(held) if held == access => return Ok((self.clone(), Change::Unchanged)),
+                Some(_) => change = Change::Changed,
+                None => {
+                    // An inert row overlaps nothing in `parse`, but the
+                    // deployment that wrote it publishes it, and would
+                    // refuse the table this grant leaves after a rollback.
+                    if let Grant::Directory { path: other, .. } = &row.grant {
+                        if row.kind == kind && row.name == name && nested(path, other) {
+                            return Err(format!(
+                                "grant directories {other:?} and {path:?} of one account overlap"
+                            ));
+                        }
+                    }
+                    rows.push(row.clone());
+                }
+            }
+        }
+        rows.push(Row {
+            kind,
+            name: name.to_string(),
+            grant: Grant::Directory {
+                access,
+                path: path.to_string(),
+            },
+        });
+        Ok((Self::of_rows(rows)?, change))
+    }
+
+    /// The table without the `kind` account `name`'s grant of `path`,
+    /// whatever its access. A grant the account does not hold refuses, so a
+    /// mistyped path is reported rather than taken for done.
+    pub fn revoke(&self, kind: Kind, name: &str, path: &str) -> Result<Self, String> {
+        let rows: Vec<Row> = self
+            .rows
+            .iter()
+            .filter(|row| row.directory_of(kind, name, path).is_none())
+            .cloned()
+            .collect();
+        if rows.len() == self.rows.len() {
+            return Err(format!(
+                "the {} {name} holds no grant of {path:?}",
+                kind.as_str()
+            ));
+        }
+        Self::of_rows(rows)
+    }
+
+    /// `rows` in canonical order, checked as a table read back.
+    fn of_rows(mut rows: Vec<Row>) -> Result<Self, String> {
+        rows.sort_by_cached_key(Row::line);
+        Self::parse(&Self { rows }.encode())
+    }
+
+    /// Every directory row the `kind` account `name` holds, publishable or
+    /// not: what a listing shows and a revoke may name.
+    pub fn held(&self, kind: Kind, name: &str) -> Vec<Directory> {
         self.rows
             .iter()
             .filter(|row| row.kind == kind && row.name == name)
@@ -230,6 +347,28 @@ impl Table {
                     path: path.clone(),
                 }),
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// The directory grants of the `kind` account `name` a launch
+    /// publishes: those `validate_path` admits.
+    pub fn directories(&self, kind: Kind, name: &str) -> Vec<Directory> {
+        self.held(kind, name)
+            .into_iter()
+            .filter(|directory| validate_path(directory.path.as_bytes()).is_ok())
+            .collect()
+    }
+
+    /// The account's rows this deployment's `validate_path` refuses, each
+    /// with why: kept, listed and revocable, never published.
+    pub fn refused(&self, kind: Kind, name: &str) -> Vec<(Directory, String)> {
+        self.held(kind, name)
+            .into_iter()
+            .filter_map(|directory| {
+                validate_path(directory.path.as_bytes())
+                    .err()
+                    .map(|why| (directory, why))
             })
             .collect()
     }
@@ -250,7 +389,10 @@ fn require_account_rows(admitted: &[Row], row: &Row) -> Result<(), String> {
             for other in same() {
                 if let Grant::Directory { path: other, .. } = &other.grant {
                     count += 1;
-                    if nested(path, other) {
+                    // Only publishable rows can overlap: an inert one is
+                    // never a view.
+                    let publishable = |path: &str| validate_path(path.as_bytes()).is_ok();
+                    if publishable(path) && publishable(other) && nested(path, other) {
                         return Err(format!(
                             "grant directories {other:?} and {path:?} of one account overlap"
                         ));
@@ -603,12 +745,78 @@ mod tests {
             "td-grants-v1\napplication\tfirefox\tsocket\tWayland\n",
             "td-grants-v1\napplication\tfirefox\tsocket\t\n",
             "td-grants-v1\napplication\tfirefox\tnetwork\thost\napplication\tfirefox\tnetwork\toff\n",
-            "td-grants-v1\napplication\tfirefox\tdirectory\trw\t.ssh\n",
-            "td-grants-v1\napplication\tfirefox\tdirectory\trw\t/Downloads\n",
-            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads/\n",
+            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDown\u{7}loads\n",
+            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDown\u{85}loads\n",
         ] {
             assert!(Table::parse(text).is_err(), "{text:?}");
         }
+        let long = format!(
+            "{MAGIC}application\tfirefox\tdirectory\trw\t{}\n",
+            "a".repeat(MAX_PATH_BYTES + 1)
+        );
+        assert!(Table::parse(&long).is_err());
+    }
+
+    /// A row this deployment's `validate_path` refuses, as a later one that
+    /// reserves more of the home leaves a row an earlier one wrote, does
+    /// not fail the table: it is held and listed, revocable, never
+    /// published, and overlaps nothing, while the account's other rows
+    /// publish as before. A grant still refuses its path.
+    #[test]
+    fn a_row_the_validator_now_refuses_is_inert_not_fatal() {
+        let text = format!(
+            "{MAGIC}application\tfirefox\tdirectory\tro\t.ssh\n\
+             application\tfirefox\tdirectory\tro\t.ssh/keys\n\
+             application\tfirefox\tdirectory\tro\t/Pictures\n\
+             application\tfirefox\tdirectory\trw\tDownloads\n"
+        );
+        let table = Table::parse(&text).unwrap();
+        assert_eq!(table.encode(), text);
+        assert_eq!(
+            table.directories(Kind::Application, "firefox"),
+            [directory(Access::ReadWrite, "Downloads")]
+        );
+        assert_eq!(table.held(Kind::Application, "firefox").len(), 4);
+        let refused: Vec<String> = table
+            .refused(Kind::Application, "firefox")
+            .into_iter()
+            .map(|(directory, _)| directory.path)
+            .collect();
+        assert_eq!(refused, [".ssh", ".ssh/keys", "/Pictures"]);
+        let revoked = table.revoke(Kind::Application, "firefox", ".ssh").unwrap();
+        assert_eq!(revoked.held(Kind::Application, "firefox").len(), 3);
+        assert!(table
+            .grant(Kind::Application, "firefox", Access::ReadOnly, ".ssh")
+            .is_err());
+        // A publishable row still may not overlap another publishable one.
+        assert!(table
+            .grant(
+                Kind::Application,
+                "firefox",
+                Access::ReadOnly,
+                "Downloads/a"
+            )
+            .is_err());
+        table
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "Pictures")
+            .unwrap();
+        // Nor may a grant nest with an inert row: the deployment that
+        // wrote the row would find the two overlapping after a rollback.
+        let inert = Table::parse(&format!(
+            "{MAGIC}application\tfirefox\tdirectory\tro\tMusic/\u{202E}x\n"
+        ))
+        .unwrap();
+        assert!(inert.directories(Kind::Application, "firefox").is_empty());
+        let overlap = inert
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "Music")
+            .unwrap_err();
+        assert!(overlap.contains("overlap"), "{overlap}");
+        inert
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "Musical")
+            .unwrap();
+        inert
+            .grant(Kind::Application, "thunderbird", Access::ReadOnly, "Music")
+            .unwrap();
     }
 
     /// One account's directories may not overlap, whatever their access;
@@ -806,6 +1014,121 @@ mod tests {
         }
         validate_path("Téléchargements".as_bytes()).unwrap();
         validate_path("下载".as_bytes()).unwrap();
+    }
+
+    /// A grant adds a canonical row, an equal one changes nothing, the
+    /// other access replaces it, and a revoke removes it whatever its
+    /// access; every other row, socket and network ones included, stays.
+    #[test]
+    fn grants_and_revokes_rewrite_one_row_in_canonical_order() {
+        let base = Table::parse(
+            "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tfirefox\tnetwork\thost\nsandbox\tdefault\tsocket\tfetch\n",
+        )
+        .unwrap();
+        let (added, change) = base
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "Pictures")
+            .unwrap();
+        assert_eq!(change, Change::Added);
+        assert_eq!(
+            added.encode(),
+            "td-grants-v1\napplication\tfirefox\tdirectory\tro\tPictures\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tfirefox\tnetwork\thost\nsandbox\tdefault\tsocket\tfetch\n"
+        );
+        let (same, change) = added
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "Pictures")
+            .unwrap();
+        assert_eq!((same.clone(), change), (added.clone(), Change::Unchanged));
+        let (writable, change) = same
+            .grant(Kind::Application, "firefox", Access::ReadWrite, "Pictures")
+            .unwrap();
+        assert_eq!(change, Change::Changed);
+        assert_eq!(
+            writable.directories(Kind::Application, "firefox"),
+            [
+                directory(Access::ReadWrite, "Downloads"),
+                directory(Access::ReadWrite, "Pictures")
+            ]
+        );
+        let revoked = writable
+            .revoke(Kind::Application, "firefox", "Pictures")
+            .unwrap();
+        assert_eq!(revoked, base);
+        // Revoking what is not held refuses: another account's, another
+        // path's, or one already revoked.
+        assert!(revoked
+            .revoke(Kind::Application, "firefox", "Pictures")
+            .is_err());
+        assert!(revoked
+            .revoke(Kind::Application, "mail", "Downloads")
+            .is_err());
+        assert!(revoked
+            .revoke(Kind::Sandbox, "firefox", "Downloads")
+            .is_err());
+        let emptied = revoked
+            .revoke(Kind::Application, "firefox", "Downloads")
+            .unwrap();
+        assert!(emptied.directories(Kind::Application, "firefox").is_empty());
+        assert!(emptied
+            .encode()
+            .contains("application\tfirefox\tnetwork\thost\n"));
+    }
+
+    /// A grant refuses what a table read back refuses: a reserved,
+    /// deceptive or irregular path, an overlap with the account's other
+    /// directories and the per-account bound.
+    #[test]
+    fn a_grant_refuses_what_the_table_refuses() {
+        let table = Table::seeded();
+        for path in [
+            ".ssh",
+            ".local",
+            ".config/git",
+            ".td-update",
+            "Down\u{202E}loads",
+            "Downloads/../x",
+            "",
+            "/Pictures",
+        ] {
+            assert!(
+                table
+                    .grant(Kind::Application, "firefox", Access::ReadOnly, path)
+                    .is_err(),
+                "{path:?}"
+            );
+        }
+        // Below the account's own Downloads: an overlap, refused for the
+        // same account, not for another.
+        assert!(table
+            .grant(
+                Kind::Application,
+                "firefox",
+                Access::ReadOnly,
+                "Downloads/a"
+            )
+            .is_err());
+        table
+            .grant(Kind::Application, "web", Access::ReadOnly, "Downloads/a")
+            .unwrap();
+        assert!(table
+            .grant(Kind::Application, "Firefox", Access::ReadOnly, "Pictures")
+            .is_err());
+        let mut full = Table::default();
+        for index in 0..MAX_DIRECTORIES {
+            full = full
+                .grant(
+                    Kind::Application,
+                    "firefox",
+                    Access::ReadOnly,
+                    &format!("d{index:02}"),
+                )
+                .unwrap()
+                .0;
+        }
+        assert!(full
+            .grant(Kind::Application, "firefox", Access::ReadOnly, "one-more")
+            .is_err());
+        // Changing an existing row's access is no new row.
+        full.grant(Kind::Application, "firefox", Access::ReadWrite, "d00")
+            .unwrap();
     }
 
     #[test]

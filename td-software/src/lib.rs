@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod grants;
 pub mod registry;
 pub mod snapshot;
 pub mod worker;

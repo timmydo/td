@@ -1208,7 +1208,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xdf9ff87d1611e26d;
+    const AUTHORITY_FINGERPRINT: u64 = 0x34e40f6a1fbd2912;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1376,6 +1376,11 @@ mod confinement {
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
+        // Root cuts a refusal to its reason bound, which the cache and
+        // grant answers' decoders here accept exactly.
+        assert!(include_str!("../../td-authd/src/software.rs")
+            .contains("pub(crate) const REASON_BYTES: usize = 200;"));
+        assert!(AUTHORITY.contains("const CACHE_REASON_BYTES: usize = 200;"));
         assert_eq!(
             fingerprint(AUTH_CHANNEL),
             AUTH_CHANNEL_FINGERPRINT,

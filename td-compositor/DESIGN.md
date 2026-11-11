@@ -5807,6 +5807,57 @@ reach the human's files, a system location or another account. td-ui's
 confirmation dialog in td-software guards against a slip, not against
 that program.
 
+### Grant requests
+
+The human lists, adds and revokes the directories of the home an
+application account is granted (WORKLOADS.md, "Grants") here, and the
+compositor forwards each over its private channel as request `2c`
+(td-authd/DESIGN.md, "Grant requests"):
+
+- `grants application NAME`: the account's directory rows, `ok` and one
+  `ro|rw<TAB>DIRECTORY` line each, in the table's order;
+- `grant application NAME ro|rw DIRECTORY`: add the row, or change its
+  access, `ok` and `added`, `changed` or `unchanged`;
+- `revoke application NAME DIRECTORY`: remove it, `ok` and `revoked`.
+
+`DIRECTORY` is the rest of the line after the single space that ends
+the access or the name, spaces and all, one to 1024 bytes, relative to
+the home, with no control character: one is refused before anything is
+sent, td-ctl's own parse included, so a newline cannot end the
+directory early. A line that begins `grant ` or `revoke ` may therefore
+be up to 2048 bytes; every other request keeps the socket's 1024.
+`application` is the only kind: `sandbox` and `workspace` are
+refused by name until their launches go through root (WORKLOADS.md
+step 7). The compositor checks the grammar and bounds alone; the path's
+rules, the application's admission and the source's checks are root's,
+whose refusal is an `error` carrying its reason. A grant changes what
+the account's next launch publishes, never a running jail.
+
+They travel the application requests' capacity-one queue, one a turn
+after the physical queue, and wait for the worker's answer at most four
+seconds, root's three-second bound on the table's writer and a margin,
+inside the conversation's five less half a second. A listing longer
+than one frame is paged: the worker asks from the next row until it
+holds the count root stated, and a page whose count or listing digest
+differs from the first's is an `unavailable` to ask again. The worker
+carries physical requests over the same wire, so a listing asks no
+further page once four seconds have passed since its first, when its
+caller has stopped waiting, and is an `unavailable` too: with the page
+then in flight, at most about seven seconds of root's writer runs a
+secret attempt or keyboard launch can wait behind (td-authd/DESIGN.md,
+"Grant requests"). Root's writer not running, or not
+answering within its bound, is an `unavailable`: the table may have
+changed, and a listing says. A live session's request is an `error`,
+and without the paired authority every grant request is one too.
+`td-ctl` prints the body, read to at most 40 KiB, with any control
+character, or one that reorders or hides text, in a listed directory
+shown as `?`, as td-software shows it: only a row root's validator
+refuses, held inert, can carry one. A grant is not
+elevation: it delegates the human's authority over the human's own
+files, so it takes the human's credentials at this socket and no secure
+attention, and any program running as the human can make one
+(td-login/THREAT-MODEL.md).
+
 ### What it deliberately is not
 
 It does not subscribe, so there is no event stream to keep in sync and no

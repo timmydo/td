@@ -23,6 +23,7 @@ fn production(name: &str) -> String {
 
 const FILES: &[&str] = &[
     "app.rs",
+    "grants.rs",
     "lib.rs",
     "main.rs",
     "registry.rs",
@@ -33,7 +34,7 @@ const FILES: &[&str] = &[
 
 /// The window's state, the tables' grammar and the answers' parser:
 /// memory alone.
-const PURE: &[&str] = &["app.rs", "registry.rs", "snapshot.rs"];
+const PURE: &[&str] = &["app.rs", "grants.rs", "registry.rs", "snapshot.rs"];
 
 #[test]
 fn the_source_inventory_is_closed() {
@@ -159,7 +160,7 @@ fn only_the_worker_talks_to_the_compositor_and_only_the_window_reads_files() {
     assert_eq!(worker.matches("::connect(").count(), 1);
     assert_eq!(worker.matches("UnixStream::connect(").count(), 1);
     assert_eq!(worker.matches("ask(").count(), 2);
-    assert!(worker.contains("Some(socket) => ask(socket, &line(&job)),"));
+    assert!(worker.contains("Some(socket) => ask(socket, &line(&job), limit(&job)),"));
     assert_eq!(worker.matches(".write_all(").count(), 1);
     assert!(worker.contains(".write_all(line.as_bytes())"));
     assert!(window.contains("const CONTROL_SOCKET: &str = \"TD_CONTROL_SOCKET\";"));

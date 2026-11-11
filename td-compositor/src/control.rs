@@ -27,7 +27,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::authority::{CacheAnswer, CacheRecord, CacheVerb};
+use crate::authority::{
+    CacheAnswer, CacheRecord, CacheVerb, GrantAccess, GrantAnswer, GrantOutcome, GrantRequest,
+    GrantVerb, GRANT_PATH_BYTES,
+};
 use crate::layout::{Command, Direction, Presentation, Rect, FINAL_WORKSPACE, INITIAL_WORKSPACE};
 use crate::reportable::reportable;
 use crate::runtime::{Runtime, Sent};
@@ -38,6 +41,19 @@ use crate::socket;
 /// A request is one line and every verb is short, so anything approaching this
 /// is a caller that has lost the protocol rather than one with a lot to say.
 const REQUEST_LIMIT: usize = 1024;
+/// A `grant` or `revoke` line's bound, the one request that carries a path:
+/// its verb, kind and application name and a directory of up to 1024 bytes.
+const GRANT_REQUEST_LIMIT: usize = 2048;
+
+/// The bound on the request line read so far: a grant's while it begins
+/// with `grant ` or `revoke `, every other request's otherwise.
+fn request_limit(read: &[u8]) -> usize {
+    if read.starts_with(b"grant ") || read.starts_with(b"revoke ") {
+        GRANT_REQUEST_LIMIT
+    } else {
+        REQUEST_LIMIT
+    }
+}
 
 /// A bound on ONE conversation — not on one `read`, which is what a socket
 /// timeout gives and what an earlier draft of this relied on. `SO_RCVTIMEO`
@@ -149,6 +165,107 @@ pub enum Request {
     /// Raise the named application's window, or ask root to start it, as
     /// its card entry does.
     Launch(ApplicationName),
+    /// `grants application NAME`: the application account's directory
+    /// grants, as root's table holds them (td-authd/DESIGN.md, "Grant
+    /// requests").
+    Grants(ApplicationName),
+    /// `grant application NAME ro|rw PATH`: grant it one of the human's
+    /// directories.
+    Grant {
+        name: ApplicationName,
+        access: GrantAccess,
+        path: GrantPath,
+    },
+    /// `revoke application NAME PATH`: take that grant back.
+    Revoke {
+        name: ApplicationName,
+        path: GrantPath,
+    },
+}
+
+/// A directory below the human's home as a grant request carries it:
+/// one to 1024 bytes, held by value so a request stays `Copy`. Its rules
+/// (no reserved tree, no `..`, no control or reordering character) are
+/// root's, which answers a path that breaks one with its reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantPath {
+    bytes: [u8; GRANT_PATH_BYTES],
+    length: u16,
+}
+
+impl GrantPath {
+    fn parse(text: &str) -> Result<Self, String> {
+        if text.is_empty() {
+            return Err("a grant needs a directory below your home".into());
+        }
+        // A newline or another control character would be cut or kept by
+        // whichever end reads it: refused here, before anything is sent.
+        if text.chars().any(char::is_control) {
+            return Err("the directory holds a control character".into());
+        }
+        let mut bytes = [0; GRANT_PATH_BYTES];
+        bytes
+            .get_mut(..text.len())
+            .ok_or("the directory is longer than 1024 bytes")?
+            .copy_from_slice(text.as_bytes());
+        let length = u16::try_from(text.len()).map_err(|_| "the directory is too long")?;
+        Ok(Self { bytes, length })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.bytes
+            .get(..usize::from(self.length))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// The account kind a grant request names: only `application` takes
+/// grants until sandbox and workspace launches go through root
+/// (WORKLOADS.md, "Landing order", step 7).
+fn grant_kind(word: Option<&str>, verb: &str) -> Result<(), String> {
+    match word {
+        Some("application") => Ok(()),
+        Some(kind @ ("sandbox" | "workspace")) => Err(format!(
+            "{kind} accounts take no grants until their launches go through root"
+        )),
+        Some(other) => Err(format!("'{other}' is not an account kind; try application")),
+        None => Err(format!("'{verb}' needs an account kind: application")),
+    }
+}
+
+/// What `grant` or `revoke` alone is told.
+fn grant_operands(verb: &str) -> String {
+    format!("'{verb}' needs an account kind, an application and a directory")
+}
+
+/// `grant` and `revoke`, whose directory is the rest of the line after
+/// one space, spaces and all; `None` for any other line.
+fn grant_change(line: &str) -> Option<Result<Request, String>> {
+    let (verb, rest) = line.split_once(' ')?;
+    let parse = |verb: &str| -> Result<Request, String> {
+        let fields: Vec<&str> = match verb {
+            "grant" => rest.splitn(4, ' ').collect(),
+            _ => rest.splitn(3, ' ').collect(),
+        };
+        let mut fields = fields.into_iter();
+        grant_kind(fields.next(), verb)?;
+        let name = ApplicationName::parse(fields.next(), verb)?;
+        if verb == "grant" {
+            let access = fields
+                .next()
+                .and_then(GrantAccess::from_word)
+                .ok_or("'grant' needs ro or rw before the directory")?;
+            let path = GrantPath::parse(fields.next().unwrap_or_default())?;
+            return Ok(Request::Grant { name, access, path });
+        }
+        let path = GrantPath::parse(fields.next().unwrap_or_default())?;
+        Ok(Request::Revoke { name, path })
+    };
+    match verb {
+        "grant" | "revoke" => Some(parse(verb)),
+        _ => None,
+    }
 }
 
 /// An application name as a request carries it: the registry's grammar,
@@ -292,6 +409,18 @@ pub const USAGE: &[(&str, &str)] = &[
         "launch <application>",
         "raise that application's window, or have root start it if installed",
     ),
+    (
+        "grants application <application>",
+        "list the directories of your home that application is granted",
+    ),
+    (
+        "grant application <application> <ro|rw> <directory>",
+        "grant it that directory below your home, read-only or writable, from its next launch",
+    ),
+    (
+        "revoke application <application> <directory>",
+        "take that grant back, from the application's next launch",
+    ),
 ];
 
 impl Request {
@@ -308,6 +437,9 @@ impl Request {
     /// Parse one request line. Errors are the caller's to read, so they name
     /// what was wrong rather than restating the whole grammar.
     pub fn parse(line: &str) -> Result<Request, String> {
+        if let Some(change) = grant_change(line) {
+            return change;
+        }
         let mut words = line.split_whitespace();
         let verb = words
             .next()
@@ -362,6 +494,12 @@ impl Request {
                 name: ApplicationName::parse(words.next(), verb)?,
             },
             "launch" => Request::Launch(ApplicationName::parse(words.next(), verb)?),
+            "grants" => {
+                grant_kind(words.next(), verb)?;
+                Request::Grants(ApplicationName::parse(words.next(), verb)?)
+            }
+            // With operands these are `grant_change`'s.
+            "grant" | "revoke" => return Err(grant_operands(verb)),
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -431,7 +569,34 @@ impl Request {
             }
             Request::Application { verb, name } => format!("{} {}", verb.word(), name.as_str()),
             Request::Launch(name) => format!("launch {}", name.as_str()),
+            Request::Grants(name) => format!("grants application {}", name.as_str()),
+            Request::Grant { name, access, path } => format!(
+                "grant application {} {} {}",
+                name.as_str(),
+                access.word(),
+                path.as_str()
+            ),
+            Request::Revoke { name, path } => {
+                format!("revoke application {} {}", name.as_str(), path.as_str())
+            }
         }
+    }
+
+    /// A grant request's form for the authority worker.
+    fn grant_request(&self) -> Option<GrantRequest> {
+        let (verb, name, path) = match self {
+            Request::Grants(name) => (GrantVerb::List, name, ""),
+            Request::Grant { name, access, path } => {
+                (GrantVerb::Grant(*access), name, path.as_str())
+            }
+            Request::Revoke { name, path } => (GrantVerb::Revoke, name, path.as_str()),
+            _ => return None,
+        };
+        Some(GrantRequest {
+            verb,
+            name: name.as_str().to_string(),
+            path: path.to_string(),
+        })
     }
 }
 
@@ -944,9 +1109,11 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
         | Request::Pointer { .. }
         | Request::ReleaseInput { .. } => return Ok(Answer::InputDisabled),
         // Answered beside the authority, which this path does not have.
-        Request::Application { .. } | Request::Launch(_) => {
-            return Ok(Answer::ApplicationsDisabled)
-        }
+        Request::Application { .. }
+        | Request::Launch(_)
+        | Request::Grants(_)
+        | Request::Grant { .. }
+        | Request::Revoke { .. } => return Ok(Answer::ApplicationsDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -1316,8 +1483,16 @@ fn converse(
     }
     // An application request is answered beside the authority, never
     // under the runtime lock while it waits; without one, `apply` refuses.
-    if let (Ok(request @ (Request::Application { .. } | Request::Launch(_))), Some(authority)) =
-        (request, authority)
+    if let (
+        Ok(
+            request @ (Request::Application { .. }
+            | Request::Launch(_)
+            | Request::Grants(_)
+            | Request::Grant { .. }
+            | Request::Revoke { .. }),
+        ),
+        Some(authority),
+    ) = (request, authority)
     {
         let reply = application_answer(runtime, authority, request, deadline);
         return write_answer(&mut stream, reply.as_bytes(), deadline);
@@ -1334,6 +1509,10 @@ fn converse(
 /// within a turn of its loop; the conversation's deadline still bounds it,
 /// less a margin for writing the answer.
 const AUTHORITY_WAIT: Duration = Duration::from_secs(3);
+/// A grant request's: root waits up to three seconds for the table's
+/// writer before it answers, so this is that and a margin, which the
+/// conversation's five seconds less `ANSWER_MARGIN` still bound.
+const GRANT_AUTHORITY_WAIT: Duration = Duration::from_secs(4);
 const ANSWER_MARGIN: Duration = Duration::from_millis(500);
 
 fn application_answer(
@@ -1364,7 +1543,63 @@ fn application_answer(
                 }
             }
         }
-        _ => "unavailable not an application request\n".into(),
+        request => {
+            let Some(grant) = request.grant_request() else {
+                return "unavailable not an application request\n".into();
+            };
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(ANSWER_MARGIN)
+                .min(GRANT_AUTHORITY_WAIT);
+            let answer = match authority.grants(grant) {
+                Ok(answer) => answer.recv_timeout(wait),
+                Err(error) => return format!("unavailable {error}\n"),
+            };
+            match answer {
+                Ok(answer) => grant_answer(answer),
+                // Sent or not, root may have changed the table: a listing
+                // says.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    "unavailable the program authority did not answer in time\n".into()
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    "unavailable the program authority is unavailable\n".into()
+                }
+            }
+        }
+    }
+}
+
+/// Root's answer to a grant request as the control socket gives it: a
+/// listing's `ACCESS<TAB>DIRECTORY` lines, or what a change did, one word;
+/// the writer's refusal is an `error` with its reason.
+pub(crate) fn grant_answer(answer: GrantAnswer) -> String {
+    match answer {
+        GrantAnswer::Listed(rows) => {
+            let mut body = String::from("ok\n");
+            for (access, path) in rows {
+                body.push_str(&format!("{}\t{path}\n", access.word()));
+            }
+            body
+        }
+        GrantAnswer::Done(outcome) => format!(
+            "ok\n{}\n",
+            match outcome {
+                GrantOutcome::Added => "added",
+                GrantOutcome::Changed => "changed",
+                GrantOutcome::Unchanged => "unchanged",
+                GrantOutcome::Revoked => "revoked",
+            }
+        ),
+        GrantAnswer::Refused(reason) => format!("error {reason}\n"),
+        GrantAnswer::Unstarted => {
+            "unavailable root could not run the grant table's writer\n".into()
+        }
+        GrantAnswer::Live => "error a live session grants nothing\n".into(),
+        GrantAnswer::Moved => {
+            "unavailable the grants changed while they were read; ask again\n".into()
+        }
+        GrantAnswer::Unfinished => "unavailable the grants took too long to read\n".into(),
     }
 }
 
@@ -1457,7 +1692,7 @@ pub(crate) fn cache_answer(name: &str, answer: CacheAnswer) -> String {
     body
 }
 
-/// Read one line, bounded in BYTES by `REQUEST_LIMIT` and in TIME by
+/// Read one line, bounded in BYTES by `request_limit` and in TIME by
 /// `deadline`. Ends at the first newline or at end of input, so a caller that
 /// writes its request and shuts down is answered exactly as one that
 /// terminates its request.
@@ -1483,8 +1718,9 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<String, St
                     None => (read, false),
                 };
                 buffer.extend_from_slice(line);
-                if buffer.len() > REQUEST_LIMIT {
-                    return Err(format!("control request exceeds {REQUEST_LIMIT} bytes"));
+                let limit = request_limit(&buffer);
+                if buffer.len() > limit {
+                    return Err(format!("control request exceeds {limit} bytes"));
                 }
                 if done {
                     break;
@@ -1549,6 +1785,11 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
         let answer = ask_bounded(path, b"lock-state\n", REQUEST_LIMIT)?;
         return decode_lock_state(&answer).map(str::to_string);
     }
+    if let Some(grant) = request.grant_request() {
+        let line = format!("{}\n", request.render());
+        let answer = ask_bounded(path, line.as_bytes(), GRANTS_LIMIT)?;
+        return decode_grant_answer(&answer, grant.verb);
+    }
     if let Request::Application {
         verb: CacheVerb::Status,
         ..
@@ -1582,6 +1823,63 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
 /// A status answer's bound: its three lines and td-app's record, with
 /// room.
 const APPLICATION_STATUS_LIMIT: usize = 8192;
+
+/// A grant answer's bound: every directory row an account holds at the
+/// longest path, with room.
+const GRANTS_LIMIT: usize = 40 * 1024;
+
+/// A grant answer's body: a listing's `ro|rw<TAB>DIRECTORY` lines, or the
+/// one word saying what a change did; an `error` is the writer's refusal.
+fn decode_grant_answer(answer: &[u8], verb: GrantVerb) -> Result<String, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed grant answer".into());
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    let Some(body) = text.strip_prefix("ok\n") else {
+        return split_answer(text, false).and_then(|_| Err(bad()));
+    };
+    let shaped = match verb {
+        GrantVerb::List => body.split_terminator('\n').all(|line| {
+            ["ro\t", "rw\t"].iter().any(|access| {
+                line.strip_prefix(access)
+                    .is_some_and(|path| !path.is_empty())
+            })
+        }),
+        GrantVerb::Grant(_) => ["added\n", "changed\n", "unchanged\n"].contains(&body),
+        GrantVerb::Revoke => body == "revoked\n",
+    };
+    if !shaped || !(body.is_empty() || body.ends_with('\n')) {
+        return Err(bad());
+    }
+    if verb != GrantVerb::List {
+        return Ok(body.to_string());
+    }
+    // Only a row root's own validator refuses, held inert, can carry
+    // one; each line, tab and newline aside, is shown as td-software
+    // shows it (td-software/src/grants.rs, `shown`).
+    let mut shown = String::with_capacity(body.len());
+    for line in body.split_terminator('\n') {
+        let (access, path) = line.split_once('\t').ok_or_else(bad)?;
+        shown.push_str(access);
+        shown.push('\t');
+        shown.extend(path.chars().map(|c| if hidden(c) { '?' } else { c }));
+        shown.push('\n');
+    }
+    Ok(shown)
+}
+
+/// A control character, or one that reorders or hides the text around
+/// it: what a grant's directory never holds once root's validator
+/// admitted it.
+fn hidden(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
 
 /// A status answer's body: the `operation=` line onward, newline-ended.
 fn decode_application_status(answer: &[u8]) -> Result<String, ControlFailure> {
@@ -2511,8 +2809,31 @@ mod tests {
             ]
             .map(|verb| Request::Application { verb, name })
             .into_iter()
-            .chain([Request::Launch(name)]),
+            .chain([Request::Launch(name), Request::Grants(name)]),
         );
+        let paths = [
+            "Pictures",
+            "My Pictures",
+            " leading space",
+            "a/b/c",
+            "Téléchargements",
+        ]
+        .map(|path| GrantPath::parse(path).unwrap());
+        let every = every.chain(paths.iter().flat_map(|path| {
+            [
+                Request::Grant {
+                    name,
+                    access: GrantAccess::ReadOnly,
+                    path: *path,
+                },
+                Request::Grant {
+                    name,
+                    access: GrantAccess::ReadWrite,
+                    path: *path,
+                },
+                Request::Revoke { name, path: *path },
+            ]
+        }));
         for request in every {
             let line = request.render();
             assert_eq!(
@@ -2855,6 +3176,9 @@ mod tests {
             "fullscreen",
             "present",
             "group",
+            "grants",
+            "grant",
+            "revoke",
         ] {
             assert!(help.contains(verb), "help text does not name '{verb}'");
         }
@@ -4538,6 +4862,27 @@ mod tests {
             answer, "error control request exceeds 1024 bytes\n",
             "a flood was not answered with the limit it broke"
         );
+        // A grant's line takes its own bound, and only a grant's: one at
+        // the longest directory is read whole, and one past it refused.
+        let longest = format!("grant application firefox rw {}", "a".repeat(1024));
+        for (line, exceeds) in [
+            (longest.clone(), false),
+            (
+                format!("{longest}{}", "a".repeat(GRANT_REQUEST_LIMIT)),
+                true,
+            ),
+        ] {
+            let mut stream = UnixStream::connect(&socket.0).expect("connect");
+            let _ = stream.write_all(format!("{line}\n").as_bytes());
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            assert_eq!(
+                answer == "error control request exceeds 2048 bytes\n",
+                exceeds,
+                "{answer:?}"
+            );
+            assert!(answer.starts_with("error "), "{answer:?}");
+        }
     }
 
     #[test]
@@ -5177,6 +5522,233 @@ mod tests {
         );
         assert!(begin.elapsed() < Duration::from_secs(2));
         drop(queued);
+    }
+
+    /// A grant names the application kind, an application, the access
+    /// and the directory as the rest of the line; anything short of that,
+    /// another kind or a directory past the table's bound is refused here.
+    #[test]
+    fn grant_requests_parse_whole_and_refuse_other_kinds() {
+        let parsed = Request::parse("grant application firefox ro My Pictures/2026").unwrap();
+        let Request::Grant { name, access, path } = parsed else {
+            panic!("{parsed:?}");
+        };
+        assert_eq!(
+            (name.as_str(), access, path.as_str()),
+            ("firefox", GrantAccess::ReadOnly, "My Pictures/2026")
+        );
+        assert_eq!(
+            Request::parse("revoke application firefox My Pictures")
+                .unwrap()
+                .grant_request(),
+            Some(GrantRequest {
+                verb: GrantVerb::Revoke,
+                name: "firefox".into(),
+                path: "My Pictures".into(),
+            })
+        );
+        assert_eq!(
+            Request::parse("grants application web")
+                .unwrap()
+                .grant_request(),
+            Some(GrantRequest {
+                verb: GrantVerb::List,
+                name: "web".into(),
+                path: String::new(),
+            })
+        );
+        let longest = "a".repeat(GRANT_PATH_BYTES);
+        assert!(Request::parse(&format!("grant application firefox rw {longest}")).is_ok());
+        for (line, expected) in [
+            ("grant", "'grant' needs an account kind"),
+            ("revoke", "'revoke' needs an account kind"),
+            ("grant application", "'grant' needs an application name"),
+            ("grant application firefox", "'grant' needs ro or rw"),
+            (
+                "grant application firefox rx Pictures",
+                "'grant' needs ro or rw",
+            ),
+            ("grant application firefox ro", "a grant needs a directory"),
+            ("grant application firefox ro ", "a grant needs a directory"),
+            ("revoke application firefox", "a grant needs a directory"),
+            ("grant application Firefox ro Pictures", "'Firefox' is not"),
+            (
+                "grant sandbox default ro src",
+                "sandbox accounts take no grants",
+            ),
+            (
+                "revoke workspace agent-1 src",
+                "workspace accounts take no grants",
+            ),
+            ("grants sandbox default", "sandbox accounts take no grants"),
+            ("grants service firefox", "'service' is not an account kind"),
+            ("grants", "'grants' needs an account kind"),
+            (
+                "grants application firefox extra",
+                "takes no argument 'extra'",
+            ),
+        ] {
+            let error = Request::parse(line).unwrap_err();
+            assert!(error.contains(expected), "{line:?}: {error}");
+        }
+        assert!(
+            Request::parse(&format!("grant application firefox rw {longest}a"))
+                .unwrap_err()
+                .contains("1024")
+        );
+        // A grant line fits its bound, and only a grant's line takes it.
+        let line = format!("grant application {} rw {longest}", "a".repeat(64));
+        assert!(line.len() <= GRANT_REQUEST_LIMIT);
+        assert_eq!(request_limit(line.as_bytes()), GRANT_REQUEST_LIMIT);
+        assert_eq!(request_limit(b"revoke application"), GRANT_REQUEST_LIMIT);
+        for other in [&b"grants application"[..], b"layout", b"grantx", b"x"] {
+            assert_eq!(request_limit(other), REQUEST_LIMIT);
+        }
+        // A control character in the directory is refused, not cut: a
+        // newline would otherwise end the line at `Pictures`.
+        for line in [
+            "grant application firefox ro Pictures\nx",
+            "grant application firefox ro Pic\ttures",
+            "revoke application firefox Pictures\u{85}",
+            "grant application firefox ro Pictures\r",
+        ] {
+            let error = Request::parse(line).unwrap_err();
+            assert!(error.contains("control character"), "{line:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn grant_answers_carry_rows_one_word_or_the_writers_reason() {
+        assert_eq!(grant_answer(GrantAnswer::Listed(Vec::new())), "ok\n");
+        assert_eq!(
+            grant_answer(GrantAnswer::Listed(vec![
+                (GrantAccess::ReadOnly, "My Pictures".into()),
+                (GrantAccess::ReadWrite, "Downloads".into()),
+            ])),
+            "ok\nro\tMy Pictures\nrw\tDownloads\n"
+        );
+        for (outcome, word) in [
+            (GrantOutcome::Added, "added"),
+            (GrantOutcome::Changed, "changed"),
+            (GrantOutcome::Unchanged, "unchanged"),
+            (GrantOutcome::Revoked, "revoked"),
+        ] {
+            assert_eq!(
+                grant_answer(GrantAnswer::Done(outcome)),
+                format!("ok\n{word}\n")
+            );
+        }
+        assert_eq!(
+            grant_answer(GrantAnswer::Refused("~/Pictures does not exist".into())),
+            "error ~/Pictures does not exist\n"
+        );
+        for answer in [
+            GrantAnswer::Unstarted,
+            GrantAnswer::Moved,
+            GrantAnswer::Unfinished,
+        ] {
+            assert!(grant_answer(answer).starts_with("unavailable "));
+        }
+        assert!(grant_answer(GrantAnswer::Live).starts_with("error "));
+        // td-ctl reads exactly those shapes back.
+        assert_eq!(
+            decode_grant_answer(b"ok\nro\tMy Pictures\nrw\tDownloads\n", GrantVerb::List).unwrap(),
+            "ro\tMy Pictures\nrw\tDownloads\n"
+        );
+        assert_eq!(decode_grant_answer(b"ok\n", GrantVerb::List).unwrap(), "");
+        // An inert row root wrote can hold what reorders or hides text;
+        // td-ctl shows each such character as `?`, as td-software does.
+        assert_eq!(
+            decode_grant_answer(
+                "ok\nro\tMusic/\u{202E}x\u{2028}\u{200B}\u{2066}\u{FEFF}\u{061C}\u{85}é\nrw\tDownloads\n"
+                    .as_bytes(),
+                GrantVerb::List
+            )
+            .unwrap(),
+            "ro\tMusic/?x??????é\nrw\tDownloads\n"
+        );
+        assert_eq!(
+            decode_grant_answer(b"ok\nadded\n", GrantVerb::Grant(GrantAccess::ReadOnly)).unwrap(),
+            "added\n"
+        );
+        assert_eq!(
+            decode_grant_answer(b"ok\nrevoked\n", GrantVerb::Revoke).unwrap(),
+            "revoked\n"
+        );
+        assert!(matches!(
+            decode_grant_answer(b"error ~/x does not exist\n", GrantVerb::Revoke),
+            Err(ControlFailure::Refused(reason)) if reason == "~/x does not exist"
+        ));
+        for (answer, verb) in [
+            (&b"ok\nrx\tPictures\n"[..], GrantVerb::List),
+            (b"ok\nro\t\n", GrantVerb::List),
+            (b"ok\nro\tPictures", GrantVerb::List),
+            (b"ok\nrevoked\n", GrantVerb::Grant(GrantAccess::ReadWrite)),
+            (b"ok\nadded\n", GrantVerb::Revoke),
+            (b"ok\n", GrantVerb::Revoke),
+            (b"ok", GrantVerb::List),
+        ] {
+            assert!(
+                matches!(
+                    decode_grant_answer(answer, verb),
+                    Err(ControlFailure::Unreachable(_))
+                ),
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// A grant request reaches root through the authority worker's control
+    /// queue, beside the runtime; with no authority it is refused as every
+    /// application request is.
+    #[test]
+    fn a_grant_request_reaches_root_through_the_authority_worker() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        let (launcher, queued) = crate::authority::Queued::launcher();
+        let worker = thread::spawn(move || {
+            let (request, reply) = queued.grants(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                request,
+                GrantRequest {
+                    verb: GrantVerb::Grant(GrantAccess::ReadOnly),
+                    name: "firefox".into(),
+                    path: "My Pictures".into(),
+                }
+            );
+            reply.send(GrantAnswer::Done(GrantOutcome::Added)).unwrap();
+            queued
+        });
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let request = Request::parse("grant application firefox ro My Pictures").unwrap();
+        assert_eq!(
+            application_answer(&runtime, &launcher, request, deadline),
+            "ok\nadded\n"
+        );
+        let queued = worker.join().unwrap();
+        let begin = Instant::now();
+        let request = Request::parse("grants application firefox").unwrap();
+        let soon = Instant::now() + Duration::from_millis(700);
+        assert_eq!(
+            application_answer(&runtime, &launcher, request, soon),
+            "unavailable the program authority did not answer in time\n"
+        );
+        assert!(begin.elapsed() < Duration::from_secs(2));
+        drop(queued);
+        let mut runtime = runtime.lock().unwrap();
+        for line in [
+            "grants application firefox",
+            "grant application firefox rw Pictures",
+            "revoke application firefox Pictures",
+        ] {
+            let request = Request::parse(line).unwrap();
+            assert!(matches!(
+                apply(&mut runtime, request),
+                Ok(Answer::ApplicationsDisabled)
+            ));
+        }
     }
 
     #[test]

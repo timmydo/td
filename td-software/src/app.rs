@@ -3,8 +3,9 @@
 //! the status row. Pure: it hands `Job`s out through `take_jobs` and takes
 //! the worker's `Reply`s, so a test drives it whole.
 
-use td_ui::chrome::{Buttons, Item, List, Status as StatusRow, ROW};
+use td_ui::chrome::{Buttons, Item, List, Status as StatusRow, TextEntry, ROW};
 use td_ui::confirmations::{self, Choice};
+use td_ui::entry_model::{Action as Edit, EntryModel};
 use td_ui::keys::{self, Section};
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Surface, INK, LINE_NUMBER, PAPER,
@@ -13,9 +14,11 @@ use td_ui::raster::{
 use td_ui::window::{Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
+use crate::grants::{self, Access, Grant};
 use crate::registry::Application;
 use crate::snapshot::{
-    CacheStatus, GenerationStatus, Operation, Part, Progress, Record, Snapshot, Stage, Status,
+    CacheStatus, Failure, GenerationStatus, Operation, Part, Progress, Record, Snapshot, Stage,
+    Status,
 };
 use crate::worker::{Job, Reply};
 
@@ -65,6 +68,111 @@ impl Action {
     }
 }
 
+/// What the folders panel offers (DESIGN.md §4.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolderAction {
+    ShareReadOnly,
+    ShareWritable,
+    StopSharing,
+    Back,
+    /// While a folder is typed: share it.
+    Share,
+    Cancel,
+}
+
+impl FolderAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShareReadOnly => "Share read-only",
+            Self::ShareWritable => "Share writable",
+            Self::StopSharing => "Stop sharing",
+            Self::Back => "Back",
+            Self::Share => "Share",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+/// A button of the window's strip: the application's, or the folders
+/// panel's while it is open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Button {
+    Application(Action),
+    Folder(FolderAction),
+}
+
+impl Button {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Application(action) => action.label(),
+            Self::Folder(action) => action.label(),
+        }
+    }
+}
+
+/// The folders panel for one Flathub application: the folders of the
+/// human's its account is granted, as root's table holds them, one of
+/// them selected, and the folder being typed to share.
+struct Folders {
+    name: String,
+    display: String,
+    listed: Option<Result<Vec<Grant>, String>>,
+    asking: bool,
+    selected: usize,
+    typing: Option<(Access, EntryModel)>,
+    /// The grant or revoke asked for, its access (none for a revoke) and
+    /// its directory, until root answers.
+    changing: Option<(Option<Access>, String)>,
+}
+
+impl Folders {
+    fn grants(&self) -> &[Grant] {
+        match &self.listed {
+            Some(Ok(grants)) => grants,
+            _ => &[],
+        }
+    }
+
+    /// Whether a request is out: no other is asked meanwhile.
+    fn busy(&self) -> bool {
+        self.asking || self.changing.is_some()
+    }
+
+    fn actions(&self) -> Vec<(FolderAction, bool)> {
+        let busy = self.busy();
+        match &self.typing {
+            Some((_, model)) => vec![
+                (FolderAction::Share, !busy && !model.text().is_empty()),
+                (FolderAction::Cancel, true),
+            ],
+            None => vec![
+                (FolderAction::ShareReadOnly, !busy),
+                (FolderAction::ShareWritable, !busy),
+                (
+                    FolderAction::StopSharing,
+                    !busy && self.grants().get(self.selected).is_some(),
+                ),
+                (FolderAction::Back, true),
+            ],
+        }
+    }
+}
+
+/// The panel's keys.
+pub const FOLDER_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "select a folder"),
+    ("r", "share a folder read-only"),
+    ("w", "share a folder writable"),
+    ("x", "stop sharing the selected folder"),
+    ("F5", "read the folders again"),
+    ("Tab", "while typing: read-only or writable"),
+    ("Return", "while typing: share it"),
+    ("Escape", "cancel the typing, or go back"),
+];
+const FOLDER_KEYS_TITLE: &str = "Folders";
+/// The most bytes a typed folder takes: the grant table's bound.
+const FOLDER_BYTES: usize = grants::MAX_PATH_BYTES;
+
 /// What a question confirms, for the entry it was asked about.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Act {
@@ -84,6 +192,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("c", "check for an update now"),
     ("x", "remove, keeping its data"),
     ("D", "delete a removed application's data"),
+    (
+        "f",
+        "the folders of yours it can reach: share or stop sharing one",
+    ),
     ("F5", "read every status again"),
     ("C-q", "quit"),
 ];
@@ -255,9 +367,11 @@ pub struct App {
     /// Bumped whenever the selected application's standing changes, so a
     /// question asked about an older state closes unanswered.
     revision: u64,
-    /// A press armed this action's button; its release on it activates
-    /// it, if the action is still offered there.
-    armed: Option<Action>,
+    /// A press armed this button; its release on it activates it, if it
+    /// is still offered there.
+    armed: Option<Button>,
+    /// The folders panel, while it is open.
+    folders: Option<Folders>,
     /// A launch request is out.
     launching: bool,
     jobs: Vec<Job>,
@@ -290,6 +404,8 @@ struct Layout {
     list: Option<List>,
     details: Rect,
     buttons_y: i64,
+    /// The typed folder's field, while one is typed.
+    entry: Option<TextEntry>,
 }
 
 impl App {
@@ -325,6 +441,7 @@ impl App {
             dialog: None,
             revision: 0,
             armed: None,
+            folders: None,
             launching: false,
             jobs: Vec::new(),
             message,
@@ -376,12 +493,46 @@ impl App {
             .map(Entry::actions)
             .unwrap_or_default()
     }
+    /// Whether the folders panel is open, and for which application.
+    pub fn folders_of(&self) -> Option<&str> {
+        Some(self.folders.as_ref()?.name.as_str())
+    }
+    /// The folders panel's buttons and whether each is enabled.
+    pub fn folder_actions(&self) -> Vec<(FolderAction, bool)> {
+        self.folders
+            .as_ref()
+            .map(Folders::actions)
+            .unwrap_or_default()
+    }
+    /// The folders the panel lists, as root's table holds them.
+    pub fn folder_grants(&self) -> Vec<Grant> {
+        self.folders
+            .as_ref()
+            .map(|folders| folders.grants().to_vec())
+            .unwrap_or_default()
+    }
+    /// The buttons the strip shows: the panel's while it is open.
+    fn buttons(&self) -> Vec<(Button, bool)> {
+        match &self.folders {
+            Some(folders) => folders
+                .actions()
+                .into_iter()
+                .map(|(action, enabled)| (Button::Folder(action), enabled))
+                .collect(),
+            None => self
+                .actions()
+                .into_iter()
+                .map(|(action, enabled)| (Button::Application(action), enabled))
+                .collect(),
+        }
+    }
     /// How long the loop may wait: briefly while anything is busy.
     pub fn wait_ms(&self) -> u64 {
         if self
             .entries
             .iter()
             .any(|entry| entry.busy() || entry.asking)
+            || self.folders.as_ref().is_some_and(Folders::busy)
         {
             100
         } else {
@@ -392,10 +543,13 @@ impl App {
     pub fn key_list(&self) -> Vec<Section> {
         let question = Section::new("Question", confirmations::KEYS);
         let window = Section::new(KEYS_TITLE, KEYS);
+        let folders = Section::new(FOLDER_KEYS_TITLE, FOLDER_KEYS);
         if self.dialog_open() {
-            vec![question, window]
+            vec![question, window, folders]
+        } else if self.folders.is_some() {
+            vec![folders, window, question]
         } else {
-            vec![window, question]
+            vec![window, question, folders]
         }
     }
 
@@ -479,6 +633,8 @@ impl App {
                     Err(error) => self.say(format!("Cannot launch {display}: {error}")),
                 }
             }
+            Reply::Grants(name, result) => self.listed(&name, result),
+            Reply::Changed(name, result) => self.changed(&name, result),
         }
         if self.entries.get(self.selected).map(Entry::key) != before {
             self.revision += 1;
@@ -587,6 +743,259 @@ impl App {
                 )),
             }
         }
+    }
+
+    // ---- folders
+
+    /// Opens the folders panel for the selected application, which must
+    /// be one from Flathub (DESIGN.md §4.3): root grants an image-shipped
+    /// one with an account of its own too, through `td-ctl`, and one that
+    /// runs as the human nothing.
+    fn open_folders(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        let display = entry.application.display.clone();
+        if entry.application.flathub.is_none() {
+            return self.say(format!(
+                "{display} ships with the system: this panel is for Flathub applications; \
+                 `td-ctl grant application {}` grants one that runs as an account of its own",
+                entry.application.name
+            ));
+        }
+        let name = entry.application.name.clone();
+        self.jobs.push(Job::Grants(name.clone()));
+        self.folders = Some(Folders {
+            name,
+            display: display.clone(),
+            listed: None,
+            asking: true,
+            selected: 0,
+            typing: None,
+            changing: None,
+        });
+        self.armed = None;
+        self.say(format!("Reading the folders of yours {display} can reach"));
+    }
+
+    fn list_folders(&mut self) {
+        let Some(folders) = &mut self.folders else {
+            return;
+        };
+        if !folders.asking {
+            folders.asking = true;
+            self.jobs.push(Job::Grants(folders.name.clone()));
+        }
+    }
+
+    fn listed(&mut self, name: &str, result: Result<Vec<Grant>, String>) {
+        let Some(folders) = self.folders.as_mut().filter(|f| f.name == name) else {
+            return;
+        };
+        folders.asking = false;
+        if let Err(error) = &result {
+            let error = format!("Cannot read {}'s folders: {error}", folders.display);
+            self.say(error);
+        }
+        let Some(folders) = &mut self.folders else {
+            return;
+        };
+        // A failed read keeps the last listing: what root last said.
+        match result {
+            Ok(grants) => {
+                folders.selected = folders.selected.min(grants.len().saturating_sub(1));
+                folders.listed = Some(Ok(grants));
+            }
+            Err(error) if folders.listed.is_none() => folders.listed = Some(Err(error)),
+            Err(_) => {}
+        }
+    }
+
+    fn changed(&mut self, name: &str, result: Result<&'static str, Failure>) {
+        let Some(folders) = self.folders.as_mut().filter(|f| f.name == name) else {
+            return;
+        };
+        let display = folders.display.clone();
+        let Some((access, path)) = folders.changing.take() else {
+            return;
+        };
+        let shown = grants::shown(&path);
+        let message = match (result, access) {
+            (Ok("unchanged"), Some(access)) => {
+                format!("{display} already reaches {shown} {}", access.label())
+            }
+            (Ok(_), Some(access)) => format!(
+                "{display} reaches {shown} {} from its next launch",
+                access.label()
+            ),
+            (Ok(_), None) => format!("{display} no longer reaches {shown} from its next launch"),
+            (Err(failure), _) if failure.definite => {
+                format!("Nothing changed: {}", failure.reason)
+            }
+            (Err(failure), _) => format!(
+                "The change may not have been made: {}; the list shows what root holds",
+                failure.reason
+            ),
+        };
+        self.say(message);
+        // What root now holds, whatever the answer said.
+        self.list_folders();
+    }
+
+    fn folder_act(&mut self, action: FolderAction) {
+        let Some(folders) = &mut self.folders else {
+            return;
+        };
+        if !folders.actions().contains(&(action, true)) {
+            return;
+        }
+        match action {
+            FolderAction::ShareReadOnly | FolderAction::ShareWritable => {
+                let access = if action == FolderAction::ShareReadOnly {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                };
+                match EntryModel::new(FOLDER_BYTES) {
+                    Ok(model) => {
+                        folders.typing = Some((access, model));
+                        self.say(format!(
+                            "Type a folder below your home to share {}; Tab switches, Return shares",
+                            access.label()
+                        ));
+                    }
+                    Err(refusal) => self.say(format!("Cannot type a folder: {refusal}")),
+                }
+            }
+            FolderAction::StopSharing => {
+                let Some(grant) = folders.grants().get(folders.selected).cloned() else {
+                    return;
+                };
+                folders.changing = Some((None, grant.path.clone()));
+                self.jobs
+                    .push(Job::Revoke(folders.name.clone(), grant.path.clone()));
+                let message = format!("Asking root to stop sharing {}", grant.shown());
+                self.say(message);
+            }
+            FolderAction::Back => {
+                self.folders = None;
+                self.say("");
+            }
+            FolderAction::Share => {
+                let Some((access, model)) = folders.typing.take() else {
+                    return;
+                };
+                let typed = model.text();
+                let path = typed.strip_prefix("~/").unwrap_or(typed).to_string();
+                self.jobs
+                    .push(Job::Grant(folders.name.clone(), access, path.clone()));
+                let message = format!(
+                    "Asking root to share {} {}",
+                    grants::shown(&path),
+                    access.label()
+                );
+                folders.changing = Some((Some(access), path));
+                self.say(message);
+            }
+            FolderAction::Cancel => {
+                folders.typing = None;
+                self.say("Nothing changed");
+            }
+        }
+        self.redraw = true;
+    }
+
+    /// A key while the panel is open: the typed folder's, or the panel's.
+    fn folder_key(&mut self, chord: &str, repeat: bool) {
+        let entry = self.layout().entry;
+        let Some(folders) = &mut self.folders else {
+            return;
+        };
+        if let Some((access, model)) = &mut folders.typing {
+            match chord {
+                "Return" if !repeat => self.folder_act(FolderAction::Share),
+                "Escape" if !repeat => self.folder_act(FolderAction::Cancel),
+                "Tab" | "S-Tab" if !repeat => {
+                    *access = match access {
+                        Access::ReadOnly => Access::ReadWrite,
+                        Access::ReadWrite => Access::ReadOnly,
+                    };
+                    self.redraw = true;
+                }
+                _ => {
+                    let Some(edit) = Edit::from_chord(chord) else {
+                        return;
+                    };
+                    match model.act(edit) {
+                        Ok(_) => {
+                            if let Some(entry) = entry {
+                                model.reveal(entry);
+                            }
+                            self.redraw = true;
+                        }
+                        Err(refusal) => self.say(format!("Not typed: {refusal}")),
+                    }
+                }
+            }
+            return;
+        }
+        let count = folders.grants().len();
+        match chord {
+            "Up" => folders.selected = folders.selected.saturating_sub(1),
+            "Down" => {
+                folders.selected = folders
+                    .selected
+                    .saturating_add(1)
+                    .min(count.saturating_sub(1));
+            }
+            _ if repeat => return,
+            "r" => return self.folder_act(FolderAction::ShareReadOnly),
+            "w" => return self.folder_act(FolderAction::ShareWritable),
+            "x" => return self.folder_act(FolderAction::StopSharing),
+            "Escape" => return self.folder_act(FolderAction::Back),
+            "F5" => return self.list_folders(),
+            _ => return,
+        }
+        self.redraw = true;
+    }
+
+    /// The panel's lines in the details' place.
+    fn folder_details(folders: &Folders) -> Vec<(String, u32)> {
+        let mut lines = vec![(
+            format!("Folders of yours {} can reach", folders.display),
+            INK,
+        )];
+        lines.push((
+            "Its own account reaches only these, from its next launch; a running window keeps what it had."
+                .into(),
+            LINE_NUMBER,
+        ));
+        match &folders.listed {
+            None => lines.push(("Reading them".into(), LINE_NUMBER)),
+            Some(Err(error)) => lines.push((format!("They cannot be read: {error}"), WARNING)),
+            Some(Ok(grants)) if grants.is_empty() => {
+                lines.push(("None: it reaches no folder of yours.".into(), INK));
+            }
+            Some(Ok(grants)) => {
+                for (index, grant) in grants.iter().enumerate() {
+                    let mark = if index == folders.selected { ">" } else { " " };
+                    lines.push((
+                        format!("{mark} {} ({})", grant.shown(), grant.access.label()),
+                        INK,
+                    ));
+                }
+            }
+        }
+        if let Some((access, _)) = &folders.typing {
+            lines.push((
+                format!(
+                    "Share {}: a folder below your home, which must be yours and exist.",
+                    access.label()
+                ),
+                INK,
+            ));
+        }
+        lines
     }
 
     // ---- actions
@@ -737,6 +1146,8 @@ impl App {
             self.revision += 1;
             self.armed = None;
             self.redraw = true;
+            // The panel is the old selection's.
+            self.folders = None;
         }
         if let Some(list) = self.layout().list {
             self.first = list.reveal(self.entries.len(), self.selected, self.first);
@@ -816,6 +1227,9 @@ impl App {
             };
             return self.dialog_event(event);
         }
+        if self.folders.is_some() {
+            return self.folder_key(chord, repeat);
+        }
         match chord {
             "Up" => self.select(self.selected.saturating_sub(1)),
             "Down" => self.select(self.selected.saturating_add(1)),
@@ -828,6 +1242,7 @@ impl App {
             "c" => self.act(Action::Update),
             "x" => self.act(Action::Remove),
             "D" => self.act(Action::DeleteData),
+            "f" => self.open_folders(),
             "F5" => self.refresh(),
             _ => {}
         }
@@ -845,13 +1260,13 @@ impl App {
         // takes its own presses first.
         let status = StatusRow::new(self.surface).rect().contains(x, y);
         let layout = self.layout();
-        let actions = self.actions();
-        let labels: Vec<&str> = actions.iter().map(|(action, _)| action.label()).collect();
+        let actions = self.buttons();
+        let labels: Vec<&str> = actions.iter().map(|(button, _)| button.label()).collect();
         let hit = (!status)
             .then(|| Buttons::new(self.surface, layout.buttons_y, &labels).hit(x, y))
             .flatten()
             .and_then(|index| actions.get(index))
-            .map(|(action, _)| *action);
+            .map(|(button, _)| *button);
         match phase {
             PointerPhase::Press => {
                 if self.armed.take().is_some() {
@@ -878,8 +1293,10 @@ impl App {
                 if armed.is_some() {
                     self.redraw = true;
                 }
-                if let Some(action) = armed.filter(|action| hit == Some(*action)) {
-                    self.act(action);
+                match armed.filter(|button| hit == Some(*button)) {
+                    Some(Button::Application(action)) => self.act(action),
+                    Some(Button::Folder(action)) => self.folder_act(action),
+                    None => {}
                 }
             }
         }
@@ -894,12 +1311,31 @@ impl App {
         let row = (ROW * s) as i64;
         let status = StatusRow::new(surface).rect();
         // As many rows as the strip wraps to on this width.
-        let actions = self.actions();
-        let labels: Vec<&str> = actions.iter().map(|(action, _)| action.label()).collect();
+        let actions = self.buttons();
+        let labels: Vec<&str> = actions.iter().map(|(button, _)| button.label()).collect();
         let strip = Buttons::new(surface, 0, &labels).rows() as i64;
         let buttons_y = (status.y - strip * row - margin / 2).max(0);
-        let rows = self.entries.len().clamp(1, LIST_ROWS) as i64;
         let width = surface.width as i64 - 2 * margin;
+        // The typed folder's field, one row above the buttons.
+        let typing = self
+            .folders
+            .as_ref()
+            .is_some_and(|folders| folders.typing.is_some());
+        let entry = typing
+            .then(|| {
+                TextEntry::new(
+                    surface,
+                    Rect {
+                        x: margin,
+                        y: buttons_y - row - margin / 2,
+                        width: u32::try_from(width).ok()?,
+                        height: u32::try_from(row).ok()?,
+                    },
+                )
+            })
+            .flatten();
+        let bottom = entry.map_or(buttons_y, |entry| entry.rect().y - margin / 2);
+        let rows = self.entries.len().clamp(1, LIST_ROWS) as i64;
         let list = (width > 0)
             .then(|| Rect {
                 x: margin,
@@ -918,15 +1354,19 @@ impl App {
                 x: margin,
                 y: top,
                 width: width.max(0) as u32,
-                height: (buttons_y - top).max(0) as u32,
+                height: (bottom - top).max(0) as u32,
             },
             buttons_y,
+            entry,
         }
     }
 
     /// The selected application's details, line by line, with each
     /// line's ink.
     pub fn details(&self) -> Vec<(String, u32)> {
+        if let Some(folders) = &self.folders {
+            return Self::folder_details(folders);
+        }
         let Some(entry) = self.entries.get(self.selected) else {
             return Vec::new();
         };
@@ -1288,13 +1728,24 @@ impl Composition for Frame<'_> {
                 y += step;
             }
         }
-        let actions = app.actions();
-        let labels: Vec<&str> = actions.iter().map(|(action, _)| action.label()).collect();
+        let typed = app
+            .folders
+            .as_ref()
+            .and_then(|folders| folders.typing.as_ref());
+        if let (Some(entry), Some((_, model))) = (layout.entry, typed) {
+            entry.emit(
+                model.field("folder below your home", true, true),
+                damage,
+                sink,
+            );
+        }
+        let actions = app.buttons();
+        let labels: Vec<&str> = actions.iter().map(|(button, _)| button.label()).collect();
         if !labels.is_empty() {
             Buttons::new(surface, layout.buttons_y, &labels).emit(
                 actions
                     .iter()
-                    .map(|(action, enabled)| (app.armed == Some(*action), *enabled)),
+                    .map(|(button, enabled)| (app.armed == Some(*button), *enabled)),
                 damage,
                 sink,
             );

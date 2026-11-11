@@ -937,8 +937,10 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// fresh volume's first boot spends it; a reused one's install finds its
 /// generation current and returns. `software-evidence`, td-software's
 /// request path (td-software/DESIGN.md §6.4), runs between that install and
-/// Firefox's start, bounded at 120 seconds.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 3814;
+/// Firefox's start, bounded at 120 seconds, and `grant-request`, the grant
+/// request path (td-authd/DESIGN.md, "Grant requests"), after it, bounded
+/// at 60.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 3874;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// Printed after the running system installs and activates a verified candidate
@@ -1378,6 +1380,14 @@ pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
 // installs Firefox first as root (`firefox-fetch`), so this install is the
 // owner's check of an installed application against the host's feed.
 pub const TD_SOFTWARE_INSTALL_MARKER: &str = "TD-SOFTWARE-INSTALL-OK";
+// Printed by the `grant-evidence` unit under the autotest token once the
+// human's control-socket `grant` of a home directory to Firefox, made by
+// `grant-request` before its launch, reached root's grant table through
+// private request `2c` and its one writer, the launch published that
+// directory as a read-only idmapped view its account's manifest lists,
+// and the human's `revoke` then took the row out of a listing that kept
+// the seeded `Downloads` (td-authd/DESIGN.md, "Grant requests").
+pub const TD_GRANT_REQUEST_MARKER: &str = "TD-GRANT-REQUEST-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows
 // it active, the applications' workspace occupied, and one window on the

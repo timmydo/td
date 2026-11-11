@@ -45,12 +45,7 @@ pub(crate) fn read_table() -> Result<Table, String> {
         .open(pinned(&state, grants::FILE_NAME))
         .map_err(|e| format!("open the workload grant table: {e}"))?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file()
-        || (metadata.uid(), metadata.gid()) != (0, 0)
-        || metadata.mode() & 0o7777 != grants::MODE
-        || metadata.nlink() != 1
-        || metadata.len() > grants::MAX_BYTES as u64
-    {
+    if !published_table(&metadata, (0, 0)) {
         return Err(format!(
             "{} must be one bounded, single-link, root-owned regular file of mode 0600",
             grants::FILE_NAME
@@ -61,6 +56,19 @@ pub(crate) fn read_table() -> Result<Table, String> {
         .read_to_string(&mut text)
         .map_err(|e| format!("read the workload grant table: {e}"))?;
     Table::parse(&text)
+}
+
+/// The grant table's file as root admits it: a root-owned regular file of
+/// exact mode 0600 within the bound, of one link or, opened just before
+/// td-firstboot renamed its successor over it, none: an unlinked inode of
+/// that shape was the whole published table, read without the writer's
+/// lock as every launch reads it.
+fn published_table(metadata: &fs::Metadata, owner: (u32, u32)) -> bool {
+    metadata.is_file()
+        && (metadata.uid(), metadata.gid()) == owner
+        && metadata.mode() & 0o7777 == grants::MODE
+        && metadata.nlink() <= 1
+        && metadata.len() <= grants::MAX_BYTES as u64
 }
 
 fn state_directory() -> Result<File, String> {
@@ -427,6 +435,7 @@ pub(crate) fn publish(name: &str, uid: u32) -> Result<(), String> {
     let home = portal_files::child(&homes, account.name(), HUMAN, true)?;
     let mountinfo = mount_table()?;
     let grants = grants_for(&table, name, &mountinfo, &account.persistent_home())?;
+    let refused = table.refused(Kind::Application, name);
     let lib = portal_files::child(&var, "lib", 0, true)?;
     let td = portal_files::child(&lib, "td", 0, true)?;
     let tree = portal_files::ensure_root_child(&td, grants::VIEW_ROOT_NAME)?;
@@ -439,6 +448,10 @@ pub(crate) fn publish(name: &str, uid: u32) -> Result<(), String> {
         home: &home,
         namespace: None,
     };
+    // A row this deployment's validator refuses is held, never published.
+    for (directory, why) in &refused {
+        live.warn(&format!("row {:?} is not published: {why}", directory.path));
+    }
     reconcile(&mut live, uid, &grants)?;
     remove_retired_mountpoint(&td, uid, &mount_rows(&mountinfo)?, &mut live);
     if name == portal_files::FILE_CHOOSER_APPLICATION {

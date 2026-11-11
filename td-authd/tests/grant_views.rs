@@ -132,10 +132,13 @@ fn a_grants_access_selects_its_fixed_attributes() {
 /// home's offset and the row's path. The literal is td-jail's own test's.
 #[test]
 fn the_derivation_keeps_the_homes_offset_below_its_mount() {
+    // `.ssh/keys` stands for a row a later validator refuses: held, never
+    // published, and no reason to leave the account's other rows out.
     let table = Table::parse(
-        "td-grants-v1\napplication\tfirefox\tdirectory\tro\tMusic/new\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tmail\tdirectory\trw\tMail\n",
+        "td-grants-v1\napplication\tfirefox\tdirectory\tro\t.ssh/keys\napplication\tfirefox\tdirectory\tro\tMusic/new\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tmail\tdirectory\trw\tMail\n",
     )
     .unwrap();
+    assert_eq!(table.refused(Kind::Application, "firefox").len(), 1);
     let grants = grants_for(&table, "firefox", STOCK, Path::new(HOME)).unwrap();
     assert_eq!(
         grants
@@ -644,5 +647,36 @@ fn the_manifest_is_written_private_to_the_account() {
     symlink(&elsewhere, temp.path().join(STAGED_MANIFEST)).unwrap();
     write_manifest(&directory, identity, &manifest).unwrap();
     assert_eq!(fs::read(&elsewhere).unwrap(), b"kept");
+    temp.cleanup().unwrap();
+}
+
+/// A launch reading the table just as td-firstboot renames its successor
+/// over it holds the earlier table at no link, which it takes; two links,
+/// another mode or another owner it refuses.
+#[test]
+fn the_table_a_publish_renamed_over_is_still_the_published_table() {
+    let temp = TempDir::new("td-grant-table-read").unwrap();
+    let path = temp.path().join(grants::FILE_NAME);
+    let write = |at: &Path| {
+        fs::write(at, "td-grants-v1\n").unwrap();
+        fs::set_permissions(at, fs::Permissions::from_mode(grants::MODE)).unwrap();
+    };
+    write(&path);
+    let identity = owner(&path);
+    let opened = File::open(&path).unwrap();
+    assert!(published_table(&opened.metadata().unwrap(), identity));
+    let successor = temp.path().join("successor");
+    write(&successor);
+    fs::rename(&successor, &path).unwrap();
+    let unlinked = opened.metadata().unwrap();
+    assert_eq!(unlinked.nlink(), 0);
+    assert!(published_table(&unlinked, identity));
+    assert!(!published_table(&unlinked, (identity.0 + 1, identity.1)));
+    let second = temp.path().join("second");
+    fs::hard_link(&path, &second).unwrap();
+    assert!(!published_table(&fs::metadata(&path).unwrap(), identity));
+    fs::remove_file(&second).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(!published_table(&fs::metadata(&path).unwrap(), identity));
     temp.cleanup().unwrap();
 }

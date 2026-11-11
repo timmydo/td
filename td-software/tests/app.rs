@@ -917,3 +917,111 @@ fn a_selected_name_opens_the_window_at_its_entry() {
     assert!(app.select_name("firefox"));
     assert_eq!(app.selected(), Some("firefox"));
 }
+
+/// `f` opens the folders a Flathub application's account is granted:
+/// a typed folder is shared through root, a selected one stopped, each
+/// change read back from root's table; a built-in application has none.
+#[test]
+fn the_folders_panel_lists_shares_and_stops_sharing() {
+    use td_software::app::FolderAction;
+    use td_software::grants::{Access, Grant};
+    let mut app = opened();
+    key(&mut app, "f");
+    assert_eq!(app.folders_of(), Some("firefox"));
+    assert_eq!(app.take_jobs(), [Job::Grants("firefox".into())]);
+    // Nothing more is asked while the listing is out.
+    assert_eq!(
+        app.folder_actions(),
+        [
+            (FolderAction::ShareReadOnly, false),
+            (FolderAction::ShareWritable, false),
+            (FolderAction::StopSharing, false),
+            (FolderAction::Back, true),
+        ]
+    );
+    let pictures = Grant {
+        access: Access::ReadOnly,
+        path: "My Pictures".into(),
+    };
+    app.reply(Reply::Grants("firefox".into(), Ok(vec![pictures.clone()])));
+    assert_eq!(app.folder_grants(), std::slice::from_ref(&pictures));
+    let details: Vec<String> = app.details().into_iter().map(|(line, _)| line).collect();
+    assert!(details
+        .iter()
+        .any(|line| line == "> ~/My Pictures (read-only)"));
+    // Share one writable: typed, Tab switches the access twice, Return.
+    key(&mut app, "w");
+    for chord in ["~", "/", "D", "o", "c", "s", " ", "x", "Backspace"] {
+        key(&mut app, chord);
+    }
+    key(&mut app, "Tab");
+    key(&mut app, "Tab");
+    assert_eq!(
+        app.folder_actions(),
+        [(FolderAction::Share, true), (FolderAction::Cancel, true)]
+    );
+    key(&mut app, "Return");
+    assert_eq!(
+        app.take_jobs(),
+        [Job::Grant(
+            "firefox".into(),
+            Access::ReadWrite,
+            "Docs ".into()
+        )]
+    );
+    app.reply(Reply::Changed("firefox".into(), Ok("added")));
+    assert!(app
+        .message()
+        .contains("reaches ~/Docs  writable from its next launch"));
+    // The change is read back from root.
+    assert_eq!(app.take_jobs(), [Job::Grants("firefox".into())]);
+    app.reply(Reply::Grants(
+        "firefox".into(),
+        Ok(vec![
+            Grant {
+                access: Access::ReadWrite,
+                path: "Docs ".into(),
+            },
+            pictures,
+        ]),
+    ));
+    // Stop sharing the second.
+    key(&mut app, "Down");
+    key(&mut app, "x");
+    assert_eq!(
+        app.take_jobs(),
+        [Job::Revoke("firefox".into(), "My Pictures".into())]
+    );
+    app.reply(Reply::Changed(
+        "firefox".into(),
+        Err(Failure {
+            reason: "the grant table is busy with another change; ask again".into(),
+            definite: true,
+        }),
+    ));
+    assert!(app
+        .message()
+        .starts_with("Nothing changed: the grant table is busy"));
+    assert_eq!(app.take_jobs(), [Job::Grants("firefox".into())]);
+    // Escape cancels typing, then closes the panel; the window's keys
+    // are its own again.
+    app.reply(Reply::Grants("firefox".into(), Ok(Vec::new())));
+    key(&mut app, "r");
+    key(&mut app, "Escape");
+    assert_eq!(app.folders_of(), Some("firefox"));
+    key(&mut app, "Return");
+    assert!(
+        app.take_jobs().is_empty(),
+        "Return outside typing shares nothing"
+    );
+    key(&mut app, "Escape");
+    assert_eq!(app.folders_of(), None);
+    key(&mut app, "Down");
+    assert_eq!(app.selected(), Some("mail"));
+    key(&mut app, "f");
+    assert_eq!(app.folders_of(), None);
+    assert!(app.take_jobs().is_empty());
+    assert!(app
+        .message()
+        .contains("this panel is for Flathub applications"));
+}

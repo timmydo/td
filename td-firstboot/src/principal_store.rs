@@ -3,13 +3,14 @@
 use crate::app_policy::Declarations;
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::workload_accounts::{self, Kind, Ledger};
-use crate::workload_grants::{self, Table};
+use crate::workload_grants::{self, Access, Change, Table};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const PATH_ONLY: i32 = 0x200000;
 const LIMIT: u64 = MAX_BYTES as u64;
@@ -30,6 +31,27 @@ const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
 const GRANTS_STAGED: &str = ".grants.next";
 const GRANTS_MODE: u32 = workload_grants::MODE;
 const GRANTS_LIMIT: u64 = workload_grants::MAX_BYTES as u64;
+/// How long a grant request waits for the lock, which an install's
+/// allocation can hold for half a minute: td-authd's serving loop waits
+/// for this writer, so a busy table is answered rather than waited out.
+const GRANT_LOCK_WAIT: Duration = Duration::from_secs(1);
+const LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// What a grant request asks of the table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GrantVerb {
+    List,
+    Grant(Access, String),
+    Revoke(String),
+}
+
+/// What it found or did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GrantReply {
+    List(Vec<workload_grants::Directory>),
+    Granted(Change),
+    Revoked,
+}
 /// The application homes, `/var/lib/td/applications/UID`, and how many
 /// entries an allocation reads in any directory it lists: past every
 /// application uid.
@@ -256,12 +278,27 @@ impl Directory {
     }
 
     fn validate(&self, file: &File, name: &str, mode: u32, limit: u64) -> Result<(), String> {
+        self.validate_links(file, name, mode, limit, false)
+    }
+
+    /// `validate`, with `unlinked` admitting a file of no link as well: one
+    /// a reader without the lock opened just before a publish renamed its
+    /// successor over it, which was the whole published file.
+    fn validate_links(
+        &self,
+        file: &File,
+        name: &str,
+        mode: u32,
+        limit: u64,
+        unlinked: bool,
+    ) -> Result<(), String> {
         let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let links_ok = metadata.nlink() == 1 || (unlinked && metadata.nlink() == 0);
         if !metadata.is_file()
             || metadata.uid() != self.uid
             || metadata.gid() != self.gid
             || metadata.mode() & 0o7777 != mode
-            || metadata.nlink() != 1
+            || !links_ok
             || metadata.len() > limit
         {
             return Err(format!(
@@ -276,6 +313,18 @@ impl Directory {
     }
 
     fn read_as(&self, name: &str, mode: u32, limit: u64) -> Result<Option<String>, String> {
+        self.read_published(name, mode, limit, false)
+    }
+
+    /// `read_as`; `unlocked` for a reader without the principal lock, which
+    /// may find the file it opened renamed over (`validate_links`).
+    fn read_published(
+        &self,
+        name: &str,
+        mode: u32,
+        limit: u64,
+        unlocked: bool,
+    ) -> Result<Option<String>, String> {
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
@@ -285,7 +334,7 @@ impl Directory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("open {name}: {error}")),
         };
-        self.validate(&file, name, mode, limit)?;
+        self.validate_links(&file, name, mode, limit, unlocked)?;
         let mut text = String::new();
         file.take(limit + 1)
             .read_to_string(&mut text)
@@ -327,6 +376,12 @@ impl Directory {
     }
 
     fn lock(&self) -> Result<File, String> {
+        self.lock_until(None)
+    }
+
+    /// The lock, waited for until `deadline` when one is given and else
+    /// for as long as it takes.
+    fn lock_until(&self, deadline: Option<Instant>) -> Result<File, String> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -355,9 +410,101 @@ impl Directory {
             .open(path)
             .map_err(|error| format!("open pinned principal lock: {error}"))?;
         self.validate(&file, LOCK, PRIVATE_MODE, LIMIT)?;
-        file.lock()
-            .map_err(|error| format!("lock principal enrollment: {error}"))?;
-        Ok(file)
+        let Some(deadline) = deadline else {
+            file.lock()
+                .map_err(|error| format!("lock principal enrollment: {error}"))?;
+            return Ok(file);
+        };
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err("the grant table is busy with another change; ask again".into())
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(format!("lock principal enrollment: {error}"))
+                }
+            }
+        }
+    }
+
+    /// A grant request (td-authd/DESIGN.md, "Grant requests") on the
+    /// `kind` account `name`'s directory rows: listed from the table as
+    /// published, or changed under the lock, waited for until `wait` has
+    /// passed, and published as boot publishes the seed. Only application
+    /// accounts take grants yet. A grant first passes `admit`, the
+    /// deployment's declaration and the source's early check; a listing
+    /// and a revocation name any account, so a row an image no longer
+    /// declares can still be seen and removed. An absent table refuses:
+    /// boot seeds it.
+    fn grants(
+        &self,
+        kind: Kind,
+        name: &str,
+        verb: &GrantVerb,
+        admit: impl FnOnce() -> Result<(), String>,
+        wait: Duration,
+    ) -> Result<GrantReply, String> {
+        if kind != Kind::Application {
+            return Err(format!(
+                "{} accounts take no grants until their launches go through root",
+                kind.as_str()
+            ));
+        }
+        if !workload_accounts::valid_name(name) {
+            return Err("invalid grant account name".into());
+        }
+        let read = |directory: &Self, unlocked: bool| -> Result<Table, String> {
+            let text = directory
+                .read_published(
+                    workload_grants::FILE_NAME,
+                    GRANTS_MODE,
+                    GRANTS_LIMIT,
+                    unlocked,
+                )?
+                .ok_or("the workload grant table is absent")?;
+            Table::parse(&text)
+        };
+        // The writer checks its own operands: a grant names a path this
+        // deployment publishes; a revoke any row the table can hold, so a
+        // row a later validator refuses can still be taken back.
+        match verb {
+            GrantVerb::List => {
+                // A renamed table is read whole; a listing takes no lock,
+                // so the table it opened may be one a publish just
+                // replaced.
+                return Ok(GrantReply::List(read(self, true)?.held(kind, name)));
+            }
+            GrantVerb::Grant(_, path) => {
+                workload_grants::validate_path(path.as_bytes())?;
+                admit()?;
+            }
+            GrantVerb::Revoke(path) => workload_grants::table_path(path.as_bytes())?,
+        }
+        let deadline = Instant::now()
+            .checked_add(wait)
+            .ok_or("grant lock deadline overflow")?;
+        let _lock = self.lock_until(Some(deadline))?;
+        let table = read(self, false)?;
+        let (next, reply) = match verb {
+            GrantVerb::List => return Ok(GrantReply::List(table.held(kind, name))),
+            GrantVerb::Grant(access, path) => match table.grant(kind, name, *access, path)? {
+                (_, Change::Unchanged) => return Ok(GrantReply::Granted(Change::Unchanged)),
+                (next, change) => (next, GrantReply::Granted(change)),
+            },
+            GrantVerb::Revoke(path) => (table.revoke(kind, name, path)?, GrantReply::Revoked),
+        };
+        self.publish_as(
+            workload_grants::FILE_NAME,
+            GRANTS_STAGED,
+            &next.encode(),
+            GRANTS_MODE,
+            GRANTS_LIMIT,
+        )?;
+        Ok(reply)
     }
 
     fn retained(&self) -> Result<Option<Registry>, String> {
@@ -744,6 +891,98 @@ pub(crate) fn allocate_application(
         Ok(taken)
     };
     directory.allocate(owner, name, policy.declarations(), outside, prepare)
+}
+
+/// What a grant may name: an application the session `owner`'s deployment
+/// declares as a service application, which runs as an account of its
+/// own. A personal application runs as the human and reaches the human's
+/// files by its policy; a row for one would be ignored at its launch.
+fn grantable(
+    declarations: &crate::app_policy::Declarations,
+    owner: u32,
+    name: &str,
+) -> Result<(), String> {
+    if declarations.owner() != owner {
+        return Err("the grant request names another session".into());
+    }
+    let row = declarations
+        .rows()
+        .iter()
+        .find(|row| row.application == name)
+        .ok_or_else(|| format!("the deployment does not declare application {name:?}"))?;
+    if row.class != crate::app_policy::Class::Service {
+        return Err(format!(
+            "application {name:?} runs as you and reaches your files by its own policy; \
+             only an application with an account of its own takes grants"
+        ));
+    }
+    Ok(())
+}
+
+/// The early answer to a grant of `path`, below the human's `home`: each
+/// name on the way, the home's included, a directory reached without
+/// following a link, owned by `owner` and writable by neither group nor
+/// others. It is not the boundary: every launch checks the source again
+/// as it publishes the view, the home's mount included, and a source
+/// created later is published then (td-authd/DESIGN.md, "Application
+/// filesystem grants").
+fn grant_source(home: &Path, path: &str, owner: (u32, u32)) -> Result<(), String> {
+    let open = |at: &Path, shown: &str| -> Result<File, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY | O_NONBLOCK)
+            .open(at)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => format!("{shown} does not exist"),
+                _ => format!("{shown} is not a directory reached without links: {error}"),
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect {shown}: {error}"))?;
+        if (metadata.uid(), metadata.gid()) != owner || metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{shown} is not the human's alone: owner {}:{}, mode {:04o}",
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode() & 0o7777
+            ));
+        }
+        Ok(file)
+    };
+    let mut current = open(home, "the home")?;
+    let mut shown = String::from("~");
+    for name in path.split('/') {
+        shown.push('/');
+        shown.push_str(name);
+        let below = PathBuf::from(format!("/proc/self/fd/{}/{name}", current.as_raw_fd()));
+        current = open(&below, &shown)?;
+    }
+    Ok(())
+}
+
+/// A grant request from td-authd (td-authd/DESIGN.md, "Grant requests"):
+/// as root, the human's `kind` account `name`'s directory rows listed, or
+/// one granted or revoked under the principal lock. No caller names a
+/// table, an owner of a source or a uid.
+pub(crate) fn grant_table(
+    owner: u32,
+    kind: Kind,
+    name: &str,
+    verb: &GrantVerb,
+) -> Result<GrantReply, String> {
+    let directory = state_directory()?;
+    let admit = || {
+        let policy = crate::app_policy::load()?;
+        grantable(policy.declarations(), owner, name)?;
+        if let GrantVerb::Grant(_, path) = verb {
+            let account =
+                crate::principals::primary_account::load().map_err(|error| error.to_string())?;
+            let human = crate::principals::primary_account::UID;
+            grant_source(&account.home(), path, (human, human))?;
+        }
+        Ok(())
+    };
+    directory.grants(kind, name, verb, admit, GRANT_LOCK_WAIT)
 }
 
 /// Reserve the deployment's identities and seed the workload account

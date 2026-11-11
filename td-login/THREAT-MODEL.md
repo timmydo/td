@@ -169,6 +169,36 @@ fatal before app code runs, as the terminal launcher does for the human
 session. Its active-account admission and post-switch checks are specified
 in `td-authd/DESIGN.md`; it uses this existing service-only credential path.
 
+The human's files reach an application account only through a directory
+grant (WORKLOADS.md, "Grants"), and asking for one takes the human's
+kernel credentials at the compositor control socket, no PIN, token or
+secure attention (td-authd/DESIGN.md, "Grant requests"). So any program
+running as UID 1000, not only td-software, can grant any directory of
+the home outside the reserved and sensitive trees, read-only or
+writable, to any application account the human owns, a networked one
+such as Firefox's included, from that account's next launch. Such a
+program already reads and writes those files itself, so a grant gives it
+no authority it lacked; what it adds is a second party that holds them.
+A read-only grant lets that account read the directory and send it over
+its network. A writable one also lets the account change what the human
+later runs or trusts: a granted repository's `.git/hooks`, its build
+scripts, a `Makefile` or a script the human executes, so an escaped or
+hostile application can turn a writable grant into code running as the
+human. Same-UID isolation is not claimed, as for `.ssh/authorized_keys`
+above.
+
+Which workloads can ask is narrower than "anything but the human", and
+not yet by account. Firefox and td-web run as accounts of their own,
+which the control socket refuses. Mail and news, td-sandbox profiles
+and jailed td-agent workspaces still run as UID 1000 (WORKLOADS.md
+steps 7 to 9); what keeps them from asking today is only that no jail
+binds `/run/td-compositor/1000/td-control` or its directory: td-jail
+reserves `/run` from every workspace, by path and by alias, and binds an
+application nothing of the compositor's but its Wayland socket, which a
+td-jail test pins. An unconfined td-agent workspace runs as the human
+with no jail and can ask. Root's writer refuses a source that is not the
+human's alone or is reached through a link, whoever asks.
+
 ## 2. The core invariant: ordering, and then proof
 
 The bug class this program exists to not have is **partial credential

@@ -524,6 +524,8 @@ enum Request {
     Installed,
     /// `22` and a name: td-software, opened at that application.
     SoftwareAt(String),
+    /// `2c`: a grant request on an application account's directories.
+    Grants(crate::grant_requests::Request),
     Secret(crate::session::Request),
 }
 
@@ -915,6 +917,9 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::SoftwareAt(name.to_string()))
         }
         [0x23] => Ok(Request::Installed),
+        [0x2c, operands @ ..] => Ok(Request::Grants(crate::grant_requests::Request::decode(
+            operands,
+        )?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -1015,6 +1020,13 @@ impl Launches {
         match request {
             Request::Software(request) => Ok(self.software.answer(config.owner, request)),
             Request::Installed => Ok(self.software.installed(config.owner)),
+            // The writer is waited for here, within its own bound.
+            Request::Grants(request) => {
+                if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
+                    return Ok(vec![0xff, 3]);
+                }
+                Ok(crate::grant_requests::answer(config.owner, &request))
+            }
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Supervised(unit) => {
                 // The live table skips the application; td-svc's `start`
@@ -1273,7 +1285,8 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
     }
     // None of these takes an operand, `20` takes exactly one but for an
     // upgrade's two, `21` exactly one, `22` none or a name, `23` none,
-    // `24` a verb and a name, and nothing above `24` is a request.
+    // `24` a verb and a name, and nothing above `24` is a request but the
+    // secret session's and `27`'s, and `2c`'s grant requests.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1297,5 +1310,19 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
     }
     assert!(request(&[0x16, 2]).is_err());
     assert_eq!(request(&[0x23])?, Request::Installed);
+    // `2c` reaches the grant decoder, which takes nothing malformed.
+    assert_eq!(
+        request(&[&[0x2c, 1, 0, 7][..], b"firefoxPictures"].concat())?,
+        Request::Grants(crate::grant_requests::Request {
+            verb: crate::grant_requests::Verb::Grant(
+                crate::workload_grants::Access::ReadOnly,
+                b"Pictures".to_vec()
+            ),
+            name: "firefox".into(),
+        })
+    );
+    for bad in [&[0x2c][..], &[0x2c, 0, 0, 0], &[0x2c, 0, 1, 7], &[0x2d]] {
+        assert!(request(bad).is_err(), "{bad:?}");
+    }
     Ok(())
 }

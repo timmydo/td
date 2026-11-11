@@ -283,6 +283,36 @@ revalidation, which fetches nothing, for up to two minutes.
   collection under the cache lock leaves a generation, an instance runs.
   It also refuses while `current` or `previous` exists.
 
+### 4.3 Folders it can reach
+
+`f` on a Flathub application opens its folders panel in place of the
+details: the directories of the human's its account is granted, as
+root's grant table holds them (WORKLOADS.md, "Grants"), read with the
+control socket's `grants application NAME`. Share read-only (`r`) and
+Share writable (`w`) take a folder typed below the home in a td-ui text
+field (a leading `~/` is dropped; Tab switches the access) and send
+`grant application NAME ro|rw PATH`; Stop sharing (`x`) sends `revoke
+application NAME PATH` for the selected row. Each answer, `added`,
+`changed`, `unchanged` or `revoked`, or root's refusal by its reason,
+shows in the status row, and the panel reads the listing again after
+every change whatever the answer said, so it shows what root holds. One
+request is out at a time. A change applies from the application's next
+launch: a running window keeps what it was launched with. Only a
+Flathub application has the panel. Root admits a grant for any
+application with an account of its own (td-authd/DESIGN.md, "Grant
+requests"), so an image-shipped one that has one, as td-web does, takes
+grants through `td-ctl` alone; mail and news run as the human and take
+none.
+
+td-software writes no table here either: root's writer validates and
+writes, and td-software reads the answers as untrusted bounded text (a
+listing at most 40 KiB and 32 rows, each path shown with control and
+reordering characters as `?`). As with Remove, any program running as
+the human can make the same requests on the control socket; a grant
+needs the human's credentials, not secure attention, because it
+delegates only the human's own authority over the human's own files
+(td-login/THREAT-MODEL.md).
+
 ## 5. A launcher that follows installs
 
 **Before this design** (as built since, §6 increment 3). The card had

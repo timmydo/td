@@ -66,6 +66,12 @@ Already built and reused by this design:
   compared with the identity td-authd published it by, one derivation
   (`engine/src/mount_identity.rs`) for both: the mount covering the
   human's home, the home's path below it and the row's path;
+- the request path that lists, adds and revokes an application
+  account's directory rows: the human's `grants`, `grant` and `revoke`
+  on the compositor control socket (td-ctl, and td-software's folders
+  panel), forwarded as td-authd's private request `2c` to td-firstboot's
+  `grant-table`, the table's one writer (td-authd/DESIGN.md, "Grant
+  requests");
 - the portal's fixed read-only Downloads view (1000→991), present while
   Firefox holds the Downloads grant;
 - the signed Flathub runtime fetch and its generations, in the runtime
@@ -79,9 +85,10 @@ Already built and reused by this design:
   (`APPLICATIONS.md` §E).
 
 Not built: subordinate accounts, sandbox and workspace accounts and their
-allocation, the `map-subuid` operation `APPLICATIONS.md` names, the
-request path that adds and revokes grants, and socket and network grants,
-whose rows the table already parses.
+allocation, the `map-subuid` operation `APPLICATIONS.md` names, grant
+requests for sandbox and workspace accounts (step 7), and socket and
+network grants, whose rows the table already parses and no request
+writes.
 
 ## A launch
 
@@ -208,7 +215,9 @@ Everything a workload reaches outside its runtime and home is a grant:
   human's programs live (`bin`, `.local/bin`, `.cargo/bin`) are never
   grantable, nor any ancestor of one; that is one list, the grant
   format's, which td-agent reads. One account's directories do not nest,
-  and a path holds no control or bidirectional format character;
+  and a path holds no control or bidirectional format character. A row a
+  later deployment's rules refuse is kept inert, listed and revocable but
+  never published, rather than failing the whole table;
 - **a socket**: Wayland, the fetch service, and others named per grant;
 - **network**: `off` or `host`, as td-sandbox's policy has today.
 
@@ -281,7 +290,7 @@ account.
    directory; an application the image ships keeps needing a carried
    row from the carried block, since nothing allocates at boot).
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
-   In three landings, two landed. First, td-jail derives the identity a
+   Landed, in three landings. First, td-jail derives the identity a
    view of a human directory must show from the mount covering the
    human's home, the home's path below that mount and the directory's
    path below the home, so nothing is mounted
@@ -300,15 +309,22 @@ account.
    revoked, FileChooser has no Downloads view. A rollback to the first
    landing re-grants Firefox's Downloads by its own boot unit, whatever
    the table says, and leaves the table and view tree unread. Third, the
-   request path through the compositor control socket that adds and
-   revokes rows, with a VM oracle that grants and revokes.
+   request path through the compositor control socket that lists, adds
+   and revokes an application account's directory rows, from td-ctl and
+   td-software's folders panel, through td-authd's request `2c` to
+   td-firstboot's `grant-table` writer under the principal state lock,
+   with a VM oracle that grants a directory to Firefox before its launch,
+   checks the read-only idmapped view the launch publishes, and revokes
+   it (td-authd/DESIGN.md, "Grant requests"). Only application accounts
+   take requests until step 7; a revoke takes effect at the account's
+   next launch.
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is
    retired.
 9. mail and news on their reserved rows, with fetch services of their
    own as td-web has (td-web/DESIGN.md §3).
-10. td-software's runtime and grant views.
+10. td-software's runtime view (its folders panel landed with step 6).
 
 ## Open questions
 

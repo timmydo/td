@@ -126,6 +126,14 @@ const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
 /// `allocate-application`'s reply, then a tab and the uid: td-authd's
 /// application cache operation reads exactly this line.
 const ALLOCATED_MARKER: &str = "TD-APPLICATION-ALLOCATED";
+/// `grant-table`'s replies, which td-authd's grant requests read exactly:
+/// a listing's first line, then a tab and its row count, then one
+/// `ACCESS<TAB>PATH` line per row; or one line saying what a change did.
+const GRANTS_LISTED: &str = "TD-GRANTS";
+const GRANT_ADDED: &str = "TD-GRANT-ADDED";
+const GRANT_CHANGED: &str = "TD-GRANT-CHANGED";
+const GRANT_UNCHANGED: &str = "TD-GRANT-UNCHANGED";
+const GRANT_REVOKED: &str = "TD-GRANT-REVOKED";
 const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 /// `render-primary-sshd`'s server form: the policy also names the root-owned
 /// provisioned keys (td-svc/DESIGN.md §10, "Profiles").
@@ -332,7 +340,8 @@ fn usage() -> String {
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
-         td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n",
+         td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n  \
+         td-firstboot grant-table OWNER list|grant|revoke KIND NAME [ro|rw] [PATH] lists an account's directory grants, or grants or revokes one of the human's directories\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
     )
@@ -424,6 +433,11 @@ fn run_with_primary(
             )
             .map_err(Failure::Failed)?;
             return emit(&format!("{ALLOCATED_MARKER}\t{uid}\n")).map_err(Failure::Failed);
+        }
+        Invocation::GrantTable(owner, kind, name, verb) => {
+            let reply =
+                principal_store::grant_table(owner, kind, &name, &verb).map_err(Failure::Failed)?;
+            return emit(&grant_reply(&reply)).map_err(Failure::Failed);
         }
         Invocation::Provision(config) => config,
     };
@@ -595,7 +609,75 @@ enum Invocation {
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     AllocateApplication(u32, String),
+    /// A grant request: the session owner, and the account and verb.
+    GrantTable(
+        u32,
+        workload_accounts::Kind,
+        String,
+        principal_store::GrantVerb,
+    ),
     Provision(Config),
+}
+
+/// `grant-table OWNER list KIND NAME`, `grant-table OWNER grant KIND NAME
+/// ro|rw PATH` or `grant-table OWNER revoke KIND NAME PATH`, td-authd's
+/// grant requests. The path's rules are the table's, checked when it is
+/// changed.
+fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
+    let usage = || {
+        Failure::Usage(
+            "grant-table requires OWNER list KIND NAME, OWNER grant KIND NAME ro|rw PATH \
+             or OWNER revoke KIND NAME PATH"
+                .into(),
+        )
+    };
+    let [_, owner, verb, kind, name, rest @ ..] = args else {
+        return Err(usage());
+    };
+    let uid = owner
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| (1000..=65533).contains(uid) && uid.to_string() == *owner)
+        .ok_or_else(|| Failure::Usage("invalid grant owner".into()))?;
+    let kind = workload_accounts::Kind::parse(kind)
+        .ok_or_else(|| Failure::Usage("invalid grant account kind".into()))?;
+    if !workload_accounts::valid_name(name) {
+        return Err(Failure::Usage("invalid grant account name".into()));
+    }
+    let verb = match (verb.as_str(), rest) {
+        ("list", []) => principal_store::GrantVerb::List,
+        ("grant", [access, path]) => principal_store::GrantVerb::Grant(
+            workload_grants::Access::parse(access).ok_or_else(usage)?,
+            path.clone(),
+        ),
+        ("revoke", [path]) => principal_store::GrantVerb::Revoke(path.clone()),
+        _ => return Err(usage()),
+    };
+    Ok(Invocation::GrantTable(uid, kind, name.clone(), verb))
+}
+
+/// What `grant-table` prints for td-authd: a listing's count and rows, or
+/// what a change did, one marker line.
+fn grant_reply(reply: &principal_store::GrantReply) -> String {
+    use principal_store::GrantReply;
+    use workload_grants::Change;
+    match reply {
+        GrantReply::List(directories) => {
+            let mut text = format!("{GRANTS_LISTED}\t{}\n", directories.len());
+            for directory in directories {
+                text.push_str(&format!(
+                    "{}\t{}\n",
+                    directory.access.as_str(),
+                    directory.path
+                ));
+            }
+            text
+        }
+        GrantReply::Granted(Change::Added) => format!("{GRANT_ADDED}\n"),
+        GrantReply::Granted(Change::Changed) => format!("{GRANT_CHANGED}\n"),
+        GrantReply::Granted(Change::Unchanged) => format!("{GRANT_UNCHANGED}\n"),
+        GrantReply::Revoked => format!("{GRANT_REVOKED}\n"),
+    }
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
@@ -725,6 +807,10 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             }
             return Ok(invocation(uid, name.clone()));
         }
+    }
+
+    if args.first().is_some_and(|first| first == "grant-table") {
+        return grant_table_invocation(args);
     }
 
     if args
@@ -1872,6 +1958,7 @@ mod tests {
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::AllocateApplication(..)
+            | Invocation::GrantTable(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
             )),
@@ -1901,6 +1988,119 @@ mod tests {
                     parse(&arguments.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
                 );
             }
+        }
+    }
+
+    /// td-authd's grant requests: a canonical owner, a known kind, a name
+    /// in the ledger's grammar and exactly the verb's operands; the path's
+    /// own rules are the table's.
+    #[test]
+    fn grant_requests_take_one_verb_and_exactly_its_operands() {
+        use principal_store::GrantVerb;
+        use workload_accounts::Kind;
+        use workload_grants::Access;
+        let parsed = |arguments: &[&str]| {
+            let mut all = vec!["grant-table".to_string()];
+            all.extend(arguments.iter().map(|a| (*a).to_string()));
+            parse(&all)
+        };
+        for (arguments, kind, expected) in [
+            (
+                &["1000", "list", "application", "firefox"][..],
+                Kind::Application,
+                GrantVerb::List,
+            ),
+            (
+                &[
+                    "1000",
+                    "grant",
+                    "application",
+                    "firefox",
+                    "ro",
+                    "My Pictures",
+                ],
+                Kind::Application,
+                GrantVerb::Grant(Access::ReadOnly, "My Pictures".into()),
+            ),
+            (
+                &["1000", "grant", "sandbox", "default", "rw", "src"],
+                Kind::Sandbox,
+                GrantVerb::Grant(Access::ReadWrite, "src".into()),
+            ),
+            (
+                &["1000", "revoke", "application", "firefox", "Downloads"],
+                Kind::Application,
+                GrantVerb::Revoke("Downloads".into()),
+            ),
+        ] {
+            match parsed(arguments) {
+                Ok(Invocation::GrantTable(1000, parsed_kind, name, verb)) => {
+                    assert_eq!(parsed_kind, kind);
+                    assert_eq!(name, arguments[3]);
+                    assert_eq!(verb, expected);
+                }
+                _ => panic!("{arguments:?}"),
+            }
+        }
+        for arguments in [
+            &[][..],
+            &["1000", "list", "application"],
+            &["01000", "list", "application", "firefox"],
+            &["999", "list", "application", "firefox"],
+            &["1000", "list", "service", "firefox"],
+            &["1000", "list", "application", "Firefox"],
+            &["1000", "list", "application", "firefox", "extra"],
+            &["1000", "grant", "application", "firefox", "Downloads"],
+            &["1000", "grant", "application", "firefox", "rx", "Downloads"],
+            &["1000", "grant", "application", "firefox", "ro", "a", "b"],
+            &["1000", "revoke", "application", "firefox"],
+            &[
+                "1000",
+                "revoke",
+                "application",
+                "firefox",
+                "rw",
+                "Downloads",
+            ],
+            &["1000", "add", "application", "firefox", "Downloads"],
+        ] {
+            assert!(
+                matches!(parsed(arguments), Err(Failure::Usage(_))),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// Exactly the lines td-authd reads: a listing's count and rows, or one
+    /// marker for what a change did.
+    #[test]
+    fn grant_replies_are_one_marker_or_a_counted_listing() {
+        use principal_store::GrantReply;
+        use workload_grants::{Access, Change, Directory};
+        assert_eq!(
+            grant_reply(&GrantReply::List(vec![
+                Directory {
+                    access: Access::ReadOnly,
+                    path: "My Pictures".into()
+                },
+                Directory {
+                    access: Access::ReadWrite,
+                    path: "Downloads".into()
+                },
+            ])),
+            "TD-GRANTS\t2\nro\tMy Pictures\nrw\tDownloads\n"
+        );
+        assert_eq!(grant_reply(&GrantReply::List(Vec::new())), "TD-GRANTS\t0\n");
+        for (reply, line) in [
+            (GrantReply::Granted(Change::Added), "TD-GRANT-ADDED\n"),
+            (GrantReply::Granted(Change::Changed), "TD-GRANT-CHANGED\n"),
+            (
+                GrantReply::Granted(Change::Unchanged),
+                "TD-GRANT-UNCHANGED\n",
+            ),
+            (GrantReply::Revoked, "TD-GRANT-REVOKED\n"),
+        ] {
+            assert_eq!(grant_reply(&reply), line);
         }
     }
 

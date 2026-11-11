@@ -834,23 +834,137 @@ the application's own policy grants (Firefox's `Opened`, say): td-jail
 then leaves that view out of the launch with one line on its stderr and
 binds the policy's grant. There is no exec grant; every view is noexec.
 
+What fails the whole table is kept to what a later deployment will not
+loosen or tighten: the format line, row shape, strict order, the row,
+byte and per-account bounds, and each directory being 1 to 1024 bytes of
+UTF-8 without a control character (`table_path`), so a row stays one
+line wherever it is listed. The rest is `validate_path`'s, which a later
+deployment may widen (more reserved trees, more refused characters): a
+row it refuses is inert, not fatal. The table still parses, boot keeps
+it, and every other row publishes as before; the inert row is held,
+listed and revocable, overlaps nothing, and is never published, each
+launch logging it with the reason on td-authd's stderr. A grant of its
+path is refused, and so is a grant nested with it: the deployment that
+wrote the row publishes it, and after a rollback to that deployment the
+two would overlap and its parser refuse the whole table. Without this a
+rolled-forward validator would refuse
+the table a human's request wrote, and with it every row, Firefox's
+`Downloads` included, and the one way to remove the row.
+
+The table is read without the writer's lock by every launch and every
+listing, so a reader that opened it just before td-firstboot renamed a
+successor over it finds the inode it holds at no link. Such an inode,
+root's, of mode 0600 and within the bound, was the whole earlier table,
+and these readers take it; a locked reader, and every other state file,
+still require exactly one link.
+
 td-firstboot writes the table once, under the same state lock and in the
 same staged, synced and renamed form as the ledger, when boot enrollment
 finds none: its seed is Firefox's `rw` `Downloads`. A present table is read
 at its exact owner, mode and single link and parsed, never rewritten, so a
 row the human revoked stays revoked and a table a later deployment wrote
 is kept; a malformed or misshapen table refuses the boot and changes
-nothing, as the ledger's does. The request path that adds and revokes rows
-is WORKLOADS.md step 6's third landing; until it lands only root editing
-the file changes a grant, and a change takes effect at the account's next
-launch. Rows naming an application that runs as the human (mail and news
-today) are ignored: such an application reaches the human's files by its
-policy, as the human, and no view is published for it.
+nothing, as the ledger's does. After boot the table changes only through
+"Grant requests" below, or root editing the file, and a change takes
+effect at the account's next launch. Rows naming an application that runs
+as the human (mail and news today) are ignored: such an application
+reaches the human's files by its policy, as the human, and no view is
+published for it.
 
 Rolling back to a deployment from before this table (WORKLOADS.md step 6's
 first landing) re-grants Firefox's `Downloads` by that deployment's own
 boot unit whatever the table says, and leaves the table and the view tree
 in place, harmless: nothing there reads them.
+
+## Grant requests
+
+The human lists, adds and revokes an application account's directory
+rows through the compositor control socket (`grants`, `grant`, `revoke`;
+td-compositor/DESIGN.md §15), which the compositor forwards on its
+private channel as request `2c`, queued to its authority worker as
+request `24` is. A grant is not elevation (WORKLOADS.md, "Grants"): it
+delegates the human's own authority over the human's own files, so the
+request needs the human's kernel credentials at the control socket, not
+secure attention or consent. Any program running as the human can
+therefore grant a non-reserved directory to any application account the
+human owns, a networked one included (td-login/THREAT-MODEL.md).
+
+```
+2c VERB 00 LEN NAME TAIL
+```
+
+`VERB` is `00` list, `01` grant read-only, `02` grant writable or `03`
+revoke; the kind byte is `00`, application, the only kind that takes
+requests until sandbox and workspace launches go through root
+(WORKLOADS.md step 7). `NAME` is 1 to 64 bytes in the registry grammar.
+A list's `TAIL` is one start row below 32; a grant's or revoke's is the
+path, 1 to 1024 bytes. Before anything else root runs `validate_path` on
+a grant's path and `table_path` on a revoke's, so a revoke can name an
+inert row ("Workload grant table"), and refuses a path that fails by its
+reason. Nothing else is admitted, and a malformed request ends the
+generation as every malformed request does.
+
+Root runs the table's one writer, `td-firstboot grant-table OWNER VERB
+application NAME [ro|rw] PATH`, as every authority child runs (null
+stdin, `/`, no environment, its output on private sockets root drains
+without blocking), and waits for it at most three seconds in the serving
+loop, reading at most 64 KiB; it is killed and reaped past that, which
+can interrupt a publish but never leave half a table, since the publish
+is a rename. The wait is the serving loop's, which answers one request
+at a time, and the compositor's authority worker carries physical and
+control-socket requests alike over its one wire, one at a time: it
+takes at most one control request a turn, after that turn's physical
+request, but a secret attempt, keyboard launch or other physical
+request that arrives while a grant request is in flight waits for it.
+A change holds the worker at most three seconds; a listing asks one
+writer run a page and no further page once four seconds have passed
+since it began (td-compositor/DESIGN.md §15), so with the page then in
+flight it holds the worker at most about seven. A program running as
+the human that floods the control socket with grants therefore delays
+physical work by at most one such request a turn, and other grant and
+application requests by a turn each. A writer that exits 2, the usage status, or is ended by a signal
+is root's failure, `ff 02`, so td-firstboot's usage text is never shown
+as a reason. The writer checks its own operands as root did (a grant's
+path by `validate_path`, a revoke's by `table_path`), then:
+
+- lists without the lock, reading the table as it is published (a table
+  renamed over while it read is still taken, "Workload grant table");
+  every row is listed, an inert one too; an absent table refuses;
+- for a grant, first admits the request: the application must be one the
+  image declares, owned by OWNER, with an account of its own (one that
+  runs as the human is refused by name), and the source must exist below
+  the human's home, reached name by name without links, each name a
+  directory of 1000:1000 writable by neither group nor others. That check
+  is early refusal for the human's sake; the launch's publication
+  ("Application filesystem grants") remains the boundary and checks the
+  source again;
+- then waits at most a second for the principal state lock the ledger
+  and seeding use, refusing "the grant table is busy" past it, rereads
+  the table, and applies the change through `Table::grant` or
+  `Table::revoke` in `engine/src/workload_grants.rs`, which re-validate
+  the whole result through the one parser: a reserved path, a nested or
+  equal row, one nested with an inert row and a 33rd directory are
+  refused there. An equal grant
+  changes nothing and writes nothing; one of the other access replaces
+  the row; revoking a row the account does not hold is refused. A change
+  is published staged, synced and renamed at 0600, as boot writes it.
+  Socket and network rows are kept as they are and never listed.
+
+The answers:
+
+| Answer | Meaning |
+| --- | --- |
+| `89 TOTAL DIGEST (ACCESS LEN_HI LEN_LO PATH)*` | a page of the account's directory rows from the start row, `ACCESS` `00` ro or `01` rw, as many as fit a frame; `DIGEST` is 8 bytes, FNV-1a over the account's whole listing as the writer printed it; the compositor asks from the next row until it holds `TOTAL`, and reports the listing moved if `TOTAL` or `DIGEST` changes between pages |
+| `8a OUTCOME` | `00` added, `01` changed access, `02` unchanged, `03` revoked |
+| `8b REASON` | the writer's refusal, 1 to 200 printable ASCII bytes |
+| `ff 02` | the writer could not run, outran its bound or printed something root cannot read; the table may or may not have changed, and a listing says |
+| `ff 03` | the live medium: nothing is granted there |
+
+The compositor ends the generation on an answer its verb cannot have.
+Revocation is not live: the running jail keeps its view until the
+account's next launch or shutdown releases it ("Application filesystem
+grants"). td-software shows an account's rows and asks for these changes
+from its folders panel (td-software/DESIGN.md §4.3).
 
 ## Fixed program launch prerequisite
 
@@ -941,6 +1055,7 @@ Subsequent payloads are exact byte records:
 | `22`, optionally with an application name | `81` plus a process handle for the human application manager, td-software, opened at that application |
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
+| `2c` plus a verb, the kind, an application name and a start row or path | a grant request ("Grant requests"): `89` a page of the account's directory rows, `8a` what a change did, or `8b` the writer's refusal |
 
 `0d` and `0f` name an application: the rest of the frame, one to 64
 bytes in the registry grammar (anything else is malformed and ends the
@@ -1156,8 +1271,8 @@ restarts. The image ships both peers atomically. Requests `07` through
 `0b` were additive within TDLA002, without negotiation or mixed-version
 compatibility. The login requests `1b` and `1c` came with the bump to
 TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` through
-`24` and `22`'s name were added within it later, and `0d` and `0f` took
-their names within it. Both peers again ship together, without
+`24`, `2c` and `22`'s name were added within it later, and `0d` and `0f`
+took their names within it. Both peers again ship together, without
 negotiation.
 
 Request `27` is the sandbox terminal: the same unprivileged terminal path
@@ -1713,8 +1828,9 @@ row without a view and names the source on stderr; the human restores the
 mode. Root does not silently undo an owner's permission change. Arbitrary
 deletion or renaming of the source by its owner removes the account's view
 at the next launch. A refused source, and a view td-jail leaves out, shows
-only in the service logs: nothing tells the human in the session until the
-request path of WORKLOADS.md step 6's third landing can report it.
+only in the service logs: a grant request ("Grant requests") refuses a
+source that fails these checks when it is made, but nothing tells the
+human in the session when one fails them later.
 
 td-jail runs as the account, which may search its 0710 view directory but
 not read it, so it holds each directory on the way to the manifest as an

@@ -477,7 +477,7 @@ fn a_malformed_or_misshapen_grant_table_refuses_and_is_kept() {
     for case in [
         "malformed",
         "overlapping",
-        "reserved",
+        "control",
         "public",
         "group-readable",
         "symlink",
@@ -492,8 +492,9 @@ fn a_malformed_or_misshapen_grant_table_refuses_and_is_kept() {
         let (text, mode) = match case {
             "malformed" => ("td-grants-v1\nbroken\n", 0o600),
             "overlapping" => (overlapping, 0o600),
-            "reserved" => (
-                "td-grants-v1\napplication\tfirefox\tdirectory\trw\t.ssh\n",
+            // A reserved path is an inert row, not a malformed table.
+            "control" => (
+                "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDown\u{7}loads\n",
                 0o600,
             ),
             "public" => (GRANTS_SEED, 0o644),
@@ -1206,4 +1207,309 @@ fn an_allocation_avoids_uids_with_a_cgroup_or_runtime_left() {
 /// The runtime directories a session left: 66560 through 66562.
 fn directory_uids_of_a_session() -> BTreeSet<u32> {
     BTreeSet::from([1000, 66560, 66561, 66562])
+}
+
+/// A grant request's table: the seed published as boot publishes it.
+fn grant_fixture() -> (notebook_temp::TempDir, Directory) {
+    let temp = notebook_temp::TempDir::new("td-grant-requests").unwrap();
+    let directory = account_directory(&temp);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    (temp, directory)
+}
+
+fn grant(directory: &Directory, verb: &GrantVerb) -> Result<GrantReply, String> {
+    directory.grants(
+        Kind::Application,
+        "firefox",
+        verb,
+        || Ok(()),
+        Duration::from_secs(1),
+    )
+}
+
+fn read_only(path: &str) -> GrantVerb {
+    GrantVerb::Grant(Access::ReadOnly, path.into())
+}
+
+/// The account's directory rows as a listing names them.
+fn listed(directory: &Directory) -> Vec<String> {
+    match grant(directory, &GrantVerb::List) {
+        Ok(GrantReply::List(rows)) => rows
+            .into_iter()
+            .map(|row| format!("{}\t{}", row.access.as_str(), row.path))
+            .collect(),
+        other => vec![format!("{other:?}")],
+    }
+}
+
+/// A grant adds a row and publishes the table privately by rename, an
+/// equal one publishes nothing, the other access replaces it, and a
+/// revoke removes it; a listing reads the account's directory rows.
+#[test]
+fn grant_requests_list_add_replace_and_revoke_rows() {
+    let (temp, directory) = grant_fixture();
+    assert_eq!(listed(&directory), ["rw\tDownloads"]);
+    let path = directory.path(workload_grants::FILE_NAME);
+    let seeded = fs::metadata(&path).unwrap();
+    assert_eq!(
+        grant(&directory, &read_only("Pictures")).unwrap(),
+        GrantReply::Granted(Change::Added)
+    );
+    let added = fs::metadata(&path).unwrap();
+    assert_ne!(added.ino(), seeded.ino());
+    assert_eq!((added.mode() & 0o7777, added.nlink()), (0o600, 1));
+    assert!(!directory.path(GRANTS_STAGED).exists());
+    assert_eq!(
+        grant_table(&directory).unwrap(),
+        "td-grants-v1\napplication\tfirefox\tdirectory\tro\tPictures\napplication\tfirefox\tdirectory\trw\tDownloads\n"
+    );
+    assert_eq!(listed(&directory), ["ro\tPictures", "rw\tDownloads"]);
+    // Idempotent: the same row again writes nothing.
+    assert_eq!(
+        grant(&directory, &read_only("Pictures")).unwrap(),
+        GrantReply::Granted(Change::Unchanged)
+    );
+    assert_eq!(fs::metadata(&path).unwrap().ino(), added.ino());
+    assert_eq!(
+        grant(
+            &directory,
+            &GrantVerb::Grant(Access::ReadWrite, "Pictures".into())
+        )
+        .unwrap(),
+        GrantReply::Granted(Change::Changed)
+    );
+    assert_eq!(listed(&directory), ["rw\tDownloads", "rw\tPictures"]);
+    assert_eq!(
+        grant(&directory, &GrantVerb::Revoke("Pictures".into())).unwrap(),
+        GrantReply::Revoked
+    );
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    // The seed's own row is revocable, and a revoked row is gone.
+    assert_eq!(
+        grant(&directory, &GrantVerb::Revoke("Downloads".into())).unwrap(),
+        GrantReply::Revoked
+    );
+    assert_eq!(grant_table(&directory).as_deref(), Some("td-grants-v1\n"));
+    assert!(listed(&directory).is_empty());
+    let error = grant(&directory, &GrantVerb::Revoke("Downloads".into())).unwrap_err();
+    assert!(error.contains("holds no grant"), "{error}");
+    temp.cleanup().unwrap();
+}
+
+/// What the table refuses a grant refuses and publishes nothing: a
+/// reserved, deceptive or overlapping path; a sandbox or workspace
+/// account; an admission that refuses; and a missing table.
+#[test]
+fn grant_requests_refuse_and_change_nothing() {
+    let (temp, directory) = grant_fixture();
+    let path = directory.path(workload_grants::FILE_NAME);
+    let before = fs::metadata(&path).unwrap();
+    for refused in [
+        ".ssh",
+        ".config",
+        ".local",
+        "Down\u{202E}loads",
+        "Downloads/a",
+    ] {
+        assert!(grant(&directory, &read_only(refused)).is_err(), "{refused}");
+    }
+    for kind in [Kind::Sandbox, Kind::Workspace] {
+        for verb in [GrantVerb::List, read_only("Pictures")] {
+            let error = directory
+                .grants(kind, "default", &verb, || Ok(()), Duration::from_secs(1))
+                .unwrap_err();
+            assert!(error.contains("take no grants"), "{error}");
+        }
+    }
+    let error = directory
+        .grants(
+            Kind::Application,
+            "mail",
+            &read_only("Pictures"),
+            || Err("application \"mail\" runs as you".into()),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.contains("runs as you"), "{error}");
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (before.ino(), before.mtime(), before.mtime_nsec())
+    );
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    // A listing or a revoke admits nothing, so a row an image no longer
+    // declares can still be seen and removed.
+    let admitted = std::cell::Cell::new(false);
+    for verb in [GrantVerb::List, GrantVerb::Revoke("Downloads".into())] {
+        directory
+            .grants(
+                Kind::Application,
+                "firefox",
+                &verb,
+                || {
+                    admitted.set(true);
+                    Ok(())
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+    }
+    assert!(!admitted.get());
+    fs::remove_file(&path).unwrap();
+    for verb in [GrantVerb::List, read_only("Pictures")] {
+        let error = grant(&directory, &verb).unwrap_err();
+        assert!(error.contains("absent"), "{error}");
+    }
+    assert!(!path.exists());
+    temp.cleanup().unwrap();
+}
+
+/// A change waits for the principal lock only so long, then answers that
+/// the table is busy; a listing takes no lock.
+#[test]
+fn a_grant_request_waits_for_the_lock_only_briefly() {
+    let (temp, directory) = grant_fixture();
+    let held = directory.lock().unwrap();
+    let started = Instant::now();
+    let error = directory
+        .grants(
+            Kind::Application,
+            "firefox",
+            &read_only("Pictures"),
+            || Ok(()),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+    assert!(error.contains("busy"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(listed(&directory), ["rw\tDownloads"]);
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    drop(held);
+    assert_eq!(
+        grant(&directory, &read_only("Pictures")).unwrap(),
+        GrantReply::Granted(Change::Added)
+    );
+    temp.cleanup().unwrap();
+}
+
+/// Only a declared service application of the session's owner takes a
+/// grant: not an undeclared name, a personal application or another
+/// session's.
+#[test]
+fn only_a_declared_service_application_is_grantable() {
+    let declarations = installable();
+    for name in ["firefox", "web", "photo"] {
+        grantable(&declarations, 1000, name).unwrap();
+    }
+    let error = grantable(&declarations, 1000, "mail").unwrap_err();
+    assert!(error.contains("runs as you"), "{error}");
+    assert!(grantable(&declarations, 1000, "other").is_err());
+    assert!(grantable(&declarations, 1001, "firefox").is_err());
+}
+
+/// The early source check: a directory of the owner's, each name on the
+/// way, the home's included, reached without a link and writable by no
+/// one else.
+#[test]
+fn a_grant_source_is_an_existing_private_directory_reached_without_links() {
+    use std::os::unix::fs::symlink;
+    let temp = notebook_temp::TempDir::new("td-grant-source").unwrap();
+    let home = temp.path().join("home");
+    DirBuilder::new().mode(0o700).create(&home).unwrap();
+    let metadata = fs::metadata(&home).unwrap();
+    let owner = (metadata.uid(), metadata.gid());
+    for directory in ["Pictures", "Pictures/2026", "Shared"] {
+        DirBuilder::new()
+            .mode(0o755)
+            .create(home.join(directory))
+            .unwrap();
+    }
+    fs::set_permissions(home.join("Shared"), Permissions::from_mode(0o775)).unwrap();
+    public_file(&home.join("file"), "", 0o600);
+    symlink("Pictures", home.join("link")).unwrap();
+    grant_source(&home, "Pictures", owner).unwrap();
+    grant_source(&home, "Pictures/2026", owner).unwrap();
+    for (path, shown, why) in [
+        ("Missing", "~/Missing", "does not exist"),
+        ("Pictures/missing", "~/Pictures/missing", "does not exist"),
+        ("file", "~/file", "not a directory"),
+        ("link", "~/link", "not a directory"),
+        ("link/2026", "~/link", "not a directory"),
+        ("Shared", "~/Shared", "alone"),
+    ] {
+        let error = grant_source(&home, path, owner).unwrap_err();
+        assert!(
+            error.starts_with(shown) && error.contains(why),
+            "{path}: {error}"
+        );
+    }
+    let foreign = (owner.0.wrapping_add(1), owner.1);
+    assert!(grant_source(&home, "Pictures", foreign)
+        .unwrap_err()
+        .starts_with("the home"));
+    fs::set_permissions(&home, Permissions::from_mode(0o770)).unwrap();
+    assert!(grant_source(&home, "Pictures", owner)
+        .unwrap_err()
+        .starts_with("the home"));
+    fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
+    temp.cleanup().unwrap();
+}
+
+/// A row a later validator refuses stays where an earlier deployment put
+/// it: listed with the account's other rows and revocable, while a grant
+/// of its path is refused before the request is admitted.
+#[test]
+fn an_inert_row_is_listed_and_revocable_but_never_granted() {
+    let (temp, directory) = grant_fixture();
+    let path = directory.path(workload_grants::FILE_NAME);
+    let staged = directory.path("inert");
+    public_file(
+        &staged,
+        "td-grants-v1\napplication\tfirefox\tdirectory\tro\t.ssh\napplication\tfirefox\tdirectory\trw\tDownloads\n",
+        0o600,
+    );
+    fs::rename(&staged, &path).unwrap();
+    assert_eq!(listed(&directory), ["ro\t.ssh", "rw\tDownloads"]);
+    let refused = directory
+        .grants(
+            Kind::Application,
+            "firefox",
+            &read_only(".ssh/keys"),
+            || Err("admitted".into()),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(refused.contains("reserved"), "{refused}");
+    assert!(matches!(
+        grant(&directory, &GrantVerb::Revoke(".ssh".into())),
+        Ok(GrantReply::Revoked)
+    ));
+    assert_eq!(listed(&directory), ["rw\tDownloads"]);
+    // A path no row can hold is refused before the lock.
+    assert!(grant(&directory, &GrantVerb::Revoke("Down\u{7}loads".into())).is_err());
+    temp.cleanup().unwrap();
+}
+
+/// A reader without the lock that opened the table just before a publish
+/// renamed its successor over it holds the whole earlier table, at no
+/// link: the listing takes it, a locked reader still refuses it.
+#[test]
+fn an_unlocked_listing_takes_a_table_renamed_over_while_it_read() {
+    let (temp, directory) = grant_fixture();
+    let path = directory.path(workload_grants::FILE_NAME);
+    let opened = File::open(&path).unwrap();
+    let staged = directory.path("successor");
+    public_file(&staged, GRANTS_SEED, 0o600);
+    fs::rename(&staged, &path).unwrap();
+    assert_eq!(opened.metadata().unwrap().nlink(), 0);
+    let name = workload_grants::FILE_NAME;
+    directory
+        .validate_links(&opened, name, GRANTS_MODE, GRANTS_LIMIT, true)
+        .unwrap();
+    assert!(directory
+        .validate_links(&opened, name, GRANTS_MODE, GRANTS_LIMIT, false)
+        .is_err());
+    temp.cleanup().unwrap();
 }

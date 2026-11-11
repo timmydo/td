@@ -35,6 +35,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "deployment.rs",
             "disk_install.rs",
             "elevation.rs",
+            "grant_requests.rs",
             "grant_views.rs",
             "handoff.rs",
             "inspection.rs",
@@ -67,6 +68,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for (name, count) in [
         ("application.rs", 0),
         ("application_cache.rs", 0),
+        ("grant_requests.rs", 0),
         ("grant_views.rs", 0),
         ("main.rs", 1),
         ("notebook.rs", 0),
@@ -127,6 +129,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "application.rs"
                     | "application_cache.rs"
                     | "software.rs"
+                    | "grant_requests.rs"
                     | "unlock.rs"
                     | "login.rs"
                     | "storage.rs"
@@ -1302,7 +1305,72 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for forbidden in ["fs::read", "fs::write", "OpenOptions", "remove_"] {
         assert!(!software.contains(forbidden), "software.rs: {forbidden}");
     }
+    // Request `2c` runs the grant table's one writer, td-firstboot, with
+    // the owner, a fixed verb and kind, and the peer's validated name,
+    // access and path: one fixed program, null stdin, no environment, no
+    // credential change, waited for within its bound by one sleep loop.
+    let grants = include_str!("../src/grant_requests.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        fingerprint(grants),
+        GRANT_REQUESTS_FINGERPRINT,
+        "grant requests changed"
+    );
+    for forbidden in [
+        "thread::spawn",
+        "thread::Builder",
+        "thread::scope",
+        "pre_exec",
+        ".uid(",
+        ".gid(",
+        ".groups(",
+        ".exec()",
+        ".env(",
+        ".envs(",
+        ".arg(",
+        "process_group",
+        "unsafe",
+        "fs::",
+        "OpenOptions",
+        "File",
+        "mount_sys",
+    ] {
+        assert!(
+            !grants.contains(forbidden),
+            "grant_requests.rs: {forbidden}"
+        );
+    }
+    assert_eq!(grants.matches("Command::new(").count(), 1);
+    assert!(grants.contains(
+        "Command::new(\"/bin/td-firstboot\");\n    command.args([\n        \"grant-table\",\n        &owner.to_string(),\n        verb,\n        \"application\",\n        &request.name,\n    ]);"
+    ));
+    assert!(grants.contains("        command.args([access.as_str()]);\n"));
+    assert!(grants.contains("    command.args(path);\n"));
+    assert_eq!(grants.matches("command.args(").count(), 3);
+    // The path reaches the writer only once the table's validator took it:
+    // a grant's by `validate_path`, a revoke's by `table_path`, which still
+    // reaches an inert row.
+    for check in [
+        "workload_grants::validate_path(path).map_err(|why| refusal(&why))?;",
+        "workload_grants::table_path(path).map_err(|why| refusal(&why))?;",
+    ] {
+        assert_eq!(grants.matches(check).count(), 1, "{check}");
+        assert!(grants.find(check).unwrap() < grants.find("Command::new(").unwrap());
+    }
+    assert_eq!(grants.matches(".spawn()").count(), 1);
+    assert_eq!(grants.matches(".env_clear()").count(), 1);
+    assert_eq!(grants.matches(".stdin(Stdio::null())").count(), 1);
+    assert!(grants.contains("    drop(command);\n"));
+    assert_eq!(grants.matches("std::thread::sleep(READ_STEP)").count(), 1);
+    assert!(grants.contains("const WRITER_TIME: Duration = Duration::from_secs(3);"));
+    assert!(grants.contains("const OUTPUT_BYTES: usize = 64 * 1024;"));
     let launch = include_str!("../src/launch.rs");
+    // A live boot refuses `2c` as it refuses `0d` and `24`.
+    assert!(launch.contains(
+        "Request::Grants(request) => {\n                if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {\n                    return Ok(vec![0xff, 3]);\n                }\n                Ok(crate::grant_requests::answer(config.owner, &request))"
+    ));
     for forbidden in [
         "thread::spawn",
         "thread::Builder",
@@ -1548,7 +1616,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
-const GRANT_VIEWS_FINGERPRINT: u64 = 0x1c5860247ab63412;
+const GRANT_REQUESTS_FINGERPRINT: u64 = 0xff1ed2342d1bfa24;
+const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f5b8f042bdbb6c2;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1562,8 +1631,8 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
-const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
-const MAIN_FINGERPRINT: u64 = 0x4e6c0984e6ea93dd;
+const LAUNCH_FINGERPRINT: u64 = 0x7311f592da8c8724;
+const MAIN_FINGERPRINT: u64 = 0x62f0cc4717b69cc5;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 

@@ -11924,7 +11924,21 @@ its application's. Only then does it print
 `TD-SOFTWARE-INSTALL-OK`, which every system boot oracle requires; it
 drives the control-socket verbs td-software sends rather than
 td-software's window. Anywhere else nothing installs until the owner
-asks.
+asks. `grant-request` follows it, before Firefox and under the same
+token and path, bounded at 60 seconds: as the human it makes
+`~/Pictures`, asks `td-ctl grant application firefox ro Pictures`
+until root answers `added` or `unchanged`, and needs `td-ctl grants
+application firefox` to list it. Once Firefox is ready,
+`grant-evidence`, bounded at 30 seconds, requires Firefox's account's
+manifest to list that directory read-only and the view it names to be
+mounted read-only and idmapped, then revokes it as the human and needs
+a listing without it that keeps the seeded `Downloads` before it prints
+`TD-GRANT-REQUEST-OK`, which every system boot oracle requires
+(td-authd/DESIGN.md, "Grant requests"). It proves root's publication,
+not td-jail's bind: nothing looks inside Firefox's jail for
+`/home/td/Pictures`, so a jail that left the listed view out would pass.
+td-jail's admission of manifest views is covered by its own tests and,
+for `Downloads`, by the Firefox download oracle's file landing there.
 
 **The image no longer carries the payload.** The Firefox recipe is a
 declaration alone: no source, no payload, no steps, and the version

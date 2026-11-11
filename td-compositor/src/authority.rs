@@ -66,6 +66,95 @@ enum Work {
 /// slot physical input's requests need.
 type CacheWork = (CacheVerb, String, SyncSender<CacheAnswer>);
 
+/// A control-socket request for root and where its answer goes: an
+/// application cache request (`24`) or a grant request (`2c`).
+pub(crate) enum ControlWork {
+    Cache(CacheWork),
+    Grants(GrantRequest, SyncSender<GrantAnswer>),
+}
+
+/// A grant's access: a read-only or a writable view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl GrantAccess {
+    /// The control socket's and the table's word.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+        }
+    }
+
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "ro" => Some(Self::ReadOnly),
+            "rw" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+}
+
+/// What a grant request asks of an application account's directories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantVerb {
+    List,
+    Grant(GrantAccess),
+    Revoke,
+}
+
+/// A grant request (td-authd/DESIGN.md, "Grant requests"): its verb, an
+/// application name in the registry grammar and, but for a listing, a
+/// directory below the human's home of one to 1024 bytes, whose rules
+/// root holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GrantRequest {
+    pub(crate) verb: GrantVerb,
+    pub(crate) name: String,
+    pub(crate) path: String,
+}
+
+/// The longest grant path, the table's bound.
+pub(crate) const GRANT_PATH_BYTES: usize = 1024;
+/// The most directory rows an account holds, the table's bound.
+const GRANT_ROWS: usize = 32;
+
+/// What a change did, as `8a` says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantOutcome {
+    Added,
+    Changed,
+    Unchanged,
+    Revoked,
+}
+
+/// Root's answer to a grant request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GrantAnswer {
+    /// Every directory row, from `89` pages.
+    Listed(Vec<(GrantAccess, String)>),
+    Done(GrantOutcome),
+    /// `8b`: the writer refused, for this reason.
+    Refused(String),
+    /// `ff 02`: root could not run the writer or read its answer.
+    Unstarted,
+    /// `ff 03`: a live session grants nothing.
+    Live,
+    /// The rows changed between two pages of one listing.
+    Moved,
+    /// The listing's pages outran `GRANT_LISTING_TIME`.
+    Unfinished,
+}
+
+/// How long one listing may hold the worker, and the physical work queued
+/// behind it, before it asks no further page: the control socket's caller
+/// has stopped waiting by then. A page already asked still runs to root's
+/// three-second bound on the table's writer.
+const GRANT_LISTING_TIME: Duration = Duration::from_secs(4);
+
 /// What td-software asks root of one application's cache, as request
 /// `24` (td-authd/DESIGN.md, "Application requests"): its status, or one
 /// of the four operations td-app runs as the application's account.
@@ -561,8 +650,9 @@ impl Installed {
 #[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
-    /// The control socket's application requests, apart from `send`.
-    control: SyncSender<CacheWork>,
+    /// The control socket's application and grant requests, apart from
+    /// `send`.
+    control: SyncSender<ControlWork>,
     login: Login,
     hostnames: Hostnames,
     application: Application,
@@ -1070,7 +1160,29 @@ impl Launcher {
             return Err("invalid application name".into());
         }
         let (reply, answer) = mpsc::sync_channel(1);
-        match self.control.try_send((verb, name.to_string(), reply)) {
+        match self
+            .control
+            .try_send(ControlWork::Cache((verb, name.to_string(), reply)))
+        {
+            Ok(()) => Ok(answer),
+            Err(TrySendError::Full(_)) => Err("an application request is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
+        }
+    }
+
+    /// Queues a grant request, its name in the registry's grammar and its
+    /// path within the table's bound; root answers on the receiver.
+    pub(crate) fn grants(&self, request: GrantRequest) -> Result<Receiver<GrantAnswer>, String> {
+        // Root ends the generation on a malformed request; refused here.
+        if !consent::application_name(&request.name) {
+            return Err("invalid application name".into());
+        }
+        let listing = request.verb == GrantVerb::List;
+        if listing != request.path.is_empty() || request.path.len() > GRANT_PATH_BYTES {
+            return Err("invalid grant path".into());
+        }
+        let (reply, answer) = mpsc::sync_channel(1);
+        match self.control.try_send(ControlWork::Grants(request, reply)) {
             Ok(()) => Ok(answer),
             Err(TrySendError::Full(_)) => Err("an application request is already pending".into()),
             Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
@@ -1114,7 +1226,7 @@ impl Launcher {
 /// A launcher whose secret attempts wait in a queue a test takes them
 /// from, playing the worker itself.
 #[cfg(test)]
-pub(crate) struct Queued(Receiver<Work>, Receiver<CacheWork>);
+pub(crate) struct Queued(Receiver<Work>, Receiver<ControlWork>);
 
 #[cfg(test)]
 impl Queued {
@@ -1154,7 +1266,18 @@ impl Queued {
     /// An application request, waiting up to `wait`, with where its
     /// answer goes.
     pub(crate) fn cache(&self, wait: Duration) -> Option<CacheWork> {
-        self.1.recv_timeout(wait).ok()
+        match self.1.recv_timeout(wait).ok()? {
+            ControlWork::Cache(work) => Some(work),
+            ControlWork::Grants(..) => None,
+        }
+    }
+
+    /// A grant request, waiting up to `wait`, with where its answer goes.
+    pub(crate) fn grants(&self, wait: Duration) -> Option<(GrantRequest, SyncSender<GrantAnswer>)> {
+        match self.1.recv_timeout(wait).ok()? {
+            ControlWork::Grants(request, reply) => Some((request, reply)),
+            ControlWork::Cache(_) => None,
+        }
     }
 
     pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
@@ -1435,10 +1558,139 @@ fn cache(wire: &mut impl Exchange, verb: CacheVerb, name: &str) -> Result<CacheA
     CacheAnswer::decode(verb, &wire.exchange(&request)?)
 }
 
+/// `2c`'s first operands: the verb byte, the application kind `00`, and
+/// the name's length and bytes.
+fn grant_head(verb: u8, name: &str) -> Result<Vec<u8>, String> {
+    let length = u8::try_from(name.len()).map_err(|_| "invalid application name")?;
+    let mut request = vec![0x2c, verb, 0, length];
+    request.extend_from_slice(name.as_bytes());
+    Ok(request)
+}
+
+/// One `89` page: the account's row count and its whole listing's digest,
+/// which every page of one listing repeats, and the rows it carries.
+type GrantPage = ((usize, u64), Vec<(GrantAccess, String)>);
+
+/// Root's answer to `2c`, exactly: a page for a listing, an outcome the
+/// verb can have for a change, or a refusal; anything else ends the
+/// paired generation.
+fn decode_grant(verb: GrantVerb, answer: &[u8]) -> Result<Result<GrantPage, GrantAnswer>, String> {
+    let invalid = || "invalid grant request answer".to_string();
+    let printable = |bytes: &[u8]| bytes.iter().all(|b| (b' '..=b'~').contains(b));
+    match (verb, answer) {
+        (_, [0xff, 2]) => return Ok(Err(GrantAnswer::Unstarted)),
+        (_, [0xff, 3]) => return Ok(Err(GrantAnswer::Live)),
+        (_, [0x8b, reason @ ..])
+            if !reason.is_empty() && reason.len() <= CACHE_REASON_BYTES && printable(reason) =>
+        {
+            let reason = std::str::from_utf8(reason).map_err(|_| invalid())?;
+            return Ok(Err(GrantAnswer::Refused(reason.to_string())));
+        }
+        (GrantVerb::Grant(_), [0x8a, 0]) => return Ok(Err(GrantAnswer::Done(GrantOutcome::Added))),
+        (GrantVerb::Grant(_), [0x8a, 1]) => {
+            return Ok(Err(GrantAnswer::Done(GrantOutcome::Changed)))
+        }
+        (GrantVerb::Grant(_), [0x8a, 2]) => {
+            return Ok(Err(GrantAnswer::Done(GrantOutcome::Unchanged)))
+        }
+        (GrantVerb::Revoke, [0x8a, 3]) => return Ok(Err(GrantAnswer::Done(GrantOutcome::Revoked))),
+        (GrantVerb::List, [0x89, _, ..]) => {}
+        _ => return Err(invalid()),
+    }
+    let [_, total, d0, d1, d2, d3, d4, d5, d6, d7, rows @ ..] = answer else {
+        return Err(invalid());
+    };
+    let digest = u64::from_be_bytes([*d0, *d1, *d2, *d3, *d4, *d5, *d6, *d7]);
+    let mut rest: &[u8] = rows;
+    let total = usize::from(*total);
+    if total > GRANT_ROWS {
+        return Err(invalid());
+    }
+    let mut rows = Vec::new();
+    while let [access, high, low, tail @ ..] = rest {
+        let access = match access {
+            0 => GrantAccess::ReadOnly,
+            1 => GrantAccess::ReadWrite,
+            _ => return Err(invalid()),
+        };
+        let length = usize::from(u16::from_be_bytes([*high, *low]));
+        let (bytes, after) = tail.split_at_checked(length).ok_or_else(invalid)?;
+        let directory = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+        if directory.is_empty()
+            || directory.len() > GRANT_PATH_BYTES
+            || directory.chars().any(char::is_control)
+        {
+            return Err(invalid());
+        }
+        rows.push((access, directory.to_string()));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Ok(((total, digest), rows)))
+}
+
+/// One grant request: a change is one exchange; a listing asks page after
+/// page from the next row until it holds the count every page states, and
+/// asks no further page once `deadline` has passed.
+fn grants(
+    wire: &mut impl Exchange,
+    request: &GrantRequest,
+    deadline: Instant,
+) -> Result<GrantAnswer, String> {
+    let verb = match request.verb {
+        GrantVerb::List => 0,
+        GrantVerb::Grant(GrantAccess::ReadOnly) => 1,
+        GrantVerb::Grant(GrantAccess::ReadWrite) => 2,
+        GrantVerb::Revoke => 3,
+    };
+    let head = grant_head(verb, &request.name)?;
+    if request.verb != GrantVerb::List {
+        let mut bytes = head;
+        bytes.extend_from_slice(request.path.as_bytes());
+        return match decode_grant(request.verb, &wire.exchange(&bytes)?)? {
+            Err(answer) => Ok(answer),
+            Ok(_) => Err("invalid grant request answer".into()),
+        };
+    }
+    let mut rows: Vec<(GrantAccess, String)> = Vec::new();
+    let mut listing = None;
+    loop {
+        let start = u8::try_from(rows.len()).map_err(|_| "invalid grant listing")?;
+        let mut bytes = head.clone();
+        bytes.push(start);
+        let (stated, page) = match decode_grant(request.verb, &wire.exchange(&bytes)?)? {
+            Ok(page) => page,
+            Err(answer) => return Ok(answer),
+        };
+        // Pages of two tables, of one count or not, are no one listing.
+        if listing.is_some_and(|listing| listing != stated) {
+            return Ok(GrantAnswer::Moved);
+        }
+        listing = Some(stated);
+        let (total, _) = stated;
+        // A page short of the count carries at least one row.
+        if page.is_empty() && rows.len() < total {
+            return Err("invalid grant listing".into());
+        }
+        rows.extend(page);
+        if rows.len() > total {
+            return Err("invalid grant listing".into());
+        }
+        if rows.len() == total {
+            return Ok(GrantAnswer::Listed(rows));
+        }
+        if Instant::now() >= deadline {
+            return Ok(GrantAnswer::Unfinished);
+        }
+    }
+}
+
 fn worker(
     mut wire: impl Exchange,
     receive: Receiver<Work>,
-    requests: Receiver<CacheWork>,
+    requests: Receiver<ControlWork>,
     mut login: LoginPoll,
     (hostnames, application, installed): (Hostnames, Application, Installed),
 ) -> Result<(), String> {
@@ -1469,14 +1721,21 @@ fn worker(
             Err(RecvTimeoutError::Disconnected) => return Err("launcher disconnected".into()),
         }
         // At most one control-socket request a turn, after physical work.
-        if let Ok((verb, name, reply)) = requests.try_recv() {
-            let answer = cache(&mut wire, verb, &name)?;
-            // An operation that started changes what is installed.
-            if answer == CacheAnswer::Started {
-                installed.ask();
+        match requests.try_recv() {
+            Ok(ControlWork::Cache((verb, name, reply))) => {
+                let answer = cache(&mut wire, verb, &name)?;
+                // An operation that started changes what is installed.
+                if answer == CacheAnswer::Started {
+                    installed.ask();
+                }
+                // A caller that stopped waiting is no failure of the channel.
+                let _ = reply.try_send(answer);
             }
-            // A caller that stopped waiting is no failure of the channel.
-            let _ = reply.try_send(answer);
+            Ok(ControlWork::Grants(request, reply)) => {
+                let deadline = Instant::now() + GRANT_LISTING_TIME;
+                let _ = reply.try_send(grants(&mut wire, &request, deadline)?);
+            }
+            Err(_) => {}
         }
         if let Some(error) = processes.poll(&mut wire)? {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
@@ -1530,7 +1789,7 @@ mod tests {
         }
     }
     /// A control queue nothing will ever send on.
-    fn idle() -> Receiver<CacheWork> {
+    fn idle() -> Receiver<ControlWork> {
         mpsc::sync_channel(QUEUE_CAPACITY).1
     }
     fn handle(number: u64) -> Vec<u8> {
@@ -2471,7 +2730,11 @@ mod tests {
         let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (reply, answer) = mpsc::sync_channel(1);
         assert!(control
-            .try_send((CacheVerb::Install, "firefox".into(), reply))
+            .try_send(ControlWork::Cache((
+                CacheVerb::Install,
+                "firefox".into(),
+                reply
+            )))
             .is_ok());
         assert!(send
             .try_send(Work::Supervised(Supervised::Start("mail".into())))
@@ -2693,7 +2956,11 @@ checked=never\nrefused=none\nprogress=none\n";
         let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (reply, answer) = mpsc::sync_channel(1);
         assert!(control
-            .try_send((CacheVerb::Install, "firefox".into(), reply))
+            .try_send(ControlWork::Cache((
+                CacheVerb::Install,
+                "firefox".into(),
+                reply
+            )))
             .is_ok());
         // The physical queue's request goes to root first.
         assert!(send
@@ -2728,7 +2995,11 @@ checked=never\nrefused=none\nprogress=none\n";
         let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (reply, _answer) = mpsc::sync_channel(1);
         assert!(control
-            .try_send((CacheVerb::Status, "firefox".into(), reply))
+            .try_send(ControlWork::Cache((
+                CacheVerb::Status,
+                "firefox".into(),
+                reply
+            )))
             .is_ok());
         let error = worker(
             wire(vec![vec![0x86]]),
@@ -2744,5 +3015,314 @@ checked=never\nrefused=none\nprogress=none\n";
         .unwrap_err();
         assert!(error.contains("application request answer"), "{error}");
         drop(send);
+    }
+
+    fn grant_request(verb: GrantVerb, path: &str) -> GrantRequest {
+        GrantRequest {
+            verb,
+            name: "firefox".into(),
+            path: path.into(),
+        }
+    }
+
+    /// A change is one `2c` and its exact outcome; a refusal carries the
+    /// writer's reason; an answer the verb cannot have ends the generation.
+    #[test]
+    fn a_grant_change_is_one_exchange_with_one_exact_answer() {
+        let ro = grant_request(GrantVerb::Grant(GrantAccess::ReadOnly), "My Pictures");
+        let mut script = wire(vec![vec![0x8a, 0]]);
+        assert_eq!(
+            grants(&mut script, &ro, later()).unwrap(),
+            GrantAnswer::Done(GrantOutcome::Added)
+        );
+        assert_eq!(
+            script.requests,
+            [b"\x2c\x01\x00\x07firefoxMy Pictures".to_vec()]
+        );
+        let rw = grant_request(GrantVerb::Grant(GrantAccess::ReadWrite), "Downloads");
+        let revoke = grant_request(GrantVerb::Revoke, "Downloads");
+        for (request, answer, expected) in [
+            (&rw, vec![0x8a, 1], GrantAnswer::Done(GrantOutcome::Changed)),
+            (
+                &rw,
+                vec![0x8a, 2],
+                GrantAnswer::Done(GrantOutcome::Unchanged),
+            ),
+            (
+                &revoke,
+                vec![0x8a, 3],
+                GrantAnswer::Done(GrantOutcome::Revoked),
+            ),
+            (&revoke, vec![0xff, 2], GrantAnswer::Unstarted),
+            (&rw, vec![0xff, 3], GrantAnswer::Live),
+            (
+                &rw,
+                b"\x8b~/Downloads does not exist".to_vec(),
+                GrantAnswer::Refused("~/Downloads does not exist".into()),
+            ),
+        ] {
+            let mut script = wire(vec![answer]);
+            assert_eq!(grants(&mut script, request, later()).unwrap(), expected);
+        }
+        let mut script = wire(vec![vec![0x8a, 3]]);
+        grants(&mut script, &revoke, later()).unwrap();
+        assert_eq!(
+            script.requests,
+            [b"\x2c\x03\x00\x07firefoxDownloads".to_vec()]
+        );
+        for (request, answer) in [
+            (&rw, vec![0x8a, 3]),
+            (&revoke, vec![0x8a, 0]),
+            (&rw, vec![0x8a, 4]),
+            (&rw, vec![0x8a]),
+            (&rw, vec![0x8b]),
+            (&rw, b"\x8b\x01".to_vec()),
+            (&rw, [&[0x8b][..], &[b'a'; 201]].concat()),
+            (&rw, vec![0x89, 0]),
+            (&rw, vec![0xff, 1]),
+            (&rw, vec![0x86]),
+        ] {
+            assert!(
+                grants(&mut wire(vec![answer.clone()]), request, later()).is_err(),
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// An `89` page: the count, the listing's digest, then the rows.
+    fn page(total: u8, digest: u64, rows: &[u8]) -> Vec<u8> {
+        let mut page = vec![0x89, total];
+        page.extend_from_slice(&digest.to_be_bytes());
+        page.extend_from_slice(rows);
+        page
+    }
+
+    /// A listing asks from the next row until it holds every row once, and
+    /// gives up when the count or the digest moves between pages.
+    #[test]
+    fn a_listing_pages_until_it_holds_the_stated_count() {
+        let list = grant_request(GrantVerb::List, "");
+        let mut script = wire(vec![page(0, 7, b"")]);
+        assert_eq!(
+            grants(&mut script, &list, later()).unwrap(),
+            GrantAnswer::Listed(vec![])
+        );
+        assert_eq!(script.requests, [b"\x2c\x00\x00\x07firefox\x00".to_vec()]);
+        let mut script = wire(vec![
+            page(2, 7, b"\x00\x00\x0bMy Pictures"),
+            page(2, 7, b"\x01\x00\x09Downloads"),
+        ]);
+        assert_eq!(
+            grants(&mut script, &list, later()).unwrap(),
+            GrantAnswer::Listed(vec![
+                (GrantAccess::ReadOnly, "My Pictures".into()),
+                (GrantAccess::ReadWrite, "Downloads".into()),
+            ])
+        );
+        assert_eq!(
+            script.requests,
+            [
+                b"\x2c\x00\x00\x07firefox\x00".to_vec(),
+                b"\x2c\x00\x00\x07firefox\x01".to_vec()
+            ]
+        );
+        let mut moved = wire(vec![
+            page(2, 7, b"\x00\x00\x01a"),
+            page(3, 7, b"\x01\x00\x01b"),
+        ]);
+        assert_eq!(
+            grants(&mut moved, &list, later()).unwrap(),
+            GrantAnswer::Moved
+        );
+        // One row revoked and another granted between pages: the count
+        // stands, the digest does not.
+        let mut swapped = wire(vec![
+            page(2, 7, b"\x00\x00\x01a"),
+            page(2, 8, b"\x01\x00\x01c"),
+        ]);
+        assert_eq!(
+            grants(&mut swapped, &list, later()).unwrap(),
+            GrantAnswer::Moved
+        );
+        let mut refused = wire(vec![b"\x8bno".to_vec()]);
+        assert_eq!(
+            grants(&mut refused, &list, later()).unwrap(),
+            GrantAnswer::Refused("no".into())
+        );
+        for answers in [
+            vec![page(2, 7, b"")],
+            vec![page(1, 7, b"\x00\x00\x01a\x00\x00\x01b")],
+            vec![page(0x21, 7, b"")],
+            vec![page(1, 7, b"\x02\x00\x01a")],
+            vec![page(1, 7, b"\x00\x00\x02a")],
+            vec![page(1, 7, b"\x00\x00\x00")],
+            vec![page(1, 7, b"\x00\x00\x01\n")],
+            vec![page(1, 7, b"\x00\x00\x01\xff")],
+            vec![vec![0x89, 0]],
+            vec![b"\x89\x00\x00\x00\x00".to_vec()],
+            vec![vec![0x8a, 0]],
+        ] {
+            assert!(
+                grants(&mut wire(answers.clone()), &list, later()).is_err(),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// A deadline no grant test reaches.
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    /// Once its deadline has passed a listing asks no further page, so a
+    /// table of many pages holds physical work behind it no longer; a page
+    /// that completes the listing still answers it.
+    #[test]
+    fn a_listing_asks_no_page_past_its_deadline() {
+        let list = grant_request(GrantVerb::List, "");
+        let passed = Instant::now();
+        let mut script = wire(vec![
+            page(3, 7, b"\x00\x00\x01a"),
+            page(3, 7, b"\x00\x00\x01b"),
+            page(3, 7, b"\x00\x00\x01c"),
+        ]);
+        assert_eq!(
+            grants(&mut script, &list, passed).unwrap(),
+            GrantAnswer::Unfinished
+        );
+        assert_eq!(script.requests, [b"\x2c\x00\x00\x07firefox\x00".to_vec()]);
+        let mut whole = wire(vec![page(1, 7, b"\x00\x00\x01a")]);
+        assert_eq!(
+            grants(&mut whole, &list, passed).unwrap(),
+            GrantAnswer::Listed(vec![(GrantAccess::ReadOnly, "a".into())])
+        );
+        let mut changed = wire(vec![vec![0x8a, 1]]);
+        let rw = grant_request(GrantVerb::Grant(GrantAccess::ReadWrite), "a");
+        assert_eq!(
+            grants(&mut changed, &rw, passed).unwrap(),
+            GrantAnswer::Done(GrantOutcome::Changed)
+        );
+    }
+
+    /// A listing that moved and a refusal are answers the worker hands on
+    /// before carrying on; an answer the request cannot have ends the
+    /// paired generation there.
+    #[test]
+    fn only_a_malformed_grant_answer_ends_the_generation() {
+        let run = |answer: Vec<Vec<u8>>| {
+            let (send, receive) = mpsc::sync_channel::<Work>(QUEUE_CAPACITY);
+            let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
+            let (reply, answered) = mpsc::sync_channel(1);
+            assert!(control
+                .try_send(ControlWork::Grants(
+                    grant_request(GrantVerb::List, ""),
+                    reply
+                ))
+                .is_ok());
+            // The worker's turn starts with the physical queue's request.
+            assert!(send
+                .try_send(Work::Supervised(Supervised::Start("mail".into())))
+                .is_ok());
+            drop(send);
+            let mut script = wire([vec![vec![0x84]], answer].concat());
+            let error = worker(
+                &mut script,
+                receive,
+                requests,
+                LoginPoll::new(Login::default()),
+                (
+                    Hostnames::default(),
+                    Application::default(),
+                    Installed::default(),
+                ),
+            )
+            .unwrap_err();
+            (error, script.requests.len(), answered.try_recv().ok())
+        };
+        let (_, asked, answer) = run(vec![
+            page(2, 7, b"\x00\x00\x01a"),
+            page(2, 8, b"\x01\x00\x01c"),
+            vec![0x83],
+        ]);
+        assert_eq!(answer, Some(GrantAnswer::Moved));
+        assert!(asked > 3, "the worker stopped after a moved listing");
+        let (_, asked, answer) = run(vec![b"\x8bno".to_vec(), vec![0x83]]);
+        assert_eq!(answer, Some(GrantAnswer::Refused("no".into())));
+        assert!(asked > 2, "the worker stopped after a refusal");
+        let (error, asked, answer) = run(vec![vec![0x8a, 0], vec![0x83]]);
+        assert!(error.contains("invalid grant request answer"), "{error}");
+        assert_eq!((asked, answer), (2, None));
+    }
+
+    /// The control queue carries a grant request to the worker, which
+    /// answers it once after the physical queue's work, and a launcher
+    /// refuses what root would end the generation over.
+    #[test]
+    fn the_worker_answers_a_grant_request_from_the_control_queue() {
+        let (send, receive) = mpsc::sync_channel::<Work>(QUEUE_CAPACITY);
+        let (control, requests) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let (reply, answer) = mpsc::sync_channel(1);
+        assert!(control
+            .try_send(ControlWork::Grants(
+                grant_request(GrantVerb::Revoke, "Downloads"),
+                reply
+            ))
+            .is_ok());
+        // The physical queue's request goes to root first.
+        assert!(send
+            .try_send(Work::Supervised(Supervised::Start("mail".into())))
+            .is_ok());
+        drop(send);
+        let mut script = wire(vec![
+            vec![0x84],
+            vec![0x8a, 3],
+            vec![0x83],
+            vec![0x9f, 0, 0],
+        ]);
+        assert!(worker(
+            &mut script,
+            receive,
+            requests,
+            LoginPoll::new(Login::default()),
+            (
+                Hostnames::default(),
+                Application::default(),
+                Installed::default()
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            answer.try_recv(),
+            Ok(GrantAnswer::Done(GrantOutcome::Revoked))
+        );
+        assert_eq!(
+            script.requests.get(..2),
+            Some(
+                &[
+                    b"\x0dmail".to_vec(),
+                    b"\x2c\x03\x00\x07firefoxDownloads".to_vec()
+                ][..]
+            )
+        );
+        let (launcher, queued) = Queued::launcher();
+        for (name, verb, path) in [
+            ("Firefox", GrantVerb::List, ""),
+            ("firefox", GrantVerb::List, "Downloads"),
+            ("firefox", GrantVerb::Revoke, ""),
+            (
+                "firefox",
+                GrantVerb::Revoke,
+                &"a".repeat(GRANT_PATH_BYTES + 1),
+            ),
+        ] {
+            let request = GrantRequest {
+                verb,
+                name: name.into(),
+                path: path.into(),
+            };
+            assert!(launcher.grants(request).is_err(), "{name} {path}");
+        }
+        assert!(launcher.grants(grant_request(GrantVerb::List, "")).is_ok());
+        assert!(queued.grants(Duration::from_secs(1)).is_some());
     }
 }

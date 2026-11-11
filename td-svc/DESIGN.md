@@ -243,7 +243,8 @@ keeps its leaf.
 
 There is a third case the model does not carry: a unit whose leader stays but
 whose real work moves on. `firefox-evidence`, `firefox-input`, `greeter`,
-`software-evidence` and `firefox-fetch` (whose leader, root's
+`software-evidence`, `grant-request`, `grant-evidence` and `firefox-fetch`
+(whose leader, root's
 `application-cache` operation, waits while td-login runs td-app) are that
 case — their leaders stay in the unit's leaf while the work
 they drive runs as td-login children elsewhere — so they are accounted for

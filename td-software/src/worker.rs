@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::grants::{self, Access, Grant};
 pub use crate::snapshot::Failure;
 use crate::snapshot::{self, Operation, Snapshot};
 
@@ -21,6 +22,12 @@ pub enum Job {
     Status(String),
     Operation(Operation, String),
     Launch(String),
+    /// The folders an application's account is granted.
+    Grants(String),
+    /// Grant it a folder below the home.
+    Grant(String, Access, String),
+    /// Take a folder's grant back.
+    Revoke(String, String),
 }
 
 /// Its answer.
@@ -29,6 +36,9 @@ pub enum Reply {
     Status(String, Box<Result<Snapshot, String>>),
     Operation(Operation, String, Result<(), Failure>),
     Launch(String, Result<(), String>),
+    Grants(String, Result<Vec<Grant>, String>),
+    /// What a grant or a revoke did, its one word, for the application.
+    Changed(String, Result<&'static str, Failure>),
 }
 
 /// The line a job writes.
@@ -37,6 +47,19 @@ pub fn line(job: &Job) -> String {
         Job::Status(name) => format!("status {name}\n"),
         Job::Operation(operation, name) => format!("{} {name}\n", operation.word()),
         Job::Launch(name) => format!("launch {name}\n"),
+        Job::Grants(name) => format!("grants application {name}\n"),
+        Job::Grant(name, access, path) => {
+            format!("grant application {name} {} {path}\n", access.word())
+        }
+        Job::Revoke(name, path) => format!("revoke application {name} {path}\n"),
+    }
+}
+
+/// The most of `job`'s answer read.
+fn limit(job: &Job) -> usize {
+    match job {
+        Job::Grants(_) => grants::MAX_ANSWER_BYTES,
+        _ => snapshot::MAX_ANSWER_BYTES,
     }
 }
 
@@ -52,14 +75,33 @@ pub fn reply(job: Job, text: Result<String, Failure>) -> Reply {
         }
         Job::Operation(operation, name) => Reply::Operation(operation, name, body.map(drop)),
         Job::Launch(name) => Reply::Launch(name, body.map(drop).map_err(|f| f.reason)),
+        Job::Grants(name) => {
+            let listed = body
+                .map_err(|failure| failure.reason)
+                .and_then(|body| grants::listing(&body));
+            Reply::Grants(name, listed)
+        }
+        Job::Grant(name, ..) => Reply::Changed(name, changed(body, false)),
+        Job::Revoke(name, _) => Reply::Changed(name, changed(body, true)),
     }
+}
+
+/// A grant's or a revoke's one word.
+fn changed(body: Result<String, Failure>, revoke: bool) -> Result<&'static str, Failure> {
+    // An answer that cannot be read may follow a change root made.
+    body.and_then(|body| {
+        grants::change(&body, revoke).map_err(|reason| Failure {
+            reason,
+            definite: false,
+        })
+    })
 }
 
 /// One conversation: the line written and the whole answer read, both
 /// within `CONVERSATION` and the answer within its bound. The connect
 /// itself has no bound std can set; it waits only while the control
 /// socket's backlog is full.
-fn ask(socket: &Path, line: &str) -> Result<String, Failure> {
+fn ask(socket: &Path, line: &str, limit: usize) -> Result<String, Failure> {
     let unsent = |reason: String| Failure {
         reason,
         definite: true,
@@ -100,7 +142,7 @@ fn ask(socket: &Path, line: &str) -> Result<String, Failure> {
             Ok(0) => break,
             Ok(count) => {
                 answer.extend_from_slice(buffer.get(..count).unwrap_or_default());
-                if answer.len() > snapshot::MAX_ANSWER_BYTES {
+                if answer.len() > limit {
                     return Err(unknown("the compositor's answer is too large".into()));
                 }
             }
@@ -124,7 +166,7 @@ fn ask(socket: &Path, line: &str) -> Result<String, Failure> {
 /// Runs one job against `socket`, or answers for a session without one.
 pub fn run(socket: Option<&Path>, job: Job) -> Reply {
     let text = match socket {
-        Some(socket) => ask(socket, &line(&job)),
+        Some(socket) => ask(socket, &line(&job), limit(&job)),
         None => Err(Failure {
             reason: "no compositor control socket: td-software runs in a td session".into(),
             definite: true,

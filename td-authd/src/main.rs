@@ -34,6 +34,7 @@ mod elevation;
     reason = "td-app's and td-jail's halves of the cache contract"
 )]
 mod flathub_app;
+mod grant_requests;
 mod grant_views;
 mod handoff;
 // Request 1a's kernel name and consent's hostname descriptions.
