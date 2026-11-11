@@ -744,3 +744,24 @@ about 8% headroom under 150,000; universal selectors, different states or
 larger caller fields can still refuse. Layers, containers, pseudo-elements,
 language selectors, functional colors, images and unsupported positioning
 and sizing values account for substantial remaining discarded CSS.
+
+## Computed-style sharing
+
+`sharing::StylePool` is an optional document-local owner of complete
+computed styles. `intern` returns an opaque StyleId; `get` borrows the
+canonical value. Equal values with equal custom properties share an ID,
+including separately computed siblings. Custom maps are canonicalized
+independently, and inherited token allocations retain their Arc sharing.
+A fingerprint only selects an equality bucket. Signed zero hashes alike.
+No global cache or tree dependency is introduced.
+
+PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
+MAX_POOL_WORK (67,108,864 field/component and string-byte visits), and
+MAX_STYLE_COMPARISONS (1,048,576 equality probes). These caller-adjustable
+pool limits are separate from the fixed parser/cascade limits in §5.
+Storage charges precede pool retention and include conservative map/node
+allowances, doubled vector/string capacity and nested token storage.
+Canonical custom maps and shared token allocations count once. Pool
+metadata stays charged even when a failed insertion retained only a new
+custom map. A refusal never returns an ID for an incomplete style.
+The newly computed candidate and cascade scratch remain caller costs.

@@ -1,0 +1,21 @@
+[package]
+name = "td-layout"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded document layout with shared styles and source identity"
+[workspace]
+[dependencies]
+td-html = { path = "../td-html" }
+td-css = { path = "../td-css" }
+td-dom = { path = "../td-dom" }
+[package.metadata.td-gate]
+clippy-all-targets = true
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

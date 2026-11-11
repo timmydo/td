@@ -78,7 +78,7 @@ allocation change before this workstream is complete.
 
 ## 3. Public data and source identity
 
-StyledDocument::new(document, sheets, limits) constructs shared styles and
+StyledDocument::new(document, sheets, input_bytes, limits) constructs shared styles and
 box records. NodeId always belongs to the borrowed document. StyleId is
 local to this styled document; accessors return Option for invalid IDs.
 The public layout entry takes the styled document, viewport dimensions,
@@ -200,7 +200,8 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | WORKING_BYTES | 64 MiB | measured transient/allocator allowance |
 | MAX_BOXES | 262,144 | box/source records |
 | MAX_STYLES | 16,384 | distinct complete computed styles |
-| MAX_STYLE_BYTES | 64 MiB | style pool within page budget |
+| MAX_POOL_BYTES | 64 MiB | style pool within page budget |
+| MAX_POOL_WORK | 67,108,864 | pool field/component and string-byte visits |
 | MAX_STYLE_COMPARISONS | 1,048,576 | pool equality probes |
 | MAX_DEPTH | 256 | layout ancestor stack |
 | MAX_LAYOUT_WORK | 64,000,000 | visited records/scalars per layout |

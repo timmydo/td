@@ -36,6 +36,7 @@ pub mod calc;
 pub mod cascade;
 pub mod conditions;
 pub mod selectors;
+pub mod sharing;
 pub mod syntax;
 pub mod values;
 pub mod variables;

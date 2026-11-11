@@ -14,7 +14,7 @@ type Tokens = Arc<[Component]>;
 type CustomValue = Option<Tokens>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CustomProperties {
-    entries: Arc<BTreeMap<String, CustomValue>>,
+    pub(crate) entries: Arc<BTreeMap<String, CustomValue>>,
     bytes: usize,
 }
 impl CustomProperties {
@@ -229,6 +229,12 @@ pub(crate) fn compute(
             .filter(|n| *n <= MAX_CUSTOM_BYTES)
             .ok_or(Error::Limit("MAX_CUSTOM_BYTES"))?;
         changes.push((name, value));
+    }
+    if changes
+        .iter()
+        .all(|(name, value)| inherited.entries.get(name) == Some(value))
+    {
+        return Ok(inherited);
     }
     let mut entries = (*inherited.entries).clone();
     for (name, value) in changes {

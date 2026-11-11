@@ -24,13 +24,13 @@ impl<T> Parsed<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Number {
     pub representation: String,
     pub integer: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Token {
     Ident(String),
     Function(String),
@@ -55,7 +55,7 @@ pub enum Token {
     Delim(char),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Component {
     Token(Token),
     Block {
