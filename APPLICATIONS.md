@@ -3347,16 +3347,28 @@ lower-level synthetic jail tests prove read-write Downloads, read-only
 Pictures, and a read-only regular-file grant, including recursive hardening of
 a separately writable nested mount. Those are confinement regressions rather
 than the system image's application selection. The current Firefox image
-prepares only its declared read-write Downloads source as a distinct self-bind
-before `switch_root`; it retains the graphical user's persistent storage and
-normal capacity while its mount root no longer aliases the reserved state
-subtree on the same Btrfs volume. Initialization performs that self-bind once
-before `switch_root`; it is not a restartable root service following mutable
-user state. A process killed in the create/unlink window of stage 2's writable
-grant probe can leave one randomly named `.td-jail-write-probe-*` file in that
-host directory. The synthetic client has the same window for one
-`.td-jail-rw-*` file in Downloads. The application user can remove either;
-normal error paths unlink them.
+prepares only its declared read-write Downloads source before `switch_root`,
+creating the directory when it is missing and mounting nothing at it, so
+that a symlink or non-directory there is reported at boot ("grant
+disabled") rather than only by a later refusal; it keeps the graphical
+user's persistent storage and normal capacity. Initialization does this
+once before `switch_root`; it is not a restartable root service following
+mutable user state, and it goes when grants are published per launch
+(WORKLOADS.md step 6). td-jail derives the identity a view of that source
+must show from the mount covering the human's home (the topmost mount at
+the home or, failing one, at its nearest ancestor), its device and root
+joined with the source's path below the home; mounts below the home do
+not count. It admits root's published view only when the two match, so a
+view of a sibling, an ancestor, a reserved tree, another device, a mount
+stacked over the source or over a directory between it and the home, or a
+source renamed or removed after publication is refused. Nothing pins the
+source's name, so renaming or removing it leaves Firefox unable to start
+until the views are released at shutdown (td-authd/DESIGN.md,
+"Application filesystem grants"). A process killed in the create/unlink
+window of stage 2's writable grant probe can leave one randomly named
+`.td-jail-write-probe-*` file in that host directory. The synthetic client
+has the same window for one `.td-jail-rw-*` file in Downloads. The
+application user can remove either; normal error paths unlink them.
 
 ### Environment
 
@@ -8862,8 +8874,10 @@ filesystem helper publishes only a Firefox Downloads view of the
 human's corresponding directory. These writable idmapped
 mounts preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
-resolution verifies their exact source mount identity and rejects nested
-mounts outside that declared source or aliases to protected state. The
+resolution verifies their exact source mount identity, which it derives
+from the mount covering the human's home and the directory's path below
+it, and rejects nested mounts outside that declared source or aliases to
+protected state. The
 portal retains its separate read-only mapped Downloads view. It also has
 one writable view, `/var/td-portal-files/1000/Opened`, of Firefox's private
 mode-0700 `Opened` directory under Firefox's application home, mapping

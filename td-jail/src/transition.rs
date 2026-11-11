@@ -10830,6 +10830,14 @@ mod tests {
         };
 
         check(base).unwrap();
+        // A grant of a home child needs no mount at the source: with the
+        // fixture's row there removed, the same grant is admitted.
+        let unmarked = base.replace(
+            "5 4 0:18 /@var/home/tester/Downloads /var/home/tester/Downloads rw - btrfs volume rw\n",
+            "",
+        );
+        assert_ne!(unmarked, base);
+        check(&unmarked).unwrap();
 
         let own_home_nested = format!(
             "{base}6 5 0:18 /@var/home/tester/Documents \

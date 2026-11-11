@@ -1981,24 +1981,92 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
     }
     require_owned_directory(&view, (uid, uid), true)?;
     let account = crate::primary_account::load()?;
-    let identity = projection_identity(mountinfo, &view, &account, component)?;
+    let identity = projection_identity(mountinfo, &view, &account, Path::new(component))?;
     Ok(Some((view, identity)))
 }
 
+/// The view's identity, when it is that of the human's `relative`
+/// directory as `human_source_identity` derives it.
 fn projection_identity(
     mountinfo: &str,
     view: &Path,
     account: &crate::primary_account::PrimaryAccount,
-    component: &str,
+    relative: &Path,
 ) -> io::Result<MountIdentity> {
     let identity = mount_identity_for_path(mountinfo, view)?;
-    let human = mount_identity_for_path(mountinfo, &account.persistent_home().join(component))?;
-    if identity != human {
+    let human = human_source_identity(mountinfo, &account.persistent_home(), relative)?;
+    // Path equality ignores repeated separators, and the kernel shows a
+    // removed directory's root as `PATH//deleted`, which would otherwise
+    // equal a directory named `deleted` below PATH; the roots must also
+    // match byte for byte, for a home whose covering root was removed.
+    if identity
+        .root
+        .as_os_str()
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair == b"//")
+        || identity != human
+        || identity.root.as_os_str() != human.root.as_os_str()
+    {
         return Err(invalid(
             "application projection does not name its declared human directory",
         ));
     }
     Ok(identity)
+}
+
+/// What a view of the human's `relative` directory must show: the device
+/// and root of the mount covering `home` (the topmost mount at the home or,
+/// failing one, at its nearest ancestor), joined with `relative`. Mounts
+/// below the home, between it and the directory or at the directory, do
+/// not count, so a view cloned from one stacked over the directory or an
+/// intermediate directory, or from a sibling, an ancestor, a reserved tree
+/// or another device, shows something else, and no mount need mark the
+/// directory for its view to be admitted.
+fn human_source_identity(
+    mountinfo: &str,
+    home: &Path,
+    relative: &Path,
+) -> io::Result<MountIdentity> {
+    validate_human_relative(relative.as_os_str().as_bytes()).map_err(invalid)?;
+    let mut identity = mount_identity_for_path(mountinfo, home)?;
+    identity.root.push(relative);
+    Ok(identity)
+}
+
+const MAX_HUMAN_RELATIVE_BYTES: usize = 1024;
+const MAX_HUMAN_RELATIVE_DEPTH: usize = 16;
+const MAX_PATH_NAME_BYTES: usize = 255;
+
+/// A human directory's path below the home, as spelled: one to
+/// `MAX_HUMAN_RELATIVE_DEPTH` names joined by single `/`, none empty, `.`
+/// or `..`, holding NUL or longer than a filesystem name may be. It reads
+/// bytes, not `Path` components, which normalise `a//b`, `a/./b` and a
+/// trailing `/` away, and depends on nothing in td-jail.
+fn validate_human_relative(relative: &[u8]) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "human directory {:?} {why}",
+            String::from_utf8_lossy(relative)
+        ))
+    };
+    if relative.is_empty() || relative.len() > MAX_HUMAN_RELATIVE_BYTES {
+        return refuse("is empty or too long");
+    }
+    let mut depth = 0_usize;
+    for name in relative.split(|byte| *byte == b'/') {
+        depth = depth.saturating_add(1);
+        if name.is_empty() || name == b"." || name == b".." {
+            return refuse("is not a plain path below the home");
+        }
+        if name.contains(&0) || name.len() > MAX_PATH_NAME_BYTES {
+            return refuse("holds an invalid name");
+        }
+    }
+    if depth > MAX_HUMAN_RELATIVE_DEPTH {
+        return refuse("is too deep");
+    }
+    Ok(())
 }
 
 fn require_projection_mounts(
@@ -3856,7 +3924,7 @@ mod tests {
                 source.root,
                 Path::new(&format!("/@var/home/{name}/Downloads"))
             );
-            let admitted = projection_identity(mounts, view, &account, "Downloads");
+            let admitted = projection_identity(mounts, view, &account, Path::new("Downloads"));
             if name == "alice" {
                 assert_eq!(admitted.unwrap(), source);
             } else {
@@ -3876,7 +3944,6 @@ mod tests {
 25 22 0:19 /@var /var rw,nosuid,nodev,relatime - btrfs none rw\n\
 24 22 0:22 / /run rw,relatime - tmpfs tmpfs rw,mode=755\n\
 21 22 0:18 / /tmp rw,relatime - tmpfs tmpfs rw\n\
-20 25 0:19 /@var/home/timmy/Downloads /var/home/timmy/Downloads rw,nosuid,nodev,relatime - btrfs none rw\n\
 33 25 0:19 /@var/home/timmy/Downloads /var/td-portal-files/1000/Downloads ro,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
 34 25 0:19 /@var/lib/td/applications/65536/Opened /var/td-portal-files/1000/Opened rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
 35 25 0:19 /@var/home/timmy/Downloads /var/lib/td/applications/65536/Downloads rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n";
@@ -3946,7 +4013,7 @@ mod tests {
         ] {
             let aliased = format!(
                 "{stock}36 25 0:19 {shown} /var/lib/td/applications/65537/alias rw,nosuid,nodev - btrfs none rw\n\
-                 37 20 0:19 {shown} /var/home/timmy/Downloads/alias rw,nosuid,nodev - btrfs none rw\n"
+                 37 25 0:19 {shown} /var/home/timmy/Downloads/alias rw,nosuid,nodev - btrfs none rw\n"
             );
             let view = mount_identity_for_path(
                 &aliased,
@@ -4004,6 +4071,219 @@ mod tests {
                 &BTreeSet::from([protected])
             )
             .is_err());
+        }
+
+        // The view's source identity is derived from the mount covering the
+        // human's home; nothing is mounted at the source. Views of any other
+        // tree, and views of a mount stacked over the source, are refused.
+        let account =
+            crate::primary_account::parse("alice:x:1000:1000:human:/home/alice:/bin/sh\n").unwrap();
+        let base = "\
+22 2 7:0 / / ro,relatime - erofs /dev/loop0 ro\n\
+24 22 0:22 / /run rw,relatime - tmpfs tmpfs rw,mode=755\n\
+23 24 0:19 / /run/td-volume ro,nosuid,nodev,noexec,relatime - btrfs none rw\n\
+25 22 0:19 /@var /var rw,nosuid,nodev,relatime - btrfs none rw\n";
+        let view = Path::new("/var/lib/td/applications/65536/Downloads");
+        let published = |extra: &str, device: &str, shown: &str| {
+            format!(
+                "{base}{extra}35 25 {device} {shown} {} rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n",
+                view.display()
+            )
+        };
+        let downloads = Path::new("Downloads");
+        let admitted = projection_identity(
+            &published("", "0:19", "/@var/home/alice/Downloads"),
+            view,
+            &account,
+            downloads,
+        )
+        .unwrap();
+        assert_eq!(admitted, identity("0:19", "/@var/home/alice/Downloads"));
+        // A home on a mount of its own is that mount's directory, and the
+        // directory the mount hides is not the human's.
+        let own = "26 25 0:19 /@alice /var/home/alice rw,nosuid,nodev - btrfs none rw\n";
+        assert_eq!(
+            projection_identity(
+                &published(own, "0:19", "/@alice/Downloads"),
+                view,
+                &account,
+                downloads
+            )
+            .unwrap(),
+            identity("0:19", "/@alice/Downloads")
+        );
+        assert!(projection_identity(
+            &published(own, "0:19", "/@var/home/alice/Downloads"),
+            view,
+            &account,
+            downloads
+        )
+        .is_err());
+        for (device, shown) in [
+            ("0:19", "/@var/home/alice/src"),
+            ("0:19", "/@var/home/alice"),
+            ("0:19", "/@var/home/alice/Downloads/nested"),
+            ("0:19", "/@var/home/bob/Downloads"),
+            ("0:19", "/@var/home/alice/.td"),
+            ("0:19", "/@var/lib/td/secrets"),
+            ("0:19", "/"),
+            ("0:8", "/@var/home/alice/Downloads"),
+            // The source renamed away after its view was published, and the
+            // source removed (the kernel's spelling of a deleted root).
+            ("0:19", "/@var/home/alice/old"),
+            ("0:19", "/@var/home/alice/Downloads//deleted"),
+        ] {
+            assert!(
+                projection_identity(&published("", device, shown), view, &account, downloads)
+                    .is_err(),
+                "{device} {shown}"
+            );
+        }
+        // A removed `Downloads` is refused even where the declared directory
+        // is a child named `deleted`, which Path equality cannot tell apart.
+        assert!(projection_identity(
+            &published("", "0:19", "/@var/home/alice/Downloads//deleted"),
+            view,
+            &account,
+            Path::new("Downloads/deleted")
+        )
+        .is_err());
+        assert!(projection_identity(
+            &published("", "0:19", "/@var/home/alice/Downloads/deleted"),
+            view,
+            &account,
+            Path::new("Downloads/deleted")
+        )
+        .is_ok());
+        // Mounts at the home or above it are its covering mount: the topmost
+        // of two stacked at the home, or one stacked at an ancestor.
+        for (covering, admitted, hidden) in [
+            (
+                "26 25 0:19 /@alice /var/home/alice rw,nosuid,nodev - btrfs none rw\n\
+                 27 26 0:30 /two /var/home/alice rw,nosuid,nodev - btrfs other rw\n",
+                ("0:30", "/two/Downloads"),
+                ("0:19", "/@alice/Downloads"),
+            ),
+            (
+                "26 25 0:40 /homes /var/home rw,nosuid,nodev - btrfs homes rw\n",
+                ("0:40", "/homes/alice/Downloads"),
+                ("0:19", "/@var/home/alice/Downloads"),
+            ),
+        ] {
+            assert_eq!(
+                projection_identity(
+                    &published(covering, admitted.0, admitted.1),
+                    view,
+                    &account,
+                    downloads
+                )
+                .unwrap(),
+                identity(admitted.0, admitted.1)
+            );
+            assert!(projection_identity(
+                &published(covering, hidden.0, hidden.1),
+                view,
+                &account,
+                downloads
+            )
+            .is_err());
+        }
+        // A home whose covering mount's root was removed derives
+        // `/@alice//deleted/Downloads`, which no view of a live directory
+        // named `deleted` may match.
+        assert!(projection_identity(
+            &published(
+                "26 25 0:19 /@alice//deleted /var/home/alice rw,nosuid,nodev - btrfs none rw\n",
+                "0:19",
+                "/@alice/deleted/Downloads"
+            ),
+            view,
+            &account,
+            downloads
+        )
+        .is_err());
+        // A directory deeper below the home: a mount at an intermediate
+        // directory does not stand in for the home's tree.
+        let music = Path::new("Music/new");
+        let intermediate = "26 25 0:30 / /var/home/alice/Music rw,nosuid,nodev - tmpfs tmpfs rw\n";
+        for extra in ["", intermediate] {
+            assert_eq!(
+                projection_identity(
+                    &published(extra, "0:19", "/@var/home/alice/Music/new"),
+                    view,
+                    &account,
+                    music
+                )
+                .unwrap(),
+                identity("0:19", "/@var/home/alice/Music/new")
+            );
+        }
+        assert!(projection_identity(
+            &published(intermediate, "0:30", "/new"),
+            view,
+            &account,
+            music
+        )
+        .is_err());
+        // A mount stacked over the source is not the human's directory,
+        // whether another filesystem or another tree of the same one.
+        for (stacked, device, root) in [
+            (
+                "26 25 0:30 / /var/home/alice/Downloads rw,nosuid,nodev - tmpfs tmpfs rw\n",
+                "0:30",
+                "/",
+            ),
+            (
+                "26 25 0:19 /@var/lib/td/secrets /var/home/alice/Downloads rw,nosuid,nodev - btrfs none rw\n",
+                "0:19",
+                "/@var/lib/td/secrets",
+            ),
+        ] {
+            let mounts = published(stacked, device, root);
+            assert_eq!(
+                mount_identity_for_path(&mounts, Path::new("/var/home/alice/Downloads")).unwrap(),
+                identity(device, root)
+            );
+            assert!(
+                projection_identity(&mounts, view, &account, downloads).is_err(),
+                "{stacked}"
+            );
+        }
+        for relative in [
+            "",
+            "/Downloads",
+            "../Downloads",
+            "Downloads/../.td",
+            "./Downloads",
+            "Downloads/",
+            "Downloads//x",
+            "Downloads/.",
+            "a/./b",
+            "a//b",
+            "a\0b",
+        ] {
+            assert!(
+                human_source_identity(base, Path::new("/var/home/alice"), Path::new(relative))
+                    .is_err(),
+                "{relative:?}"
+            );
+        }
+        // Bounds: a name of 255 bytes, 16 names and 1024 bytes are the most.
+        let name = |length: usize| "n".repeat(length);
+        let longest = name(MAX_PATH_NAME_BYTES);
+        let deepest = vec!["d"; MAX_HUMAN_RELATIVE_DEPTH].join("/");
+        let fullest =
+            |last: usize| format!("{longest}/{longest}/{longest}/{}/{}", name(200), name(last));
+        assert_eq!(fullest(55).len(), MAX_HUMAN_RELATIVE_BYTES);
+        for admitted in [longest.clone(), deepest.clone(), fullest(55)] {
+            validate_human_relative(admitted.as_bytes()).unwrap();
+        }
+        for refused in [
+            name(MAX_PATH_NAME_BYTES + 1),
+            format!("{deepest}/d"),
+            fullest(56),
+        ] {
+            validate_human_relative(refused.as_bytes()).unwrap_err();
         }
         assert!(private_application_home(Path::new(
             "/var/lib/td/applications/65536"

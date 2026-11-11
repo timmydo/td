@@ -331,7 +331,6 @@ const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
 const PORTAL_FILE_CHOOSER_COMPLETED: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const FIREFOX_DOWNLOAD_NAME: &str = "td-firefox-download.txt";
-const FIREFOX_XDG_MOUNT_MARKER: &str = "/run/td-firefox-downloads-mounted";
 const FIREFOX_EVIDENCE_PATH: &str = "/run/td-firefox-evidence-ok";
 const FIREFOX_EVIDENCE_TMP_PATH: &str = "/run/.td-firefox-evidence.tmp";
 const FIREFOX_EVIDENCE: &str = "td-firefox-evidence-v1";
@@ -3011,9 +3010,6 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then\n\
            /bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\"\n\
            /bin/td-util chmod 0700 \"/sysroot$downloads\"\n\
-           /bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\"\n\
-           /bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
-           /bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
          else\n\
            echo 'td-init: cannot prepare Firefox Downloads source; grant disabled' >&2\n\
          fi\n"
@@ -3087,7 +3083,7 @@ fn build_tty_session() -> String {
 
 fn build_shutdown(sys: &SystemDef) -> String {
     if !sys.desktop() {
-        // No application or portal files to release and no Downloads bind.
+        // No application or portal files to release.
         return format!(
             "#!/bin/sh\n\
              ok=1\n\
@@ -3116,9 +3112,6 @@ fn build_shutdown(sys: &SystemDef) -> String {
          /bin/td-authd release-application-files firefox || {{ echo 'td-shutdown: Firefox file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-handoff || {{ echo 'td-shutdown: portal handoff release failed' >&2; ok=0; }}\n\
-         if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
-           downloads=$(/bin/td-util cat {FIREFOX_XDG_MOUNT_MARKER}) && /bin/umount \"$downloads\" || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
-         fi\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
          /bin/td-util test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
@@ -8911,7 +8904,8 @@ mod tests {
             Some(format!("/var{UI_HOME}").as_str())
         );
         assert!(jail.contains("crate::primary_account::load()?"));
-        assert!(jail.contains("account.persistent_home().join(component)"));
+        assert!(jail.contains("fn human_source_identity("));
+        assert!(jail.contains("&account.persistent_home(),"));
         let application_grants = include_str!("../../../td-authd/src/application_files.rs");
         assert!(application_grants.contains(
             "portal_files::child(&homes, account.name(), crate::primary_account::UID, true)?"
@@ -13509,28 +13503,34 @@ mod tests {
              EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
         let shutdown = build_shutdown(&SYSTEM);
-        let xdg_guard = format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
-        let download_unmount = "/bin/umount \"$downloads\" || {";
+        let var_unmount = "/bin/umount /var || {";
         assert!(
             shutdown.contains("/bin/td-init sync || {")
-                && shutdown.contains(&download_unmount)
-                && shutdown.contains("/bin/umount /var || {")
+                && shutdown.contains(var_unmount)
                 && shutdown.contains("/bin/umount -a -r --exclude /run || {")
                 && shutdown.contains("/bin/td-util test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
         );
-        let portal_release = "/bin/td-authd release-portal-files || {";
-        assert_eq!(shutdown.matches(portal_release).count(), 1);
-        assert!(shutdown.find(portal_release) < shutdown.find(&download_unmount));
-        let handoff_release = "/bin/td-authd release-portal-handoff || {";
-        assert_eq!(shutdown.matches(handoff_release).count(), 1);
-        assert!(shutdown.find(handoff_release) < shutdown.find("/bin/umount /var || {"));
-        assert_eq!(shutdown.matches(&xdg_guard).count(), 1);
-        assert!(
-            shutdown.find(&xdg_guard) < shutdown.find(&download_unmount)
-                && shutdown.find(&download_unmount) < shutdown.find("/bin/umount /var || {"),
-            "Firefox's Downloads self-bind must be released only when init installed it"
+        assert_eq!(shutdown.matches(var_unmount).count(), 1);
+        for release in [
+            "/bin/td-authd release-application-files firefox || {",
+            "/bin/td-authd release-portal-files || {",
+            "/bin/td-authd release-portal-handoff || {",
+        ] {
+            assert_eq!(shutdown.matches(release).count(), 1, "{release}");
+            assert!(
+                shutdown.find(release) < shutdown.find(var_unmount),
+                "{release} must precede unmounting /var"
+            );
+        }
+        // Init mounts nothing at the human's Downloads, so shutdown unmounts
+        // only /var and then everything else: the views above are released
+        // by td-authd, and no other umount names a path of its own.
+        assert_eq!(
+            shutdown.matches("/bin/umount ").count(),
+            2,
+            "shutdown must unmount only /var and the final sweep"
         );
     }
 
@@ -13909,8 +13909,6 @@ mod tests {
     fn firefox_downloads_is_prepared_once_before_switch_root() {
         let init = build_deployment_init(&SYSTEM);
         let source_mkdir = format!("elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then");
-        let download_mount =
-            format!("/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\"");
         let download_link_guard =
             format!("if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then");
         let download_directory_guard = format!(
@@ -13918,38 +13916,34 @@ mod tests {
         );
         let source_chown = format!("/bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\"");
         let source_chmod = format!("/bin/td-util chmod 0700 \"/sysroot$downloads\"");
-        let mount_marker = format!(
-            "/bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}"
-        );
         let downloads_end = "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'";
         assert_eq!(init.matches(&source_mkdir).count(), 1);
         assert_eq!(init.matches(&download_link_guard).count(), 1);
         assert_eq!(init.matches(&download_directory_guard).count(), 1);
         assert_eq!(init.matches(&source_chown).count(), 1);
         assert_eq!(init.matches(&source_chmod).count(), 1);
-        assert_eq!(init.matches(&download_mount).count(), 1);
-        assert_eq!(init.matches(&mount_marker).count(), 1);
         assert_eq!(init.matches("grant disabled").count(), 3);
+        let setup = init
+            .split_once(&download_link_guard)
+            .expect("Firefox Downloads setup start")
+            .1
+            .split_once(downloads_end)
+            .expect("Firefox Downloads setup end")
+            .0;
         assert!(
-            !init
-                .split_once(&download_link_guard)
-                .expect("Firefox Downloads setup start")
-                .1
-                .split_once(downloads_end)
-                .expect("Firefox Downloads setup end")
-                .0
-                .contains("exit 1"),
+            !setup.contains("exit 1"),
             "untrusted persistent Downloads entries must disable the grant, not abort init"
         );
+        // td-jail derives the source's identity from the home's mount, so
+        // init makes the directory and mounts nothing at it.
+        assert!(!setup.contains("/bin/mount") && !setup.contains("/run/"));
         assert!(
             init.find(&download_link_guard) < init.find(&download_directory_guard)
                 && init.find(&download_directory_guard) < init.find(&source_mkdir)
                 && init.find(&source_mkdir) < init.find(&source_chown)
                 && init.find(&source_chown) < init.find(&source_chmod)
-                && init.find(&source_chmod) < init.find(&download_mount)
-                && init.find(&download_mount) < init.find(&mount_marker)
-                && init.find(&mount_marker) < init.find("exec /bin/switch_root /sysroot /init"),
-            "the Downloads self-bind must precede switch_root"
+                && init.find(&source_chmod) < init.find("exec /bin/switch_root /sysroot /init"),
+            "the Downloads source must be prepared before switch_root"
         );
     }
 
@@ -14110,11 +14104,9 @@ mod tests {
         assert!(init.find("/bin/umount /dev").unwrap() < init.find("/bin/switch_root").unwrap());
         assert!(init.find(prepare).unwrap() < init.find("/bin/switch_root").unwrap());
         assert!(!init.contains("/home/tester") && !init.contains("/home/alice"));
-        assert!(init.contains("downloads=\"$primary_home/Downloads\""));
-        assert!(init.contains("/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\""));
-        assert!(init.contains(&format!(
-            "/bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}"
-        )));
+        let downloads = "downloads=\"$primary_home/Downloads\"";
+        assert_eq!(init.matches(downloads).count(), 1);
+        assert!(init.find(prepare).unwrap() < init.find(downloads).unwrap());
         let deployment = build_initramfs_spec("deployment-init", Phase::Deployment);
         let selector = build_initramfs_spec("selector-init", Phase::Selector);
         assert!(deployment.contains(

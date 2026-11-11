@@ -1595,10 +1595,38 @@ grant. This shared directory is outside the private per-application state
 boundary; arbitrary deletion or renaming by its owner can also deny it.
 
 Jail admission permits only the declared projection's source identities,
-including its root, through the otherwise reserved home boundary. The
-maintenance backing-volume ancestor remains read-only and grants no
-sibling state. Nested mounts pointing outside the declared human source
-and protected mounts at or below it are refused.
+including its root, through the otherwise reserved home boundary. It
+derives the root's identity from the mount covering the human's home (the
+topmost mount at the home or, failing one, at its nearest ancestor)
+joined with the declared directory's path below it. Mounts below the
+home, between it and the directory or at the directory, do not count:
+nothing need be mounted at the source, and a view of a mount stacked
+over the source or over a directory between it and the home is refused.
+A view root the kernel shows with `//` (`PATH//deleted`, a removed
+directory) is refused. The maintenance backing-volume ancestor remains
+read-only and grants no sibling state. Nested mounts pointing outside
+the declared human source and protected mounts at or below it are
+refused.
+
+Nothing pins the source's name while its views exist. If the human
+renames or removes `Downloads` after preparation, Firefox's view and the
+portal's read-only view keep showing the old directory; the view's root
+then names the new path or `PATH//deleted`, so jail admission refuses
+every later Firefox launch and a repeated preparation refuses the
+present view (`require_same_directory`) until shutdown releases the
+views, and the portal keeps serving the old directory. Nothing is
+admitted wrongly; the human has made their own grant unavailable until
+the next boot. Per-launch publication, which releases and republishes a
+stale view, removes this limit (WORKLOADS.md step 6).
+
+The publisher does not yet check the source's mount. A directory with a
+mount stacked on it is opened across that mount, so preparation
+publishes a view of the stacked tree, and only jail admission refuses
+it, far from the cause; the portal's read-only view has no such check.
+Stacking a mount there takes root, and the failure is closed: Firefox
+does not start. The per-launch publisher of WORKLOADS.md step 6 closes
+the gap by refusing a source whose mount is not the home's covering
+mount.
 
 ## Immutable consent description prerequisite
 

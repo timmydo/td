@@ -340,6 +340,8 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n\
             Path::new("/var/td-store-link")
         )
         .is_err());
+        // The image mounts nothing at a home child, but one mounted there
+        // (an older image's self-bind of Downloads) leaves the layout valid.
         assert!(require_layout(
             &account("tester"),
             &format!("{IMAGE}/dev/vda /var/home/tester/Downloads none rw,nodev,nosuid,bind 0 0\n"),

@@ -60,7 +60,9 @@ Already built and reused by this design:
 - root-made, value-pinned idmapped views of the human's files:
   `prepare-portal-files` (Downloads, 1000→991, read-only) and
   `prepare-application-files firefox` (Downloads, 1000→65536)
-  (td-authd/DESIGN.md; `UNSAFE.md` §16);
+  (td-authd/DESIGN.md; `UNSAFE.md` §16), the second of which td-jail
+  admits by comparing it with the identity it derives for the human's
+  directory from the mount covering the human's home;
 - the signed Flathub runtime fetch and its generations, in the runtime
   store below, and the leases a launch holds on them (`APPLICATIONS.md`
   §W.9);
@@ -259,6 +261,11 @@ account.
    directory; an application the image ships keeps needing a carried
    row from the carried block, since nothing allocates at boot).
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
+   In three landings, the first landed: td-jail derives the identity a
+   view of a human directory must show from the mount covering the
+   human's home and the directory's path below it, so nothing is mounted
+   at a granted directory to mark it, and init no longer binds
+   `Downloads` onto itself (`APPLICATIONS.md` §C, "Filesystem grants").
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is

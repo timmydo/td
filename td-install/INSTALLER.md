@@ -1854,10 +1854,9 @@ its complete primary-account tables before packing. The deployment
 initramfs packs the source-built static provisioner and runs this operation before unmounting procfs or entering the root. The
 selector does not pack it. Generic early directory creation excludes the
 primary UID. Downloads preparation derives its path from the returned
-home and retains its existing grant policy; it records the successful
-self-bind path in a root-owned mode-0600 file under `/run`. Shutdown uses
-that private record to release the same bind before `/var`, after the
-application and portal views are released. Invalid home ownership or
+home and retains its existing grant policy; it mounts nothing there.
+Shutdown releases the application and portal views of it before `/var`.
+Invalid home ownership or
 type stops boot and requires inspection from a trusted recovery
 environment; user changes to home permissions do not prevent boot.
 A successful profile emits `td-firstboot: primary home created|present
