@@ -3117,13 +3117,14 @@ all-target Clippy.
 
 The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds
 the crate with cargo on td's Rust toolchain, staging the
-`td-civil`, `td-fs`, `td-jpeg`, `td-ui`, `td-compositor` and
-`td-test-compositor` trees beside it so the calendar and the decoder
+`td-alloc`, `td-av1`, `td-civil`, `td-fs`, `td-jpeg`, `td-ui`,
+`td-compositor` and `td-test-compositor` trees beside it so the calendar and the decoder
 resolve, the toolkit's `#[path]` mounts and embedded notices resolve as
 the sources name them, and the tests' dev-dependencies resolve, links
 the binary fully static and splits its debug companion: the td-editor
-and td-taskmgr shape, with a lock that lists only td-photo, td-civil,
-td-jpeg, td-ui and the dev-only td-fs and td-test-compositor. The
+and td-taskmgr shape, with a lock that lists only td-photo, td-alloc,
+td-av1, td-civil, td-jpeg, td-ui and the dev-only td-fs and
+td-test-compositor. The
 system image
 (`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe
 output, companion included, into the immutable root and links

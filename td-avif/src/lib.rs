@@ -96,8 +96,7 @@ pub fn header(bytes: &[u8]) -> Result<Header, Error> {
 pub fn primary_image(bytes: &[u8]) -> Result<ImageItem, Error> {
     let item = container::parse(bytes)?;
     let mut data = Vec::new();
-    data.try_reserve_exact(item.length)
-        .map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut data, item.length).map_err(|_| Error::Limit)?;
     for extent in item.extents {
         data.extend_from_slice(extent);
     }
@@ -146,7 +145,7 @@ pub fn decode(bytes: &[u8]) -> Result<Rgba8, Error> {
     let image = td_av1::decode(&item.data).map_err(codec_error)?;
     drop(item.data);
     let mut rgba = Vec::new();
-    rgba.try_reserve_exact(header.width * header.height * 4)
+    td_alloc::reserve_exact(&mut rgba, header.width * header.height * 4)
         .map_err(|_| Error::Limit)?;
     let [y, u, v] = &image.planes;
     let chroma_width = header.width.div_ceil(2);

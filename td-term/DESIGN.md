@@ -24,7 +24,8 @@ td-term is its own crate, `td-term/`, and its own static binary. Its manifest
 declares two dependencies, `td-fs = { path = "../td-fs" }`, whose atomic
 replace installs the runtime terminfo entry and whose bounded read takes
 `/proc/self/status` and `/etc/passwd`, and `td-ui = { path =
-"../td-ui" }`, and its lock lists exactly td-term, td-fs and td-ui. It is a
+"../td-ui" }`, and its lock lists exactly td-term, td-fs, td-ui and the
+transitive td-alloc sibling. It is a
 td-ui client like td-editor or td-portal's chooser: the Wayland wire codec,
 the connection and its SCM_RIGHTS transport, the object table, the seat,
 keymap compilation, key repeat, pointer decoding, the data device, and the
@@ -1845,7 +1846,8 @@ terminal, and td-term's prove the program:
 ## 7. Running outside td
 
 td-term builds on any host with the pinned Rust toolchain, with no
-dependency but its siblings td-fs and td-ui, and runs under any Wayland
+external dependency, using td-fs, td-ui and their sibling dependencies,
+and runs under any Wayland
 compositor that offers `wl_seat` version 5 or later, `wl_shm` and
 `xdg_shell` -- sway, for one, in place of foot:
 

@@ -3,13 +3,21 @@
 version = 4
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-av1"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-avif"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-av1",
 ]
 
@@ -20,6 +28,9 @@ version = "0.1.0"
 [[package]]
 name = "td-gif"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-html"
@@ -28,14 +39,23 @@ version = "0.1.0"
 [[package]]
 name = "td-jpeg"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-png"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-ui"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-url"
@@ -45,6 +65,7 @@ version = "0.1.0"
 name = "td-web"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-avif",
  "td-fetch-client",
  "td-gif",
@@ -59,3 +80,6 @@ dependencies = [
 [[package]]
 name = "td-webp"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]

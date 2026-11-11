@@ -1,6 +1,6 @@
 # td-ui
 
-td-ui is the dependency-free Rust toolkit that td-owned graphical programs
+td-ui is the std-only Rust toolkit that td-owned graphical programs
 share. Today it carries the pinned Unifont face and wire codec, the XKB
 keyboard translation, repeat policy and pointer decoding, the clipped XRGB
 raster with its palette and scrollbar geometry, the Wayland client
@@ -4568,3 +4568,6 @@ call inventory, and a PTY restoration test pin the implementation.
 The relay terminal guard cannot cross threads: its signal mask belongs to
 the entering thread. Restoration attempts both termios and the signal mask,
 even if the terminal has disappeared.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

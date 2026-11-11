@@ -1,7 +1,7 @@
 # td-av1
 
 This standalone, std-only crate owns the AV1 arithmetic shared by td's
-picture codecs, a still-picture encoder and a bounded still-picture decoder. It forbids unsafe code and has no dependencies. No module
+picture codecs, a still-picture encoder and a bounded still-picture decoder. It forbids unsafe code and depends only on the sibling `td-alloc` crate. No module
 opens files, reads the environment, obtains time, starts threads itself or reaches
 network/process services.
 
@@ -275,3 +275,6 @@ Fixtures include td-encoded pictures independently decoded by dav1d 1.5.1
 and libaom 3.8.0 pictures decoded by dav1d. Tests pin exact YUV planes,
 tile edges, odd/thin geometry, truncation, symbol admission and a
 deterministic mutation corpus. The codec tests require no external tool.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

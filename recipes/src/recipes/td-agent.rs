@@ -25,6 +25,7 @@ pub fn recipe() -> Recipe {
             "td-png",
             "td-remote",
             "td-toml",
+            "td-alloc",
             "td-ui",
             "td-url",
             "td-util",
@@ -64,6 +65,7 @@ mod tests {
                 "td-png".into(),
                 "td-remote".into(),
                 "td-toml".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-url".into(),
                 "td-util".into(),
@@ -87,18 +89,8 @@ mod tests {
     /// by a literal `#[path]` or `include` macro, transitively.
     #[test]
     fn the_staged_trees_are_the_closure_its_manifest_and_files_name() {
-        let manifest = include_str!("../../../td-agent/Cargo.toml");
-        let mut crates = vec!["td-agent"];
-        for line in manifest.lines() {
-            if let Some((_, rest)) = line.split_once("{ path = \"../") {
-                if !line.trim_start().starts_with('#') {
-                    crates.push(rest.split('"').next().unwrap());
-                }
-            }
-        }
-        let (mut trees, mounts) = crate::source_closure::trees_named(&crates);
+        let (mut trees, mounts) = crate::source_closure::cargo_trees_named(&["td-agent"]);
         assert!(mounts > 10, "{mounts}");
-        trees.extend(crates.iter().map(|name| name.to_string()));
         trees.remove("td-agent");
         let staged: std::collections::BTreeSet<String> = recipe()
             .local_source_trees

@@ -325,6 +325,10 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "the shared xz decoder (td-builder and td-feed), the shared gzip decoder, target-static td-install and target-static td-boot (each through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
     ),
     (
+        "td-alloc/src/lib.rs",
+        "td-builder source extraction, raw inflate consumers, image decoders and UI picture fitting",
+    ),
+    (
         "td-inflate/src/gzip.rs",
         "td-builder source extraction, the bounded OSTree importer, target-static td-util's gunzip and zcat, and td-png's image data (raw DEFLATE)",
     ),
@@ -756,7 +760,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    if p == "td-inflate/src/gzip.rs" {
+    if matches!(p, "td-inflate/src/gzip.rs" | "td-alloc/src/lib.rs") {
         sel.add_preflight("cargo-test");
         sel.add_preflight("net-test");
         // engine/ is staged into the td-net seed, but that is re-derived LIVE
@@ -769,7 +773,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // crate is selected as for any other target-included source.
         sel.add_target("recipe-checks");
         sel.add_note(&format!(
-            "td-inflate/src/gzip.rs is shared by {}: check-engine is the fast signal, recipe-checks builds the target crate, and the full check exercises the from-source consumer.",
+            "{p} is shared by {}: check-engine is the fast signal, recipe-checks builds the target crate, and the full check exercises the from-source consumer.",
             target_included_consumers(p).unwrap_or("td-builder source extraction")
         ));
         return;
@@ -2518,6 +2522,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "engine/src/sha256.rs",
         "engine/src/flathub_app.rs",
         "engine/src/crc32.rs",
+        "td-alloc/src/lib.rs",
         "td-inflate/src/gzip.rs",
         "engine/src/gpt.rs",
         "engine/src/cpio.rs",
@@ -3272,7 +3277,22 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
     };
     let root = resolve_root();
     match args {
+        [op] if op == "allocation-inventory" => match crate::allocation_guard::render(&root) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        [op] if op == "allocations" => match crate::allocation_guard::check(&root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        },
         [op] if op == "locks" => {
+            if let Err(e) = crate::allocation_guard::check(&root) {
+                return fail(&e);
+            }
+
             let locks = match dependency_free_locks(&root) {
                 Ok(locks) => locks,
                 Err(e) => return fail(&e),
@@ -3465,7 +3485,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             }
         }
         _ => {
-            eprintln!("usage: td-builder gate-crates locks");
+            eprintln!("usage: td-builder gate-crates locks|allocations|allocation-inventory");
             eprintln!("       td-builder gate-crates cargo-cmds");
             eprintln!("       td-builder gate-crates fmt --all [--write]");
             eprintln!("       td-builder gate-crates names");
@@ -5819,6 +5839,7 @@ fn mapped_paths(root: &Path, roster: &[GateCrate], changed: &[String]) -> Vec<St
 /// opt in take. A change to one of these takes every crate's legs; any
 /// other builder file is the builder's own, and its workspace legs test it.
 const CRATE_LEG_SOURCES: &[&str] = &[
+    "builder/src/allocation_guard.rs",
     "builder/src/affected/source_reads.rs",
     "builder/src/affected.rs",
     "builder/src/check_loop.rs",
@@ -6343,6 +6364,13 @@ pub(crate) fn gate_crate_names(root: &Path) -> Result<Vec<String>, String> {
 }
 
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
+    if matches!(name, "cargo-test" | "net-test") {
+        if let Err(e) = crate::allocation_guard::check(root) {
+            eprintln!("affected-checks: {e}");
+            return 1;
+        }
+    }
+
     match name {
         "shell-syntax" => run_shell(root, SHELL_SYNTAX),
         "start-bootstrap" => run_shell(root, "bash tests/start.sh"),

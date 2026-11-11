@@ -5,7 +5,7 @@
 //! enlargement, into the raster's own byte order, so drawing it is a
 //! blend and nothing more.
 
-use std::collections::TryReserveError;
+use td_alloc::Error as AllocError;
 
 /// The longest axis a picture may have.
 pub const MAX_PICTURE_AXIS: usize = 8192;
@@ -101,14 +101,14 @@ impl Picture {
     /// size; a larger asks for its own), premultiplied, in the raster's
     /// byte order; none when its memory cannot be had.
     pub fn fit(&self, width: usize, height: usize) -> Option<Fitted> {
-        self.fit_with(width, height, Vec::try_reserve_exact)
+        self.fit_with(width, height, td_alloc::reserve_exact)
     }
 
     fn fit_with(
         &self,
         width: usize,
         height: usize,
-        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), TryReserveError>,
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), AllocError>,
     ) -> Option<Fitted> {
         let width = width.clamp(1, self.width);
         let height = height.clamp(1, self.height);
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn failed_fit_allocation_keeps_the_picture_usable() {
         let image = Picture::new(1, 1, vec![10, 20, 30, 255]).unwrap();
-        let refused = image.fit_with(1, 1, |out, _| out.try_reserve_exact(usize::MAX));
+        let refused = image.fit_with(1, 1, |out, _| td_alloc::reserve_exact(out, usize::MAX));
         assert!(refused.is_none());
         assert_eq!(
             image.fit(1, 1).unwrap().pixel(0, 0),

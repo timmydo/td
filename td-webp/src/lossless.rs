@@ -35,7 +35,7 @@ impl Bits<'_> {
 }
 fn buffer<T: Clone>(n: usize, value: T) -> Result<Vec<T>, Error> {
     let mut v = Vec::new();
-    v.try_reserve_exact(n).map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut v, n).map_err(|_| Error::Limit)?;
     v.resize(n, value);
     Ok(v)
 }
@@ -70,7 +70,7 @@ impl Huffman {
             return Err(Error::Bitstream);
         }
         let mut symbols = Vec::new();
-        symbols.try_reserve_exact(used).map_err(|_| Error::Limit)?;
+        td_alloc::reserve_exact(&mut symbols, used).map_err(|_| Error::Limit)?;
         for len in 1..16 {
             for (symbol, &n) in lengths.iter().enumerate() {
                 if usize::from(n) == len {
@@ -351,7 +351,7 @@ fn image(bits: &mut Bits<'_>, width: usize, height: usize, meta: bool) -> Result
         return Err(Error::Limit);
     }
     let mut groups = Vec::new();
-    groups.try_reserve_exact(count).map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut groups, count).map_err(|_| Error::Limit)?;
     for _ in 0..count {
         groups.push(Group {
             green: Huffman::read(bits, 280 + cache.len())?,
@@ -363,7 +363,7 @@ fn image(bits: &mut Bits<'_>, width: usize, height: usize, meta: bool) -> Result
     }
     let size = width.checked_mul(height).ok_or(Error::Limit)?;
     let mut output = Vec::new();
-    output.try_reserve_exact(size).map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut output, size).map_err(|_| Error::Limit)?;
     while output.len() < size {
         let pos = output.len();
         let group = if entropy.is_empty() {
@@ -557,7 +557,7 @@ pub(crate) fn decode(bytes: &[u8], width: usize, height: usize) -> Result<Vec<u3
         work: 0,
     };
     let mut transforms = Vec::new();
-    transforms.try_reserve_exact(4).map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut transforms, 4).map_err(|_| Error::Limit)?;
     let mut seen = 0u32;
     let mut coded_width = width;
     while bits.read(1)? != 0 {

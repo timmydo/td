@@ -1339,6 +1339,7 @@ const BUILDER_FP_ROOTS: &[&str] = &[
     "td-civil/src/tzif.rs",
     "engine/src",
     "td-inflate/src/gzip.rs",
+    "td-alloc/src/lib.rs",
     "engine/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",

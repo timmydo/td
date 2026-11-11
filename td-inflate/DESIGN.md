@@ -36,3 +36,6 @@ Zlib tests cover framing, dictionary refusal, checksum, trailing bytes,
 empty output and every truncated prefix. Fetch-service loopback tests
 exercise negotiation and framing through the actual HTTP reader. PNG's
 independent oracle suite continues to check image decoding.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

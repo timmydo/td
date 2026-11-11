@@ -18,6 +18,7 @@ pub fn recipe() -> Recipe {
             "td-json",
             "td-kv",
             "td-toml",
+            "td-alloc",
             "td-ui",
             "td-compositor",
         ])
@@ -48,6 +49,7 @@ mod tests {
                 "td-json".into(),
                 "td-kv".into(),
                 "td-toml".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
             ])
@@ -75,6 +77,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "td-alloc",
                 "td-civil",
                 "td-fetch-client",
                 "td-html",

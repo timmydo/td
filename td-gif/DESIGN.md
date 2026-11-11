@@ -1,6 +1,6 @@
 # td-gif
 
-A dependency-free, safe Rust GIF87a/GIF89a first-image decoder for future
+A std-only, safe Rust GIF87a/GIF89a first-image decoder for future
 inline web pictures. The byte-slice API follows td-png's shape:
 `header(bytes) -> Result<Header, Error>` reads logical-screen width and
 height; `decode(bytes) -> Result<Rgba8, Error>` returns owned eight-bit
@@ -95,3 +95,6 @@ RGBA formulas and compared to those formulas exactly. The random palette
 fixtures traverse all code widths independently of the synthetic writer.
 Their generator takes the host tool path explicitly; it is not run by tests,
 not a shipped dependency and not a recipe input. WebP and AVIF are deferred.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

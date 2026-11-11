@@ -44,6 +44,7 @@
 
 /// Paths under `builder/src`; a trailing `/` names a directory.
 pub const HOST_ONLY: &[&str] = &[
+    "allocation_guard.rs",
     "affected.rs",
     "affected/",
     "check_loop.rs",

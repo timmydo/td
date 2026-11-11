@@ -8,6 +8,7 @@ description = "Bounded AVIF still-picture decoder"
 [workspace]
 
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-av1 = { path = "../td-av1" }
 
 [package.metadata.td-gate]

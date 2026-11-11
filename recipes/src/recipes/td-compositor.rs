@@ -70,6 +70,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
     ("gzip", include_str!("../../../td-inflate/src/gzip.rs")),
+    ("allocation", include_str!("../../../td-alloc/src/lib.rs")),
     (
         "headless",
         include_str!("../../../td-compositor/src/headless.rs"),

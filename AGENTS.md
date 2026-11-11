@@ -36,6 +36,7 @@ needs them:
 - For shared header lexical syntax, read `td-header/DESIGN.md`.
 - For shared Unicode normalization, read `td-nfc/DESIGN.md`.
 - For shared Markdown parsing, read `td-markdown/DESIGN.md`.
+- For allocation helpers or allocation source guards, read `td-alloc/DESIGN.md`.
 - For shared JPEG decoding or encoding, read `td-jpeg/DESIGN.md`.
 - For shared PNG decoding or encoding, read `td-png/DESIGN.md`.
 - For the transport to a td program on another machine over ssh, read
@@ -662,6 +663,11 @@ message.
   same roster (`td-builder gate-crates`), so one derivation feeds both tiers.
   A crate whose in-sandbox suite differs from the host preflight's declares
   `gate-test-args` beside `test-args`.
+- New production buffer/string growth uses `td-alloc` or a reviewed
+  allocation-free strategy; exceptions require a specifically reviewed debt
+  amendment. Propagate reservation failures without allocating diagnostics.
+  `td-alloc/DESIGN.md` owns the source guard, recorded legacy debt, failure
+  tests and migration limits.
 - Use `std`, not `no_std`. Allocate buffers and collections outside hot loops
   where practical. Keep comments terse and explain a non-obvious why; design
   rationale and review history belong in the commit message or normative doc.

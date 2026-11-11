@@ -22,6 +22,7 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&[
             "td-civil",
             "td-remote",
+            "td-alloc",
             "td-ui",
             "td-compositor",
             "td-fs",
@@ -49,6 +50,7 @@ mod tests {
             Some(vec![
                 "td-civil".to_string(),
                 "td-remote".to_string(),
+                "td-alloc".to_string(),
                 "td-ui".to_string(),
                 "td-compositor".to_string(),
                 "td-fs".to_string(),

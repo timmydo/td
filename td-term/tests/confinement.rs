@@ -141,7 +141,8 @@ fn the_manifest_declares_the_toolkit_and_td_fs_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 3);
+    assert_eq!(lock.matches("[[package]]").count(), 4);
+    assert!(lock.contains("name = \"td-alloc\""));
     assert!(lock.contains("name = \"td-fs\""));
     assert!(lock.contains("name = \"td-term\""));
     assert!(lock.contains("name = \"td-ui\""));

@@ -61,6 +61,8 @@ pub mod tar;
 pub mod tar_write;
 // `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists
 // its pins, td-builder assembles and admits the root against it.
+#[path = "../../td-alloc/src/lib.rs"]
+pub mod allocation;
 pub mod debian_root;
 pub mod dynamic_application;
 pub mod elf;

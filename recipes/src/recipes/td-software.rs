@@ -16,7 +16,14 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-software", "0.1.0")
         .local_source("td-software")
-        .local_source_trees(&["td-civil", "td-fs", "td-ui", "td-compositor", "engine"])
+        .local_source_trees(&[
+            "td-civil",
+            "td-fs",
+            "td-alloc",
+            "td-ui",
+            "td-compositor",
+            "engine",
+        ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-software")
@@ -37,9 +44,16 @@ mod tests {
         assert_eq!(
             r.local_source_trees,
             Some(
-                ["td-civil", "td-fs", "td-ui", "td-compositor", "engine"]
-                    .map(String::from)
-                    .to_vec()
+                [
+                    "td-civil",
+                    "td-fs",
+                    "td-alloc",
+                    "td-ui",
+                    "td-compositor",
+                    "engine"
+                ]
+                .map(String::from)
+                .to_vec()
             )
         );
         assert_eq!(r.cargo_subdir.as_deref(), Some("td-software"));

@@ -21,6 +21,7 @@ pub fn recipe() -> Recipe {
             "td-kv",
             "td-regex",
             "td-toml",
+            "td-alloc",
             "td-ui",
             "td-compositor",
             "td-test-compositor",
@@ -55,6 +56,7 @@ mod tests {
                 "td-kv".into(),
                 "td-regex".into(),
                 "td-toml".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
                 "td-test-compositor".into(),
@@ -83,6 +85,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "td-alloc",
                 "td-civil",
                 "td-encoding",
                 "td-fetch-client",

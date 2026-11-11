@@ -41,6 +41,6 @@ mod tests {
                 assert!(!source.contains(name), "shared arithmetic names {name}");
             }
         }
-        assert!(!include_str!("../Cargo.toml").contains("[dependencies]"));
+        assert!(include_str!("../Cargo.toml").contains("td-alloc = { path = \"../td-alloc\" }"));
     }
 }

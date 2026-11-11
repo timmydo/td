@@ -22,6 +22,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-pass")
         .local_source_trees(&[
             "td-secret",
+            "td-alloc",
             "td-ui",
             "td-compositor",
             "td-authd",
@@ -59,6 +60,7 @@ mod tests {
             Some(
                 [
                     "td-secret",
+                    "td-alloc",
                     "td-ui",
                     "td-compositor",
                     "td-authd",
@@ -89,28 +91,15 @@ mod tests {
     }
 
     /// The trees td-pass's build reads are exactly the ones staged: every
-    /// file the five compiled crates name by a literal `#[path]` or
+    /// file the compiled crates name by a literal `#[path]` or
     /// `include` macro, test code included, and every file those name in
     /// turn, resolved against the naming file's directory, lies in
     /// td-pass or a staged tree, and every staged tree is reached.
     #[test]
     fn the_staged_trees_are_the_closure_its_files_name() {
-        let (mut trees, mounts) = crate::source_closure::trees_named(&[
-            "td-pass",
-            "td-secret",
-            "td-tpm",
-            "td-fido",
-            "td-ui",
-        ]);
+        let (mut trees, mounts) = crate::source_closure::cargo_trees_named(&["td-pass"]);
         assert!(mounts > 100, "{mounts}");
         trees.remove("td-pass");
-        trees.insert("td-secret".to_owned());
-        trees.insert("td-tpm".to_owned());
-        trees.insert("td-fido".to_owned());
-        trees.insert("td-ui".to_owned());
-        // The native harness: a dev-dependency, which cargo reads to
-        // resolve the lock though no shipped file names it.
-        trees.insert("td-test-compositor".to_owned());
         let staged: std::collections::BTreeSet<String> = recipe()
             .local_source_trees
             .unwrap_or_default()

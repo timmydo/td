@@ -49,6 +49,10 @@ mod png_encode;
 // inflater.
 #[cfg(test)]
 #[allow(dead_code)]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-alloc/src/lib.rs")]
+mod allocation;
+#[cfg(test)]
+#[allow(dead_code)]
 #[cfg_attr(
     test,
     allow(
@@ -1217,6 +1221,7 @@ mod confinement {
 
     /// Sources another crate owns, mounted by path rather than kept in src.
     const MOUNTED: &[&str] = &[
+        "allocation.rs",
         "app_policy.rs",
         "atlas.rs",
         "coverage.rs",
@@ -1260,6 +1265,7 @@ mod confinement {
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("gzip.rs", include_str!("../../td-inflate/src/gzip.rs")),
+        ("allocation.rs", include_str!("../../td-alloc/src/lib.rs")),
         ("headless.rs", include_str!("headless.rs")),
         ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),
@@ -1637,9 +1643,12 @@ unsafe impl Send for MappedRegion {}"#;
         }
         assert_eq!(occurrences(SYS, "const SYS_"), 9);
         for (name, source) in OTHER {
+            if *name == "allocation.rs" {
+                assert!(source.starts_with("#![forbid(unsafe_code)]\n"));
+            }
             assert_eq!(
                 source.matches("unsafe").count(),
-                usize::from(*name == "authority.rs"),
+                usize::from(matches!(*name, "authority.rs" | "allocation.rs")),
                 "{name} changed its permitted denial-only keyword count"
             );
             assert!(

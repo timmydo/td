@@ -3,6 +3,7 @@
 //! Kept in-tree and std-only for the same reason as `tar.rs`: source seed
 //! preparation should not require host unpackers or an external dependency.
 
+use crate::allocation;
 use crate::crc32::crc32;
 use std::fs::File;
 use std::io::Read;
@@ -468,9 +469,7 @@ fn dynamic_trees(bits: &mut BitReader<'_>) -> Result<(Huffman, Huffman), RawErro
         .checked_add(hdist)
         .ok_or(RawError::Message("dynamic Huffman length count overflow"))?;
     let mut lengths = Vec::new();
-    lengths
-        .try_reserve_exact(total)
-        .map_err(|_| RawError::Allocation)?;
+    allocation::reserve_exact(&mut lengths, total).map_err(|_| RawError::Allocation)?;
     while lengths.len() < total {
         let sym = code_tree.decode(bits)?;
         match sym {
@@ -570,7 +569,7 @@ fn push_output(out: &mut Vec<u8>, byte: u8, max_output_bytes: usize) -> Result<(
     if out.len() >= max_output_bytes {
         return Err(output_limit_error(max_output_bytes));
     }
-    out.try_reserve(1).map_err(|_| RawError::Allocation)?;
+    allocation::reserve(out, 1).map_err(|_| RawError::Allocation)?;
     out.push(byte);
     Ok(())
 }
@@ -591,7 +590,7 @@ fn copy_match(
     if new_len > max_output_bytes {
         return Err(output_limit_error(max_output_bytes));
     }
-    out.try_reserve(len).map_err(|_| RawError::Allocation)?;
+    allocation::reserve(out, len).map_err(|_| RawError::Allocation)?;
     for _ in 0..len {
         let src = out
             .len()
@@ -755,9 +754,7 @@ impl Huffman {
         }
 
         let mut symbols = Vec::new();
-        symbols
-            .try_reserve_exact(symbol_count)
-            .map_err(|_| RawError::Allocation)?;
+        allocation::reserve_exact(&mut symbols, symbol_count).map_err(|_| RawError::Allocation)?;
         symbols.resize(symbol_count, 0u16);
         for (symbol, len) in lengths.iter().enumerate() {
             if *len == 0 {

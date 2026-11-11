@@ -75,6 +75,15 @@ are not required. td-jail's opt-in live development test
 (`td-jail/tests/development_launch.rs`, `#[ignore]`) does build and run a
 static i386 executable, so it also needs a `cc` that targets `-m32`.
 
+## Allocation source guard
+
+`td-builder gate-crates allocations` checks production Rust against the
+reviewed inventory in `td-alloc/allocation-debt.tsv`. The cargo-test and
+net-test preflights run it before Cargo, and sandbox gate 325 reaches the
+same check through `gate-crates locks`. Inventory growth is a reviewed debt
+amendment, never a routine way to make a guard pass. The allocator contract,
+scanner limits and migration rules live in `td-alloc/DESIGN.md`.
+
 ## Ready
 
 `td-builder ready` is the pre-push gate. It runs

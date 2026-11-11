@@ -99,7 +99,7 @@ fn push<T>(out: &mut Vec<T>, value: T, limit: usize) -> Result<(), Error> {
     if out.len() >= limit {
         return Err(Error::Limit);
     }
-    out.try_reserve(1).map_err(|_| Error::Limit)?;
+    td_alloc::reserve(out, 1).map_err(|_| Error::Limit)?;
     out.push(value);
     Ok(())
 }

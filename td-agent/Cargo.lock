@@ -23,6 +23,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-civil"
 version = "0.1.0"
 
@@ -45,6 +49,9 @@ version = "0.1.0"
 [[package]]
 name = "td-jpeg"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-json"
@@ -57,6 +64,9 @@ version = "0.1.0"
 [[package]]
 name = "td-png"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-remote"
@@ -76,6 +86,9 @@ version = "0.1.0"
 [[package]]
 name = "td-ui"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-url"

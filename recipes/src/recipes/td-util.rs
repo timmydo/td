@@ -127,6 +127,11 @@ const ENGINE: &[(&str, &str, &str)] = &[
         include_str!("../../../engine/src/crc32.rs"),
     ),
     (
+        "allocation",
+        "{src}/td-alloc/src/lib.rs",
+        include_str!("../../../td-alloc/src/lib.rs"),
+    ),
+    (
         "gzip",
         "{src}/td-inflate/src/gzip.rs",
         include_str!("../../../td-inflate/src/gzip.rs"),
@@ -396,7 +401,11 @@ mod tests {
             } else {
                 "engine"
             };
-            let relative = format!("{tree}/src/{name}.rs");
+            let relative = if *name == "allocation" {
+                "td-alloc/src/lib.rs".to_string()
+            } else {
+                format!("{tree}/src/{name}.rs")
+            };
             assert_eq!(*path, format!("{{src}}/{relative}"));
             let on_disk = std::fs::read_to_string(repo.join(&relative)).unwrap();
             assert!(!on_disk.is_empty(), "{relative} must be readable");

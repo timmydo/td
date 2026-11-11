@@ -251,7 +251,8 @@ fn image(
     let mut image = Rgba8 {
         width: screen.header.width,
         height: screen.header.height,
-        data: vec![0; screen.header.width * screen.header.height * 4],
+        data: td_alloc::filled(screen.header.width * screen.header.height * 4, 0)
+            .map_err(|_| Error::Limit)?,
     };
     for pixel in image.data.as_chunks_mut::<4>().0 {
         *pixel = background;

@@ -11,7 +11,7 @@ fn put<T>(s: &mut [T], i: usize, v: T) -> Result<(), Error> {
 }
 fn zeros<T: Clone>(n: usize, v: T) -> Result<Vec<T>, Error> {
     let mut out = Vec::new();
-    out.try_reserve_exact(n).map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut out, n).map_err(|_| Error::Limit)?;
     out.resize(n, v);
     Ok(out)
 }
@@ -241,9 +241,7 @@ fn modes(
 ) -> Result<Vec<Macroblock>, Error> {
     let mut above = zeros(mw * 4, 0usize)?;
     let mut output = Vec::new();
-    output
-        .try_reserve_exact(mw * mh)
-        .map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut output, mw * mh).map_err(|_| Error::Limit)?;
     for _y in 0..mh {
         let mut left = [0usize; 4];
         for x in 0..mw {
@@ -749,9 +747,7 @@ fn reconstruct(data: &[u8], header: Header) -> Result<(Plane, Plane, Plane), Err
     let sizes_at = 10 + first_size;
     let mut pos = sizes_at + 3 * (params.partitions - 1);
     let mut partitions = Vec::new();
-    partitions
-        .try_reserve_exact(params.partitions)
-        .map_err(|_| Error::Limit)?;
+    td_alloc::reserve_exact(&mut partitions, params.partitions).map_err(|_| Error::Limit)?;
     for i in 0..params.partitions {
         let n = if i + 1 == params.partitions {
             data.len().checked_sub(pos).ok_or(Error::Truncated)?
@@ -820,7 +816,7 @@ fn reconstruct(data: &[u8], header: Header) -> Result<(Plane, Plane, Plane), Err
 pub(super) fn decode(data: &[u8], header: Header) -> Result<Rgba8, Error> {
     let (y, u, v) = reconstruct(data, header)?;
     let mut rgba = Vec::new();
-    rgba.try_reserve_exact(header.width * header.height * 4)
+    td_alloc::reserve_exact(&mut rgba, header.width * header.height * 4)
         .map_err(|_| Error::Limit)?;
     for py in 0..header.height {
         for px in 0..header.width {

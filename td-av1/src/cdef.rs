@@ -73,7 +73,7 @@ pub fn filter(
     mi_rows: usize,
     mi_cols: usize,
     skip: impl Fn(usize, usize) -> bool,
-) -> Result<(), std::collections::TryReserveError> {
+) -> Result<(), td_alloc::Error> {
     if strengths.is_off() {
         return Ok(());
     }

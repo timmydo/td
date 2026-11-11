@@ -17,6 +17,7 @@
 //!     `td-builder check` rung.
 
 mod affected;
+mod allocation_guard;
 mod build;
 mod build_daemon;
 mod build_root;

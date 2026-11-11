@@ -15,7 +15,7 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-dua", "0.1.0")
         .local_source("td-dua")
-        .local_source_trees(&["td-civil", "td-json", "td-ui", "td-compositor"])
+        .local_source_trees(&["td-civil", "td-json", "td-alloc", "td-ui", "td-compositor"])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("td-dua")
@@ -38,6 +38,7 @@ mod tests {
             Some(vec![
                 "td-civil".into(),
                 "td-json".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-compositor".into()
             ])

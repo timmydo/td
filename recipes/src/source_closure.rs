@@ -89,3 +89,31 @@ pub(crate) fn trees_named(crates: &[&str]) -> (BTreeSet<String>, usize) {
     }
     (trees, mounts)
 }
+
+/// Cargo's transitive sibling closure, including dev-dependencies, and every
+/// source tree its literal file mounts reach.
+pub(crate) fn cargo_trees_named(crates: &[&str]) -> (BTreeSet<String>, usize) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut crates: Vec<String> = crates.iter().map(|name| name.to_string()).collect();
+    let mut next = 0;
+    while next < crates.len() {
+        let manifest =
+            std::fs::read_to_string(root.join(&crates[next]).join("Cargo.toml")).unwrap();
+        for line in manifest
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+        {
+            if let Some((_, rest)) = line.split_once("{ path = \"../") {
+                let name = rest.split('"').next().unwrap();
+                if !crates.iter().any(|value| value == name) {
+                    crates.push(name.to_string());
+                }
+            }
+        }
+        next += 1;
+    }
+    let refs: Vec<&str> = crates.iter().map(String::as_str).collect();
+    let (mut trees, mounts) = trees_named(&refs);
+    trees.extend(crates);
+    (trees, mounts)
+}

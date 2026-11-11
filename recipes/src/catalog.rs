@@ -669,6 +669,7 @@ mod tests {
                 "engine",
                 "net",
                 "td-agent",
+                "td-alloc",
                 "td-authd",
                 "td-av1",
                 "td-avif",

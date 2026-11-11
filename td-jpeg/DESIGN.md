@@ -203,6 +203,9 @@ deterministic mutations, progression errors and scan/segment limits.
 The fixture generator and provenance live under `tests/fixtures/progressive`.
 
 `tests/confinement.rs` pins the two pure decoder source files that opens nothing and
-names no thread, a manifest of no dependencies, the bounds above, and
+names no thread, a manifest depending only on td-alloc, the bounds above, and
 the fixture (its length and markers) and the hashes its README records,
 and the oracle's contract stated in `src/lib.rs`.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

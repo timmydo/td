@@ -37,3 +37,6 @@ indexing_slicing = "deny"
 # Tracked build inputs not represented by Cargo dependency edges.
 [package.metadata.review]
 source-inputs = ["../td-compositor", "../td-fs"]
+
+[dependencies]
+td-alloc = { path = "../td-alloc" }

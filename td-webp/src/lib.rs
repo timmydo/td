@@ -189,8 +189,7 @@ fn decode_chunks(mut chunks: Chunks<'_>, expected: Header, extended: bool) -> Re
                     expected.height,
                 )?;
                 let mut rgba = Vec::new();
-                rgba.try_reserve_exact(pixels.len() * 4)
-                    .map_err(|_| Error::Limit)?;
+                td_alloc::reserve_exact(&mut rgba, pixels.len() * 4).map_err(|_| Error::Limit)?;
                 for p in pixels {
                     rgba.extend_from_slice(&[
                         (p >> 16) as u8,
@@ -250,7 +249,7 @@ fn decode_chunks(mut chunks: Chunks<'_>, expected: Header, extended: bool) -> Re
                 )?;
                 let mut canvas = Vec::new();
                 let size = expected.width * expected.height * 4;
-                canvas.try_reserve_exact(size).map_err(|_| Error::Limit)?;
+                td_alloc::reserve_exact(&mut canvas, size).map_err(|_| Error::Limit)?;
                 canvas.resize(size, 0);
                 for (row, source) in frame.data.chunks_exact(width * 4).enumerate() {
                     let start = ((y + row) * expected.width + x) * 4;
@@ -297,12 +296,12 @@ fn decode_alpha(data: &[u8], header: Header) -> Result<Vec<u8>, Error> {
             if body.len() != count {
                 return Err(Error::Bitstream);
             }
-            alpha.try_reserve_exact(count).map_err(|_| Error::Limit)?;
+            td_alloc::reserve_exact(&mut alpha, count).map_err(|_| Error::Limit)?;
             alpha.extend_from_slice(body);
         }
         1 => {
             let pixels = lossless::decode(body, header.width, header.height)?;
-            alpha.try_reserve_exact(count).map_err(|_| Error::Limit)?;
+            td_alloc::reserve_exact(&mut alpha, count).map_err(|_| Error::Limit)?;
             alpha.extend(pixels.into_iter().map(|p| (p >> 8) as u8));
         }
         _ => return Err(Error::Unsupported),

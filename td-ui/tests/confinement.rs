@@ -932,7 +932,7 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_consumer_sta
 }
 
 #[test]
-fn the_crate_depends_on_nothing_and_declares_its_gate() {
+fn the_crate_depends_only_on_allocation_helpers_and_declares_its_gate() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
     let code: String = manifest
@@ -941,8 +941,8 @@ fn the_crate_depends_on_nothing_and_declares_its_gate() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !code.contains("dependencies"),
-        "td-ui is the leaf: it names no dependency table of any kind"
+        code.contains("td-alloc = { path = \"../td-alloc\" }"),
+        "the toolkit uses the shared allocation helpers"
     );
     assert!(code.contains("[workspace]"), "own workspace root");
     assert!(code.contains("[package.metadata.td-gate]"));
@@ -967,8 +967,8 @@ fn the_crate_depends_on_nothing_and_declares_its_gate() {
         lock.lines()
             .filter(|line| line.trim() == "[[package]]")
             .count(),
-        1,
-        "the leaf's lock lists only itself"
+        2,
+        "the toolkit lock lists itself and td-alloc"
     );
     assert!(!lock.contains("source ="));
 }

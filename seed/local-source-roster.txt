@@ -10,25 +10,25 @@
 # local-source-roster > seed/local-source-roster.txt` when a recipe adds,
 # removes, or renames a `local_source'/`local_source_trees' declaration —
 # an ordinary edit inside a staged tree does not move a row.
-td-agent-source td-agent td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-jpeg,td-json,td-markdown,td-png,td-remote,td-toml,td-ui,td-url,td-util,td-compositor,engine,td-inflate,td-test-compositor
+td-agent-source td-agent td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-jpeg,td-json,td-markdown,td-png,td-remote,td-toml,td-alloc,td-ui,td-url,td-util,td-compositor,engine,td-inflate,td-test-compositor
 td-disks-source td-disks td-btrfs,td-fs
-td-dua-source td-dua td-civil,td-json,td-ui,td-compositor
-td-editor-source td-editor td-civil,td-remote,td-ui,td-compositor,td-fs,td-test-compositor
+td-dua-source td-dua td-civil,td-json,td-alloc,td-ui,td-compositor
+td-editor-source td-editor td-civil,td-remote,td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
 td-install-qemu-test-source td-install-qemu-test
-td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-json,td-kv,td-regex,td-toml,td-ui,td-compositor,td-test-compositor
-td-net-source net engine,td-inflate,td-fs,td-civil,td-primitives,td-tls-provider
-td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-ui,td-compositor
+td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-json,td-kv,td-regex,td-toml,td-alloc,td-ui,td-compositor,td-test-compositor
+td-net-source net engine,td-alloc,td-inflate,td-fs,td-civil,td-primitives,td-tls-provider
+td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-alloc,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
-td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil,td-time,td-disks
-td-photo-source td-photo td-av1,td-civil,td-fs,td-jpeg,td-ui,td-compositor,td-test-compositor
-td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui,td-tpm,td-fido,td-test-compositor
-td-review-source td-review td-fs,td-ui,td-compositor
-td-sandbox-source td-sandbox td-fs,td-ui,td-compositor,engine
-td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-luks,td-encoding,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
-td-software-source td-software td-civil,td-fs,td-ui,td-compositor,engine
+td-pass-source td-pass td-secret,td-alloc,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil,td-time,td-disks
+td-photo-source td-photo td-av1,td-civil,td-fs,td-jpeg,td-alloc,td-ui,td-compositor,td-test-compositor
+td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-alloc,td-ui,td-tpm,td-fido,td-test-compositor
+td-review-source td-review td-fs,td-alloc,td-ui,td-compositor
+td-sandbox-source td-sandbox td-fs,td-alloc,td-ui,td-compositor,engine
+td-setup-source td-setup td-install,td-alloc,td-ui,td-compositor,td-protector,td-luks,td-encoding,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
+td-software-source td-software td-civil,td-fs,td-alloc,td-ui,td-compositor,engine
 td-ssh-interop-source td-ssh-interop td-firstboot
 td-ssh-source td-ssh td-primitives,td-encoding,td-login,td-fs,td-source-scan,engine
-td-taskmgr-source td-taskmgr td-ui,td-compositor,td-fs,td-test-compositor
-td-term-source td-term td-fs,td-ui,td-compositor
+td-taskmgr-source td-taskmgr td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
+td-term-source td-term td-fs,td-alloc,td-ui,td-compositor
 td-time-source td-time td-civil,td-fs,engine
-td-web-source td-web td-av1,td-avif,td-fetch-client,td-gif,td-html,td-jpeg,td-png,td-ui,td-url,td-webp,td-util,td-compositor,engine,td-inflate
+td-web-source td-web td-av1,td-avif,td-fetch-client,td-gif,td-html,td-jpeg,td-png,td-alloc,td-ui,td-url,td-webp,td-util,td-compositor,engine,td-inflate

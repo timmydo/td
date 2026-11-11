@@ -50,6 +50,9 @@ mod cpio;
 // The engine's CRC and inflater, the ones source preparation trusts, rather
 // than a second copy. Std-only; the confinement tests below pin these two
 // attributes and scan both files.
+#[path = "../../td-alloc/src/lib.rs"]
+#[allow(dead_code)]
+mod allocation;
 #[path = "../../engine/src/crc32.rs"]
 #[allow(dead_code)]
 // The engine file's own tests, held to the engine's lints rather than these.
@@ -367,6 +370,10 @@ mod confinement {
     /// attribute that reaches each. Nothing else may leave `src/`.
     const ENGINE: &[(&str, &str)] = &[
         (
+            "allocation.rs",
+            concat!("#[", "path=\"../../td-alloc/src/lib.rs\"]"),
+        ),
+        (
             "tar_extract.rs",
             concat!("#[", "path=\"../../engine/src/tar_extract.rs\"]"),
         ),
@@ -391,17 +398,18 @@ mod confinement {
         let main = squeeze(&source("main.rs"));
         for (file, attr) in ENGINE {
             assert_eq!(main.matches(attr).count(), 1, "{file}'s #[path] attribute");
-            let tree = if *file == "gzip.rs" {
-                "td-inflate"
-            } else {
-                "engine"
+            let (tree, source_file) = match *file {
+                "allocation.rs" => ("td-alloc", "lib.rs"),
+                "gzip.rs" => ("td-inflate", *file),
+                _ => ("engine", *file),
             };
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
                 .join(tree)
                 .join("src")
-                .join(file);
+                .join(source_file);
             let text = scan::strip_comments(&std::fs::read_to_string(&path).unwrap());
+            let text = text.replace(concat!("#![forbid(un", "safe_code)]"), "");
             assert!(!text.contains(concat!("un", "safe")), "{file} names unsafe");
             for construct in scan::DECOUPLING {
                 assert!(!squeeze(&text).contains(construct), "{file}: `{construct}`");

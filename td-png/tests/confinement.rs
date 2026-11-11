@@ -106,8 +106,7 @@ fn two_source_files_that_open_nothing_and_mount_checksums_inflate_and_deflate() 
 fn the_manifest_has_no_dependencies_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
-    assert!(!manifest.contains("dependencies]"), "no dependencies");
-    assert!(!manifest.contains("path ="));
+    assert!(manifest.contains("td-alloc = { path = \"../td-alloc\" }"));
     assert!(manifest.contains("[package.metadata.td-gate]\nclippy-all-targets = true\n"));
     for lint in [
         "unwrap_used",
@@ -121,7 +120,7 @@ fn the_manifest_has_no_dependencies_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 1);
+    assert_eq!(lock.matches("[[package]]").count(), 2);
     assert!(lock.contains("name = \"td-png\""));
 }
 

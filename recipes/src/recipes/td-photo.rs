@@ -21,6 +21,7 @@ pub fn recipe() -> Recipe {
             "td-civil",
             "td-fs",
             "td-jpeg",
+            "td-alloc",
             "td-ui",
             "td-compositor",
             "td-test-compositor",
@@ -49,6 +50,7 @@ mod tests {
                 "td-civil".into(),
                 "td-fs".into(),
                 "td-jpeg".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
                 "td-test-compositor".into()

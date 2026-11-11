@@ -794,6 +794,7 @@ fn evaluator_source_fingerprint(
         "recipes/Cargo.toml",
         "engine/Cargo.toml",
         "td-inflate/src/gzip.rs",
+        "td-alloc/src/lib.rs",
         "Cargo.toml",
         "Cargo.lock",
         "tests/recipe-eval-tool.sh",

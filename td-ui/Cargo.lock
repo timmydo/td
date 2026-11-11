@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-ui"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]

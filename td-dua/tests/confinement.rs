@@ -182,6 +182,9 @@ fn the_manifest_names_the_calendar_the_json_writer_and_the_toolkit() {
         .filter_map(|line| line.strip_prefix("name = \""))
         .filter_map(|rest| rest.strip_suffix('"'))
         .collect();
-    assert_eq!(names, ["td-civil", "td-dua", "td-json", "td-ui"]);
+    assert_eq!(
+        names,
+        ["td-alloc", "td-civil", "td-dua", "td-json", "td-ui"]
+    );
     assert!(!lock.contains("source ="), "no registry or git source");
 }

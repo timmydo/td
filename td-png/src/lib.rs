@@ -17,6 +17,7 @@
 //! than copied. `encode_rgb8` writes eight-bit RGB over td-util's DEFLATE
 //! encoder, mounted the same way (`encode.rs`).
 
+use td_alloc as allocation;
 #[path = "../../engine/src/crc32.rs"]
 #[allow(dead_code)]
 // The engine file's own tests, held to the engine's lints rather than these.
@@ -428,9 +429,7 @@ pub fn decode(data: &[u8]) -> Result<Rgba8, Error> {
             if image.len().saturating_add(chunk.data.len()) > budget {
                 return Err(Error::Budget);
             }
-            image
-                .try_reserve(chunk.data.len())
-                .map_err(|_| Error::Allocation)?;
+            td_alloc::reserve(&mut image, chunk.data.len()).map_err(|_| Error::Allocation)?;
             image.extend_from_slice(chunk.data);
             continue;
         }
@@ -461,8 +460,7 @@ pub fn decode(data: &[u8]) -> Result<Rgba8, Error> {
                 let (triples, _) = chunk.data.as_chunks::<3>();
                 let most = 1usize << head.depth;
                 let mut entries = Vec::new();
-                entries
-                    .try_reserve_exact(triples.len().min(most))
+                td_alloc::reserve_exact(&mut entries, triples.len().min(most))
                     .map_err(|_| Error::Allocation)?;
                 entries.extend(triples.iter().take(most).map(|&[r, g, b]| [r, g, b, 255]));
                 palette = Some(entries);
@@ -670,8 +668,7 @@ fn expand(
             height: head.height,
         })?;
     let mut data = Vec::new();
-    data.try_reserve_exact(size)
-        .map_err(|_| Error::Allocation)?;
+    td_alloc::reserve_exact(&mut data, size).map_err(|_| Error::Allocation)?;
     data.resize(size, 0);
     let mut out = Rgba8 {
         width: head.width,
@@ -689,11 +686,9 @@ fn expand(
         }
         let len = row_bytes(head, w).ok_or(Error::Length)?;
         prior.clear();
-        prior
-            .try_reserve_exact(len)
-            .map_err(|_| Error::Allocation)?;
+        td_alloc::reserve_exact(&mut prior, len).map_err(|_| Error::Allocation)?;
         row.clear();
-        row.try_reserve_exact(len).map_err(|_| Error::Allocation)?;
+        td_alloc::reserve_exact(&mut row, len).map_err(|_| Error::Allocation)?;
         prior.resize(len, 0);
         for r in 0..h {
             let kind = *raw.get(at).ok_or(Error::Length)?;

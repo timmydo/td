@@ -23,16 +23,10 @@ use std::fmt;
 mod progressive;
 
 fn buffer<T>(capacity: usize) -> Result<Vec<T>, Error> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(capacity)
-        .map_err(|_| Error::Allocation)?;
-    Ok(out)
+    td_alloc::with_capacity(capacity).map_err(|_| Error::Allocation)
 }
-
 fn filled<T: Copy>(len: usize, value: T) -> Result<Vec<T>, Error> {
-    let mut out = buffer(len)?;
-    out.resize(len, value);
-    Ok(out)
+    td_alloc::filled(len, value).map_err(|_| Error::Allocation)
 }
 
 /// The longest axis any RGB buffer here may have.

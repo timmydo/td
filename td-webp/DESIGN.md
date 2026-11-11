@@ -75,3 +75,6 @@ bitstream specifications and RFC 6386 for VP8. Algorithm arithmetic uses explici
 bytes and checked slice access. Tests compare committed synthetic images
 against independent libwebp RGBA, YUV and alpha output and exercise truncated containers,
 entropy truncation, mutation, dimensions and allocation/work admission.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

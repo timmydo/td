@@ -254,17 +254,34 @@ fn module_body_at(code: &str, from: usize) -> Option<usize> {
 fn literal_len_at(code: &str, at: usize) -> Option<usize> {
     let rest = code.get(at..)?;
     let c = rest.chars().next()?;
-    let ident_before = code
-        .get(..at)
-        .and_then(|s| s.chars().next_back())
-        .is_some_and(|p| p.is_alphanumeric() || p == '_');
-    if c == '"' || (c == 'r' && !ident_before) {
+    let before = code.get(..at).and_then(|s| s.chars().next_back());
+    let bounded = !before.is_some_and(|p| p.is_alphanumeric() || matches!(p, '_' | '\''));
+    let len = if c == '"' || (c == 'r' && bounded) {
         string_literal_span(rest).map(|(_, len)| len)
+    } else if matches!(c, 'b' | 'c') && bounded {
+        let body = rest.get(1..)?;
+        if c == 'b' && body.starts_with('\'') {
+            Some(char_literal_len(body).saturating_add(1))
+        } else {
+            string_literal_span(body).map(|(_, len)| len.saturating_add(1))
+        }
     } else if c == '\'' {
         Some(char_literal_len(rest))
     } else {
         None
-    }
+    }?;
+    // A suffix belongs to this token, even inside a macro. Its trailing r
+    // must not be mistaken for the opener of another raw string.
+    let suffix = if len > 1 {
+        rest.get(len..)?
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .map(char::len_utf8)
+            .sum()
+    } else {
+        0
+    };
+    Some(len.saturating_add(suffix))
 }
 
 /// The `td-*` directories `text` names outside its comments, its
@@ -465,7 +482,7 @@ pub fn impure_names(text: &str) -> Vec<&'static str> {
 }
 
 /// `code` with its string and char literals blanked to spaces.
-fn blank_literals(code: &str) -> String {
+pub fn blank_literals(code: &str) -> String {
     let mut literals = Vec::new();
     let mut at = 0usize;
     while let Some(rest) = code.get(at..).filter(|r| !r.is_empty()) {
@@ -702,8 +719,8 @@ pub fn char_literal_len(rest: &str) -> usize {
 /// are stepped over whole as the block scan steps over them: plain, raw or
 /// spanning lines, so a `//` inside quotes (`"https://..."`) is kept, a
 /// `'"'` opens no string, and a `/*` inside a string opens no comment. A
-/// raw byte string (`br"..."`) is read as a plain one, the bound the block
-/// scan shares. The newlines inside a cut block are kept, so line numbers
+/// byte or C string, including raw forms, uses the same literal scanner.
+/// The newlines inside a cut block are kept, so line numbers
 /// hold; a block that never closes runs to the end, where the compiler
 /// would refuse it.
 pub fn strip_comments(text: &str) -> String {
@@ -711,17 +728,7 @@ pub fn strip_comments(text: &str) -> String {
     let mut at = 0usize;
     while let Some(rest) = text.get(at..).filter(|r| !r.is_empty()) {
         let Some(c) = rest.chars().next() else { break };
-        let ident_before = text
-            .get(..at)
-            .and_then(|s| s.chars().next_back())
-            .is_some_and(|p| p.is_alphanumeric() || p == '_');
-        let literal = if c == '"' || (c == 'r' && !ident_before) {
-            string_literal_span(rest).map(|(_, len)| len)
-        } else if c == '\'' {
-            Some(char_literal_len(rest))
-        } else {
-            None
-        };
+        let literal = literal_len_at(text, at);
         if let Some(len) = literal {
             out.push_str(rest.get(..len).unwrap_or(""));
             at = at.saturating_add(len);
@@ -777,19 +784,10 @@ pub fn block_end(code: &str, open: usize) -> Option<usize> {
     let mut at = open;
     while let Some(rest) = code.get(at..).filter(|r| !r.is_empty()) {
         let c = rest.chars().next()?;
-        let ident_before = code
-            .get(..at)
-            .and_then(|s| s.chars().next_back())
-            .is_some_and(|p| p.is_alphanumeric() || p == '_');
-        let skip = if c == '"' || (c == 'r' && !ident_before) {
-            string_literal_span(rest).map(|(_, len)| len)
-        } else if rest.starts_with("/*") {
-            Some(rest.find("*/").map_or(rest.len(), |e| e.saturating_add(2)))
-        } else if c == '\'' {
-            Some(char_literal_len(rest))
-        } else {
-            None
-        };
+        let skip = literal_len_at(code, at).or_else(|| {
+            rest.starts_with("/*")
+                .then(|| rest.find("*/").map_or(rest.len(), |e| e.saturating_add(2)))
+        });
         if let Some(len) = skip {
             at = at.saturating_add(len);
             continue;
@@ -811,6 +809,22 @@ pub fn block_end(code: &str, open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn byte_c_and_suffixed_literals_keep_the_scan_synchronized() {
+        for literal in [r##"br#"a " /* }"#"##, r##"cr#"a " /* }"#"##] {
+            let code = format!("{{ let _ = {literal}; }} // comment");
+            let stripped = super::strip_comments(&code);
+            assert!(stripped.contains(literal));
+            assert!(!stripped.contains("// comment"));
+            assert_eq!(super::block_end(&stripped, 0), stripped.rfind('}'));
+            let blanked = super::blank_literals(&stripped);
+            assert!(!blanked.contains("/*"));
+        }
+        assert_eq!(super::literal_len_at(r##""x"r#"tail"##, 0), Some(4));
+        assert_eq!(super::literal_len_at(r##"r#"x"#r#"tail"##, 0), Some(7));
+        assert_eq!(super::literal_len_at("'r", 1), None);
+    }
+
     #[test]
     fn ordered_blank_preserves_overlaps_and_utf8_offsets() {
         let code = "aébcdefgh";

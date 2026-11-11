@@ -148,7 +148,8 @@ fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 7);
+    assert_eq!(lock.matches("[[package]]").count(), 8);
+    assert!(lock.contains("name = \"td-alloc\""));
     assert!(lock.contains("name = \"td-av1\""));
     assert!(lock.contains("name = \"td-civil\""));
     assert!(lock.contains("name = \"td-fs\""));

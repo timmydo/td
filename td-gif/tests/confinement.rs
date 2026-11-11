@@ -41,7 +41,7 @@ fn pure_std_only_source_and_standalone_gate() {
         assert!(!production.contains(forbidden), "source names {forbidden}");
     }
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(!manifest.contains("dependencies]"));
+    assert!(manifest.contains("td-alloc = { path = \"../td-alloc\" }"));
     assert!(manifest.contains("[workspace]\n"));
     assert!(manifest.contains("[package.metadata.td-gate]\nclippy-all-targets = true\n"));
     for lint in [
@@ -56,7 +56,7 @@ fn pure_std_only_source_and_standalone_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")));
     }
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
-    assert_eq!(lock.matches("[[package]]").count(), 1);
+    assert_eq!(lock.matches("[[package]]").count(), 2);
     assert!(lock.contains("name = \"td-gif\""));
 }
 

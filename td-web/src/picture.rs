@@ -193,7 +193,7 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, Error> {
         Format::Jpeg => {
             let image = td_jpeg::decode(body, scale).map_err(|e| decode_error(Cause::Jpeg(e)))?;
             let mut rgba = Vec::new();
-            rgba.try_reserve_exact(image.data.len() / 3 * 4)
+            td_alloc::reserve_exact(&mut rgba, image.data.len() / 3 * 4)
                 .map_err(|_| Error::Resources)?;
             for pixel in image.data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(pixel);
@@ -216,6 +216,41 @@ pub(crate) mod tests {
     pub(crate) const WEBP: &[u8] = include_bytes!("../../td-webp/tests/fixtures/palette.webp");
 
     pub(crate) const GIF: &[u8] = b"GIF89a\x02\0\x01\0\x80\0\0\0\0\0\xff\0\0\x21\xf9\x04\x01\0\0\0\0\x2c\0\0\0\0\x02\0\x01\0\0\x02\x02\x44\x0a\0\x3b";
+
+    #[test]
+    fn every_picture_reservation_can_fail_without_losing_later_decodes() {
+        let png = include_bytes!("../../td-png/tests/fixtures/suite/rgb8.png");
+        let jpeg = include_bytes!("../../td-jpeg/tests/fixtures/progressive/420-prog.jpg");
+        for (format, bytes) in [
+            (Format::Png, png.as_slice()),
+            (Format::Jpeg, jpeg.as_slice()),
+            (Format::Gif, GIF),
+            (Format::Webp, WEBP),
+            (Format::Avif, AVIF),
+        ] {
+            let expected = decode(format, bytes).unwrap();
+            let mut succeeded = false;
+            for after in 0..1024 {
+                match td_alloc::with_reservation_limit(after, || decode(format, bytes)) {
+                    Err(error) => assert!(
+                        error.resources(),
+                        "{format:?}, reservation {after}: {error}"
+                    ),
+                    Ok(actual) => {
+                        assert!(after > 0);
+                        assert_eq!(actual.fit(11, 9), expected.fit(11, 9));
+                        succeeded = true;
+                        break;
+                    }
+                }
+            }
+            assert!(succeeded, "{format:?}");
+            assert_eq!(
+                decode(format, bytes).unwrap().fit(11, 9),
+                expected.fit(11, 9)
+            );
+        }
+    }
 
     #[test]
     fn gif_dimensions_and_encoded_bytes_are_checked_before_decode() {

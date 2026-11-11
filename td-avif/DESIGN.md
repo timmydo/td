@@ -86,3 +86,6 @@ in its design document. Conversion visits each visible pixel once.
 Pixel tests cover a libavif/libaom container, exact RGBA values derived
 from independently decoded YUV, metadata disagreement, unsupported codec
 tools, truncation, and full/limited-range matrix vectors.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

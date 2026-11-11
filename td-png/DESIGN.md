@@ -169,7 +169,10 @@ Python's zlib when the encoder landed.
 nothing, the checksum and td-inflate mounts and td-util's encoder and
 nothing else,
 the encoder reaching only `crate::deflate` and `crate::crc32` (and no
-`super::` outside its tests), a manifest of no
-dependencies, the bounds above, the fixture inventory, `shapes.png`'s
+`super::` outside its tests), a manifest depending only on td-alloc, the
+bounds above, the fixture inventory, `shapes.png`'s
 length, every hash the decode test holds being the README's, and the
 expansion contract stated in `src/lib.rs`.
+
+Allocation helpers use the sibling `td-alloc` implementation under its
+reservation and error contract (`td-alloc/DESIGN.md`).

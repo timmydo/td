@@ -17,6 +17,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-setup")
         .local_source_trees(&[
             "td-install",
+            "td-alloc",
             "td-ui",
             "td-compositor",
             "td-protector",
@@ -50,6 +51,7 @@ mod tests {
             recipe.local_source_trees,
             Some(vec![
                 "td-install".into(),
+                "td-alloc".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
                 "td-protector".into(),
