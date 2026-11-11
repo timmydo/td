@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::time::Instant;
 
 use td_ui::chrome::{Status, TextEntry, ROW};
 use td_ui::entry_model::{Action, EntryModel};
@@ -22,7 +23,7 @@ use td_url::{Reference, Url};
 
 use crate::document::{self, Document, Place, Rendered, Renderer};
 use crate::fetch::{self, Fetcher};
-use crate::view::{self, Pane, View};
+use crate::view::{self, Pane, Selection, View};
 
 /// The longest address the row holds, in characters.
 const MAX_ADDRESS: usize = 4096;
@@ -40,6 +41,21 @@ const IDLE_WAIT_MS: u64 = 1000;
 /// scale: a narrower pane shows each line's start, cut at its edge as a
 /// preformatted line is, rather than a line for every few glyphs.
 pub const MIN_WRAP_EMS: i64 = 8;
+/// The most text a copy takes, in bytes: the clipboard's own ceiling. A
+/// selection past it is not copied, and the status row says so.
+pub const MAX_COPY: usize = td_ui::clipboard::MAX_BYTES;
+/// How far, in font pixels each way, the pointer may move between a press
+/// and its release for the two to be a click, and a second press lie from
+/// a click to make the pair a double click, as in td-ui's message list.
+const NEAR: i64 = 4;
+/// How long after a click's release a press makes a double or a triple
+/// click, as in td-ui's message list.
+const MULTI_CLICK_MS: u64 = td_ui::messages::MULTI_CLICK_MS;
+/// While a selecting drag holds the pointer above or below the page, the
+/// page scrolls once each `DRAG_SCROLL_MS`, a line for each line's height
+/// the pointer is past the edge, at most `DRAG_SCROLL_LINES`.
+const DRAG_SCROLL_MS: u64 = 50;
+const DRAG_SCROLL_LINES: i64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -100,6 +116,63 @@ struct Layout {
     body: TextFamily,
 }
 
+/// What a press of the button on the page began, until its release.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    /// Where it was pressed, and where the pointer is now.
+    from: (i64, i64),
+    at: (i64, i64),
+    /// Where a drag selects from.
+    anchor: Place,
+    /// The link under the press, followed by a click.
+    link: Option<usize>,
+    /// One for a press, two for a double click's, three for a triple's.
+    count: u8,
+    /// Whether it selects as the pointer moves: once it has moved further
+    /// than `NEAR` from where it began, or from a Shift press at once. A
+    /// double or a triple click's selection is not moved by a drag.
+    selecting: bool,
+    /// Whether the pointer has moved from where it was pressed: only a
+    /// drag scrolls past the page's edge, not a Shift press on its last
+    /// line, nor a move that leaves the pointer there.
+    moved: bool,
+}
+
+/// A click: when it was released, where, and which of a run it was.
+#[derive(Clone, Copy, Debug)]
+struct Click {
+    released: u64,
+    at: (i64, i64),
+    count: u8,
+}
+
+/// Milliseconds since the window began, for telling a double click from
+/// two clicks: read at each press and release, since a pointer input
+/// carries no time and is handled before the turn's `poll` is told one.
+struct Clock {
+    epoch: Instant,
+    #[cfg(test)]
+    fixed: Option<u64>,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            #[cfg(test)]
+            fixed: None,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(fixed) = self.fixed {
+            return fixed;
+        }
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// The page shown, and its rendering for the layout it was made for.
 struct Current {
     doc: Document,
@@ -139,6 +212,12 @@ pub struct App {
     metrics: Metrics,
     /// Whether body text is in Serif rather than Sans.
     serif: bool,
+    /// The press on the page being held, and the click before it.
+    press: Option<Press>,
+    click: Option<Click>,
+    clock: Clock,
+    /// When a drag past the page's edge last scrolled it.
+    drag_scrolled: Option<u64>,
 }
 
 /// Counts a worker until its thread ends, however it ends.
@@ -216,6 +295,10 @@ impl App {
             faces,
             metrics,
             serif: false,
+            press: None,
+            click: None,
+            clock: Clock::new(),
+            drag_scrolled: None,
         })
     }
 
@@ -411,6 +494,9 @@ impl App {
             (None, Some(url)) => format!("{} - td-web", url.text()),
             (None, None) => "td-web".into(),
         };
+        // A press on the page before it is not on this one.
+        self.press = None;
+        self.click = None;
         self.current = Current {
             doc,
             fragment,
@@ -586,6 +672,18 @@ impl App {
             "Escape" if !self.stop() => {
                 self.current.view.focus = None;
                 self.current.view.hits.clear();
+                self.current.view.selection = None;
+            }
+            "C-a" => {
+                let page = &self.current.rendered.page;
+                let end = page.line_end(page.lines.len().saturating_sub(1));
+                self.current.view.select(Some(Selection {
+                    anchor: Place::default(),
+                    focus: end,
+                }));
+            }
+            "S-Left" | "S-Right" | "C-S-Left" | "C-S-Right" | "S-Up" | "S-Down" => {
+                self.extend_by(chord);
             }
             _ => {}
         }
@@ -608,11 +706,75 @@ impl App {
         let _ = self.query.act(Action::SelectAll);
     }
 
+    /// Moves the selection's focus by a keyboard chord: a character, a
+    /// word or a logical line, from where it is; with nothing selected,
+    /// from the focused link's start, else the first line shown's. The
+    /// page scrolls as little as shows where it went.
+    fn extend_by(&mut self, chord: &str) {
+        let rows = self.rows();
+        let Current { view, rendered, .. } = &mut self.current;
+        let page = Arc::clone(&rendered.page);
+        if page.lines.is_empty() {
+            return;
+        }
+        let selection = view.selection.unwrap_or_else(|| {
+            let start = view
+                .focus
+                .and_then(|link| page.link_place(link))
+                .unwrap_or(view.top);
+            Selection {
+                anchor: start,
+                focus: start,
+            }
+        });
+        let at = selection.focus;
+        let focus = match chord {
+            "S-Left" => page.before_char(at),
+            "S-Right" => page.after_char(at),
+            "C-S-Left" => page.word_before(at),
+            "C-S-Right" => page.word_after(at),
+            "S-Up" => page.line_up(at),
+            _ => page.line_down(at),
+        };
+        view.select(Some(Selection { focus, ..selection }));
+        view.reveal(focus, rendered, &mut self.metrics, rows);
+        self.refresh_hover();
+    }
+
+    /// The page's selected text, when any is selected: `Err` past
+    /// `MAX_COPY`.
+    fn selected_text(&self) -> Option<Result<String, ()>> {
+        let (start, end) = self.current.view.selection?.range()?;
+        let page = &self.current.rendered.page;
+        match page.text(start, end, MAX_COPY) {
+            Some(text) if text.is_empty() => None,
+            Some(text) => Some(Ok(text)),
+            None => Some(Err(())),
+        }
+    }
+
+    /// Copies, first that applies: the address or find row's selection
+    /// while it has focus, the page's selection, the focused link's URL,
+    /// the page's.
     fn copy(&mut self, clipboard: &mut dyn Clipboard) {
         let text = match self.focus {
             Focus::Address => self.address.copy().ok().flatten(),
             Focus::Find => self.query.copy().ok().flatten(),
             Focus::Page => None,
+        };
+        let text = match text {
+            Some(text) => Some(text),
+            None => match self.selected_text() {
+                Some(Ok(text)) => Some(text.into()),
+                Some(Err(())) => {
+                    self.message = Some(format!(
+                        "not copied: the selection is past {} MiB",
+                        MAX_COPY >> 20
+                    ));
+                    return;
+                }
+                None => None,
+            },
         };
         let text = text.or_else(|| {
             let link = self.current.view.focus?;
@@ -725,10 +887,21 @@ impl App {
         }
     }
 
-    fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64) {
-        if phase != PointerPhase::Press {
-            return;
+    fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) {
+        match phase {
+            PointerPhase::Press => self.press(x, y, extend),
+            PointerPhase::Move => self.drag(x, y),
+            PointerPhase::Release => self.release(x, y),
         }
+    }
+
+    /// A press: in the address row, its caret; on the page, a click, a
+    /// drag or a double or triple click begins, Shift extending the
+    /// selection from its anchor.
+    fn press(&mut self, x: i64, y: i64, extend: bool) {
+        self.press = None;
+        self.drag_scrolled = None;
+        let click = self.click.take();
         let address = self.address_rect();
         if address.contains(x, y) {
             self.focus = Focus::Address;
@@ -737,11 +910,166 @@ impl App {
             }
             return;
         }
-        if self.page_rect().contains(x, y) {
-            self.focus = Focus::Page;
-            if let Some(link) = self.link_at(x, y) {
-                self.follow_link(link);
+        if !self.page_rect().contains(x, y) {
+            return;
+        }
+        self.focus = Focus::Page;
+        let now = self.clock.now();
+        let near = (NEAR * self.scale()).unsigned_abs();
+        let count = match click {
+            Some(click)
+                if !extend
+                    && click.count < 3
+                    && now.saturating_sub(click.released) <= MULTI_CLICK_MS
+                    && click.at.0.abs_diff(x) <= near
+                    && click.at.1.abs_diff(y) <= near =>
+            {
+                click.count + 1
             }
+            _ => 1,
+        };
+        let link = self.link_at(x, y).filter(|_| count == 1 && !extend);
+        let pane = self.pane();
+        let Current { view, rendered, .. } = &mut self.current;
+        let spot = view.spot(rendered, &pane, x, y);
+        let caret = spot.map_or(view.top, |spot| spot.caret);
+        let page = &rendered.page;
+        let anchor = match view.selection {
+            Some(selection) if extend => selection.anchor,
+            _ => caret,
+        };
+        view.select(match count {
+            _ if extend => Some(Selection {
+                anchor,
+                focus: caret,
+            }),
+            2 => spot
+                .and_then(|spot| page.word(spot.under?))
+                .map(|(anchor, focus)| Selection { anchor, focus }),
+            3 => spot.map(|spot| Selection {
+                anchor: Place::line(spot.caret.logical),
+                focus: page.line_end(spot.caret.logical),
+            }),
+            _ => None,
+        });
+        self.press = Some(Press {
+            from: (x, y),
+            at: (x, y),
+            anchor,
+            link,
+            count,
+            selecting: extend,
+            moved: false,
+        });
+    }
+
+    /// The pointer moved with the button held: a press's drag past `NEAR`
+    /// selects from it to the pointer.
+    fn drag(&mut self, x: i64, y: i64) {
+        let near = NEAR * self.scale();
+        let Some(press) = &mut self.press else {
+            return;
+        };
+        press.at = (x, y);
+        press.moved |= (x, y) != press.from;
+        if press.count == 1 && !press.selecting {
+            let (from_x, from_y) = press.from;
+            press.selecting = (x - from_x).abs() > near || (y - from_y).abs() > near;
+        }
+        if press.selecting {
+            self.select_to(x, y);
+        }
+    }
+
+    /// The selection from the press's anchor to where a point falls.
+    fn select_to(&mut self, x: i64, y: i64) {
+        let Some(press) = self.press else {
+            return;
+        };
+        let pane = self.pane();
+        let view = &mut self.current.view;
+        if let Some(spot) = view.spot(&self.current.rendered, &pane, x, y) {
+            view.select(Some(Selection {
+                anchor: press.anchor,
+                focus: spot.caret,
+            }));
+        }
+    }
+
+    /// The button's release: a click on a link follows it, and any other
+    /// click is kept for the next press to pair with.
+    fn release(&mut self, x: i64, y: i64) {
+        self.drag_scrolled = None;
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        if press.selecting {
+            return;
+        }
+        match press.link {
+            Some(link) => self.follow_link(link),
+            None => {
+                self.click = Some(Click {
+                    released: self.clock.now(),
+                    at: (x, y),
+                    count: press.count,
+                })
+            }
+        }
+    }
+
+    /// How many lines a selecting drag held above the page (less than
+    /// none) or below its last line shown whole scrolls by at a time:
+    /// none before the pointer has moved, and none on a page shorter than
+    /// a line, which shows no line whole to select to.
+    fn drag_past(&self) -> Option<i64> {
+        let press = self.press.filter(|press| press.selecting && press.moved)?;
+        let pane = self.pane();
+        if pane.shown() == 0 {
+            return None;
+        }
+        let height = i64::from(pane.line.height.max(1));
+        let top = pane.rect.y;
+        let bottom = top + pane.shown() as i64 * height;
+        let y = press.at.1;
+        let lines = if y < top {
+            -(1 + (top - y) / height)
+        } else if y >= bottom {
+            1 + (y - bottom) / height
+        } else {
+            return None;
+        };
+        Some(lines.clamp(-DRAG_SCROLL_LINES, DRAG_SCROLL_LINES))
+    }
+
+    /// Scrolls a selecting drag held past the page's edge, at most once
+    /// each `DRAG_SCROLL_MS`, and extends the selection to where the
+    /// pointer falls on the lines then shown.
+    fn drag_scroll(&mut self, now: u64) {
+        let Some(lines) = self.drag_past() else {
+            self.drag_scrolled = None;
+            return;
+        };
+        if self
+            .drag_scrolled
+            .is_some_and(|at| now.saturating_sub(at) < DRAG_SCROLL_MS)
+        {
+            return;
+        }
+        self.drag_scrolled = Some(now);
+        let before = (self.current.view.top, self.current.view.selection);
+        self.scroll(isize::try_from(lines).unwrap_or(0));
+        self.reselect();
+        if (self.current.view.top, self.current.view.selection) != before {
+            self.redraw = true;
+        }
+    }
+
+    /// A selecting drag's selection extended again to where the pointer
+    /// falls, after the lines under it moved.
+    fn reselect(&mut self) {
+        if let Some(press) = self.press.filter(|press| press.selecting) {
+            self.select_to(press.at.0, press.at.1);
         }
     }
 
@@ -814,14 +1142,33 @@ const PAGE_KEYS: &[(&str, &str)] = &[
     ("Return", "follow the focused link"),
     ("Space, PageDown, PageUp", "page down or up"),
     ("Home, End", "top or bottom"),
-    ("/, Ctrl+F", "find; n and N next and previous"),
-    ("Escape", "stop loading, else clear focus and find"),
+    (
+        "/, Ctrl+F",
+        "find and select a match; n and N next and previous",
+    ),
+    (
+        "drag, double or triple click",
+        "select text, a word or a line",
+    ),
+    ("Shift+click", "extend the selection"),
+    (
+        "Shift+arrows",
+        "extend it a character or line; with Ctrl a word",
+    ),
+    ("Ctrl+A", "select the page"),
+    (
+        "Escape",
+        "stop loading, else clear focus, find and selection",
+    ),
 ];
 const BROWSER_KEYS: &[(&str, &str)] = &[
     ("Ctrl+L, F6", "the address"),
     ("Alt+Left, Alt+Right", "back, forward"),
     ("Ctrl+R, F5", "reload"),
-    ("Ctrl+C", "copy the link's or the page's address"),
+    (
+        "Ctrl+C",
+        "copy the selection, else the link's or page's address",
+    ),
     ("F8", "body text in Sans or Serif"),
     ("Ctrl+Q, Ctrl+W", "close"),
 ];
@@ -841,15 +1188,27 @@ impl Handler for App {
                 self.message = None;
                 self.key(chord, clipboard);
             }
-            Input::Pointer { phase, x, y, .. } => {
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+                ..
+            } => {
                 if phase == PointerPhase::Press {
                     self.message = None;
                 }
-                self.pointer(phase, x, y);
+                self.pointer(phase, x, y, extend);
+            }
+            Input::CancelPointer => {
+                self.press = None;
+                self.click = None;
+                self.drag_scrolled = None;
             }
             Input::Wheel { rows, .. } => {
                 self.message = None;
                 self.scroll(rows);
+                self.reselect();
             }
             Input::Resize(surface) => {
                 self.surface = surface;
@@ -867,16 +1226,19 @@ impl Handler for App {
         self.flow()
     }
 
-    fn poll(&mut self, _now: u64) -> Flow {
+    fn poll(&mut self, now: u64) -> Flow {
         if self.loading.is_some() {
             self.settle();
             self.redraw = true;
         }
+        self.drag_scroll(now);
         self.flow()
     }
 
     fn wait_ms(&self, _now: u64) -> u64 {
-        if self.loading.is_some() {
+        if self.drag_past().is_some() {
+            DRAG_SCROLL_MS
+        } else if self.loading.is_some() {
             LOADING_WAIT_MS
         } else {
             IDLE_WAIT_MS
@@ -1379,17 +1741,9 @@ mod tests {
         let x = page.x + inset + i64::from(left) + 1;
         app.motion(Some((x, y)));
         assert_eq!(app.status_text(), "https://example.org/a");
-        let mut board = Board::default();
-        app.input(
-            Input::Pointer {
-                phase: PointerPhase::Press,
-                x,
-                y,
-                extend: false,
-                follow: false,
-            },
-            &mut board,
-        );
+        app.mouse(PointerPhase::Press, (x, y), false);
+        assert!(app.loading.is_none(), "followed at the release");
+        app.mouse(PointerPhase::Release, (x, y), false);
         settle(&mut app);
         assert_eq!(app.title(), "A - td-web");
         assert_eq!(app.hover, None, "nothing under the pointer on the new page");
@@ -1686,6 +2040,522 @@ mod tests {
         assert_eq!(all[at - 1].logical, 40, "its first line");
     }
 
+    /// The pointer's presses, moves and releases, as methods so a point
+    /// read from the app can be an argument.
+    trait Pointing {
+        fn mouse(&mut self, phase: PointerPhase, at: (i64, i64), extend: bool);
+        /// A press at `from`, the pointer moved to `to` and released there.
+        fn drag_from(&mut self, from: (i64, i64), to: (i64, i64));
+        /// A click at `at`, `ms` after the window began.
+        fn click_at(&mut self, at: (i64, i64), ms: u64);
+        fn shift_click(&mut self, at: (i64, i64));
+    }
+
+    impl Pointing for App {
+        fn mouse(&mut self, phase: PointerPhase, (x, y): (i64, i64), extend: bool) {
+            let mut board = Board::default();
+            self.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend,
+                    follow: false,
+                },
+                &mut board,
+            );
+        }
+
+        fn drag_from(&mut self, from: (i64, i64), to: (i64, i64)) {
+            self.mouse(PointerPhase::Press, from, false);
+            self.mouse(PointerPhase::Move, to, false);
+            self.mouse(PointerPhase::Release, to, false);
+        }
+
+        fn click_at(&mut self, at: (i64, i64), ms: u64) {
+            self.clock.fixed = Some(ms);
+            self.mouse(PointerPhase::Press, at, false);
+            self.mouse(PointerPhase::Release, at, false);
+        }
+
+        fn shift_click(&mut self, at: (i64, i64)) {
+            self.mouse(PointerPhase::Press, at, true);
+            self.mouse(PointerPhase::Release, at, false);
+        }
+    }
+
+    /// What Ctrl+C copies.
+    fn copied(app: &mut App) -> Vec<String> {
+        let mut board = Board::default();
+        app.input(
+            Input::Key {
+                chord: "C-c",
+                repeat: false,
+            },
+            &mut board,
+        );
+        board.copies
+    }
+
+    /// A point a pixel into glyph `glyph` of the `row`th line shown: its
+    /// left half on the cell.
+    fn point(app: &App, row: usize, glyph: usize) -> (i64, i64) {
+        let x = on_screen(app)[row].line.glyphs[glyph].x;
+        let page = app.page_rect();
+        let height = i64::from(app.metrics.line().height);
+        (
+            page.x + app.inset() + i64::from(x) + 1,
+            page.y + row as i64 * height + 1,
+        )
+    }
+
+    /// Two paragraphs on a pane 200 pixels wide, the first wrapped.
+    fn two_paragraphs() -> App {
+        let page = "<p>alpha beta gamma delta epsilon zeta</p><p>second para</p>";
+        let mut app = app(site().page("https://example.org/t", "text/html", page));
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(200)), &mut board);
+        typed(&mut app, "example.org/t");
+        let lines: Vec<String> = on_screen(&app).iter().map(|w| shown(&w.line)).collect();
+        assert_eq!(
+            lines,
+            ["alpha beta gamma delta", "epsilon zeta", "", "second para"]
+        );
+        app
+    }
+
+    #[test]
+    fn a_drag_selects_across_wrapped_and_logical_lines_and_copies_them() {
+        let mut app = two_paragraphs();
+        app.drag_from(point(&app, 0, 6), point(&app, 3, 7));
+        assert_eq!(app.current.view.selection.unwrap().anchor.logical, 0);
+        // The space the wrap dropped is the page's, and so is the blank
+        // line between the paragraphs.
+        assert_eq!(
+            copied(&mut app),
+            ["beta gamma delta epsilon zeta\n\nsecond "]
+        );
+        assert_eq!(app.status_text(), "copied");
+        // Dragged up past where it began, it selects before it.
+        app.drag_from(point(&app, 1, 8), point(&app, 0, 11));
+        assert_eq!(copied(&mut app), ["gamma delta epsilon "]);
+        // A plain click clears it.
+        app.click_at(point(&app, 3, 1), 0);
+        assert_eq!(app.current.view.selection, None);
+    }
+
+    #[test]
+    fn a_double_click_selects_a_word_and_a_triple_click_its_logical_line() {
+        let mut app = two_paragraphs();
+        let gamma = point(&app, 0, 12);
+        app.click_at(gamma, 1000);
+        assert_eq!(app.current.view.selection, None, "a click selects nothing");
+        app.click_at(gamma, 1000 + MULTI_CLICK_MS);
+        assert_eq!(copied(&mut app), ["gamma"]);
+        app.click_at((gamma.0 + NEAR, gamma.1 - 1), 1600);
+        assert_eq!(
+            copied(&mut app),
+            ["alpha beta gamma delta epsilon zeta"],
+            "from its first wrapped line to its last"
+        );
+        // A fourth is a first again, as is a slow or distant second.
+        app.click_at(gamma, 1700);
+        assert_eq!(app.current.view.selection, None);
+        app.click_at(gamma, 1701 + MULTI_CLICK_MS);
+        assert_eq!(app.current.view.selection, None, "slow");
+        app.click_at((gamma.0 + NEAR + 1, gamma.1), 2400);
+        assert_eq!(app.current.view.selection, None, "distant");
+        // On a continuation, the word and its logical line; a drag after
+        // a double click does not move what it selected.
+        let epsilon = point(&app, 1, 2);
+        app.click_at(epsilon, 5000);
+        app.clock.fixed = Some(5100);
+        app.mouse(PointerPhase::Press, epsilon, false);
+        app.mouse(PointerPhase::Move, point(&app, 3, 3), false);
+        app.mouse(PointerPhase::Release, point(&app, 3, 3), false);
+        assert_eq!(copied(&mut app), ["epsilon"]);
+        // Off a word, a double click selects nothing.
+        let space = point(&app, 0, 5);
+        app.click_at(space, 9000);
+        app.click_at(space, 9100);
+        assert_eq!(app.current.view.selection, None);
+    }
+
+    #[test]
+    fn a_shift_click_extends_the_selection_from_its_anchor() {
+        let mut app = two_paragraphs();
+        app.drag_from(point(&app, 0, 6), point(&app, 0, 10));
+        assert_eq!(copied(&mut app), ["beta"]);
+        app.shift_click(point(&app, 0, 17));
+        assert_eq!(copied(&mut app), ["beta gamma "]);
+        app.shift_click(point(&app, 0, 0));
+        assert_eq!(copied(&mut app), ["alpha "], "the anchor kept");
+        // With nothing selected it starts at the press, and its drag
+        // extends at once.
+        key(&mut app, "Escape");
+        app.mouse(PointerPhase::Press, point(&app, 3, 0), true);
+        app.mouse(PointerPhase::Move, point(&app, 3, 1), false);
+        app.mouse(PointerPhase::Release, point(&app, 3, 1), false);
+        assert_eq!(copied(&mut app), ["s"]);
+    }
+
+    /// A press and release within `NEAR` of each other on a link follow
+    /// it; a drag further selects and follows nothing, as does a Shift
+    /// press or a press the pointer's leaving cancels.
+    #[test]
+    fn a_click_on_a_link_follows_it_and_a_drag_from_it_selects() {
+        let mut app = app(site());
+        typed(&mut app, "example.org");
+        let link = point(&app, 0, 1);
+        let near = (link.0 + NEAR, link.1 + NEAR);
+        app.mouse(PointerPhase::Press, link, false);
+        app.mouse(PointerPhase::Move, near, false);
+        app.mouse(PointerPhase::Release, near, false);
+        settle(&mut app);
+        assert_eq!(app.title(), "A - td-web");
+        key(&mut app, "M-Left");
+        settle(&mut app);
+        let far = (link.0 + NEAR + 1, link.1);
+        app.mouse(PointerPhase::Press, link, false);
+        app.mouse(PointerPhase::Move, far, false);
+        app.mouse(PointerPhase::Release, far, false);
+        assert!(app.loading.is_none(), "not followed");
+        assert_eq!(copied(&mut app), ["o"]);
+        app.shift_click(point(&app, 0, 0));
+        assert!(app.loading.is_none(), "not followed");
+        assert_eq!(copied(&mut app), ["t"]);
+        app.mouse(PointerPhase::Press, link, false);
+        let mut board = Board::default();
+        app.input(Input::CancelPointer, &mut board);
+        app.mouse(PointerPhase::Release, link, false);
+        assert!(app.loading.is_none(), "cancelled");
+    }
+
+    #[test]
+    fn a_drag_past_the_pane_scrolls_at_a_bounded_rate_and_extends() {
+        let mut lines = String::new();
+        for n in 0..200 {
+            lines.push_str(&format!("<p>line {n}</p>"));
+        }
+        let mut app = app(site().page("https://example.org/long", "text/html", &lines));
+        typed(&mut app, "example.org/long");
+        let start = point(&app, 0, 0);
+        let pane = app.pane();
+        let height = i64::from(pane.line.height);
+        let shown = pane.shown();
+        let bottom = pane.rect.y + shown as i64 * height;
+        assert_eq!(app.wait_ms(0), IDLE_WAIT_MS);
+        app.mouse(PointerPhase::Press, start, false);
+        app.mouse(PointerPhase::Move, (start.0, bottom), false);
+        assert_eq!(app.wait_ms(0), DRAG_SCROLL_MS);
+        let top = |app: &App| app.current.view.top.logical;
+        let focus = |app: &App| app.current.view.selection.unwrap().focus;
+        assert_eq!(top(&app), 0);
+        assert_eq!(focus(&app).logical, shown - 1, "the last line's end");
+        app.poll(1000);
+        assert_eq!(top(&app), 1);
+        app.poll(1000 + DRAG_SCROLL_MS - 1);
+        assert_eq!(top(&app), 1, "not sooner");
+        app.poll(1000 + DRAG_SCROLL_MS);
+        assert_eq!(top(&app), 2);
+        assert_eq!(focus(&app).logical, 2 + shown - 1);
+        // Further past the edge, faster, but at most DRAG_SCROLL_LINES.
+        app.mouse(PointerPhase::Move, (start.0, bottom + 2 * height), false);
+        app.poll(2000);
+        assert_eq!(top(&app), 5);
+        app.mouse(PointerPhase::Move, (start.0, bottom + 50 * height), false);
+        app.poll(3000);
+        assert_eq!(top(&app), 5 + DRAG_SCROLL_LINES as usize);
+        assert_eq!(app.current.view.selection.unwrap().anchor, Place::default());
+        // Above the pane it scrolls back, to the first line's start.
+        app.mouse(PointerPhase::Move, (start.0, pane.rect.y - 1), false);
+        app.poll(4000);
+        assert_eq!(top(&app), 8);
+        assert_eq!(focus(&app), Place::line(8));
+        // Inside the pane, or released, it stops.
+        app.mouse(PointerPhase::Move, (start.0, pane.rect.y + 1), false);
+        app.poll(5000);
+        assert_eq!(top(&app), 8);
+        app.mouse(PointerPhase::Move, (start.0, bottom), false);
+        app.mouse(PointerPhase::Release, (start.0, bottom), false);
+        assert_eq!(app.wait_ms(0), IDLE_WAIT_MS);
+        app.poll(6000);
+        assert_eq!(top(&app), 8);
+        let copy = copied(&mut app);
+        assert!(copy[0].starts_with("line 0\n\nline 1\n"), "{copy:?}");
+    }
+
+    /// A Shift press on the line partly shown below the last whole one
+    /// extends the selection there and scrolls nothing until the pointer
+    /// moves; a drag held past the page's end redraws only when it moves
+    /// something; and the wheel turned during a drag moves the selection's
+    /// end to where the pointer now falls.
+    #[test]
+    fn only_a_drag_scrolls_and_only_a_change_redraws() {
+        let mut lines = String::new();
+        for n in 0..200 {
+            lines.push_str(&format!("<p>line {n}</p>"));
+        }
+        let mut app = app(site().page("https://example.org/long", "text/html", &lines));
+        typed(&mut app, "example.org/long");
+        let pane = app.pane();
+        let height = i64::from(pane.line.height);
+        let bottom = pane.rect.y + pane.shown() as i64 * height;
+        assert!(
+            bottom + 1 < pane.rect.y + i64::from(pane.rect.height),
+            "a part line"
+        );
+        app.mouse(PointerPhase::Press, (40, bottom + 1), true);
+        app.poll(1000);
+        app.mouse(PointerPhase::Move, (40, bottom + 1), false);
+        app.poll(2000);
+        app.mouse(PointerPhase::Release, (40, bottom + 1), false);
+        assert_eq!(app.current.view.top, Place::default(), "not scrolled");
+        let focus = app.current.view.selection.unwrap().focus;
+        assert_eq!(focus.logical, pane.shown() - 1, "the last whole line's end");
+        // At the page's end a drag below it scrolls nothing and asks for
+        // no paint.
+        key(&mut app, "End");
+        let top = app.current.view.top;
+        app.mouse(PointerPhase::Press, (40, pane.rect.y + 1), false);
+        app.mouse(PointerPhase::Move, (40, bottom), false);
+        app.poll(3000);
+        app.redraw = false;
+        app.poll(3100);
+        assert!(!app.redraw);
+        assert_eq!(app.current.view.top, top);
+        // The wheel turned while the pointer is held over the page.
+        app.mouse(PointerPhase::Move, (40, pane.rect.y + 1), false);
+        let first = app.current.view.selection.unwrap().focus;
+        let mut board = Board::default();
+        app.input(
+            Input::Wheel {
+                rows: -3,
+                columns: 0,
+            },
+            &mut board,
+        );
+        let now = app.current.view.selection.unwrap().focus;
+        assert_eq!(now.logical, app.current.view.top.logical);
+        assert!(now < first, "{now:?} {first:?}");
+        app.mouse(PointerPhase::Release, (40, pane.rect.y + 1), false);
+    }
+
+    /// A pane shorter than a line shows no line whole: a press there
+    /// anchors at the top and a drag does not scroll.
+    #[test]
+    fn a_pane_shorter_than_a_line_does_not_drag_scroll() {
+        let mut lines = String::new();
+        for n in 0..50 {
+            lines.push_str(&format!("<p>line {n}</p>"));
+        }
+        let mut app = app(site().page("https://example.org/long", "text/html", &lines));
+        typed(&mut app, "example.org/long");
+        key(&mut app, "PageDown");
+        let height = 2 * td_ui::chrome::ROW + 8;
+        let mut board = Board::default();
+        app.input(
+            Input::Resize(Surface::new(800, height, Scale::new(1).unwrap()).unwrap()),
+            &mut board,
+        );
+        let pane = app.pane();
+        assert_eq!(pane.shown(), 0);
+        let top = app.current.view.top;
+        assert!(top > Place::default());
+        app.mouse(PointerPhase::Press, (40, pane.rect.y + 1), true);
+        app.mouse(PointerPhase::Move, (40, pane.rect.y + 40), false);
+        assert_eq!(app.wait_ms(0), IDLE_WAIT_MS);
+        app.poll(1000);
+        assert_eq!(app.current.view.top, top);
+        app.mouse(PointerPhase::Release, (40, pane.rect.y + 40), false);
+        assert_eq!(app.current.view.selection.unwrap().anchor, top);
+    }
+
+    /// The glyphs the page paints on the selection's ground, spaces left
+    /// out.
+    fn painted_selection(app: &App) -> String {
+        let mut marked = String::new();
+        view::paint(
+            &app.current.rendered,
+            &app.current.view,
+            None,
+            &app.pane(),
+            &mut |draw| {
+                if let td_ui::raster::Primitive::Glyph { scalar, style, .. } = draw.primitive {
+                    if style.background == td_ui::raster::SELECTED && scalar != ' ' {
+                        marked.push(scalar);
+                    }
+                }
+            },
+        );
+        marked
+    }
+
+    #[test]
+    fn a_selection_survives_scrolling_past_the_wrap_window_a_resize_and_f8() {
+        // One logical line of some 500 wrapped lines, read 30 lines in.
+        let words: Vec<String> = (0..10_000).map(|n| format!("w{n}")).collect();
+        let page = format!("<div>{}</div>", words.join(" "));
+        let mut app = app(site().page("https://example.org/p", "text/html", &page));
+        typed(&mut app, "example.org/p");
+        for _ in 0..30 {
+            key(&mut app, "Down");
+        }
+        app.drag_from(point(&app, 0, 0), point(&app, 2, 3));
+        let selection = app.current.view.selection;
+        let text = copied(&mut app);
+        assert!(text[0].len() > 100, "{text:?}");
+        let words: String = text[0].split(' ').collect();
+        assert_eq!(painted_selection(&app), words);
+        key(&mut app, "End");
+        let first = crate::document::tests::laid(&mut app.current.rendered)
+            .front()
+            .unwrap()
+            .place();
+        assert!(first > selection.unwrap().focus, "its lines are not laid");
+        assert_eq!(painted_selection(&app), "");
+        let mut board = Board::default();
+        for change in [Some(surface(300)), None, Some(surface(800)), None] {
+            match change {
+                Some(surface) => {
+                    app.input(Input::Resize(surface), &mut board);
+                }
+                None => key(&mut app, "F8"),
+            }
+            assert_eq!(app.current.view.selection, selection);
+            assert_eq!(copied(&mut app), text);
+        }
+        key(&mut app, "Home");
+        for _ in 0..30 {
+            key(&mut app, "Down");
+        }
+        assert_eq!(painted_selection(&app), words);
+    }
+
+    #[test]
+    fn ctrl_c_copies_a_rows_then_the_pages_selection_then_the_link_then_the_address() {
+        let mut app = app(site());
+        typed(&mut app, "example.org");
+        key(&mut app, "Tab");
+        assert_eq!(copied(&mut app), ["https://example.org/a"]);
+        app.drag_from(point(&app, 0, 0), point(&app, 0, 2));
+        assert_eq!(app.current.view.focus, None, "the selection replaces it");
+        assert_eq!(copied(&mut app), ["to"]);
+        key(&mut app, "C-l");
+        assert_eq!(copied(&mut app), ["https://example.org/"], "the row's");
+        key(&mut app, "Escape");
+        assert_eq!(copied(&mut app), ["to"]);
+        key(&mut app, "Tab");
+        assert_eq!(app.current.view.selection, None, "the link replaces it");
+        assert_eq!(copied(&mut app), ["https://example.org/a"]);
+        key(&mut app, "C-a");
+        assert_eq!(copied(&mut app), ["to a mail"]);
+        key(&mut app, "Escape");
+        assert_eq!(app.current.view.selection, None);
+        assert_eq!(copied(&mut app), ["https://example.org/"], "the page's");
+    }
+
+    #[test]
+    fn navigation_clears_the_selection_and_a_press_held_over_it() {
+        let mut app = two_paragraphs();
+        key(&mut app, "C-a");
+        assert!(app.current.view.selection.is_some());
+        typed(&mut app, "example.org/a");
+        assert_eq!(app.current.view.selection, None);
+        key(&mut app, "M-Left");
+        settle(&mut app);
+        assert_eq!(app.title(), "https://example.org/t - td-web");
+        assert_eq!(app.current.view.selection, None, "not kept in the history");
+        // A page arriving under a held press is not dragged over.
+        app.mouse(PointerPhase::Press, point(&app, 0, 0), false);
+        key(&mut app, "C-r");
+        settle(&mut app);
+        app.mouse(PointerPhase::Move, point(&app, 3, 3), false);
+        app.mouse(PointerPhase::Release, point(&app, 3, 3), false);
+        assert_eq!(app.current.view.selection, None);
+        assert!(app.loading.is_none());
+    }
+
+    #[test]
+    fn a_selection_past_the_copy_bound_is_not_copied() {
+        let line = "x".repeat(99);
+        let lines = MAX_COPY / 100 + 1;
+        let body = format!("{line}\n").repeat(lines);
+        let mut app = app(site().page("https://example.org/big", "text/plain", &body));
+        typed(&mut app, "example.org/big");
+        key(&mut app, "C-a");
+        assert_eq!(copied(&mut app), Vec::<String>::new());
+        assert_eq!(
+            app.status_text(),
+            format!("not copied: the selection is past {} MiB", MAX_COPY >> 20)
+        );
+        // Up to the last line's start, it is within the bound.
+        key(&mut app, "S-Up");
+        let copy = copied(&mut app);
+        assert_eq!(copy[0].len(), (lines - 1) * 100);
+        assert!(copy[0].len() <= MAX_COPY);
+        assert_eq!(copy[0], body[..(lines - 1) * 100]);
+    }
+
+    #[test]
+    fn find_selects_its_match_and_shift_keys_extend_it() {
+        let page = "<p>alpha beta gamma</p><p>delta</p>";
+        let mut app = app(site().page("https://example.org/f", "text/html", page));
+        typed(&mut app, "example.org/f");
+        key(&mut app, "/");
+        for c in "beta".chars() {
+            key(&mut app, &c.to_string());
+        }
+        assert_eq!(copied(&mut app), ["beta"], "from the find row");
+        key(&mut app, "Escape");
+        for (chord, copy) in [
+            ("S-Right", "beta "),
+            ("C-S-Right", "beta gamma"),
+            ("S-Down", "beta gamma\n"),
+            ("S-Down", "beta gamma\n\ndelta"),
+            ("S-Up", "beta gamma\n\n"),
+            ("S-Left", "beta gamma\n"),
+            ("C-S-Left", "beta gamma"),
+            ("C-S-Left", "beta "),
+        ] {
+            key(&mut app, chord);
+            assert_eq!(copied(&mut app), [copy], "{chord}");
+        }
+        // With nothing selected, from the first line shown, or from the
+        // focused link.
+        key(&mut app, "Escape");
+        key(&mut app, "S-Right");
+        assert_eq!(copied(&mut app), ["a"]);
+        let mut app = app_over(Arc::new(site()));
+        typed(&mut app, "example.org");
+        key(&mut app, "Tab");
+        key(&mut app, "Tab");
+        key(&mut app, "C-S-Right");
+        assert_eq!(copied(&mut app), ["mail"]);
+    }
+
+    /// A line that is not wrapped copies its kept text whole, past what
+    /// the pane shows of it.
+    #[test]
+    fn a_line_not_wrapped_copies_its_kept_text_past_the_panes_edge() {
+        let page = format!("<pre>{}END</pre><p>after</p>", "x".repeat(300));
+        let mut app = app(site().page("https://example.org/pre", "text/html", &page));
+        typed(&mut app, "example.org/pre");
+        let laid = on_screen(&app)[0].line.glyphs.len();
+        assert!(laid < 300);
+        let at = point(&app, 0, 5);
+        for ms in [1000, 1100, 1200] {
+            app.click_at(at, ms);
+        }
+        let whole = format!("{}END", "x".repeat(300));
+        assert_eq!(copied(&mut app), std::slice::from_ref(&whole));
+        // A drag into the inset right of the lines takes it whole too.
+        let pane = app.pane();
+        let right = pane.rect.x + i64::from(pane.rect.width) - 1;
+        app.drag_from(point(&app, 0, 0), (right, at.1));
+        assert_eq!(copied(&mut app), [whole]);
+    }
+
     /// The pinned faces' directories for `family`: the image's and the
     /// XDG data home's, never a host's packaged faces.
     fn pinned(family: td_ui::face_file::Family) -> Vec<td_ui::face_file::Place> {
@@ -1739,6 +2609,15 @@ mod tests {
         assert_eq!(app.status_text(), "https://example.org/a");
         app.motion(Some((left + i64::from(end) + 2, page.y + 1)));
         assert_eq!(app.hover, None);
+        // A drag selects by the glyphs' pixels: from the left half of the
+        // first 'm' to the left half of the space after the last; and a
+        // double click on an 'i' selects its word.
+        let pen = |at: usize| left + i64::from(first.glyphs[at].x) + 1;
+        app.drag_from((pen(5), page.y + 1), (pen(9), page.y + 1));
+        assert_eq!(copied(&mut app), ["mmmm"]);
+        app.click_at((pen(2), page.y + 1), 1000);
+        app.click_at((pen(2), page.y + 1), 1100);
+        assert_eq!(copied(&mut app), ["iiii"]);
         // A match spans its glyphs' pixels.
         key(&mut app, "/");
         for c in "after".chars() {

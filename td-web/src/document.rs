@@ -223,6 +223,237 @@ impl Page {
         }
         Some(first.unwrap_or(Place::line(link.line)))
     }
+
+    /// Where logical line `logical` ends: after its last run's text.
+    pub fn line_end(&self, logical: usize) -> Place {
+        let runs = self.lines.get(logical).map_or(&[][..], |line| &line.runs);
+        match runs.len().checked_sub(1) {
+            Some(last) => Place {
+                logical,
+                run: last,
+                at: runs.get(last).map_or(0, |run| run.text.len()),
+            },
+            None => Place::line(logical),
+        }
+    }
+
+    /// The characters of `at`'s logical line from `at` on, each with where
+    /// it is.
+    fn chars_from(&self, at: Place) -> impl Iterator<Item = (Place, char)> + '_ {
+        let runs = self
+            .lines
+            .get(at.logical)
+            .map_or(&[][..], |line| &line.runs);
+        runs.iter()
+            .enumerate()
+            .skip(at.run)
+            .flat_map(move |(run, part)| {
+                let from = if run == at.run { at.at } else { 0 };
+                let text = part.text.get(from..).unwrap_or_default();
+                text.char_indices().map(move |(byte, c)| {
+                    let place = Place {
+                        logical: at.logical,
+                        run,
+                        at: from + byte,
+                    };
+                    (place, c)
+                })
+            })
+    }
+
+    /// The characters of `at`'s logical line before `at`, the nearest
+    /// first, each with where it is.
+    fn chars_before(&self, at: Place) -> impl Iterator<Item = (Place, char)> + '_ {
+        let runs = self
+            .lines
+            .get(at.logical)
+            .map_or(&[][..], |line| &line.runs);
+        runs.iter()
+            .enumerate()
+            .take(at.run.saturating_add(1))
+            .rev()
+            .flat_map(move |(run, part)| {
+                let upto = if run == at.run {
+                    at.at
+                } else {
+                    part.text.len()
+                };
+                let text = part.text.get(..upto).unwrap_or_default();
+                text.char_indices().rev().map(move |(byte, c)| {
+                    let place = Place {
+                        logical: at.logical,
+                        run,
+                        at: byte,
+                    };
+                    (place, c)
+                })
+            })
+    }
+
+    /// Where the character after `at` ends; at a logical line's end, the
+    /// next line's start, and at the page's end `at` itself.
+    pub fn after_char(&self, at: Place) -> Place {
+        match self.chars_from(at).next() {
+            Some((place, c)) => place.past(c),
+            None => self.next_start(at),
+        }
+    }
+
+    /// Where the character before `at` starts; at a logical line's start,
+    /// the line before's end, and at the page's start `at` itself.
+    pub fn before_char(&self, at: Place) -> Place {
+        match self.chars_before(at).next() {
+            Some((place, _)) => place,
+            None => self.previous_end(at),
+        }
+    }
+
+    /// Where the next word from `at` ends, past what is no word before
+    /// it; its logical line's end when no word is left there, and from a
+    /// line's end the next line's start.
+    pub fn word_after(&self, at: Place) -> Place {
+        let mut chars = self.chars_from(at).peekable();
+        if chars.peek().is_none() {
+            return self.next_start(at);
+        }
+        let mut end = None;
+        for (place, c) in chars {
+            if word_char(c) {
+                end = Some(place.past(c));
+            } else if end.is_some() {
+                break;
+            }
+        }
+        end.unwrap_or_else(|| self.line_end(at.logical))
+    }
+
+    /// Where the word before `at` starts, past what is no word after it;
+    /// its logical line's start when no word is left there, and from a
+    /// line's start the line before's end.
+    pub fn word_before(&self, at: Place) -> Place {
+        let mut chars = self.chars_before(at).peekable();
+        if chars.peek().is_none() {
+            return self.previous_end(at);
+        }
+        let mut start = None;
+        for (place, c) in chars {
+            if word_char(c) {
+                start = Some(place);
+            } else if start.is_some() {
+                break;
+            }
+        }
+        start.unwrap_or(Place::line(at.logical))
+    }
+
+    /// The word of letters and digits the character at `at` is in, from
+    /// where it starts to where it ends, within its logical line; none
+    /// when that character is no word's.
+    pub fn word(&self, at: Place) -> Option<(Place, Place)> {
+        let (place, c) = self.chars_from(at).next()?;
+        if !word_char(c) {
+            return None;
+        }
+        let start = self
+            .chars_before(place)
+            .take_while(|&(_, c)| word_char(c))
+            .last()
+            .map_or(place, |(start, _)| start);
+        let end = self
+            .chars_from(place)
+            .take_while(|&(_, c)| word_char(c))
+            .last()
+            .map_or(place, |(last, c)| last.past(c));
+        Some((start, end))
+    }
+
+    /// Where the selection moves down a logical line from `at`: its line's
+    /// end, or from there the next line's.
+    pub fn line_down(&self, at: Place) -> Place {
+        if self.chars_from(at).next().is_some() {
+            return self.line_end(at.logical);
+        }
+        let next = at.logical.saturating_add(1);
+        if next < self.lines.len() {
+            self.line_end(next)
+        } else {
+            at
+        }
+    }
+
+    /// Where the selection moves up a logical line from `at`: its line's
+    /// start, or from there the line before's.
+    pub fn line_up(&self, at: Place) -> Place {
+        if self.chars_before(at).next().is_some() {
+            return Place::line(at.logical);
+        }
+        at.logical.checked_sub(1).map_or(at, Place::line)
+    }
+
+    /// The next logical line's start after `at`'s; `at` on the last.
+    fn next_start(&self, at: Place) -> Place {
+        let next = at.logical.saturating_add(1);
+        if next < self.lines.len() {
+            Place::line(next)
+        } else {
+            at
+        }
+    }
+
+    /// The logical line before `at`'s end; `at` on the first.
+    fn previous_end(&self, at: Place) -> Place {
+        at.logical
+            .checked_sub(1)
+            .map_or(at, |before| self.line_end(before))
+    }
+
+    /// The page's text from `start` to `end`, the runs of each logical
+    /// line joined and the lines joined by a newline; none when it is
+    /// longer than `most` bytes, which is found by measuring it before
+    /// any of it is gathered, so what is made is never larger.
+    pub fn text(&self, start: Place, end: Place, most: usize) -> Option<String> {
+        let size = self.pieces(start, end).try_fold(0usize, |size, piece| {
+            Some(size.saturating_add(piece.len())).filter(|&size| size <= most)
+        })?;
+        let mut out = String::with_capacity(size);
+        self.pieces(start, end)
+            .for_each(|piece| out.push_str(piece));
+        Some(out)
+    }
+
+    /// The text from `start` to `end` in pieces: the part of each run
+    /// between them, and a newline between two logical lines.
+    fn pieces(&self, start: Place, end: Place) -> impl Iterator<Item = &str> + '_ {
+        let last = end.logical.min(self.lines.len().saturating_sub(1));
+        (start.logical..=last).flat_map(move |logical| {
+            let runs = self.lines.get(logical).map_or(&[][..], |line| &line.runs);
+            let on_first = logical == start.logical;
+            let on_last = logical == end.logical;
+            let parts = runs.iter().enumerate().filter_map(move |(run, part)| {
+                if (on_first && run < start.run) || (on_last && run > end.run) {
+                    return None;
+                }
+                let from = if on_first && run == start.run {
+                    start.at
+                } else {
+                    0
+                };
+                let to = if on_last && run == end.run {
+                    end.at
+                } else {
+                    part.text.len()
+                };
+                part.text.get(from..to)
+            });
+            (!on_first).then_some("\n").into_iter().chain(parts)
+        })
+    }
+}
+
+/// Whether `c` is part of a word as a double click and a word's move take
+/// it: a letter or a digit.
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric()
 }
 
 /// Where a reader is in a page, kept across wraps: a logical line, and
@@ -254,6 +485,14 @@ impl Place {
     fn after(self) -> Self {
         Self {
             at: self.at.saturating_add(1),
+            ..self
+        }
+    }
+
+    /// Where `c`, the character at this place, ends.
+    pub fn past(self, c: char) -> Self {
+        Self {
+            at: self.at.saturating_add(c.len_utf8()),
             ..self
         }
     }
@@ -2701,5 +2940,119 @@ pub(crate) mod tests {
         let picture = doc.picture().unwrap();
         assert_eq!((picture.width(), picture.height()), (8, 8));
         assert_eq!(picture.bytes(), 8 * 8 * 4);
+    }
+
+    /// A page of plain runs, a line of them each.
+    fn of_runs(lines: &[&[&str]]) -> Page {
+        let lines = lines
+            .iter()
+            .map(|runs| Logical {
+                runs: runs
+                    .iter()
+                    .map(|text| Run {
+                        text: text.to_string(),
+                        style: Style::default(),
+                        link: None,
+                    })
+                    .collect(),
+                wrap: true,
+            })
+            .collect();
+        Page {
+            lines,
+            ..Page::default()
+        }
+    }
+
+    fn at(logical: usize, run: usize, at: usize) -> Place {
+        Place { logical, run, at }
+    }
+
+    /// The text between two places is the logical lines', their runs
+    /// joined and the lines by a newline, a line's own leading structure
+    /// with it; none past the bound.
+    #[test]
+    fn the_text_between_two_places_joins_runs_and_lines() {
+        let page = of_runs(&[&["> ", "alpha ", "beta"], &[], &["gamma"]]);
+        let whole = "> alpha beta\n\ngamma";
+        let end = page.line_end(2);
+        assert_eq!(end, at(2, 0, 5));
+        assert_eq!(page.line_end(1), at(1, 0, 0));
+        assert_eq!(page.text(at(0, 0, 0), end, usize::MAX).unwrap(), whole);
+        assert_eq!(page.text(at(0, 1, 2), at(0, 2, 2), 100).unwrap(), "pha be");
+        assert_eq!(
+            page.text(at(0, 2, 2), at(2, 0, 3), 100).unwrap(),
+            "ta\n\ngam"
+        );
+        assert_eq!(page.text(at(0, 1, 6), at(0, 2, 0), 100).unwrap(), "");
+        assert_eq!(page.text(at(0, 0, 0), end, whole.len()).unwrap(), whole);
+        assert_eq!(page.text(at(0, 0, 0), end, whole.len() - 1), None);
+        assert_eq!(page.text(at(0, 0, 0), end, 3), None);
+        // A run longer than the bound is refused before it is copied.
+        let long = "x".repeat(1 << 20);
+        let page = of_runs(&[&["ab", &long]]);
+        assert_eq!(page.text(at(0, 0, 0), page.line_end(0), 1000), None);
+        let text = page
+            .text(at(0, 0, 0), page.line_end(0), 2 + long.len())
+            .unwrap();
+        assert_eq!(
+            (text.len(), text.capacity()),
+            (2 + long.len(), 2 + long.len())
+        );
+        // Several runs, which a string grown run by run would hold with
+        // room to spare (eight bytes, then sixteen).
+        let page = of_runs(&[&["aaaaa", "bbbb"]]);
+        let text = page.text(at(0, 0, 0), page.line_end(0), 100).unwrap();
+        assert_eq!((text.as_str(), text.capacity()), ("aaaaabbbb", 9));
+        // A quote's marks its continuations repeat are not its text.
+        let doc = html_doc(b"<blockquote>alpha beta gamma delta epsilon</blockquote>");
+        let laid = cells(&doc, 10);
+        assert!(laid.lines.len() > 2, "{:?}", text_of(&laid));
+        assert!(text_of(&laid)[1].starts_with('>'));
+        let page = &laid.page;
+        let last = page.lines.len() - 1;
+        assert_eq!(
+            page.text(Place::default(), page.line_end(last), 1000)
+                .unwrap(),
+            "> alpha beta gamma delta epsilon"
+        );
+    }
+
+    /// Words, characters and logical lines a selection moves by, across
+    /// runs, and at a line's ends across lines, an empty one included.
+    #[test]
+    fn words_characters_and_lines_cross_runs_and_lines() {
+        let page = of_runs(&[&["foo", "-bar baz"], &[], &["qux"], &["ab", "cd"]]);
+        assert_eq!(page.after_char(at(0, 0, 3)), at(0, 1, 1));
+        assert_eq!(page.after_char(at(0, 1, 8)), at(1, 0, 0));
+        assert_eq!(page.after_char(at(1, 0, 0)), at(2, 0, 0));
+        assert_eq!(page.after_char(at(3, 1, 2)), at(3, 1, 2), "the page's end");
+        assert_eq!(page.before_char(at(0, 1, 0)), at(0, 0, 2));
+        assert_eq!(page.before_char(at(2, 0, 0)), at(1, 0, 0));
+        assert_eq!(
+            page.before_char(at(0, 0, 0)),
+            at(0, 0, 0),
+            "the page's start"
+        );
+        assert_eq!(page.word(at(0, 0, 1)), Some((at(0, 0, 0), at(0, 0, 3))));
+        assert_eq!(page.word(at(0, 1, 0)), None, "no word's");
+        assert_eq!(page.word(at(0, 1, 2)), Some((at(0, 1, 1), at(0, 1, 4))));
+        assert_eq!(page.word(at(3, 1, 0)), Some((at(3, 0, 0), at(3, 1, 2))));
+        assert_eq!(page.word(at(1, 0, 0)), None, "an empty line");
+        assert_eq!(page.word_after(at(0, 0, 0)), at(0, 0, 3));
+        assert_eq!(page.word_after(at(0, 0, 3)), at(0, 1, 4));
+        assert_eq!(page.word_after(at(0, 1, 4)), at(0, 1, 8));
+        assert_eq!(page.word_after(at(0, 1, 8)), at(1, 0, 0));
+        assert_eq!(page.word_before(at(0, 1, 8)), at(0, 1, 5));
+        assert_eq!(page.word_before(at(0, 1, 5)), at(0, 1, 1));
+        assert_eq!(page.word_before(at(0, 1, 1)), at(0, 0, 0));
+        assert_eq!(page.word_before(at(0, 0, 0)), at(0, 0, 0));
+        assert_eq!(page.word_before(at(2, 0, 0)), at(1, 0, 0));
+        assert_eq!(page.line_down(at(0, 0, 1)), at(0, 1, 8));
+        assert_eq!(page.line_down(at(0, 1, 8)), at(1, 0, 0));
+        assert_eq!(page.line_down(at(3, 1, 2)), at(3, 1, 2));
+        assert_eq!(page.line_up(at(0, 1, 3)), at(0, 0, 0));
+        assert_eq!(page.line_up(at(2, 0, 0)), at(1, 0, 0));
+        assert_eq!(page.line_up(at(0, 0, 0)), at(0, 0, 0));
     }
 }

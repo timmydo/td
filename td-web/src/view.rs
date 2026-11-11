@@ -11,7 +11,7 @@ use td_ui::raster::{
     SELECTED,
 };
 
-use crate::document::{Place, Rendered, NO_LINK};
+use crate::document::{Place, Rendered, Wrapped, NO_LINK};
 
 /// The most matches find marks.
 pub const MAX_HITS: usize = 10_000;
@@ -54,6 +54,35 @@ impl Pane {
     }
 }
 
+/// Text selected in the page: where it was begun and where it is now,
+/// in either order, as places in its logical lines, so it is kept however
+/// the page is wrapped and however little of it is laid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    pub anchor: Place,
+    pub focus: Place,
+}
+
+impl Selection {
+    /// Its ends in the page's order; none when it holds nothing.
+    pub fn range(self) -> Option<(Place, Place)> {
+        let (start, end) = if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        };
+        (start < end).then_some((start, end))
+    }
+}
+
+/// Where a point of the pane falls in the page's text: the place between
+/// characters nearest it (`caret`), and the character under it, if any.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Spot {
+    pub caret: Place,
+    pub under: Option<Place>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct View {
     /// Where the first line shown starts.
@@ -64,6 +93,8 @@ pub struct View {
     pub hits: Vec<Hit>,
     /// The current match, an index into `hits`.
     pub at: usize,
+    /// The text selected, which find's current match becomes.
+    pub selection: Option<Selection>,
 }
 
 /// The first of `count` items for which `before` is false, `before` being
@@ -82,6 +113,16 @@ fn first_not(count: usize, before: impl Fn(usize) -> bool) -> usize {
 }
 
 impl View {
+    /// Selects `selection`, or nothing. A selection and a focused link
+    /// exclude each other, so a copy takes the one there is: selecting
+    /// lets the focused link go, and focusing a link clears the selection.
+    pub fn select(&mut self, selection: Option<Selection>) {
+        if selection.is_some() {
+            self.focus = None;
+        }
+        self.selection = selection;
+    }
+
     /// Keeps the view inside the page, its top no further down than the
     /// last screenful's first line, and lays the lines shown.
     pub fn settle(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
@@ -152,6 +193,7 @@ impl View {
     ) {
         let page = Arc::clone(&rendered.page);
         let count = page.links.len();
+        self.selection = None;
         if count == 0 {
             self.focus = None;
             return;
@@ -196,6 +238,9 @@ impl View {
         let top = self.top;
         let first = self.hits.partition_point(|hit| hit.start < top);
         self.at = if first < self.hits.len() { first } else { 0 };
+        if self.hits.is_empty() {
+            self.selection = None;
+        }
         self.show_hit(rendered, metrics, rows);
     }
 
@@ -287,9 +332,13 @@ impl View {
 
     /// Shows the current match whole where the screen holds it: its last
     /// character's line, then its first drawn's, a space a wrapped line
-    /// ends with being dropped there.
+    /// ends with being dropped there; and selects it.
     fn show_hit(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
         if let Some(hit) = self.hits.get(self.at).copied() {
+            self.select(Some(Selection {
+                anchor: hit.start,
+                focus: hit.end,
+            }));
             let last = Place {
                 at: hit.end.at.saturating_sub(1),
                 ..hit.end
@@ -298,6 +347,71 @@ impl View {
             let first = rendered.page.drawn(hit.start, hit.end);
             self.reveal(first, rendered, metrics, rows);
         }
+    }
+
+    /// Where a point of `pane` falls in the text of the lines shown: on a
+    /// line, the place between characters nearest it, by the halves of
+    /// the glyphs drawn there, and the character under it; left of a
+    /// line's text, its own start (a continuation's repeated marks are
+    /// not page text); right of it, or in the inset right of the lines,
+    /// its end, which for a line that is not wrapped is its logical
+    /// line's, past what is laid of it. Above the pane, the first line
+    /// shown's start; below the last line shown whole, the last's end.
+    /// No place is before a glyph of no width that follows one with
+    /// width, so a mark stays with its base. None with no line shown
+    /// whole.
+    pub fn spot(&self, rendered: &Rendered, pane: &Pane, x: i64, y: i64) -> Option<Spot> {
+        let rect = pane.rect;
+        let shown = || rendered.shown(self.top, pane.shown());
+        let first = shown().next()?;
+        let end = |wrapped: &Wrapped| Spot {
+            caret: line_end(rendered, wrapped),
+            under: None,
+        };
+        if y < rect.y {
+            return Some(Spot {
+                caret: first.place(),
+                under: None,
+            });
+        }
+        let row = usize::try_from((y - rect.y) / pane.height()).unwrap_or(usize::MAX);
+        let Some(wrapped) = shown().nth(row) else {
+            return shown().last().map(end);
+        };
+        let right = rect.x.saturating_add(i64::from(rect.width));
+        if x >= right.saturating_sub(pane.inset) {
+            return Some(end(wrapped));
+        }
+        let x = x - rect.x.saturating_add(pane.inset);
+        let mut under = None;
+        // Whether a glyph with width came before: a base marks follow.
+        let mut based = false;
+        for (place, left, right) in glyphs(rendered, wrapped) {
+            let (left, right) = (i64::from(left), i64::from(right));
+            if left <= x && x < right {
+                under = Some(place);
+            }
+            // A place falls before a glyph of no width, a combining mark,
+            // only where no base comes before it, for a point at or left
+            // of it: a mark is never parted from its base, and a line that
+            // begins with marks still has a start.
+            let before = if left < right {
+                x < left + (right - left) / 2
+            } else {
+                !based && x <= left
+            };
+            based |= left < right;
+            if before {
+                return Some(Spot {
+                    caret: place,
+                    under,
+                });
+            }
+        }
+        Some(Spot {
+            under,
+            ..end(wrapped)
+        })
     }
 
     /// The link painted at a point of `pane`: none in the inset left of
@@ -316,6 +430,71 @@ impl View {
         let piece = wrapped.line.hit(x - left)?;
         (piece.tag < rendered.page.links.len()).then_some(piece.tag)
     }
+}
+
+/// The glyphs of `wrapped` that show the page's text, in order: where
+/// each one's character is, and the pixels it spans from the line's left.
+/// A continuation's repeated marks are left out.
+fn glyphs<'a>(
+    rendered: &'a Rendered,
+    wrapped: &'a Wrapped,
+) -> impl Iterator<Item = (Place, u32, u32)> + 'a {
+    let line = &wrapped.line;
+    line.pieces
+        .iter()
+        .filter(|piece| wrapped.shows(piece))
+        .flat_map(move |piece| {
+            let text = rendered
+                .page
+                .run(wrapped, piece)
+                .and_then(|run| run.text.get(piece.text.clone()))
+                .unwrap_or_default();
+            text.char_indices()
+                .zip(piece.glyphs.clone())
+                .filter_map(move |((byte, _), at)| {
+                    let glyph = line.glyphs.get(at)?;
+                    let right = line
+                        .glyphs
+                        .get(at + 1)
+                        .map_or(line.width, |next| next.x)
+                        .max(glyph.x);
+                    let place = Place {
+                        logical: wrapped.logical,
+                        run: piece.run,
+                        at: piece.text.start + byte,
+                    };
+                    Some((place, glyph.x, right))
+                })
+        })
+}
+
+/// Where `wrapped`'s text ends: after its last glyph, its own start when
+/// it shows none; for a line that is not wrapped, its logical line's end,
+/// past what is laid of it.
+fn line_end(rendered: &Rendered, wrapped: &Wrapped) -> Place {
+    let unwrapped = rendered
+        .page
+        .lines
+        .get(wrapped.logical)
+        .is_some_and(|line| !line.wrap);
+    if unwrapped {
+        return rendered.page.line_end(wrapped.logical);
+    }
+    let last = glyphs(rendered, wrapped).last();
+    last.and_then(|(place, _, _)| {
+        let c = rendered
+            .page
+            .lines
+            .get(place.logical)?
+            .runs
+            .get(place.run)?
+            .text
+            .get(place.at..)?
+            .chars()
+            .next()?;
+        Some(place.past(c))
+    })
+    .unwrap_or_else(|| wrapped.place())
 }
 
 /// For each prefix of `needle`, how long its longest prefix that is also
@@ -389,6 +568,7 @@ pub fn paint(
         // the characters a line shows.
         let from = wrapped.place();
         let first = view.hits.partition_point(|hit| hit.end <= from);
+        let selected = view.selection.and_then(Selection::range);
         let line = &wrapped.line;
         for pass in [Pass::Ground, Pass::Glyph, Pass::Stroke] {
             // The first match not wholly before the glyph.
@@ -446,7 +626,12 @@ pub fn paint(
                             .filter(|hit| hit.start <= place)
                             .map(|_| next)
                     });
-                    let ground = if focused || (hit.is_some() && hit == Some(view.at)) {
+                    let chosen = place
+                        .zip(selected)
+                        .is_some_and(|(place, (start, end))| start <= place && place < end);
+                    // The current match is on the selection's ground while
+                    // it is the selection, as find leaves it.
+                    let ground = if focused || chosen {
                         SELECTED
                     } else if hit.is_some() {
                         INACTIVE_SELECTION
@@ -967,5 +1152,287 @@ mod tests {
         line.width = 0;
         let (_, glyphs) = painted(&rendered, &view, None, &pane(1));
         assert_eq!(glyphs.len(), MAX_STACKED);
+    }
+
+    /// `lines` wrapped `columns` cells wide and shown from the first on
+    /// `rows` lines.
+    fn narrow(lines: &[Line], columns: u32, rows: usize) -> (Rendered, View) {
+        let page = Arc::new(page(lines, Style::default()));
+        shown(
+            Rendered::new(&page, columns * CELL_WIDTH as u32, TextFamily::Sans),
+            rows,
+        )
+    }
+
+    /// A point falls between the characters by the halves of the glyphs
+    /// it is among, on the character under it; left of a line's text at
+    /// its start, right of it or in the right inset at its end, above the
+    /// pane at the first line's start and below the lines at the last's
+    /// end; over a continuation's repeated marks at its own text's start;
+    /// and right of a line that is not wrapped at its logical line's end.
+    #[test]
+    fn a_point_falls_between_characters_by_their_halves() {
+        // "one" / "two" / "three", a cell a glyph.
+        let (rendered, view) = narrow(&[&[("one two three", None)]], 5, 3);
+        let three = pane(3);
+        let spot = |x: i64, y: i64| view.spot(&rendered, &three, x, y).unwrap();
+        let caret = |x: i64, y: i64| spot(x, y).caret;
+        assert_eq!(
+            spot(CW + 3, 1),
+            Spot {
+                caret: at(0, 0, 0),
+                under: Some(at(0, 0, 0))
+            }
+        );
+        assert_eq!(
+            spot(CW + 5, 1),
+            Spot {
+                caret: at(0, 0, 1),
+                under: Some(at(0, 0, 0))
+            },
+            "the right half of 'o'"
+        );
+        assert_eq!(
+            spot(CW - 1, 1),
+            Spot {
+                caret: at(0, 0, 0),
+                under: None
+            },
+            "the inset"
+        );
+        assert_eq!(caret(CW + 3 * CW + 2, 1), at(0, 0, 3), "past 'one'");
+        assert_eq!(spot(CW + 3 * CW + 2, 1).under, None);
+        assert_eq!(caret(800 - CW, 1), at(0, 0, 3), "the right inset");
+        assert_eq!(caret(CW + 1, CH + 1), at(0, 0, 4), "'two'");
+        assert_eq!(caret(CW + 5, -40), at(0, 0, 0), "above the pane");
+        assert_eq!(caret(CW + 5, 3 * CH + 1), at(0, 0, 13), "below the lines");
+        // The repeated mark of "> beta" is no page text.
+        let (rendered, view) = narrow(&[&[("> ", None), ("alpha beta gamma", None)]], 10, 3);
+        let lines: Vec<String> = rendered
+            .shown(view.top, 3)
+            .map(|w| w.line.glyphs.iter().map(|g| g.scalar).collect())
+            .collect();
+        assert_eq!(lines, ["> alpha", ">beta", ">gamma"]);
+        let spot = view.spot(&rendered, &three, CW + 1, CH + 1).unwrap();
+        assert_eq!(
+            spot,
+            Spot {
+                caret: at(0, 1, 6),
+                under: None
+            }
+        );
+        // A line that is not wrapped ends where its logical line does.
+        let wide = "x".repeat(200);
+        let mut unwrapped = page(&[&[(&wide, None)]], Style::default());
+        unwrapped.lines[0].wrap = false;
+        let (rendered, view) = shown(
+            Rendered::new(&Arc::new(unwrapped), 800, TextFamily::Sans),
+            1,
+        );
+        let one = pane(1);
+        let laid = rendered
+            .shown(view.top, 1)
+            .next()
+            .unwrap()
+            .line
+            .glyphs
+            .len();
+        assert!(laid < 200);
+        assert_eq!(
+            view.spot(&rendered, &one, 800 - 1, 1).unwrap().caret,
+            at(0, 0, 200)
+        );
+        assert_eq!(
+            view.spot(&rendered, &one, CW + 10 * CW, 1).unwrap().caret,
+            at(0, 0, 10)
+        );
+        let (empty, view) = shown(rendered_empty(), 1);
+        assert_eq!(view.spot(&empty, &one, CW, 1), None);
+    }
+
+    fn rendered_empty() -> Rendered {
+        Rendered::new(&Arc::new(Page::default()), 800, TextFamily::Sans)
+    }
+
+    /// The glyphs painted on the selection's ground.
+    fn chosen(rendered: &Rendered, view: &View, rows: i64) -> (String, String) {
+        let (_, glyphs) = painted(rendered, view, None, &pane(rows));
+        let on = glyphs.iter().filter(|glyph| glyph.4 == SELECTED);
+        let off = glyphs.iter().filter(|glyph| glyph.4 != SELECTED);
+        (
+            on.map(|glyph| glyph.2).collect(),
+            off.map(|glyph| glyph.2).collect(),
+        )
+    }
+
+    /// The selection is painted glyph by glyph where it is laid, across
+    /// the ends of wrapped lines, never on a continuation's repeated
+    /// marks, and on a line not wrapped only as far as it is laid.
+    #[test]
+    fn a_selection_paints_only_laid_glyphs_on_its_ground() {
+        let (rendered, mut view) = narrow(&[&[("one two three", None)]], 5, 3);
+        view.select(Some(Selection {
+            anchor: at(0, 0, 10),
+            focus: at(0, 0, 2),
+        }));
+        assert_eq!(chosen(&rendered, &view, 3).0, "etwoth");
+        // Empty, it paints nothing.
+        view.select(Some(Selection {
+            anchor: at(0, 0, 4),
+            focus: at(0, 0, 4),
+        }));
+        assert_eq!(chosen(&rendered, &view, 3).0, "");
+        let (rendered, mut view) = narrow(&[&[("> ", None), ("alpha beta gamma", None)]], 10, 3);
+        view.select(Some(Selection {
+            anchor: at(0, 0, 0),
+            focus: at(0, 1, 16),
+        }));
+        assert_eq!(
+            chosen(&rendered, &view, 3),
+            ("> alphabetagamma".to_string(), ">>".to_string())
+        );
+        let wide = "x".repeat(200);
+        let mut unwrapped = page(&[&[(&wide, None)], &[("y", None)]], Style::default());
+        unwrapped.lines[0].wrap = false;
+        let (rendered, mut view) = shown(
+            Rendered::new(&Arc::new(unwrapped), 800, TextFamily::Sans),
+            2,
+        );
+        view.select(Some(Selection {
+            anchor: at(0, 0, 0),
+            focus: at(1, 0, 1),
+        }));
+        let (on, off) = chosen(&rendered, &view, 2);
+        assert!(off.is_empty());
+        let laid = rendered
+            .shown(view.top, 1)
+            .next()
+            .unwrap()
+            .line
+            .glyphs
+            .len();
+        assert!(
+            on.len() > 100 && on.len() <= laid + 1,
+            "{} of {laid}",
+            on.len()
+        );
+        // A selection takes the focused link's place, and focusing a link
+        // the selection's.
+        let (mut rendered, mut view) = narrow(&[&[("go", Some(0))], &[("x", None)]], 10, 2);
+        view.step_link(true, &mut rendered, &mut cell(), 2);
+        assert_eq!(view.focus, Some(0));
+        view.select(Some(Selection {
+            anchor: at(1, 0, 0),
+            focus: at(1, 0, 1),
+        }));
+        assert_eq!(view.focus, None);
+        view.step_link(true, &mut rendered, &mut cell(), 2);
+        assert_eq!((view.focus, view.selection), (Some(0), None));
+    }
+
+    /// A combining mark of no advance is never parted from its base: no
+    /// place falls between them, though the pointer is past the base's
+    /// middle and before the mark's pen.
+    #[test]
+    fn no_place_falls_between_a_base_and_its_mark() {
+        let (mut rendered, view) = narrow(&[&[("e\u{301}x", None)]], 10, 1);
+        // As Noto measures them: the mark takes no advance.
+        let line = &mut laid(&mut rendered)[0].line;
+        assert_eq!(line.glyphs.len(), 3);
+        line.glyphs[1].x = CW as u32;
+        line.glyphs[2].x = CW as u32;
+        line.width = 2 * CW as u32;
+        let one = pane(1);
+        let spot = |x: i64| view.spot(&rendered, &one, CW + x, 1).unwrap();
+        assert_eq!(spot(2).caret, at(0, 0, 0));
+        assert_eq!(
+            spot(6),
+            Spot {
+                caret: at(0, 0, 3),
+                under: Some(at(0, 0, 0))
+            },
+            "past the base's middle: after its mark"
+        );
+        assert_eq!(spot(CW + 2).caret, at(0, 0, 3));
+        assert_eq!(spot(CW + 6).caret, at(0, 0, 4));
+    }
+
+    /// A line that begins with a mark of no advance still has a start a
+    /// point reaches: left of the mark, in the inset, or at its pen; and
+    /// a line of such marks alone has its start there and its end
+    /// right of them.
+    #[test]
+    fn a_line_beginning_with_a_mark_of_no_advance_has_a_start() {
+        let (mut rendered, view) = narrow(&[&[("\u{301}ab", None)]], 10, 1);
+        let line = &mut laid(&mut rendered)[0].line;
+        assert_eq!(line.glyphs.len(), 3);
+        line.glyphs[1].x = 0;
+        line.glyphs[2].x = CW as u32;
+        line.width = 2 * CW as u32;
+        let one = pane(1);
+        let caret =
+            |rendered: &Rendered, x: i64| view.spot(rendered, &one, CW + x, 1).unwrap().caret;
+        assert_eq!(caret(&rendered, -1), at(0, 0, 0), "the inset");
+        assert_eq!(caret(&rendered, 0), at(0, 0, 0), "the line's left edge");
+        assert_eq!(caret(&rendered, 2), at(0, 0, 2), "before 'a'");
+        assert_eq!(caret(&rendered, 6), at(0, 0, 3), "after 'a'");
+        let (mut rendered, view) = narrow(&[&[("\u{301}\u{301}", None)]], 10, 1);
+        let line = &mut laid(&mut rendered)[0].line;
+        for glyph in &mut line.glyphs {
+            glyph.x = 0;
+        }
+        line.width = 0;
+        let caret = |x: i64| view.spot(&rendered, &one, CW + x, 1).unwrap().caret;
+        assert_eq!(caret(-1), at(0, 0, 0));
+        assert_eq!(caret(0), at(0, 0, 0));
+        assert_eq!(caret(5), at(0, 0, 4), "right of them, the end");
+    }
+
+    /// Tab clears the selection on a page with no link to focus too.
+    #[test]
+    fn tab_clears_the_selection_without_links() {
+        let (mut rendered, mut view) = narrow(&[&[("no links", None)]], 80, 1);
+        view.select(Some(Selection {
+            anchor: at(0, 0, 0),
+            focus: at(0, 0, 2),
+        }));
+        view.step_link(true, &mut rendered, &mut cell(), 1);
+        assert_eq!((view.focus, view.selection), (None, None));
+    }
+
+    /// The current match is on the selection's ground only while it is
+    /// the selection: once another is made, it is a match like the rest.
+    #[test]
+    fn the_current_match_is_painted_selected_only_while_it_is_the_selection() {
+        let (mut rendered, mut view) = narrow(&[&[("ab ab", None)]], 80, 1);
+        view.find("ab", &mut rendered, &mut cell(), 1);
+        let grounds = |view: &View| -> Vec<u32> {
+            let (_, glyphs) = painted(&rendered, view, None, &pane(1));
+            glyphs.iter().map(|glyph| glyph.4).collect()
+        };
+        let (on, off, plain) = (SELECTED, INACTIVE_SELECTION, PAPER);
+        assert_eq!(grounds(&view), [on, on, plain, off, off]);
+        view.select(Some(Selection {
+            anchor: at(0, 0, 3),
+            focus: at(0, 0, 4),
+        }));
+        assert_eq!(grounds(&view), [off, off, plain, on, off]);
+    }
+
+    /// Find's current match is the selection, and a query that matches
+    /// nothing leaves none.
+    #[test]
+    fn finds_current_match_is_selected() {
+        let (mut rendered, mut view) = narrow(&[&[("alpha beta alpha", None)]], 80, 1);
+        let metrics = &mut cell();
+        view.find("alpha", &mut rendered, metrics, 1);
+        let selected = |view: &View| view.selection.and_then(Selection::range);
+        assert_eq!(selected(&view), Some((at(0, 0, 0), at(0, 0, 5))));
+        view.step_hit(true, &mut rendered, metrics, 1);
+        assert_eq!(selected(&view), Some((at(0, 0, 11), at(0, 0, 16))));
+        view.remark("alpha", &rendered, metrics);
+        assert_eq!(selected(&view), Some((at(0, 0, 11), at(0, 0, 16))), "kept");
+        view.find("zeta", &mut rendered, metrics, 1);
+        assert_eq!(view.selection, None);
     }
 }

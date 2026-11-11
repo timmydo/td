@@ -261,10 +261,12 @@ sniff of its first bytes for `<!doctype html` or `<html`:
   `MAX_PRE_CHARS` (4096) characters, a link left with no text no link,
   and laid out only as far as the pane shows it, its edge and td-ui's
   `OVERHANG` past it, again at each width: without horizontal scrolling
-  (§10) a pane shows no more. Find matches, and the pointer and focus
-  mark, only what of such a line is laid: a match past the edge is not
-  found, and a link whose text is all past it is focused on its line
-  with nothing marked, the status row naming where it goes.
+  (§10) a pane shows no more. Find matches, and the pointer, the focus
+  and the selection mark, only what of such a line is laid: a match
+  past the edge is not found, and a link whose text is all past it is
+  focused on its line with nothing marked, the status row naming where
+  it goes; a selection spanning such a line copies its kept text whole
+  (§8).
   Without the proportional faces (none installed, `TD_UI_FACE=bitmap`,
   every in-process test) td-ui measures every glyph a cell and the page
   draws on the cell. Links keep their looks; colours named by the
@@ -463,19 +465,24 @@ URL, then ` - td-web`.
 | `Ctrl+L`, `F6` | focus the address row, its text selected |
 | `Enter` (address) | navigate to it: a text with no scheme is taken as `https://` |
 | `Escape` (address) | restore the current URL and return to the page |
-| `Tab`, `Shift+Tab` | focus the next or previous link |
+| `Tab`, `Shift+Tab` | focus the next or previous link, clearing the selection |
 | `Enter` (page) | follow the focused link |
 | `Alt+Left`, `Alt+Right` | back, forward |
 | `Ctrl+R`, `F5` | reload |
-| `Ctrl+F`, `/` | find in page; `Enter`/`Shift+Enter`, then `n`/`N`, next/previous |
+| `Ctrl+F`, `/` | find in page, the current match selected; `Enter`/`Shift+Enter`, then `n`/`N`, next/previous |
 | `Up`, `Down`, `PageUp`, `PageDown`, `Space`, `Home`, `End` | scroll |
-| `Ctrl+C` | copy the address or find row's selection while it has focus, else the focused link's URL, else the page's |
+| `Shift+Left`, `Shift+Right` (page) | move the selection's end a character; with `Ctrl`, to the word before's start or the word after's end |
+| `Shift+Up`, `Shift+Down` (page) | move it to its logical line's start or end, from there the line before's start or the line after's end |
+| `Ctrl+A` (page) | select the page |
+| `Escape` (page) | stop loading, else clear the focused link, find's marks and the selection |
+| `Ctrl+C` | copy the address or find row's selection while it has focus, else the page's selection, else the focused link's URL, else the page's |
 | `F8` | body text in Noto Sans or Noto Serif, for this run |
 | `Ctrl+Q`, `Ctrl+W` | close |
 | `?`, `F1` | the key list (`F1` is the window's own) |
 
-A click on a link follows it, the pointer over one says where it goes,
-and the wheel scrolls; which link a point is on is the piece of its
+A click on a link follows it at the button's release (below), the
+pointer over one says where it goes, and the wheel scrolls; which link
+a point is on is the piece of its
 line under it, by pixel, never in the inset left of the lines or on a
 line not shown whole. Find searches the page's logical lines, all of
 them however few are laid (§5), and matches within one, across its
@@ -506,8 +513,100 @@ keeps the text at the top, inside a long paragraph too, and the
 focused link; find's marks are made again on the new lines, the
 current match's index kept as far as there are as many matches,
 without moving to it. Coming back to a page opens it
-at the text its top line began with, however it is wrapped now. There
-is no text selection in the page yet.
+at the text its top line began with, however it is wrapped now.
+
+**Selection.** Text in the page is selected as two places in its
+logical lines (§5's `Place`, here any character's, not only where a
+wrapped line starts): where it was begun and where it is now, in either
+order. So it is kept unchanged however far the page scrolls, the wrap
+forgetting the lines far from those shown, and through a resize, `F8`
+and anything else that wraps the page again, as the place at the top
+is.
+
+- **Pointer.** A press on the page and a drag select from the place
+  between characters nearest the press, by the halves of the glyphs
+  drawn there, to the one nearest the pointer: left of a line's text
+  is its start, a continuation's repeated marks included; right of it,
+  or in the inset right of the lines, its end, a line not wrapped
+  ending where its logical line does, past what is laid of it; above
+  the page, the first line shown's start; below its last line shown
+  whole, the last's end; with no line shown whole, a pane shorter than
+  a line, the first line shown's start. No place falls before a glyph
+  of no width after one with width, so a combining mark is never parted
+  from its base, while a line that begins with marks keeps its start.
+  Once the pointer has moved from where it was pressed, held above the page or below that line it
+  scrolls it once each `DRAG_SCROLL_MS` (50 ms), a line for each
+  line's height it is past the edge and at most `DRAG_SCROLL_LINES`
+  (4), so at most 80 lines a second, the selection following to the
+  lines then shown, as it does when the wheel turns during a drag; a
+  pane showing no line whole does not scroll so, and a scroll that
+  moves nothing asks for no paint. A press clears the selection and
+  selects nothing until the pointer goes further than `NEAR` (4 pixels
+  at scale one) from it on either axis: a press and its release within
+  that are a click, which follows the link under the press, and a
+  press on a link dragged further selects and follows nothing. A
+  second press within td-ui's `MULTI_CLICK_MS` (500 ms) of a click's
+  release and within `NEAR` of it selects the word of letters and
+  digits under it, across runs and wrapped lines but not past its
+  logical line (off a word, nothing); a third selects the logical line
+  whole; a fourth is a first again, and the drag of a double or triple
+  click moves nothing. The window reports no click count, a pointer
+  input carries no time, and inputs are handled before the turn's
+  `poll` is told one, so td-web counts clicks on its own monotonic
+  clock, read at each press and release. A
+  click that follows a link, a drag, a Shift press and a press the
+  pointer's leaving cancels are no click a later press pairs with. A
+  Shift press moves the selection's end there from its anchor, and its
+  drag goes on moving it; with nothing selected it begins there. A
+  Shift press follows no link.
+- **Keyboard.** td-web has no caret; the keys move the selection's
+  end. Find's current match is the selection whenever find moves to
+  one, as the query is typed, by `Enter` or by `n`, and a query that
+  matches nothing leaves none. On the page `Shift+Left` and
+  `Shift+Right` move the end a character, from a logical line's end to
+  the next's start and back; `Ctrl+Shift+Left` and `Ctrl+Shift+Right`
+  to the start of the word before or the end of the word after, within
+  the logical line, and across a line's end a step, as a character;
+  `Shift+Up` and `Shift+Down` to the logical line's start or end, and
+  from there to the start of the line before or the end of the line
+  after; the page scrolls as little as shows where the end went. With
+  nothing selected they begin at the focused link's start, else the
+  first line shown's. `Ctrl+A` selects the page.
+- **One of a selection and a focused link.** Selecting lets the
+  focused link go and `Tab` clears the selection, so `Ctrl+C` copies
+  the one there is (the precedence in the table above). `Escape` on
+  the page clears the selection with the focus and find's marks,
+  unless it stops a load. A page arriving, by any navigation, reload
+  or history step, starts with none, a press held over the page before
+  it is dropped, and the history keeps no selection.
+- **Painting.** Each glyph of a line laid whose character lies between
+  the two places is drawn on `SELECTED` in paper ink, as the focused
+  link is. Find's current match is drawn so because it is the
+  selection; once another selection replaces it, it is drawn on
+  `INACTIVE_SELECTION` like every other match. Nothing is laid for it,
+  so a
+  selection reaching lines far from those shown costs nothing until
+  they are shown; a continuation's repeated marks and the space a wrap
+  drops at a line's end show no ground.
+- **Copying.** `Ctrl+C` copies the page's text between the two places,
+  each logical line's runs joined and the lines joined by a newline:
+  the space a wrap drops is copied, and the marks a continuation
+  repeats are not, being td-web's drawing rather than the page's text.
+  A logical line's own leading structure, td-html's quote, heading and
+  list marks, is copied with it, as its first wrapped line shows it and
+  as td-html's text has it. A line not wrapped copies what td-web keeps
+  of it, up to `MAX_PRE_CHARS`, past the pane's edge. A copy holds at
+  most `MAX_COPY`, td-ui's clipboard ceiling (`clipboard::MAX_BYTES`,
+  1 MiB), which the window keeps for its sends: a selection past it is
+  not copied and the status row says so. The selection's text is
+  measured before any of it is gathered and gathered into a string of
+  exactly its size, so a copy never holds more than `MAX_COPY`, even
+  `Ctrl+A` on the largest page, beside the memory §3 counts.
+- **No primary selection.** td-web sets no primary selection and pastes
+  none on a middle click: td-ui's widget window binds the primary
+  selection for no handler and delivers no middle button (td-ui/DESIGN.md,
+  "Widget window"), so that is td-ui's increment before it is td-web's
+  (§10).
 
 ## 9. Increments
 
@@ -558,7 +657,9 @@ order; each is its own design amendment when it starts:
   "Proportional faces", "Not yet"): its seam reads the cell grid, and
   over proportional faces narrow glyphs share a cell, so the text it
   reads is not the text drawn.
-- **Text selection** in the page, and copying it.
+- **Primary selection**: the page's selection offered as the primary
+  selection, and a middle click pasting it into the address row, once
+  td-ui's widget window binds it and delivers the middle button.
 - **Bounded rendering**: the rendering is off the window's thread and
   one at a time, but td-html still builds it whole, up to
   `HTML_LIMITS`, before td-web keeps `MAX_LINES` of it, so a hostile
