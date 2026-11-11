@@ -81,9 +81,13 @@ allocation change before this workstream is complete.
 StyledDocument::new(document, sheets, input_bytes, limits) constructs shared styles and
 box records. NodeId always belongs to the borrowed document. StyleId is
 local to this styled document; accessors return Option for invalid IDs.
-The public layout entry takes the styled document, viewport dimensions,
-mutable FontMetrics, and an optional vertical window. Its Result owns
-geometry and emitted lines, with resource usage and work counters. Refusal
+`block::layout` takes the styled document, mutable FontMetrics and a
+Request with viewport dimensions, an optional vertical window and the
+charged bytes of any previous layout output retained during the call. Its Result owns
+geometry and emitted lines, with resource usage and work counters.
+BoxGeometry records are in postorder and name DOM elements; this is not
+a paint-order API. `output_bytes` excludes the shared styled document,
+so it can be passed as `retained_output_bytes` on a resize request. Refusal
 is an error, never successful partial output. There is no implicit I/O.
 
 Every TextFragment carries a DOM **text NodeId and UTF-8 byte range** into
@@ -146,21 +150,27 @@ Preformatted trailing spaces are still dropped to preserve the prose
 contract: this differs from CSS pre/pre-wrap. A bare empty inline sequence
 does not generate a line; an explicit newline does, and preserves the
 following empty line. This differs from prose's empty-input one-line rule.
-Text-transform is retained in the style but initially not applied.
+Text-transform and text-indent are retained in the style but initially
+not applied. Block content widths are floored to whole pixels for the
+prose-compatible break test; output positions retain subpixel precision.
 
 `inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
 StyleId for the line strut. It returns bounded lines and byte/work charges.
 The same internal flow can measure without retaining lines. Vec growth is
 charged before reserve, including doubled capacity and allocation overhead.
 
-Line height uses the largest participating font ascent/descent and CSS
-line-height, with half-leading around the baseline. A preserved newline
+Line height uses participating text scalars, replaced elements and explicit
+breaks, with CSS line-height and half-leading around the baseline. Empty
+inline boxes and discarded spaces do not contribute additional struts in
+this first model. A preserved newline
 contributes its own metrics to the line it ends, without a text fragment. Inline replaced elements
 align to the baseline. Initial text-align supports left/start, right/end
 and center; justify uses left. Vertical-align other than baseline is
 deferred. Letter spacing contributes to scalar advances, clamped so an
 advance cannot be negative. Inline non-replaced margins, borders and
-padding, generated content and list markers are deferred.
+padding, inline relative offsets, generated content and list markers are
+deferred. An HTML br uses the explicit-newline rule, including its own
+metrics and the following empty line.
 
 ## 5. Block flow and replaced elements
 
@@ -176,8 +186,8 @@ Auto horizontal margins divide positive free space. Over-constrained
 left-to-right boxes adjust the used right margin. Negative margins remain
 signed. Adjacent block sibling margins collapse by largest positive plus
 most negative; parent/child and empty-through margin collapse are deferred
-and their margins add. Relative offsets move visual geometry, not the
-space reserved in flow. Overflow is reported geometrically; clipping,
+and their margins add. Block relative offsets move visual geometry, not the space reserved
+in flow. Overflow is reported geometrically; clipping,
 scroll containers and stacking contexts are consumer/future work.
 
 Tables, flex and inline-block formatting are not implemented: those
@@ -194,8 +204,11 @@ dimensions. With neither dimension it uses 300 by 150 CSS px; a single
 attribute replaces that dimension and leaves the other default. These are
 placeholder dimensions, not a guessed decoded aspect ratio. CSS dimensions
 override attributes; a known two-attribute ratio supplies an auto opposite
-dimension. Min/max sizes and box-sizing apply. No image decode or load can
-change geometry inside a layout call. SVG/MathML remain excluded with the
+dimension. Min/max sizes and box-sizing apply; the first model clamps the two
+dimensions independently rather than preserving the ratio through those
+constraints. Invalid or attribute dimensions over td-css MAX_ABSOLUTE_VALUE
+(1,000,000 px) use the corresponding placeholder default. Inline images are atomic; wrapping modes allow a break before or after
+them. No image decode or load can change geometry inside a layout call. SVG/MathML remain excluded with the
 td-dom projection; object/embed/canvas have no content-specific renderer.
 
 ## 6. Work bounds, resize and validation
@@ -218,6 +231,7 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_LINE_SCALARS | 65,536 | pending single-line scratch |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
 | MAX_FRAGMENTS | 1,048,576 | emitted text/replaced fragments |
+| MAX_VIEWPORT | 1,000,000 px | viewport width and height |
 | MAX_COORDINATE | 1,000,000,000 px | absolute geometry extent |
 
 Dimensions, arithmetic and metrics are validated before use; NaN,
@@ -237,13 +251,22 @@ wall time, work, peak RSS and the cost of retaining the old result while
 building the new one. Numerical latency is deliberately not claimed before
 that experiment; these measurements are a completion requirement.
 
-Line boxes can be emitted lazily for a vertical window: measure the whole
-flow, retain block geometry, emit only intersecting lines. This saves
+Line boxes can be emitted lazily for a half-open vertical window: measure
+the whole flow, retain block geometry, emit only intersecting logical line
+boxes. Empty windows emit none. This is line-box intersection, not a glyph
+ink query; a future painter must account for overhang in its overscan.
+Every line is measured for overflow even when not retained. Bounds include
+signed image margins and fractional replaced geometry, rounded outward to
+1/64 px. A line's content advance can be negative with negative image
+margins; geometric rectangles still have non-negative extents. This saves
 output memory but does not skip the measurement work. The first API repeats
 that pass for another window; paragraph checkpoints and incremental layout
 are deferred. It has exact total height, unlike a progressively unknown
 document tail. A consumer may discard the previous Layout before resize to
-avoid overlapping outputs, and must account for overlap if it keeps both.
+avoid overlapping outputs. If it keeps both, it passes the previous
+output_bytes in Request.retained_output_bytes; the same admission budget
+then covers both results. Width changes that alter active media rules add
+stylesheet compilation and cascade costs to the layout-only pass.
 
 Tests cover source ranges and transformations, sibling style sharing and
 custom-property differences, CSS used-size examples, inline/block splits,

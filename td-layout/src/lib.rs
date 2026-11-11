@@ -1,5 +1,6 @@
 //! Bounded, source-preserving normal flow. See DESIGN.md for the subset.
 #![forbid(unsafe_code)]
+pub mod block;
 pub mod inline;
 use std::mem::size_of;
 use td_css::selectors::Element;

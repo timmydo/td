@@ -39,12 +39,23 @@ pub struct TextFragment {
     pub width: f64,
 }
 #[derive(Clone, Debug, PartialEq)]
+pub struct ReplacedFragment {
+    pub node: NodeId,
+    pub style: StyleId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub struct Line {
     pub y: f64,
     pub height: f64,
     pub baseline: f64,
+    /// Content advance; negative replaced-element margins can make it signed.
     pub width: f64,
     pub fragments: Vec<TextFragment>,
+    pub replaced: Vec<ReplacedFragment>,
 }
 pub struct WrappedText {
     pub lines: Vec<Line>,
@@ -57,11 +68,12 @@ pub(crate) struct Pending {
     range: Range<usize>,
     style: StyleId,
     display: DisplayText,
-    pen: u64,
-    advance: u64,
+    pen: i64,
+    advance: i64,
     above: i64,
     below: i64,
     space: bool,
+    image: Option<(f64, f64, [f64; 4])>,
 }
 pub(crate) struct Counters {
     pub bytes: usize,
@@ -117,7 +129,17 @@ impl Counters {
         Ok(())
     }
 }
+pub(crate) struct LineBounds {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub advance: f64,
+}
 pub(crate) trait LineSink {
+    fn measure(&mut self, _bounds: LineBounds) -> Result<(), Error> {
+        Ok(())
+    }
     fn wants(&self, y: f64, height: f64) -> bool;
     fn line(&mut self, line: Line, counters: &mut Counters) -> Result<(), Error>;
 }
@@ -154,12 +176,19 @@ pub fn wrap_text(
         work: counters.work,
     })
 }
+pub(crate) struct ImageRun {
+    pub node: NodeId,
+    pub style: StyleId,
+    pub width: f64,
+    pub height: f64,
+    pub margin: [f64; 4],
+}
 pub(crate) struct Flow<'s, 'd, 'm, M> {
     styled: &'s StyledDocument<'d>,
     metrics: &'m mut M,
     width: u32,
     pending: Vec<Pending>,
-    pen: u64,
+    pen: i64,
     after_space: Option<usize>,
     last_space: bool,
     after_newline: bool,
@@ -250,7 +279,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 Some(ComputedValue::Length(Length::Px(n))) => (*n * f64::from(UNIT)).round(),
                 _ => 0.0,
             };
-            let advance = (f64::from(self.metrics.advance(style, shown)) + spacing).max(0.0) as u64;
+            let advance = (f64::from(self.metrics.advance(style, shown)) + spacing).max(0.0) as i64;
             let item = Pending {
                 node: run.node,
                 range: run.range.start + at..run.range.start + at + scalar.len_utf8(),
@@ -261,9 +290,69 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 above,
                 below,
                 space: shown == ' ',
+                image: None,
             };
             self.push(item, soft, counters, sink)?;
         }
+        Ok(())
+    }
+    pub fn image(
+        &mut self,
+        image: ImageRun,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+    ) -> Result<(), Error> {
+        let ImageRun {
+            node,
+            style,
+            width,
+            height,
+            margin,
+        } = image;
+        counters.step(1)?;
+        let [top, right, bottom, left] = margin;
+        let advance = ((width + left + right) * 64.0).round() as i64;
+        let soft = !matches!(
+            keyword(
+                self.styled.style(style).ok_or(Error::Invalid)?,
+                Property::WhiteSpace
+            ),
+            "pre" | "nowrap"
+        );
+        if soft
+            && (self.pen + advance + 32).div_euclid(64) > i64::from(self.width)
+            && !self.pending.is_empty()
+        {
+            if self.pending.iter().any(|p| !p.space) {
+                self.emit(counters, sink, None)?;
+            }
+            self.pending.clear();
+            self.pen = 0;
+            self.after_space = None;
+        }
+        let above = ((height + top + bottom) * 64.0).round() as i64;
+        self.push(
+            Pending {
+                node,
+                range: 0..0,
+                style,
+                display: DisplayText::Source,
+                pen: 0,
+                advance,
+                above,
+                below: 0,
+                space: false,
+                image: Some((width, height, margin)),
+            },
+            false,
+            counters,
+            sink,
+        )?;
+        if soft {
+            self.after_space = Some(self.pending.len());
+        }
+        self.last_space = false;
+        self.previous_cr = false;
         Ok(())
     }
     pub fn hard_break(
@@ -293,7 +382,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         sink: &mut impl LineSink,
     ) -> Result<(), Error> {
         let width = self.width;
-        let over = |pen: u64| (pen + item.advance + 32) / 64 > u64::from(width);
+        let over = |pen: i64| (pen + item.advance + 32).div_euclid(64) > i64::from(width);
         if !item.space
             && over(self.pen)
             && !self.pending.is_empty()
@@ -310,9 +399,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.pending = rest;
             counters.step(self.pending.len())?;
             for p in &mut self.pending {
-                p.pen -= shift;
+                p.pen = p.pen.checked_sub(shift).ok_or(Error::Invalid)?;
             }
-            self.pen -= shift.min(self.pen);
+            self.pen = self.pen.checked_sub(shift).ok_or(Error::Invalid)?;
             if soft && over(self.pen) && !self.pending.is_empty() {
                 self.emit(counters, sink, None)?;
                 self.pending.clear();
@@ -378,9 +467,63 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         if !coordinate(next_y) {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
+        let mut bounds = LineBounds {
+            left: 0.0,
+            top: self.y,
+            right: 0.0,
+            bottom: next_y,
+            advance: width,
+        };
+        counters.step(pending.len())?;
+        for p in pending {
+            let x = p.pen as f64 / 64.0;
+            let end = (p.pen + p.advance) as f64 / 64.0;
+            bounds.left = bounds.left.min(x).min(end);
+            bounds.right = bounds.right.max(x).max(end);
+            if let Some((width, height, margin)) = p.image {
+                let [_, _, bottom, left] = margin;
+                let image_x = x + left;
+                let image_y = self.y + (above as f64 / 64.0 - height - bottom);
+                bounds.left = bounds.left.min(image_x);
+                bounds.right = bounds.right.max(image_x + width);
+                bounds.top = bounds.top.min(image_y);
+                bounds.bottom = bounds.bottom.max(image_y + height);
+            }
+        }
+        for value in [
+            bounds.left,
+            bounds.top,
+            bounds.right,
+            bounds.bottom,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+        ] {
+            if !coordinate(value) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+        }
+        sink.measure(bounds)?;
         if sink.wants(self.y, height) {
             let mut fragments: Vec<TextFragment> = Vec::new();
+            let mut replaced = Vec::new();
             for p in pending {
+                if let Some((width, height, margin)) = p.image {
+                    if counters.fragments >= counters.limits.fragments {
+                        return Err(Error::Limit("MAX_FRAGMENTS"));
+                    }
+                    counters.fragments += 1;
+                    counters.reserve(&mut replaced)?;
+                    let [_, _, bottom, left] = margin;
+                    replaced.push(ReplacedFragment {
+                        node: p.node,
+                        style: p.style,
+                        x: p.pen as f64 / 64.0 + left,
+                        y: above as f64 / 64.0 - height - bottom,
+                        width,
+                        height,
+                    });
+                    continue;
+                }
                 if let Some(last) = fragments.last_mut().filter(|f| {
                     f.node == p.node
                         && f.style == p.style
@@ -413,6 +556,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                     baseline: above as f64 / 64.0,
                     width,
                     fragments,
+                    replaced,
                 },
                 counters,
             )?;
