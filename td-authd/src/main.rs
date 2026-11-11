@@ -13,7 +13,6 @@ mod admission;
 mod app_policy;
 mod application;
 mod application_cache;
-mod application_files;
 mod backoff;
 mod channel;
 #[allow(
@@ -35,6 +34,7 @@ mod elevation;
     reason = "td-app's and td-jail's halves of the cache contract"
 )]
 mod flathub_app;
+mod grant_views;
 mod handoff;
 // Request 1a's kernel name and consent's hostname descriptions.
 #[path = "../../td-firstboot/src/hostname.rs"]
@@ -94,6 +94,15 @@ mod unlock;
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(dead_code, reason = "the application policy reads the ledger")]
 mod workload_accounts;
+// The grant table the views are published from and the manifest td-jail
+// reads, one reviewed copy with td-firstboot's seed and td-jail's reader.
+#[path = "../../engine/src/workload_grants.rs"]
+#[allow(dead_code, reason = "firstboot seeds; td-jail reads manifests")]
+mod workload_grants;
+// The mountinfo derivation td-jail admits the published views by.
+#[path = "../../engine/src/mount_identity.rs"]
+#[allow(dead_code, reason = "td-jail derives more identities than views")]
+mod mount_identity;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -103,8 +112,7 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
     td-authd terminal-exec UID GENERATION HANDLE [PROGRAM [APP]] | td-authd prepare-portal-files | \
     td-authd release-portal-files | td-authd prepare-portal-handoff | \
-    td-authd release-portal-handoff | td-authd prepare-application-files APP | \
-    td-authd release-application-files APP | \
+    td-authd release-portal-handoff | td-authd release-grant-views | \
     td-authd application-start OWNER APP direct -- ARG... | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
@@ -154,13 +162,10 @@ fn run(arguments: &[String]) -> Result<(), String> {
     if arguments == ["portal-file-namespace"] {
         return portal_files::namespace_helper();
     }
+    if arguments == ["release-grant-views"] {
+        return grant_views::release_all();
+    }
     if let Some((verb, rest)) = arguments.split_first() {
-        if verb == "prepare-application-files" {
-            return application_files::prepare(rest);
-        }
-        if verb == "release-application-files" {
-            return application_files::release(rest);
-        }
         if verb == "application-start" {
             return application::start(rest);
         }

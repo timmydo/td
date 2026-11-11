@@ -266,6 +266,11 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
     let uid = admit(&LAUNCH, request.owner, &request.name)?;
+    // An application's own account gets the views its grants name, before
+    // its first process; one running as the human needs none.
+    if uid != request.owner {
+        crate::grant_views::publish(&request.name, uid)?;
+    }
     // No root log or inherited descriptor reaches the credential helper or
     // application.
     let error = request

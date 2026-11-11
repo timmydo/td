@@ -1,7 +1,10 @@
-//! Root preparation of the portal's fixed read-only Downloads view and
-//! its writable view of Firefox's handoff directory.
+//! Root preparation of the portal's fixed read-only Downloads view, which
+//! follows Firefox's `Downloads` grant, and its writable view of Firefox's
+//! handoff directory.
 
-use crate::{application, launch, mount_sys};
+use crate::mount_sys::ViewAccess;
+use crate::workload_accounts::Kind;
+use crate::{application, grant_views, launch, mount_sys};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -14,15 +17,21 @@ use std::time::Duration;
 const HUMAN: u32 = 1000;
 const PORTAL: u32 = 991;
 const VIEW: &str = "/var/td-portal-files/1000/Downloads";
+/// The one application FileChooser serves, whose `/home/td/Downloads` the
+/// portal's view pairs with, and the grant the pairing needs: its account's
+/// row for the human's `Downloads`.
+pub(crate) const FILE_CHOOSER_APPLICATION: &str = "firefox";
+const FILE_CHOOSER_DIRECTORY: &str = "Downloads";
 /// Where the portal writes the files OpenURI.OpenFile hands Firefox; the
 /// same directory is Firefox's read-only `~/Opened` grant.
 const HANDOFF: &str = "Opened";
 const HANDOFF_VIEW: &str = "/var/td-portal-files/1000/Opened";
 const DEADLINE: Duration = Duration::from_secs(5);
+const PORTAL_LOCK: &str = "portal-1000-downloads";
 const MAX_MOUNTINFO: u64 = 1024 * 1024;
 const DIRECTORY_FLAGS: i32 = 0x10000 | 0x20000;
 
-fn pinned(parent: &File, name: &str) -> PathBuf {
+pub(crate) fn pinned(parent: &File, name: &str) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), name))
 }
 
@@ -220,51 +229,105 @@ pub(crate) fn namespace_helper() -> Result<(), String> {
     endpoint.write_all(&[3]).map_err(|e| e.to_string())
 }
 
+/// The boot's preparation of the read-only Downloads view; each Firefox
+/// launch repeats it (`sync_downloads`).
 pub(crate) fn prepare() -> Result<(), String> {
     launch::require_launch_startup()?;
+    sync_downloads(&grant_views::read_table()?)
+}
+
+/// Root's lock on the portal's Downloads view, which the boot's preparation
+/// and each Firefox launch both bring in line: a private file in root's
+/// private lock directory, waited for within a deadline.
+fn lock_view(var: &File) -> Result<File, String> {
+    let lib = child(var, "lib", 0, true)?;
+    let td = child(&lib, "td", 0, true)?;
+    let tree = ensure_root_child(&td, crate::workload_grants::VIEW_ROOT_NAME)?;
+    let locks = grant_views::private_directory(&tree, grant_views::LOCKS, (0, 0))?;
+    grant_views::lock(&locks, PORTAL_LOCK, (0, 0), DEADLINE)
+}
+
+/// Whether `table` grants FileChooser's application the human's
+/// `Downloads`, which is what makes the portal's view and the
+/// application's `/home/td/Downloads` the same directory.
+fn downloads_granted(table: &crate::workload_grants::Table) -> bool {
+    table
+        .directories(Kind::Application, FILE_CHOOSER_APPLICATION)
+        .iter()
+        .any(|directory| directory.path == FILE_CHOOSER_DIRECTORY)
+}
+
+/// The read-only Downloads view as `table` has it: present, and showing
+/// the human's present `Downloads`, while FileChooser's application holds
+/// a grant of it; released otherwise, so FileChooser refuses. A view of a
+/// renamed or replaced directory is released and published again, and a
+/// directory on a mount stacked over the human's home is refused.
+pub(crate) fn sync_downloads(table: &crate::workload_grants::Table) -> Result<(), String> {
     let root = directory(Path::new("/"), 0, true)?;
     let var = child(&root, "var", 0, true)?;
+    let _lock = lock_view(&var)?;
     let home = child(&var, "home", 0, true)?;
     let account = crate::primary_account::load().map_err(|error| error.to_string())?;
     let human = child(&home, account.name(), HUMAN, true)?;
-    let source = child(&human, "Downloads", HUMAN, false)?;
+    let source = if downloads_granted(table) {
+        grant_views::human_directory(&human, FILE_CHOOSER_DIRECTORY, (HUMAN, HUMAN))?
+    } else {
+        None
+    };
+    let Some(source) = source else {
+        return release_view();
+    };
     let grants = ensure_root_child(&var, "td-portal-files")?;
     let session = ensure_root_child(&grants, "1000")?;
-    if let Some(options) = mount_options()? {
-        return require_view(&source, &session, &options);
+    if let Ok(Some(options)) = mount_options() {
+        if require_view(&source.file, &session, &options).is_ok() {
+            return Ok(());
+        }
     }
+    // None, a stale one, or a stack of them: every one goes first.
+    release_view()?;
     let target = ensure_root_child(&session, "Downloads")?;
     let namespace = namespace()?;
-    let mount = mount_sys::clone_directory(source.as_fd()).map_err(|e| e.to_string())?;
-    mount_sys::portal_attributes(mount.as_fd(), namespace.as_fd()).map_err(|e| e.to_string())?;
+    let mount = mount_sys::clone_directory(source.file.as_fd()).map_err(|e| e.to_string())?;
+    mount_sys::view_attributes(mount.as_fd(), namespace.as_fd(), ViewAccess::ReadOnly)
+        .map_err(|e| e.to_string())?;
     mount_sys::publish(mount.as_fd(), target.as_fd()).map_err(|e| e.to_string())?;
     let options = mount_options()?.ok_or("published file-grant mount is missing")?;
-    require_view(&source, &session, &options)
+    require_view(&source.file, &session, &options)
 }
 
 /// The supervisor calls this after all services stop and before unmounting /var.
 pub(crate) fn release() -> Result<(), String> {
     launch::require_launch_startup()?;
-    if mount_options()?.is_none() {
-        return Ok(());
-    }
+    let root = directory(Path::new("/"), 0, true)?;
+    let var = child(&root, "var", 0, true)?;
+    let _lock = lock_view(&var)?;
+    release_view()
+}
+
+/// Unmounts every mount at the view, a stack included, until none remains.
+fn release_view() -> Result<(), String> {
+    grant_views::unmount_all(VIEW)
+}
+
+/// Unmounts the one mount at `path` through td-init's `/bin/umount` applet,
+/// from `/`, with a cleared environment, null stdin and stdout and its
+/// stderr tail quoted in a failure. No lazy detach or other fallback.
+pub(crate) fn unmount(path: &str) -> Result<(), String> {
     let (status, mut umount) = crate::stderr_tail::status(
         Command::new("/bin/umount")
-            .arg(VIEW)
+            .arg(path)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null()),
     )
-    .map_err(|e| format!("start fixed portal unmount: {e}"))?;
+    .map_err(|e| format!("start unmount of {path}: {e}"))?;
     if !status.success() {
         return Err(format!(
-            "fixed portal unmount failed: {status}{}",
+            "unmount of {path} failed: {status}{}",
             umount.said()
         ));
-    }
-    if mount_options()?.is_some() {
-        return Err("file-grant mount remains after unmount".into());
     }
     Ok(())
 }
@@ -340,7 +403,7 @@ pub(crate) fn prepare_handoff() -> Result<(), String> {
     let target = ensure_root_child(&session, HANDOFF)?;
     let namespace = namespace_mapping(uid, PORTAL)?;
     let mount = mount_sys::clone_directory(source.as_fd()).map_err(|e| e.to_string())?;
-    mount_sys::application_attributes(mount.as_fd(), namespace.as_fd())
+    mount_sys::view_attributes(mount.as_fd(), namespace.as_fd(), ViewAccess::Writable)
         .map_err(|e| e.to_string())?;
     mount_sys::publish(mount.as_fd(), target.as_fd()).map_err(|e| e.to_string())?;
     let options = mount_options_at(HANDOFF_VIEW)?.ok_or("published handoff mount is missing")?;
@@ -353,21 +416,7 @@ pub(crate) fn release_handoff() -> Result<(), String> {
     if mount_options_at(HANDOFF_VIEW)?.is_none() {
         return Ok(());
     }
-    let (status, mut umount) = crate::stderr_tail::status(
-        Command::new("/bin/umount")
-            .arg(HANDOFF_VIEW)
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null()),
-    )
-    .map_err(|e| format!("start fixed handoff unmount: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "fixed handoff unmount failed: {status}{}",
-            umount.said()
-        ));
-    }
+    unmount(HANDOFF_VIEW)?;
     if mount_options_at(HANDOFF_VIEW)?.is_some() {
         return Err("handoff mount remains after unmount".into());
     }
@@ -382,16 +431,14 @@ mod tests;
 #[test]
 #[allow(clippy::unwrap_used)]
 fn application_mount_lookup_uses_its_exact_view_and_refuses_stacks() {
-    let view = "/var/lib/td/applications/65537/Downloads";
+    let view = "/var/lib/td/grant-views/65537/0";
     let row = format!("7 1 0:1 / {view} rw,nosuid,nodev,noexec - btrfs none rw\n");
     assert_eq!(
         mount_options_for(&row, view).unwrap().as_deref(),
         Some("rw,nosuid,nodev,noexec")
     );
-    assert!(
-        mount_options_for(&row, "/var/lib/td/applications/65536/Downloads")
-            .unwrap()
-            .is_none()
-    );
+    assert!(mount_options_for(&row, "/var/lib/td/grant-views/65536/0")
+        .unwrap()
+        .is_none());
     assert!(mount_options_for(&format!("{row}{row}"), view).is_err());
 }

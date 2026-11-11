@@ -90,7 +90,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "application" => Some(Self::Application),
             "sandbox" => Some(Self::Sandbox),
@@ -99,7 +99,7 @@ impl Kind {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Application => "application",
             Self::Sandbox => "sandbox",
@@ -133,8 +133,9 @@ pub struct Ledger {
 /// The principal table's application name grammar (td-authd/DESIGN.md,
 /// "Principal registry prerequisite"), copied: td-firstboot compiles both
 /// files, but the ledger's coming readers do not compile `principals.rs`.
-/// The engine crate's tests hold the two equal.
-fn valid_name(value: &str) -> bool {
+/// The engine crate's tests hold the two equal. The grant table keys its
+/// rows by the same names.
+pub fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)

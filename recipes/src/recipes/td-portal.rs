@@ -160,10 +160,17 @@ mod tests {
             "let home = child(&var, \"home\", 0, true)?;",
             "let account = crate::primary_account::load().map_err(|error| error.to_string())?;",
             "let human = child(&home, account.name(), HUMAN, true)?;",
-            "let source = child(&human, \"Downloads\", HUMAN, false)?;",
+            "grant_views::human_directory(&human, FILE_CHOOSER_DIRECTORY, (HUMAN, HUMAN))?",
+            "const FILE_CHOOSER_DIRECTORY: &str = \"Downloads\";",
+            "pub(crate) const FILE_CHOOSER_APPLICATION: &str = \"firefox\";",
         ] {
             assert!(grant.contains(step), "{step}");
         }
+        // Firefox's side of the pair is its seeded grant row, not a policy
+        // permission.
+        let seed = include_str!("../../../engine/src/workload_grants.rs");
+        assert!(seed.contains("name: \"firefox\".into(),"));
+        assert!(seed.contains("path: \"Downloads\".into(),"));
         let init = super::super::system_x86_64::deployment_init_fixture();
         assert!(init.contains(
             "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1"

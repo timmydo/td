@@ -3,6 +3,7 @@
 use crate::app_policy::Declarations;
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::workload_accounts::{self, Kind, Ledger};
+use crate::workload_grants::{self, Table};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
@@ -24,6 +25,11 @@ const PRIVATE_MODE: u32 = 0o600;
 const ACCOUNTS_STAGED: &str = ".accounts.next";
 const ACCOUNTS_MODE: u32 = workload_accounts::MODE;
 const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
+/// The workload grant table (td-authd/DESIGN.md, "Workload grant table"):
+/// what each account may reach of the human's, root's alone to read.
+const GRANTS_STAGED: &str = ".grants.next";
+const GRANTS_MODE: u32 = workload_grants::MODE;
+const GRANTS_LIMIT: u64 = workload_grants::MAX_BYTES as u64;
 /// The application homes, `/var/lib/td/applications/UID`, and how many
 /// entries an allocation reads in any directory it lists: past every
 /// application uid.
@@ -385,10 +391,10 @@ impl Directory {
         Ok(retained)
     }
 
-    /// Boot enrollment under one hold of the lock: the reservations and the
-    /// workload account ledger seeded from what they retain. Both are
-    /// computed and checked before either is published, so a refusal
-    /// changes nothing.
+    /// Boot enrollment under one hold of the lock: the reservations, the
+    /// workload account ledger seeded from what they retain, and the
+    /// workload grant table, seeded only when absent. All are computed and
+    /// checked before any is published, so a refusal changes nothing.
     fn enroll_checked(
         &self,
         desired: &Registry,
@@ -398,6 +404,7 @@ impl Directory {
         let retained = self.merged(desired)?;
         validate(&retained)?;
         let ledger = self.seeded_accounts(&retained)?;
+        let grants = self.seeded_grants()?;
         self.publish_reservations(&retained)?;
         self.publish_as(
             workload_accounts::FILE_NAME,
@@ -406,7 +413,27 @@ impl Directory {
             ACCOUNTS_MODE,
             ACCOUNTS_LIMIT,
         )?;
+        if let Some(grants) = grants {
+            self.publish_as(
+                workload_grants::FILE_NAME,
+                GRANTS_STAGED,
+                &grants.encode(),
+                GRANTS_MODE,
+                GRANTS_LIMIT,
+            )?;
+        }
         Ok(ledger)
+    }
+
+    /// The grant table to publish: the seed (Firefox's `Downloads`) when
+    /// none exists, else none, once the present one has been read at its
+    /// exact shape and parsed. The seed is written once, so a row the human
+    /// revoked stays revoked; a malformed table refuses and is never reset.
+    fn seeded_grants(&self) -> Result<Option<Table>, String> {
+        match self.read_as(workload_grants::FILE_NAME, GRANTS_MODE, GRANTS_LIMIT)? {
+            Some(text) => Table::parse(&text).map(|_| None),
+            None => Ok(Some(Table::seeded())),
+        }
     }
 
     /// The retained reservations joined with the deployment's. The caller

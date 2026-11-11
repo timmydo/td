@@ -27,6 +27,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../engine/src/host_path.rs"),
     ),
     (
+        "mount_identity",
+        include_str!("../../../engine/src/mount_identity.rs"),
+    ),
+    (
         "permissions",
         include_str!("../../../engine/src/permissions.rs"),
     ),
@@ -43,6 +47,10 @@ const MODULES: &[(&str, &str)] = &[
     (
         "workload_accounts",
         include_str!("../../../engine/src/workload_accounts.rs"),
+    ),
+    (
+        "workload_grants",
+        include_str!("../../../engine/src/workload_grants.rs"),
     ),
     (
         "workspace",

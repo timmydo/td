@@ -24,10 +24,23 @@ UID/GID 1000 to portal UID/GID 991 and requires read-only, nosuid, nodev and
 noexec mount attributes before publication. This lets FileChooser retain
 its bounded Downloads view when the portal stops sharing the human UID,
 including files created with mode 0600. It grants no access to the rest of
-the human home. The portal does not receive a mount or namespace descriptor. The empty
-root-owned destination directories persist under `/var`, with the mount
-recreated at boot. This shared view stays outside reserved private-runtime
-trees so the jail's alias refusal does not also reserve human Downloads.
+the human home. FileChooser serves Firefox alone, so the view exists only
+while the workload grant table holds Firefox's `Downloads` row
+("Workload grant table"): boot preparation and every Firefox launch
+release it when the row is revoked or its source is gone, keep a present
+view only while it still shows the source with its required options, and
+otherwise publish it again. With the row revoked FileChooser answers that
+its Downloads grant is unavailable. The source passes the grant views'
+checks ("Application filesystem grants"), a stacked mount included. Both
+callers take one lock, a private file in root's private lock directory
+below `/var/lib/td/grant-views`, waited for within a deadline, so they
+never publish over each other; before publishing, every mount at the
+view, a stack included, is unmounted until none remains. A Firefox
+launch whose portal sync fails logs it and goes on. The portal does not
+receive a mount or namespace descriptor. The empty root-owned destination
+directories persist under `/var`, with the mount recreated at boot. This
+shared view stays outside reserved private-runtime trees so the jail's
+alias refusal does not also reserve human Downloads.
 
 Grant creation and jail admission share `primary_account.rs`: resolve UID
 1000 from `/etc/passwd`, require GID 1000 and a canonical `/home/NAME` or
@@ -52,11 +65,12 @@ admission as the terminal authority. Each path component is opened through
 a retained parent descriptor without following links. Root ancestors and
 the human home must exclude other writers; Downloads must be directly
 owned by human UID/GID 1000. Root owns all destination parents and permits
-traversal. Repeated preparation accepts only the same source inode exposed
-at the fixed mountpoint with all four restrictive mount flags and portal
-ownership. A replaced Downloads root, stacked mounts or changed parent
-metadata is refused; this helper does not repair a live altered grant.
-The portal waits for this unit to settle but does not require its success.
+traversal. Repeated preparation keeps a present view only when it is the
+one mount at the fixed mountpoint, shows the same source inode with all
+four restrictive mount flags and portal ownership; a view of a replaced or
+renamed Downloads, or a stack, is released and published again. Changed
+parent metadata refuses. The portal waits for this unit to settle but does
+not require its success.
 An unavailable grant refuses FileChooser requests; Settings and Secret
 remain available.
 
@@ -759,6 +773,84 @@ fails leaves the row, and the
 next install, which finds the row, completes root's interrupted
 creation. A removed application keeps its row and home, so its
 reinstall is allocated the same uid and finds its state.
+
+## Workload grant table
+
+What a workload account may reach of the human's (WORKLOADS.md,
+"Grants") is one root-only table, `/var/lib/td/grants.tsv`, root:root mode
+0600 in the root-owned 0755 `/var/lib/td`: unlike the account ledger, no
+workload or human program can read the table. That hides rows, not
+views: a published view is a mount, and any unjailed process reading
+`/proc/self/mountinfo` sees each view's root and the account's uid in its
+path, so which directories an account holds while its views are mounted
+is not secret from the host. Its format is
+`engine/src/workload_grants.rs`, which td-firstboot, td-authd and td-jail
+each include by path, and from which td-agent reads the sensitive trees
+below. It begins `td-grants-v1`, followed by tab-separated rows, each
+line compared with its trailing newline in strictly ascending byte order
+with no duplicate (an edit by hand must keep that order: `ro` sorts
+before `rw` in the same account's rows), keyed by the account as the
+ledger keys it, kind and name:
+
+```
+KIND<TAB>name<TAB>directory<TAB>ro|rw<TAB>PATH
+KIND<TAB>name<TAB>socket<TAB>SOCKET
+KIND<TAB>name<TAB>network<TAB>off|host
+```
+
+Only `directory` rows take effect today. v1 parses socket and network
+rows already, for the same reason the ledger parses kinds it does not
+yet write, and rejects malformed ones; a later format is `td-grants-v2`,
+landed as the ledger's would be. An account holds at most 32 directory
+rows, 16 socket rows and one network row; the table at most 4096 rows and
+1 MiB. `PATH` is relative to the human's home: at most 1024 bytes, 16
+names of at most 255 bytes, no empty, `.` or `..` name, and UTF-8 with no
+control character (C0, DEL or C1) and none of the format characters that
+reorder or hide what a path shows (U+061C, U+200B to U+200F, U+2028 to
+U+202E, U+2060 to U+2069, U+FEFF), since a consent will show it, nor
+U+FFFD, which td-authd's lossy reading of mountinfo makes of a name that
+is not UTF-8. It may not be, lie below or contain:
+
+- td's own trees: `.td`, every top-level `.td-*` name (`.td-update`'s
+  publisher keys, `.td-agent`, `.td-rust`, `.td-build-cache`), `.cache`,
+  `.config` whole (td's configuration, and what the session or git runs
+  on the human's behalf), `.local/share` (td-sandbox's homes, keyrings,
+  desktop entries) and `.local/state`;
+- the sensitive trees td-agent refuses a workspace too, one list in the
+  format file: credentials, keyrings and profiles (`.ssh`, `.gnupg`,
+  `.password-store`, `.aws`, `.mozilla`, `.var/app` and the rest) and
+  where the human's own programs live (`bin`, `.local/bin`,
+  `.cargo/bin`), where a writable grant would run the workload's code as
+  the human.
+
+So `.local`, `.cargo` and `.var` are refused as ancestors. Two directory
+rows of one account may not be equal or nest, since two views of one
+tree would let the account reach one name through two grants of
+different access. `validate_path` is the one byte validator: td-authd
+applies it before opening a source and td-jail to every source it
+admits, so a table and a jail cannot disagree on what is reserved. Every
+path it admits is a grant target td-jail accepts, apart from one meeting
+the application's own policy grants (Firefox's `Opened`, say): td-jail
+then leaves that view out of the launch with one line on its stderr and
+binds the policy's grant. There is no exec grant; every view is noexec.
+
+td-firstboot writes the table once, under the same state lock and in the
+same staged, synced and renamed form as the ledger, when boot enrollment
+finds none: its seed is Firefox's `rw` `Downloads`. A present table is read
+at its exact owner, mode and single link and parsed, never rewritten, so a
+row the human revoked stays revoked and a table a later deployment wrote
+is kept; a malformed or misshapen table refuses the boot and changes
+nothing, as the ledger's does. The request path that adds and revokes rows
+is WORKLOADS.md step 6's third landing; until it lands only root editing
+the file changes a grant, and a change takes effect at the account's next
+launch. Rows naming an application that runs as the human (mail and news
+today) are ignored: such an application reaches the human's files by its
+policy, as the human, and no view is published for it.
+
+Rolling back to a deployment from before this table (WORKLOADS.md step 6's
+first landing) re-grants Firefox's `Downloads` by that deployment's own
+boot unit whatever the table says, and leaves the table and the view tree
+in place, harmless: nothing there reads them.
 
 ## Fixed program launch prerequisite
 
@@ -1525,30 +1617,110 @@ td-software/DESIGN.md §3 accepts.
 
 ## Application filesystem grants
 
-Root startup prepares one writable idmapped view: Firefox shares human
-Downloads, resolved through the same primary-account reader as portal
-preparation and jail admission, below the assigned
-application's private home. `prepare-application-files APP` and the matching
-shutdown operation accept only `firefox`. Active-account and
-durable-ledger admission select the UID; no caller supplies a path or map.
-The existing root namespace helper maps filesystem human UID/GID 1000 to
-that application identity. Mount attributes require nosuid, nodev and noexec;
-a cloned read-only source remains read-only and refuses writable admission.
-The portal's separate read-only Downloads view is unchanged; its writable
+`application-start` publishes an application account's grant views after
+admission and before its first process, when the application runs as an
+account of its own rather than as the human; no caller supplies a path,
+access or map. It reads the grant table as root reads it (an absent table
+refuses: boot seeds it) and takes the account's directory rows. What a
+view of each row must show is derived from mountinfo by the one function
+td-jail admits it by (`engine/src/mount_identity.rs`): the device and
+root of the mount covering the human's home (the topmost mount at the home
+or, failing one, at its nearest ancestor), joined with the home's path
+below that mount's mountpoint and then with the row's path. On the stock
+layout the home is a plain directory below the `/var` subvolume's mount,
+so a view of `Downloads` shows `/@var/home/NAME/Downloads`.
+
+Views live at `/var/lib/td/grant-views/UID/N`, a root-owned tree outside
+every workload-writable home: `grant-views` is root:root 0755 and each
+account's directory root:UID exact mode 0710, so the account opens the
+names it knows (its manifest and the views it lists) and lists nothing.
+The launch first takes the account's lock: a private root file in
+`grant-views/.locks`, a root:root 0700 directory no account can enter,
+so none can open the lock to hold a launch up; it waits for the lock at
+most ten seconds and then fails closed. td-svc runs one unit per
+application, which already serialises its launches; the lock covers a
+launch racing a manual one. Under it the launch reconciles in an order
+that keeps the manifest true of what is mounted throughout, and never
+removes it:
+
+1. Every view no row accounts for is dropped from the manifest, which is
+   rewritten without it, and then unmounted and its mountpoint removed,
+   before any source is opened: a revoked row's, a renamed or removed
+   source's (whose root then names the new path or `PATH//deleted`), one
+   whose access changed either way, one that lost a restriction or its
+   idmap, one with a mount stacked on it, and an empty mountpoint a
+   failed launch left. A view accounts for a row while it is the one
+   mount at its path showing the row's derived device and root, its
+   access, nosuid, nodev, noexec and `idmapped`.
+2. Each row's source is opened below the human home, resolved through the
+   same primary-account reader as portal preparation and jail admission,
+   name by name through a retained parent without following links. Every
+   name on the way must be a directory of human UID/GID 1000 writable by
+   neither group nor others, and must lie on the home's own mount: a
+   descriptor's mount id from `/proc/self/fdinfo` that differs from the
+   home's is a mount stacked over the source or over a directory between
+   it. A missing name gets no view. A refused source (a link, a file, a
+   foreign owner, another writer, a stack) gets no view and one line on
+   td-authd's stderr, and the launch goes on with the other rows: one bad
+   row costs that row, not the application. Nothing is created. A view
+   from step 1 that a stat shows as the source's device and inode, owned
+   by the account, is kept; any other row is published at the lowest index
+   no present view holds: a detached, nonrecursive `OPEN_TREE_CLONE` of
+   the source, idmapped through one namespace per launch from the root
+   namespace helper, mapping filesystem UID/GID 1000 to the account, with
+   read-only, nosuid, nodev and noexec for an `ro` row and nosuid, nodev
+   and noexec for an `rw` one, moved onto its empty mountpoint. Indices
+   run to 64, twice the rows, so a replacement goes up beside the view it
+   replaces.
+3. A fresh mount table must show every new view as step 1 would keep it,
+   with the source's inode, or the launch refuses with the manifest of
+   step 1 in place. The manifest `td-grant-views-v1`, listing
+   `INDEX<TAB>ro|rw<TAB>PATH` for each view, root:UID mode 0640, is then
+   staged privately, synced and renamed over the old one, and the views it
+   no longer lists are released.
+
+Only the account and root read which views it holds. A manifest that
+outlives a reboot names unmounted paths; td-jail refuses those, and every
+launch rewrites the manifest before the account's first process. The
+launch also removes, once, the empty root-owned 0755 `Downloads`
+mountpoint the retired boot unit left in Firefox's private home, when no
+mount covers it. Firefox's launch also brings the portal's Downloads view
+in line with its grant ("Portal file preparation").
+
+td-jail binds only what the manifest lists, at `/home/td/PATH` in the
+jail; it reads the manifest through the same root-owned directories
+without following links, requires each listed view to be exactly the one
+mount at its path with the options above and the identity it derives for
+the human's directory, and refuses the launch otherwise. A listed view
+whose target meets one of the application's own policy grants, or one
+td-jail keeps for itself, is left out with one line on td-jail's stderr.
+With no manifest an account has no views. Running jails keep their own
+copies of a view, since each jail's mount namespace is private: a
+revocation or a rename reaches the account at its next launch, not in a
+running one, and the root mount stays until that launch or shutdown
+releases it. The supervisor's shutdown runs `release-grant-views` after
+every service stops and before unmounting /var: it unmounts every mount
+below the view tree, deepest first, and reports any that remains. The
+portal's separate read-only Downloads view is unchanged; its writable
 handoff view maps the other way, Firefox's identity to the portal's
 ("Portal handoff").
 
-Every directory is opened through a retained parent without following links.
-The human source must be directly owned by UID/GID 1000, and the private
-application home must have exact app ownership and mode 0700. Preparation
-runs before application processes start; it is not live repair of an
-app-writable home or protection against a root mount-table editor. A present
-view must match the source device/inode, selected mapped owner and all four
-required options. Wrong or stacked mounts are refused. Shutdown resolves the
-same enrolled assignment and invokes only the fixed view's umount helper;
-failed ledger admission or a remaining mount is reported, not silently
-ignored. The image must stop services before releasing these mounts and
-release them before unmounting /var.
+Preparation is not live repair of a running jail or protection against a
+root mount-table editor. A writable view's grantee can change the shared
+source's permissions and contents. If it gives the source to group or
+others, the next launch of any account granted that directory leaves that
+row without a view and names the source on stderr; the human restores the
+mode. Root does not silently undo an owner's permission change. Arbitrary
+deletion or renaming of the source by its owner removes the account's view
+at the next launch. A refused source, and a view td-jail leaves out, shows
+only in the service logs: nothing tells the human in the session until the
+request path of WORKLOADS.md step 6's third landing can report it.
+
+td-jail runs as the account, which may search its 0710 view directory but
+not read it, so it holds each directory on the way to the manifest as an
+`O_PATH` descriptor, checks its metadata, and opens only the manifest for
+reading, through that descriptor; the views it reaches by path, for
+`lstat` and the bind.
 
 Application activation uses the same application policy reader, the
 image's declarations joined with the workload account ledger, in the
@@ -1577,56 +1749,27 @@ Bus evidence connects as the human observer and independently checks the
 subject application UID against the immutable policy. An unjailed service
 UID retains launcher filtering and is not an unrestricted bus observer.
 
-The grant preparer may create the declared missing human directory,
-initially root-owned mode 0700 and then transferred to the human UID/GID.
-A pinned empty root-owned directory with only owner permissions is the
-restartable creation intermediate; nonempty or nonprivate remnants refuse.
-Existing sources must already have human UID/GID and mode 0700, checked
-before publication; private parent modes must also be valid;
-no recursive chown, fallback copy, or broad human-home grant is performed.
-The writable mapped owner can change the shared source's permissions and
-contents. Firefox and mail therefore share availability of Downloads, as
-well as its data: either grantee or the human can invalidate its private
-mode. The next preparation refuses and identifies the application and
-source in its diagnostic. The human owner must restore mode 0700 on the
-named source before retrying the service. Root does not silently undo an
-owner's permission change or start an application without its required
-grant. This shared directory is outside the private per-application state
-boundary; arbitrary deletion or renaming by its owner can also deny it.
-
-Jail admission permits only the declared projection's source identities,
-including its root, through the otherwise reserved home boundary. It
-derives the root's identity from the mount covering the human's home (the
-topmost mount at the home or, failing one, at its nearest ancestor)
-joined with the declared directory's path below it. Mounts below the
+Jail admission permits only the listed views' source identities,
+including their roots, through the otherwise reserved home boundary. It
+derives each identity by the derivation publication used: the mount
+covering the human's home (the topmost mount at the home or, failing one,
+at its nearest ancestor), joined with the home's path below that mount's
+mountpoint and then with the listed directory's path. Mounts below the
 home, between it and the directory or at the directory, do not count:
 nothing need be mounted at the source, and a view of a mount stacked
 over the source or over a directory between it and the home is refused.
 A view root the kernel shows with `//` (`PATH//deleted`, a removed
-directory) is refused. The maintenance backing-volume ancestor remains
-read-only and grants no sibling state. Nested mounts pointing outside
+directory) is refused, and roots are compared byte by byte, so a
+`PATH//deleted` root never counts as nested in, or apart from, another.
+The maintenance backing-volume ancestor remains read-only and grants no
+sibling state. Nested mounts pointing outside
 the declared human source and protected mounts at or below it are
 refused.
 
 Nothing pins the source's name while its views exist. If the human
-renames or removes `Downloads` after preparation, Firefox's view and the
-portal's read-only view keep showing the old directory; the view's root
-then names the new path or `PATH//deleted`, so jail admission refuses
-every later Firefox launch and a repeated preparation refuses the
-present view (`require_same_directory`) until shutdown releases the
-views, and the portal keeps serving the old directory. Nothing is
-admitted wrongly; the human has made their own grant unavailable until
-the next boot. Per-launch publication, which releases and republishes a
-stale view, removes this limit (WORKLOADS.md step 6).
-
-The publisher does not yet check the source's mount. A directory with a
-mount stacked on it is opened across that mount, so preparation
-publishes a view of the stacked tree, and only jail admission refuses
-it, far from the cause; the portal's read-only view has no such check.
-Stacking a mount there takes root, and the failure is closed: Firefox
-does not start. The per-launch publisher of WORKLOADS.md step 6 closes
-the gap by refusing a source whose mount is not the home's covering
-mount.
+renames or removes a granted directory, a running jail keeps showing the
+old directory, and the next launch releases the stale view and publishes
+the directory the row now names, or none.
 
 ## Immutable consent description prerequisite
 

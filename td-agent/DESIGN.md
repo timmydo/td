@@ -4046,7 +4046,10 @@ td-agent then refuses, for every one of those sources, on top of §C:
   browser profile; a configuration home's (`~/.config` and
   `$XDG_CONFIG_HOME`) `autostart`, `systemd`, `environment.d` and `git`,
   which the session or git runs from; a data home's `applications`;
-  and sandboxed applications' `~/.var/app` and `~/snap`;
+  and sandboxed applications' `~/.var/app` and `~/snap`. These lists
+  are the workload grant table's (`engine/src/workload_grants.rs`,
+  td-authd/DESIGN.md, "Workload grant table"), one copy: no grant of
+  the human's files names one either;
 - a shared or extra directory that contains a worktree or any part of the
   git chain, which would make a protected entry's ancestors renamable;
 - a shared or extra directory, or a directory workspace, that is,

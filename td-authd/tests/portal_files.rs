@@ -48,3 +48,26 @@ fn directory_checks_reject_redirects_wrong_owners_and_other_writers() {
     fs::remove_file(link).unwrap();
     fs::remove_dir(root).unwrap();
 }
+
+/// The portal's Downloads view follows Firefox's grant row alone: another
+/// account's Downloads, another of Firefox's directories, or no table row
+/// leaves FileChooser with nothing to serve.
+#[test]
+fn the_portal_downloads_view_needs_firefoxs_downloads_row() {
+    use crate::workload_grants::Table;
+    let table = |rows: &str| Table::parse(&format!("td-grants-v1\n{rows}")).unwrap();
+    assert!(downloads_granted(&Table::seeded()));
+    assert!(downloads_granted(&table(
+        "application\tfirefox\tdirectory\tro\tDownloads\n"
+    )));
+    for revoked in [
+        "",
+        "application\tfirefox\tdirectory\trw\tDocuments\n",
+        "application\tfirefox\tdirectory\trw\tDownloads/inbox\n",
+        "application\tmail\tdirectory\trw\tDownloads\n",
+        "sandbox\tfirefox\tdirectory\trw\tDownloads\n",
+        "workspace\tfirefox\tdirectory\trw\tDownloads\n",
+    ] {
+        assert!(!downloads_granted(&table(revoked)), "{revoked:?}");
+    }
+}

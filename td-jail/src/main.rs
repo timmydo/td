@@ -33,6 +33,12 @@ mod host_path;
     path = "../../engine/src/permissions.rs"
 )]
 mod permissions;
+// The mountinfo derivation td-authd publishes grant views by.
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/mount_identity.rs"
+)]
+mod mount_identity;
 #[cfg_attr(
     not(feature = "target-recipe"),
     path = "../../td-authd/src/primary_account.rs"
@@ -48,6 +54,13 @@ mod transition;
     path = "../../engine/src/workload_accounts.rs"
 )]
 mod workload_accounts;
+// The grant table's path validator and the view manifest td-authd writes.
+#[allow(dead_code, reason = "td-jail reads the manifest; td-authd writes it")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/workload_grants.rs"
+)]
+mod workload_grants;
 mod workspace;
 
 use std::io::Write;
@@ -310,7 +323,9 @@ mod confinement {
         assert!(!WORKSPACE.contains("unsafe"));
         assert!(!WORKSPACE.contains("sys::"));
         // The application policy and the ledger reader it joins read two
-        // root-owned files and run nothing; the root includes each once.
+        // root-owned files, the grant table's format and the mountinfo
+        // derivation read none, and all four run nothing; the root includes
+        // each once.
         for (name, shared) in [
             (
                 "app_policy.rs",
@@ -319,6 +334,14 @@ mod confinement {
             (
                 "workload_accounts.rs",
                 include_str!("../../engine/src/workload_accounts.rs"),
+            ),
+            (
+                "workload_grants.rs",
+                include_str!("../../engine/src/workload_grants.rs"),
+            ),
+            (
+                "mount_identity.rs",
+                include_str!("../../engine/src/mount_identity.rs"),
             ),
         ] {
             for forbidden in ["unsafe", "Command", "std::process", "#[path", "include!"] {

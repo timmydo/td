@@ -57,12 +57,17 @@ Already built and reused by this design:
   application accounts from it and every application identity consumer
   reads it (td-authd/DESIGN.md, "Workload account ledger");
 - td-jail's mapping of an external uid to 1000 inside the jail;
-- root-made, value-pinned idmapped views of the human's files:
-  `prepare-portal-files` (Downloads, 1000→991, read-only) and
-  `prepare-application-files firefox` (Downloads, 1000→65536)
-  (td-authd/DESIGN.md; `UNSAFE.md` §16), the second of which td-jail
-  admits by comparing it with the identity it derives for the human's
-  directory from the mount covering the human's home;
+- the workload grant table `/var/lib/td/grants.tsv`, root's alone,
+  whose directory rows keyed by account td-authd publishes as idmapped
+  views at each application launch and lists in the account's manifest,
+  seeded once with Firefox's writable Downloads (td-authd/DESIGN.md,
+  "Workload grant table" and "Application filesystem grants";
+  `UNSAFE.md` §16); td-jail binds only the views a manifest lists, each
+  compared with the identity td-authd published it by, one derivation
+  (`engine/src/mount_identity.rs`) for both: the mount covering the
+  human's home, the home's path below it and the row's path;
+- the portal's fixed read-only Downloads view (1000→991), present while
+  Firefox holds the Downloads grant;
 - the signed Flathub runtime fetch and its generations, in the runtime
   store below, and the leases a launch holds on them (`APPLICATIONS.md`
   §W.9);
@@ -74,8 +79,9 @@ Already built and reused by this design:
   (`APPLICATIONS.md` §E).
 
 Not built: subordinate accounts, sandbox and workspace accounts and their
-allocation, the `map-subuid` operation `APPLICATIONS.md` names, and any
-grant other than the fixed Downloads views.
+allocation, the `map-subuid` operation `APPLICATIONS.md` names, the
+request path that adds and revokes grants, and socket and network grants,
+whose rows the table already parses.
 
 ## A launch
 
@@ -193,9 +199,16 @@ Everything a workload reaches outside its runtime and home is a grant:
 
 - **a directory** of the human's: a detached idmapped bind mount mapping
   filesystem uid/gid 1000 to the workload's account, read-only or
-  writable, nosuid, nodev, and noexec unless the grant says otherwise.
-  This generalizes `prepare-application-files firefox` from one fixed
-  application and directory to validated (account, directory, mode) rows;
+  writable, and always nosuid, nodev and noexec: there is no exec grant.
+  Rows are validated (account, directory, mode) triples. td's own trees
+  in the home (`.td` and every top-level `.td-*`, `.cache`, `.config`
+  whole, `.local/share`, `.local/state`), the sensitive trees td-agent
+  refuses a workspace (credentials, keyrings, profiles such as `.ssh`,
+  `.gnupg`, `.password-store`, `.mozilla`, `.var/app`) and where the
+  human's programs live (`bin`, `.local/bin`, `.cargo/bin`) are never
+  grantable, nor any ancestor of one; that is one list, the grant
+  format's, which td-agent reads. One account's directories do not nest,
+  and a path holds no control or bidirectional format character;
 - **a socket**: Wayland, the fetch service, and others named per grant;
 - **network**: `off` or `host`, as td-sandbox's policy has today.
 
@@ -203,7 +216,14 @@ The human requests a grant through the compositor control socket, as
 td-software's install requests arrive. A grant is not elevation: it
 delegates the human's own authority over the human's own files, so it
 needs the human's credentials, not secure attention. td-authd keeps the
-grant table root-owned and performs the mounts at launch. A workload
+grant table root-owned and readable by root alone, performs the mounts at
+launch below a root-owned tree outside every workload-writable home, and
+writes each account a manifest of its views that only it and root can
+read. The table's rows are root's alone, but a mounted view is visible
+in the host's mountinfo to any unjailed process. A revoked grant's view
+is released at the account's next launch, or at shutdown, whichever
+comes first; until then the root mount stays, and a running jail keeps
+what it was launched with. A workload
 cannot grant itself anything; when it needs a file it asks td-portal
 (FileChooser and its successors), whose dialog the human answers.
 
@@ -261,11 +281,27 @@ account.
    directory; an application the image ships keeps needing a carried
    row from the carried block, since nothing allocates at boot).
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
-   In three landings, the first landed: td-jail derives the identity a
+   In three landings, two landed. First, td-jail derives the identity a
    view of a human directory must show from the mount covering the
-   human's home and the directory's path below it, so nothing is mounted
+   human's home, the home's path below that mount and the directory's
+   path below the home, so nothing is mounted
    at a granted directory to mark it, and init no longer binds
    `Downloads` onto itself (`APPLICATIONS.md` §C, "Filesystem grants").
+   Second, the root-only grant table keyed by account, seeded once by
+   td-firstboot with Firefox's writable Downloads, and per-launch
+   publication: `application-start` publishes an application account's
+   views and manifest, td-jail binds what the manifest lists in place of
+   Firefox's fixed projection and its `xdg-download` permission, the boot
+   unit that prepared Firefox's view is gone, and shutdown releases every
+   view (td-authd/DESIGN.md, "Workload grant table"). td-authd publishes
+   and td-jail admits by one shared mountinfo derivation; one row whose
+   source is refused costs that row its view, not the launch; and td-agent
+   reads its refused trees from the grant format. With Firefox's row
+   revoked, FileChooser has no Downloads view. A rollback to the first
+   landing re-grants Firefox's Downloads by its own boot unit, whatever
+   the table says, and leaves the table and view tree unread. Third, the
+   request path through the compositor control socket that adds and
+   revokes rows, with a VM oracle that grants and revokes.
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is

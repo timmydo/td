@@ -1565,7 +1565,6 @@ const TD_SVC_UNITS: &[&str] = &[
     "fetchd",
     "egressd",
     "web-fetch",
-    "firefox-files",
     "fetch-evidence",
     "portal-files",
     "firefox-handoff",
@@ -2129,13 +2128,6 @@ fn build_desktop_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         [firefox-files]\n\
-         type=oneshot\n\
-         exec=/bin/td-authd prepare-application-files firefox\n\
-         after=td-firstboot\n\
-         requires=td-firstboot\n\
-         timeout=30\n\
-         \n\
          # Boot evidence under the autotest token only: the probe, as the UI\n\
          # user, asks the service for a loopback URL and gets the policy's exact\n\
          # refusal, which proves the socket, the framing and the policy without\n\
@@ -2150,7 +2142,8 @@ fn build_desktop_td_svc_conf() -> String {
          requires=fetchd\n\
          timeout={application_evidence}\n\
          \n\
-         # Root prepares one read-only mapped Downloads view for the portal.\n\
+         # Root prepares one read-only mapped Downloads view for the portal while\n\
+         # Firefox's account holds the grant of it; each Firefox launch repeats it.\n\
          [portal-files]\n\
          type=oneshot\n\
          exec=/bin/td-authd prepare-portal-files\n\
@@ -2485,8 +2478,8 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
-         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence\n\
-         requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
+         after=audio,busd,portal,wayland,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence\n\
+         requires=wayland,firefox-autotest,firefox-tls-origin,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=on-failure\n\
@@ -3109,7 +3102,7 @@ fn build_shutdown(sys: &SystemDef) -> String {
         "#!/bin/sh\n\
          ok=1\n\
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
-         /bin/td-authd release-application-files firefox || {{ echo 'td-shutdown: Firefox file release failed' >&2; ok=0; }}\n\
+         /bin/td-authd release-grant-views || {{ echo 'td-shutdown: grant view release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-handoff || {{ echo 'td-shutdown: portal handoff release failed' >&2; ok=0; }}\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
@@ -7992,7 +7985,7 @@ mod tests {
             .any(|byte| { matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60 }));
         assert_eq!(
             unit_key("firefox", "requires").as_deref(),
-            Some("wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot")
+            Some("wayland,firefox-autotest,firefox-tls-origin,td-firstboot")
         );
         let firefox_ready = unit_key("firefox", "ready").unwrap_or_default();
         assert_eq!(
@@ -8828,54 +8821,54 @@ mod tests {
         );
     }
 
+    /// The human's directories reach an application through the grant
+    /// table alone: no application declares one in its policy, no unit
+    /// prepares one, the launch publishes them, and shutdown releases them
+    /// all before /var goes.
     #[test]
-    fn human_grant_rosters_match_installed_permissions_and_lifecycle_units() {
-        let helper = include_str!("../../../td-authd/src/application_files.rs")
+    fn human_grants_are_published_per_launch_and_released_at_shutdown() {
+        let firefox = crate::catalog::lookup("firefox").unwrap();
+        let permissions = firefox.application_permissions.as_ref().unwrap();
+        let keyfile = permissions.to_keyfile();
+        assert!(
+            keyfile.lines().all(|line| !line.starts_with("xdg-")),
+            "{keyfile}"
+        );
+        assert!(keyfile.lines().any(|line| line == "~/Opened=ro"));
+        let launch = include_str!("../../../td-authd/src/application.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
+        let admitted = launch
+            .find("let uid = admit(&LAUNCH, request.owner, &request.name)?;")
+            .unwrap();
+        let published = launch
+            .find("crate::grant_views::publish(&request.name, uid)?;")
+            .unwrap();
+        let exec = launch.find(".exec();").unwrap();
+        assert!(admitted < published && published < exec);
+        let seed = include_str!("../../../engine/src/workload_grants.rs");
+        assert!(seed.contains("name: \"firefox\".into(),"));
+        assert!(seed.contains(
+            "access: Access::ReadWrite,\n                    path: \"Downloads\".into(),"
+        ));
+        let conf = build_td_svc_conf(&SYSTEM);
+        assert!(!conf.contains("application-files"));
+        assert!(!conf.contains("[firefox-files]"));
+        let shutdown = build_shutdown(&SYSTEM);
+        assert!(!shutdown.contains("application-files"));
+        let release = "/bin/td-authd release-grant-views || {";
+        assert_eq!(shutdown.matches(release).count(), 1);
+        assert!(shutdown.find(release) < shutdown.find("/bin/umount /var || {"));
+        // td-jail binds what the manifest lists, with no application named.
         let jail = include_str!("../../../td-jail/src/authority.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        let shutdown = build_shutdown(&SYSTEM);
-        for (app, variant, location, consumer) in
-            [("firefox", "FirefoxDownloads", "xdg-download", "firefox")]
-        {
-            let recipe = crate::catalog::lookup(app).unwrap();
-            let permissions = recipe.application_permissions.as_ref().unwrap();
-            assert!(
-                permissions
-                    .to_keyfile()
-                    .lines()
-                    .any(|line| line == format!("{location}=rw:create")),
-                "{app}"
-            );
-            assert!(
-                helper.contains(&format!("[name] if name == {app:?} => Ok(Self::{variant})")),
-                "{app}"
-            );
-            assert_eq!(
-                unit_key(&format!("{app}-files"), "exec"),
-                Some(format!("/bin/td-authd prepare-application-files {app}"))
-            );
-            assert!(unit_key(consumer, "requires")
-                .unwrap()
-                .split(',')
-                .any(|unit| unit == format!("{app}-files")));
-            assert!(shutdown.contains(&format!("/bin/td-authd release-application-files {app} ||")));
-        }
-        assert_eq!(helper.matches("=> Ok(Self::").count(), 1);
-        assert!(helper.contains("Self::FirefoxDownloads => \"Downloads\""));
-        let projection = jail
-            .split("let component = match ")
-            .nth(1)
-            .unwrap()
-            .split("};")
-            .next()
-            .unwrap();
-        assert!(projection.contains("Some(\"firefox\") => \"Downloads\""));
-        assert_eq!(projection.matches("Some(").count(), 1);
+        assert!(
+            jail.contains("views: granted_views(mountinfo, &state.real_home, &reserved_mounts)?,")
+        );
+        assert!(!jail.contains("Some(\"firefox\") => \"Downloads\""));
     }
 
     /// The stock compositor uses only the fixed root terminal authority.
@@ -8906,10 +8899,10 @@ mod tests {
         assert!(jail.contains("crate::primary_account::load()?"));
         assert!(jail.contains("fn human_source_identity("));
         assert!(jail.contains("&account.persistent_home(),"));
-        let application_grants = include_str!("../../../td-authd/src/application_files.rs");
-        assert!(application_grants.contains(
-            "portal_files::child(&homes, account.name(), crate::primary_account::UID, true)?"
-        ));
+        let application_grants = include_str!("../../../td-authd/src/grant_views.rs");
+        assert!(application_grants.contains("const HUMAN: u32 = primary_account::UID;"));
+        assert!(application_grants
+            .contains("portal_files::child(&homes, account.name(), HUMAN, true)?"));
         assert!(jail.contains(r#"PathBuf::from(format!("/run/user/{owner}"))"#));
         let probe = include_str!("../../../td-compositor/src/session.rs");
         assert!(probe.contains(&format!(
@@ -9876,7 +9869,6 @@ mod tests {
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
             ("egressd", vec!["seat", "netup"]),
-            ("firefox-files", vec!["td-firstboot"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal-files", vec!["td-firstboot"]),
             ("firefox-handoff", vec!["td-firstboot"]),
@@ -9919,7 +9911,6 @@ mod tests {
                     "busd",
                     "portal",
                     "wayland",
-                    "firefox-files",
                     "firefox-handoff",
                     "firefox-autotest",
                     "firefox-tls-origin",
@@ -10564,7 +10555,7 @@ mod tests {
         // a wedged broker names the instance it could not register.
         assert_eq!(
             unit_key("firefox", "requires").as_deref(),
-            Some("wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot"),
+            Some("wayland,firefox-autotest,firefox-tls-origin,td-firstboot"),
             "Firefox must not start without its compositor — and \
              its finite autotest preparation and verified origin — and must \
              not be made strictly dependent on a broker whose restart backoff \
@@ -13514,7 +13505,7 @@ mod tests {
         );
         assert_eq!(shutdown.matches(var_unmount).count(), 1);
         for release in [
-            "/bin/td-authd release-application-files firefox || {",
+            "/bin/td-authd release-grant-views || {",
             "/bin/td-authd release-portal-files || {",
             "/bin/td-authd release-portal-handoff || {",
         ] {

@@ -29,13 +29,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
         [
             "application.rs",
             "application_cache.rs",
-            "application_files.rs",
             "backoff.rs",
             "channel.rs",
             "consent.rs",
             "deployment.rs",
             "disk_install.rs",
             "elevation.rs",
+            "grant_views.rs",
             "handoff.rs",
             "inspection.rs",
             "launch.rs",
@@ -67,7 +67,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for (name, count) in [
         ("application.rs", 0),
         ("application_cache.rs", 0),
-        ("application_files.rs", 0),
+        ("grant_views.rs", 0),
         ("main.rs", 1),
         ("notebook.rs", 0),
         ("notebook_mail.rs", 0),
@@ -140,9 +140,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "stderr_tail.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
-            let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
-                && ["::Command", ".spawn("].contains(&forbidden);
-            if !child_api && !mapping_child_api {
+            let mapping_child_api =
+                name == "portal_files.rs" && ["::Command", ".spawn("].contains(&forbidden);
+            // The launch lock's bounded wait sleeps; pinned below.
+            let lock_wait = name == "grant_views.rs" && forbidden == "::thread";
+            if !child_api && !mapping_child_api && !lock_wait {
                 assert!(!source.contains(forbidden), "{name}: {forbidden}");
             }
         }
@@ -765,9 +767,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert!(!shared.contains(forbidden), "saved.rs: {forbidden}");
     }
-    // The application policy and the workload account ledger reader it
-    // joins, each one reviewed copy compiled at the crate root: they read
-    // two root-owned files and write, run and include nothing.
+    // The application policy, the workload account ledger reader it joins,
+    // the grant table's format and the mountinfo derivation, each one
+    // reviewed copy compiled at the crate root: they read two root-owned
+    // files, parse text and write, run and include nothing.
     let main = include_str!("../src/main.rs");
     for (attribute, module) in [
         (
@@ -777,6 +780,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
         (
             "#[path = \"../../engine/src/workload_accounts.rs\"]\n#[allow(dead_code, reason = \"the application policy reads the ledger\")]\nmod workload_accounts;\n",
             "mod workload_accounts;",
+        ),
+        (
+            "#[path = \"../../engine/src/workload_grants.rs\"]\n#[allow(dead_code, reason = \"firstboot seeds; td-jail reads manifests\")]\nmod workload_grants;\n",
+            "mod workload_grants;",
+        ),
+        (
+            "#[path = \"../../engine/src/mount_identity.rs\"]\n#[allow(dead_code, reason = \"td-jail derives more identities than views\")]\nmod mount_identity;\n",
+            "mod mount_identity;",
         ),
     ] {
         assert_eq!(main.matches(attribute).count(), 1, "{module}");
@@ -790,6 +801,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
         (
             "workload_accounts.rs",
             include_str!("../../engine/src/workload_accounts.rs"),
+        ),
+        (
+            "workload_grants.rs",
+            include_str!("../../engine/src/workload_grants.rs"),
+        ),
+        (
+            "mount_identity.rs",
+            include_str!("../../engine/src/mount_identity.rs"),
         ),
     ] {
         let production: String = shared
@@ -1056,7 +1075,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x55e36d8f0cda71d6,
+        0x7b46c47b8b2fb584,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1396,7 +1415,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let mounts = include_str!("../src/mount_sys.rs");
     assert_eq!(
         fingerprint(mounts),
-        0x5453b70c86c2349b,
+        0xc82ef8c319e2b10b,
         "fixed mount boundary changed"
     );
     for constant in [
@@ -1407,8 +1426,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "const CLONE_NEWUSER: usize = 0x1000_0000;",
         "const AT_EMPTY_PATH: usize = 0x1000;",
         "const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;",
-        "const PORTAL_ATTRIBUTES: u64 = 0x100000 | 1 | 2 | 4 | 8;",
-        "const APPLICATION_ATTRIBUTES: u64 = 0x100000 | 2 | 4 | 8;",
+        "const READ_ONLY_VIEW: u64 = 0x100000 | 1 | 2 | 4 | 8;",
+        "const WRITABLE_VIEW: u64 = 0x100000 | 2 | 4 | 8;",
         "const MOVE_FLAGS: usize = 4 | 0x40;",
     ] {
         assert!(mounts.contains(constant), "{constant}");
@@ -1419,17 +1438,22 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(mounts.matches("#[allow(unsafe_code)]").count(), 2);
     assert_eq!(mounts.matches("syscall5(").count(), 5);
     assert_eq!(mounts.matches("adopt(").count(), 2);
+    // The two attribute words are the only ones a view takes.
+    assert_eq!(mounts.matches("_VIEW: u64 = ").count(), 2);
+    assert_eq!(mounts.matches("set_attributes(").count(), 2);
     let files = include_str!("../src/portal_files.rs");
     assert_eq!(
         fingerprint(files),
-        0x0a84523165fc906c,
+        0x0a06a1b75210af46,
         "root portal grant controller changed"
     );
     assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
-    // The Downloads view and the Firefox handoff view, each its own fixed path.
-    assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 2);
-    assert!(files.contains(".arg(VIEW)"));
-    assert!(files.contains(".arg(HANDOFF_VIEW)"));
+    // One unmount, the fixed applet, for the portal's two fixed views, the
+    // Downloads view and the Firefox handoff view, and the grant views.
+    assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 1);
+    assert_eq!(files.matches(".arg(path)").count(), 1);
+    assert!(files.contains("grant_views::unmount_all(VIEW)"));
+    assert!(files.contains("unmount(HANDOFF_VIEW)?"));
     assert_eq!(files.matches(".spawn(").count(), 1);
     assert_eq!(
         files.matches("launch::require_launch_startup()?").count(),
@@ -1437,42 +1461,65 @@ fn the_production_source_and_raw_boundary_are_closed() {
     );
     assert_eq!(files.matches("mount_sys::new_user_namespace(").count(), 1);
     assert_eq!(files.matches("mount_sys::clone_directory(").count(), 2);
-    assert_eq!(files.matches("mount_sys::portal_attributes(").count(), 1);
-    // Only the handoff view is writable, and only Firefox's UID maps to it.
-    assert_eq!(
-        files.matches("mount_sys::application_attributes(").count(),
-        1
-    );
+    // The Downloads view is read-only; only the handoff view is writable,
+    // and only Firefox's UID maps to it.
+    assert_eq!(files.matches("mount_sys::view_attributes(").count(), 2);
+    assert_eq!(files.matches("ViewAccess::ReadOnly)").count(), 1);
+    assert_eq!(files.matches("ViewAccess::Writable)").count(), 1);
     assert_eq!(files.matches("namespace_mapping(uid, PORTAL)").count(), 1);
     assert_eq!(files.matches("admitted_uid(\"firefox\")").count(), 1);
     assert_eq!(files.matches("mount_sys::publish(").count(), 2);
-    let application_files = include_str!("../src/application_files.rs");
-    assert_eq!(fingerprint(application_files), 0x865a0468a9b2aae8);
+    // The Downloads view exists only while FileChooser's application holds
+    // the grant of it.
+    assert!(files.contains("pub(crate) const FILE_CHOOSER_APPLICATION: &str = \"firefox\";"));
+    assert!(files.contains("const FILE_CHOOSER_DIRECTORY: &str = \"Downloads\";"));
+    // Grant views: one clone, one attribute call selected by the row's
+    // access, one publication, one mapping per launch to the account's
+    // uid, release through the portal's one unmount, a lock waited for by
+    // sleeping to a deadline, and the manifest only ever replaced by a
+    // rename, never removed.
+    let views = include_str!("../src/grant_views.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
     assert_eq!(
-        application_files
-            .matches("mount_sys::clone_directory(")
-            .count(),
-        1
+        fingerprint(views),
+        GRANT_VIEWS_FINGERPRINT,
+        "root grant view publisher changed"
     );
-    assert_eq!(
-        application_files
-            .matches("mount_sys::application_attributes(")
-            .count(),
-        1
-    );
-    assert_eq!(application_files.matches("mount_sys::publish(").count(), 1);
-    assert_eq!(
-        application_files
-            .matches("application::admitted_uid(")
-            .count(),
-        2
-    );
-    assert_eq!(
-        application_files
-            .matches("Command::new(\"/bin/umount\")")
-            .count(),
-        1
-    );
+    for (call, count) in [
+        ("mount_sys::clone_directory(", 1),
+        ("mount_sys::view_attributes(", 1),
+        ("mount_sys::publish(", 1),
+        ("mount_sys::new_user_namespace(", 0),
+        ("portal_files::namespace_for(self.uid)", 1),
+        ("portal_files::unmount(", 1),
+        ("launch::require_launch_startup()?", 1),
+        ("Command", 0),
+        (".spawn(", 0),
+        (".exec(", 0),
+        ("namespace_mapping", 0),
+        ("::thread", 1),
+        ("std::thread::sleep(LOCK_POLL)", 1),
+        ("file.try_lock()", 1),
+        (".lock()", 1),
+        ("io::stderr().lock()", 1),
+        ("fs::rename(", 1),
+        ("remove_file(directory, STAGED_MANIFEST)?", 1),
+        ("grants::MANIFEST_NAME)", 1),
+        ("mount_identity::human_source_identity(", 1),
+    ] {
+        assert_eq!(views.matches(call).count(), count, "grant_views.rs: {call}");
+    }
+    assert!(views.contains("view_access(access)"));
+    assert!(views.contains("format!(\"{}/{}/{index}\", grants::VIEW_ROOT, self.uid)"));
+    // The portal's Downloads view: one lock for its two callers, and every
+    // mount at it released before one is published.
+    assert_eq!(files.matches("let _lock = lock_view(&var)?;").count(), 2);
+    assert!(files.contains(
+        "    release_view()?;\n    let target = ensure_root_child(&session, \"Downloads\")?;"
+    ));
+    assert!(files.contains("    grant_views::unmount_all(VIEW)\n"));
     let channel = include_str!("../src/channel.rs");
     assert_eq!(channel.matches("sys::prepare(").count(), 1);
     assert_eq!(channel.matches("sys::receive(").count(), 1);
@@ -1501,6 +1548,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
+const GRANT_VIEWS_FINGERPRINT: u64 = 0x1c5860247ab63412;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1515,7 +1563,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
-const MAIN_FINGERPRINT: u64 = 0xa25ebeeebfcacca8;
+const MAIN_FINGERPRINT: u64 = 0x4e6c0984e6ea93dd;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 

@@ -1114,12 +1114,13 @@ pub(crate) fn refuse_pseudo_filesystems(mountinfo: &str, source: &Path) -> io::R
 
 /// `outer` is `inner` or one of its ancestors in the same filesystem,
 /// however either is mounted: a bind of `/home` elsewhere contains the
-/// home as surely as `/home` does.
+/// home as surely as `/home` does. A root too irregular to compare, such
+/// as a removed one's `PATH//deleted`, may contain it.
 fn contains_by_identity(
     outer: &authority::MountIdentity,
     inner: &authority::MountIdentity,
 ) -> bool {
-    outer.device == inner.device && path_is_same_or_child(&inner.root, &outer.root)
+    outer.device == inner.device && authority::root_may_be_within(&inner.root, &outer.root)
 }
 
 /// Whether a directory's `mounts` alias a reserved tree: a reservation
@@ -1807,6 +1808,12 @@ mod tests {
         assert!(!contains_by_identity(&identity("0:6", "/@home"), &home));
         assert!(!contains_by_identity(
             &identity("0:5", "/@home/user"),
+            &home
+        ));
+        // A removed root, shown `PATH//deleted`, is not compared as a path:
+        // it may contain the home, so it refuses.
+        assert!(contains_by_identity(
+            &identity("0:5", "/@home/u/src//deleted"),
             &home
         ));
     }

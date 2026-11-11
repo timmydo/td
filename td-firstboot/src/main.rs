@@ -101,6 +101,13 @@ mod tpm;
     reason = "the ledger's readers share the file; firstboot uses its seed and reader"
 )]
 mod workload_accounts;
+// The workload grant table: principal_store seeds it once.
+#[path = "../../engine/src/workload_grants.rs"]
+#[allow(
+    dead_code,
+    reason = "td-authd publishes from the table and td-jail reads manifests; firstboot seeds it"
+)]
+mod workload_grants;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};

@@ -1,4 +1,5 @@
-//! Fixed Linux x86-64 operations for portal and application file grants.
+//! Fixed Linux x86-64 operations for the portal's views and workload grant
+//! views.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -10,8 +11,8 @@ const SYS_MOUNT_SETATTR: usize = 442;
 const CLONE_NEWUSER: usize = 0x1000_0000;
 const AT_EMPTY_PATH: usize = 0x1000;
 const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;
-const PORTAL_ATTRIBUTES: u64 = 0x100000 | 1 | 2 | 4 | 8;
-const APPLICATION_ATTRIBUTES: u64 = 0x100000 | 2 | 4 | 8;
+const READ_ONLY_VIEW: u64 = 0x100000 | 1 | 2 | 4 | 8;
+const WRITABLE_VIEW: u64 = 0x100000 | 2 | 4 | 8;
 const MOVE_FLAGS: usize = 4 | 0x40;
 
 #[repr(C)]
@@ -83,18 +84,29 @@ pub(crate) fn clone_directory(source: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(adopt(fd))
 }
 
-pub(crate) fn portal_attributes(
-    mount: BorrowedFd<'_>,
-    namespace: BorrowedFd<'_>,
-) -> io::Result<()> {
-    set_attributes(mount, namespace, PORTAL_ATTRIBUTES)
+/// The two fixed attribute sets an idmapped view takes: both nosuid, nodev
+/// and noexec, one also read-only. No caller supplies a flags word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewAccess {
+    ReadOnly,
+    Writable,
 }
 
-pub(crate) fn application_attributes(
+impl ViewAccess {
+    pub(crate) fn attributes(self) -> u64 {
+        match self {
+            Self::ReadOnly => READ_ONLY_VIEW,
+            Self::Writable => WRITABLE_VIEW,
+        }
+    }
+}
+
+pub(crate) fn view_attributes(
     mount: BorrowedFd<'_>,
     namespace: BorrowedFd<'_>,
+    access: ViewAccess,
 ) -> io::Result<()> {
-    set_attributes(mount, namespace, APPLICATION_ATTRIBUTES)
+    set_attributes(mount, namespace, access.attributes())
 }
 
 fn set_attributes(mount: BorrowedFd<'_>, namespace: BorrowedFd<'_>, set: u64) -> io::Result<()> {

@@ -91,6 +91,13 @@ pub mod target_profile;
 // `#[path]`-includes to seed it and td-login and the bus policy's includers
 // to read it; td-builder and td-recipe-eval do not use it.
 pub mod workload_accounts;
+// `workload_grants` is the workload grant table and the per-account view
+// manifest: td-firstboot seeds the table, td-authd publishes from it and
+// td-jail admits what the manifest lists, each `#[path]`-including it.
+pub mod workload_grants;
+// `mount_identity` derives mount identities from mountinfo text: td-jail
+// admits mounts by it and td-authd publishes grant views by it.
+pub mod mount_identity;
 pub mod xz;
 
 #[cfg(test)]

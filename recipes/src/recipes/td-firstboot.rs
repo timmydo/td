@@ -51,6 +51,11 @@ const MODULES: &[(&str, &str)] = &[
         "workload_accounts",
         include_str!("../../../engine/src/workload_accounts.rs"),
     ),
+    // The workload grant table principal_store seeds.
+    (
+        "workload_grants",
+        include_str!("../../../engine/src/workload_grants.rs"),
+    ),
     // The Flathub declarations, the applications an install allocates for.
     (
         "flathub_app",
@@ -191,6 +196,7 @@ pub fn recipe() -> Recipe {
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),
                 "encoding" => "{src}/td-encoding/src/lib.rs".into(),
                 "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
+                "workload_grants" => "{src}/engine/src/workload_grants.rs".into(),
                 "flathub_app" => "{src}/engine/src/flathub_app.rs".into(),
                 _ => format!("{{src}}/td-firstboot/src/{name}.rs"),
             },
@@ -377,7 +383,7 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "{src}/principal-tests.rs".into(),
-        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"engine/src/workload_accounts.rs\"] mod workload_accounts;\n#[path = \"engine/src/flathub_app.rs\"] mod flathub_app;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
+        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"engine/src/workload_accounts.rs\"] mod workload_accounts;\n#[path = \"engine/src/workload_grants.rs\"] mod workload_grants;\n#[path = \"engine/src/flathub_app.rs\"] mod flathub_app;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
         exec: false,
     });
     steps.push(

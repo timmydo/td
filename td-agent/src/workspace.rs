@@ -661,51 +661,10 @@ pub struct Places {
     pub locals: Vec<PathBuf>,
 }
 
-/// Below the home: credentials, keyrings, browser and mail profiles,
-/// sandboxed applications' data.
-const SENSITIVE: &[&str] = &[
-    ".aws",
-    ".azure",
-    ".cargo/credentials",
-    ".cargo/credentials.toml",
-    ".docker",
-    ".git-credentials",
-    ".gnupg",
-    ".kube",
-    ".librewolf",
-    ".mozilla",
-    ".netrc",
-    ".npmrc",
-    ".password-store",
-    ".pypirc",
-    ".ssh",
-    ".thunderbird",
-    ".var/app",
-    "snap",
-];
-/// Below each configuration home: credentials, browser profiles, and what
-/// the session starts or git runs on the human's behalf.
-const CONFIG_SENSITIVE: &[&str] = &[
-    "BraveSoftware",
-    "autostart",
-    "chromium",
-    "environment.d",
-    "gcloud",
-    "gh",
-    "git",
-    "google-chrome",
-    "microsoft-edge",
-    "opera",
-    "systemd",
-    "td-agent",
-    "vivaldi",
-];
-/// Below each data home: keyrings, td-pass's vault, desktop entries,
-/// and td-agent's own stores and workspace repositories.
-const DATA_SENSITIVE: &[&str] = &["applications", "keyrings", "td-agent", "td-pass"];
-/// Below the home: where the human's own programs are put, refused to a
-/// tree the model can write, as `PATH`'s directories are.
-const EXECUTED: &[&str] = &[".cargo/bin", ".local/bin", "bin"];
+// What a workspace may not reach is the list no workload grant may name
+// either: one copy, the grant table's (td-authd/DESIGN.md, "Workload grant
+// table").
+use crate::workload_grants::{CONFIG_SENSITIVE, DATA_SENSITIVE, EXECUTED, HOME_SENSITIVE};
 
 impl Places {
     /// From the environment, with td-agent's state at `state`, the
@@ -793,7 +752,7 @@ impl Places {
                 .map(|name| (credentials.to_string(), resolved(&base.join(name)), false))
                 .collect()
         };
-        places.extend(below(&self.home, SENSITIVE));
+        places.extend(below(&self.home, HOME_SENSITIVE));
         for config in &self.config_homes {
             places.extend(below(config, CONFIG_SENSITIVE));
         }

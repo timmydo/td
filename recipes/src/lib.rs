@@ -12,8 +12,19 @@
 #[allow(dead_code)]
 mod app_policy;
 // The workload account ledger, by the name the shared application policy
-// reads it under.
+// reads it under, and the grant table td-jail's authority admits views by.
+#[cfg(test)]
+use td_engine::mount_identity;
 use td_engine::workload_accounts;
+#[cfg(test)]
+use td_engine::workload_grants;
+/// td-jail's one-write stderr line, which its authority reports a skipped
+/// grant view through; td-jail's main defines it for the shipped binary.
+#[cfg(test)]
+fn write_stderr_line(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    std::io::stderr().write_all(format!("{text}\n").as_bytes())
+}
 pub mod application;
 pub mod catalog;
 #[cfg(test)]

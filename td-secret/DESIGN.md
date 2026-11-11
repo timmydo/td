@@ -1111,10 +1111,10 @@ source-built test applications run through the production td-jail entry,
 with immutable mail/news UID assignments, real cgroup delegation, namespace
 and seccomp confinement, and completed broker registration. Disposable
 package and account files are prepared by the guest controller. A disposable
-tmpfs backs /var; the production prepare-application-files command supplies
-mail's required idmapped Downloads view and its matching release removes it
-after the applications stop. This does not exercise image composition or
-the root application-start launcher.
+tmpfs backs /var. The applications hold no grant of the human's files and
+start through td-jail directly, so no grant view is published for them.
+This does not exercise image composition or the root application-start
+launcher.
 Both applications deliberately carry FLATPAK_ID=mail. Each test entry invokes
 the production td-secret get client and checks its captured stdout against
 exact credential fixture bytes. The client also completes its normal D-Bus

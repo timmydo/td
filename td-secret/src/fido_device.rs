@@ -1267,27 +1267,13 @@ pub(crate) mod vm_tests {
                 std::os::unix::fs::symlink("/bin/td-jail", format!("/bin/{app}")).unwrap();
                 registry.push_str(&format!("{app}\t{package}\n"));
             }
+            // The fixture's applications hold no grant and start their jails
+            // directly, so no grant view is published for them.
             fs::write("/etc/td-applications.tsv", registry).unwrap();
-            std::os::unix::fs::symlink("/bin/td-init", "/bin/umount").unwrap();
-            application_files("prepare-application-files");
             if !reopen {
                 let store = crate::owned_store(1000).unwrap();
                 store.set("mail", "private", b"mail-only fixture").unwrap();
             }
-        }
-
-        fn application_files(operation: &str) {
-            let output = Command::new("/bin/td-authd")
-                .args([operation, "mail"])
-                .env_clear()
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
         }
 
         struct Portal {
@@ -2000,7 +1986,6 @@ pub(crate) mod vm_tests {
             mail.finish();
             news.finish();
             portal.finish();
-            application_files("release-application-files");
             assert_eq!(hid.finish(), (9, 0));
             if persistent {
                 fs::write(
@@ -2212,7 +2197,6 @@ pub(crate) mod vm_tests {
             mail.finish();
             news.finish();
             portal.finish();
-            application_files("release-application-files");
             assert_eq!(hid.finish(), (2, 0));
             assert_eq!(sealed_bytes(), before, "cold unlock rewrote the store");
             applet(&["umount", "/var"]);

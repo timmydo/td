@@ -137,3 +137,12 @@ pub mod window;
 pub mod window_wire;
 pub mod wire;
 pub mod workspace;
+// The grant table's format, for the sensitive trees of the home it and
+// td-agent's workspace admission share, and the ledger's account kinds it
+// keys rows by.
+#[allow(dead_code, reason = "td-agent reads only the shared sensitive lists")]
+#[path = "../../engine/src/workload_accounts.rs"]
+mod workload_accounts;
+#[allow(dead_code, reason = "td-agent reads only the shared sensitive lists")]
+#[path = "../../engine/src/workload_grants.rs"]
+mod workload_grants;

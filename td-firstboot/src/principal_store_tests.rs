@@ -412,6 +412,162 @@ fn boot_enrollment_seeds_a_public_account_ledger_idempotently() {
     temp.cleanup().unwrap();
 }
 
+const GRANTS_SEED: &str = "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\n";
+
+fn grant_table(directory: &Directory) -> Option<String> {
+    directory
+        .read_as(workload_grants::FILE_NAME, GRANTS_MODE, GRANTS_LIMIT)
+        .unwrap()
+}
+
+/// The first boot seeds Firefox's `Downloads` grant, private to root, and
+/// no later boot rewrites the table.
+#[test]
+fn boot_enrollment_seeds_a_private_grant_table_once() {
+    let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
+    let directory = account_directory(&temp);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+    let path = directory.path(workload_grants::FILE_NAME);
+    let before = fs::metadata(&path).unwrap();
+    assert_eq!(before.mode() & 0o7777, 0o600);
+    assert_eq!(before.nlink(), 1);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (before.ino(), before.mtime(), before.mtime_nsec())
+    );
+    assert!(!directory.path(GRANTS_STAGED).exists());
+    temp.cleanup().unwrap();
+}
+
+/// A present table is only validated: a revoked seed row is not seeded
+/// again, and rows a later deployment wrote are kept.
+#[test]
+fn a_present_grant_table_is_never_reseeded_or_rewritten() {
+    for text in [
+        "td-grants-v1\n",
+        "td-grants-v1\napplication\tfirefox\tdirectory\tro\tDocuments\n",
+        "td-grants-v1\napplication\tmail\tdirectory\trw\tDownloads\nsandbox\tdefault\tnetwork\toff\nworkspace\tagent-1\tsocket\twayland\n",
+    ] {
+        let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
+        let directory = account_directory(&temp);
+        public_file(&directory.path(workload_grants::FILE_NAME), text, 0o600);
+        directory
+            .enroll_checked(&app("mail", 65537), |_| Ok(()))
+            .unwrap();
+        assert_eq!(grant_table(&directory).as_deref(), Some(text));
+        // The rest of the boot's enrollment went ahead.
+        assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+        temp.cleanup().unwrap();
+    }
+}
+
+/// A malformed table, or one of another mode, owner, link or size, refuses
+/// the boot, publishes nothing and is never reset.
+#[test]
+fn a_malformed_or_misshapen_grant_table_refuses_and_is_kept() {
+    use std::os::unix::fs::symlink;
+    let oversized = format!("{GRANTS_SEED}{}", "x".repeat(workload_grants::MAX_BYTES));
+    for case in [
+        "malformed",
+        "overlapping",
+        "reserved",
+        "public",
+        "group-readable",
+        "symlink",
+        "hardlink",
+        "oversized",
+    ] {
+        let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
+        let directory = account_directory(&temp);
+        let path = directory.path(workload_grants::FILE_NAME);
+        let target = directory.path("unrelated");
+        let overlapping = "td-grants-v1\napplication\tfirefox\tdirectory\tro\tDownloads\napplication\tfirefox\tdirectory\trw\tDownloads/a\n";
+        let (text, mode) = match case {
+            "malformed" => ("td-grants-v1\nbroken\n", 0o600),
+            "overlapping" => (overlapping, 0o600),
+            "reserved" => (
+                "td-grants-v1\napplication\tfirefox\tdirectory\trw\t.ssh\n",
+                0o600,
+            ),
+            "public" => (GRANTS_SEED, 0o644),
+            "group-readable" => (GRANTS_SEED, 0o640),
+            "oversized" => (oversized.as_str(), 0o600),
+            _ => (GRANTS_SEED, 0o600),
+        };
+        public_file(&target, text, mode);
+        match case {
+            "symlink" => symlink("unrelated", &path).unwrap(),
+            "hardlink" => fs::hard_link(&target, &path).unwrap(),
+            _ => fs::rename(&target, &path).unwrap(),
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(
+            directory
+                .enroll_checked(&app("mail", 65537), |_| Ok(()))
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "{case}");
+        unchanged(
+            &directory,
+            &[
+                (LEDGER, None),
+                (NOTEBOOK_LEDGER, None),
+                (workload_accounts::FILE_NAME, None),
+            ],
+        );
+        temp.cleanup().unwrap();
+    }
+    // A directory pinned for another owner refuses this owner's table, as
+    // `/var/lib/td`'s refuses any but root's.
+    let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
+    let directory = account_directory(&temp);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    for (uid, gid) in [
+        (directory.uid.wrapping_add(1), directory.gid),
+        (directory.uid, directory.gid.wrapping_add(1)),
+    ] {
+        let foreign = Directory {
+            file: directory.file.try_clone().unwrap(),
+            uid,
+            gid,
+        };
+        assert!(foreign.seeded_grants().is_err());
+    }
+    temp.cleanup().unwrap();
+}
+
+#[test]
+fn interrupted_grant_staging_is_removed_but_other_writers_are_refused() {
+    let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
+    let directory = account_directory(&temp);
+    let staged = directory.path(GRANTS_STAGED);
+    for mode in [0o600, 0o000] {
+        public_file(&staged, "td-gra", mode);
+        directory
+            .enroll_checked(&app("mail", 65537), |_| Ok(()))
+            .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
+        fs::remove_file(directory.path(workload_grants::FILE_NAME)).unwrap();
+    }
+    public_file(&staged, "td-gra", 0o640);
+    assert!(directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .is_err());
+    assert!(staged.exists());
+    temp.cleanup().unwrap();
+}
+
 #[test]
 fn a_removed_applications_reservation_keeps_its_account_row() {
     let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
@@ -472,10 +628,15 @@ fn unchanged(directory: &Directory, before: &[(&str, Option<Vec<u8>>)]) {
 }
 
 fn snapshot(directory: &Directory) -> Vec<(&'static str, Option<Vec<u8>>)> {
-    [LEDGER, NOTEBOOK_LEDGER, workload_accounts::FILE_NAME]
-        .into_iter()
-        .map(|name| (name, fs::read(directory.path(name)).ok()))
-        .collect()
+    [
+        LEDGER,
+        NOTEBOOK_LEDGER,
+        workload_accounts::FILE_NAME,
+        workload_grants::FILE_NAME,
+    ]
+    .into_iter()
+    .map(|name| (name, fs::read(directory.path(name)).ok()))
+    .collect()
 }
 
 #[test]

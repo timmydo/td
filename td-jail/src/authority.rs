@@ -8,9 +8,14 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+// The mountinfo derivation td-authd publishes views by, one shared file.
+pub(crate) use crate::mount_identity::{
+    decode_mountinfo_path, mount_identity_for_path, MountIdentity,
+};
 
 pub(crate) const CONFIG_PATH: &str = "/etc/td-app.conf";
 const REGISTRY_PATH: &str = "/etc/td-applications.tsv";
@@ -1709,6 +1714,47 @@ where
             mount_identities,
         ));
     }
+    // The account's published views join the policy's grants. A view
+    // meeting one of the application's own grants by source, target or
+    // mount identity is left out, said so, and the launch goes on with the
+    // policy's grant; two views meeting each other, which td-authd never
+    // publishes, refuse.
+    let overlap = |left: (&FilesystemGrant, &BTreeSet<MountIdentity>),
+                   right: (&FilesystemGrant, &BTreeSet<MountIdentity>)| {
+        paths_overlap(&left.0.source, &right.0.source)
+            || paths_overlap(&left.0.target, &right.0.target)
+            || mount_identity_sets_overlap(left.1, right.1)
+    };
+    let mut views: Vec<(FilesystemGrant, BTreeSet<MountIdentity>)> = Vec::new();
+    for view in &post_boundary.views {
+        let candidate = (&view.grant, &view.identities);
+        if realized
+            .iter()
+            .any(|(grant, mounts)| overlap((grant, mounts), candidate))
+        {
+            skip_view(
+                &view.grant.target,
+                "it overlaps the application's own filesystem grant",
+            );
+            continue;
+        }
+        if views
+            .iter()
+            .any(|(grant, mounts)| overlap((grant, mounts), candidate))
+        {
+            return Err(invalid(format!(
+                "granted view at {} overlaps another granted view",
+                view.grant.target.display()
+            )));
+        }
+        views.push((view.grant.clone(), view.identities.clone()));
+    }
+    realized.extend(views);
+    if realized.len() > MAX_FILESYSTEM_ENTRIES {
+        return Err(invalid(format!(
+            "an application launch exceeds {MAX_FILESYSTEM_ENTRIES} filesystem grants"
+        )));
+    }
     let mut grants = realized
         .into_iter()
         .map(|(grant, _)| grant)
@@ -1917,7 +1963,7 @@ struct GrantBoundary {
     allowed_home_mount: MountIdentity,
     allowed_home_mounts: BTreeSet<MountIdentity>,
     other_home_mounts: BTreeSet<MountIdentity>,
-    human_projection: Option<(PathBuf, MountIdentity)>,
+    views: Vec<AdmittedView>,
 }
 
 fn private_application_home(home: &Path) -> bool {
@@ -1933,23 +1979,101 @@ fn private_application_home(home: &Path) -> bool {
         && home.as_os_str() == std::ffi::OsStr::new(&format!("/var/lib/td/applications/{uid}"))
 }
 
-// Only the root-prepared, identity-mapped view of one declared human
-// directory may cross the separate-home reservation.
-fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf, MountIdentity)>> {
+/// A view td-authd published of one of the human's directories for this
+/// launch, as its account's manifest lists it, and the identities of the
+/// mounts at and below it.
+#[derive(Clone, Debug)]
+struct AdmittedView {
+    grant: FilesystemGrant,
+    identities: BTreeSet<MountIdentity>,
+}
+
+/// The views the account whose private home is `home` binds: those its
+/// manifest (td-authd/DESIGN.md, "Application filesystem grants") lists,
+/// each bound at `/home/td/PATH` once it shows the human's `PATH`. Only a
+/// root-prepared, identity-mapped view crosses the separate-home
+/// reservation, and only one the manifest names. Another home, or an
+/// account with no manifest, has none.
+fn granted_views(
+    mountinfo: &str,
+    home: &Path,
+    reserved: &BTreeSet<MountIdentity>,
+) -> io::Result<Vec<AdmittedView>> {
     if !private_application_home(home) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let uid = home
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.parse::<u32>().ok())
         .ok_or_else(|| invalid("invalid private application home"))?;
-    let policy = crate::app_policy::load().map_err(invalid)?;
-    let component = match policy.for_uid(uid).map(|rule| rule.application).as_deref() {
-        Some("firefox") => "Downloads",
-        _ => return Ok(None),
+    let Some(manifest) = read_view_manifest(uid)? else {
+        return Ok(Vec::new());
     };
-    let view = home.join(component);
+    let account = crate::primary_account::load()?;
+    let directory = Path::new(crate::workload_grants::VIEW_ROOT).join(uid.to_string());
+    let mut views = Vec::new();
+    for entry in manifest.views() {
+        let view = directory.join(entry.index.to_string());
+        // A target the jail keeps for itself is the table's and td-jail's
+        // disagreement, not the launch's: the view is left out and said so.
+        let target = Path::new("/home/td").join(&entry.path);
+        if let Err(error) =
+            validate_filesystem_target(&target).and_then(|()| require_grant_target(&target))
+        {
+            skip_view(&target, &error.to_string());
+            continue;
+        }
+        let identities = admit_view(mountinfo, &view, entry, &account, reserved)?;
+        let metadata = fs::symlink_metadata(&view)?;
+        if !metadata.file_type().is_dir() || metadata.uid() != uid || metadata.gid() != uid {
+            return Err(invalid(format!(
+                "grant view {} does not show the human's directory as this account's",
+                view.display()
+            )));
+        }
+        views.push(AdmittedView {
+            grant: FilesystemGrant {
+                source: view,
+                target: Path::new("/home/td").join(&entry.path),
+                read_only: entry.access == crate::workload_grants::Access::ReadOnly,
+                source_kind: FilesystemSourceKind::Directory,
+                source_device: metadata.dev(),
+                source_inode: metadata.ino(),
+            },
+            identities,
+        });
+    }
+    Ok(views)
+}
+
+/// One line saying a listed view is left out of this launch and why.
+fn skip_view(target: &Path, why: &str) {
+    let _ = crate::write_stderr_line(&format!(
+        "td-jail: grant view at {} left out: {why}",
+        target.display()
+    ));
+}
+
+/// The view at `view` when it is what `entry` lists: one mount exactly
+/// there, carrying the entry's access with nosuid, nodev, noexec and its
+/// idmap, whose identity is the human's `entry.path` as the mount covering
+/// the home derives it and which holds no mount outside that directory or
+/// aliasing a reserved one. The identities of the mounts at and below it.
+fn admit_view(
+    mountinfo: &str,
+    view: &Path,
+    entry: &crate::workload_grants::View,
+    account: &crate::primary_account::PrimaryAccount,
+    reserved: &BTreeSet<MountIdentity>,
+) -> io::Result<BTreeSet<MountIdentity>> {
+    let required = [
+        entry.access.as_str(),
+        "nosuid",
+        "nodev",
+        "noexec",
+        "idmapped",
+    ];
     let mut found = false;
     for line in mountinfo.lines() {
         let left = line
@@ -1959,30 +2083,133 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
         let fields = left.split_whitespace().collect::<Vec<_>>();
         let path =
             decode_mountinfo_path(fields.get(4).ok_or_else(|| invalid("missing mountpoint"))?)?;
-        if path != view {
+        if path.as_os_str().as_bytes() != view.as_os_str().as_bytes() {
             continue;
         }
         let options = fields
             .get(5)
             .ok_or_else(|| invalid("missing mount options"))?;
         if found
-            || !["rw", "nosuid", "nodev", "noexec"]
+            || !required
                 .iter()
                 .all(|required| options.split(',').any(|option| option == *required))
         {
-            return Err(invalid(
-                "declared human projection is stacked or lacks mount restrictions",
-            ));
+            return Err(invalid(format!(
+                "grant view {} is stacked or lacks its access or mount restrictions",
+                view.display()
+            )));
         }
         found = true;
     }
     if !found {
-        return Err(invalid("declared human projection has not been prepared"));
+        return Err(invalid(format!(
+            "grant view {} has not been published",
+            view.display()
+        )));
     }
-    require_owned_directory(&view, (uid, uid), true)?;
-    let account = crate::primary_account::load()?;
-    let identity = projection_identity(mountinfo, &view, &account, Path::new(component))?;
-    Ok(Some((view, identity)))
+    let identity = projection_identity(mountinfo, view, account, Path::new(&entry.path))?;
+    let identities = mount_tree_identities(mountinfo, view)?;
+    require_projection_mounts(&identities, &identity, reserved)?;
+    Ok(identities)
+}
+
+/// The manifest td-authd wrote for `uid`'s launch, read through
+/// root-owned directories without following links: `/var/lib/td`, its
+/// `grant-views`, the account's directory there (root, the account's
+/// group, mode 0710) and the manifest in it (root, the account's group,
+/// mode 0640, one link, bounded). None when any of the last three is
+/// absent: nothing was published for the account.
+fn read_view_manifest(uid: u32) -> io::Result<Option<crate::workload_grants::Manifest>> {
+    read_view_manifest_at(
+        Path::new("/var/lib/td"),
+        uid,
+        ((0, 0), uid),
+        crate::workload_grants::VIEWS_MODE,
+    )
+}
+
+/// Linux x86-64's `O_PATH`: a descriptor that names a file without opening
+/// it for reading, which needs only search permission on the way.
+const O_PATH: i32 = 0o10_000_000;
+
+/// `read_view_manifest` below `state`, its directories of owner and group
+/// `owners.0`, the account's directory and manifest of group `owners.1`,
+/// that directory at exactly `views_mode`. td-jail runs
+/// as the account, which may search its view directory but not list it:
+/// every directory is held as an `O_PATH` descriptor, checked by its
+/// metadata, and only the manifest is opened for reading, through it.
+fn read_view_manifest_at(
+    state: &Path,
+    uid: u32,
+    owners: ((u32, u32), u32),
+    views_mode: u32,
+) -> io::Result<Option<crate::workload_grants::Manifest>> {
+    let ((owner, group), account_group) = owners;
+    use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+    use crate::workload_grants as grants;
+    use std::os::fd::AsRawFd;
+    let open = |path: &Path, flags: i32| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | flags)
+            .open(path)
+    };
+    let directory = |path: &Path| open(path, O_PATH | O_DIRECTORY);
+    let pinned = |parent: &File, name: &str| {
+        PathBuf::from(format!("/proc/self/fd/{}/{name}", parent.as_raw_fd()))
+    };
+    let root_controlled = |file: &File, gid: u32, mode: Option<u32>| -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_dir()
+            || metadata.uid() != owner
+            || metadata.gid() != gid
+            || metadata.mode() & 0o022 != 0
+            || mode.is_some_and(|mode| metadata.mode() & 0o7777 != mode)
+        {
+            return Err(invalid("grant view directories are not root-controlled"));
+        }
+        Ok(())
+    };
+    let absent = |result: io::Result<File>| match result {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    let state = directory(state)?;
+    root_controlled(&state, group, None)?;
+    let Some(root) = absent(directory(&pinned(&state, grants::VIEW_ROOT_NAME)))? else {
+        return Ok(None);
+    };
+    root_controlled(&root, group, None)?;
+    let Some(account) = absent(directory(&pinned(&root, &uid.to_string())))? else {
+        return Ok(None);
+    };
+    root_controlled(&account, account_group, Some(views_mode))?;
+    let Some(file) = absent(open(&pinned(&account, grants::MANIFEST_NAME), O_NONBLOCK))? else {
+        return Ok(None);
+    };
+    require_manifest_shape(&file.metadata()?, (owner, account_group))?;
+    let mut text = String::new();
+    file.take(grants::MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_string(&mut text)?;
+    grants::Manifest::parse(&text).map(Some).map_err(invalid)
+}
+
+/// A manifest td-authd wrote for the account: a single-link regular file
+/// of `owner` (root and the account's group), exactly mode 0640 so no other
+/// account reads which views this one holds, within its bound.
+fn require_manifest_shape(metadata: &fs::Metadata, owner: (u32, u32)) -> io::Result<()> {
+    if !metadata.is_file()
+        || (metadata.uid(), metadata.gid()) != owner
+        || metadata.mode() & 0o7777 != crate::workload_grants::MANIFEST_MODE
+        || metadata.nlink() != 1
+        || metadata.len() > crate::workload_grants::MAX_MANIFEST_BYTES as u64
+    {
+        return Err(invalid(
+            "the grant view manifest is not one bounded root-written file for this account",
+        ));
+    }
+    Ok(())
 }
 
 /// The view's identity, when it is that of the human's `relative`
@@ -2015,58 +2242,16 @@ fn projection_identity(
     Ok(identity)
 }
 
-/// What a view of the human's `relative` directory must show: the device
-/// and root of the mount covering `home` (the topmost mount at the home or,
-/// failing one, at its nearest ancestor), joined with `relative`. Mounts
-/// below the home, between it and the directory or at the directory, do
-/// not count, so a view cloned from one stacked over the directory or an
-/// intermediate directory, or from a sibling, an ancestor, a reserved tree
-/// or another device, shows something else, and no mount need mark the
-/// directory for its view to be admitted.
+/// What a view of the human's `relative` directory must show, by the one
+/// derivation td-authd publishes by (`mount_identity::human_source_identity`),
+/// once the table's validator admits `relative`.
 fn human_source_identity(
     mountinfo: &str,
     home: &Path,
     relative: &Path,
 ) -> io::Result<MountIdentity> {
-    validate_human_relative(relative.as_os_str().as_bytes()).map_err(invalid)?;
-    let mut identity = mount_identity_for_path(mountinfo, home)?;
-    identity.root.push(relative);
-    Ok(identity)
-}
-
-const MAX_HUMAN_RELATIVE_BYTES: usize = 1024;
-const MAX_HUMAN_RELATIVE_DEPTH: usize = 16;
-const MAX_PATH_NAME_BYTES: usize = 255;
-
-/// A human directory's path below the home, as spelled: one to
-/// `MAX_HUMAN_RELATIVE_DEPTH` names joined by single `/`, none empty, `.`
-/// or `..`, holding NUL or longer than a filesystem name may be. It reads
-/// bytes, not `Path` components, which normalise `a//b`, `a/./b` and a
-/// trailing `/` away, and depends on nothing in td-jail.
-fn validate_human_relative(relative: &[u8]) -> Result<(), String> {
-    let refuse = |why: &str| {
-        Err(format!(
-            "human directory {:?} {why}",
-            String::from_utf8_lossy(relative)
-        ))
-    };
-    if relative.is_empty() || relative.len() > MAX_HUMAN_RELATIVE_BYTES {
-        return refuse("is empty or too long");
-    }
-    let mut depth = 0_usize;
-    for name in relative.split(|byte| *byte == b'/') {
-        depth = depth.saturating_add(1);
-        if name.is_empty() || name == b"." || name == b".." {
-            return refuse("is not a plain path below the home");
-        }
-        if name.contains(&0) || name.len() > MAX_PATH_NAME_BYTES {
-            return refuse("holds an invalid name");
-        }
-    }
-    if depth > MAX_HUMAN_RELATIVE_DEPTH {
-        return refuse("is too deep");
-    }
-    Ok(())
+    crate::workload_grants::validate_path(relative.as_os_str().as_bytes()).map_err(invalid)?;
+    crate::mount_identity::human_source_identity(mountinfo, home, relative)
 }
 
 fn require_projection_mounts(
@@ -2075,16 +2260,14 @@ fn require_projection_mounts(
     reserved: &BTreeSet<MountIdentity>,
 ) -> io::Result<()> {
     for identity in source {
-        if identity.device != projection.device
-            || !path_is_same_or_child(&identity.root, &projection.root)
-        {
+        if identity.device != projection.device || !root_within(&identity.root, &projection.root) {
             return Err(invalid("human projection contains an undeclared mount"));
         }
         for protected in reserved {
             if mount_identities_overlap(identity, protected)
                 && !(protected.device == projection.device
-                    && protected.root != projection.root
-                    && path_is_same_or_child(&projection.root, &protected.root))
+                    && protected.root.as_os_str() != projection.root.as_os_str()
+                    && root_within(&projection.root, &protected.root))
             {
                 return Err(invalid("human projection aliases a reserved mount"));
             }
@@ -2154,7 +2337,7 @@ impl GrantBoundary {
         let other_home_mounts =
             mount_identities_outside_allowed_home(mountinfo, &home_roots, &state.real_home)?;
         Ok(Self {
-            human_projection: human_projection(mountinfo, &state.real_home)?,
+            views: granted_views(mountinfo, &state.real_home, &reserved_mounts)?,
             reserved,
             home_roots,
             allowed_home: state.real_home.clone(),
@@ -2200,7 +2383,7 @@ impl GrantBoundary {
             allowed_home: state.real_home.clone(),
             home_mounts: BTreeSet::new(),
             other_home_mounts: BTreeSet::new(),
-            human_projection: None,
+            views: Vec::new(),
         })
     }
 
@@ -2228,11 +2411,6 @@ impl GrantBoundary {
                 source.display(),
                 path.display()
             )));
-        }
-        if let Some((view, identity)) = &self.human_projection {
-            if path_is_same_or_child(source, view) {
-                return require_projection_mounts(source_mounts, identity, &self.reserved_mounts);
-            }
         }
         require_grant_mount_identities(
             source,
@@ -2296,14 +2474,50 @@ pub(crate) fn path_is_same_or_child(path: &Path, root: &Path) -> bool {
     path == root || path.strip_prefix(root).is_ok()
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct MountIdentity {
-    pub(crate) device: String,
-    pub(crate) root: PathBuf,
+/// How mount root `inner` lies against `outer`, compared as the bytes
+/// mountinfo shows: whether it is `outer` or below it, or None when either
+/// is not a plain absolute path (an empty, `.` or `..` name, or a trailing
+/// `/`). The kernel shows a removed directory's root as `PATH//deleted`,
+/// which a `Path` comparison, normalising `//`, places below PATH; every
+/// nesting of two mount identities is decided here, so none can.
+fn root_nesting(inner: &Path, outer: &Path) -> Option<bool> {
+    fn plain(path: &[u8]) -> bool {
+        match path.strip_prefix(b"/".as_slice()) {
+            Some([]) => true,
+            Some(rest) => rest
+                .split(|byte| *byte == b'/')
+                .all(|name| !name.is_empty() && name != b"." && name != b".."),
+            None => false,
+        }
+    }
+    let (inner, outer) = (inner.as_os_str().as_bytes(), outer.as_os_str().as_bytes());
+    if !plain(inner) || !plain(outer) {
+        return None;
+    }
+    Some(
+        inner == outer
+            || outer == b"/"
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.first() == Some(&b'/')),
+    )
+}
+
+/// `inner` is certainly `outer` or below it: what admits.
+pub(crate) fn root_within(inner: &Path, outer: &Path) -> bool {
+    root_nesting(inner, outer) == Some(true)
+}
+
+/// `inner` may be `outer` or below it, certainly or for want of a plain
+/// root to say otherwise: what refuses.
+pub(crate) fn root_may_be_within(inner: &Path, outer: &Path) -> bool {
+    root_nesting(inner, outer) != Some(false)
 }
 
 fn mount_identities_overlap(left: &MountIdentity, right: &MountIdentity) -> bool {
-    left.device == right.device && paths_overlap(&left.root, &right.root)
+    left.device == right.device
+        && (root_may_be_within(&left.root, &right.root)
+            || root_may_be_within(&right.root, &left.root))
 }
 
 pub(crate) fn mount_identity_sets_overlap(
@@ -2357,7 +2571,7 @@ pub(crate) fn require_grant_mount_identities(
             .any(|home| mount_identities_overlap(source_mount, home))
             && !allowed_home_mounts.iter().any(|allowed| {
                 source_mount.device == allowed.device
-                    && path_is_same_or_child(&source_mount.root, &allowed.root)
+                    && root_within(&source_mount.root, &allowed.root)
             })
         {
             return Err(io::Error::new(
@@ -2388,11 +2602,11 @@ pub(crate) fn reserved_alias<'a>(
                 return None;
             }
             let reservation_contains_home = reserved_mount.device == home.device
-                && reserved_mount.root != home.root
-                && path_is_same_or_child(&home.root, &reserved_mount.root);
+                && reserved_mount.root.as_os_str() != home.root.as_os_str()
+                && root_within(&home.root, &reserved_mount.root);
             let source_is_below_home = source_mount.device == home.device
-                && source_mount.root != home.root
-                && path_is_same_or_child(&source_mount.root, &home.root);
+                && source_mount.root.as_os_str() != home.root.as_os_str()
+                && root_within(&source_mount.root, &home.root);
             (!(reservation_contains_home && source_is_below_home))
                 .then_some((source_mount, reserved_mount))
         })
@@ -2430,8 +2644,8 @@ pub(crate) fn mount_identities_outside_allowed_home(
 /// The identities a grant may not alias: every mount below the reserved
 /// roots, except one showing a directory strictly below the allowed home
 /// that no reserved root's own identity overlaps. Such a mount is that
-/// home's data seen from a reserved tree, as root's projection of the
-/// human's `Downloads` into Firefox's home is, and reserves nothing a
+/// home's data seen from a reserved tree, as a root-published grant view
+/// of the human's `Downloads` is, and reserves nothing a
 /// grant of the home child itself could not reach. What keeps the home's
 /// reserved state (`~/.td`) refused however it is mounted is that each
 /// reserved root's own identity always overlaps itself and so is never
@@ -2449,8 +2663,8 @@ fn grant_reserved_mounts(
     let mut identities = mount_identities_for_roots(mountinfo, reserved)?;
     identities.retain(|identity| {
         let below_home = identity.device == home.device
-            && identity.root != home.root
-            && path_is_same_or_child(&identity.root, &home.root);
+            && identity.root.as_os_str() != home.root.as_os_str()
+            && root_within(&identity.root, &home.root);
         !below_home
             || anchors
                 .iter()
@@ -2494,141 +2708,6 @@ pub(crate) fn mount_tree_identities(
         identities.insert(mount_identity_for_path(mountinfo, &path)?);
     }
     Ok(identities)
-}
-
-#[derive(Clone, Debug)]
-struct MountRow {
-    id: u64,
-    parent: u64,
-    device: String,
-    root: PathBuf,
-    mountpoint: PathBuf,
-}
-
-fn root_mount_row(rows: &[MountRow]) -> Option<MountRow> {
-    for row in rows.iter().rev() {
-        if row.mountpoint == Path::new("/") {
-            return Some(row.clone());
-        }
-    }
-    None
-}
-
-fn child_mount_row(rows: &[MountRow], parent: u64) -> Option<MountRow> {
-    for row in rows.iter().rev() {
-        if row.parent == parent {
-            return Some(row.clone());
-        }
-    }
-    None
-}
-
-pub(crate) fn decode_mountinfo_path(field: &str) -> io::Result<PathBuf> {
-    let mut decoded = Vec::with_capacity(field.len());
-    let mut bytes = field.as_bytes().iter().copied();
-    while let Some(byte) = bytes.next() {
-        if byte != b'\\' {
-            decoded.push(byte);
-            continue;
-        }
-        let escape = [bytes.next(), bytes.next(), bytes.next()];
-        let value = match escape {
-            [Some(b'0'), Some(b'4'), Some(b'0')] => b' ',
-            [Some(b'0'), Some(b'1'), Some(b'1')] => b'\t',
-            [Some(b'0'), Some(b'1'), Some(b'2')] => b'\n',
-            [Some(b'1'), Some(b'3'), Some(b'4')] => b'\\',
-            _ => {
-                return Err(io::Error::other(
-                    "mountinfo contains an invalid path escape",
-                ));
-            }
-        };
-        decoded.push(value);
-    }
-    Ok(PathBuf::from(OsString::from_vec(decoded)))
-}
-
-pub(crate) fn mount_identity_for_path(mountinfo: &str, path: &Path) -> io::Result<MountIdentity> {
-    let mut rows = BTreeMap::<usize, Vec<MountRow>>::new();
-    let mut mount_ids = BTreeSet::new();
-    for line in mountinfo.lines() {
-        let left = line
-            .split_once(" - ")
-            .ok_or_else(|| io::Error::other("mountinfo row has no separator"))?
-            .0;
-        let mut fields = left.split_whitespace();
-        let id = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no mount ID"))?
-            .parse::<u64>()
-            .map_err(|error| io::Error::other(format!("invalid mount ID: {error}")))?;
-        let parent = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no parent ID"))?
-            .parse::<u64>()
-            .map_err(|error| io::Error::other(format!("invalid mount parent ID: {error}")))?;
-        if !mount_ids.insert(id) {
-            return Err(io::Error::other(format!("mountinfo repeats mount ID {id}")));
-        }
-        let device = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no device"))?;
-        let root = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no root"))?;
-        let mountpoint = fields
-            .next()
-            .ok_or_else(|| io::Error::other("mountinfo row has no mount point"))?;
-        let root = decode_mountinfo_path(root)?;
-        let mountpoint = decode_mountinfo_path(mountpoint)?;
-        if path.strip_prefix(&mountpoint).is_err() {
-            continue;
-        }
-        let depth = mountpoint.components().count();
-        rows.entry(depth).or_default().push(MountRow {
-            id,
-            parent,
-            device: device.to_string(),
-            root,
-            mountpoint,
-        });
-    }
-    let mut selected: Option<MountRow> = None;
-    let mut selected_ids = BTreeSet::new();
-    for rows_at_depth in rows.into_values() {
-        if selected.is_none() {
-            selected = root_mount_row(&rows_at_depth);
-            if let Some(row) = &selected {
-                selected_ids.insert(row.id);
-            }
-        }
-        while let Some(parent) = selected.as_ref().map(|row| row.id) {
-            let Some(next) = child_mount_row(&rows_at_depth, parent) else {
-                break;
-            };
-            if !selected_ids.insert(next.id) {
-                return Err(io::Error::other("mountinfo parent tree contains a cycle"));
-            }
-            selected = Some(next);
-        }
-    }
-    let selected = selected
-        .ok_or_else(|| io::Error::other(format!("mountinfo does not cover {}", path.display())))?;
-    let relative = path.strip_prefix(&selected.mountpoint).map_err(|error| {
-        io::Error::other(format!(
-            "selected mount {} does not cover {}: {error}",
-            selected.mountpoint.display(),
-            path.display()
-        ))
-    })?;
-    let mut root = selected.root;
-    if !relative.as_os_str().is_empty() {
-        root.push(relative);
-    }
-    Ok(MountIdentity {
-        device: selected.device,
-        root,
-    })
 }
 
 fn registry_entry(text: &str, selected: &str) -> io::Result<Option<PathBuf>> {
@@ -3934,8 +4013,8 @@ mod tests {
     }
 
     /// A personal application's grant of the human's `Downloads` is not
-    /// refused because root also projects that directory into Firefox's
-    /// home below the reserved `/var/lib/td`; the table is a stock boot's.
+    /// refused because root also publishes a view of that directory for
+    /// Firefox below the reserved `/var/lib/td`; the table is a stock boot's.
     #[test]
     fn a_projection_of_the_home_into_a_reserved_tree_does_not_reserve_it() {
         let stock = "\
@@ -3946,7 +4025,7 @@ mod tests {
 21 22 0:18 / /tmp rw,relatime - tmpfs tmpfs rw\n\
 33 25 0:19 /@var/home/timmy/Downloads /var/td-portal-files/1000/Downloads ro,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
 34 25 0:19 /@var/lib/td/applications/65536/Opened /var/td-portal-files/1000/Opened rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
-35 25 0:19 /@var/home/timmy/Downloads /var/lib/td/applications/65536/Downloads rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n";
+35 25 0:19 /@var/home/timmy/Downloads /var/lib/td/grant-views/65536/0 rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n";
         let home = Path::new("/var/home/timmy");
         let reserved = [
             home.join(".td/app"),
@@ -4030,6 +4109,308 @@ mod tests {
                 "{shown}: {error}"
             );
         }
+    }
+
+    /// Mount roots nest by their bytes; a root that is not plain, as a
+    /// removed one's `PATH//deleted`, is never inside another and never
+    /// apart from it.
+    #[test]
+    fn mount_roots_nest_bytewise_and_an_irregular_root_admits_nothing() {
+        let path = Path::new;
+        assert!(root_within(path("/a/b"), path("/a")));
+        assert!(root_within(path("/a"), path("/a")));
+        assert!(root_within(path("/a"), path("/")));
+        assert!(!root_within(path("/ab"), path("/a")));
+        assert!(!root_within(path("/a"), path("/a/b")));
+        assert!(!root_may_be_within(path("/ab"), path("/a")));
+        for irregular in ["/a//deleted", "/a/./b", "/a/../b", "/a/", "a/b", ""] {
+            assert!(!root_within(path(irregular), path("/a")), "{irregular}");
+            assert!(!root_within(path("/a/b"), path(irregular)), "{irregular}");
+            assert!(
+                root_may_be_within(path(irregular), path("/a")),
+                "{irregular}"
+            );
+        }
+        let identity = |root: &str| MountIdentity {
+            device: "0:9".into(),
+            root: root.into(),
+        };
+        // Identities compare by bytes: a removed directory is not its live
+        // namesake, and a set keeps both.
+        assert_ne!(identity("/a//deleted"), identity("/a/deleted"));
+        assert_eq!(
+            BTreeSet::from([identity("/a//deleted"), identity("/a/deleted")]).len(),
+            2
+        );
+        assert!(mount_identities_overlap(
+            &identity("/x//deleted"),
+            &identity("/y")
+        ));
+        assert!(!mount_identities_overlap(
+            &identity("/x/a"),
+            &identity("/y")
+        ));
+        // A removed mount inside a view is not inside its directory.
+        let projection = identity("/@var/home/alice/Downloads");
+        assert!(require_projection_mounts(
+            &BTreeSet::from([
+                projection.clone(),
+                identity("/@var/home/alice/Downloads//deleted")
+            ]),
+            &projection,
+            &BTreeSet::new()
+        )
+        .is_err());
+    }
+
+    /// td-jail admits a view by the derivation td-authd published it by:
+    /// on the stock layout the home is a plain directory below the `/var`
+    /// subvolume's mount, and both name its offset (td-authd's
+    /// `the_derivation_keeps_the_homes_offset_below_its_mount` holds the
+    /// same literal). What the table refuses, td-jail refuses too.
+    #[test]
+    fn a_view_identity_is_the_one_td_authd_publishes_by() {
+        let stock = "22 1 0:19 /@ / rw,relatime shared:1 - btrfs /dev/vda2 rw\n\
+                     25 22 0:19 /@var /var rw,relatime shared:2 - btrfs /dev/vda2 rw\n";
+        let home = Path::new("/var/home/alice");
+        let identity = human_source_identity(stock, home, Path::new("Downloads")).unwrap();
+        assert_eq!(
+            identity,
+            crate::mount_identity::human_source_identity(stock, home, Path::new("Downloads"))
+                .unwrap()
+        );
+        assert_eq!(identity.device, "0:19");
+        assert_eq!(
+            identity.root.as_os_str().as_bytes(),
+            b"/@var/home/alice/Downloads"
+        );
+        for refused in [".td-update", ".config/foo", ".local/bin", ".gnupg"] {
+            assert!(
+                human_source_identity(stock, home, Path::new(refused)).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The account reads its manifest through a view directory it may
+    /// search but not list (0710 root:UID in production; 0100 here, where
+    /// the test's user owns it): every directory is held by `O_PATH`, so
+    /// the read succeeds without read permission on the directory.
+    #[test]
+    fn a_manifest_is_read_through_a_directory_the_account_cannot_list() {
+        let guard = super::grant_temp::TempDir::new("authority-views").unwrap();
+        let state = guard.path().join("state");
+        let account = state.join("grant-views/65536");
+        fs::create_dir_all(&account).unwrap();
+        for directory in [state.clone(), state.join("grant-views")] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manifest = account.join("manifest");
+        fs::write(&manifest, "td-grant-views-v1\n2\trw\tDownloads\n").unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o640)).unwrap();
+        let shown = fs::symlink_metadata(&manifest).unwrap();
+        let owner = ((shown.uid(), shown.gid()), shown.gid());
+        let read = |mode: u32| {
+            fs::set_permissions(&account, fs::Permissions::from_mode(mode)).unwrap();
+            let result = read_view_manifest_at(&state, 65536, owner, mode);
+            fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+            result
+        };
+        for mode in [0o100, 0o710] {
+            let listed = read(mode).unwrap().unwrap();
+            assert_eq!(listed.views().len(), 1, "{mode:o}");
+            assert_eq!(
+                listed.views().first().map(|view| view.path.as_str()),
+                Some("Downloads")
+            );
+        }
+        // A directory the account cannot even search holds no manifest it
+        // can read (root's override aside).
+        if owner.0 .0 != 0 {
+            assert!(read(0o000).is_err());
+        }
+        // A mode other than the one required, another owner, and no
+        // manifest or no account directory.
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o710)).unwrap();
+        assert!(read_view_manifest_at(&state, 65536, owner, 0o750).is_err());
+        assert!(
+            read_view_manifest_at(&state, 65536, (owner.0, owner.1.wrapping_add(1)), 0o710)
+                .is_err()
+        );
+        assert!(read_view_manifest_at(&state, 65537, owner, 0o710)
+            .unwrap()
+            .is_none());
+        fs::remove_file(&manifest).unwrap();
+        assert!(read(0o100).unwrap().is_none());
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Only the account and root may read which views it holds, and only
+    /// root writes the list.
+    #[test]
+    fn a_view_manifest_is_one_private_file_of_root_and_the_account() {
+        use std::os::unix::fs::symlink;
+        let guard = super::grant_temp::TempDir::new("authority-manifest").unwrap();
+        let path = guard.path().join("manifest");
+        fs::write(&path, "td-grant-views-v1\n").unwrap();
+        let metadata = |path: &Path| fs::symlink_metadata(path).unwrap();
+        let shown = metadata(&path);
+        let owner = (shown.uid(), shown.gid());
+        for (mode, admitted) in [
+            (0o640, true),
+            (0o644, false),
+            (0o660, false),
+            (0o600, false),
+            (0o4640, false),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                require_manifest_shape(&metadata(&path), owner).is_ok(),
+                admitted,
+                "{mode:o}"
+            );
+        }
+        for other in [
+            (owner.0.wrapping_add(1), owner.1),
+            (owner.0, owner.1.wrapping_add(1)),
+        ] {
+            assert!(require_manifest_shape(&metadata(&path), other).is_err());
+        }
+        let linked = guard.path().join("linked");
+        fs::hard_link(&path, &linked).unwrap();
+        assert!(require_manifest_shape(&metadata(&path), owner).is_err());
+        fs::remove_file(&linked).unwrap();
+        symlink("manifest", &linked).unwrap();
+        assert!(require_manifest_shape(&metadata(&linked), owner).is_err());
+        fs::write(
+            &path,
+            "x".repeat(crate::workload_grants::MAX_MANIFEST_BYTES + 1),
+        )
+        .unwrap();
+        assert!(require_manifest_shape(&metadata(&path), owner).is_err());
+    }
+
+    /// td-jail binds a view only as the manifest lists it: one mount at
+    /// its path with the entry's access, nosuid, nodev, noexec and its
+    /// idmap, showing the human's directory and nothing beside it.
+    #[test]
+    fn a_granted_view_is_admitted_only_as_its_manifest_lists_it() {
+        use crate::workload_grants::{Access, View};
+        let account =
+            crate::primary_account::parse("alice:x:1000:1000:human:/home/alice:/bin/sh\n").unwrap();
+        let base = "\
+22 2 7:0 / / ro,relatime - erofs /dev/loop0 ro\n\
+24 22 0:22 / /run rw,relatime - tmpfs tmpfs rw,mode=755\n\
+25 22 0:19 /@var /var rw,nosuid,nodev,relatime - btrfs none rw\n";
+        let view = Path::new("/var/lib/td/grant-views/65536/0");
+        let published = |options: &str, shown: &str| {
+            format!(
+                "{base}35 25 0:19 {shown} {} {options} - btrfs none rw\n",
+                view.display()
+            )
+        };
+        let rw = "rw,nosuid,nodev,noexec,relatime,idmapped";
+        let ro = "ro,nosuid,nodev,noexec,relatime,idmapped";
+        let entry = |access, path: &str| View {
+            index: 0,
+            access,
+            path: path.into(),
+        };
+        let downloads = entry(Access::ReadWrite, "Downloads");
+        let documents = entry(Access::ReadOnly, "Documents");
+        let none = BTreeSet::new();
+        let shown = MountIdentity {
+            device: "0:19".into(),
+            root: "/@var/home/alice/Downloads".into(),
+        };
+        let one = published(rw, "/@var/home/alice/Downloads");
+        assert_eq!(
+            admit_view(&one, view, &downloads, &account, &none).unwrap(),
+            BTreeSet::from([shown.clone()])
+        );
+        admit_view(
+            &published(ro, "/@var/home/alice/Documents"),
+            view,
+            &documents,
+            &account,
+            &none,
+        )
+        .unwrap();
+        // The access must be the entry's, both ways.
+        assert!(admit_view(
+            &published(rw, "/@var/home/alice/Documents"),
+            view,
+            &documents,
+            &account,
+            &none
+        )
+        .is_err());
+        assert!(admit_view(
+            &published(ro, "/@var/home/alice/Downloads"),
+            view,
+            &downloads,
+            &account,
+            &none
+        )
+        .is_err());
+        for missing in ["nosuid", "nodev", "noexec", "idmapped"] {
+            let options = rw
+                .split(',')
+                .filter(|option| *option != missing)
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(
+                admit_view(
+                    &published(&options, "/@var/home/alice/Downloads"),
+                    view,
+                    &downloads,
+                    &account,
+                    &none
+                )
+                .is_err(),
+                "{missing}"
+            );
+        }
+        // Unpublished, stacked, another directory, another view's path.
+        assert!(admit_view(base, view, &downloads, &account, &none).is_err());
+        let stacked = format!(
+            "{one}36 35 0:19 /@var/home/alice/Downloads {} {rw} - btrfs none rw\n",
+            view.display()
+        );
+        assert!(admit_view(&stacked, view, &downloads, &account, &none).is_err());
+        assert!(admit_view(
+            &published(rw, "/@var/home/alice/src"),
+            view,
+            &downloads,
+            &account,
+            &none
+        )
+        .is_err());
+        assert!(admit_view(
+            &one,
+            Path::new("/var/lib/td/grant-views/65536/1"),
+            &downloads,
+            &account,
+            &none
+        )
+        .is_err());
+        // A mount below the view that is not the human's directory, and a
+        // reserved mount the directory lies in.
+        let nested = format!(
+            "{one}36 35 0:30 / {}/x rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n",
+            view.display()
+        );
+        assert!(admit_view(&nested, view, &downloads, &account, &none).is_err());
+        assert!(admit_view(&one, view, &downloads, &account, &BTreeSet::from([shown])).is_err());
+        // A tree the jail's private home reserves is no target.
+        assert!(admit_view(
+            &published(rw, "/@var/home/alice/.cache/x"),
+            view,
+            &entry(Access::ReadWrite, ".cache/x"),
+            &account,
+            &none
+        )
+        .is_err());
     }
 
     #[test]
@@ -4261,6 +4642,7 @@ mod tests {
             "a/./b",
             "a//b",
             "a\0b",
+            "a\tb",
         ] {
             assert!(
                 human_source_identity(base, Path::new("/var/home/alice"), Path::new(relative))
@@ -4268,22 +4650,14 @@ mod tests {
                 "{relative:?}"
             );
         }
-        // Bounds: a name of 255 bytes, 16 names and 1024 bytes are the most.
-        let name = |length: usize| "n".repeat(length);
-        let longest = name(MAX_PATH_NAME_BYTES);
-        let deepest = vec!["d"; MAX_HUMAN_RELATIVE_DEPTH].join("/");
-        let fullest =
-            |last: usize| format!("{longest}/{longest}/{longest}/{}/{}", name(200), name(last));
-        assert_eq!(fullest(55).len(), MAX_HUMAN_RELATIVE_BYTES);
-        for admitted in [longest.clone(), deepest.clone(), fullest(55)] {
-            validate_human_relative(admitted.as_bytes()).unwrap();
-        }
-        for refused in [
-            name(MAX_PATH_NAME_BYTES + 1),
-            format!("{deepest}/d"),
-            fullest(56),
-        ] {
-            validate_human_relative(refused.as_bytes()).unwrap_err();
+        // The grant table's one validator decides (its own tests hold its
+        // bounds): a reserved tree of the home is no human directory here.
+        for reserved in [".ssh", ".td/app", ".config/td-mail", ".local"] {
+            assert!(
+                human_source_identity(base, Path::new("/var/home/alice"), Path::new(reserved))
+                    .is_err(),
+                "{reserved}"
+            );
         }
         assert!(private_application_home(Path::new(
             "/var/lib/td/applications/65536"
@@ -5305,6 +5679,61 @@ mod tests {
         assert!(real_home.join("Downloads").is_dir());
         assert!(real_home.join("Pictures").is_dir());
 
+        // A published view joins the policy's grants, ordered by target;
+        // one meeting a grant or another view is refused.
+        let view = |target: &str, root: &str| AdmittedView {
+            grant: FilesystemGrant {
+                source: Path::new("/var/lib/td/grant-views/65536").join(root),
+                target: PathBuf::from(target),
+                read_only: false,
+                source_kind: FilesystemSourceKind::Directory,
+                source_device: 0,
+                source_inode: 0,
+            },
+            identities: BTreeSet::from([MountIdentity {
+                device: "0:4242".into(),
+                root: Path::new("/@var/home/alice").join(root),
+            }]),
+        };
+        let with_views = |views: Vec<AdmittedView>| {
+            resolve_filesystem_grants_with_boundary(&policy, &state, |mountinfo| {
+                let mut boundary = GrantBoundary::for_test(
+                    mountinfo,
+                    &state,
+                    &package,
+                    &runtime,
+                    &wayland,
+                    &bus,
+                    &fetch_runtime,
+                )?;
+                boundary.views = views.clone();
+                Ok(boundary)
+            })
+        };
+        let joined = with_views(vec![view("/home/td/Music", "0")]).unwrap();
+        assert_eq!(
+            joined
+                .iter()
+                .map(|grant| grant.target.clone())
+                .collect::<Vec<_>>(),
+            ["/home/td/Downloads", "/home/td/Music", "/home/td/Pictures"].map(PathBuf::from)
+        );
+        // A view meeting the application's own grant is left out and the
+        // launch goes on with the policy's grants.
+        let policy_only = with_views(Vec::new()).unwrap();
+        for target in ["/home/td/Downloads", "/home/td/Pictures/x", "/home/td"] {
+            assert_eq!(
+                with_views(vec![view(target, "0")]).unwrap(),
+                policy_only,
+                "{target}"
+            );
+        }
+        assert!(with_views(vec![
+            view("/home/td/Music", "0"),
+            view("/home/td/Music/a", "1")
+        ])
+        .is_err());
+
         let denied = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .unwrap()
@@ -5608,7 +6037,10 @@ mod tests {
             (Some(OsString::from("td term")), "terminal-name grammar"),
             (Some(OsString::from("xterm;id")), "terminal-name grammar"),
             (Some(OsString::from("../vt100")), "terminal-name grammar"),
-            (Some(OsString::from_vec(vec![b'v', 0xff])), "not UTF-8"),
+            (
+                Some(std::os::unix::ffi::OsStringExt::from_vec(vec![b'v', 0xff])),
+                "not UTF-8",
+            ),
         ] {
             let error = terminal_name(term.clone()).unwrap_err();
             assert!(error.to_string().contains(reason), "{term:?}: {error}");

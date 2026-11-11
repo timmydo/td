@@ -1583,9 +1583,11 @@ and both recipes were deleted together, and roughly 1 GB left every image.
 
 **Dynamic-package admission has now LANDED.** Firefox's recipe declares the
 25.08 platform policy, generates its manifest and launcher, and
-compiles the first td policy: Wayland, shared network, one writable/create
-Downloads grant, the bare `org.mozilla.firefox` bus name and the
-`org.mozilla.firefox.*` suffix grant for its remote-control name. X11,
+compiles the first td policy: Wayland, shared network, its read-only
+`Opened` handoff directory, the bare `org.mozilla.firefox` bus name and the
+`org.mozilla.firefox.*` suffix grant for its remote-control name; its
+writable Downloads is the workload grant table's seed row, not a policy
+grant (§C, "Filesystem grants"). X11,
 blanket devices, development access, audio, printing and smart cards remain
 absent. The runtime-major environment table forces
 `LIBGL_ALWAYS_SOFTWARE=1`; Firefox's own declaration selects Wayland without
@@ -3307,8 +3309,8 @@ home does not by itself reject a source physically below the home: the source
 does not carry its reserved siblings. Conversely, a mount below a reserved
 tree that shows a directory strictly below that exact home, and overlaps
 no reserved root's own identity, reserves nothing: it is the home's data
-seen from elsewhere, as root's projection of the human's `Downloads` into
-Firefox's home under `/var/lib/td` is, so a personal application's grant
+seen from elsewhere, as root's grant views of the human's directories
+under `/var/lib/td/grant-views` are, so a personal application's grant
 of `~/Downloads` is not refused for it. Such a view of the home itself,
 of anything outside it, or of anything overlapping the mount identity of
 a reserved root inside the home (`~/.td`, which td creates as a plain
@@ -3346,25 +3348,39 @@ outside the dynamic private home, stopping at each declared grant root. The
 lower-level synthetic jail tests prove read-write Downloads, read-only
 Pictures, and a read-only regular-file grant, including recursive hardening of
 a separately writable nested mount. Those are confinement regressions rather
-than the system image's application selection. The current Firefox image
-prepares only its declared read-write Downloads source before `switch_root`,
-creating the directory when it is missing and mounting nothing at it, so
-that a symlink or non-directory there is reported at boot ("grant
-disabled") rather than only by a later refusal; it keeps the graphical
-user's persistent storage and normal capacity. Initialization does this
-once before `switch_root`; it is not a restartable root service following
-mutable user state, and it goes when grants are published per launch
-(WORKLOADS.md step 6). td-jail derives the identity a view of that source
-must show from the mount covering the human's home (the topmost mount at
-the home or, failing one, at its nearest ancestor), its device and root
-joined with the source's path below the home; mounts below the home do
-not count. It admits root's published view only when the two match, so a
-view of a sibling, an ancestor, a reserved tree, another device, a mount
-stacked over the source or over a directory between it and the home, or a
-source renamed or removed after publication is refused. Nothing pins the
-source's name, so renaming or removing it leaves Firefox unable to start
-until the views are released at shutdown (td-authd/DESIGN.md,
-"Application filesystem grants"). A process killed in the create/unlink
+than the system image's application selection.
+
+An application that runs as an account of its own declares no grant of
+the human's files in its policy: what it reaches of them is its rows in
+the root-only workload grant table, which td-authd publishes as idmapped
+views below `/var/lib/td/grant-views` at each launch and lists in the
+account's manifest (td-authd/DESIGN.md, "Workload grant table" and
+"Application filesystem grants"). td-jail binds each listed view at
+`/home/td/PATH`, read-only or writable as the row says and always
+nosuid, nodev and noexec, and nothing else of the human's home; with no
+manifest the account has no views. Firefox's `Downloads` is the table's
+seed. A row whose source is missing gets no view: publication creates
+nothing, so the image's initialization still creates the graphical
+user's `Downloads` before `switch_root` when it is missing, mounting
+nothing at it, and reports a symlink or non-directory there at boot
+("grant disabled"). td-jail derives the identity each view must show
+by the one function td-authd publishes it by: the mount covering the
+human's home (the topmost mount at the home or, failing one, at its
+nearest ancestor), its device and root joined with the home's path below
+that mount's mountpoint and then with the source's path below the home;
+mounts below the home do not count. It admits a listed view only when the two match and it is the one
+mount at its path with the row's access, nosuid, nodev, noexec and its
+idmap, so a view of a sibling, an ancestor, a reserved tree, another
+device, a mount stacked over the source or over a directory between it
+and the home, or a source renamed or removed after publication is
+refused. Roots are compared byte by byte, so a removed directory's
+`PATH//deleted` root never counts as nested. The next launch releases a
+stale view and publishes the source the row names, so renaming or
+removing a granted directory costs only the running jail its view, and
+the root mount stays until that launch or shutdown. A row whose source
+td-authd refuses gets no view and a log line, and the launch goes on; a
+listed view meeting the application's own policy grants is left out by
+td-jail the same way. A process killed in the create/unlink
 window of stage 2's writable grant probe can leave one randomly named
 `.td-jail-write-probe-*` file in that host directory. The synthetic client
 has the same window for one `.td-jail-rw-*` file in Downloads. The
@@ -6504,7 +6520,7 @@ not for a persistent Session lifecycle.
 Without it, a file chooser can only grant what the sandbox can already
 see — the app's own home and its declared `--filesystem` grants.
 Selecting anything else returns response 2 with a named diagnostic.
-Firefox with its default `xdg-download` grant downloads and uploads
+Firefox with its seeded Downloads grant downloads and uploads
 fine; darktable needs an explicit `xdg-pictures` grant; several GNOME
 workflows will look like they work until the user picks a file outside a
 granted root. Landing it later needs `/dev/fuse`, the FUSE wire protocol,
@@ -6732,6 +6748,12 @@ a Request is exported or the `/var/td-portal-files/1000/Downloads` root is
 opened. The host and guest roots are compiled as that one application's
 authenticated grant pair. This fails closed for the unresolved/unconfined
 ambiguity and prevents another jailed app from receiving Firefox's paths.
+The pair stays compiled, but the host root exists only while the workload
+grant table holds Firefox's `Downloads` row: boot and each Firefox launch
+release the portal's view when the row is revoked or its source is gone
+(td-authd/DESIGN.md, "Portal file preparation"), and FileChooser then
+answers that its Downloads grant is unavailable rather than serving a
+directory Firefox no longer reaches.
 
 The human can read the original Downloads directory but cannot enter the
 portal's private compositor protocol or credential-store runtime. Human-UID
@@ -7781,7 +7803,7 @@ and image commits — showing:
    every default action after the first, and requires exactly one trusted link
    activation. A following physical Shift keyup is the ordered command boundary,
    so delayed repeats are observed before success. The volatile Firefox
-   profile selects its compiled `/home/td/Downloads` grant without a prompt.
+   profile selects its seeded `/home/td/Downloads` grant without a prompt.
    Outside the jail, a td-owned unprivileged probe then requires one stable
    regular inode at the corresponding `/var/home/NAME/Downloads` source,
    derived from the validated primary account:
@@ -8869,15 +8891,18 @@ their home isolation depends on the jail boundary, not a separate host UID.
 
 For applications assigned service UIDs, firstboot migrates legacy state into mode-0700
 `/var/lib/td/applications/APP_UID`, creates the corresponding service
-runtime and cgroup, and removes the old application directory. The root
-filesystem helper publishes only a Firefox Downloads view of the
-human's corresponding directory. These writable idmapped
-mounts preserve mode-0600 files and map new writes back to human ownership.
+runtime and cgroup, and removes the old application directory. At each
+launch td-authd publishes, for the account's rows of the root-only
+workload grant table, idmapped views of the human's directories below
+`/var/lib/td/grant-views/APP_UID` and lists them in the account's
+manifest; the table's seed is Firefox's writable Downloads
+(td-authd/DESIGN.md, "Workload grant table"). These idmapped mounts
+preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
-resolution verifies their exact source mount identity, which it derives
-from the mount covering the human's home and the directory's path below
-it, and rejects nested mounts outside that declared source or aliases to
-protected state. The
+resolution binds only the views the manifest lists, verifies their exact
+source mount identity, which it derives from the mount covering the
+human's home and the directory's path below it, and rejects nested
+mounts outside that listed source or aliases to protected state. The
 portal retains its separate read-only mapped Downloads view. It also has
 one writable view, `/var/td-portal-files/1000/Opened`, of Firefox's private
 mode-0700 `Opened` directory under Firefox's application home, mapping

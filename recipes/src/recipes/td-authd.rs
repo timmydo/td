@@ -175,10 +175,6 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/consent.rs"),
     ),
     (
-        "src/application_files.rs",
-        include_str!("../../../td-authd/src/application_files.rs"),
-    ),
-    (
         "src/application.rs",
         include_str!("../../../td-authd/src/application.rs"),
     ),
@@ -197,6 +193,14 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "src/mount_sys.rs",
         include_str!("../../../td-authd/src/mount_sys.rs"),
+    ),
+    (
+        "src/grant_views.rs",
+        include_str!("../../../td-authd/src/grant_views.rs"),
+    ),
+    (
+        "tests/grant_views.rs",
+        include_str!("../../../td-authd/tests/grant_views.rs"),
     ),
     (
         "src/portal_files.rs",
@@ -301,6 +305,17 @@ pub fn recipe() -> Recipe {
         (
             "{src}/engine/src/workload_accounts.rs",
             include_str!("../../../engine/src/workload_accounts.rs"),
+        ),
+        // The grant table the launch publishes from and the manifest it
+        // writes for td-jail.
+        (
+            "{src}/engine/src/workload_grants.rs",
+            include_str!("../../../engine/src/workload_grants.rs"),
+        ),
+        // The mountinfo derivation td-jail admits the views by.
+        (
+            "{src}/engine/src/mount_identity.rs",
+            include_str!("../../../engine/src/mount_identity.rs"),
         ),
         (
             "{src}/td-firstboot/src/principals.rs",

@@ -204,7 +204,7 @@ one.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies and the portable vault's logind sleep-delay inhibitor; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
@@ -3109,7 +3109,7 @@ Confinement tests pin the source, the shared file, every argv, path and
 deadline, and the counts of each write and process API. No instruction,
 syscall, option or allowance is added.
 
-### Portal file-grant mount boundary
+### File-grant mount boundary
 
 `td-authd/src/mount_sys.rs` is separate from the channel module shared with
 the compositor. It has one function-scoped syscall instruction and one
@@ -3125,28 +3125,35 @@ propagation; flags are exactly AT_EMPTY_PATH. move_mount(429) publishes
 through borrowed source and destination descriptors, two empty paths, and
 exactly MOVE_MOUNT_F_EMPTY_PATH(4)|MOVE_MOUNT_T_EMPTY_PATH(0x40).
 
-The application-grant wrapper additionally admits exactly
-MOUNT_ATTR_IDMAP|NOSUID|NODEV|NOEXEC (0x10000e), with the same zero clear
-and propagation fields. It does not clear an inherited read-only attribute;
-a resulting read-only view fails the required writable-view check. The two
-public wrappers select these fixed values; no caller supplies a flags word.
-The shared namespace helper may map human UID/GID 1000 to the immutable,
-actively enrolled Firefox application UID for its fixed Downloads
-grant. It may also map that Firefox UID/GID to portal UID/GID 991
+The writable profile admits exactly MOUNT_ATTR_IDMAP|NOSUID|NODEV|NOEXEC
+(0x10000e), with the same zero clear and propagation fields. It does not
+clear an inherited read-only attribute; a resulting read-only view fails
+the required writable-view check. The one public wrapper takes a
+two-valued access (`ViewAccess::ReadOnly` or `Writable`) that selects one
+of these two fixed words; no caller supplies a flags word, and no profile
+clears NOEXEC, so there is no exec grant. The shared namespace helper may
+map human UID/GID 1000 to portal UID/GID 991 for the portal's read-only
+Downloads view, or to an application account in the ledger's application
+range for that account's grant views, which root publishes at its launch
+from the root-only workload grant table (td-authd/DESIGN.md, "Workload
+grant table"). It may also map the Firefox UID/GID to portal UID/GID 991
 for the portal's writable handoff view of Firefox's private `Opened`
 directory, the one use of the writable profile with a portal destination.
-Application mapping startup and shutdown are root-only. The same instruction
-and adoption sites serve both mount profiles.
+Mapping, publication and release are root-only. The same instruction and
+adoption sites serve both mount profiles.
 
 The wrappers accept neither paths nor flags. Safe std owns all descriptors
 and closes the detached mount on failure. No descriptor from this boundary
-is received over D-Bus or the attention channel. The production consumer
-selects the fixed human Downloads source and read-only portal destination;
-the application consumer selects only Firefox Downloads beneath that
-assigned application's private home; the handoff consumer
-selects only Firefox's `Opened` directory and the fixed portal destination.
-No consumer provides a general mount operation or accepts a path from an
-application.
+is received over D-Bus or the attention channel. The portal consumer
+selects the fixed human Downloads source and read-only portal destination,
+only while Firefox holds the Downloads grant; the grant-view consumer
+selects a source only from a root-only table row, validated by the one
+shared path validator, opened below the human home without following
+links and on the home's own mount, and a destination only below
+`/var/lib/td/grant-views/UID`, a root-owned tree outside every
+workload-writable home; the handoff consumer selects only Firefox's
+`Opened` directory and the fixed portal destination. No consumer provides
+a general mount operation or accepts a path from an application.
 
 ## 17. `td-mail` — retired
 

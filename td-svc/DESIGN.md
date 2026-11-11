@@ -415,7 +415,8 @@ listener.
 
 The portal follows the same distinction. It requires the broker, runs at
 UID 991 beneath its root supervisor, and is ordered after root preparation
-of its read-only Downloads view. Its live evidence client remains human
+of its read-only Downloads view, present while Firefox holds the
+Downloads grant. Its live evidence client remains human
 UID 1000. Portal failure is application evidence failure, outside the
 bootsuccess strict chain. The portal child remains in its supervisor's
 process group, so normal stop/restart containment covers both without a
@@ -432,12 +433,13 @@ application's session leaf (`td-app-UID/session`, or the human's
 the mail, news and web units run at boot only on an oracle's (§3's
 `unless-exists=`); an ordinary session starts mail and news from its own
 shell (APPLICATIONS.md §W.7), and Firefox and web from their launcher
-cards. Firefox also requires `firefox-files`,
-whose root grant oneshot finishes before it starts; mail and news
-require the human's `fetchd`, and web its own `web-fetch`, td-fetchd run
-as web's account on every boot (td-web/DESIGN.md §3), since a skipped
-unit would satisfy `requires=` with no socket. Shutdown releases Firefox's view after
-services stop and before releasing the portal view and `/var`.
+cards. No unit prepares an application's grants: its root launch
+publishes them (td-authd/DESIGN.md, "Application filesystem grants").
+Mail and news require the human's `fetchd`, and web its own `web-fetch`,
+td-fetchd run as web's account on every boot (td-web/DESIGN.md §3),
+since a skipped unit would satisfy `requires=` with no socket. Shutdown
+releases every grant view after services stop and before releasing the
+portal view and `/var`.
 
 Application audio uses both edges deliberately. `audio requires=seat`
 because its private identity and runtime directory do not exist before seat

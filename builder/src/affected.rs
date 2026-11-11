@@ -305,6 +305,14 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "host and target-static td-firstboot's workload account ledger seeding and install-time allocation, and its readers: td-login's application accounts and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
     ),
     (
+        "engine/src/workload_grants.rs",
+        "host and target-static td-firstboot's workload grant table seeding, target-static td-authd's per-launch grant view publication and manifest writer, target-static td-jail's manifest admission and shared grant path validator, and td-agent's workspace refusals, which share its sensitive trees of the home",
+    ),
+    (
+        "engine/src/mount_identity.rs",
+        "target-static td-jail's mountinfo identities and grant view admission, and target-static td-authd's grant view publication, one derivation for both",
+    ),
+    (
         "engine/src/sha256.rs",
         "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
@@ -2461,6 +2469,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "engine/src/workload_accounts.rs",
         "td-login's application accounts"
     );
+    assert_contains!(
+        "engine/src/workload_grants.rs",
+        "td-firstboot's workload grant table seeding"
+    );
+    assert_contains!(
+        "engine/src/workload_grants.rs",
+        "td-jail's manifest admission"
+    );
+    assert_contains!(
+        "engine/src/mount_identity.rs",
+        "target-static td-authd's grant view publication"
+    );
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
@@ -2493,6 +2513,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     let expected_target_included = [
         "engine/src/principals.rs",
         "engine/src/workload_accounts.rs",
+        "engine/src/workload_grants.rs",
+        "engine/src/mount_identity.rs",
         "engine/src/sha256.rs",
         "engine/src/flathub_app.rs",
         "engine/src/crc32.rs",
