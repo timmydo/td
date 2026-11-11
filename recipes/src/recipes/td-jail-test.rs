@@ -305,7 +305,7 @@ pub fn recipe() -> Recipe {
                 &format!(
                     "'{bin}' --internal-write-seccomp-filter >'{{root}}/filter.bpf' || {{ echo 'td-jail could not export its compiled seccomp filter' >&2; exit 1; }}; \
                      '{probe}' --allow-inherited-confinement '{{root}}/filter.bpf' || exit 1; \
-                     for a in mail news; do \
+                     for a in mail news web; do \
                      '{bin}' --internal-write-seccomp-filter \"$a\" >\"{{root}}/filter-$a.bpf\" || {{ echo \"td-jail could not export its $a filter\" >&2; exit 1; }}; \
                      '{probe}' --application-filter \"$a\" --allow-inherited-confinement \"{{root}}/filter-$a.bpf\" || exit 1; \
                      done"

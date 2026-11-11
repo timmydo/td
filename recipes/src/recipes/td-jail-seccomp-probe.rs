@@ -88,6 +88,7 @@ pub(crate) fn source() -> &'static str {
 #include <errno.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
@@ -418,8 +419,12 @@ static int expect_refused(long number, long a, long b, const char *what) {
     return expect_errno(syscall(number, a, b, 0, 0, 0, 0), ENOSYS, what);
 }
 
-static int prove_application_filter(int mail) {
+static void *probe_thread(void *argument) { return argument; }
+
+static int prove_application_filter(int mail, int web) {
     struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    pthread_t thread;
+    void *joined = NULL;
     char *spawn_argv[] = {(char *)"td-jail-probe", NULL};
     char *spawn_envp[] = {NULL};
     pid_t spawned;
@@ -510,6 +515,21 @@ static int prove_application_filter(int mail) {
     errno = 0;
     if (expect_errno(waitpid(-1, NULL, WNOHANG), ECHILD, "failed spawn's reap") != 0)
         return 1;
+    /* glibc starts a thread with clone3 first: that answers ENOSYS here, and
+     * the clone it falls back to must start one. */
+    if (pthread_create(&thread, NULL, probe_thread, &one) != 0 ||
+        pthread_join(thread, &joined) != 0 || joined != &one)
+        return fail("a thread could not start under the application filter");
+    /* td-kv's fdatasync is mail's and news's: on no descriptor any kernel
+     * answers EBADF, so ENOSYS can only be the web filter's. */
+    if (web) {
+        if (expect_refused(SYS_fdatasync, -1, 0, "fdatasync") != 0)
+            return 1;
+    } else {
+        errno = 0;
+        if (expect_errno(syscall(SYS_fdatasync, -1), EBADF, "fdatasync") != 0)
+            return 1;
+    }
     if (mail) {
         fd = (int)syscall(SYS_memfd_create, "td-jail-probe", 0);
         if (fd < 0)
@@ -527,6 +547,7 @@ int main(int argc, char **argv) {
     int allow_inherited_confinement = 0;
     int application = 0;
     int mail = 0;
+    int web = 0;
     int initial_nnp;
     int initial_seccomp;
     int fd;
@@ -548,8 +569,10 @@ int main(int argc, char **argv) {
         application = 1;
         if (strcmp(argv[2], "mail") == 0)
             mail = 1;
+        else if (strcmp(argv[2], "web") == 0)
+            web = 1;
         else if (strcmp(argv[2], "news") != 0)
-            return fail("application filter must be mail or news");
+            return fail("application filter must be mail, news or web");
         argc -= 2;
         argv += 2;
     }
@@ -586,7 +609,7 @@ int main(int argc, char **argv) {
     if (require_status() != 0)
         return 1;
     if (application) {
-        if (prove_application_filter(mail) != 0 || prove_i386_boundary(1) != 0)
+        if (prove_application_filter(mail, web) != 0 || prove_i386_boundary(1) != 0)
             return 1;
         puts(TD_APPLICATION_MARKER);
         return 0;
@@ -743,10 +766,10 @@ mod tests {
         let install = main
             .find("syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0")
             .unwrap();
-        let prove = main.find("prove_application_filter(mail)").unwrap();
+        let prove = main.find("prove_application_filter(mail, web)").unwrap();
         assert!(install < prove);
         let witnesses = source
-            .split_once("static int prove_application_filter(int mail)")
+            .split_once("static int prove_application_filter(int mail, int web)")
             .unwrap()
             .1
             .split_once("int main(")
@@ -768,6 +791,8 @@ mod tests {
             "AF_NETLINK",
             "SOCK_DGRAM",
             "SYS_memfd_create",
+            "SYS_fdatasync",
+            "pthread_create",
             "expect_x32_kill",
         ] {
             assert!(

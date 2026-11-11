@@ -786,7 +786,6 @@ const APPLICATION_ALLOWED: &[u32] = &[
     72,  // fcntl
     73,  // flock
     74,  // fsync
-    75,  // fdatasync
     77,  // ftruncate
     79,  // getcwd
     80,  // chdir
@@ -830,9 +829,12 @@ const APPLICATION_ALLOWED: &[u32] = &[
     439, // faccessat2
 ];
 
-// What td-mail and td-secret reach and td-news and td-open do not.
+// What td-mail and td-secret reach and td-news and td-open do not. Its
+// fdatasync is td-kv's sync_data, which news reaches too and td-web does
+// not link.
 const MAIL_ALLOWED: &[u32] = &[
     55,  // getsockopt: td-secret's peer_uid
+    75,  // fdatasync: td-kv
     84,  // rmdir: td-mail
     91,  // fchmod: td-mail and td-secret
     93,  // fchown: td-secret
@@ -840,19 +842,26 @@ const MAIL_ALLOWED: &[u32] = &[
     319, // memfd_create: td-secret's create_credential
 ];
 
-// The news package adds nothing to what every application reaches.
-const NEWS_ALLOWED: &[u32] = &[];
+// td-kv's sync_data, which td-web does not link.
+const NEWS_ALLOWED: &[u32] = &[
+    75, // fdatasync: td-kv
+];
+
+// td-web reaches nothing beyond what every application does: its threads,
+// fetches, decoders and unwinding name no other number.
+const WEB_ALLOWED: &[u32] = &[];
 
 pub(crate) fn application_program(filter: ApplicationFilter) -> io::Result<Vec<SockFilter>> {
     match filter {
         ApplicationFilter::Standard => Ok(standard_program()?.instructions().to_vec()),
         ApplicationFilter::Mail => allowlist_program(MAIL_ALLOWED),
         ApplicationFilter::News => allowlist_program(NEWS_ALLOWED),
+        ApplicationFilter::Web => allowlist_program(WEB_ALLOWED),
     }
 }
 
 // ENOSYS for what the list lacks, as a kernel without the call answers, and
-// ENOTTY for an ioctl, as a descriptor without the request does. Neither
+// ENOTTY for an ioctl, as a descriptor without the request does. No such
 // program has a terminal grant, so tcgetattr answers as it would anyway.
 // Neither is a kill: a program must be able to report what failed.
 fn allowlist_program(extra: &[u32]) -> io::Result<Vec<SockFilter>> {
@@ -1479,8 +1488,13 @@ mod tests {
         );
     }
 
-    fn allowlist_programs() -> [(ApplicationFilter, Vec<SockFilter>); 2] {
-        [ApplicationFilter::Mail, ApplicationFilter::News].map(|filter| {
+    fn allowlist_programs() -> [(ApplicationFilter, Vec<SockFilter>); 3] {
+        [
+            ApplicationFilter::Mail,
+            ApplicationFilter::News,
+            ApplicationFilter::Web,
+        ]
+        .map(|filter| {
             let program = application_program(filter).unwrap();
             (filter, program)
         })
@@ -1494,19 +1508,20 @@ mod tests {
             APPLICATION_ALLOWED,
             &[
                 0, 1, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 24, 25, 28, 32, 33, 34,
-                39, 42, 44, 45, 46, 47, 51, 52, 59, 60, 61, 62, 63, 72, 73, 74, 75, 77, 79, 80, 81,
-                82, 83, 87, 89, 99, 102, 104, 107, 108, 115, 131, 143, 145, 157, 158, 186, 202,
-                204, 217, 218, 219, 228, 230, 231, 234, 247, 257, 262, 267, 269, 273, 293, 302,
-                318, 332, 334, 439
+                39, 42, 44, 45, 46, 47, 51, 52, 59, 60, 61, 62, 63, 72, 73, 74, 77, 79, 80, 81, 82,
+                83, 87, 89, 99, 102, 104, 107, 108, 115, 131, 143, 145, 157, 158, 186, 202, 204,
+                217, 218, 219, 228, 230, 231, 234, 247, 257, 262, 267, 269, 273, 293, 302, 318,
+                332, 334, 439
             ]
         );
-        assert_eq!(MAIL_ALLOWED, &[55, 84, 91, 93, 263, 319]);
-        assert!(NEWS_ALLOWED.is_empty());
+        assert_eq!(MAIL_ALLOWED, &[55, 75, 84, 91, 93, 263, 319]);
+        assert_eq!(NEWS_ALLOWED, &[75]);
+        assert!(WEB_ALLOWED.is_empty());
     }
 
     #[test]
     fn the_allowlists_are_sorted_distinct_real_and_never_a_denied_number() {
-        for list in [APPLICATION_ALLOWED, MAIL_ALLOWED, NEWS_ALLOWED] {
+        for list in [APPLICATION_ALLOWED, MAIL_ALLOWED, NEWS_ALLOWED, WEB_ALLOWED] {
             assert!(list.windows(2).all(|pair| pair[0] < pair[1]));
             for syscall in list {
                 assert!(!DENIED_SYSCALLS.contains(syscall), "denied {syscall}");
@@ -1525,7 +1540,7 @@ mod tests {
                 );
             }
         }
-        for syscall in MAIL_ALLOWED.iter().chain(NEWS_ALLOWED) {
+        for syscall in MAIL_ALLOWED.iter().chain(NEWS_ALLOWED).chain(WEB_ALLOWED) {
             assert!(!APPLICATION_ALLOWED.contains(syscall), "repeated {syscall}");
         }
     }
@@ -1537,7 +1552,10 @@ mod tests {
         for (filter, program) in allowlist_programs() {
             let extra = match filter {
                 ApplicationFilter::Mail => MAIL_ALLOWED,
-                _ => NEWS_ALLOWED,
+                ApplicationFilter::News => NEWS_ALLOWED,
+                ApplicationFilter::Web => WEB_ALLOWED,
+                // Not an allowlist; allowlist_programs yields none.
+                ApplicationFilter::Standard => continue,
             };
             for syscall in 0_u32..=600 {
                 if matches!(
@@ -1688,6 +1706,7 @@ mod tests {
             ApplicationFilter::Standard,
             ApplicationFilter::Mail,
             ApplicationFilter::News,
+            ApplicationFilter::Web,
         ] {
             assert_eq!(ApplicationFilter::from_wire(filter.wire()), Some(filter));
         }

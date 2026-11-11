@@ -8620,6 +8620,7 @@ mod tests {
             ("standard", authority::ApplicationFilter::Standard),
             ("mail", authority::ApplicationFilter::Mail),
             ("news", authority::ApplicationFilter::News),
+            ("web", authority::ApplicationFilter::Web),
         ] {
             assert_eq!(
                 parse_mode(args(&[FILTER_ARG, name])).unwrap(),
@@ -8832,6 +8833,7 @@ mod tests {
             authority::ApplicationFilter::Standard,
             authority::ApplicationFilter::Mail,
             authority::ApplicationFilter::News,
+            authority::ApplicationFilter::Web,
         ] {
             let Mode::Stage2 { action, .. } = launch("absent", filter.wire()).unwrap() else {
                 panic!("not a stage 2 launch");
@@ -8846,6 +8848,7 @@ mod tests {
         assert!(launch("present", "standard").is_ok());
         assert!(launch("present", "mail").is_err());
         assert!(launch("present", "news").is_err());
+        assert!(launch("present", "web").is_err());
         assert!(launch("absent", "extra").is_err());
     }
 
@@ -9292,6 +9295,7 @@ mod tests {
         for filter in [
             authority::ApplicationFilter::Mail,
             authority::ApplicationFilter::News,
+            authority::ApplicationFilter::Web,
         ] {
             assert!(matches!(
                 parse_mode(emit(false, filter).into_iter()).unwrap(),
@@ -9712,6 +9716,13 @@ mod tests {
             Mode::ApplicationFilterProbe {
                 application: "mail".into(),
                 filter: authority::ApplicationFilter::Mail,
+            }
+        );
+        assert_eq!(
+            parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "web", "web"])).unwrap(),
+            Mode::ApplicationFilterProbe {
+                application: "web".into(),
+                filter: authority::ApplicationFilter::Web,
             }
         );
         assert!(parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "mail"])).is_err());

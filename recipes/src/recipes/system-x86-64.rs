@@ -33,8 +33,8 @@ use crate::shared::{
     TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
     TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
-    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, TD_WEB_ENTRY,
-    TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
+    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER,
+    TD_WEB_ENTRY, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1582,6 +1582,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "news",
     "news-evidence",
     "web",
+    "web-evidence",
     "shell-workspace",
     "placement-evidence",
     "setup",
@@ -2365,6 +2366,19 @@ fn build_desktop_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=never\n\
          \n\
+         # As news-evidence, for web, but asked as td-web's own account: its\n\
+         # jail is in that account's delegated cgroup, which td-jail reads\n\
+         # only as its owner, as Firefox's evidence asks as its account. So\n\
+         # a launch the workload ledger, the jail or the account's fetch\n\
+         # directory broke prints no marker.\n\
+         [web-evidence]\n\
+         type=oneshot\n\
+         unless-exists={live_medium}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda{web_uid} -- /bin/td-jail --probe-process-token {web_name} {web_program} && /bin/td-login exec-service-as tda{web_uid} -- /bin/td-jail --probe-application-filter {web_name} {web_name} && /bin/echo {web_marker}'\n\
+         after=web,firefox-tls-setup\n\
+         requires=web\n\
+         timeout={application_evidence}\n\
+         \n\
          # The view returns to the first workspace once the applications are\n\
          # decided, ready or not, so Firefox maps beside the shell.\n\
          [shell-workspace]\n\
@@ -2708,6 +2722,7 @@ fn build_desktop_td_svc_conf() -> String {
         application_fetch = svc_timeouts::APPLICATION_FETCH,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
+        web_marker = TD_WEB_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
         application_settle = APPLICATION_SETTLE_SECS,
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
@@ -3957,15 +3972,19 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          >/run/td-jail-seccomp-probe/filter-mail.bpf \
          && /bin/td-jail --internal-write-seccomp-filter news \
          >/run/td-jail-seccomp-probe/filter-news.bpf \
+         && /bin/td-jail --internal-write-seccomp-filter web \
+         >/run/td-jail-seccomp-probe/filter-web.bpf \
          && /bin/chown 0:0 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe /run/td-jail-seccomp-probe/filter.bpf \
          /run/td-jail-seccomp-probe/filter-mail.bpf \
          /run/td-jail-seccomp-probe/filter-news.bpf \
+         /run/td-jail-seccomp-probe/filter-web.bpf \
          && /bin/chmod 0555 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe \
          && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf \
          /run/td-jail-seccomp-probe/filter-mail.bpf \
-         /run/td-jail-seccomp-probe/filter-news.bpf; then \
+         /run/td-jail-seccomp-probe/filter-news.bpf \
+         /run/td-jail-seccomp-probe/filter-web.bpf; then \
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '[ -x /run/td-jail-seccomp-probe/probe ] \
          && [ ! -w /run/td-jail-seccomp-probe/probe ] \
@@ -3975,6 +3994,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && [ ! -w /run/td-jail-seccomp-probe/filter-mail.bpf ] \
          && [ -r /run/td-jail-seccomp-probe/filter-news.bpf ] \
          && [ ! -w /run/td-jail-seccomp-probe/filter-news.bpf ] \
+         && [ -r /run/td-jail-seccomp-probe/filter-web.bpf ] \
+         && [ ! -w /run/td-jail-seccomp-probe/filter-web.bpf ] \
          && [ ! -w /run/td-jail-seccomp-probe ] || \
          {{ echo \"td-jail: target seccomp inputs are not immutable\"; exit 1; }}; \
          p=$(/run/td-jail-seccomp-probe/probe \
@@ -3994,6 +4015,12 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"td-jail: target news filter probe failed\"; exit 1; }}; \
          [ \"$p\" = {TD_JAIL_APPLICATION_FILTER_PROBE_MARKER} ] || \
          {{ echo \"td-jail: target news filter probe returned unexpected output\"; \
+         exit 1; }}; \
+         p=$(/run/td-jail-seccomp-probe/probe --application-filter web \
+         /run/td-jail-seccomp-probe/filter-web.bpf 2>&1) || \
+         {{ echo \"td-jail: target web filter probe failed\"; exit 1; }}; \
+         [ \"$p\" = {TD_JAIL_APPLICATION_FILTER_PROBE_MARKER} ] || \
+         {{ echo \"td-jail: target web filter probe returned unexpected output\"; \
          exit 1; }}'; then echo {TD_JAIL_SECCOMP_PROBE_MARKER}; mts=1; fi; \
          else echo \"td-jail: could not prepare immutable target seccomp inputs\"; fi; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
@@ -8602,6 +8629,34 @@ mod tests {
                 .uid_of(td_engine::workload_accounts::Kind::Application, TD_WEB_NAME),
             Some(WEB_UID)
         );
+        // Its evidence is news's, but td-jail is asked as the account whose
+        // delegated cgroup holds the jail, not as the login user.
+        let exec = unit_key("web-evidence", "exec").unwrap_or_default();
+        assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
+        assert!(
+            exec.contains(&format!(
+                "/bin/td-util sleep {APPLICATION_SETTLE_SECS}; /bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-jail --probe-process-token {TD_WEB_NAME} td-web && /bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-jail --probe-application-filter {TD_WEB_NAME} {TD_WEB_NAME} && /bin/echo {TD_WEB_BOOT_MARKER}'"
+            )),
+            "{exec}"
+        );
+        assert!(!exec.contains("exec-primary"), "{exec}");
+        for (key, value) in [
+            ("type", "oneshot".to_string()),
+            ("requires", TD_WEB_NAME.into()),
+            ("unless-exists", LIVE_MEDIUM.into()),
+            ("timeout", svc_timeouts::APPLICATION_EVIDENCE.to_string()),
+        ] {
+            assert_eq!(
+                unit_key("web-evidence", key).as_deref(),
+                Some(value.as_str()),
+                "{key}"
+            );
+        }
+        // An exact console line, so it waits for TLS setup's decision too.
+        assert_eq!(
+            unit_after("web-evidence"),
+            vec![TD_WEB_NAME, "firefox-tls-setup"]
+        );
         for (key, value) in [
             (
                 "exec",
@@ -8705,14 +8760,14 @@ mod tests {
             ),
             format!("const MAIL_NAME: &str = \"{TD_MAIL_NAME}\";"),
             format!("const NEWS_NAME: &str = \"{TD_NEWS_NAME}\";"),
+            format!("const WEB_NAME: &str = \"{TD_WEB_NAME}\";"),
         ] {
             assert_eq!(AUTHORITY.matches(&declaration).count(), 1, "{declaration}");
         }
-        // And another static application is a decision, not a silent
-        // default. web is one: it runs on the standard program, since no
-        // allowlist has been derived from its realized binary
-        // (APPLICATIONS.md, "Per-application allowlists"), and td-jail's
-        // selection names it nowhere.
+        // And a fourth static application is a decision, not a silent
+        // default: each of these three has a list derived from its realized
+        // binary (APPLICATIONS.md, "Per-application allowlists"), and
+        // td-jail's selection names each.
         let mut on_the_runtime: Vec<&str> = SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.runtime == runtime.name)
@@ -8725,8 +8780,13 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .unwrap();
-        assert!(selection.contains("MAIL_NAME => ApplicationFilter::Mail"));
-        assert!(!selection.contains("WEB") && !selection.contains(TD_WEB_NAME));
+        for arm in [
+            "MAIL_NAME => ApplicationFilter::Mail",
+            "NEWS_NAME => ApplicationFilter::News",
+            "WEB_NAME => ApplicationFilter::Web",
+        ] {
+            assert!(selection.contains(arm), "{arm}");
+        }
     }
 
     #[test]
@@ -9548,6 +9608,7 @@ mod tests {
             "software-evidence",
             "terminal",
             "web",
+            "web-evidence",
         ];
         expected.sort();
         assert_eq!(skipped, expected);
@@ -9848,6 +9909,7 @@ mod tests {
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
             ("web-fetch", vec!["td-firstboot", "netup"]),
             ("web", vec!["busd", "web-fetch", "applications-workspace"]),
+            ("web-evidence", vec!["web", "firefox-tls-setup"]),
             ("shell-workspace", vec!["mail", "news", "web"]),
             (
                 "placement-evidence",
@@ -9988,16 +10050,11 @@ mod tests {
         }
     }
 
-    /// Every shipped application but those named below has a boot oracle
-    /// unit of its own, named `<name>-evidence`, and the roster's length is
-    /// pinned so that adding an entry is a reviewed change here rather than
-    /// a silent one.
+    /// Every shipped application has a boot oracle unit of its own, named
+    /// `<name>-evidence`, and the roster's length is pinned so that adding
+    /// an entry is a reviewed change here rather than a silent one.
     #[test]
     fn every_shipped_application_has_a_boot_oracle_unit() {
-        // td-web has none yet (td-web/DESIGN.md §10, "Boot evidence"). Its
-        // `[web]` unit starts it on an oracle's boot, but nothing requires
-        // that unit or reads a marker, so main's boot does not prove it.
-        const WITHOUT_ORACLE: &[&str] = &[TD_WEB_NAME];
         assert_eq!(
             SHIPPED_APPLICATIONS.len(),
             4,
@@ -10007,27 +10064,14 @@ mod tests {
         );
         for application in SHIPPED_APPLICATIONS {
             let unit = format!("{}-evidence", application.name);
-            if WITHOUT_ORACLE.contains(&application.name) {
-                assert!(
-                    !TD_SVC_UNITS.contains(&unit.as_str()),
-                    "{unit} exists: {} is no longer without an oracle",
-                    application.name
-                );
-                assert!(
-                    TD_SVC_UNITS.contains(&application.name),
-                    "{} has no unit of its own",
-                    application.name
-                );
-                continue;
-            }
             assert!(
                 TD_SVC_UNITS.contains(&unit.as_str()),
                 "{} ships without a boot oracle unit {unit}",
                 application.name
             );
             // The unit is a real td-svc entry that runs once per boot: the
-            // source-built mail/news oracles are oneshots that require their
-            // app, the foreign Firefox oracle is a daemon that never
+            // source-built mail/news/web oracles are oneshots that require
+            // their app, the foreign Firefox oracle is a daemon that never
             // restarts. Either way it is a defined unit, not just a name.
             assert!(
                 matches!(
@@ -13634,7 +13678,12 @@ mod tests {
                 "{unit}"
             );
         }
-        for unit in ["mail-evidence", "news-evidence", "placement-evidence"] {
+        for unit in [
+            "mail-evidence",
+            "news-evidence",
+            "web-evidence",
+            "placement-evidence",
+        ] {
             assert_eq!(
                 unit_key(unit, "unless-exists").as_deref(),
                 Some(LIVE_MEDIUM),
@@ -14929,6 +14978,7 @@ mod tests {
                 && bootsuccess.contains("[ ! -w /run/td-jail-seccomp-probe/filter.bpf ]")
                 && bootsuccess.contains("--application-filter mail")
                 && bootsuccess.contains("--application-filter news")
+                && bootsuccess.contains("--application-filter web")
                 && bootsuccess.contains(TD_JAIL_APPLICATION_FILTER_PROBE_MARKER)
                 && bootsuccess.contains(TD_JAIL_SECCOMP_PROBE_MARKER)
                 && bootsuccess.contains(&format!(

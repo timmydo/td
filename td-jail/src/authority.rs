@@ -93,6 +93,7 @@ const DYNAMIC_RUNTIME: &str = "freedesktop-platform-25-08";
 const STATIC_RUNTIME: &str = "static-runtime-1";
 const MAIL_NAME: &str = "mail";
 const NEWS_NAME: &str = "news";
+const WEB_NAME: &str = "web";
 const FIREFOX_LIBRARY_PATH: &str = "/app/lib:/app/lib/firefox";
 const FIREFOX_NAME: &str = "firefox";
 const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
@@ -122,6 +123,7 @@ pub(crate) enum ApplicationFilter {
     Standard,
     Mail,
     News,
+    Web,
 }
 
 impl ApplicationFilter {
@@ -130,6 +132,7 @@ impl ApplicationFilter {
             ApplicationFilter::Standard => "standard",
             ApplicationFilter::Mail => "mail",
             ApplicationFilter::News => "news",
+            ApplicationFilter::Web => "web",
         }
     }
 
@@ -138,6 +141,7 @@ impl ApplicationFilter {
             "standard" => Some(ApplicationFilter::Standard),
             "mail" => Some(ApplicationFilter::Mail),
             "news" => Some(ApplicationFilter::News),
+            "web" => Some(ApplicationFilter::Web),
             _ => None,
         }
     }
@@ -1427,10 +1431,10 @@ fn dynamic_runtime(runtime: &str, flathub: Option<FlathubSource>) -> io::Result<
             .is_some_and(|suffix| suffix.starts_with('-')))
 }
 
-/// A narrower program for the two td-owned static applications, whose
+/// A narrower program for the three td-owned static applications, whose
 /// realized binaries its list was read from. Host mode runs whatever the host
 /// built, against the host's libc, so it keeps the standard program, and so
-/// does a package of either name on any other runtime.
+/// does a package of any of those names on any other runtime.
 fn application_filter(
     name: &str,
     runtime: &str,
@@ -1443,6 +1447,7 @@ fn application_filter(
     match name {
         MAIL_NAME => ApplicationFilter::Mail,
         NEWS_NAME => ApplicationFilter::News,
+        WEB_NAME => ApplicationFilter::Web,
         _ => ApplicationFilter::Standard,
     }
 }
@@ -4231,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_static_applications_in_product_mode_get_an_allowlist() {
+    fn only_the_three_static_applications_in_product_mode_get_an_allowlist() {
         let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-static-runtime-1";
         let other = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08";
         assert_eq!(
@@ -4242,16 +4247,19 @@ mod tests {
             application_filter("news", runtime, false, false),
             ApplicationFilter::News
         );
+        assert_eq!(
+            application_filter("web", runtime, false, false),
+            ApplicationFilter::Web
+        );
         for (name, runtime, flathub, host_mode) in [
             ("firefox", runtime, false, false),
-            // td-web is static on the same runtime, but no allowlist has
-            // been derived from its binary (APPLICATIONS.md, "Per-application
-            // allowlists"), so it keeps the standard program.
-            ("web", runtime, false, false),
             ("mail", runtime, false, true),
             ("news", runtime, false, true),
+            ("web", runtime, false, true),
             ("mail", runtime, true, false),
+            ("web", runtime, true, false),
             ("mail", other, false, false),
+            ("web", other, false, false),
             ("mail", "/td/store/not-a-store-path", false, false),
             ("mailx", runtime, false, false),
         ] {

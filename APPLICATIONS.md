@@ -3385,7 +3385,7 @@ Freedesktop 25.08 receives only `/app/lib:/app/lib/firefox`.
 ### The seccomp filter
 
 **The standard program is a Flatpak-derived, deliberately stricter deny list,
-not an allow list.** Two td-built applications get allow lists instead
+not an allow list.** Three td-built applications get allow lists instead
 ("Per-application allowlists" below). This diverges from td's instincts and is argued rather than slipped in:
 an allow list over the runtime glibc's whole syscall surface breaks every
 time that glibc updates — a new `*_time64` or `statx` variant appears and
@@ -3583,18 +3583,19 @@ behavior checks on the target kernel.
 ### Per-application allowlists
 
 The standard program is a deny list because td controls neither Firefox nor the
-runtime's glibc. Neither reason holds for `mail` and `news`: td builds each
-program in those two packages, statically, against the imported glibc, so the
-syscalls it can make are a property of bytes td has read. Each therefore gets an
-allowlist program in place of the standard one, selected by stage 1 from the
-authenticated name and the `static-runtime` output, and carried to stage 2 as a
-closed word it cannot widen. Host mode keeps the standard program, because there
-the binary is whatever the host built against the host's libc. So does any other
-application, and a package of either name on any other runtime. `web`, td's own
-browser (td-web/DESIGN.md §3), is a third td-built static package on that
-runtime, and it too keeps the standard program: no list has been derived from its
-binary in the way below, and a compiled program beyond the five UNSAFE.md §9
-names would be an amendment there.
+runtime's glibc. Neither reason holds for `mail`, `news` and `web`, td's own
+browser (td-web/DESIGN.md §3): td builds each program in those three packages,
+statically, against the imported glibc, so the syscalls it can make are a
+property of bytes td has read. Each therefore gets an allowlist program in place
+of the standard one, selected by stage 1 from the authenticated name and the
+`static-runtime` output, and carried to stage 2 as a closed word it cannot widen.
+`web` runs as its own service account rather than the login user; the selection
+reads neither. Host mode keeps the standard program, because there the binary is
+whatever the host built against the host's libc. So does any other application,
+and a package of any of those names on any other runtime. A fourth static
+application on that runtime is a decision, not a silent default, which a recipe
+test holds, and a compiled program beyond those UNSAFE.md §9 names is an
+amendment there.
 
 An allowlist answers `ENOSYS` for what it lacks, as a kernel without the call
 does, so that a program reports what failed. It keeps the arch and x32 kills. It
@@ -3607,9 +3608,9 @@ allowlist too: `FIONBIO`,
 and `ENOTTY` for any other. That is the one request whose path through the binaries
 any td program takes. The others they name are behind something these jails lack or
 an option td never asks for: `TCGETS`, `TCSETSF` and `TIOCSPGRP`, in `tcgetattr`,
-td-secret's PIN terminal and `tcsetpgrp`, need the terminal neither package has a
-grant for; `FIONREAD`, `SIOCGIFCONF` and the other `SIOCGIF*` requests are glibc's
-resolver and interface helpers, which no td program calls; `PIDFD_GET_INFO` needs a
+td-secret's PIN terminal and `tcsetpgrp`, need the terminal none of these
+packages has a grant for; `FIONREAD`, `SIOCGIFCONF` and the other `SIOCGIF*`
+requests are glibc's resolver and interface helpers, which no td program calls; `PIDFD_GET_INFO` needs a
 pidfd no td program asks for.
 
 **How the lists are derived, and how to do it again.** Tests cannot supply a list:
@@ -3645,31 +3646,40 @@ against the jail's pid limit, for a missing `password_command` or browser; and `
 not all traced to an option. Narrowing those would trade a call nothing misuses for a
 program that fails for a person.
 The vDSO adds nothing of its own: the fallbacks of `clock_gettime` and `getrandom`,
-the two vDSO-backed functions these binaries hold, are numbers already listed. The mail list adds
-what td-mail and td-secret reach and td-news and td-open do not.
+the two vDSO-backed functions these binaries hold, are numbers already listed. The
+shared list is what all three packages and td-jail's stage 2 reach. The mail list adds what td-mail and
+td-secret reach and td-news and td-open do not; mail and news add td-kv's
+`fdatasync`, which td-web does not link; and web adds nothing. td-web's binary names
+no number td-news's does not: its render and fetch threads (`clone`, glibc having
+tried `clone3`), each thread's malloc arena (`mmap`, `mprotect`, `madvise`), its
+decoders and the unwinding that catches a rendering's panic reach only listed calls,
+and the spawn and resolver code it links is left out as above.
 
 **What proves it.** The interpreter holds each program to exactly its list across
 the whole table, and to its argument rules. The realized C probe installs each
 exported program through witnesses: `getppid` and `FIONREAD` on a socket succeed on
-any kernel without the filter, so their refusal can only be the filter's. The QEMU
-leg runs that on the target kernel with no allowance for inherited confinement, as
-part of `TD-JAIL-SECCOMP-PROBE-OK`; `td-jail-test` also runs it, and skips it as it
+any kernel without the filter, so their refusal can only be the filter's, and
+`fdatasync` on no descriptor, which any kernel answers `EBADF`, tells web's program
+from the others. It starts a thread under each. The QEMU leg runs that on the
+target kernel with no allowance for inherited confinement, as part of `TD-JAIL-SECCOMP-PROBE-OK`; `td-jail-test` also runs it, and skips it as it
 does the standard program's when its build is already confined. A boot then checks
 that each application's own stage 2 holds its filter's name, by
-`--probe-application-filter`, before it may print `TD-MAIL-RUNNING` or
-`TD-NEWS-RUNNING`, because an application on the standard program runs as well as ever
+`--probe-application-filter`, before it may print `TD-MAIL-RUNNING`,
+`TD-NEWS-RUNNING` or `TD-WEB-RUNNING` (asked as `tda65540`, whose cgroup holds
+td-web's jail), because an application on the standard program runs as well as ever
 and nothing else would notice. That reads what stage 2 was told; that stage 2
 installs what it was told is the launch path's unit test and its one call. Whether a
-list is sufficient is established by running under it: the boot starts both
+list is sufficient is established by running under it: the boot starts all three
 applications, and the deriving review ran the crates' end-to-end tests under the
-exported programs with the realized binaries.
+exported programs with the realized binaries, and the realized td-web, which has
+none, in a headless compositor through a fetch service.
 
 **What no oracle establishes is that the lists still fit.** A list goes stale when
 what the binaries can call changes: a change to the Rust toolchain or the Debian root's
 glibc, and more often an ordinary change to a program in those packages or a crate
-they link, such as td-mail, td-news, td-open, td-secret, td-ui, td-fs, td-kv or
-td-fetch-client. Each new reach for an operating-system facility is a question for
-this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
+they link, such as td-mail, td-news, td-open, td-secret, td-web, td-ui, td-fs,
+td-kv, td-html, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
+operating-system facility is a question for this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
 `UnixListener`, td-ui's PTY and its `Connection::waker` datagram pair are all off
 these lists today. Deriving them again is
 the reviewer's to do; a number gone missing fails as `ENOSYS` in that program, not as
@@ -3677,8 +3687,8 @@ a wider jail, and only on the path that reaches it.
 
 This does not reduce what the allowed calls can reach: a kernel bug in `read`, `mmap`
 or a Unix socket is reachable here as anywhere. It removes the rest: over two hundred
-calls and the whole `ioctl` space, for the two programs that parse the most untrusted
-mail and news.
+calls and the whole `ioctl` space, for the three programs that parse the most
+untrusted mail, news and web pages.
 
 ### Firefox's nested sandbox
 
@@ -6290,9 +6300,8 @@ the portal and itself — but the two surfaces it could once reach, the shared
 descriptor budget and its own init-namespace pid, are the closed gaps above.
 What can be machine-checked today is narrower: the system recipe asserts that
 exactly one shipped application's permission file carries a `[Session Bus
-Policy]` entry, and that every shipped application but `web`, which no oracle
-drives until td-ui's control socket can (td-web/DESIGN.md §10), has an
-evidence unit; a second bus-holding entry, or another application without its
+Policy]` entry, and that every shipped application has an evidence unit; a
+second bus-holding entry, or another application without its
 oracle, breaks the build. The first message routed between two applications' peers is an oracle
 still to write.
 
@@ -8038,7 +8047,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused (since admitted for the personal `mail` and `news`, whose shell launch keeps the shell's directory where a grant maps it, §W.7). A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment. Reworked again (§W.8, "Reworked again"): for news the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted (`td-ui/DESIGN.md`, increment 13), and the recipe stages `td-editor` beside `td-ui` | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
 | 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; no shipped application holds the terminal grant, and §W.7's relaunch is a window request |
-| 37 | **web, td's own browser — LANDED** (td-web/DESIGN.md §3): `web` (td-web) is a source-built static package on the data-only `static-runtime`, like mail and news, but a service-account application, `tda65540`, UID 65540, with no `/bin` name: its launcher card starts the `[web]` unit, which an oracle's boot alone starts unasked. A service-account jail takes the fetch socket only from its own runtime directory, so `[web-fetch]` runs td-fetchd as that account at `/run/user/65540/td-fetch/socket`, and `[web]` requires it. Its permissions are `sockets=wayland;fetch` and resource limits: no network, filesystem grant, bus name or terminal. It keeps the standard seccomp program and has no boot oracle yet | the session opens td-web from its card, in a jail of its own account with a fetch service of its own |
+| 37 | **web, td's own browser — LANDED** (td-web/DESIGN.md §3): `web` (td-web) is a source-built static package on the data-only `static-runtime`, like mail and news, but a service-account application, `tda65540`, UID 65540, with no `/bin` name: its launcher card starts the `[web]` unit, which an oracle's boot alone starts unasked. A service-account jail takes the fetch socket only from its own runtime directory, so `[web-fetch]` runs td-fetchd as that account at `/run/user/65540/td-fetch/socket`, and `[web]` requires it. Its permissions are `sockets=wayland;fetch` and resource limits: no network, filesystem grant, bus name or terminal. It keeps the standard seccomp program (since given an allowlist of its own, "Per-application allowlists") and has no boot oracle yet (since `[web-evidence]` prints `TD-WEB-RUNNING`, asked as `tda65540`, which the system boot requires) | the session opens td-web from its card, in a jail of its own account with a fetch service of its own |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support

@@ -73,11 +73,16 @@ td-svc's `[web]` unit, which runs `td-authd application-start 1000 web
 direct --`, ready once the compositor reports its window. Like the
 other applications' units it starts at boot only on an oracle's (it
 names `/run/td-applications-on-demand`), on the applications'
-workspace. Nothing observes that start: no unit requires `[web]` and
-no oracle reads a marker of it, so main's boot proves nothing of td-web
-yet (§10, "Boot evidence"). "web" and "browser" are Firefox's search
-terms too, so they list both cards, Firefox's first by label: Firefox
-stays the browser a bare search opens. Its permissions keyfile grants:
+workspace. There, under the autotest token, `[web-evidence]` requires
+it and, a few seconds after its window reported ready, asks td-jail as
+`tda65540`, whose delegated cgroup holds the jail, for td-web itself
+still in its instance under the installed sandbox and for its stage 2
+holding its allowlist's name; only then does it print `TD-WEB-RUNNING`,
+which main's system boot requires. So a launch the workload ledger, the
+jail or the account's fetch directory broke reds there. "web" and
+"browser" are Firefox's search terms too, so they list both cards,
+Firefox's first by label: Firefox stays the browser a bare search opens.
+Its permissions keyfile grants:
 
 ```text
 [Context]
@@ -157,11 +162,14 @@ restart a program that exits on the cap. One CPU, twice news's, since
 a page is rendered on the render thread and laid out on the window's
 (§8).
 
-td-jail gives td-web the standard seccomp program, not an allowlist:
-mail's and news's lists were derived from their realized binaries
-(APPLICATIONS.md, "Per-application allowlists"), none has been derived
-from td-web's, and a compiled program beyond the five UNSAFE.md §9 names
-is an amendment there.
+td-jail gives td-web an allowlist seccomp program in place of the
+standard one, derived from its realized binary as mail's and news's
+were (APPLICATIONS.md, "Per-application allowlists"): the list every
+td static application shares, without td-kv's `fdatasync`, which mail
+and news add and td-web does not link. What is off it answers `ENOSYS`;
+`socket` is `AF_UNIX` alone and `ioctl` `FIONBIO` alone. A change that
+reaches for another operating-system facility, in td-web or a crate it
+links, derives the list again, or that path fails in the jail.
 
 **Its own fetch service.** A service-account jail takes the fetch
 socket only from its own runtime directory, owned by its own UID
@@ -550,13 +558,6 @@ order; each is its own design amendment when it starts:
   "Proportional faces", "Not yet"): its seam reads the cell grid, and
   over proportional faces narrow glyphs share a cell, so the text it
   reads is not the text drawn.
-- **Boot evidence**: a `[web-evidence]` unit, as news's, that probes
-  the running jail's process token and filter as tda65540 and prints a
-  marker main's system boot requires, so a launch path broken by the
-  ledger, the jail or the fetch directory reds there.
-- **An allowlist**: derive td-web's seccomp program from its realized
-  binary, as mail's and news's were (APPLICATIONS.md, "Per-application
-  allowlists"); it parses the most hostile input of td's programs.
 - **Text selection** in the page, and copying it.
 - **Bounded rendering**: the rendering is off the window's thread and
   one at a time, but td-html still builds it whole, up to

@@ -157,8 +157,8 @@ native corpus under `spec/vt` and the libvterm importer
 `td-ui-import-libvterm`, the renderer (`vt_render`) with its PPM goldens
 under `spec/vt_render`, the terminfo compiler (`vt_terminfo`), and the
 PTY with its reader, writer and waiter threads (`pty`), whose four
-`ioctl(2)` requests joined the raw module under `UNSAFE.md` §19. The `mail` and
-`news` jails allow neither those requests nor everything else this crate can call
+`ioctl(2)` requests joined the raw module under `UNSAFE.md` §19. The `mail`,
+`news` and `web` jails allow neither those requests nor everything else this crate can call
 (`APPLICATIONS.md`, "Per-application allowlists"), so a program in those packages
 that starts using more of the crate re-derives its list. Newly built beside them: `vt_keys`, the chord encoder that replaces the
 compositor's evdev key table, so the terminal reads the chords the

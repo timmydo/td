@@ -1351,11 +1351,18 @@ pub const TD_SETUP_LIVE_MARKER: &str = "TD-SETUP-LIVE-READY";
 pub const SETUP_INPUT_CMDLINE_TOKEN: &str = "td.setup-input=1";
 pub const TD_SETUP_SHOWN_PREFIX: &str = "TD-SETUP-SHOWN ";
 pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
+// Printed by the `web-evidence` unit under the autotest token as the
+// news marker is, but with td-jail asked as td-web's own service account,
+// tda65540, whose delegated cgroup holds its jail: td-web is still in its
+// instance a few seconds after its window reported ready, launched through
+// the workload ledger's account with its own fetch service's directory
+// bound, and its stage 2 holds its allowlist's name.
+pub const TD_WEB_BOOT_MARKER: &str = "TD-WEB-RUNNING";
 // Printed by the `fetch-evidence` unit under the autotest token once
 // td-fetchd's probe, as the UI user, has asked the fetch service for a
 // loopback URL and received the policy's exact refusal: the socket is
 // served, the framing is understood and the policy is on, in a VM with no
-// route out (APPLICATIONS.md §W.8). The in-jail half is the mail and news
+// route out (APPLICATIONS.md §W.8). The in-jail half is the mail, news and web
 // markers above: their jails carry `sockets=fetch`, and stage 2 refuses to
 // launch without the socket bound.
 pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
