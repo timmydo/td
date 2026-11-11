@@ -25,6 +25,8 @@ use std::rc::Rc;
 
 /// Bounded extraction; see `td-html/DESIGN.md` for its text heuristic.
 pub mod extract;
+/// Bounded HTML5 tokens for the document parser.
+pub mod html5;
 /// Bounded references; see `td-html/DESIGN.md` for the streaming contract.
 pub mod reference;
 
