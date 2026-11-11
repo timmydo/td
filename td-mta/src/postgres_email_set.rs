@@ -239,6 +239,66 @@ fn single(outcome: BatchOutcome) -> Result<Outcome, Error> {
     Ok(outcome.state)
 }
 
+/// Custody after a confirmed outcome: this operation must never publish again.
+pub(crate) struct Retirement {
+    change: Change,
+    pub(crate) outcome: BatchOutcome,
+}
+impl Retirement {
+    pub(crate) fn new(change: Change, outcome: BatchOutcome) -> Self {
+        Self { change, outcome }
+    }
+    pub(crate) fn operation(&self) -> EmailOperationId {
+        self.change.operation()
+    }
+    pub(crate) fn retire(
+        &self,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        let change = self.change.clone();
+        let expected = self.outcome.clone();
+        postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+            Box::pin(async move {
+                begin(client, &change).await?;
+                client
+                    .query_one(
+                        "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                        &[&change.binding.account().as_bytes().as_slice()],
+                    )
+                    .await
+                    .map_err(|_| Error::Database)?;
+                if let Some(recorded) = receipt(client, &change).await? {
+                    if recorded != expected {
+                        return Err(Error::Integrity);
+                    }
+                    if client
+                        .execute(
+                            "DELETE FROM td_mta.flag_receipts WHERE account=$1 AND operation=$2",
+                            &[
+                                &change.binding.account().as_bytes().as_slice(),
+                                &change.operation.as_bytes().as_slice(),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| Error::Database)?
+                        != 1
+                    {
+                        return Err(Error::Integrity);
+                    }
+                }
+                // An absent receipt also settles an earlier lost retirement COMMIT.
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .map_err(|_| Error::Database)
+            })
+        })
+        .map_err(Error::Connection)?
+    }
+}
+
 fn flag(value: Option<bool>) -> u8 {
     match value {
         None => 0,

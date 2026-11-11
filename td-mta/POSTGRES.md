@@ -1522,9 +1522,20 @@ receipts resolve even after policy changes or revocation; this does not
 authorize another mutation. The API is not a client authentication endpoint.
 A missing receipt never authorizes a new operation identity after uncertainty.
 COMMIT loss returns Indeterminate and requires retaining the original Change.
-At 1024 receipts per account fresh operations refuse; there is no pruning or
-unbounded recovery promise. Runtime retention/retry policy and bulk JMAP
-mapping remain runtime integration work. All calls retain finite worker/deadline limits.
+At 1024 receipts per account fresh operations refuse. Cold callers retain
+receipts for historical inspection; there is no age-based or arbitrary pruning.
+The HTTP owner retires its exact receipt only after confirmed publication or
+historical settlement. Retirement checks epoch, account, operation, digest and
+complete outcome under the account writer lock. Once confirmed, the owner
+transitions irreversibly to retirement-only custody: it cannot publish that
+operation again. Missing receipts settle a lost retirement acknowledgement.
+Retirement failures preserve the known successful response and keep this
+owner fenced until retirement succeeds; the next mutation retries cleanup
+before admitting a new operation. Unknown publication outcomes retain the
+original receipt and inspection-only settlement path. A process crash may
+leave orphan receipts; no live request sweeps another owner's records.
+Existing installations at the ceiling require the fenced, backed-up operator
+procedure in PRODUCTION.md before serving the new binary. All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
 a confirmed historical receipt as known success.
 

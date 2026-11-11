@@ -27,6 +27,7 @@ enum Operation {
     Update(Change),
     Destroy(deletion::Deletion),
     Filing(filing::Filing),
+    Retiring(changes::Retirement),
 }
 impl Operation {
     fn operation(&self) -> EmailOperationId {
@@ -34,6 +35,27 @@ impl Operation {
             Self::Update(value) => value.operation(),
             Self::Destroy(value) => value.operation(),
             Self::Filing(value) => value.operation(),
+            Self::Retiring(value) => value.operation(),
+        }
+    }
+    fn confirmed(self, outcome: changes::BatchOutcome) -> Self {
+        let change = match self {
+            Self::Update(value) => value,
+            Self::Destroy(value) => value.into_change(),
+            Self::Filing(value) => value.into_change(),
+            Self::Retiring(value) => return Self::Retiring(value),
+        };
+        Self::Retiring(changes::Retirement::new(change, outcome))
+    }
+    fn retire(
+        &self,
+        connection: &postgres_probe::Request<'_>,
+        trust: &td_crypto::TrustStore,
+        deadline: Instant,
+    ) -> Result<(), changes::Error> {
+        match self {
+            Self::Retiring(value) => value.retire(connection, trust, deadline),
+            _ => Err(changes::Error::Invalid),
         }
     }
     fn inspect(
@@ -46,6 +68,7 @@ impl Operation {
             Self::Update(value) => changes::inspect_batch(connection, trust, deadline, value),
             Self::Destroy(value) => deletion::inspect(connection, trust, deadline, value),
             Self::Filing(value) => filing::inspect(connection, trust, deadline, value),
+            Self::Retiring(value) => Ok(Some(value.outcome.clone())),
         }
     }
     fn publish(
@@ -56,6 +79,7 @@ impl Operation {
         password: &[u8],
     ) -> Result<changes::BatchOutcome, changes::Error> {
         match self {
+            Self::Retiring(_) => Err(changes::Error::Invalid),
             Self::Update(value) => {
                 changes::publish_batch(connection, trust, deadline, value, password)
             }
@@ -181,9 +205,9 @@ impl Pending {
             return Err(Error::Invalid);
         }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
-        let Some(change) = pending.as_ref() else {
+        if pending.is_none() {
             return Ok(None);
-        };
+        }
         let now = Instant::now();
         let deadline = clock.deadline_instant(until)?.min(
             now.checked_add(Duration::from_secs(10))
@@ -203,21 +227,45 @@ impl Pending {
                     crate::postgres_resolver::Error::Deadline => Error::Deadline,
                     _ => Error::Dns,
                 })?;
+        let mut confirmed = None;
         for address in addresses {
             let mut connection = loaded.bootstrap.request(address);
             connection.mode = Mode::Runtime;
+            let change = pending.as_ref().ok_or(Error::Invalid)?;
             match change.inspect(&connection, &loaded.trust, deadline) {
                 Ok(Some(outcome)) => {
                     let operation = change.operation();
-                    *pending = None;
-                    return Ok(Some(Settled { operation, outcome }));
+                    let retiring = pending
+                        .take()
+                        .ok_or(Error::Invalid)?
+                        .confirmed(outcome.clone());
+                    *pending = Some(retiring);
+                    confirmed = Some(Settled { operation, outcome });
+                    match pending.as_ref().ok_or(Error::Invalid)?.retire(
+                        &connection,
+                        &loaded.trust,
+                        deadline,
+                    ) {
+                        Ok(()) => {
+                            *pending = None;
+                            return Ok(confirmed);
+                        }
+                        Err(changes::Error::Connection(postgres_probe::Error::Transport)) => {
+                            continue
+                        }
+                        Err(_) => return Ok(confirmed),
+                    }
                 }
                 Ok(None) => return Ok(None),
                 Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
                 Err(error) => return Err(map_error(error)),
             }
         }
-        Err(Error::Invalid)
+        if confirmed.is_some() {
+            Ok(confirmed)
+        } else {
+            Err(Error::Invalid)
+        }
     }
 }
 
@@ -385,7 +433,7 @@ impl Updates<'_> {
                             } else {
                                 16
                             })
-                        + 32,
+                        + 48,
                     ..Default::default()
                 },
             )
@@ -396,6 +444,18 @@ impl Updates<'_> {
         let deadline = self.clock.deadline_instant(until)?;
         if Instant::now() >= deadline {
             return Err(Error::Deadline);
+        }
+        let retiring = matches!(
+            self.pending
+                .change
+                .try_lock()
+                .map_err(|_| Error::Busy)?
+                .as_ref(),
+            Some(Operation::Retiring(_))
+        );
+        if retiring {
+            self.pending
+                .settle(self.loaded, self.executable, self.slots, self.clock, until)?;
         }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
         if pending.is_some() {
@@ -424,7 +484,9 @@ impl Updates<'_> {
         *pending = Some(change);
         let change = pending.as_ref().ok_or(Error::Invalid)?;
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+        let mut publication_address = None;
         for address in addresses {
+            publication_address = Some(address);
             let mut connection = self.loaded.bootstrap.request(address);
             connection.mode = Mode::Runtime;
             outcome = change.publish(&connection, &self.loaded.trust, deadline, self.password);
@@ -448,7 +510,23 @@ impl Updates<'_> {
                 {
                     return Err(Error::Corrupt);
                 }
-                *pending = None;
+                let confirmed = pending
+                    .take()
+                    .ok_or(Error::Invalid)?
+                    .confirmed(outcome.clone());
+                *pending = Some(confirmed);
+                if let Some(address) = publication_address {
+                    let mut connection = self.loaded.bootstrap.request(address);
+                    connection.mode = Mode::Runtime;
+                    if pending
+                        .as_ref()
+                        .ok_or(Error::Invalid)?
+                        .retire(&connection, &self.loaded.trust, deadline)
+                        .is_ok()
+                    {
+                        *pending = None;
+                    }
+                }
                 Ok(Completion {
                     before_sequence: Sequence::from_u64(outcome.state.old_sequence),
                     outcome: Ok(Sequence::from_u64(outcome.state.new_sequence)),

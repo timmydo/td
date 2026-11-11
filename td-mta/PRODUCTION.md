@@ -604,3 +604,28 @@ sudo systemctl start td-mta-maint-scrub-status.service
 Inspect the JSON progress and retained failure identifiers before taking any
 repair action. A successful selective message read does not replace this
 whole-body check; a clean scrub does not replace a backup or restore test.
+
+## Recovering an exhausted Email mutation receipt ledger
+
+A primary account with 1024 `td_mta.flag_receipts` refuses fresh moves,
+read/star assignments and destruction with `storageWorkLimit`. The updated
+HTTP owner retires its own confirmed receipts; it does not automatically
+prune receipts left by older processes or crashes.
+
+For the one-time legacy recovery, first retain a verified database backup and
+stop all five mail services and any other process using the mutation API.
+Pause search jobs as for binary activation. Confirm there are no surviving
+mail runtime database sessions or in-process pending operations. Preserve an
+owner-only export of the exact account's receipts with the deployment record.
+Only after fencing every publisher and abandoning its old in-memory operation
+identities may the owner delete that account's `flag_receipts` in a transaction
+under its account row lock. Do not delete mail, change history, replica receipts,
+or other operation families. A cold caller retaining a Change must settle and
+relinquish it before its receipt can be retired; never resume that Change after
+cleanup. The owner SQL is an incident recovery operation, not a scheduled job.
+
+Activate the reviewed binary, verify readiness, and verify that normal client
+moves commit and the receipt count stays bounded. Retain queued client moves
+so their idempotent destination assignments can replay. A binary rollback
+cannot restore the retired receipt history; the protected export remains
+historical evidence and must not be blindly reinserted into a live ledger.

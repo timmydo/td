@@ -523,6 +523,106 @@ pub(super) fn exercise(
     };
     let email_hex = sql(fixture, "SELECT encode(id,'hex') FROM td_mta.emails");
     let email = td_mta::ids::EmailId::parse(&email_hex).unwrap();
+    // A nearly full legacy ledger must allow unlimited confirmed HTTP writes.
+    let baseline: usize = sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts")
+        .parse()
+        .unwrap();
+    let account = binding.account();
+    sql(fixture, &format!("INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex') FROM generate_series(1,{}) n", 1023 - baseline));
+    let set_flag = |flagged| {
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let mut meter = td_mta::admission::work::Meter::new(
+            until,
+            td_mta::admission::work::Charge {
+                records: 10000,
+                ..Default::default()
+            },
+        );
+        td_mta::jmap_request::dispatch::EmailMutator::update(
+            &updates,
+            td_mta::store_fs::EmailUpdateRequest {
+                account: binding.account(),
+                device: device.device_id(),
+                expected: None,
+                updates: &[td_mta::store_fs::EmailUpdate {
+                    email,
+                    mailbox: None,
+                    seen: None,
+                    flagged: Some(flagged),
+                }],
+                deadline: until,
+            },
+            &mut meter,
+        )
+    };
+    for flagged in [true, false, true] {
+        assert!(set_flag(flagged).unwrap().outcome.is_ok());
+        assert_eq!(confirmed.operation().unwrap(), None);
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
+            "1023"
+        );
+    }
+    sql(fixture, "CREATE FUNCTION public.refuse_receipt_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture retirement failure'; END $$; CREATE TRIGGER refuse_receipt_retirement BEFORE DELETE ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.refuse_receipt_retirement()");
+    assert!(
+        set_flag(false).unwrap().outcome.is_ok(),
+        "cleanup cannot erase known publication"
+    );
+    let retained = confirmed.operation().unwrap().unwrap();
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
+        "1024"
+    );
+    assert!(
+        set_flag(true).is_err(),
+        "failed retirement fences another publication"
+    );
+    assert_eq!(confirmed.operation().unwrap(), Some(retained));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"
+        ),
+        "0"
+    );
+    let cleanup_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+    let settled = confirmed
+        .settle(
+            &loaded,
+            executable,
+            &cleanup_slots,
+            &clock,
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, retained);
+    assert_eq!(
+        confirmed.operation().unwrap(),
+        Some(retained),
+        "failed cleanup preserves the fence and known outcome"
+    );
+    // Simulate a retirement COMMIT whose acknowledgement was lost.
+    sql(fixture, "DROP TRIGGER refuse_receipt_retirement ON td_mta.flag_receipts; DROP FUNCTION public.refuse_receipt_retirement()");
+    sql(
+        fixture,
+        &format!("DELETE FROM td_mta.flag_receipts WHERE operation=decode('{retained}','hex')"),
+    );
+    assert!(set_flag(true).unwrap().outcome.is_ok());
+    assert_eq!(confirmed.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
+        "1023"
+    );
+    sql(
+        fixture,
+        "DELETE FROM td_mta.flag_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
+        baseline.to_string()
+    );
+    assert!(set_flag(false).unwrap().outcome.is_ok());
     sql(fixture, "CREATE FUNCTION public.delay_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_client_commit()");
     let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
     let mut meter = td_mta::admission::work::Meter::new(
