@@ -239,3 +239,190 @@ copies of Jim Tcl's manual whole, and a 16 MiB budget four (1.45 MiB),
 but not eight. A reader whose memory cannot hold its largest input's tree
 therefore has its input limit, not its budget, cut ordinary documents,
 and a budget of some 11 times its input limit cuts only hostile ones.
+
+## Document tree
+
+The document API is a separate, bounded HTML parser for future layout.
+The resident renderer and streaming extractor keep their existing parsers:
+`to_text`, `to_rich` and both `_within` forms retain byte-identical output,
+including malformed markup, invalid UTF-8, nesting and budget cutoffs.
+Moving them onto the document tree is outside this contract. Building a
+new tree must not silently change mail, news, agent or browser rendering.
+The resident cost figures above apply to those APIs, not to this tree.
+
+### Parsing model
+
+The algorithm reference is the [WHATWG HTML parsing chapter](https://html.spec.whatwg.org/multipage/parsing.html),
+with [html5lib's tokenizer and tree-construction cases](https://github.com/html5lib/html5lib-tests)
+as independent test examples. This is a documented subset, not a claim
+of browser conformance. Input is decoded UTF-8 (`&str`); encoding sniffing
+belongs to the caller. CRLF and lone CR become LF; an initial BOM is
+ignored. NUL handling follows the tokenizer state and tree context.
+Scripts never run, the scripting flag is off, and there is no
+`document.write`, network access, speculative parser, custom-element
+callback, XML parser, shadow DOM or public fragment-parser entry point.
+
+The tokenizer implements data, RCDATA, RAWTEXT, script data (including
+escaped and double-escaped forms), PLAINTEXT, tag/end-tag and all attribute
+states, comments including bogus and abruptly closed comments, DOCTYPE
+including public/system identifiers and force-quirks, and foreign CDATA.
+Character references use the complete WHATWG named-reference data,
+including two-scalar replacements, longest matches and attribute-context
+ambiguity, and numeric replacement rules. This table is separate from the
+resident renderer's deliberately frozen reference vocabulary. Malformed
+input recovers through the corresponding states; errors are counted,
+without storing source strings per diagnostic. Processing instructions
+use the historical HTML bogus-comment recovery, including in foreign
+content; the newer processing-instruction nodes are outside this subset.
+
+Tree construction supplies implied html/head/body elements, the initial,
+before-html, before-head, in-head, in-head-noscript, after-head, in-body,
+text, in-table, in-table-text, in-caption, in-column-group, in-table-body,
+in-row, in-cell, in-template, after-body and after-after-body modes.
+Scope checks, implied end tags, active-formatting reconstruction and the
+adoption agency algorithm repair misnested formatting. The adoption
+agency's outer loop is bounded to eight iterations as in the algorithm;
+formatting duplicates use its three-entry rule. Table text is buffered
+through the next non-character token: a non-whitespace run is foster
+parented as a whole. Non-table tokens in table context use the same
+foster-parent insertion location. The historical in-select and
+in-select-in-table modes are retained for ordinary select/option markup;
+customizable select parsing is outside this subset.
+
+Template elements own a detached DocumentFragment containing their
+contents, with a template insertion-mode stack and formatting marker.
+The fragment has no parent and is not among the template's ordinary
+children. There is no template instantiation. Frameset construction is
+excluded: frameset/frame start and end tags are ignored, their other
+contents processed using the current mode; no in-frameset,
+after-frameset or after-after-frameset mode is advertised.
+
+SVG and MathML elements retain namespaces, attributes and text, with
+foreign self-closing tags and CDATA. HTML integration points and MathML
+text integration points switch back to HTML token handling; HTML breakout
+tags leave foreign content. SVG element/attribute case adjustments and
+foreign xlink/xml/xmlns attribute namespaces are retained. These are tree
+semantics only: there is no SVG/MathML renderer, geometry, resource loading
+or XML well-formedness check. Unknown HTML elements remain elements.
+
+### API and ownership
+
+`document::parse(&str)` and `parse_with_limits(&str, ParseLimits)` return
+`Result<Document, ParseError>`. A refusal returns no partial tree. Nodes
+are arena-indexed by opaque `NodeId`; no Rc, recursive node ownership or
+mutation API escapes parsing. `Document::node` validates an id and returns
+an immutable node. IDs are local to their document, not global identity.
+The document owns all names, attributes and text and does not borrow the
+input. Iteration in document order follows links, not allocation order:
+repair may move a node or allocate an ancestor after its descendants.
+
+Node kinds are Document, DocumentFragment, Element, Text, Comment and
+Doctype. Elements expose their local name, namespace (HTML, SVG or
+MathML), attributes and optional template-content id. An attribute has a
+local name, optional prefix and namespace (none, XML, XMLNS or XLink),
+and value; duplicate token attributes keep the first. Text and comment
+nodes own their contents. Doctypes retain name, optional public/system
+identifiers and force-quirks; the document reports its quirks mode.
+Nodes expose parent, first/last child and previous/next sibling ids;
+children are iterated without copying a vector. Invalid ids return None.
+Text nodes coalesce with the adjacent text at the insertion location.
+
+`html5::Tokenizer` is an incremental token iterator over a bounded `&str`,
+with explicit text-mode and foreign-CDATA controls for the tree builder.
+It emits owned tags, text, comments and doctypes. It does not guess a
+context from a start tag: only the builder knows whether that start tag
+was accepted. EOF and terminal refusal remain terminal on repeated calls.
+Callers retaining every token must budget that retained storage themselves.
+
+### Admission and work bounds
+
+`html5::ParseLimits` lets callers lower each of the following ceilings;
+values above a ceiling are clamped, zero is a valid restrictive limit.
+All arithmetic used in admission is checked or saturating. Refusal names
+its limit. Budgets are charged before allocating or extending the item
+which would exceed them, including discarded duplicate attributes,
+formatting clones and implicit elements. They are cumulative, never
+refunded after a node is moved or parsing drops a temporary token.
+
+| Constant | Ceiling | What it bounds |
+|---|---:|---|
+| `MAX_INPUT_BYTES` | 4 MiB | UTF-8 input before preprocessing/allocation |
+| `MAX_NODES` | 262,144 | All arena nodes, including document, fragments and repair clones |
+| `MAX_ATTRIBUTES` | 524,288 | Token attributes and attributes copied during repair |
+| `MAX_TREE_BYTES` | 128 MiB | Cumulative allocation charge described below |
+| `MAX_DEPTH` | 256 | Open elements and final parent-chain depth, fragment roots included |
+| `MAX_ATTRIBUTES_PER_TAG` | 256 | Attributes encountered on one tag, duplicates included |
+| `MAX_NAME_BYTES` | 1,024 | Tag, attribute and doctype names after preprocessing |
+| `MAX_ATTRIBUTE_BYTES` | 1 MiB | Each decoded attribute value |
+| `MAX_WORK` | 64 million | Tokenizer scalar transitions plus tree traversal/repair steps |
+| `MAX_ADOPTION_PASSES` | 8 | Adoption-agency outer iterations per end tag |
+| `MAX_FORMATTING_DUPLICATES` | 3 | Identical active formatting entries after the last marker |
+
+The allocation charge is `NODE_CHARGE` (256 bytes) per arena node,
+`ATTRIBUTE_CHARGE` (128 bytes) per token or copied attribute, and
+`BYTE_CHARGE` (2 bytes) per byte appended to owned strings. Token text,
+comments, names and doctype identifiers use that same string charge;
+moving a token's string into a node costs no second string charge.
+Attribute and node vector growth is covered by their fixed charges,
+parser stacks by the depth/node ceilings. The byte charge allows ordinary
+geometric string capacity growth; it is an admission model, not a promise
+about the allocator's metadata or the caller's retained source. Text and
+comment lengths need no independent ceiling beyond input, work and bytes.
+Tree edits that increase depth check the moved subtree as well as the
+insertion point. Parent links must remain acyclic on every successful
+return; exceeding depth is a refusal, never silent flattening.
+
+The tokenizer consumes input monotonically; reconsume/state transitions
+and entity scans cost work too. Tree scans (scope, formatting, ancestors,
+reparented descendants) cost work per visited entry. There is no unbounded
+recursive call chain or recursive destruction. Limits bound hostile input
+independently of how forgiving HTML recovery is. Parse-time and retained
+memory measurements on real pages supplement, rather than replace, these
+admission rules.
+
+### Styling boundary
+
+A separate std-only `td-dom` crate depends on `td-html` and `td-css` and
+owns the adapter. td-html has no CSS dependency; existing consumers gain
+no CSS closure. The adapter borrows an immutable Document and exposes
+HTML elements through `td_css::Element`, with element-only parent, child
+and sibling traversal and text-child detection excluding comments.
+Foreign elements and template fragments do not become HTML selector
+subjects or leak their descendants into that tree. HTML a/area elements
+with href are links. Caller-supplied hover/focus/checked state remains
+stable during a cascade; visited history is never exposed.
+
+An end-to-end test parses a document and computes parents before children,
+using td-css's HTML user-agent sheet, an author sheet, inline styles and
+inherited values. No existing application consumes this adapter yet.
+The future layout consumer chooses when to compute styles and retains
+only the computed values it needs; the adapter does not cache every
+property on every node.
+
+### Test contract and work order
+
+Before any implementation, a frozen copy of the current resident renderer
+is compared byte-for-byte against the working crate over deterministic
+malformed/generated documents, depth edges, references, invalid UTF-8,
+plain/rich output, widths and input/output limits, plus real pages. Run
+that scratch differential at every commit. Its baseline and downloaded
+pages are not committed. New small tests are original Rust fixtures
+adapted from named html5lib cases, with WHATWG section references; no test
+suite is vendored. Tokenizer expectations include duplicates, EOF in each
+state family, references in text/attributes, raw-text closing prefixes,
+script escapes, comments, doctypes and CDATA. Tree tests report case counts
+by insertion mode and explicitly identify excluded frameset, fragment,
+scripting and newer customizable-select/processing-instruction cases.
+
+Each configurable bound has below/at/above tests; fixed algorithm bounds
+have fixtures exercising the boundary. Tree tests assert bidirectional
+links, unique reachability, namespace handling, formatting repair,
+foster parenting and template isolation. Real-page measurements use the
+eight sites named in td-css/DESIGN.md, with page capture identity, node
+and attribute counts, parse-plus-cascade time and peak process memory.
+
+The independently landable work is: (1) this contract and renderer
+baseline; (2) tokenizer and references; (3) document tree and mode
+fixtures; (4) td-dom adapter and whole-page measurements. A renderer
+migration is deferred and requires its own deliberate compatibility
+proposal; it is not a fifth implementation step in this workstream.
