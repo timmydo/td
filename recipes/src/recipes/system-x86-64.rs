@@ -10352,7 +10352,9 @@ mod tests {
         let principals = build_principals(&SYSTEM);
         assert!(!principals.contains("application\t"));
         for table in [build_passwd(&SYSTEM), build_group(&SYSTEM)] {
-            assert!(!table.contains("tda"), "{table}");
+            for form in ["tda", "tdw"] {
+                assert!(!table.contains(form), "{form}: {table}");
+            }
         }
         for application in SYSTEM.applications {
             let rule = policy.for_name(application.name).unwrap();
@@ -17928,6 +17930,7 @@ mod principal_tests {
             "tdb1000",
             "tdp1000",
             "tda65536",
+            "tdw98304",
         ] {
             assert!(
                 registry.check_primary_name(&passwd, &group, name).is_err(),

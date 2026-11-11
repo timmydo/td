@@ -33,8 +33,8 @@ pub(crate) const KEY_TYPE: &str = "ssh-ed25519";
 const MAX_KEYS: usize = 64;
 const MAX_COMMENT: usize = 256;
 /// The account forms td-firstboot reserves for sessions and applications:
-/// one of these followed by decimal digits. The application form is the
-/// workload account ledger's.
+/// one of these followed by decimal digits. The application and the sandbox
+/// and workspace forms are the workload account ledger's.
 const RESERVED_ACCOUNT_PREFIXES: &[&str] = &[
     td_engine::workload_accounts::APPLICATION_ACCOUNT_PREFIX,
     "tdb",
@@ -42,6 +42,7 @@ const RESERVED_ACCOUNT_PREFIXES: &[&str] = &[
     "tdi",
     "tdp",
     "tdv",
+    td_engine::workload_accounts::WORKLOAD_ACCOUNT_PREFIX,
 ];
 
 pub(crate) struct ProvisionedAccount {
@@ -253,7 +254,9 @@ mod tests {
         let group = etc_table(STEM, "group").unwrap();
         let primary = primary_account::parse(&passwd).unwrap();
         assert_eq!(check_name(STEM, primary.name()), Ok(()));
-        for name in ["ada", "operator", "test", "tda", "tdb-1", "tdax1"] {
+        for name in [
+            "ada", "operator", "test", "tda", "tdb-1", "tdax1", "tdw", "tdwalter",
+        ] {
             assert_eq!(check_name(STEM, name), Ok(()), "{name}");
         }
         let mut others = 0;
@@ -267,18 +270,18 @@ mod tests {
         }
         assert!(others > 4, "{others}");
         for name in [
-            "root", "sshd", "wheel", "tda1000", "tdb1", "tdc2", "tdi3", "tdp4", "tdv1000", "",
-            "Ada", "1ada",
+            "root", "sshd", "wheel", "tda1000", "tdb1", "tdc2", "tdi3", "tdp4", "tdv1000",
+            "tdw98304", "", "Ada", "1ada",
         ] {
             assert!(check_name(STEM, name).is_err(), "{name:?}");
         }
         assert!(
             include_str!("../../../../../td-firstboot/src/principals.rs")
-                .contains(r#"if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]"#)
+                .contains(r#"if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv", "tdw"]"#)
         );
         assert_eq!(
             RESERVED_ACCOUNT_PREFIXES,
-            ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]
+            ["tda", "tdb", "tdc", "tdi", "tdp", "tdv", "tdw"]
         );
         assert!(check_name("td-no-such-recipe", "ada").is_err());
     }

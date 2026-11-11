@@ -11,12 +11,13 @@
 //! before consumers start. Readers still validate the live files; see
 //! THREAT-MODEL.md and td-install/INSTALLER.md for admission and publication.
 //!
-//! An application account is not here at all: `tda<uid>` names the workload
-//! account ledger's application row holding that uid, and no passwd or group
-//! entry may take that form or an id in a workload account range, so neither
-//! file can speak for an account of the other class (THREAT-MODEL.md §7).
+//! A workload account is not here at all: `tda<uid>` names the workload
+//! account ledger's application row holding that uid and `tdw<uid>` its
+//! sandbox or workspace row, and no passwd or group entry may take either
+//! form or an id in a workload account range, so neither file can speak for
+//! an account of the other class (THREAT-MODEL.md §7).
 
-pub use crate::workload_accounts::application_account_name as application_name;
+pub use crate::workload_accounts::ledger_account_name as ledger_name;
 use crate::workload_accounts::{self, Kind, Ledger, LEDGER_UIDS};
 use std::fs;
 
@@ -31,7 +32,7 @@ fn refuse_workload_entry(
     name: &str,
     ids: [u32; 2],
 ) -> Result<(), String> {
-    if application_name(name) || ids.iter().any(|id| LEDGER_UIDS.contains(id)) {
+    if ledger_name(name) || ids.iter().any(|id| LEDGER_UIDS.contains(id)) {
         return Err(format!(
             "{path}:{lineno}: {name:?} takes a workload account's name or id; \
              workload accounts come from the account ledger alone"
@@ -240,22 +241,21 @@ pub fn account(name: &str) -> Result<Account, String> {
     account_in(&read(PASSWD)?, PASSWD, name)
 }
 
-/// The application account `name` (`tda<uid>`), resolved from the ledger
-/// alone: its application row holds that uid. Its group is its uid, its home
-/// the private one firstboot prepares, its shell `/bin/false`; the class is
-/// the service class. passwd and group are read whole and must speak for no
-/// workload account, so no entry of either aliases this one.
-pub fn application_account_in(
+/// The workload account `name`, resolved from the ledger alone: `tda<uid>`
+/// when its application row holds that uid, `tdw<uid>` when its sandbox or
+/// workspace row does. Its group is its uid, its home the private one
+/// firstboot prepares below its kind's directory, its shell `/bin/false`;
+/// the class is the service class. passwd and group are read whole and must
+/// speak for no workload account, so no entry of either aliases this one.
+pub fn ledger_account_in(
     ledger: &Ledger,
     passwd: &str,
     group: &str,
     name: &str,
 ) -> Result<Account, String> {
-    let uid = workload_accounts::application_account_uid(name)
-        .ok_or_else(|| format!("{name:?} does not spell an application account's uid"))?;
-    ledger
-        .name(Kind::Application, uid)
-        .ok_or_else(|| format!("the account ledger holds no application account {uid}"))?;
+    let (kind, uid) = ledger.account(name).ok_or_else(|| {
+        format!("the account ledger holds no workload account {name:?} of its kind")
+    })?;
     for (lineno, line) in entries(passwd) {
         let f = fields(line, 7, PASSWD, lineno)?;
         let (Some(entry), Some(id), Some(gid)) = (f.first(), f.get(2), f.get(3)) else {
@@ -274,14 +274,18 @@ pub fn application_account_in(
         name: name.to_string(),
         uid,
         gid: uid,
-        gecos: "td application".into(),
-        home: format!("/var/lib/td/applications/{uid}"),
+        gecos: match kind {
+            Kind::Application => "td application",
+            Kind::Sandbox | Kind::Workspace => "td workload",
+        }
+        .into(),
+        home: format!("{}/{}/{uid}", workload_accounts::DIRECTORY, kind.homes()),
         shell: "/bin/false".into(),
     })
 }
 
-pub fn application_account(name: &str) -> Result<Account, String> {
-    application_account_in(
+pub fn ledger_account(name: &str) -> Result<Account, String> {
+    ledger_account_in(
         &workload_accounts::load()?,
         &read(PASSWD)?,
         &read(GROUP)?,
@@ -306,9 +310,9 @@ pub fn supplementary_in(text: &str, path: &str, user: &str) -> Result<Vec<u32>, 
         // parse would hand out a set that is quietly too small.
         let gid = number(path, lineno, "gid", gid)?;
         refuse_workload_entry(path, lineno, name, [gid, gid])?;
-        if let Some(member) = members.split(',').find(|member| application_name(member)) {
+        if let Some(member) = members.split(',').find(|member| ledger_name(member)) {
             return Err(format!(
-                "{path}:{lineno}: group {name:?} lists the application account {member:?}"
+                "{path}:{lineno}: group {name:?} lists the workload account {member:?}"
             ));
         }
         // EXACT, not trimmed: trimming is the permissive direction — it would grant
@@ -538,7 +542,7 @@ mod tests {
         assert_eq!(supplementary_in(g, GROUP, "").unwrap(), Vec::<u32>::new());
     }
 
-    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tweb\t65540\nworkspace\tagent\t98304\n";
+    const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tweb\t65540\nsandbox\tdefault\t98310\nworkspace\tagent\t98304\n";
 
     fn ledger() -> Ledger {
         Ledger::parse(LEDGER).unwrap()
@@ -548,7 +552,7 @@ mod tests {
     /// its fixed group, home and shell, and no supplementary group.
     #[test]
     fn an_application_account_comes_from_the_ledger_alone() {
-        let account = application_account_in(&ledger(), PW, GR, "tda65540").unwrap();
+        let account = ledger_account_in(&ledger(), PW, GR, "tda65540").unwrap();
         assert_eq!(
             account,
             Account {
@@ -576,18 +580,66 @@ mod tests {
             "firefox",
         ] {
             assert!(
-                application_account_in(&ledger(), PW, GR, name).is_err(),
+                ledger_account_in(&ledger(), PW, GR, name).is_err(),
                 "{name}"
             );
         }
-        assert!(application_account_in(&Ledger::default(), PW, GR, "tda65536").is_err());
+        assert!(ledger_account_in(&Ledger::default(), PW, GR, "tda65536").is_err());
         // The reserved form is `tda` and digits; other `tda` names are names.
-        assert!(application_name("tda1"));
+        assert!(ledger_name("tda1"));
         for name in ["tda", "tdadam", "tda1x", "xtda1", "TDA1"] {
-            assert!(!application_name(name), "{name}");
+            assert!(!ledger_name(name), "{name}");
         }
         let tdadam = "tdadam::1000:1000:Adam:/home/tdadam:/bin/sh\n";
         assert_eq!(account_in(tdadam, PASSWD, "tdadam").unwrap().uid, 1000);
+    }
+
+    /// `tdw<uid>` is the ledger's sandbox or workspace row holding that uid,
+    /// with its fixed group, its home below `workloads`, and no
+    /// supplementary group; an application row never answers for it, nor a
+    /// sandbox or workspace row for `tda<uid>`.
+    #[test]
+    fn a_sandbox_or_workspace_account_comes_from_the_ledger_alone() {
+        for (name, uid) in [("tdw98304", 98304), ("tdw98310", 98310)] {
+            assert_eq!(
+                ledger_account_in(&ledger(), PW, GR, name).unwrap(),
+                Account {
+                    name: name.into(),
+                    uid,
+                    gid: uid,
+                    gecos: "td workload".into(),
+                    home: format!("/var/lib/td/workloads/{uid}"),
+                    shell: "/bin/false".into(),
+                }
+            );
+            assert_eq!(
+                supplementary_in(GR, GROUP, name).unwrap(),
+                Vec::<u32>::new()
+            );
+        }
+        for name in [
+            "tdw65536",
+            "tdw65540",
+            "tdw98305",
+            "tdw098304",
+            "tdw4294967296",
+            "tdw",
+            "tdwagent",
+            "tda98310",
+            "agent",
+        ] {
+            assert!(
+                ledger_account_in(&ledger(), PW, GR, name).is_err(),
+                "{name}"
+            );
+        }
+        assert!(ledger_account_in(&Ledger::default(), PW, GR, "tdw98304").is_err());
+        assert!(ledger_name("tdw1"));
+        for name in ["tdw", "tdwalter", "tdw1x", "xtdw1", "TDW1"] {
+            assert!(!ledger_name(name), "{name}");
+        }
+        let tdwalter = "tdwalter::1000:1000:Walter:/home/tdwalter:/bin/sh\n";
+        assert_eq!(account_in(tdwalter, PASSWD, "tdwalter").unwrap().uid, 1000);
     }
 
     /// Neither file may speak for a workload account, whatever is looked up:
@@ -600,6 +652,8 @@ mod tests {
         for entry in [
             "tda65536:!td-service:65536:65536:td application:/var/lib/td/applications/65536:/bin/false",
             "tda1:!:1:1::/:/bin/false",
+            "tdw98304:!td-service:98304:98304:td workload:/var/lib/td/workloads/98304:/bin/false",
+            "tdw1:!:1:1::/:/bin/false",
             "evil::65536:65536:Evil:/home/evil:/bin/sh",
             "evil::1001:65540:Evil:/home/evil:/bin/sh",
             "evil::98304:1001:Evil:/home/evil:/bin/sh",
@@ -609,23 +663,32 @@ mod tests {
             for name in ["tester", "root", "evil"] {
                 assert!(account_in(&passwd, PASSWD, name).is_err(), "{entry}: {name}");
             }
-            assert!(
-                application_account_in(&ledger(), &passwd, GR, "tda65536").is_err(),
-                "{entry}"
-            );
+            for account in ["tda65536", "tdw98304"] {
+                assert!(
+                    ledger_account_in(&ledger(), &passwd, GR, account).is_err(),
+                    "{entry}: {account}"
+                );
+            }
         }
         for group in [
             "tda65536:x:65536:",
+            "tdw98304:x:98304:",
+            "tdw1:x:1001:",
             "apps:x:70000:",
+            "sandboxes:x:100000:",
             "audio:x:994:tda65536",
             "audio:x:994:tester,tda1",
+            "audio:x:994:tdw98304",
+            "audio:x:994:tester,tdw1",
         ] {
             let text = format!("{GR}{group}\n");
             assert!(supplementary_in(&text, GROUP, "tester").is_err(), "{group}");
-            assert!(
-                application_account_in(&ledger(), PW, &text, "tda65536").is_err(),
-                "{group}"
-            );
+            for account in ["tda65536", "tdw98304"] {
+                assert!(
+                    ledger_account_in(&ledger(), PW, &text, account).is_err(),
+                    "{group}: {account}"
+                );
+            }
         }
         // The ranges are exact: the ids beside them are ordinary.
         for id in [65534, 65535, 131072] {
@@ -639,7 +702,7 @@ mod tests {
         // A malformed id anywhere still fails the lookup.
         let broken = format!("{PW}broken:x:1001:zero:B:/home/b:/bin/sh\n");
         assert!(account_in(&broken, PASSWD, "tester").is_err());
-        assert!(application_account_in(&ledger(), &broken, GR, "tda65536").is_err());
+        assert!(ledger_account_in(&ledger(), &broken, GR, "tda65536").is_err());
     }
 
     #[test]

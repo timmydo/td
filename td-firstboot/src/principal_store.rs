@@ -52,10 +52,9 @@ pub(crate) enum GrantReply {
     Granted(Change),
     Revoked,
 }
-/// The application homes, `/var/lib/td/applications/UID`, and how many
-/// entries an allocation reads in any directory it lists: past every
-/// application uid.
-const HOMES: &str = "applications";
+/// How many entries an allocation reads in any directory it lists, the
+/// homes below `/var/lib/td/applications` and `/var/lib/td/workloads`
+/// among them: past every uid of either range.
 const MAX_HOMES: usize = 1 << 16;
 /// `flathub_app::RUNTIME_STORE`'s last component, below `/var/lib/td`, and
 /// the runtime account that owns it (`flathub_app::RUNTIME_UID`). This file
@@ -120,10 +119,13 @@ pub(crate) fn prepare_runtime_store() -> Result<(), String> {
 }
 
 /// The uid every entry of the directory `path` names after `prefix`, in
-/// canonical decimal; entries are listed, never followed. More than
-/// `MAX_HOMES` entries refuses.
-pub(crate) fn uid_entries(path: &Path, prefix: &str) -> Result<BTreeSet<u32>, String> {
-    let mut uids = BTreeSet::new();
+/// canonical decimal, added to `uids`; entries are listed, never followed.
+/// More than `MAX_HOMES` entries refuses.
+pub(crate) fn uid_entries(
+    path: &Path,
+    prefix: &str,
+    uids: &mut BTreeSet<u32>,
+) -> Result<(), String> {
     let entries =
         fs::read_dir(path).map_err(|error| format!("list {}: {error}", path.display()))?;
     for (index, entry) in entries.enumerate() {
@@ -148,7 +150,7 @@ pub(crate) fn uid_entries(path: &Path, prefix: &str) -> Result<BTreeSet<u32>, St
             uids.insert(uid);
         }
     }
-    Ok(uids)
+    Ok(())
 }
 
 /// The uids of every `/run/user/UID`, whoever owns it.
@@ -620,18 +622,41 @@ impl Directory {
     /// retained reservation of any owner names, every id `outside` reads
     /// (passwd and group, and every account cgroup and runtime directory
     /// that exists, all read here under the lock) and every home left below
-    /// `applications`: a lost ledger forgets its allocations but never
-    /// re-issues a uid whose home, cgroup or runtime remains, so a new row's
-    /// preparation finds none of them. Before anything is published the
-    /// row must pass the admission a launch applies (`launch_uid`), so an
-    /// install refuses exactly what a launch would. An absent ledger
-    /// refuses: boot seeds it before anything can install.
+    /// `applications` or `workloads`: a lost ledger forgets its allocations
+    /// but never re-issues a uid whose home, cgroup or runtime remains, so a
+    /// new row's preparation finds none of them. Before anything is
+    /// published the row must pass the admission a launch applies
+    /// (`launch_uid`), so an install refuses exactly what a launch would. An
+    /// absent ledger refuses: boot seeds it before anything can install.
     fn allocate(
         &self,
         owner: u32,
         name: &str,
         declarations: &Declarations,
         outside: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+        prepare: impl FnOnce(u32, bool) -> Result<(), String>,
+    ) -> Result<u32, String> {
+        let admit = |retained: &Registry, ledger: &Ledger, uid: u32| {
+            let policy = crate::app_policy::Policy::join(declarations.clone(), ledger.clone());
+            if launch_uid(retained, &policy, owner, name)? != uid {
+                return Err("application launch and allocation disagree".into());
+            }
+            Ok(())
+        };
+        self.allocate_account(Kind::Application, name, outside, admit, prepare)
+    }
+
+    /// The `kind` account `name` holds in the published ledger, allocated
+    /// as `allocate` allocates an application's: `admit` judges the
+    /// resulting ledger, under the lock and before anything is published,
+    /// with the retained reservations and the account's uid. Its taken set
+    /// covers every kind, so a uid one kind left is never another's.
+    fn allocate_account(
+        &self,
+        kind: Kind,
+        name: &str,
+        outside: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+        admit: impl FnOnce(&Registry, &Ledger, u32) -> Result<(), String>,
         prepare: impl FnOnce(u32, bool) -> Result<(), String>,
     ) -> Result<u32, String> {
         let _lock = self.lock()?;
@@ -642,11 +667,8 @@ impl Directory {
         let mut taken = outside()?;
         taken.extend(retained.applications().map(|application| application.uid));
         taken.extend(self.homes()?);
-        let (ledger, uid, new) = Ledger::parse(&text)?.allocate(Kind::Application, name, &taken)?;
-        let policy = crate::app_policy::Policy::join(declarations.clone(), ledger.clone());
-        if launch_uid(&retained, &policy, owner, name)? != uid {
-            return Err("application launch and allocation disagree".into());
-        }
+        let (ledger, uid, new) = Ledger::parse(&text)?.allocate(kind, name, &taken)?;
+        admit(&retained, &ledger, uid)?;
         if new {
             self.publish_as(
                 workload_accounts::FILE_NAME,
@@ -660,24 +682,37 @@ impl Directory {
         Ok(uid)
     }
 
-    /// The uids of the homes below the child `applications`; none when it
-    /// is absent.
+    /// The uids of the homes below the children `applications` and
+    /// `workloads`; none from one that is absent.
     fn homes(&self) -> Result<BTreeSet<u32>, String> {
-        self.uid_entries(HOMES, "")
+        let mut uids = BTreeSet::new();
+        self.uid_entries_into(Kind::Application.homes(), "", &mut uids)?;
+        self.uid_entries_into(Kind::Sandbox.homes(), "", &mut uids)?;
+        Ok(uids)
     }
 
     /// The uid every entry of the child directory `name` names after
     /// `prefix`, in canonical decimal, read without following links; none
     /// when the child is absent.
     fn uid_entries(&self, name: &str, prefix: &str) -> Result<BTreeSet<u32>, String> {
+        let mut uids = BTreeSet::new();
+        self.uid_entries_into(name, prefix, &mut uids)?;
+        Ok(uids)
+    }
+
+    /// `uid_entries`, added to `uids`.
+    fn uid_entries_into(
+        &self,
+        name: &str,
+        prefix: &str,
+        uids: &mut BTreeSet<u32>,
+    ) -> Result<(), String> {
         match fs::symlink_metadata(self.path(name)) {
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeSet::new())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("inspect {name}: {error}")),
         }
-        uid_entries(&self.child(name)?.path("."), prefix)
+        uid_entries(&self.child(name)?.path("."), prefix, uids)
     }
 
     fn publish(&self, name: &str, staged: &str, text: &str) -> Result<(), String> {
@@ -884,13 +919,63 @@ pub(crate) fn allocate_application(
     prior.verify_installed_accounts(&desired)?;
     let policy = crate::app_policy::load()?;
     allocatable(policy.declarations(), owner, name, flathub)?;
-    let outside = || {
-        let mut taken = crate::principals::installed_ids()?;
-        taken.extend(runtime_uids()?);
-        taken.extend(delegated()?);
-        Ok(taken)
-    };
+    let outside = || outside_ids(delegated);
     directory.allocate(owner, name, policy.declarations(), outside, prepare)
+}
+
+/// What root may allocate a workload account for: a sandbox of a session
+/// `owner` the deployment's principal table names. A workspace's account
+/// waits for td-agent's workspaces to launch through root (WORKLOADS.md
+/// step 8), and an application's is `allocate_application`'s.
+fn workload_allocatable(registry: &Registry, owner: u32, kind: Kind) -> Result<(), String> {
+    if !registry.sessions().any(|session| session.owner == owner) {
+        return Err("workload allocation names another session".into());
+    }
+    if kind != Kind::Sandbox {
+        return Err(crate::allocation::format(format_args!(
+            "{} accounts are not allocated here; only a sandbox's is",
+            kind.as_str()
+        ))
+        .unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// Root's allocation of a sandbox's account (td-authd/DESIGN.md, "Workload
+/// account ledger"): with the deployment enrolled and its accounts
+/// verified, the ledger row of the session `owner`'s `kind` workload
+/// `name`, added when absent from 98304 through 131071, and `prepare` run
+/// with its uid and whether the row is new, under the principal lock.
+/// `delegated` reads the uids of the account cgroups that exist, which a
+/// new row avoids, as do the homes, runtime directories, passwd and group
+/// ids and retained reservations an application's allocation avoids. No
+/// caller supplies a uid.
+pub(crate) fn allocate_workload(
+    owner: u32,
+    kind: Kind,
+    name: &str,
+    delegated: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+    prepare: impl FnOnce(u32, bool) -> Result<(), String>,
+) -> Result<u32, String> {
+    let desired = Registry::load()?;
+    let directory = state_directory()?;
+    let prior = directory.verify_enrolled(&desired)?;
+    prior.verify_installed_accounts(&desired)?;
+    workload_allocatable(&desired, owner, kind)?;
+    let outside = || outside_ids(delegated);
+    directory.allocate_account(kind, name, outside, |_, _, _| Ok(()), prepare)
+}
+
+/// The ids outside the state directory a new row avoids, read under the
+/// lock: every passwd and group id, every `/run/user` entry and every
+/// account cgroup `delegated` reads.
+fn outside_ids(
+    delegated: impl FnOnce() -> Result<BTreeSet<u32>, String>,
+) -> Result<BTreeSet<u32>, String> {
+    let mut taken = crate::principals::installed_ids()?;
+    taken.extend(runtime_uids()?);
+    taken.extend(delegated()?);
+    Ok(taken)
 }
 
 /// What a grant may name: an application the session `owner`'s deployment

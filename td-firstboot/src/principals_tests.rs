@@ -216,6 +216,8 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         "tda",
         "tdcarol",
         "tda99x",
+        "tdw",
+        "tdwalter",
         &"a".repeat(32),
     ] {
         registry.check_primary_name(PASSWD, GROUP, name).unwrap();
@@ -232,6 +234,8 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         "tda65536",
         "tdc1002",
         "tda99999",
+        "tdw98304",
+        "tdw7",
         "tdb0",
         "tdp0001",
         "",
@@ -298,7 +302,7 @@ fn primary_name_check_refuses_orphan_authority_and_inconsistent_tables() {
     }
 }
 
-/// An application account is a ledger row, so neither table may carry
+/// A workload account is a ledger row, so neither table may carry
 /// one: not by its name form, not by an id the ledger allocates from, and
 /// not by a retained application reservation's uid.
 #[test]
@@ -308,6 +312,8 @@ fn no_account_or_group_speaks_for_a_workload_account() {
     for row in [
         "tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false",
         "tda7:!td-service:2007:2007:A:/:/bin/false",
+        "tdw98304:!td-service:98304:98304:Sandbox:/var/lib/td/workloads/98304:/bin/false",
+        "tdw7:!td-service:2008:2008:W:/:/bin/false",
         "app::65536:1001:A:/home/app:/bin/sh",
         "app::2000:98304:A:/home/app:/bin/sh",
         "app::131071:131071:A:/home/app:/bin/sh",
@@ -323,6 +329,8 @@ fn no_account_or_group_speaks_for_a_workload_account() {
         "apps:x:65540:",
         "apps:x:98304:",
         "audio:x:994:tester,tda65536",
+        "tdw7:x:2009:",
+        "audio:x:994:tester,tdw98304",
     ] {
         let group = format!("{GROUP}{row}\n");
         assert!(registry.verify_accounts(PASSWD, &group).is_err(), "{row}");

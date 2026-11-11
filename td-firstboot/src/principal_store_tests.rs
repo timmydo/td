@@ -1175,7 +1175,8 @@ fn an_allocation_avoids_uids_with_a_cgroup_or_runtime_left() {
             .unwrap();
     }
     fs::write(cgroups.join("cgroup.procs"), b"").unwrap();
-    let delegated = uid_entries(&cgroups, "td-app-").unwrap();
+    let mut delegated = BTreeSet::new();
+    uid_entries(&cgroups, "td-app-", &mut delegated).unwrap();
     assert_eq!(delegated, BTreeSet::from([66563]));
     // A linked `user` refuses rather than being listed.
     fs::rename(&users, temp.path().join("users")).unwrap();
@@ -1207,6 +1208,181 @@ fn an_allocation_avoids_uids_with_a_cgroup_or_runtime_left() {
 /// The runtime directories a session left: 66560 through 66562.
 fn directory_uids_of_a_session() -> BTreeSet<u32> {
     BTreeSet::from([1000, 66560, 66561, 66562])
+}
+
+/// `directory`'s allocation of the sandbox `name`, avoiding `outside`,
+/// recording each preparation's uid and whether its row was new.
+fn allocate_sandbox(
+    directory: &Directory,
+    name: &str,
+    outside: BTreeSet<u32>,
+    prepared: &mut Vec<(u32, bool)>,
+) -> Result<u32, String> {
+    directory.allocate_account(
+        Kind::Sandbox,
+        name,
+        || Ok(outside),
+        |_, _, _| Ok(()),
+        |uid, fresh| {
+            prepared.push((uid, fresh));
+            Ok(())
+        },
+    )
+}
+
+/// A sandbox's account takes the lowest free uid of 98304 through 131071,
+/// never an application's, and is published at the ledger's public mode;
+/// a second allocation returns the same row, publishes nothing and
+/// prepares again, not as new. A failed preparation keeps the row.
+#[test]
+fn a_sandbox_allocation_takes_a_workload_uid_once() {
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let mut prepared = Vec::new();
+    let uid = allocate_sandbox(&directory, "default", BTreeSet::new(), &mut prepared).unwrap();
+    assert_eq!(uid, 98304);
+    let path = directory.path(workload_accounts::FILE_NAME);
+    let published = fs::metadata(&path).unwrap();
+    assert_eq!(published.mode() & 0o7777, 0o644);
+    assert_eq!(
+        account_ledger(&directory).unwrap(),
+        format!("{SEEDED}sandbox\tdefault\t98304\n")
+    );
+    assert!(!directory.path(ACCOUNTS_STAGED).exists());
+    assert_eq!(
+        allocate_sandbox(&directory, "default", BTreeSet::new(), &mut prepared).unwrap(),
+        98304
+    );
+    assert_eq!(prepared, [(98304, true), (98304, false)]);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), published.ino());
+    // An application's allocation is untouched by the sandbox's, and the
+    // next sandbox takes the next workload uid.
+    assert_eq!(
+        allocate_into(&directory, "photo", &mut Vec::new()).unwrap(),
+        66560
+    );
+    assert_eq!(
+        allocate_sandbox(&directory, "tools", BTreeSet::new(), &mut Vec::new()).unwrap(),
+        98305
+    );
+    assert!(directory
+        .allocate_account(
+            Kind::Sandbox,
+            "broken",
+            no_ids,
+            |_, _, _| Ok(()),
+            |_, _| Err("no cgroup".into()),
+        )
+        .is_err());
+    let ledger = Ledger::parse(&account_ledger(&directory).unwrap()).unwrap();
+    assert_eq!(ledger.uid_of(Kind::Sandbox, "broken"), Some(98306));
+    assert_eq!(ledger.uid_of(Kind::Sandbox, "default"), Some(98304));
+    prepared.clear();
+    assert_eq!(
+        allocate_sandbox(&directory, "broken", BTreeSet::new(), &mut prepared).unwrap(),
+        98306
+    );
+    assert_eq!(prepared, [(98306, false)]);
+    // A refusal by `admit` publishes and prepares nothing.
+    let before = account_ledger(&directory);
+    assert!(directory
+        .allocate_account(
+            Kind::Sandbox,
+            "refused",
+            no_ids,
+            |_, _, _| Err("refused".into()),
+            |_, _| Err("prepared".into()),
+        )
+        .is_err());
+    assert_eq!(account_ledger(&directory), before);
+    temp.cleanup().unwrap();
+}
+
+/// A sandbox's new row avoids every uid another row holds, whatever its
+/// kind, every id read outside the state directory (passwd, group, an
+/// account cgroup, a runtime directory) and every home left below
+/// `workloads` or `applications`; a linked `workloads` refuses.
+#[test]
+fn a_sandbox_allocation_avoids_rows_ids_and_left_homes() {
+    let workspace = format!("{SEEDED}workspace\tagent\t98304\n");
+    let (temp, directory) =
+        allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(&workspace));
+    // A sandbox may share a workspace's name, never its uid.
+    assert_eq!(
+        allocate_sandbox(&directory, "agent", BTreeSet::new(), &mut Vec::new()).unwrap(),
+        98305
+    );
+    temp.cleanup().unwrap();
+
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    assert_eq!(
+        allocate_sandbox(
+            &directory,
+            "default",
+            BTreeSet::from([98304, 98306]),
+            &mut Vec::new()
+        )
+        .unwrap(),
+        98305
+    );
+    temp.cleanup().unwrap();
+
+    // A lost ledger forgot 98304 and 98305, whose homes remain, and 98306,
+    // left among the application homes; a link or a non-numeric entry
+    // names no uid.
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    for (parent, names) in [
+        ("workloads", &["98304", "98305", "098307"][..]),
+        ("applications", &["98306"][..]),
+    ] {
+        let homes = temp.path().join(parent);
+        DirBuilder::new().mode(0o755).create(&homes).unwrap();
+        for name in names {
+            DirBuilder::new()
+                .mode(0o700)
+                .create(homes.join(name))
+                .unwrap();
+        }
+    }
+    std::os::unix::fs::symlink("98304", temp.path().join("workloads/98308")).unwrap();
+    let mut prepared = Vec::new();
+    assert_eq!(
+        allocate_sandbox(&directory, "default", BTreeSet::new(), &mut prepared).unwrap(),
+        98307
+    );
+    assert_eq!(prepared, [(98307, true)]);
+    temp.cleanup().unwrap();
+
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let elsewhere = notebook_temp::TempDir::new("td-workload-homes").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), temp.path().join("workloads")).unwrap();
+    assert!(allocate_sandbox(&directory, "default", BTreeSet::new(), &mut Vec::new()).is_err());
+    assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    temp.cleanup().unwrap();
+
+    // With every workload uid taken there is none to give.
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let everything: BTreeSet<u32> = workload_accounts::WORKLOAD_UIDS.collect();
+    assert!(allocate_sandbox(&directory, "default", everything, &mut Vec::new()).is_err());
+    assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    temp.cleanup().unwrap();
+}
+
+/// Only a session owner's sandbox is allocated here: a workspace's waits
+/// for step 8, and an application's is the install's.
+#[test]
+fn only_a_sessions_sandbox_is_allocatable_as_a_workload() {
+    let registry = Registry::parse(SESSION).unwrap();
+    workload_allocatable(&registry, 1000, Kind::Sandbox).unwrap();
+    for (owner, kind) in [
+        (1001, Kind::Sandbox),
+        (1000, Kind::Workspace),
+        (1000, Kind::Application),
+    ] {
+        assert!(
+            workload_allocatable(&registry, owner, kind).is_err(),
+            "{owner} {kind:?}"
+        );
+    }
 }
 
 /// A grant request's table: the seed published as boot publishes it.

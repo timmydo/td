@@ -133,8 +133,9 @@ The 1000:1000 ownership is authority shared by every unconfined process with
 that uid, not a same-uid security boundary. Confined applications cannot reach
 cgroupfs; other uid-1000 session components are trusted by this design.
 
-Activated application accounts use sibling `td-app-UID` delegations, and
-the desktop's Flathub runtime account the sibling `td-runtimes`.
+Activated application accounts use sibling `td-app-UID` delegations,
+sandbox and workspace accounts sibling `td-workload-UID` ones, and the
+desktop's Flathub runtime account the sibling `td-runtimes`.
 Their provisioner is td-firstboot after durable account validation, with
 this root controller setup as a prerequisite. It requires empty domain
 subtrees and reads back controller and ownership changes before reporting

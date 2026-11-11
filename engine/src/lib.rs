@@ -282,6 +282,132 @@ mod account_ledger_reader {
         assert_eq!(APPLICATION_UIDS.end() + 1, *WORKLOAD_UIDS.start());
         assert_eq!(LEDGER_UIDS.end(), WORKLOAD_UIDS.end());
     }
+
+    /// `tdw` and canonical digits is the sandbox and workspace account
+    /// form; either reserved form is a ledger account's name.
+    #[test]
+    fn the_workload_account_name_spells_a_uid() {
+        use crate::workload_accounts::{
+            application_account_name, ledger_account_name, workload_account_name,
+            workload_account_uid,
+        };
+        assert_eq!(workload_account_uid("tdw98304"), Some(98304));
+        assert_eq!(workload_account_uid("tdw7"), Some(7));
+        for name in ["tdw098304", "tdw4294967296"] {
+            assert!(workload_account_name(name));
+            assert_eq!(workload_account_uid(name), None, "{name}");
+        }
+        for name in [
+            "tdw", "tdwalter", "tdw1x", "xtdw1", "TDW1", "tdw-1", "tda1", "",
+        ] {
+            assert!(!workload_account_name(name), "{name}");
+            assert_eq!(workload_account_uid(name), None);
+        }
+        for name in ["tda65536", "tdw98304", "tda0", "tdw0"] {
+            assert!(ledger_account_name(name), "{name}");
+        }
+        for name in ["tdb1", "tdv1000", "tda", "tdw", "tdwalter", "tdadam", ""] {
+            assert!(!ledger_account_name(name), "{name}");
+        }
+        assert!(!application_account_name("tdw98304"));
+    }
+
+    /// Each ledger range has its own delegation; nothing outside them has
+    /// one here.
+    #[test]
+    fn a_ledger_accounts_delegation_follows_its_range() {
+        use crate::workload_accounts::delegation;
+        for uid in [65536, 66560, 98303] {
+            assert_eq!(
+                delegation(uid).map(|name| name.to_string()),
+                Some(format!("td-app-{uid}"))
+            );
+        }
+        for uid in [98304, 100000, 131071] {
+            assert_eq!(
+                delegation(uid).map(|name| name.to_string()),
+                Some(format!("td-workload-{uid}"))
+            );
+        }
+        for uid in [0, 998, 1000, 65535, 131072, u32::MAX] {
+            assert_eq!(delegation(uid), None, "{uid}");
+        }
+    }
+
+    /// Sandbox and workspace rows together stop at `WORKLOAD_ROWS`, so
+    /// cycling sandbox names cannot spend the ledger's rows: an application
+    /// is still allocated at the bound, an existing row still returned, and
+    /// a ledger already past it still parses.
+    #[test]
+    fn workload_rows_stop_at_their_bound_and_leave_applications_room() {
+        use crate::workload_accounts::{Kind, Ledger, WORKLOAD_ROWS};
+        use std::collections::BTreeSet;
+        let ledger = |sandboxes: usize, workspaces: usize| {
+            let mut text = String::from("td-accounts-v1\napplication\tfirefox\t65536\n");
+            for index in 0..sandboxes {
+                text.push_str(&format!("sandbox\ts{index:05}\t{}\n", 98304 + index));
+            }
+            for index in 0..workspaces {
+                text.push_str(&format!(
+                    "workspace\tw{index:05}\t{}\n",
+                    98304 + sandboxes + index
+                ));
+            }
+            Ledger::parse(&text).unwrap()
+        };
+        let none = BTreeSet::new();
+        let below = ledger(WORKLOAD_ROWS - 1001, 1000);
+        let (at, uid, new) = below.allocate(Kind::Sandbox, "last", &none).unwrap();
+        assert!(new);
+        assert_eq!(uid, 98304 + u32::try_from(WORKLOAD_ROWS).unwrap() - 1);
+        for full in [at, ledger(WORKLOAD_ROWS, 0), ledger(0, WORKLOAD_ROWS)] {
+            for kind in [Kind::Sandbox, Kind::Workspace] {
+                assert!(full.allocate(kind, "more", &none).is_err(), "{kind:?}");
+            }
+            let (_, uid, new) = full.allocate(Kind::Application, "photo", &none).unwrap();
+            assert_eq!((uid, new), (66560, true));
+        }
+        let full = ledger(WORKLOAD_ROWS, 0);
+        assert_eq!(
+            full.allocate(Kind::Sandbox, "s00007", &none).unwrap(),
+            (full.clone(), 98311, false)
+        );
+        // Parsing never applies the bound.
+        let past = ledger(WORKLOAD_ROWS + 1, 0);
+        assert!(past.allocate(Kind::Sandbox, "more", &none).is_err());
+    }
+
+    /// A reserved name resolves only to a row of a kind its form names:
+    /// `tda` an application's, `tdw` a sandbox's or a workspace's.
+    #[test]
+    fn a_reserved_name_resolves_only_from_its_kinds_rows() {
+        use crate::workload_accounts::{Kind, Ledger};
+        let ledger = Ledger::parse(concat!(
+            "td-accounts-v1\n",
+            "application\tfirefox\t65536\n",
+            "sandbox\tdefault\t98304\n",
+            "workspace\tagent\t98305\n",
+        ))
+        .unwrap();
+        assert_eq!(ledger.account("tda65536"), Some((Kind::Application, 65536)));
+        assert_eq!(ledger.account("tdw98304"), Some((Kind::Sandbox, 98304)));
+        assert_eq!(ledger.account("tdw98305"), Some((Kind::Workspace, 98305)));
+        for name in [
+            "tdw65536",
+            "tda98304",
+            "tdw98306",
+            "tda65537",
+            "tdw098304",
+            "firefox",
+            "default",
+            "",
+        ] {
+            assert_eq!(ledger.account(name), None, "{name}");
+        }
+        assert_eq!(Kind::Application.homes(), "applications");
+        assert_eq!(Kind::Sandbox.homes(), "workloads");
+        assert_eq!(Kind::Workspace.homes(), "workloads");
+    }
 }
 
 /// Hash-visible EROFS producer format. Change when packed bytes change.

@@ -8,6 +8,13 @@ mod host_path;
 mod relay;
 mod state;
 mod wire;
+// The workload account ledger's name grammar, which a profile's name must
+// meet to become a sandbox account (td-authd/DESIGN.md, "Workload account
+// ledger"); a test pins how the two grammars relate.
+#[cfg(test)]
+#[allow(dead_code, reason = "tests compare its name grammar with a profile's")]
+#[path = "../../engine/src/workload_accounts.rs"]
+mod workload_accounts;
 
 use std::ffi::OsString;
 use std::fs;

@@ -8857,9 +8857,10 @@ Firefox runs under external service UID 65536, and td's own browser,
 `web` (td-web/DESIGN.md §3), under 65540, `tda65540`. Each is the
 workload account ledger's application row of its name, which firstboot
 seeds with these carried rows; no passwd or group entry names an
-application account, and td-login resolves `tda<uid>` from the ledger
-alone. The source-built mail and news applications run as the login
-user, UID 1000, inside td-jail. Their 65537 and 65538 ledger rows remain
+application account, or a sandbox's or workspace's (`tdw<uid>`), and
+td-login resolves either form from the ledger alone. The source-built
+mail and news applications run as the login user, UID 1000, inside
+td-jail. Their 65537 and 65538 ledger rows remain
 and are never reused, as is Claude Code's 65539 (§W.9); firstboot
 prepares neither private homes nor service runtimes for those personal
 applications. The declarations name each installed application's class,
@@ -10031,7 +10032,8 @@ deferring them. The shape:
   credentials. Stage 1 therefore starts in the session leaf; when it moves
   blocked stage 2 into a sibling per-instance leaf, the delegated root is the
   source/destination common ancestor and uid 1000 owns the required control files.
-  Activated app accounts select `td-app-APP_UID/session` instead, and the
+  Activated app accounts select `td-app-APP_UID/session` instead, sandbox
+  and workspace accounts `td-workload-UID/session`, and the
   Flathub runtime account (UID 998) `td-runtimes/session`. Firstboot
   prepares the installed assignments' sibling delegations after td-svc's root
   controller setup, then their private `/run/user/APP_UID` directories. The

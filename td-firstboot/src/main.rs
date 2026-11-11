@@ -15,6 +15,11 @@
 //! the one program in the image that already has the required key implementation, so this
 //! crate stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
+// td-alloc's fallible growth, mounted by path as direct-rustc consumers
+// mount it (td-alloc/DESIGN.md).
+#[path = "../../td-alloc/src/lib.rs"]
+#[allow(dead_code, reason = "td-firstboot formats and copies text through it")]
+mod allocation;
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code, reason = "shared immutable application assignments")]
 mod app_policy;
@@ -93,12 +98,12 @@ mod ssh_render;
     reason = "shared sealed-store format and root enrollment entry points"
 )]
 mod tpm;
-// The workload account ledger: principal_store seeds it, the application
-// policy reads it.
+// The workload account ledger: principal_store seeds it and allocates in it,
+// the application policy reads it.
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(
     dead_code,
-    reason = "the ledger's readers share the file; firstboot uses its seed and reader"
+    reason = "the ledger's readers share the file; firstboot uses its seed, reader, allocator, name forms and delegations"
 )]
 mod workload_accounts;
 // The workload grant table: principal_store seeds it once.
@@ -126,6 +131,8 @@ const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
 /// `allocate-application`'s reply, then a tab and the uid: td-authd's
 /// application cache operation reads exactly this line.
 const ALLOCATED_MARKER: &str = "TD-APPLICATION-ALLOCATED";
+/// `allocate-workload`'s reply, then a tab and the uid.
+const WORKLOAD_ALLOCATED_MARKER: &str = "TD-WORKLOAD-ALLOCATED";
 /// `grant-table`'s replies, which td-authd's grant requests read exactly:
 /// a listing's first line, then a tab and its row count, then one
 /// `ACCESS<TAB>PATH` line per row; or one line saying what a change did.
@@ -306,6 +313,12 @@ fn main() -> ExitCode {
             emit_err(&format!("td-firstboot: {message}\n{}", usage()));
             ExitCode::from(2)
         }
+        // A refused allocation carries no text of its own: it is reported
+        // from static text, which needs none.
+        Err(Failure::Failed(message)) if message.is_empty() => {
+            emit_err("td-firstboot: allocation refused\n");
+            ExitCode::FAILURE
+        }
         Err(Failure::Failed(message)) => {
             emit_err(&format!("td-firstboot: {message}\n"));
             ExitCode::FAILURE
@@ -341,6 +354,7 @@ fn usage() -> String {
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
          td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n  \
+         td-firstboot allocate-workload OWNER sandbox NAME allocates a sandbox's account when absent and prepares its home and cgroup\n  \
          td-firstboot grant-table OWNER list|grant|revoke KIND NAME [ro|rw] [PATH] lists an account's directory grants, or grants or revokes one of the human's directories\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
@@ -433,6 +447,26 @@ fn run_with_primary(
             )
             .map_err(Failure::Failed)?;
             return emit(&format!("{ALLOCATED_MARKER}\t{uid}\n")).map_err(Failure::Failed);
+        }
+        Invocation::AllocateWorkload(owner, kind, name) => {
+            // An empty home of its own and its delegation; /sys/fs/cgroup is
+            // volatile, so the root launch that runs it ensures the
+            // delegation again each boot.
+            let uid = principal_store::allocate_workload(
+                owner,
+                kind,
+                &name,
+                application_runtime::delegated_uids,
+                |uid, fresh| {
+                    application_state::create_workload(uid, fresh)?;
+                    application_runtime::ensure(uid, fresh)
+                },
+            )
+            .map_err(Failure::Failed)?;
+            // Written as it is formatted: once the account is allocated,
+            // no allocation can fail its reply.
+            return emit_args(format_args!("{WORKLOAD_ALLOCATED_MARKER}\t{uid}\n"))
+                .map_err(Failure::Failed);
         }
         Invocation::GrantTable(owner, kind, name, verb) => {
             let reply =
@@ -609,6 +643,9 @@ enum Invocation {
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     AllocateApplication(u32, String),
+    /// A workload account's allocation: the session owner, the kind and
+    /// the name.
+    AllocateWorkload(u32, workload_accounts::Kind, String),
     /// A grant request: the session owner, and the account and verb.
     GrantTable(
         u32,
@@ -634,11 +671,7 @@ fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
     let [_, owner, verb, kind, name, rest @ ..] = args else {
         return Err(usage());
     };
-    let uid = owner
-        .parse::<u32>()
-        .ok()
-        .filter(|uid| (1000..=65533).contains(uid) && uid.to_string() == *owner)
-        .ok_or_else(|| Failure::Usage("invalid grant owner".into()))?;
+    let uid = session_owner(owner).ok_or_else(|| Failure::Usage("invalid grant owner".into()))?;
     let kind = workload_accounts::Kind::parse(kind)
         .ok_or_else(|| Failure::Usage("invalid grant account kind".into()))?;
     if !workload_accounts::valid_name(name) {
@@ -654,6 +687,35 @@ fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
         _ => return Err(usage()),
     };
     Ok(Invocation::GrantTable(uid, kind, name.clone(), verb))
+}
+
+/// `allocate-workload OWNER KIND NAME`: a canonical session owner, a known
+/// kind and a name in the ledger's grammar. Which kinds are allocated is
+/// `principal_store`'s rule: a sandbox's account only, today.
+fn allocate_workload_invocation(args: &[String]) -> Result<Invocation, Failure> {
+    let [_, owner, kind, name] = args else {
+        return Err(Failure::Usage(
+            "allocate-workload requires OWNER KIND NAME".into(),
+        ));
+    };
+    let uid =
+        session_owner(owner).ok_or_else(|| Failure::Usage("invalid workload owner".into()))?;
+    let kind = workload_accounts::Kind::parse(kind)
+        .ok_or_else(|| Failure::Usage("invalid workload account kind".into()))?;
+    if !workload_accounts::valid_name(name) {
+        return Err(Failure::Usage("invalid workload account name".into()));
+    }
+    let name = allocation::string(name).map_err(|_| Failure::Failed(String::new()))?;
+    Ok(Invocation::AllocateWorkload(uid, kind, name))
+}
+
+/// A session owner's uid as td-authd spells it: canonical decimal in the
+/// human range.
+fn session_owner(owner: &str) -> Option<u32> {
+    owner
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| (1000..=65533).contains(uid) && uid.to_string() == *owner)
 }
 
 /// What `grant-table` prints for td-authd: a listing's count and rows, or
@@ -811,6 +873,12 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
 
     if args.first().is_some_and(|first| first == "grant-table") {
         return grant_table_invocation(args);
+    }
+    if args
+        .first()
+        .is_some_and(|first| first == "allocate-workload")
+    {
+        return allocate_workload_invocation(args);
     }
 
     if args
@@ -1800,8 +1868,14 @@ fn write_durably_owned(
 /// panics on a failed write and Rust leaves SIGPIPE ignored, so `td-firstboot |
 /// head` would abort — which the no-panic rule forbids.
 fn emit(text: &str) -> Result<(), String> {
+    emit_args(format_args!("{text}"))
+}
+
+/// `emit` of what `args` formats, written as it is formatted: nothing is
+/// allocated before the write.
+fn emit_args(args: std::fmt::Arguments<'_>) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
-    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+    match out.write_fmt(args).and_then(|()| out.flush()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -1958,6 +2032,7 @@ mod tests {
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::AllocateApplication(..)
+            | Invocation::AllocateWorkload(..)
             | Invocation::GrantTable(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
@@ -1988,6 +2063,42 @@ mod tests {
                     parse(&arguments.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
                 );
             }
+        }
+    }
+
+    /// A workload allocation names a canonical owner, a known kind and a
+    /// name in the ledger's grammar, and nothing else; which kinds are
+    /// allocated is the store's rule.
+    #[test]
+    fn workload_allocations_take_an_owner_a_kind_and_a_name() {
+        use workload_accounts::Kind;
+        let parsed = |arguments: &[&str]| {
+            let mut all = vec!["allocate-workload".to_string()];
+            all.extend(arguments.iter().map(|a| (*a).to_string()));
+            parse(&all)
+        };
+        assert!(matches!(
+            parsed(&["1000", "sandbox", "default"]),
+            Ok(Invocation::AllocateWorkload(1000, Kind::Sandbox, name)) if name == "default"
+        ));
+        assert!(matches!(
+            parsed(&["1000", "workspace", "agent"]),
+            Ok(Invocation::AllocateWorkload(1000, Kind::Workspace, _))
+        ));
+        for arguments in [
+            &[][..],
+            &["1000", "sandbox"],
+            &["1000", "sandbox", "default", "extra"],
+            &["01000", "sandbox", "default"],
+            &["0", "sandbox", "default"],
+            &["65534", "sandbox", "default"],
+            &["1000", "Sandbox", "default"],
+            &["1000", "service", "default"],
+            &["1000", "sandbox", "Default"],
+            &["1000", "sandbox", "../default"],
+            &["1000", "sandbox", ""],
+        ] {
+            assert!(parsed(arguments).is_err(), "{arguments:?}");
         }
     }
 

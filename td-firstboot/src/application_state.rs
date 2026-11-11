@@ -1,7 +1,9 @@
-//! Each application account's private, root-controlled home: made at boot,
-//! with the human's legacy state moved into it for an application whose
-//! account predates the workload account ledger, or empty for one an
-//! install allocated, then, while the human's session runs, by the install.
+//! Each workload account's private, root-controlled home. An application's
+//! is made at boot, with the human's legacy state moved into it for an
+//! application whose account predates the workload account ledger, or empty
+//! for one an install allocated, then, while the human's session runs, by
+//! the install. A sandbox's or workspace's is made empty when root
+//! allocates its account.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
@@ -115,7 +117,9 @@ fn staging_child(
     Ok(child)
 }
 
-fn root_chain(place: &Place) -> io::Result<File> {
+/// The root-owned mode-0755 directory `homes` below `place`'s chain, made
+/// when absent.
+fn root_chain(place: &Place, homes: &str) -> io::Result<File> {
     let ids = place.ids;
     let mut current = directory(Path::new(place.top))?;
     for name in place.chain {
@@ -133,7 +137,7 @@ fn root_chain(place: &Place) -> io::Result<File> {
             "application state parent permits an untrusted writer",
         ));
     }
-    root_child(ids, &current, "applications", 0o755, place.root)
+    root_child(ids, &current, homes, 0o755, place.root)
 }
 
 fn migration_lock(ids: &dyn Ownership, base: &File, root: Owner) -> io::Result<File> {
@@ -207,8 +211,16 @@ fn boot(
     uid: u32,
     account: Owner,
 ) -> Result<(), String> {
-    let source = migrates(uid).then_some(former);
-    home(place, source, application, account, false)
+    let former = migrates(uid).then_some(former);
+    home(
+        place,
+        Purpose::Application {
+            application,
+            former,
+        },
+        account,
+        false,
+    )
 }
 
 fn migrates(uid: u32) -> bool {
@@ -224,7 +236,51 @@ fn migrates(uid: u32) -> bool {
 /// so this is a defence. The caller holds the principal lock.
 pub(crate) fn create(application: &str, uid: u32, fresh: bool) -> Result<(), String> {
     validate(application, uid)?;
-    home(&LIVE, None, application, (uid, uid), fresh)
+    home(
+        &LIVE,
+        Purpose::Application {
+            application,
+            former: None,
+        },
+        (uid, uid),
+        fresh,
+    )
+}
+
+/// The home of a sandbox's or workspace's account, `workloads/UID`
+/// (WORKLOADS.md, "Accounts"): an empty directory of the account's own at
+/// mode 0700, below a root-owned mode-0755 `workloads` made when absent.
+/// Nothing of the human's is moved in; a published home is left as it
+/// stands, root's interrupted creation, empty, is completed, and a `fresh`
+/// account refuses any existing home, as `create` does. The caller holds
+/// the principal lock.
+pub(crate) fn create_workload(uid: u32, fresh: bool) -> Result<(), String> {
+    if !crate::workload_accounts::WORKLOAD_UIDS.contains(&uid) {
+        return Err("invalid workload account uid".into());
+    }
+    home(&LIVE, Purpose::Workload, (uid, uid), fresh)
+}
+
+/// Whose home `home` prepares.
+#[derive(Clone, Copy)]
+enum Purpose<'a> {
+    /// An application's, `applications/UID`, holding its `.td/app/APP`,
+    /// with `former`'s legacy state moved in when there is one.
+    Application {
+        application: &'a str,
+        former: Option<&'a ApplicationHome>,
+    },
+    /// A sandbox's or workspace's, `workloads/UID`, empty.
+    Workload,
+}
+
+impl Purpose<'_> {
+    fn homes(self) -> &'static str {
+        match self {
+            Self::Application { .. } => crate::workload_accounts::Kind::Application.homes(),
+            Self::Workload => crate::workload_accounts::Kind::Sandbox.homes(),
+        }
+    }
 }
 
 fn validate(application: &str, uid: u32) -> Result<(), String> {
@@ -243,19 +299,19 @@ fn validate(application: &str, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// The private home `applications/UID` of `place`, published to `account`
-/// once complete, with `former`'s state moved into it when there is one.
-fn home(
-    place: &Place,
-    former: Option<&ApplicationHome>,
-    application: &str,
-    account: Owner,
-    fresh: bool,
-) -> Result<(), String> {
+/// The private home of `place` that `purpose` names, published to `account`
+/// once complete: an application's with its `.td/app/APP`, and `former`'s
+/// state moved into it when there is one; a workload's empty. Only
+/// application homes migrate, so only they take the migration lock; a
+/// workload's is made under the principal lock alone.
+fn home(place: &Place, purpose: Purpose, account: Owner, fresh: bool) -> Result<(), String> {
     let (root, ids) = (place.root, place.ids);
     let result = (|| {
-        let base = root_chain(place)?;
-        let _migration = migration_lock(ids, &base, root)?;
+        let base = root_chain(place, purpose.homes())?;
+        let _migration = match purpose {
+            Purpose::Application { .. } => Some(migration_lock(ids, &base, root)?),
+            Purpose::Workload => None,
+        };
         let name = account.0.to_string();
         match directory(&at(&base, &name)) {
             Ok(_) if fresh => {
@@ -263,25 +319,41 @@ fn home(
             }
             Ok(existing) => {
                 let metadata = existing.metadata()?;
-                if matches_owner(ids, &metadata, account) && metadata.mode() & 0o7777 == 0o700 {
+                if matches_owner(ids, &metadata, account) {
+                    // Published: the account may have changed its own
+                    // home's mode, which must not refuse every later
+                    // preparation; root restores 0700 through the
+                    // unfollowed descriptor and keeps the contents.
+                    if metadata.mode() & 0o7777 != 0o700 {
+                        existing.set_permissions(Permissions::from_mode(0o700))?;
+                        existing.sync_all()?;
+                    }
                     return Ok(());
                 }
                 if !matches_owner(ids, &metadata, root) || metadata.mode() & 0o7777 & !0o700 != 0 {
-                    return Err(invalid(
-                        "application home has invalid ownership or permissions",
-                    ));
+                    return Err(invalid("home has invalid ownership or permissions"));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         let private = root_child(ids, &base, &name, 0o700, root)?;
-        let state = staging_child(ids, &private, ".td", 0o700, root, account)?;
-        let applications = staging_child(ids, &state, "app", 0o700, root, account)?;
-        migrate(ids, former, application, account, &applications, root)?;
-        for child in [&applications, &state] {
-            ids.give(child, account)?;
-            child.sync_all()?;
+        match purpose {
+            Purpose::Application {
+                application,
+                former,
+            } => {
+                let state = staging_child(ids, &private, ".td", 0o700, root, account)?;
+                let applications = staging_child(ids, &state, "app", 0o700, root, account)?;
+                migrate(ids, former, application, account, &applications, root)?;
+                for child in [&applications, &state] {
+                    ids.give(child, account)?;
+                    child.sync_all()?;
+                }
+            }
+            // Nothing is made inside; an unpublished home holding anything
+            // was not left by this creation.
+            Purpose::Workload => require_empty(&private)?,
         }
         // All child metadata and rename publications precede removal of this
         // root-owned barrier. Interrupted conversion stays inaccessible.
@@ -289,7 +361,16 @@ fn home(
         private.sync_all()?;
         base.sync_all()
     })();
-    result.map_err(|error| format!("prepare application {application} state: {error}"))
+    result.map_err(|error| match purpose {
+        Purpose::Application { application, .. } => {
+            format!("prepare application {application} state: {error}")
+        }
+        Purpose::Workload => crate::allocation::format(format_args!(
+            "prepare workload account {} home: {error}",
+            account.0
+        ))
+        .unwrap_or_default(),
+    })
 }
 
 fn legacy_parent(ids: &dyn Ownership, former: &ApplicationHome) -> io::Result<Option<File>> {
@@ -402,7 +483,7 @@ fn migrate(
 fn require_empty(entry: &File) -> io::Result<()> {
     if fs::read_dir(at(entry, "."))?.next().transpose()?.is_some() {
         return Err(invalid(
-            "interrupted empty application creation contains unexpected state",
+            "interrupted empty creation contains unexpected state",
         ));
     }
     Ok(())
@@ -580,6 +661,7 @@ mod tests {
 
     const ROOT: Owner = (0, 0);
     const ACCOUNT: Owner = (66560, 66560);
+    const WORKLOAD: Owner = (98304, 98304);
     const HUMAN: Owner = (1000, 1000);
 
     /// A scratch `applications` tree owned by root, and a human home.
@@ -629,7 +711,22 @@ mod tests {
         }
 
         fn create(&self, fresh: bool) -> Result<(), String> {
-            home(&self.place(), None, "photo", self.account, fresh)
+            let purpose = Purpose::Application {
+                application: "photo",
+                former: None,
+            };
+            home(&self.place(), purpose, self.account, fresh)
+        }
+
+        fn workload(&self, fresh: bool) -> Result<(), String> {
+            home(&self.place(), Purpose::Workload, WORKLOAD, fresh)
+        }
+
+        fn workload_home(&self) -> PathBuf {
+            self.temp
+                .path()
+                .join("workloads")
+                .join(WORKLOAD.0.to_string())
         }
 
         fn boot(&self, application: &str, uid: u32) -> Result<(), String> {
@@ -691,6 +788,123 @@ mod tests {
         assert_eq!(fs::read(home.join(".td/app/photo/kept")).unwrap(), b"state");
         assert!(homes.create(true).is_err());
         assert_eq!(fs::read(home.join(".td/app/photo/kept")).unwrap(), b"state");
+    }
+
+    /// A sandbox's home is `workloads/UID`, empty and the account's alone at
+    /// 0700, below a root-owned 0755 `workloads` made when absent; nothing
+    /// of the human's and no application layout goes in. A repeat finds it
+    /// as it stands; a new row refuses it as another's leftover.
+    #[test]
+    fn a_workload_home_is_empty_and_the_accounts_own() {
+        let homes = Homes::new();
+        let record = homes.legacy("photo");
+        homes.workload(true).unwrap();
+        let workloads = homes.temp.path().join("workloads");
+        assert_eq!(homes.owner(&workloads), homes.root);
+        assert_eq!(fs::metadata(&workloads).unwrap().mode() & 0o7777, 0o755);
+        let home = homes.workload_home();
+        assert_eq!(homes.owner(&home), WORKLOAD);
+        assert_eq!(fs::metadata(&home).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+        // No migration lock beside it, no application home, and the
+        // human's state where it was.
+        assert_eq!(fs::read_dir(&workloads).unwrap().count(), 1);
+        assert!(!homes.temp.path().join("applications").exists());
+        assert_eq!(fs::read(&record).unwrap(), b"the human's");
+        fs::write(home.join("kept"), b"state").unwrap();
+        homes.workload(false).unwrap();
+        assert_eq!(fs::read(home.join("kept")).unwrap(), b"state");
+        assert!(homes.workload(true).is_err());
+        assert_eq!(fs::read(home.join("kept")).unwrap(), b"state");
+    }
+
+    /// A workload home root left unpublished is completed when empty and
+    /// refused when it holds anything, which no creation put there; a
+    /// published home of another owner, a wrong mode or a link refuses.
+    #[test]
+    fn a_workload_home_completes_only_an_empty_interrupted_creation() {
+        let homes = Homes::new();
+        let workloads = homes.temp.path().join("workloads");
+        homes.left(&workloads, homes.root);
+        fs::set_permissions(&workloads, Permissions::from_mode(0o755)).unwrap();
+        let home = homes.workload_home();
+        homes.left(&home, homes.root);
+        assert!(homes.workload(true).is_err());
+        assert_eq!(homes.owner(&home), homes.root);
+        homes.workload(false).unwrap();
+        assert_eq!(homes.owner(&home), WORKLOAD);
+
+        let homes = Homes::new();
+        let workloads = homes.temp.path().join("workloads");
+        homes.left(&workloads, homes.root);
+        fs::set_permissions(&workloads, Permissions::from_mode(0o755)).unwrap();
+        let home = homes.workload_home();
+        homes.left(&home, homes.root);
+        homes.record(&home.join("planted"), HUMAN);
+        assert!(homes.workload(false).is_err());
+        assert_eq!(homes.owner(&home), homes.root);
+
+        for owner in [HUMAN, ACCOUNT] {
+            let homes = Homes::new();
+            homes.workload(true).unwrap();
+            homes.set(&homes.workload_home(), owner);
+            assert!(homes.workload(false).is_err(), "{owner:?}");
+        }
+        // The account changing its own home's mode costs it that mode, not
+        // every later preparation: root restores 0700 and keeps what is in
+        // it. A new row still refuses the home.
+        for mode in [0o750, 0o755, 0o500, 0o2700] {
+            let homes = Homes::new();
+            homes.workload(true).unwrap();
+            let home = homes.workload_home();
+            fs::write(home.join("kept"), b"state").unwrap();
+            fs::set_permissions(&home, Permissions::from_mode(mode)).unwrap();
+            homes.workload(false).unwrap();
+            assert_eq!(
+                fs::metadata(&home).unwrap().mode() & 0o7777,
+                0o700,
+                "{mode:o}"
+            );
+            assert_eq!(homes.owner(&home), WORKLOAD);
+            assert_eq!(fs::read(home.join("kept")).unwrap(), b"state");
+            assert!(homes.workload(true).is_err());
+        }
+
+        let homes = Homes::new();
+        let elsewhere = homes.temp.path().join("elsewhere");
+        homes.left(&elsewhere, homes.root);
+        std::os::unix::fs::symlink(&elsewhere, homes.temp.path().join("workloads")).unwrap();
+        assert!(homes.workload(true).is_err());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// An application's published home whose mode its account changed is
+    /// restored to 0700 by an install and by boot, contents kept, rather
+    /// than failing every later preparation.
+    #[test]
+    fn an_application_home_the_account_rechmodded_is_restored() {
+        let homes = Homes::new();
+        homes.create(true).unwrap();
+        let home = homes.home();
+        fs::write(home.join(".td/app/photo/kept"), b"state").unwrap();
+        fs::set_permissions(&home, Permissions::from_mode(0o755)).unwrap();
+        homes.create(false).unwrap();
+        assert_eq!(fs::metadata(&home).unwrap().mode() & 0o7777, 0o700);
+        fs::set_permissions(&home, Permissions::from_mode(0o711)).unwrap();
+        homes.boot("photo", 66560).unwrap();
+        assert_eq!(fs::metadata(&home).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(homes.owner(&home), homes.account);
+        assert_eq!(fs::read(home.join(".td/app/photo/kept")).unwrap(), b"state");
+    }
+
+    #[test]
+    fn a_workload_home_takes_only_a_workload_uid() {
+        for uid in [0, 1000, 65536, 98303, 131072, u32::MAX] {
+            assert_eq!(
+                create_workload(uid, true).unwrap_err(),
+                "invalid workload account uid"
+            );
+        }
     }
 
     /// A run killed before publication leaves root-owned state, which a

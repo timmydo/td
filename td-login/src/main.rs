@@ -54,7 +54,7 @@ mod tty;
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(
     dead_code,
-    reason = "td-login resolves application accounts; td-firstboot seeds the ledger"
+    reason = "td-login resolves workload accounts; td-firstboot seeds the ledger"
 )]
 mod workload_accounts;
 

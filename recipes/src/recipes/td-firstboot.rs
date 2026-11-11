@@ -41,6 +41,8 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    // td-alloc's fallible growth, mounted by path.
+    ("allocation", include_str!("../../../td-alloc/src/lib.rs")),
     (
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
@@ -166,6 +168,7 @@ pub fn recipe() -> Recipe {
         "{src}/engine/src",
         "{src}/td-tpm/src",
         "{src}/td-fido/src",
+        "{src}/td-alloc/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -184,6 +187,7 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "allocation" => "{src}/td-alloc/src/lib.rs".into(),
                 "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
                 "fido_cbor" => "{src}/td-fido/src/fido_cbor.rs".into(),
                 "fido_ctap" => "{src}/td-fido/src/fido_ctap.rs".into(),
@@ -383,7 +387,7 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "{src}/principal-tests.rs".into(),
-        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"engine/src/workload_accounts.rs\"] mod workload_accounts;\n#[path = \"engine/src/workload_grants.rs\"] mod workload_grants;\n#[path = \"engine/src/flathub_app.rs\"] mod flathub_app;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
+        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-alloc/src/lib.rs\"] mod allocation;\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"engine/src/workload_accounts.rs\"] mod workload_accounts;\n#[path = \"engine/src/workload_grants.rs\"] mod workload_grants;\n#[path = \"engine/src/flathub_app.rs\"] mod flathub_app;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
         exec: false,
     });
     steps.push(

@@ -1,7 +1,12 @@
-//! Root preparation of application runtimes and cgroups: at sysinit for
-//! every active application, and for an account an install allocates while
-//! the human's session runs (`ensure`).
+//! Root preparation of application runtimes and workload account cgroups:
+//! at sysinit for every active application, and for an account allocated
+//! while the human's session runs (`ensure`), an application's at its
+//! install or a sandbox's.
 
+use crate::workload_accounts::{
+    delegation, APPLICATION_DELEGATION_PREFIX, APPLICATION_UIDS, WORKLOAD_DELEGATION_PREFIX,
+    WORKLOAD_UIDS,
+};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -157,45 +162,92 @@ fn assign(file: &File, uid: u32) -> io::Result<()> {
 /// to one value.
 const RUNTIME_UID: u32 = 998;
 const RUNTIME_DELEGATION: &str = "td-runtimes";
-/// An application account's delegation is this, then its uid.
-const APPLICATION_PREFIX: &str = "td-app-";
 
 /// The immutable account and durable reservation must already be validated.
 /// Startup precedes every human/app process; this never repairs a live tree.
 pub(crate) fn prepare(uid: u32) -> Result<(), String> {
-    if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
+    if !APPLICATION_UIDS.contains(&uid) {
         return Err("invalid application runtime uid".into());
     }
-    delegate(&format!("{APPLICATION_PREFIX}{uid}"), uid, "application")
-        .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
+    delegate(
+        &format!("{APPLICATION_DELEGATION_PREFIX}{uid}"),
+        uid,
+        "application",
+    )
+    .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
     crate::principal_store::prepare_application_runtime(uid)
         .map_err(|error| format!("prepare application uid {uid} runtime: {error}"))
 }
 
-/// An account allocated at install, while the session runs: its delegation
-/// only when absent (or an interrupted root-owned creation), never again
-/// over a delegated one, which a running instance populates and `prepare`
-/// would refuse; then its runtime directory, which `prepare` already
-/// completes or accepts. A `fresh` account, whose ledger row this install
-/// added, refuses a cgroup or runtime directory it already owns, as a
-/// defence: allocation avoided every uid with either. A retry, the row
-/// already published, completes root's interrupted creation. The caller holds the principal lock.
+/// An account allocated while the session runs, an application's at its
+/// install or a sandbox's when root asks for it: its delegation
+/// (`td-app-UID` or `td-workload-UID`) only when absent (or an interrupted
+/// root-owned creation), never again over a delegated one, which a running
+/// instance populates and `delegate` would refuse; then an application's
+/// runtime directory, which `prepare` already completes or accepts. A
+/// sandbox gets none: td-login sets no `XDG_RUNTIME_DIR` and a workspace jail
+/// binds nothing of `/run`. A `fresh` account, whose ledger row this
+/// allocation added, refuses a cgroup or runtime directory it already owns,
+/// as a defence: allocation avoided every uid with either. A retry, the row
+/// already published, completes root's interrupted creation. The caller
+/// holds the principal lock.
 pub(crate) fn ensure(uid: u32, fresh: bool) -> Result<(), String> {
-    if !crate::workload_accounts::APPLICATION_UIDS.contains(&uid) {
-        return Err("invalid application runtime uid".into());
-    }
-    let name = format!("{APPLICATION_PREFIX}{uid}");
+    let name = delegation(uid).ok_or("invalid workload account uid")?;
+    let name = crate::allocation::format(format_args!("{name}")).map_err(|_| String::new())?;
     let found = delegated(&name).map_err(|error| format!("inspect {name}: {error}"))?;
     let runtime = crate::principal_store::application_runtime_owner(uid)?;
-    pending(runtime, uid, fresh).map_err(|error| format!("/run/user/{uid}: {error}"))?;
-    // A delegation published to `uid` is trusted as complete: `delegate`
-    // assigns the cgroup to the account only as its last step.
-    if pending(found, uid, fresh).map_err(|error| format!("{name}: {error}"))? {
-        delegate(&name, uid, "application")
-            .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
+    let steps = ensure_steps(uid, fresh, found, runtime)?;
+    let label = steps.label;
+    if steps.delegate {
+        delegate(&name, uid, label)
+            .map_err(|error| format!("prepare {label} uid {uid} cgroup: {error}"))?;
     }
-    crate::principal_store::prepare_application_runtime(uid)
-        .map_err(|error| format!("prepare application uid {uid} runtime: {error}"))
+    if steps.runtime {
+        crate::principal_store::prepare_application_runtime(uid)
+            .map_err(|error| format!("prepare {label} uid {uid} runtime: {error}"))?;
+    }
+    Ok(())
+}
+
+/// What `ensure` does for one account.
+#[derive(Debug, PartialEq, Eq)]
+struct Steps {
+    /// The account's kind as errors name it.
+    label: &'static str,
+    /// Whether its delegation is still to be made.
+    delegate: bool,
+    /// Whether its `/run/user/UID` is made or completed: an application's
+    /// only.
+    runtime: bool,
+}
+
+/// `ensure`'s decision for `uid`, from the owners of its delegation and its
+/// `/run/user/UID` as found. A delegation published to `uid` is trusted as
+/// complete: `delegate` assigns the cgroup to the account only as its last
+/// step. The runtime directory is judged for a sandbox's account too, though
+/// none is made for it, as a defence: a fresh account refuses one it owns,
+/// and any account one of another owner, which allocation avoided.
+fn ensure_steps(
+    uid: u32,
+    fresh: bool,
+    delegation: Option<(u32, u32)>,
+    runtime: Option<(u32, u32)>,
+) -> Result<Steps, String> {
+    let label = if APPLICATION_UIDS.contains(&uid) {
+        "application"
+    } else if WORKLOAD_UIDS.contains(&uid) {
+        "workload account"
+    } else {
+        return Err("invalid workload account uid".into());
+    };
+    pending(runtime, uid, fresh).map_err(|error| format!("/run/user/{uid}: {error}"))?;
+    let delegate =
+        pending(delegation, uid, fresh).map_err(|error| format!("{label} cgroup: {error}"))?;
+    Ok(Steps {
+        label,
+        delegate,
+        runtime: label == "application",
+    })
 }
 
 /// Whether `found`, the owner of an account's existing directory, still
@@ -213,11 +265,20 @@ fn pending(found: Option<(u32, u32)>, uid: u32, fresh: bool) -> Result<bool, Str
     }
 }
 
-/// The uid of every `td-app-UID` cgroup at the unified root, whoever owns
-/// it: an install's new row avoids each.
+/// The uid of every `td-app-UID` and `td-workload-UID` cgroup at the
+/// unified root, whoever owns it: an allocation's new row avoids each.
 pub(crate) fn delegated_uids() -> Result<BTreeSet<u32>, String> {
     let hierarchy = hierarchy().map_err(|error| format!("open the cgroup hierarchy: {error}"))?;
-    crate::principal_store::uid_entries(&at(&hierarchy, "."), APPLICATION_PREFIX)
+    delegations_in(&at(&hierarchy, "."))
+}
+
+/// The uids `delegated_uids` reads from the hierarchy `root`.
+fn delegations_in(root: &Path) -> Result<BTreeSet<u32>, String> {
+    let mut uids = BTreeSet::new();
+    for prefix in [APPLICATION_DELEGATION_PREFIX, WORKLOAD_DELEGATION_PREFIX] {
+        crate::principal_store::uid_entries(root, prefix, &mut uids)?;
+    }
+    Ok(uids)
 }
 
 /// The owner of the unified hierarchy's child `name`, if there is one.
@@ -350,6 +411,8 @@ mod tests {
         }
     }
 
+    /// Boot prepares only applications; an allocation prepares an
+    /// application's or a sandbox's, nothing outside the ledger's ranges.
     #[test]
     fn non_application_ids_refuse_before_any_filesystem_access() {
         for uid in [0, 991, 1000, 65533, 65534, 65535, 2147483648, u32::MAX] {
@@ -357,10 +420,87 @@ mod tests {
             for fresh in [false, true] {
                 assert_eq!(
                     ensure(uid, fresh).unwrap_err(),
-                    "invalid application runtime uid"
+                    "invalid workload account uid"
                 );
             }
         }
+        for uid in [98304, 131071] {
+            assert_eq!(prepare(uid).unwrap_err(), "invalid application runtime uid");
+        }
+        assert!(ensure(131072, true).is_err());
+    }
+
+    /// A sandbox's account is delegated as an application's is, under the
+    /// same fresh and owner rules, but never given a `/run/user/UID`; one
+    /// it owns still refuses a fresh account, and another's any account.
+    #[test]
+    fn a_workload_account_is_delegated_but_gets_no_runtime_directory() {
+        let (app, sandbox) = (66560, 98304);
+        let mine = |uid: u32| Some((uid, uid));
+        for fresh in [false, true] {
+            assert_eq!(
+                ensure_steps(sandbox, fresh, None, None).unwrap(),
+                Steps {
+                    label: "workload account",
+                    delegate: true,
+                    runtime: false
+                }
+            );
+            assert_eq!(
+                ensure_steps(app, fresh, None, None).unwrap(),
+                Steps {
+                    label: "application",
+                    delegate: true,
+                    runtime: true
+                }
+            );
+            for uid in [app, sandbox] {
+                // Root's interrupted creation is completed.
+                assert!(
+                    ensure_steps(uid, fresh, Some((0, 0)), Some((0, 0)))
+                        .unwrap()
+                        .delegate
+                );
+                // Another account's directory refuses.
+                assert!(ensure_steps(uid, fresh, Some((1000, 1000)), None).is_err());
+                assert!(ensure_steps(uid, fresh, None, Some((1000, 1000))).is_err());
+            }
+        }
+        // A published delegation is kept on a retry, and refused as a new
+        // account's leftover, as is a runtime directory it owns.
+        assert!(
+            !ensure_steps(sandbox, false, mine(sandbox), mine(sandbox))
+                .unwrap()
+                .delegate
+        );
+        assert!(ensure_steps(sandbox, true, mine(sandbox), None).is_err());
+        assert!(ensure_steps(sandbox, true, None, mine(sandbox)).is_err());
+        for uid in [0, 1000, 65535, 131072, u32::MAX] {
+            assert!(ensure_steps(uid, false, None, None).is_err(), "{uid}");
+        }
+    }
+
+    /// An allocation avoids every leftover delegation, an application's or
+    /// a sandbox's or workspace's, named canonically after its prefix.
+    #[test]
+    fn leftover_delegations_of_either_kind_are_listed() {
+        let temp = td_fs::TempDir::new("td-account-cgroups").unwrap();
+        for name in [
+            "td-app-66560",
+            "td-workload-98304",
+            "td-workload-098305",
+            "td-workload-",
+            "td-workloads-98306",
+            "td-user-1000",
+            "td-runtimes",
+            "98307",
+        ] {
+            fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            delegations_in(temp.path()).unwrap(),
+            BTreeSet::from([66560, 98304])
+        );
     }
 
     /// An install while the application runs must not delegate its

@@ -304,7 +304,7 @@ engine/src/tar_write.rs	allocation-macro	2
 engine/src/target_profile.rs	allocating-conversion	4
 engine/src/target_profile.rs	allocation-macro	4
 engine/src/workload_accounts.rs	allocating-conversion	10
-engine/src/workload_accounts.rs	allocation-macro	12
+engine/src/workload_accounts.rs	allocation-macro	13
 engine/src/workload_accounts.rs	unchecked-growth-or-clone	9
 engine/src/workload_grants.rs	allocating-constructor	1
 engine/src/workload_grants.rs	allocating-conversion	15
@@ -1815,7 +1815,7 @@ td-fido/src/fido_virtual_tests.rs	heap-owner	5
 td-fido/src/fido_virtual_tests.rs	unchecked-growth-or-clone	23
 td-fido/src/root.rs	allocating-conversion	2
 td-firstboot/src/application_runtime.rs	allocating-conversion	2
-td-firstboot/src/application_runtime.rs	allocation-macro	16
+td-firstboot/src/application_runtime.rs	allocation-macro	15
 td-firstboot/src/application_state.rs	allocating-conversion	2
 td-firstboot/src/application_state.rs	allocation-macro	3
 td-firstboot/src/cloud.rs	allocating-conversion	7
@@ -1856,9 +1856,9 @@ td-firstboot/src/principal_store.rs	allocating-conversion	15
 td-firstboot/src/principal_store.rs	allocation-macro	46
 td-firstboot/src/principal_store.rs	heap-owner	1
 td-firstboot/src/principal_store.rs	unchecked-growth-or-clone	10
-td-firstboot/src/principal_store_tests.rs	allocating-conversion	38
-td-firstboot/src/principal_store_tests.rs	allocation-macro	14
-td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	7
+td-firstboot/src/principal_store_tests.rs	allocating-conversion	43
+td-firstboot/src/principal_store_tests.rs	allocation-macro	16
+td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	8
 td-firstboot/src/principals.rs	allocating-conversion	24
 td-firstboot/src/principals.rs	allocation-macro	20
 td-firstboot/src/principals.rs	unchecked-growth-or-clone	12
@@ -2104,7 +2104,7 @@ td-login/src/creds.rs	allocating-constructor	1
 td-login/src/creds.rs	allocation-macro	10
 td-login/src/creds.rs	unchecked-growth-or-clone	2
 td-login/src/db.rs	allocating-conversion	6
-td-login/src/db.rs	allocation-macro	18
+td-login/src/db.rs	allocation-macro	17
 td-login/src/db.rs	unchecked-growth-or-clone	2
 td-login/src/exec_as.rs	allocating-conversion	3
 td-login/src/exec_as.rs	allocation-macro	6

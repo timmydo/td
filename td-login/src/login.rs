@@ -249,8 +249,8 @@ pub(crate) fn authorize(name: &str, forced: bool) -> Result<Account, String> {
     if !plausible_name(name) {
         return Err(format!("{name:?} is not a plausible user name"));
     }
-    // An application account is the ledger's, and service-only.
-    if db::application_name(name) {
+    // A workload account is the ledger's, and service-only.
+    if db::ledger_name(name) {
         return Err(format!("account {name:?} is service-only"));
     }
     let account = db::account(name)?;
@@ -271,15 +271,16 @@ pub(crate) fn authorize(name: &str, forced: bool) -> Result<Account, String> {
 ///
 /// Kept beside `authorize` so every front end still reaches one account and
 /// secret lookup boundary. The separate policy call is load-bearing: ordinary
-/// forced sessions continue to reject this account class. An application
-/// account (`tda<uid>`) comes from the workload account ledger alone and is
-/// of the service class by construction; every other name is passwd's.
+/// forced sessions continue to reject this account class. A workload
+/// account (`tda<uid>` or `tdw<uid>`) comes from the workload account ledger
+/// alone and is of the service class by construction; every other name is
+/// passwd's.
 pub(crate) fn authorize_service(name: &str) -> Result<Account, String> {
     if !plausible_name(name) {
         return Err(format!("{name:?} is not a plausible user name"));
     }
-    let (account, secret) = if db::application_name(name) {
-        (db::application_account(name)?, db::Secret::Service)
+    let (account, secret) = if db::ledger_name(name) {
+        (db::ledger_account(name)?, db::Secret::Service)
     } else {
         (db::account(name)?, db::secret(name)?)
     };
@@ -434,13 +435,15 @@ mod tests {
         }
     }
 
-    /// An application account is service-only and the ledger's: no ordinary
+    /// A workload account is service-only and the ledger's: no ordinary
     /// session, forced or not, starts as one.
     #[test]
-    fn an_application_account_is_never_an_ordinary_session() {
-        for forced in [false, true] {
-            let err = authorize("tda65536", forced).unwrap_err();
-            assert_eq!(err, "account \"tda65536\" is service-only");
+    fn a_workload_account_is_never_an_ordinary_session() {
+        for name in ["tda65536", "tdw98304"] {
+            for forced in [false, true] {
+                let err = authorize(name, forced).unwrap_err();
+                assert_eq!(err, format!("account {name:?} is service-only"));
+            }
         }
     }
 

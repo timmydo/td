@@ -4,8 +4,9 @@
 //! after an application's removal included. The file is std-only and uses
 //! no other module, so target programs include it by path: td-firstboot
 //! seeds the ledger at boot and allocates in it when td-authd installs an
-//! application, and `load` is the one live reader td-login and the bus
-//! policy's includers share. Parsing, seeding and allocation perform no I/O.
+//! application or root asks for a sandbox's account, and `load` is the one
+//! live reader td-login and the bus policy's includers share. Parsing,
+//! seeding and allocation perform no I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -32,6 +33,12 @@ pub const O_NONBLOCK: i32 = 0x800;
 /// at a 64-byte average.
 pub const MAX_BYTES: usize = 256 * 1024;
 const MAX_ROWS: usize = 4096;
+/// The sandbox and workspace rows allocation adds, together, at most. Rows
+/// are permanent and a session's programs can ask root for any sandbox
+/// name, so without this bound they could spend every row and leave no
+/// application install or carried row a place. Parsing does not apply it:
+/// a ledger that already holds more stays readable.
+pub const WORKLOAD_ROWS: usize = 2048;
 /// Application accounts.
 pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
 /// The application block the image reserves: the carried rows, the retained
@@ -42,34 +49,95 @@ pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
 pub const CARRIED_UIDS: RangeInclusive<u32> = 65536..=66559;
 /// The application uids an install allocates: the rest of the range.
 pub const ALLOCATED_UIDS: RangeInclusive<u32> = 66560..=98303;
-/// Sandbox and workspace accounts, which share one range. Nothing writes
-/// those kinds yet; v1 parses them so a deployment that does can roll back.
+/// Sandbox and workspace accounts, which share one range. td-firstboot
+/// allocates sandbox rows; v1 parses workspace rows so a deployment that
+/// writes them can roll back.
 pub const WORKLOAD_UIDS: RangeInclusive<u32> = 98304..=131071;
 /// Every uid the ledger allocates, application through workspace: no
 /// passwd or group entry may hold one.
 pub const LEDGER_UIDS: RangeInclusive<u32> = 65536..=131071;
 /// The reserved name of an application account: this, then its uid.
 pub const APPLICATION_ACCOUNT_PREFIX: &str = "tda";
+/// The reserved name of a sandbox or workspace account: this, then its uid.
+/// The two kinds share one range, so one form names either.
+pub const WORKLOAD_ACCOUNT_PREFIX: &str = "tdw";
+/// An application account's cgroup delegation below the unified root is
+/// this, then its uid; a sandbox's or workspace's the next.
+pub const APPLICATION_DELEGATION_PREFIX: &str = "td-app-";
+pub const WORKLOAD_DELEGATION_PREFIX: &str = "td-workload-";
+
+/// The digits after `prefix`, when `name` is `prefix` and decimal digits.
+fn account_digits<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// The uid `name` spells canonically after `prefix`, if it does.
+fn account_uid(name: &str, prefix: &str) -> Option<u32> {
+    let digits = account_digits(name, prefix)?;
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| uid.to_string() == digits)
+}
 
 /// Whether `name` has the reserved application account form, `tda` and
 /// decimal digits. Only the ledger answers for such a name; another name
 /// that merely begins `tda` is an ordinary one.
 pub fn application_account_name(name: &str) -> bool {
-    name.strip_prefix(APPLICATION_ACCOUNT_PREFIX)
-        .is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    account_digits(name, APPLICATION_ACCOUNT_PREFIX).is_some()
 }
 
 /// The uid an application account name spells canonically, if it is one.
 pub fn application_account_uid(name: &str) -> Option<u32> {
-    let digits = name
-        .strip_prefix(APPLICATION_ACCOUNT_PREFIX)
-        .filter(|_| application_account_name(name))?;
-    digits
-        .parse::<u32>()
-        .ok()
-        .filter(|uid| uid.to_string() == digits)
+    account_uid(name, APPLICATION_ACCOUNT_PREFIX)
+}
+
+/// Whether `name` has the reserved sandbox and workspace account form,
+/// `tdw` and decimal digits, which only the ledger answers for.
+pub fn workload_account_name(name: &str) -> bool {
+    account_digits(name, WORKLOAD_ACCOUNT_PREFIX).is_some()
+}
+
+/// The uid a sandbox or workspace account name spells canonically, if it is
+/// one.
+pub fn workload_account_uid(name: &str) -> Option<u32> {
+    account_uid(name, WORKLOAD_ACCOUNT_PREFIX)
+}
+
+/// Whether `name` has either reserved form: a ledger account's, which no
+/// passwd or group entry may take.
+pub fn ledger_account_name(name: &str) -> bool {
+    application_account_name(name) || workload_account_name(name)
+}
+
+/// The cgroup delegation of the ledger account holding `uid`, by its range:
+/// `td-app-UID` for an application, `td-workload-UID` for a sandbox or
+/// workspace; none outside the ledger's ranges.
+pub fn delegation(uid: u32) -> Option<DelegationName> {
+    let prefix = if APPLICATION_UIDS.contains(&uid) {
+        APPLICATION_DELEGATION_PREFIX
+    } else if WORKLOAD_UIDS.contains(&uid) {
+        WORKLOAD_DELEGATION_PREFIX
+    } else {
+        return None;
+    };
+    Some(DelegationName { prefix, uid })
+}
+
+/// A delegation's name, its range's prefix then its uid. It allocates
+/// nothing: the caller formats it into storage of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DelegationName {
+    prefix: &'static str,
+    uid: u32,
+}
+
+impl std::fmt::Display for DelegationName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.prefix, f)?;
+        std::fmt::Display::fmt(&self.uid, f)
+    }
 }
 
 /// The uids the image reserved before the ledger existed. Every seeded
@@ -111,6 +179,15 @@ impl Kind {
         match self {
             Self::Application => APPLICATION_UIDS,
             Self::Sandbox | Self::Workspace => WORKLOAD_UIDS,
+        }
+    }
+
+    /// The directory below `DIRECTORY` holding this kind's account homes,
+    /// each named by its uid.
+    pub fn homes(self) -> &'static str {
+        match self {
+            Self::Application => "applications",
+            Self::Sandbox | Self::Workspace => "workloads",
         }
     }
 
@@ -210,6 +287,24 @@ impl Ledger {
             .map(|((_, name), _)| name.as_str())
     }
 
+    /// The kind and uid of the account a reserved name spells, when this
+    /// ledger holds it: `tda<uid>` an application row's, `tdw<uid>` a
+    /// sandbox's or workspace's. Any other name, a uid no row of a kind its
+    /// form names holds, or a noncanonical spelling, is none.
+    pub fn account(&self, name: &str) -> Option<(Kind, u32)> {
+        let (uid, kinds): (u32, &[Kind]) = match application_account_uid(name) {
+            Some(uid) => (uid, &[Kind::Application]),
+            None => (
+                workload_account_uid(name)?,
+                &[Kind::Sandbox, Kind::Workspace],
+            ),
+        };
+        kinds
+            .iter()
+            .find(|kind| self.name(**kind, uid).is_some())
+            .map(|kind| (*kind, uid))
+    }
+
     /// Whether this ledger holds every row of `older` at the same uid. Rows
     /// are never removed or reassigned, so a later read of the published
     /// ledger always does; a reader keeps its copy when one does not.
@@ -240,7 +335,9 @@ impl Ledger {
     /// (`ALLOCATED_UIDS` for an application, never the carried block) that
     /// no row of any kind holds and `taken` does not name
     /// (td-authd/DESIGN.md, "Workload account ledger"). No caller supplies
-    /// the uid.
+    /// the uid. A new sandbox or workspace row is refused once those kinds
+    /// hold `WORKLOAD_ROWS` together, so the rest of `MAX_ROWS` stays for
+    /// applications and carried rows.
     pub fn allocate(
         &self,
         kind: Kind,
@@ -249,6 +346,19 @@ impl Ledger {
     ) -> Result<(Self, u32, bool), String> {
         if let Some(uid) = self.uid_of(kind, name) {
             return Ok((self.clone(), uid, false));
+        }
+        if kind != Kind::Application
+            && self
+                .rows
+                .keys()
+                .filter(|(held, _)| *held != Kind::Application)
+                .count()
+                >= WORKLOAD_ROWS
+        {
+            return Err(format!(
+                "the account ledger holds {WORKLOAD_ROWS} sandbox and workspace accounts, \
+                 its bound; refusing {name:?}"
+            ));
         }
         let held: BTreeSet<u32> = self.rows.values().copied().collect();
         let uid = kind

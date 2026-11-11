@@ -53,7 +53,8 @@ Adversaries considered:
   mistake or damaged saved setting must refuse, and readers still validate
   the live files. Numeric identities and authentication fields are preserved.
   The workload account ledger, `/var/lib/td/accounts.tsv`, is part of the
-  database: it alone names application accounts (§7).
+  database: it alone names application, sandbox and workspace accounts
+  (§7).
 - **A3 — a hostile caller of td-login**: whatever execs `login`,
   `login-primary`, `exec-as`, `exec-primary` or `exec-service-as` chooses
   argv, the environment, the current directory, and the open file
@@ -159,10 +160,12 @@ leaf: cgroup v2 requires write authority at the source/destination common
 ancestor.
 The human UID 1000 selects `td-user-1000/session`; the Flathub runtime
 account, UID 998, selects `td-runtimes/session`; the ledger's application
-UIDs, 65536 through 98303, select `td-app-UID/session`. Every other non-root
-UID reports that no delegation is configured. Firstboot prepares only the
-installed, durably reserved application accounts' cgroups and, on the
-desktop, the runtime account's at sysinit, as specified in
+UIDs, 65536 through 98303, select `td-app-UID/session`, and its sandbox
+and workspace UIDs, 98304 through 131071, `td-workload-UID/session`. Every
+other non-root UID reports that no delegation is configured. Firstboot
+prepares only the installed, durably reserved application accounts'
+cgroups and, on the desktop, the runtime account's at sysinit, and a
+sandbox account's when root allocates it, as specified in
 `td-authd/DESIGN.md`; this selector alone activates nothing.
 The root-configured td-authd application launcher makes a failed placement
 fatal before app code runs, as the terminal launcher does for the human
@@ -228,7 +231,8 @@ for uid 1000 it writes its own pid to the fixed
 `/sys/fs/cgroup/td-user-1000/session/cgroup.procs` and requires
 `/proc/self/cgroup` to read back exactly `0::/td-user-1000/session`. Root
 sessions do nothing; application UIDs select their canonical
-`td-app-UID/session` path and the runtime account `td-runtimes/session`.
+`td-app-UID/session` path, sandbox and workspace UIDs
+`td-workload-UID/session`, and the runtime account `td-runtimes/session`.
 Other nonroot UIDs have no configured delegation.
 No argv or account-database path field selects the path. This uses safe
 filesystem I/O
@@ -405,9 +409,11 @@ decision; the console refusal below adds a hand-back to root that reuses
 | anything else       | `Hashed`     | **denied**          | allowed    | allowed            | denied            |
 | no entry / no file  | —            | denied              | denied     | denied             | denied            |
 | ledger `tda<uid>`   | `Service`    | denied              | denied     | denied             | **allowed**       |
+| ledger `tdw<uid>`   | `Service`    | denied              | denied     | denied             | **allowed**       |
 
-The last row is no passwd entry: an application account is the workload
-account ledger's row (§7), of the service class by construction.
+The last two rows are no passwd entries: an application account, and a
+sandbox's or workspace's, is the workload account ledger's row (§7), of
+the service class by construction.
 
 Consequences worth stating plainly:
 
@@ -870,31 +876,39 @@ Against A2, the parsers fail closed rather than fail soft:
   parses; a malformed group file fails the lookup rather than silently
   granting a smaller set.
 
-Application accounts come from the workload account ledger
+Workload accounts come from the workload account ledger
 (`td-authd/DESIGN.md`, "Workload account ledger") alone. `tda<uid>`, `tda`
-followed by digits, is their reserved form; another name that merely
-begins `tda` is an ordinary name.
+followed by digits, is an application account's reserved form, and
+`tdw<uid>` a sandbox's or workspace's; another name that merely begins
+`tda` or `tdw` is an ordinary name.
 
-- `exec-service-as tda<uid>` reads the ledger through the shared reader in
-  `engine/src/workload_accounts.rs`, which opens `/var/lib/td` without
-  following links, requires it root-owned and writable by no one else,
-  and requires `accounts.tsv` to be a single-link, bounded, root-owned
-  regular file of mode 0644 at the canonical format. The uid must be
-  spelled canonically and an application row must hold it. The account
-  is then fixed, not read: gid equal to uid, home
-  `/var/lib/td/applications/<uid>`, shell `/bin/false`, the service class,
-  and no supplementary group. A missing, hostile or malformed ledger, or a
-  uid it does not hold, refuses. Any application row resolves, a retired
-  application's (a former install's `tda65539`) or a personal one's
-  included: td-login reads no declarations, and `exec-service-as`'s caller
-  is root, which could run as any uid anyway. Such an account has no
-  home, runtime or cgroup delegation prepared, since firstboot prepares
-  only the declared service applications; td-login only warns when the
-  join fails (§1), and the root launchers that start applications, td-authd's
-  among them, select only declared ones and make a failed placement fatal.
+- `exec-service-as tda<uid>` or `tdw<uid>` reads the ledger through the
+  shared reader in `engine/src/workload_accounts.rs` (`Ledger::account`),
+  which opens `/var/lib/td` without following links, requires it
+  root-owned and writable by no one else, and requires `accounts.tsv` to
+  be a single-link, bounded, root-owned regular file of mode 0644 at the
+  canonical format. The uid must be spelled canonically and a row of a
+  kind the form names must hold it: an application row for `tda`, a
+  sandbox or workspace row for `tdw`. An application row never answers
+  for `tdw<uid>`, nor a sandbox or workspace row for `tda<uid>`, and the
+  ranges keep the kinds' uids apart. The account is then fixed, not read:
+  gid equal to uid, home `/var/lib/td/applications/<uid>` or
+  `/var/lib/td/workloads/<uid>` by kind, shell `/bin/false`, the service
+  class, and no supplementary group. A missing, hostile or malformed
+  ledger, or a uid it does not hold, refuses. Any application row
+  resolves, a retired application's (a former install's `tda65539`) or a
+  personal one's included, and any sandbox or workspace row: td-login
+  reads no declarations or grants, and `exec-service-as`'s caller is root,
+  which could run as any uid anyway. Such an account may have no home,
+  runtime or cgroup delegation prepared, since firstboot prepares only the
+  declared service applications at boot and a sandbox's delegation lasts
+  from its allocation to shutdown; td-login only warns when the join
+  fails (§1), and the root launchers that start applications, td-authd's
+  among them, select only declared ones and make a failed placement
+  fatal. Nothing launches as a sandbox account yet (WORKLOADS.md step 7).
 - Every lookup, human or service, reads passwd and group whole and
-  refuses when any entry is of the reserved form or holds a uid or gid in
-  the ledger's ranges (65536 through 131071), or a group lists a
+  refuses when any entry is of either reserved form or holds a uid or gid
+  in the ledger's ranges (65536 through 131071), or a group lists a
   reserved-form member. Such an entry would be a second account policy
   for a ledger uid, the class confusion the alias rule above refuses
   within passwd: an empty password field the forced paths admit, or
@@ -904,6 +918,14 @@ begins `tda` is an ordinary name.
 - `login`, `login -f`, `exec-as` and `exec-primary` refuse a reserved-form
   name before any lookup, and a primary name of that form stays refused
   by the shared primary validator.
+- Reserving a form refuses a human who already holds a name of it. The
+  `tdw` form arrived after installs whose primary name was chosen freely,
+  so a human named `tdw` and digits (`tdw7`) on such an install loses
+  every login lookup and fails primary preparation on each boot of a
+  deployment that reserves the form, until rolled back or renamed. The
+  risk is accepted as very unlikely: the installer refuses such names from
+  then on, and the alternative, a passwd account that can speak for a
+  ledger account, is the class confusion this section refuses.
 
 The supplementary set handed to `setgroups(2)` is the user's `/etc/group`
 memberships **plus** the primary gid, sorted and deduplicated. Sorting is

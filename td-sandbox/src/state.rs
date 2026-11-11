@@ -235,6 +235,35 @@ fn parse(policy: &str) -> io::Result<Policy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile name that begins with a letter is a ledger name, so its
+    /// sandbox account can be allocated under it; one that begins with a
+    /// digit or a hyphen is not, and the cutover to ledger accounts reports
+    /// and drops it.
+    #[test]
+    fn a_profile_name_beginning_with_a_letter_is_a_ledger_name() {
+        use crate::workload_accounts::valid_name as ledger_name;
+        let alphabet = "abz09-";
+        let mut checked = 0;
+        for first in alphabet.chars() {
+            for second in alphabet.chars() {
+                for tail in ["", "x", "-1", &"a".repeat(30)] {
+                    let candidate = format!("{first}{second}{tail}");
+                    if name(&candidate).is_ok() && first.is_ascii_lowercase() {
+                        assert!(ledger_name(&candidate), "{candidate}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 50, "{checked}");
+        for profile in ["1box", "-x", "9", "0-tools", "-"] {
+            assert!(name(profile).is_ok(), "{profile}");
+            assert!(!ledger_name(profile), "{profile}");
+        }
+        assert!(ledger_name(&"a".repeat(32)) && name(&"a".repeat(32)).is_ok());
+    }
+
     #[test]
     fn default_seeds_the_share_once_and_preserves_user_changes() -> io::Result<()> {
         let home = td_fs::TempDir::new("sandbox-default")?;

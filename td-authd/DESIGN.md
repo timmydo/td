@@ -349,9 +349,10 @@ changes no running uid. Every reserved uid/gid is checked against the
 complete current passwd and group tables, including retired
 assignments. A future activated account must use the canonical name
 `tdc<owner>`, `tdb<owner>`, or `tdp<owner>` for compositor, broker, or
-portal. An application's account is no passwd entry: it is the workload
-account ledger's row (below), and passwd and group must hold no entry of
-the `tda<digits>` form, none at a uid or gid in the ledger's ranges
+portal. A workload account, an application's or a sandbox's, is no passwd
+entry: it is the workload account ledger's row (below), and passwd and
+group must hold no entry of the `tda<digits>` or `tdw<digits>` form, none
+at a uid or gid in the ledger's ranges
 (65536 through 131071) and none at a retained application reservation's
 uid. Its primary gid equals uid,
 shell is `/bin/false`, and password field is exactly `!td-service`; it has
@@ -426,9 +427,10 @@ All operations use safe filesystem
 I/O through retained directory and control descriptors. Startup before any
 human/application process and a root-controlled mount hierarchy are trusted.
 This is not live cgroup repair or a credential-switch authority. The
-one preparation outside sysinit is an install's allocation ("Workload
-account ledger"), which delegates only a cgroup that is absent or an
-interrupted root-owned creation, never again one already delegated to
+preparations outside sysinit are an allocation's, an install's for an
+application and root's for a sandbox's `td-workload-UID` ("Workload
+account ledger"), each of which delegates only a cgroup that is absent or
+an interrupted root-owned creation, never again one already delegated to
 the account.
 
 The app delegation is an empty domain cgroup. Firstboot enables and reads
@@ -463,8 +465,10 @@ one with another owner or mode refused and only an interrupted root-owned
 creation completed. No `/run/user` runtime is made for it.
 
 Before dropping credentials, td-login selects `td-user-1000/session` for
-the human, `td-runtimes/session` for UID 998 and
-`td-app-APP_UID/session` for the reserved application UID range. The
+the human, `td-runtimes/session` for UID 998,
+`td-app-APP_UID/session` for the reserved application UID range and
+`td-workload-UID/session` for the sandbox and workspace range ("Workload
+account ledger"). The
 kernel enforces placement and td-login reads membership back. Its
 ordinary placement failure remains a diagnostic for console recovery;
 the application launcher must require the expected membership after the
@@ -532,8 +536,12 @@ its home from the same code with no migration source: an empty
 `.td/app/APP` and nothing of the human's, published to the account the
 same way, and boot's preparation of such an account is the same, never a
 migration, even over the install's interrupted root-owned home. A
-published home is left as it is, so a reinstall finds its state, and the
-next boot's preparation finds it published and returns. The human's
+published home's contents are left as they are, so a reinstall finds its
+state, and the next boot's preparation finds it published and returns.
+The account may change its own home's mode; every preparation of a
+published home, boot's and an install's, sets it back to 0700 through the
+unfollowed descriptor rather than refusing, so an application cannot
+make its next boot or install fail that way. The human's
 inodes in an unpublished home, which only an interrupted migration
 leaves, are refused by a preparation that migrates nothing. A new row
 never takes a uid with a home, `td-app-UID` cgroup or `/run/user/UID`
@@ -546,7 +554,8 @@ synced. Firstboot validates the existing human `.td/app/NAME` tree without write
 then moves its directory into
 that home, through retained source and destination directory descriptors.
 It keeps the jail's `.td/app/NAME` layout. It never copies or merges a second
-tree over existing state. A published app-owned mode-0700 home is complete;
+tree over existing state. A published app-owned home is complete (its mode
+restored to 0700 when the account changed it);
 later human recreations of the old path are ignored. All supported launches
 must use the private home when the image activates the account.
 
@@ -589,7 +598,7 @@ Every workload account (WORKLOADS.md, "Accounts") is a row of one ledger,
 `/var/lib/td/accounts.tsv`, root:root mode 0644 in the root-owned 0755
 `/var/lib/td`. It holds only each account's kind, name and uid. The mode is
 a trade: every local uid, applications' included, can read the name of
-every application ever installed, removed ones included, and later every
+every application ever installed, removed ones included, and every
 sandbox and workspace name; in return the readers coming next need no
 privilege to resolve an account. The canonical format begins
 `td-accounts-v1` followed by tab-separated rows sorted by kind, then name:
@@ -598,10 +607,11 @@ privilege to resolve an account. The canonical format begins
 KIND<TAB>name<TAB>uid
 ```
 
-`KIND` is `application`, `sandbox` or `workspace`. Only application rows
-are written today; v1 parses the other two already, because rows are
-permanent and a deployment that rolls back must still read the ledger a
-later one extended. Any further kind or format change is
+`KIND` is `application`, `sandbox` or `workspace`. Application and sandbox
+rows are written today; v1 parses workspace rows already, as it parsed
+sandbox rows before anything wrote one, because rows are permanent and a
+deployment that rolls back must still read the ledger a later one
+extended. Any further kind or format change is
 `td-accounts-v2`, landed in two steps: first a deployment that reads both
 versions, then one that writes v2, which may not ship until the reader is
 the oldest deployment an install can retain as `previous`. Names follow the principal table's
@@ -623,7 +633,16 @@ kind, a uid outside its kind's range, noncanonical decimal spelling, an
 invalid name, unsorted rows, a name held twice under one kind and a uid
 held by two rows. It bounds the ledger to 4096 rows and 256 KiB, a 64-byte
 average row, with the same headroom reason: a bound a later deployment
-outgrows strands the rollback.
+outgrows strands the rollback. Allocation, not the parser, bounds
+sandbox and workspace rows together at 2048 (`WORKLOAD_ROWS`): rows are
+permanent, and any program running as the human can have root allocate
+a sandbox under any name (once its launches go through root, WORKLOADS.md
+step 7), so cycling names would otherwise spend every row and leave no
+application install or carried row a place. At the bound a new sandbox
+or workspace is refused for good, an existing one is still returned, and
+applications keep the rest of the row and byte bounds (with long
+names the 256 KiB bound binds first, still far above the declared
+Flathub set). A ledger already holding more still parses.
 
 Every check that a uid is an application's uses the ledger's application
 range, 65536 through 98303 (`APPLICATION_UIDS`): td-login's and td-jail's
@@ -631,12 +650,15 @@ cgroup delegation, td-jail's private-home check, td-authd's launcher and
 allocation replies, the consent codec's credential target (a data-only
 copy td-authd's tests hold equal) and firstboot's state and runtime
 preparation. Only the principal table's parser keeps its wider range,
-for retained rows. No
+for retained rows. A sandbox's or workspace's account is named
+`tdw<uid>` (`WORKLOAD_ACCOUNT_PREFIX`), one form for both kinds, since
+they share a range, and its delegation is `td-workload-UID` beside an
+application's `td-app-UID` (`delegation`, by range). No
 passwd or group entry may hold a uid or gid anywhere in 65536 through
-131071 (`LEDGER_UIDS`) or take the `tda<digits>` form
-(`application_account_name`); the ledger reader's file shares both with
+131071 (`LEDGER_UIDS`) or take the `tda<digits>` or `tdw<digits>` form
+(`ledger_account_name`); the ledger reader's file shares both with
 td-login, td-firstboot and td-ssh, and the server check's reserved name
-prefixes take the application one from it.
+prefixes take the application and workload ones from it.
 
 The ledger narrows the principal table in two ways. Its application uids
 stop at 98303, and its rows are keyed by name alone, not by human owner.
@@ -654,15 +676,15 @@ Rows are never removed. A removed application keeps its row, so a
 reinstall gets the same uid and no uid is ever reused. A lost ledger,
 restored offline from a copy missing later rows, forgets those
 allocations, but no allocation re-issues a uid whose home remains under
-`/var/lib/td/applications`, or whose cgroup or runtime directory
-remains; the forgotten account's state stays there,
+`/var/lib/td/applications` or `/var/lib/td/workloads`, or whose cgroup or
+runtime directory remains; the forgotten account's state stays there,
 owned by its uid, for that offline repair to restore. The ledger is
 assignment data, not authority: which workloads are installed and what
 they may do stays with their declarations and grants.
 
 `engine/src/workload_accounts.rs` holds the dependency-free parser,
 encoder, seed and allocator; td-firstboot includes it and is the ledger's
-one writer, at boot and when td-authd allocates (below). Under the
+one writer, at boot and when root allocates (below). Under the
 principal ledger's lock its `--enroll-principals` mode merges
 the reservations, then seeds the account ledger with the rows the image
 reserved before it existed (firefox 65536, mail 65537, news 65538, web
@@ -693,8 +715,9 @@ the ledger only at the published shape above. To a launcher, a credential
 binding or a check (`app_policy::load`) a missing or malformed ledger is
 an error, never an empty ledger:
 
-- td-login's `exec-service-as tda<uid>` resolves the name from the
-  ledger alone (td-login/THREAT-MODEL.md §7).
+- td-login's `exec-service-as tda<uid>`, and `tdw<uid>` for a sandbox or
+  workspace row, resolves the name from the ledger alone
+  (td-login/THREAT-MODEL.md §7).
 - The application policy (`td-busd/src/app_policy.rs`) joins the image's
   declarations, `/etc/td-bus-applications.tsv` at
   `td-bus-applications-v2`, a `NAME CLASS OWNED` row per application with
@@ -750,11 +773,15 @@ image ships, which has its carried row or none, all refuse. Then, under
 refuses: boot seeds it first) and returns an existing row unchanged, or
 adds the lowest uid of 66560 through 98303 that no row of any kind holds
 and that no retained principal row (of any owner), passwd uid or gid,
-group gid, entry of `/var/lib/td/applications`, `td-app-UID` cgroup at
-the unified root or `/run/user/UID` entry names. Each directory is read
+group gid, entry of `/var/lib/td/applications` or `/var/lib/td/workloads`,
+`td-app-UID` or `td-workload-UID` cgroup at the unified root or
+`/run/user/UID` entry names: one taken set for every kind, so a uid one
+kind left behind is never another's. Each directory is read
 under the lock, listed without following links, its names taken in
 canonical decimal after their prefix and bounded at 65536 entries; an
-absent directory names none, and a linked one refuses. A new uid
+absent directory names none, and a linked or unreadable one refuses, so
+an install fails closed on a damaged `workloads` as on a damaged
+`applications`. A new uid
 therefore has no home, cgroup or runtime directory to inherit. No
 caller supplies a uid. Before
 publishing, it applies `check-launch-application`'s admission to the
@@ -773,6 +800,59 @@ fails leaves the row, and the
 next install, which finds the row, completes root's interrupted
 creation. A removed application keeps its row and home, so its
 reinstall is allocated the same uid and finds its state.
+
+A sandbox's account (WORKLOADS.md, "Accounts") is allocated by
+`td-firstboot allocate-workload OWNER sandbox NAME`, which root runs as
+it runs `allocate-application` and which answers one line,
+`TD-WORKLOAD-ALLOCATED`, a tab and the uid. Nothing runs it yet: the
+root launch of a sandbox (WORKLOADS.md step 7) will, when td-sandbox asks
+for one. td-firstboot requires root credentials and the deployment
+enrolled and its accounts verified, as for an application; OWNER must be
+a session owner of the deployment's principal table, NAME a name in the
+ledger's grammar and the kind `sandbox`. td-sandbox's own names are 1 to
+32 lowercase letters, digits or hyphens: one that begins with a letter
+is a ledger name, and one that begins with a digit or a hyphen (`1box`,
+`-x`) is not, so td-sandbox's cutover to ledger accounts reports and
+drops such a profile, as the repository user decided (td-sandbox's tests
+pin the relation). A workspace's
+account waits for td-agent's workspaces to launch through root
+(WORKLOADS.md step 8), and `application` is the install's. No caller
+supplies a uid. Under `.principals.lock` it reads the published ledger
+(an absent one refuses) and returns an existing `sandbox` row unchanged,
+or adds the lowest uid of 98304 through 131071 that no row of any kind
+holds and that the taken set above does not name, while sandbox and
+workspace rows together hold fewer than `WORKLOAD_ROWS`, then publishes
+the ledger as boot does. Rows are keyed by kind and name, not by human
+owner, as applications' are: a second session owner would share them.
+There is no launch admission to agree with: a sandbox's policy is the
+grants the human made for it, not a declaration.
+Still under the lock it prepares the account. Its home is
+`/var/lib/td/workloads/UID`, made below a root-owned mode-0755
+`workloads` created when absent, as `applications` is: an empty directory
+created root-owned at mode 0700 and given to the account last, with
+nothing of the human's moved in and no `.td/app` layout. A home published
+to the account keeps its contents, its mode set back to 0700 if the
+account changed it, as an application's is, so a sandbox cannot make
+its next allocation, or a root launch's per-boot preparation, refuse; root's
+interrupted creation, which can hold nothing, is completed, and one
+holding anything is refused.
+Only application homes migrate, so a workload's takes no
+`.migration.lock`; the principal lock serializes it. Its cgroup is
+`td-workload-UID` at the unified root, delegated as an application's is
+("Application runtime preparation") and only when absent or root's
+interrupted creation. It gets no `/run/user/UID`: td-login sets no
+`XDG_RUNTIME_DIR`, and a workspace jail binds nothing of `/run`. For a row
+this allocation added, an existing home, delegation or `/run/user/UID`
+the account owns refuses, as for an application. A failed preparation
+leaves the row, and the next allocation completes it.
+
+The unified hierarchy is volatile and boot iterates only applications,
+so a sandbox's delegation exists from its allocation until shutdown.
+Whatever launches a sandbox through root must therefore prepare the
+delegation again on its first launch of each boot, as the allocation's
+preparation does, before td-login places the account; until then
+td-login's placement for `tdw<uid>` finds no `td-workload-UID` and warns,
+as for any account without one (td-login/THREAT-MODEL.md §2).
 
 ## Workload grant table
 

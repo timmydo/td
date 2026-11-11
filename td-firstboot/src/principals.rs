@@ -24,8 +24,8 @@ pub(crate) fn application_home(uid: u32) -> PathBuf {
 }
 
 // The ledger's accounts come from the ledger, so no passwd or group entry
-// may take the application name form or hold a uid it allocates.
-use crate::workload_accounts::{application_account_name, LEDGER_UIDS};
+// may take a workload account name form or hold a uid it allocates.
+use crate::workload_accounts::{ledger_account_name, LEDGER_UIDS};
 pub(crate) use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 
 const TABLE_NAME: &str = "td-principals.tsv";
@@ -302,7 +302,7 @@ impl Registry {
         primary_account::validate_name(name).map_err(|error| error.to_string())?;
         let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
         self.verify_retained_accounts(self, passwd, group)?;
-        if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]
+        if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv", "tdw"]
             .iter()
             .any(|prefix| {
                 name.strip_prefix(prefix).is_some_and(|suffix| {
@@ -448,12 +448,12 @@ impl Registry {
         names
     }
 
-    /// Whether an account or group entry speaks for a workload account: the
-    /// application name form, an id the ledger allocates from, or a retained
+    /// Whether an account or group entry speaks for a workload account: a
+    /// ledger account name form, an id the ledger allocates from, or a retained
     /// application reservation's uid. Workload accounts come from the
     /// ledger, so passwd and group carry none.
     fn workload_entry(&self, name: &str, ids: [u32; 2]) -> bool {
-        application_account_name(name)
+        ledger_account_name(name)
             || ids.into_iter().any(|id| {
                 LEDGER_UIDS.contains(&id)
                     || self.applications().any(|application| application.uid == id)
@@ -518,8 +518,7 @@ impl Registry {
                 return Err("invalid principal group row".into());
             };
             let gid = decimal(gid, 0..=u32::MAX)?;
-            if self.workload_entry(name, [gid, gid])
-                || members.split(',').any(application_account_name)
+            if self.workload_entry(name, [gid, gid]) || members.split(',').any(ledger_account_name)
             {
                 return Err(
                     "a group takes or admits a workload account; workload accounts come from the account ledger"
