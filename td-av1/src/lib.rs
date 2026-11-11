@@ -1,12 +1,19 @@
 #![forbid(unsafe_code)]
 //! Shared AV1 arithmetic used by td's picture codecs.
-//! The encoder and arithmetic operate on caller-validated geometry.
+//! The bounded decoder admits hostile still-picture streams; the encoder
+//! and arithmetic operate on caller-validated geometry.
 
 pub mod cdef;
 pub mod cdf;
 pub mod deblock;
 pub mod intra;
 pub mod transform;
+
+pub use intra::decode::{
+    decode, header, DecodeError as Error, DecodeHeader as Header, Decoded as Yuv8,
+    MAX_IMAGE_PIXELS, MAX_INPUT_BYTES, MAX_OBUS, MAX_SYMBOLS,
+};
+pub const MAX_AXIS: usize = intra::MAX_AXIS;
 
 #[cfg(test)]
 mod tests {
@@ -17,6 +24,7 @@ mod tests {
             include_str!("cdf.rs"),
             include_str!("deblock.rs"),
             include_str!("intra.rs"),
+            include_str!("intra/decode.rs"),
             include_str!("transform.rs"),
         ] {
             for name in [

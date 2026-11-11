@@ -20,6 +20,8 @@
 //! quantizers and scans, `cdf` the default CDFs, `deblock` and `cdef` the
 //! filters.
 
+pub mod decode;
+
 use std::fmt;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 

@@ -14,8 +14,8 @@
 //! for chroma.
 
 /// A frame's deblocking levels (spec `loop_filter_params`): luma's for
-/// vertical and for horizontal edges, then U's and V's. Both luma levels
-/// zero turn the whole filter off.
+/// vertical and for horizontal edges, then U's and V's, after any reference
+/// deltas. Chroma can remain nonzero when both effective luma levels are zero.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Levels {
     pub luma: [u8; 2],
@@ -40,7 +40,7 @@ pub fn filter(
     levels: Levels,
     block_log2: impl Fn(usize, usize, bool) -> u32,
 ) {
-    if levels.luma == [0, 0] {
+    if levels.luma == [0, 0] && levels.u == 0 && levels.v == 0 {
         return;
     }
     for (plane, p) in planes.into_iter().enumerate() {

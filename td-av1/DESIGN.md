@@ -1,7 +1,7 @@
 # td-av1
 
 This standalone, std-only crate owns the AV1 arithmetic shared by td's
-picture codecs and still-picture AV1 encoder. It forbids unsafe code and has no dependencies. No module
+picture codecs, a still-picture encoder and a bounded still-picture decoder. It forbids unsafe code and has no dependencies. No module
 opens files, reads the environment, obtains time, starts threads itself or reaches
 network/process services.
 
@@ -32,9 +32,9 @@ module names for its existing consumers.
 
 Plane dimensions, strides and allocation extents must agree, be positive,
 and fit the caller's image budget. The photo caller admits at most 16384
-pixels per axis. A future hostile-bitstream consumer must establish its own
-pixel/work budgets and validate these preconditions before calling the
-primitives; these APIs are not an allocation or malformed-stream boundary.
+pixels per axis. The decoder establishes pixel/work budgets, geometry and coefficient bounds
+before calling the primitives. The primitive APIs themselves are not an
+allocation or malformed-stream boundary.
 
 The arithmetic and unit tests are shared unchanged with the photo encoder.
 Its independent reconstruction hashes and optional dav1d oracle remain in
@@ -50,7 +50,7 @@ the caller's thread; td-photo's `PhotoRunner` uses its existing bounded
 worker pool. The encoder caps concurrency at 16. Geometry and quality are
 validated at construction; RGB rows are trusted caller-owned data, not an
 untrusted compressed stream. This API has the encoder's existing infallible
-buffer allocations and is not the future decoder's hostile-input boundary.
+buffer allocations and is separate from the decoder's hostile-input boundary.
 
 `intra::Encoder<R>` is a pure std still-picture encoder. Its coding
 contract is:
@@ -203,3 +203,69 @@ over: zeroing a transform's few levels outright bought luma about 2%
 but cost RGB 3% at low rates, a chroma weight trading one for the
 other, and coding more luma modes in full bought under 1% on luma for
 half again the time.
+
+## Decoder
+
+`header(&[u8])` reads the first sequence header under the input/OBU budget
+and returns its dimensions, AV1 configuration record and CICP values.
+`decode(&[u8])` reads one complete picture and returns eight-bit Y, U and V
+planes, chroma half-sized with odd dimensions rounded up. Both use typed
+errors; unsupported tools refuse. Container parsing, auxiliary alpha and
+YUV-to-RGB presentation belong to the caller. This is an initial AV1
+still-picture subset, not a complete AV1 or AVIF implementation.
+
+The admitted stream has main profile, eight-bit colour 4:2:0, one reduced
+still-picture sequence header and one frame OBU. Temporal delimiter and
+padding OBUs are allowed; other OBU forms refuse. Geometry uses 64-pixel
+superblocks, uniform tiles, square blocks down to 4x4 and horizontal or
+vertical halves of 8/16/32-pixel blocks. All thirteen intra modes, angle
+deltas, intra edge filtering, recursive intra prediction and chroma from
+luma are supported. Transforms fill their block and use the reduced
+transform set's four DCT/ADST pairs; identity transforms currently refuse.
+The decoder uses adaptive or fixed CDFs as the header requests. It reads
+coefficients and signs with the normative symbol decoder, validates the
+terminating one and zero padding, and bounds Golomb lengths to the spec's
+twenty bits. Dequantization bounds each inverse input to sixteen bits.
+
+Deblocking permits zero sharpness and intra-reference deltas, including
+updates; mode deltas are parsed but do not affect intra blocks. The filter
+receives effective levels and skips the whole frame only when every plane
+has zero strength; delta-adjusted luma zero does not suppress chroma.
+Original base luma 0/0 disables deblocking globally; otherwise reference
+deltas apply even to an individual zero base luma direction. A chroma
+plane whose original base strength is zero remains disabled (AV1 7.14). CDEF may
+be disabled or use one strength preset. Quantizer deltas, segmentation,
+quantization matrices, lossless coding, screen content, other partitions,
+smaller transform selection, non-reduced transform sets, restoration,
+superresolution, film grain, monochrome and higher bit depths refuse.
+The display metadata is returned without colour conversion.
+
+The encoder and decoder share prediction edges, contexts, integer
+transforms, dequantization and reconstruction filters. The decoder invokes
+no encoder search or thread runner. It retains one tile's band buffers and
+reuses block/coefficient scratch across the tile; whole-frame reconstruction
+is needed because filtering follows intra prediction.
+
+Decoder bounds:
+
+- Encoded input: 64 MiB; at most 1024 OBUs.
+- Axis: 1–16384; visible pixels: 16 Mi; padded luma plane: 20 Mi pixels.
+- Tile geometry: at most 64 columns and 64 rows, with AV1 tile width/area
+  constraints. Partition recursion has at most five levels.
+- Entropy work: 64 Mi symbols across all tiles. Each symbol searches at
+  most sixteen CDF entries. Raw header/padding reads are input-linear.
+- A coded transform has at most 1024 coefficients; an inverse block has
+  at most 4096 samples. Golomb lengths and dequantization keep arithmetic
+  bounded, including hostile coefficient magnitudes.
+
+Frame and growing block buffers reserve fallibly. Existing bounded tile
+constructors and reconstruction filters retain their shared std allocation
+behavior; an allocator exhausting the process can still abort. The bounds
+limit simultaneously live codec buffers to less than 80 MiB at the largest
+admitted picture, excluding caller-owned input and allocator bookkeeping.
+`header` does not allocate pixel planes.
+
+Fixtures include td-encoded pictures independently decoded by dav1d 1.5.1
+and libaom 3.8.0 pictures decoded by dav1d. Tests pin exact YUV planes,
+tile edges, odd/thin geometry, truncation, symbol admission and a
+deterministic mutation corpus. The codec tests require no external tool.
