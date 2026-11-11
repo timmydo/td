@@ -671,6 +671,7 @@ mod tests {
                 "td-agent",
                 "td-authd",
                 "td-av1",
+                "td-avif",
                 "td-btrfs",
                 "td-busd",
                 "td-civil",

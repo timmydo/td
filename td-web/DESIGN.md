@@ -35,7 +35,7 @@ crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
 and td's own crates by path: `td-ui` for the window, `td-html` for
 markup, `td-fetch-client` for the network, `td-url` for URLs, and the
-shared decoders (`td-png`, `td-jpeg`, `td-gif`, `td-webp`) for pictures. It adds no external
+shared decoders (`td-png`, `td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. It adds no external
 dependency and no `unsafe`: it declares `#![forbid(unsafe_code)]`; the
 only raw syscall surface in its closure is td-ui's Wayland transport,
 already recorded in UNSAFE.md, and td-fetch-client forbids `unsafe` as
@@ -227,7 +227,7 @@ by who chose them:
 too; a larger body is refused by the service and shown as an error. A
 picture is shown within td-ui's bounds (8192 pixels an axis, 16 Mi
 pixels): a larger JPEG is decoded at the largest of td-jpeg's scales
-that fits, a larger PNG, GIF or WebP is refused. Markup past `MAX_MARKUP` (2 MiB)
+that fits, a larger PNG, GIF, WebP or AVIF is refused. Markup past `MAX_MARKUP` (2 MiB)
 and text past `MAX_TEXT` (4 MiB) are not rendered, and the page says
 so (§5). Requests carry
 `accept: text/html, application/xhtml+xml, text/plain;q=0.9,
@@ -277,17 +277,20 @@ sniff of its first bytes for `<!doctype html` or `<html`:
 - `text/*` is shown as it is, its tabs expanded every eight
   characters, wrapped at the pane's width in the monospace face on
   prose lines.
-- `image/png`, `image/jpeg` (`image/pjpeg` included), `image/gif` and
-  `image/webp`
+- `image/png`, `image/jpeg` (`image/pjpeg` included), `image/gif`,
+  `image/webp` and `image/avif`
   reached by navigation use one `picture` dispatch module and are shown
   fitted to the pane, never enlarged. With no type or
-  `application/octet-stream`, PNG, JPEG, GIF87a, GIF89a and RIFF/WEBP signatures select
+  `application/octet-stream`, PNG, JPEG, GIF87a, GIF89a, RIFF/WEBP and AVIF file-type signatures select
   that same decoder. An explicit different type remains authoritative.
   JPEG includes progressive scans; GIF shows only its first image, with
   the transparent canvas and palette policy of td-gif/DESIGN.md. WebP
   supports lossy/lossless pictures and the first animation frame, under
-  td-webp/DESIGN.md's canvas, alpha and color-conversion rules. No animation
-  runs. Encoded bytes and decoded dimensions are checked by the
+  td-webp/DESIGN.md's canvas, alpha and color-conversion rules. AVIF uses
+  td-avif/DESIGN.md's initial opaque eight-bit still subset; unsupported
+  AV1 tools and container features report an error. The Accept header
+  does not explicitly advertise AVIF while its codec coverage is partial.
+  No animation runs. Encoded bytes and decoded dimensions are checked by the
   shared entry point before allocating picture pixels; decoding runs on
   the existing render thread and is skipped for an already stopped reply.
 - Anything else is not shown: the page names the type and size and

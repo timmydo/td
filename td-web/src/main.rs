@@ -1,5 +1,5 @@
 //! td-web, td's own document browser (td-web/DESIGN.md): HTML, text,
-//! PNG, JPEG, GIF and WebP over `http` and `https`, fetched through td's fetch
+//! PNG, JPEG, GIF, WebP and AVIF over `http` and `https`, fetched through td's fetch
 //! service and shown in a td-ui window. No script runs.
 #![forbid(unsafe_code)]
 
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: td-web [URL]
 
-td's document browser: HTML, text, PNG, JPEG, GIF and WebP over http and https,
+td's document browser: HTML, text, PNG, JPEG, GIF, WebP and AVIF over http and https,
 fetched through td's fetch service. No script runs. An address without
 a scheme is taken as https.
 ";

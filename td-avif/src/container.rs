@@ -1,5 +1,6 @@
 use crate::{
-    dimensions, Error, Header, MAX_BOXES, MAX_EXTENTS, MAX_INPUT_BYTES, MAX_ITEMS, MAX_PROPERTIES,
+    dimensions, Colour, Error, Header, MAX_BOXES, MAX_EXTENTS, MAX_INPUT_BYTES, MAX_ITEMS,
+    MAX_PROPERTIES,
 };
 
 struct Reader<'a> {
@@ -108,6 +109,7 @@ pub(super) struct Parsed<'a> {
     pub config: [u8; 4],
     pub extents: Vec<&'a [u8]>,
     pub length: usize,
+    pub colour: Option<Colour>,
 }
 
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
@@ -117,29 +119,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
     let mut budget = MAX_BOXES;
     let mut boxes = Boxes::new(bytes, 0);
     let first = boxes.next(&mut budget)?.ok_or(Error::NotAvif)?;
-    if first.kind != b"ftyp" || first.bytes.len() < 8 || first.bytes.len() % 4 != 0 {
-        return Err(Error::NotAvif);
-    }
-    if first
-        .bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .enumerate()
-        .any(|(i, brand)| i != 1 && brand == b"avis")
-    {
-        return Err(Error::Unsupported);
-    }
-    if !first
-        .bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .enumerate()
-        .any(|(i, brand)| i != 1 && brand == b"avif")
-    {
-        return Err(Error::NotAvif);
-    }
+    avif_brand(first)?;
     let mut meta = None;
     let mut mdats = Vec::new();
     while let Some(b) = boxes.next(&mut budget)? {
@@ -185,13 +165,14 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
         return Err(Error::Container);
     }
     item_type(iinf.ok_or(Error::Container)?, primary, &mut budget)?;
-    let (header, config) = properties(iprp.ok_or(Error::Container)?, primary, &mut budget)?;
+    let (header, config, colour) = properties(iprp.ok_or(Error::Container)?, primary, &mut budget)?;
     let (extents, length) = locations(iloc.ok_or(Error::Container)?, primary, bytes, idat, &mdats)?;
     Ok(Parsed {
         header,
         config,
         extents,
         length,
+        colour,
     })
 }
 
@@ -261,7 +242,7 @@ fn properties(
     b: BoxData<'_>,
     primary: usize,
     budget: &mut usize,
-) -> Result<(Header, [u8; 4]), Error> {
+) -> Result<(Header, [u8; 4], Option<Colour>), Error> {
     let mut boxes = Boxes::new(b.bytes, b.start);
     let (mut ipco, mut ipma) = (None, None);
     while let Some(child) = boxes.next(budget)? {
@@ -323,7 +304,7 @@ fn properties(
         }
     }
     r.done()?;
-    let (mut header, mut config, mut pixel) = (None, None, None);
+    let (mut header, mut config, mut pixel, mut colour) = (None, None, None, None);
     for (p, essential) in selected {
         let mut r = Reader::new(p.bytes);
         match p.kind {
@@ -368,13 +349,25 @@ fn properties(
                 r.done()?;
             }
             b"colr" => {
+                if colour.is_some() {
+                    return Err(Error::Container);
+                }
                 if r.take(4)? != b"nclx" {
                     return Err(Error::Unsupported);
                 }
-                r.take(6)?;
-                if r.number(1)? & 0x7f != 0 {
+                let primaries = r.number(2)? as u16;
+                let transfer = r.number(2)? as u16;
+                let matrix = r.number(2)? as u16;
+                let range = r.number(1)?;
+                if range & 0x7f != 0 {
                     return Err(Error::Container);
                 }
+                colour = Some(Colour {
+                    primaries,
+                    transfer,
+                    matrix,
+                    full_range: range & 0x80 != 0,
+                });
                 r.done()?;
             }
             // Transformative properties cannot silently be ignored even when nonessential.
@@ -400,7 +393,7 @@ fn properties(
             return Err(Error::Container);
         }
     }
-    Ok((header.ok_or(Error::Container)?, config))
+    Ok((header.ok_or(Error::Container)?, config, colour))
 }
 
 fn locations<'a>(
@@ -480,4 +473,43 @@ fn locations<'a>(
         return Err(Error::Container);
     }
     Ok((extents, total))
+}
+
+fn avif_brand(first: BoxData<'_>) -> Result<(), Error> {
+    if first.kind != b"ftyp" || first.bytes.len() < 8 || !first.bytes.len().is_multiple_of(4) {
+        return Err(Error::NotAvif);
+    }
+    if first
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .any(|(i, brand)| i != 1 && brand == b"avis")
+    {
+        return Err(Error::Unsupported);
+    }
+    if !first
+        .bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .any(|(i, brand)| i != 1 && brand == b"avif")
+    {
+        return Err(Error::NotAvif);
+    }
+    Ok(())
+}
+
+pub(super) fn is_avif(bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return false;
+    }
+    let mut budget = 1;
+    Boxes::new(bytes, 0)
+        .next(&mut budget)
+        .ok()
+        .flatten()
+        .is_some_and(|first| avif_brand(first).is_ok())
 }

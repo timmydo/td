@@ -3,9 +3,12 @@ name = "td-avif"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bounded AVIF image container reader"
+description = "Bounded AVIF still-picture decoder"
 
 [workspace]
+
+[dependencies]
+td-av1 = { path = "../td-av1" }
 
 [package.metadata.td-gate]
 clippy-all-targets = true

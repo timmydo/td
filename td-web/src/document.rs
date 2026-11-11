@@ -1,6 +1,6 @@
 //! A response as td-web shows it (DESIGN.md §5): HTML rendered once
 //! through td-html's rich output into logical lines, text as it is, a
-//! PNG, JPEG, GIF or WebP decoded, anything else named and not shown, all of it on
+//! PNG, JPEG, GIF, WebP or AVIF decoded, anything else named and not shown, all of it on
 //! the render thread; and the rendering, those lines wrapped by pixel
 //! width into lines of styled pieces with link targets, on the window's
 //! thread, a few at a time near the ones shown, for each width and body
@@ -1451,7 +1451,7 @@ impl Document {
                 };
                 let said = format!(
                     "This is {named}, {size} bytes.\n\ntd-web shows HTML, text, PNG, \
-                     JPEG, GIF and WebP; Firefox opens the rest."
+                     JPEG, GIF, WebP and AVIF; Firefox opens the rest."
                 );
                 (plain(&said, false, base), None, None)
             }
@@ -2481,6 +2481,7 @@ pub(crate) mod tests {
             ("image/png", td_png::encode_rgb8(1, 1, &[0, 0, 0]).unwrap()),
             ("image/gif", picture::tests::GIF.to_vec()),
             ("image/webp", picture::tests::WEBP.to_vec()),
+            ("image/avif", picture::tests::AVIF.to_vec()),
         ] {
             let doc = Document::from_reply_unless(base(), 200, Some(kind), body, &stopped);
             assert!(doc.is_none(), "{kind}");
@@ -3025,6 +3026,35 @@ pub(crate) mod tests {
         assert!(doc.picture().is_none());
         assert!(text_of(&cells(&doc, 80))[0].starts_with("The GIF could not be read"));
     }
+    #[test]
+    fn avif_navigation_uses_the_shared_decoder_and_admitted_still_subset() {
+        let expected = Picture::new(6, 4, [232, 134, 109, 255].repeat(24)).unwrap();
+        for mime in [
+            Some("image/avif"),
+            Some("IMAGE/AVIF; x=y"),
+            None,
+            Some("application/octet-stream"),
+        ] {
+            let doc = Document::from_reply(base(), 200, mime, picture::tests::AVIF.to_vec());
+            assert_eq!(doc.picture().unwrap().fit(6, 4), expected.fit(6, 4));
+        }
+        let doc = Document::from_reply(
+            base(),
+            200,
+            Some("application/pdf"),
+            picture::tests::AVIF.to_vec(),
+        );
+        assert!(doc.picture().is_none());
+        let doc = Document::from_reply(
+            base(),
+            200,
+            Some("image/avif"),
+            include_bytes!("../../td-avif/tests/fixtures/libavif.avif").to_vec(),
+        );
+        assert!(doc.picture().is_none());
+        assert!(text_of(&cells(&doc, 80))[0].starts_with("The AVIF could not be decoded"));
+    }
+
     #[test]
     fn webp_navigation_uses_mime_or_container_signature() {
         let expected = Picture::new(

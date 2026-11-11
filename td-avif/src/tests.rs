@@ -115,6 +115,54 @@ fn independent_libavif_container_extracts_its_primary_item() {
 }
 
 #[test]
+fn admitted_avif_decodes_opaque_rgba_and_refuses_metadata_disagreement() {
+    let bytes = include_bytes!("../tests/fixtures/libaom-reduced.avif");
+    let image = decode(bytes).unwrap();
+    assert_eq!((image.width, image.height), (6, 4));
+    assert_eq!(image.data, [232, 134, 109, 255].repeat(24));
+    assert!(is_avif(bytes));
+    assert!(!is_avif(b"not an AVIF"));
+    let mut wrong_size = bytes.to_vec();
+    let ispe = at(&wrong_size, b"ispe");
+    wrong_size[ispe + 4..ispe + 8].copy_from_slice(&7u32.to_be_bytes());
+    assert_eq!(decode(&wrong_size), Err(Error::Container));
+    let mut wrong_config = bytes.to_vec();
+    let config = at(&wrong_config, b"av1C");
+    wrong_config[config + 1] = 4;
+    assert_eq!(decode(&wrong_config), Err(Error::Container));
+    let mut wrong_colour = bytes.to_vec();
+    let colour = at(&wrong_colour, b"nclx");
+    wrong_colour[colour + 5] = 1;
+    assert_eq!(decode(&wrong_colour), Err(Error::Container));
+    let unsupported = include_bytes!("../tests/fixtures/libavif.avif");
+    assert_eq!(decode(unsupported), Err(Error::Unsupported));
+    for n in 0..bytes.len() {
+        assert!(decode(&bytes[..n]).is_err(), "prefix {n}");
+    }
+}
+
+#[test]
+fn colour_conversion_handles_range_and_both_matrices() {
+    let mut colour = Colour {
+        primaries: 1,
+        transfer: 13,
+        matrix: 6,
+        full_range: true,
+    };
+    assert_eq!(rgb([0, 128, 128], colour), [0, 0, 0]);
+    assert_eq!(rgb([255, 128, 128], colour), [255, 255, 255]);
+    assert_eq!(rgb([128, 0, 128], colour), [128, 172, 0]);
+    colour.matrix = 1;
+    assert_eq!(rgb([128, 0, 128], colour), [128, 152, 0]);
+    for matrix in [1, 6] {
+        colour.matrix = matrix;
+        colour.full_range = false;
+        assert_eq!(rgb([16, 128, 128], colour), [0, 0, 0]);
+        assert_eq!(rgb([235, 128, 128], colour), [255, 255, 255]);
+    }
+}
+
+#[test]
 fn sequence_signaling_does_not_fall_back_to_a_primary_still() {
     let mut branded = file(false, None);
     branded[8..12].copy_from_slice(b"avis");

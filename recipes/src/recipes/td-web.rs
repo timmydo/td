@@ -11,6 +11,8 @@ pub fn recipe() -> Recipe {
     Recipe::rust("td-web", "0.1.0")
         .local_source("td-web")
         .local_source_trees(&[
+            "td-av1",
+            "td-avif",
             "td-fetch-client",
             "td-gif",
             "td-html",
@@ -45,6 +47,8 @@ mod tests {
         assert_eq!(
             r.local_source_trees,
             Some(vec![
+                "td-av1".into(),
+                "td-avif".into(),
                 "td-fetch-client".into(),
                 "td-gif".into(),
                 "td-html".into(),
@@ -83,6 +87,8 @@ mod tests {
         assert_eq!(
             names,
             [
+                "td-av1",
+                "td-avif",
                 "td-fetch-client",
                 "td-gif",
                 "td-html",
@@ -102,16 +108,30 @@ mod tests {
     /// literal `#[path]` or `include` macro, transitively.
     #[test]
     fn the_staged_trees_are_the_closure_its_manifest_and_files_name() {
-        let manifest = include_str!("../../../td-web/Cargo.toml");
-        let mut crates = vec!["td-web"];
-        for line in manifest.lines() {
-            if let Some((_, rest)) = line.split_once("{ path = \"../") {
-                if !line.trim_start().starts_with('#') {
-                    crates.extend(rest.split('"').next());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut crates = vec!["td-web".to_string()];
+        let mut next = 0;
+        while next < crates.len() {
+            let manifest =
+                std::fs::read_to_string(root.join(&crates[next]).join("Cargo.toml")).unwrap();
+            for line in manifest
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+            {
+                if let Some((_, rest)) = line.split_once("{ path = \"../") {
+                    if let Some(name) = rest.split('"').next() {
+                        if !crates.iter().any(|value| value == name) {
+                            crates.push(name.to_string());
+                        }
+                    }
                 }
             }
+            next += 1;
         }
-        let (mut trees, mounts) = crate::source_closure::trees_named(&crates);
+        let refs: Vec<&str> = crates.iter().map(String::as_str).collect();
+        let (mut trees, mounts) = crate::source_closure::trees_named(&refs);
         assert!(mounts > 0, "{mounts}");
         trees.extend(crates.iter().map(|name| name.to_string()));
         trees.remove("td-web");
