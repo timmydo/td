@@ -137,7 +137,7 @@ read-only, each at its path in the root, and nothing else of it:
 
 | Root directory | Mounted at | Role |
 | --- | --- | --- |
-| `usr` | `/usr` | Debian's GCC 14.2.0 (the host linker driver only) and binutils 2.44, x86-64 and `aarch64-linux-gnu` cross; glibc 2.41, libgcc_s and zlib for the upstream Rust host tools, build scripts and proc macros |
+| `usr` | `/usr` | Debian's GCC 14.2.0 for x86-64 (the host linker driver only) and binutils 2.44 for x86-64 and `aarch64-linux-gnu`; glibc 2.41, libgcc_s and zlib for the upstream Rust host tools, build scripts and proc macros |
 | `usr/lib` | `/lib` | the usrmerge link the root's loader link and `libc.so` script name |
 | `usr/lib64` | `/lib64` | the loader, `/lib64/ld-linux-x86-64.so.2` |
 
@@ -178,7 +178,7 @@ only the named cache entry and retry; there is no automatic repair or fsync
 claim. A hard kill may leave `crypto-portable-<pid>-<attempt>` scratch behind;
 remove it only after confirming that process has ended. The build host needs
 space for archives, extraction and the reconstructed kit; the build root
-lives once per machine in the shared seed store (about 660 MiB), and nothing
+lives once per machine in the shared seed store (about 510 MiB), and nothing
 of it is copied into the worktree. Each extracted Rust component and its
 private archive are removed after installation. Superseded content-addressed
 kits remain until explicitly removed. Remove an old `crypto-*` cache entry
@@ -194,12 +194,13 @@ td-builder gate-crates crypto-portable-cross-build --archives /path/to/archives
 ```
 
 This command uses the aarch64 kit and the build root's Debian
-`aarch64-linux-gnu` binutils (`nm`, `objcopy`) in an isolated offline build.
-It applies the same dependency admission, API confinement and fallback refusal
-as the x86-64 path. Rust uses its generic ARM CPU baseline and requests frame
-pointers and level-1 debug data. No C is compiled, so the root's arm64 cross
-compiler and libgcc take no part. Rustdoc's pinned
-baseline features are `neon` and `outline-atomics`.
+`aarch64-linux-gnu` binutils (`nm`, `objdump`, `objcopy`) in an isolated
+offline build. It applies the same dependency admission, API confinement
+and fallback refusal as the x86-64 path. Rust uses its generic ARM CPU
+baseline and requests frame pointers and level-1 debug data. No C is
+compiled, and the root carries no arm64 cross compiler, C library or
+libgcc. Rustdoc's pinned baseline features are `neon` and
+`outline-atomics`.
 
 Rust's ARM target defaults to a non-PIE static executable. This build uses
 stable `link-self-contained=no`, PIC and explicit linker flags to select the
