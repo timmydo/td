@@ -11,6 +11,9 @@
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
+// td-alloc, by the name td-jail's authority reaches it under.
+#[cfg(test)]
+use td_engine::allocation;
 // The workload account ledger, by the name the shared application policy
 // reads it under, and the grant table td-jail's authority admits views by.
 #[cfg(test)]

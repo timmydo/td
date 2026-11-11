@@ -1,6 +1,8 @@
 //! The `workspace` launch kind (APPLICATIONS.md §C, td-agent/DESIGN.md §8):
-//! a launch on a development host, or on td by td's account, whose policy
-//! is a spec file its launcher writes, for an agent's tools. It runs a program the launcher names, not
+//! a launch on a development host, or on td by td's account or by a
+//! sandbox's or workspace's ledger account that root's intake started,
+//! whose policy is a spec file its launcher writes, for an agent's tools or
+//! a sandbox's shell. It runs a program the launcher names, not
 //! a package; binds the launcher's worktrees read-write and executable at
 //! their real paths, its git repositories through the git mount chain,
 //! shared directories at theirs, a private home, and the host's own system
@@ -24,6 +26,8 @@ use crate::authority::{
     self, path_is_same_or_child, paths_overlap, FilesystemGrant, FilesystemSourceKind,
 };
 use crate::flathub_app::{self, FlathubRuntime};
+use crate::workload_accounts::canonical_decimal;
+use crate::workload_accounts::{Kind, WORKLOAD_UIDS, WORKSPACE_INTAKE, WORKSPACE_SPECS};
 
 /// The argument after the exact `td-jail` argv[0] that selects this kind.
 pub(crate) const WORKSPACE_ARG: &str = "--workspace";
@@ -223,6 +227,25 @@ pub(crate) struct WorkspacePlan {
     pub(crate) arguments: Vec<OsString>,
     /// The spec's runtime, held; none for a native workspace.
     pub(crate) runtime: Option<WorkspaceRuntime>,
+    /// Whether the channel is a connection root's intake accepted, a
+    /// ledger caller's, rather than its launcher's unnamed socket pair.
+    pub(crate) intake: bool,
+}
+
+/// Who may launch the kind, which decides whose spec, home and grants an
+/// instance takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// td's account, the human, launching itself (td-agent, and
+    /// td-sandbox until it launches through root), or any nonzero identity
+    /// on a development host: its own spec, its passwd home, the spec's
+    /// directories, and a socket pair to its launcher.
+    Human,
+    /// A sandbox's or workspace's ledger account, which root's workspace
+    /// intake started (td-authd/DESIGN.md, "Workspace launch intake"):
+    /// root's spec, the account's own home, the views its manifest lists,
+    /// and the intake's connection.
+    Account(Kind),
 }
 
 /// A runtime store's `current`, held for the launch, and its tree, which
@@ -310,6 +333,8 @@ struct Spec {
     repositories: Vec<PathBuf>,
     read: Vec<PathBuf>,
     write: Vec<PathBuf>,
+    /// A ledger caller's views, root's, bound as `write` and `read` are.
+    views: Vec<FilesystemGrant>,
 }
 
 /// The exact, ordered keyfile: `format=1`, an optional `profile`, an
@@ -475,12 +500,32 @@ where
             "the workspace kind requires a nonzero identity",
         ));
     }
-    require_account(uid, Path::new(UID_MAP), Path::new(authority::CONFIG_PATH))?;
+    let caller = require_account(
+        (uid, gid),
+        Path::new(UID_MAP),
+        Path::new(authority::CONFIG_PATH),
+        crate::workload_accounts::load,
+    )?;
     let spec_path = Path::new(spec_path);
-    let text = read_spec(spec_path, uid)?;
-    let spec = parse_spec(&text)?;
+    let text = read_spec(spec_path, uid, caller)?;
+    let mut spec = parse_spec(&text)?;
+    if let Caller::Account(kind) = caller {
+        require_account_spec(&spec, kind, uid)?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        spec.views = authority::workspace_views(
+            &mountinfo,
+            uid,
+            require_view_target,
+            &reserved_identities(&mountinfo, RESERVED)?,
+        )?;
+    }
     let runtime = spec.runtime;
-    let real_home = authority::account_home(uid)?;
+    // A ledger account's home is the spec's, its own; the human's is the
+    // one no directory may be or contain.
+    let real_home = authority::account_home(match caller {
+        Caller::Human => uid,
+        Caller::Account(_) => TD_ACCOUNT_UID,
+    })?;
     // The home as the account names it and as it resolves, which differ
     // where `/home` is a link (`/var/home` on OSTree hosts).
     let real_home = match fs::canonicalize(&real_home) {
@@ -489,6 +534,7 @@ where
     };
     let arguments = authority::collect_arguments(arguments)?;
     let mut plan = admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)?;
+    plan.intake = matches!(caller, Caller::Account(_));
     if let Some(runtime) = runtime {
         plan.runtime = Some(spec_runtime(runtime, &td_runtime_source())?);
     }
@@ -543,20 +589,95 @@ fn require_td_for_runtime(config: &Path) -> io::Result<()> {
 }
 
 /// Where the product configuration at `config` is installed, td's, the
-/// kind serves td's account alone, as the initial user namespace knows it
+/// kind serves td's account and the sandbox and workspace accounts of the
+/// ledger `ledger` reads, as the initial user namespace knows them
 /// (`uid_map`, the caller's map): a uid is the caller's namespace's, and
-/// an application's own is the account's. On a development host, any
-/// nonzero identity. It grants nothing the caller could not do itself:
-/// td-jail is no more privileged than its caller, and the kind only
-/// narrows what the caller's tools reach.
-fn require_account(uid: u32, uid_map: &Path, config: &Path) -> io::Result<()> {
-    if uid == TD_ACCOUNT_UID && initial_user_namespace(uid_map)? {
-        return Ok(());
+/// an application's own is the account's. A ledger account's gid is its
+/// uid. On a development host, any nonzero identity, as td's account. It
+/// grants nothing the caller could not do itself: td-jail is no more
+/// privileged than its caller, and the kind only narrows what the
+/// caller's tools reach.
+fn require_account(
+    (uid, gid): (u32, u32),
+    uid_map: &Path,
+    config: &Path,
+    ledger: impl FnOnce() -> Result<crate::workload_accounts::Ledger, String>,
+) -> io::Result<Caller> {
+    let initial = initial_user_namespace(uid_map)?;
+    if uid == TD_ACCOUNT_UID && initial {
+        return Ok(Caller::Human);
+    }
+    if WORKLOAD_UIDS.contains(&uid) && initial && configuration_installed(config)? {
+        let ledger = ledger().map_err(|error| {
+            crate::error(
+                io::ErrorKind::PermissionDenied,
+                format_args!("the workspace kind reads the account ledger: {error}"),
+            )
+        })?;
+        let kind = [Kind::Sandbox, Kind::Workspace]
+            .into_iter()
+            .find(|kind| ledger.name(*kind, uid).is_some())
+            .filter(|_| gid == uid)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the workspace kind's caller holds no sandbox or workspace ledger account",
+                )
+            })?;
+        return Ok(Caller::Account(kind));
     }
     authority::require_no_configuration_at(
         config,
-        "the workspace kind for any identity but td's account in the initial user namespace",
-    )
+        "the workspace kind for any identity but td's account or a sandbox's or \
+         workspace's ledger account in the initial user namespace",
+    )?;
+    Ok(Caller::Human)
+}
+
+/// Whether td's product configuration is installed at `config`.
+fn configuration_installed(config: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(config) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(crate::error(
+            error.kind(),
+            format_args!("inspect product application configuration: {error}"),
+        )),
+    }
+}
+
+/// A ledger caller's spec, which root wrote: the account's own home, and no
+/// directory of the caller's to bind, since the account has none; what it
+/// reaches of the human's is its manifest's views.
+fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
+    if !(spec.scratch.is_empty()
+        && spec.worktrees.is_empty()
+        && spec.checkouts.is_empty()
+        && spec.repositories.is_empty()
+        && spec.read.is_empty()
+        && spec.write.is_empty())
+    {
+        return Err(invalid(
+            "a ledger account's workspace spec names no directory; its grants are its views",
+        ));
+    }
+    if spec.home != kind.home(uid) {
+        return Err(crate::error(
+            io::ErrorKind::InvalidInput,
+            format_args!(
+                "a ledger account's workspace home is {}, not {}",
+                kind.home(uid).display(),
+                spec.home.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Where a ledger caller's view of the human's directory may be bound: at
+/// a canonical path that is no tree the jail keeps for itself.
+pub(crate) fn require_view_target(target: &Path) -> io::Result<()> {
+    refuse_reserved(target, &[], RESERVED)
 }
 
 /// Whether the map at `uid_map` is the initial user namespace's: the
@@ -570,9 +691,43 @@ fn initial_user_namespace(uid_map: &Path) -> io::Result<bool> {
     Ok(fields == ["0", "0", "4294967295"])
 }
 
-/// The spec: a direct regular file of the caller's that no one else can
-/// write, bounded.
-fn read_spec(path: &Path, uid: u32) -> io::Result<String> {
+/// The spec: a direct regular file no one but its owner can write,
+/// bounded. The human's own is the caller's; a ledger caller's is root's,
+/// of one link in a directory of root's no one else can write, so neither
+/// the account nor a link it made can stand in for it.
+fn read_spec(path: &Path, uid: u32, caller: Caller) -> io::Result<String> {
+    match caller {
+        Caller::Human => read_spec_of(path, uid, false),
+        Caller::Account(_) if account_spec_path(path, uid) => read_spec_of(path, 0, true),
+        Caller::Account(_) => Err(crate::error(
+            io::ErrorKind::PermissionDenied,
+            format_args!(
+                "a ledger account's workspace spec lies in root's {WORKSPACE_SPECS}/{uid}, not at {}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// Whether `path` is a launch spec root writes for `uid`:
+/// `WORKSPACE_SPECS/UID/N`, N canonical decimal, as td-authd's
+/// `workspace-exec` admits it.
+fn account_spec_path(path: &Path, uid: u32) -> bool {
+    path.to_str()
+        .and_then(|path| path.strip_prefix(WORKSPACE_SPECS))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(owner, id)| {
+            canonical_decimal(owner)
+                && owner.parse::<u32>() == Ok(uid)
+                && canonical_decimal(id)
+                && id.parse::<u64>().is_ok()
+        })
+}
+
+/// `read_spec` for a spec `owner` owns, and with `sealed` of one link in a
+/// directory `owner` owns that no one else can write.
+fn read_spec_of(path: &Path, owner: u32, sealed: bool) -> io::Result<String> {
     if !path.is_absolute() {
         return Err(invalid("workspace spec path is not absolute"));
     }
@@ -583,14 +738,35 @@ fn read_spec(path: &Path, uid: u32) -> io::Result<String> {
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != uid
+        || metadata.uid() != owner
         || metadata.permissions().mode() & 0o022 != 0
         || fs::canonicalize(path)? != path
     {
         return Err(invalid(format!(
-            "workspace spec {} is not a direct regular file only its owner, the caller, can write",
-            path.display()
+            "workspace spec {} is not a direct regular file only its owner, {}, can write",
+            path.display(),
+            if sealed { "root" } else { "the caller" }
         )));
+    }
+    if sealed {
+        let directory = path
+            .parent()
+            .map(fs::symlink_metadata)
+            .transpose()?
+            .ok_or_else(|| invalid("workspace spec has no directory"))?;
+        if metadata.nlink() != 1
+            || !directory.is_dir()
+            || directory.uid() != owner
+            || directory.permissions().mode() & 0o022 != 0
+        {
+            return Err(crate::error(
+                io::ErrorKind::InvalidInput,
+                format_args!(
+                    "workspace spec {} is not root's one link in a directory of root's",
+                    path.display()
+                ),
+            ));
+        }
     }
     let mut text = String::new();
     (&mut file)
@@ -603,7 +779,7 @@ fn read_spec(path: &Path, uid: u32) -> io::Result<String> {
 }
 
 fn admit(
-    spec: Spec,
+    mut spec: Spec,
     spec_path: &Path,
     uid: u32,
     gid: u32,
@@ -702,6 +878,7 @@ fn admit(
             .chain(&spec.repositories)
             .chain(&spec.read)
             .chain(&spec.write)
+            .chain(spec.views.iter().map(|grant| &grant.target))
             .chain(chain.iter().map(|grant| &grant.target)),
         MAX_PLAN_BYTES,
     )?;
@@ -712,6 +889,14 @@ fn admit(
         .collect::<io::Result<Vec<_>>>()?;
     for tree in &spec.write {
         shared.push(admit_directory(tree, false)?);
+    }
+    // A ledger caller's views: each source root's published mount, its
+    // target the human's path, held to every check a shared directory is.
+    // Moved, not copied: `first_view` finds them again below.
+    let first_view = shared.len();
+    for view in std::mem::take(&mut spec.views) {
+        crate::allocation::push(&mut shared, view)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     }
     let scratch = spec
         .scratch
@@ -813,6 +998,23 @@ fn admit(
         }
         identities.push((grant.source.clone(), mounts));
     }
+    // A view binds at the human's path, not at its source's, so its target
+    // must meet no other bind's either.
+    for view in shared.iter().skip(first_view) {
+        let met = all
+            .iter()
+            .filter(|grant| paths_overlap(&grant.target, &view.target))
+            .count();
+        if met > 1 {
+            return Err(crate::error(
+                io::ErrorKind::InvalidInput,
+                format_args!(
+                    "grant view at {} overlaps another workspace directory",
+                    view.target.display()
+                ),
+            ));
+        }
+    }
     for (index, (source, mounts)) in identities.iter().enumerate() {
         for (other, other_mounts) in identities.iter().skip(index + 1) {
             if paths_overlap(source, other)
@@ -842,6 +1044,7 @@ fn admit(
         shared,
         arguments,
         runtime: None,
+        intake: false,
     })
 }
 
@@ -1157,11 +1360,21 @@ fn reserved_identities(
     Ok(identities)
 }
 
-/// The channel, by its inode in the launcher's `/proc/net/unix`: an
-/// unnamed, connected Unix stream socket. A datagram socket could address
-/// any pathname socket on the host with `sendto`, and the jail's filter
-/// leaves `sendto` alone.
-pub(crate) fn require_stream_pair(table: &str, inode: u64) -> io::Result<()> {
+/// The channel, by its inode in the launcher's `/proc/net/unix`: a
+/// connected Unix stream socket, unnamed for the human's launcher's
+/// socket pair, or, for a ledger caller (`intake`), an accepted connection
+/// that carries the intake's name. A datagram socket could address any
+/// pathname socket on the host with `sendto`, and the jail's filter leaves
+/// `sendto` alone; a connected stream socket's `sendto` reaches its peer
+/// alone. The name proves the shape, not the origin, since any namespace
+/// can bind a socket of that name: what makes the connection root's is
+/// the caller's class, a ledger account only root's launch starts.
+pub(crate) fn require_stream_pair(table: &str, inode: u64, intake: bool) -> io::Result<()> {
+    require_stream_row(table, inode, intake.then_some(WORKSPACE_INTAKE))
+}
+
+/// `require_stream_pair`, a named row admitted only at `named`.
+fn require_stream_row(table: &str, inode: u64, named: Option<&str>) -> io::Result<()> {
     let inode = inode.to_string();
     let row = table
         .lines()
@@ -1169,10 +1382,16 @@ pub(crate) fn require_stream_pair(table: &str, inode: u64) -> io::Result<()> {
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         .find(|fields| fields.get(6) == Some(&inode.as_str()))
         .ok_or_else(|| invalid("the workspace channel is not a Unix socket of this namespace"))?;
-    if row.get(4) != Some(&UNIX_STREAM) || row.get(5) != Some(&UNIX_CONNECTED) || row.len() != 7 {
-        return Err(invalid(
-            "the workspace channel is not an unnamed, connected Unix stream socket",
-        ));
+    let shape = match named {
+        Some(name) => row.len() == 8 && row.get(7) == Some(&name),
+        None => row.len() == 7,
+    };
+    if row.get(4) != Some(&UNIX_STREAM) || row.get(5) != Some(&UNIX_CONNECTED) || !shape {
+        return Err(invalid(if named.is_some() {
+            "the workspace channel is not a connection root's workspace intake accepted"
+        } else {
+            "the workspace channel is not an unnamed, connected Unix stream socket"
+        }));
     }
     Ok(())
 }
@@ -1402,18 +1621,152 @@ mod tests {
         // An application's: its own uid 1000 is the host's 65536.
         let jailed = base.join("jailed");
         fs::write(&jailed, "      1000      65536          1\n").unwrap();
-        assert!(require_account(1001, &initial, &config).is_ok());
-        assert!(require_account(TD_ACCOUNT_UID, &jailed, &config).is_ok());
+        type Reader = fn() -> Result<crate::workload_accounts::Ledger, String>;
+        fn ledger() -> Result<crate::workload_accounts::Ledger, String> {
+            crate::workload_accounts::Ledger::parse(concat!(
+                "td-accounts-v1\n",
+                "application\tfirefox\t65536\n",
+                "sandbox\tdefault\t98304\n",
+                "workspace\tagent\t98305\n",
+            ))
+        }
+        fn unread() -> Result<crate::workload_accounts::Ledger, String> {
+            Err("no ledger".to_string())
+        }
+        let account = |uid: u32, map: &Path, ledger: Reader| {
+            require_account((uid, uid), map, &config, ledger)
+        };
+        assert_eq!(account(1001, &initial, ledger).unwrap(), Caller::Human);
+        assert_eq!(
+            account(TD_ACCOUNT_UID, &jailed, ledger).unwrap(),
+            Caller::Human
+        );
+        // A development host knows no ledger: any identity is its own.
+        assert_eq!(account(98304, &initial, unread).unwrap(), Caller::Human);
         fs::write(&config, "format=1\n").unwrap();
-        assert!(require_account(TD_ACCOUNT_UID, &initial, &config).is_ok());
-        let refused = require_account(1001, &initial, &config).unwrap_err();
+        // On td both caller classes exist: td's account, which td-agent and
+        // td-sandbox launch as, and a sandbox's or workspace's ledger
+        // account, which root's intake starts.
+        assert_eq!(
+            account(TD_ACCOUNT_UID, &initial, unread).unwrap(),
+            Caller::Human
+        );
+        assert_eq!(
+            account(98304, &initial, ledger).unwrap(),
+            Caller::Account(Kind::Sandbox)
+        );
+        assert_eq!(
+            account(98305, &initial, ledger).unwrap(),
+            Caller::Account(Kind::Workspace)
+        );
+        let refused = account(1001, &initial, ledger).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
-        assert!(require_account(65536, &initial, &config).is_err());
-        let refused = require_account(TD_ACCOUNT_UID, &jailed, &config).unwrap_err();
+        // An application's account, a ledger uid no row holds, one outside
+        // the range, one whose gid is not its uid, one in another
+        // namespace, and any when the ledger cannot be read.
+        for uid in [65536, 98303, 98306, 131071, 131072] {
+            let refused = account(uid, &initial, ledger).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{uid}");
+        }
+        assert!(require_account((98304, 98305), &initial, &config, ledger).is_err());
+        assert!(require_account((98304, 1000), &initial, &config, ledger).is_err());
+        assert!(account(98304, &jailed, ledger).is_err());
+        assert!(account(98304, &initial, unread).is_err());
+        let refused = account(TD_ACCOUNT_UID, &jailed, ledger).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         // This process's own map reads as one or the other.
         assert!(initial_user_namespace(Path::new(UID_MAP)).is_ok());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A ledger caller's spec is root's, of one link in root's directory,
+    /// never its own; the human's is its own.
+    #[test]
+    fn a_ledger_callers_spec_is_roots_and_the_humans_its_own() {
+        let temp = crate::test_temp::TempDir::new("td-jail-spec-owner").unwrap();
+        let directory = temp.path().join("specs");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
+        let directory = fs::canonicalize(&directory).unwrap();
+        let path = directory.join("1");
+        fs::write(&path, "format=1\nentry=/bin/true\nhome=/h\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let me = fs::metadata(&path).unwrap().uid();
+        // The caller's own spec serves the human and never a ledger account.
+        assert!(read_spec(&path, me, Caller::Human).is_ok());
+        for kind in [Kind::Sandbox, Kind::Workspace] {
+            let refused = read_spec(&path, me, Caller::Account(kind)).unwrap_err();
+            assert!(refused.to_string().contains("root"), "{refused}");
+        }
+        // A ledger caller's spec is one root wrote for it, by name.
+        assert!(account_spec_path(
+            Path::new("/run/td-authd/workspaces/98304/7"),
+            98304
+        ));
+        for other in [
+            "/run/td-authd/workspaces/98305/7",
+            "/run/td-authd/workspaces/98304/07",
+            "/run/td-authd/workspaces/98304/x",
+            "/run/td-authd/workspaces/98304/",
+            "/run/td-authd/workspaces/98304/../98305/7",
+            "/tmp/run/td-authd/workspaces/98304/7",
+        ] {
+            assert!(!account_spec_path(Path::new(other), 98304), "{other}");
+        }
+        // Sealed, as root's must be: one link, in a directory of its owner's
+        // that no one else may write (this test's uid stands for root).
+        assert!(read_spec_of(&path, me, true).is_ok());
+        let linked = directory.join("2");
+        fs::hard_link(&path, &linked).unwrap();
+        assert!(read_spec_of(&path, me, true).is_err());
+        assert!(read_spec_of(&path, me, false).is_ok());
+        fs::remove_file(&linked).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o730)).unwrap();
+        assert!(read_spec_of(&path, me, true).is_err());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
+        assert!(read_spec_of(&path, me.wrapping_add(1), true).is_err());
+        temp.cleanup().unwrap();
+    }
+
+    /// Root writes a ledger caller's spec with the account's own home and
+    /// no directory to bind: its grants are its manifest's views, bound at
+    /// the human's own paths.
+    #[test]
+    fn a_ledger_callers_spec_names_its_home_and_no_directory() {
+        let home = "/var/lib/td/workloads/98304";
+        let spec = |extra: &str| {
+            parse_spec(&format!(
+                "format=1\nprofile=development-offline\nentry=/td/store/x/bin/td-sandbox\nhome={home}\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert!(require_account_spec(&spec(""), Kind::Sandbox, 98304).is_ok());
+        assert!(require_account_spec(&spec(""), Kind::Workspace, 98304).is_ok());
+        assert!(require_account_spec(&spec(""), Kind::Sandbox, 98305).is_err());
+        for extra in [
+            "worktree=/var/home/alice/src\n",
+            "checkout=/var/home/alice/src\n",
+            "repository=/var/home/alice/r.git\n",
+            "read=/var/home/alice/src\n",
+            "write=/var/home/alice/src\n",
+        ] {
+            assert!(
+                require_account_spec(&spec(extra), Kind::Sandbox, 98304).is_err(),
+                "{extra}"
+            );
+        }
+        let other = parse_spec(
+            "format=1\nentry=/td/store/x/bin/td-sandbox\nhome=/var/home/alice/.local/share/td-sandbox/x/home\n",
+        )
+        .unwrap();
+        assert!(require_account_spec(&other, Kind::Sandbox, 98304).is_err());
+        assert!(require_view_target(Path::new("/var/home/alice/sandbox")).is_ok());
+        for reserved in ["/run/x", "/tmp/x", "/etc", "/opt/workspace", "/"] {
+            assert!(
+                require_view_target(Path::new(reserved)).is_err(),
+                "{reserved}"
+            );
+        }
     }
 
     #[test]
@@ -1473,6 +1826,57 @@ mod tests {
                     .contains(&name.to_str().unwrap_or_default())
                 })
         );
+    }
+
+    /// Root's intakes admit the human's kernel credentials, which a
+    /// workload still running as the human carries; it is kept from them
+    /// only because no jail binds them. `/run`'s reservation refuses the
+    /// intakes and their directories to every workspace, by path and by
+    /// alias, and no jail source binds one: td-jail names the workspace
+    /// intake only to recognise a channel's row, never as a mount source.
+    #[test]
+    fn no_jail_reaches_roots_intakes() {
+        let home = &[PathBuf::from("/home/u")];
+        for refused in [
+            "/run/td-authd",
+            "/run/td-authd/1000",
+            WORKSPACE_INTAKE,
+            "/run/td-authd/1000/set",
+            WORKSPACE_SPECS,
+        ] {
+            assert!(
+                refuse_reserved(Path::new(refused), home, RESERVED).is_err(),
+                "{refused}"
+            );
+        }
+        for (name, source) in [
+            ("authority.rs", include_str!("authority.rs")),
+            ("bus.rs", include_str!("bus.rs")),
+            ("cgroup.rs", include_str!("cgroup.rs")),
+            ("firefox.rs", include_str!("firefox.rs")),
+            ("flathub.rs", include_str!("flathub.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("seccomp.rs", include_str!("seccomp.rs")),
+            ("sys.rs", include_str!("sys.rs")),
+            ("transition.rs", include_str!("transition.rs")),
+            ("workspace.rs", include_str!("workspace.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            assert!(!production.contains("/run/td-authd"), "{name}");
+            let named = production.matches("WORKSPACE_INTAKE").count();
+            let expected = if name == "workspace.rs" { 2 } else { 0 };
+            assert_eq!(named, expected, "{name} names WORKSPACE_INTAKE");
+        }
+        let production = include_str!("workspace.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(production.contains(
+            "use crate::workload_accounts::{Kind, WORKLOAD_UIDS, WORKSPACE_INTAKE, WORKSPACE_SPECS};"
+        ));
+        assert!(production.contains(
+            "    require_stream_row(table, inode, intake.then_some(WORKSPACE_INTAKE))\n"
+        ));
     }
 
     #[test]
@@ -1560,6 +1964,7 @@ mod tests {
             repositories: Vec::new(),
             read: read.iter().map(|path| path.to_path_buf()).collect(),
             write: Vec::new(),
+            views: Vec::new(),
         };
         let spec_path = base.join("spec");
         let admit_spec = |spec: Spec| {
@@ -1581,6 +1986,31 @@ mod tests {
         );
         assert_eq!(plan.working_directory(), tree);
         assert!(plan.shared[0].read_only && !plan.home.read_only);
+        // A ledger caller's views join the shared directories: bound at
+        // their targets as listed, and refused where one overlaps another.
+        let shown = fs::metadata(&shared).unwrap();
+        let view = |target: &Path| FilesystemGrant {
+            source: shared.clone(),
+            target: target.to_path_buf(),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: shown.dev(),
+            source_inode: shown.ino(),
+        };
+        let mut viewed = spec(&[&entry], &home, &[], &[]);
+        viewed.views = vec![view(&shared)];
+        let plan = admit_spec(viewed).unwrap();
+        assert!(plan
+            .shared
+            .iter()
+            .any(|grant| grant.target == shared && !grant.read_only));
+        assert!(!plan.intake);
+        let mut overlapping = spec(&[&entry], &home, &[&tree], &[]);
+        overlapping.views = vec![view(&tree)];
+        assert!(admit_spec(overlapping).is_err());
+        let mut twice = spec(&[&entry], &home, &[], &[]);
+        twice.views = vec![view(&shared), view(&shared)];
+        assert!(admit_spec(twice).is_err());
 
         // Path directories, a bound system tree's own, in order, each once.
         let mut searched = spec(&[&entry], &home, &[&tree], &[]);
@@ -1885,10 +2315,56 @@ mod tests {
             00000000aae3d76c: 00000002 00000000 00000000 0005 03 13\n\
             00000000aae3d76d: 00000002 00000000 00010000 0001 01 14 /run/s\n\
             00000000aae3d76e: 00000003 00000000 00000000 0001 03 15 /run/t\n";
-        assert!(require_stream_pair(table, 11).is_ok());
+        assert!(require_stream_pair(table, 11, false).is_ok());
         for refused in [12, 13, 14, 15, 16, 1] {
-            assert!(require_stream_pair(table, refused).is_err(), "{refused}");
+            assert!(
+                require_stream_pair(table, refused, false).is_err(),
+                "{refused}"
+            );
         }
+        // A ledger caller's channel is a connection root's intake accepted,
+        // which carries the intake's name, and nothing else.
+        let intake = format!(
+            "{table}00000000aae3d76f: 00000003 00000000 00000000 0001 03 17 {WORKSPACE_INTAKE}\n\
+             00000000aae3d770: 00000002 00000000 00010000 0001 01 18 {WORKSPACE_INTAKE}\n\
+             00000000aae3d771: 00000002 00000000 00000000 0002 03 19 {WORKSPACE_INTAKE}\n"
+        );
+        assert!(require_stream_pair(&intake, 17, true).is_ok());
+        assert!(require_stream_pair(&intake, 17, false).is_err());
+        for refused in [11, 15, 18, 19, 12] {
+            assert!(
+                require_stream_pair(&intake, refused, true).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The kernel names an accepted connection after its listener in
+    /// `/proc/net/unix`, which is how td-jail knows the intake's.
+    #[test]
+    fn an_accepted_connection_carries_its_listeners_name() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let temp = crate::test_temp::TempDir::new("td-jail-intake-name").unwrap();
+        let path = fs::canonicalize(temp.path()).unwrap().join("intake");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let inode = |stream: &UnixStream| {
+            fs::metadata(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(stream)
+            ))
+            .unwrap()
+            .ino()
+        };
+        let table = fs::read_to_string("/proc/net/unix").unwrap();
+        let name = path.to_str().unwrap();
+        require_stream_row(&table, inode(&accepted), Some(name)).unwrap();
+        assert!(require_stream_row(&table, inode(&accepted), None).is_err());
+        assert!(require_stream_row(&table, inode(&accepted), Some("/run/other")).is_err());
+        // The connecting end is unnamed, as a socket pair's are.
+        require_stream_row(&table, inode(&client), None).unwrap();
+        temp.cleanup().unwrap();
     }
 
     #[test]

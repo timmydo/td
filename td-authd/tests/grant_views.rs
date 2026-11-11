@@ -100,30 +100,165 @@ fn a_source_across_a_stacked_mount_is_refused() {
 /// writable one; both nosuid, nodev and noexec under their idmap.
 #[test]
 fn a_grants_access_selects_its_fixed_attributes() {
-    assert_eq!(view_access(Access::ReadOnly), ViewAccess::ReadOnly);
-    assert_eq!(view_access(Access::ReadWrite), ViewAccess::Writable);
+    assert_eq!(view_access(Access::ReadOnly, false), ViewAccess::ReadOnly);
+    assert_eq!(view_access(Access::ReadWrite, false), ViewAccess::Writable);
     assert_eq!(ViewAccess::ReadOnly.attributes(), 0x10000f);
     assert_eq!(ViewAccess::Writable.attributes(), 0x10000e);
     for access in [Access::ReadOnly, Access::ReadWrite] {
         let options = format!("{},nosuid,nodev,noexec,relatime,idmapped", access.as_str());
-        assert!(view_options(&options, access));
+        assert!(view_options(&options, access, false));
         for missing in [access.as_str(), "nosuid", "nodev", "noexec", "idmapped"] {
             let without = options
                 .split(',')
                 .filter(|option| *option != missing)
                 .collect::<Vec<_>>()
                 .join(",");
-            assert!(!view_options(&without, access), "{missing}");
+            assert!(!view_options(&without, access, false), "{missing}");
         }
     }
     assert!(!view_options(
         "rw,nosuid,nodev,noexec,idmapped",
-        Access::ReadOnly
+        Access::ReadOnly,
+        false
     ));
     assert!(!view_options(
         "ro,nosuid,nodev,noexec,idmapped",
-        Access::ReadWrite
+        Access::ReadWrite,
+        false
     ));
+}
+
+/// The account's kind alone chooses executable views: a sandbox's and a
+/// workspace's are the same words without NOEXEC (8), an application's
+/// never lack it, whatever the row.
+#[test]
+fn the_accounts_kind_alone_makes_views_executable() {
+    assert!(!executable_views(Kind::Application));
+    assert!(executable_views(Kind::Sandbox));
+    assert!(executable_views(Kind::Workspace));
+    assert_eq!(
+        view_access(Access::ReadOnly, true),
+        ViewAccess::ReadOnlyExecutable
+    );
+    assert_eq!(
+        view_access(Access::ReadWrite, true),
+        ViewAccess::WritableExecutable
+    );
+    assert_eq!(ViewAccess::ReadOnlyExecutable.attributes(), 0x100007);
+    assert_eq!(ViewAccess::WritableExecutable.attributes(), 0x100006);
+    for access in [Access::ReadOnly, Access::ReadWrite] {
+        let noexec = view_access(access, false).attributes();
+        let exec = view_access(access, true).attributes();
+        assert_eq!(noexec & 8, 8);
+        assert_eq!(exec, noexec & !8);
+        assert_eq!(
+            view_access(access, executable_views(Kind::Application)).attributes() & 8,
+            8
+        );
+        // An executable view lacks noexec, which its source's mount never
+        // carries, and needs the rest; a noexec view is never executable.
+        let options = format!("{},nosuid,nodev,relatime,idmapped", access.as_str());
+        assert!(view_options(&options, access, true));
+        assert!(!view_options(&format!("{options},noexec"), access, true));
+        assert!(!view_options(&options, access, false));
+        assert!(view_options(&format!("{options},noexec"), access, false));
+        for missing in [access.as_str(), "nosuid", "nodev", "idmapped"] {
+            let without = options
+                .split(',')
+                .filter(|option| *option != missing)
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(!view_options(&without, access, true), "{missing}");
+        }
+    }
+    // A sandbox's rows are its own and published executable; another
+    // kind's rows of the same name are not its.
+    let table = Table::parse(
+        "td-grants-v1\napplication\tdefault\tdirectory\tro\tMusic\nsandbox\tdefault\tdirectory\trw\tsandbox\n",
+    )
+    .unwrap();
+    let sandbox = grants_for(&table, Kind::Sandbox, "default", STOCK, Path::new(HOME)).unwrap();
+    assert_eq!(sandbox.len(), 1);
+    assert_eq!(sandbox[0].path, "sandbox");
+    assert!(sandbox[0].executable);
+    let application =
+        grants_for(&table, Kind::Application, "default", STOCK, Path::new(HOME)).unwrap();
+    assert_eq!(application.len(), 1);
+    assert_eq!(application[0].path, "Music");
+    assert!(!application[0].executable);
+}
+
+/// A sandbox's view of a source on a noexec mount could not execute,
+/// which td-jail refuses of an executable grant, so that row gets no view
+/// and a warning while the others publish; an application's view of it,
+/// noexec anyway, is published.
+#[test]
+fn an_executable_view_skips_a_source_on_a_noexec_mount() {
+    let mount = |id: u64, mountpoint: &str, options: &str| MountRow {
+        id,
+        parent: 1,
+        device: "0:19".into(),
+        root: "/".into(),
+        mountpoint: mountpoint.into(),
+        options: options.into(),
+    };
+    let mounts = [
+        mount(25, "/var", "rw,nosuid,nodev,relatime"),
+        mount(
+            26,
+            "/var/home/alice/media",
+            "rw,nosuid,nodev,noexec,relatime",
+        ),
+    ];
+    executable_source(&mounts, 25).unwrap();
+    assert!(executable_source(&mounts, 26)
+        .unwrap_err()
+        .contains("noexec"));
+    assert!(executable_source(&mounts, 27).is_err());
+
+    let executable = |access, path: &str| Grant {
+        executable: true,
+        ..grant(access, path)
+    };
+    let grants = [
+        executable(Access::ReadWrite, "src"),
+        executable(Access::ReadOnly, "media"),
+    ];
+    let mut host = Fake::new(&[("src", 11), ("media", 12)]);
+    host.noexec.push("media".into());
+    run(&mut host, &grants).unwrap();
+    assert!(host.calls.contains(&"publish 0 src".to_string()));
+    assert!(!host.calls.iter().any(|call| call.starts_with("publish 1")));
+    assert!(host
+        .calls
+        .iter()
+        .any(|call| call.starts_with("warn grant of \"media\" gets no view")));
+    assert_eq!(host.calls.last().map(String::as_str), Some("manifest [0]"));
+    // An application's view of the same source is noexec anyway.
+    let mut host = Fake::new(&[("media", 12)]);
+    host.noexec.push("media".into());
+    run(&mut host, &[grant(Access::ReadOnly, "media")]).unwrap();
+    assert!(host.calls.contains(&"publish 0 media".to_string()));
+}
+
+/// A launch publishes views only for a uid of its account's kind: a
+/// sandbox's never at an application's uid, nor the reverse, nor the
+/// human's, before anything is read.
+#[test]
+fn views_are_published_only_for_the_kinds_own_uids() {
+    for (kind, uid) in [
+        (Kind::Sandbox, 65536),
+        (Kind::Sandbox, 1000),
+        (Kind::Workspace, 98303),
+        (Kind::Application, 98304),
+        (Kind::Application, 1000),
+    ] {
+        let error = publish(kind, "default", uid).unwrap_err();
+        assert!(
+            error.contains("of the launch's kind"),
+            "{kind:?} {uid}: {error}"
+        );
+    }
 }
 
 /// td-authd and td-jail derive what a view must show by one function, so
@@ -139,7 +274,7 @@ fn the_derivation_keeps_the_homes_offset_below_its_mount() {
     )
     .unwrap();
     assert_eq!(table.refused(Kind::Application, "firefox").len(), 1);
-    let grants = grants_for(&table, "firefox", STOCK, Path::new(HOME)).unwrap();
+    let grants = grants_for(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
     assert_eq!(
         grants
             .iter()
@@ -160,13 +295,13 @@ fn the_derivation_keeps_the_homes_offset_below_its_mount() {
     );
     // A home that is its own mount contributes no offset.
     let own = format!("{STOCK}30 25 0:31 /@home/alice {HOME} rw - btrfs /dev/vdb rw\n");
-    let grants = grants_for(&table, "firefox", &own, Path::new(HOME)).unwrap();
+    let grants = grants_for(&table, Kind::Application, "firefox", &own, Path::new(HOME)).unwrap();
     assert_eq!(
         grants[1].identity,
         identity("0:31", "/@home/alice/Downloads")
     );
     // A view the kernel shows for the stock layout is kept as is.
-    let stock = grants_for(&table, "firefox", STOCK, Path::new(HOME)).unwrap();
+    let stock = grants_for(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
     let downloads = &stock[1..];
     let mut host = Fake::new(&[("Downloads", 11)]);
     host.mount(0, &grant(Access::ReadWrite, "Downloads"), RW, 11);
@@ -201,6 +336,7 @@ fn grant(access: Access, path: &str) -> Grant {
         access,
         path: path.into(),
         identity: identity("0:19", &format!("/@var/home/alice/{path}")),
+        executable: false,
     }
 }
 
@@ -210,6 +346,8 @@ fn grant(access: Access, path: &str) -> Grant {
 /// grant at that moment, so no manifest a launch writes is ever untrue.
 struct Fake {
     sources: Vec<(String, Result<u64, String>)>,
+    /// Sources on a noexec mount.
+    noexec: Vec<String>,
     views: BTreeMap<usize, Present>,
     grants: Vec<Grant>,
     calls: Vec<String>,
@@ -222,6 +360,7 @@ impl Fake {
                 .iter()
                 .map(|(path, inode)| ((*path).to_string(), Ok(*inode)))
                 .collect(),
+            noexec: Vec::new(),
             views: BTreeMap::new(),
             grants: Vec::new(),
             calls: Vec::new(),
@@ -274,8 +413,11 @@ impl Host for Fake {
         Ok(self.views.values().cloned().collect())
     }
 
-    fn source(&mut self, path: &str) -> Result<Found<(String, u64)>, String> {
+    fn source(&mut self, path: &str, executable: bool) -> Result<Found<(String, u64)>, String> {
         self.calls.push(format!("source {path}"));
+        if executable && self.noexec.iter().any(|name| name == path) {
+            return Err("its mount is noexec".into());
+        }
         match self.sources.iter().find(|(name, _)| name == path) {
             None => Ok(None),
             Some((_, Ok(inode))) => Ok(Some(((path.to_string(), *inode), (7, *inode)))),
@@ -287,13 +429,23 @@ impl Host for Fake {
         &mut self,
         index: usize,
         source: &(String, u64),
-        access: Access,
+        granted: &Grant,
     ) -> Result<(), String> {
         self.calls.push(format!("publish {index} {}", source.0));
         assert!(!self.views.contains_key(&index), "published over a view");
-        let options = if access == Access::ReadWrite { RW } else { RO };
-        let grant = grant(access, &source.0);
-        self.mount(index, &grant, options, source.1);
+        let options = if granted.access == Access::ReadWrite {
+            RW
+        } else {
+            RO
+        };
+        // An executable view's word lacks noexec.
+        let options = if granted.executable {
+            options.replace(",noexec", "")
+        } else {
+            options.to_string()
+        };
+        let grant = grant(granted.access, &source.0);
+        self.mount(index, &grant, &options, source.1);
         Ok(())
     }
 
@@ -527,17 +679,17 @@ fn a_published_view_that_shows_something_else_refuses() {
         fn present(&mut self) -> Result<Vec<Present>, String> {
             self.0.present()
         }
-        fn source(&mut self, path: &str) -> Result<Found<Self::Source>, String> {
-            self.0.source(path)
+        fn source(&mut self, path: &str, executable: bool) -> Result<Found<Self::Source>, String> {
+            self.0.source(path, executable)
         }
         fn publish(
             &mut self,
             index: usize,
             source: &Self::Source,
-            access: Access,
+            grant: &Grant,
         ) -> Result<(), String> {
             self.0
-                .publish(index, &(source.0.clone(), source.1 + 1), access)
+                .publish(index, &(source.0.clone(), source.1 + 1), grant)
         }
         fn release(&mut self, index: usize) -> Result<(), String> {
             self.0.release(index)

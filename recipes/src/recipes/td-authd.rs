@@ -203,6 +203,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/tests/grant_views.rs"),
     ),
     (
+        "src/workspace.rs",
+        include_str!("../../../td-authd/src/workspace.rs"),
+    ),
+    (
+        "tests/workspace.rs",
+        include_str!("../../../td-authd/tests/workspace.rs"),
+    ),
+    (
         "src/grant_requests.rs",
         include_str!("../../../td-authd/src/grant_requests.rs"),
     ),
@@ -294,12 +302,18 @@ pub fn recipe() -> Recipe {
         "{src}/td-secret/src",
         "{src}/td-civil/src",
         "{src}/td-busd/src",
+        "{src}/td-alloc/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
     }
     for (path, source) in [
+        // td-alloc's fallible growth, mounted by path.
+        (
+            "{src}/td-alloc/src/lib.rs",
+            include_str!("../../../td-alloc/src/lib.rs"),
+        ),
         // Application declarations joined with the workload account
         // ledger, the one source of an application's uid.
         (

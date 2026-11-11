@@ -65,6 +65,27 @@ pub const WORKLOAD_ACCOUNT_PREFIX: &str = "tdw";
 /// this, then its uid; a sandbox's or workspace's the next.
 pub const APPLICATION_DELEGATION_PREFIX: &str = "td-app-";
 pub const WORKLOAD_DELEGATION_PREFIX: &str = "td-workload-";
+/// The root intake at which the primary human's programs ask root to start
+/// a sandbox's shell as its account (td-authd/DESIGN.md, "Workspace launch
+/// intake"). An accepted connection carries this name in
+/// `/proc/net/unix`, which td-jail requires of a ledger caller's channel.
+/// That proves the channel's shape, a connected stream, not its origin:
+/// any namespace can bind a pathname socket of this name. Its origin is
+/// the caller's class, a ledger account in the initial namespace, which
+/// only root's launch produces.
+pub const WORKSPACE_INTAKE: &str = "/run/td-authd/1000/workspace";
+/// Root's directory of workspace launch specs, one root-owned directory of
+/// the account's group per account below it.
+pub const WORKSPACE_SPECS: &str = "/run/td-authd/workspaces";
+
+/// Whether `digits` spells a number in canonical decimal, as `to_string`
+/// would: digits only, no leading zero but zero's own. One copy for the
+/// includers that read such numbers.
+pub fn canonical_decimal(digits: &str) -> bool {
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
+}
 
 /// The digits after `prefix`, when `name` is `prefix` and decimal digits.
 fn account_digits<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
@@ -191,6 +212,12 @@ impl Kind {
             Self::Application => "applications",
             Self::Sandbox | Self::Workspace => "workloads",
         }
+    }
+
+    /// The private home of this kind's account `uid`, the one path root
+    /// prepares it at and a launch binds.
+    pub fn home(self, uid: u32) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{DIRECTORY}/{}/{uid}", self.homes()))
     }
 
     /// The part of `uids` allocation draws from.
@@ -512,6 +539,16 @@ mod tests {
             text.push_str(&format!("workspace\t{name}\t{}\n", 100000 + index));
         }
         text
+    }
+
+    #[test]
+    fn canonical_decimal_is_what_to_string_spells() {
+        for digits in ["0", "7", "1000", "4294967296"] {
+            assert!(canonical_decimal(digits), "{digits:?}");
+        }
+        for digits in ["", "00", "01", "+1", "-1", " 1", "1 ", "1a", "\u{661}"] {
+            assert!(!canonical_decimal(digits), "{digits:?}");
+        }
     }
 
     #[test]

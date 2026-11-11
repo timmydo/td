@@ -2,14 +2,15 @@
 //! (td-authd/DESIGN.md, "Application filesystem grants"): each directory
 //! row the workload grant table holds for the account becomes a detached,
 //! nonrecursive idmapped clone of the human's directory, mapping filesystem
-//! uid/gid 1000 to the account, nosuid, nodev, noexec and read-only unless
-//! the row is `rw`, published at `/var/lib/td/grant-views/UID/N` and listed
-//! in the account's manifest for td-jail.
+//! uid/gid 1000 to the account, nosuid, nodev, read-only unless the row is
+//! `rw`, and noexec for an application's account but not a sandbox's or a
+//! workspace's, published at `/var/lib/td/grant-views/UID/N` and listed in
+//! the account's manifest for td-jail.
 
 use crate::mount_identity::{self, MountIdentity, MountRow};
 use crate::mount_sys::{self, ViewAccess};
 use crate::portal_files::{self, pinned};
-use crate::workload_accounts::{Kind, APPLICATION_UIDS, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+use crate::workload_accounts::{Kind, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::workload_grants::{self as grants, Access, Manifest, Table, View};
 use crate::{launch, primary_account};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -166,20 +167,55 @@ fn mount_rows(text: &str) -> Result<Vec<MountRow>, String> {
     mount_identity::mount_rows(text).map_err(|e| e.to_string())
 }
 
-/// The access a view of a grant takes.
-fn view_access(access: Access) -> ViewAccess {
-    match access {
-        Access::ReadOnly => ViewAccess::ReadOnly,
-        Access::ReadWrite => ViewAccess::Writable,
+/// Whether the views of a `kind` account's grants are executable: a
+/// sandbox's or workspace's, whose shell runs what the human shares with
+/// it, are; an application's never. The kind alone decides, never a row or
+/// a caller.
+fn executable_views(kind: Kind) -> bool {
+    match kind {
+        Kind::Application => false,
+        Kind::Sandbox | Kind::Workspace => true,
     }
 }
 
-/// Whether mount options hold a view's: its access, nosuid, nodev, noexec
-/// and the idmap.
-fn view_options(options: &str, access: Access) -> bool {
-    [access.as_str(), "nosuid", "nodev", "noexec", "idmapped"]
+/// The attribute word a view of a grant takes.
+fn view_access(access: Access, executable: bool) -> ViewAccess {
+    match (access, executable) {
+        (Access::ReadOnly, false) => ViewAccess::ReadOnly,
+        (Access::ReadWrite, false) => ViewAccess::Writable,
+        (Access::ReadOnly, true) => ViewAccess::ReadOnlyExecutable,
+        (Access::ReadWrite, true) => ViewAccess::WritableExecutable,
+    }
+}
+
+/// Whether mount options hold a view's: its access, nosuid, nodev and the
+/// idmap, and noexec exactly when it is not `executable`. An executable
+/// view's source never lies on a noexec mount (`executable_source`), since
+/// its word clears nothing and td-jail would refuse it.
+fn view_options(options: &str, access: Access, executable: bool) -> bool {
+    let has = |wanted: &str| options.split(',').any(|option| option == wanted);
+    [access.as_str(), "nosuid", "nodev", "idmapped"]
         .iter()
-        .all(|required| options.split(',').any(|option| option == *required))
+        .all(|required| has(required))
+        && has("noexec") != executable
+}
+
+/// An executable view's source: its mount, the row `id` of `mounts`, must
+/// let it execute. Its view clears nothing, so a source on a noexec mount
+/// would give a view td-jail refuses as an executable grant, failing the
+/// launch; the row gets no view instead, as any refused source does.
+fn executable_source(mounts: &[MountRow], id: u64) -> Result<(), String> {
+    let mount = mounts
+        .iter()
+        .find(|row| row.id == id)
+        .ok_or("the granted directory's mount is not in the mount table")?;
+    if mount.options.split(',').any(|option| option == "noexec") {
+        return Err(crate::message(format_args!(
+            "its mount at {} is noexec, and a sandbox's view of it must be executable",
+            mount.mountpoint.display()
+        )));
+    }
+    Ok(())
 }
 
 /// A directory row of the account's: its access and path, and what a view
@@ -189,6 +225,8 @@ struct Grant {
     access: Access,
     path: String,
     identity: MountIdentity,
+    /// By the account's kind (`executable_views`).
+    executable: bool,
 }
 
 /// A view directory found below the account's: its index, the mounts at
@@ -210,21 +248,22 @@ fn shows(view: &Present, grant: &Grant) -> bool {
     };
     mount.device == grant.identity.device
         && mount.root.as_os_str().as_bytes() == grant.identity.root.as_os_str().as_bytes()
-        && view_options(&mount.options, grant.access)
+        && view_options(&mount.options, grant.access, grant.executable)
 }
 
-/// The application `name`'s directory rows, each with what a view of it
+/// The `kind` account `name`'s directory rows, each with what a view of it
 /// must show below `home` by the derivation td-jail admits it by: the root
 /// of the mount covering the home, the home's path below that mount's
 /// mountpoint, and the row's path.
 fn grants_for(
     table: &Table,
+    kind: Kind,
     name: &str,
     mountinfo: &str,
     home: &Path,
 ) -> Result<Vec<Grant>, String> {
     let mut grants = Vec::new();
-    for directory in table.directories(Kind::Application, name) {
+    for directory in table.directories(kind, name) {
         let identity =
             mount_identity::human_source_identity(mountinfo, home, Path::new(&directory.path))
                 .map_err(|e| e.to_string())?;
@@ -232,6 +271,7 @@ fn grants_for(
             access: directory.access,
             path: directory.path,
             identity,
+            executable: executable_views(kind),
         });
     }
     Ok(grants)
@@ -248,14 +288,11 @@ trait Host {
     /// The views below the account's directory now, each with its mounts.
     fn present(&mut self) -> Result<Vec<Present>, String>;
     /// The human's directory a row names, opened and checked, with its
-    /// device and inode; None when it is absent.
-    fn source(&mut self, path: &str) -> Result<Found<Self::Source>, String>;
-    fn publish(
-        &mut self,
-        index: usize,
-        source: &Self::Source,
-        access: Access,
-    ) -> Result<(), String>;
+    /// device and inode; None when it is absent. An `executable` view's
+    /// source must also lie on a mount that lets it execute.
+    fn source(&mut self, path: &str, executable: bool) -> Result<Found<Self::Source>, String>;
+    fn publish(&mut self, index: usize, source: &Self::Source, grant: &Grant)
+        -> Result<(), String>;
     /// Unmounts every mount at the view and removes its mountpoint.
     fn release(&mut self, index: usize) -> Result<(), String>;
     /// Replaces the account's manifest whole, by a staged rename.
@@ -284,8 +321,9 @@ fn manifest_of(listed: &[(usize, usize)], grants: &[Grant]) -> Result<Manifest, 
 ///    an empty mountpoint) are dropped from the manifest and released,
 ///    before any source is opened, so no later refusal pins them.
 /// 2. Each row's source is opened and checked. A row whose source is absent
-///    gets no view; one whose source is refused gets none and a warning,
-///    and the other rows go on. A present view that still shows the source
+///    gets no view; one whose source is refused, an executable view's on a
+///    noexec mount included, gets none and a warning, and the other rows
+///    go on. A present view that still shows the source
 ///    is kept; any other row gets a new view at a free index.
 /// 3. The new views are checked as mounted, the manifest replaced, and the
 ///    views it no longer lists released.
@@ -310,7 +348,7 @@ fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), St
     let mut listed: Vec<(usize, usize)> = Vec::new();
     let mut expected: Vec<(usize, (u64, u64, u32, u32))> = Vec::new();
     for (at, grant) in grants.iter().enumerate() {
-        let (source, (device, inode)) = match host.source(&grant.path) {
+        let (source, (device, inode)) = match host.source(&grant.path, grant.executable) {
             Ok(Some(found)) => found,
             Ok(None) => continue,
             Err(error) => {
@@ -331,7 +369,7 @@ fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), St
                 let index = (0..grants::MAX_VIEWS)
                     .find(|index| !occupied.contains(index))
                     .ok_or("no free grant view index")?;
-                host.publish(index, &source, grant.access)?;
+                host.publish(index, &source, grant)?;
                 occupied.push(index);
                 index
             }
@@ -374,12 +412,17 @@ impl Host for Live<'_> {
         present_views(self.views, self.uid, &mount_rows(&mount_table()?)?)
     }
 
-    fn source(&mut self, path: &str) -> Result<Found<File>, String> {
-        Ok(human_directory(self.home, path, (HUMAN, HUMAN))?
-            .map(|source| (source.file, (source.device, source.inode))))
+    fn source(&mut self, path: &str, executable: bool) -> Result<Found<File>, String> {
+        let Some(source) = human_directory(self.home, path, (HUMAN, HUMAN))? else {
+            return Ok(None);
+        };
+        if executable {
+            executable_source(&mount_rows(&mount_table()?)?, mount_id(&source.file)?)?;
+        }
+        Ok(Some((source.file, (source.device, source.inode))))
     }
 
-    fn publish(&mut self, index: usize, source: &File, access: Access) -> Result<(), String> {
+    fn publish(&mut self, index: usize, source: &File, grant: &Grant) -> Result<(), String> {
         let target = portal_files::ensure_root_child(self.views, &index.to_string())?;
         if fs::read_dir(pinned(&target, ""))
             .map_err(|e| e.to_string())?
@@ -396,8 +439,12 @@ impl Host for Live<'_> {
             .as_ref()
             .ok_or("grant view mapping is missing")?;
         let mount = mount_sys::clone_directory(source.as_fd()).map_err(|e| e.to_string())?;
-        mount_sys::view_attributes(mount.as_fd(), namespace.as_fd(), view_access(access))
-            .map_err(|e| e.to_string())?;
+        mount_sys::view_attributes(
+            mount.as_fd(),
+            namespace.as_fd(),
+            view_access(grant.access, grant.executable),
+        )
+        .map_err(|e| e.to_string())?;
         mount_sys::publish(mount.as_fd(), target.as_fd()).map_err(|e| e.to_string())
     }
 
@@ -416,16 +463,19 @@ impl Host for Live<'_> {
     }
 }
 
-/// Publishes the grant views of the application account `name` runs as,
-/// `uid`, for its launch, and writes its manifest: root's per-launch step
-/// after admission and before the account's first process. td-svc runs one
-/// unit per application, which serialises its launches; a launch that finds
-/// another holding the account's lock past the deadline fails closed.
+/// Publishes the grant views of the `kind` account `name`, `uid`, for its
+/// launch, and writes its manifest: root's per-launch step after admission
+/// and before the account's first process. Launches of one account wait
+/// for one another's publication under its lock; one that finds another
+/// holding it past the deadline fails closed. A launch already running
+/// keeps the views its jail bound, whatever a later one releases here.
 /// FileChooser's application also brings the portal's Downloads view in
-/// line with its grant, which never fails the launch.
-pub(crate) fn publish(name: &str, uid: u32) -> Result<(), String> {
-    if !APPLICATION_UIDS.contains(&uid) {
-        return Err("grant views belong to an application account".into());
+/// line with its grant, which never fails the launch. Returns the table
+/// the views were published from, whose network row a workspace launch
+/// applies.
+pub(crate) fn publish(kind: Kind, name: &str, uid: u32) -> Result<Table, String> {
+    if !kind.uids().contains(&uid) {
+        return Err("grant views belong to a ledger account of the launch's kind".into());
     }
     let table = read_table()?;
     let account = primary_account::load().map_err(|error| error.to_string())?;
@@ -434,8 +484,8 @@ pub(crate) fn publish(name: &str, uid: u32) -> Result<(), String> {
     let homes = portal_files::child(&var, "home", 0, true)?;
     let home = portal_files::child(&homes, account.name(), HUMAN, true)?;
     let mountinfo = mount_table()?;
-    let grants = grants_for(&table, name, &mountinfo, &account.persistent_home())?;
-    let refused = table.refused(Kind::Application, name);
+    let grants = grants_for(&table, kind, name, &mountinfo, &account.persistent_home())?;
+    let refused = table.refused(kind, name);
     let lib = portal_files::child(&var, "lib", 0, true)?;
     let td = portal_files::child(&lib, "td", 0, true)?;
     let tree = portal_files::ensure_root_child(&td, grants::VIEW_ROOT_NAME)?;
@@ -453,13 +503,15 @@ pub(crate) fn publish(name: &str, uid: u32) -> Result<(), String> {
         live.warn(&format!("row {:?} is not published: {why}", directory.path));
     }
     reconcile(&mut live, uid, &grants)?;
-    remove_retired_mountpoint(&td, uid, &mount_rows(&mountinfo)?, &mut live);
-    if name == portal_files::FILE_CHOOSER_APPLICATION {
-        if let Err(error) = portal_files::sync_downloads(&table) {
-            live.warn(&format!("the portal's Downloads view: {error}"));
+    if kind == Kind::Application {
+        remove_retired_mountpoint(&td, uid, &mount_rows(&mountinfo)?, &mut live);
+        if name == portal_files::FILE_CHOOSER_APPLICATION {
+            if let Err(error) = portal_files::sync_downloads(&table) {
+                live.warn(&format!("the portal's Downloads view: {error}"));
+            }
         }
     }
-    Ok(())
+    Ok(table)
 }
 
 /// The empty root-owned `Downloads` mountpoint the retired boot unit made
@@ -562,10 +614,17 @@ pub(crate) fn lock(
     }
 }
 
-/// The account's view directory below the view tree: root-owned, of the
-/// account's group, exactly mode 0710, so the account reaches the names
-/// td-jail opens without listing them; created or completed here.
-fn account_directory(tree: &File, uid: u32) -> Result<File, String> {
+/// The account's directory below `tree`, the view tree or root's spec
+/// tree: root-owned, of the account's group, exactly mode 0710, so the
+/// account reaches the names td-jail opens without listing them; created
+/// or completed here.
+pub(crate) fn account_directory(tree: &File, uid: u32) -> Result<File, String> {
+    account_directory_of(tree, uid, 0)
+}
+
+/// `account_directory`, `owner`'s rather than root's: root's on a running
+/// system, a test's own scratch tree's otherwise.
+pub(crate) fn account_directory_of(tree: &File, uid: u32, owner: u32) -> Result<File, String> {
     let name = uid.to_string();
     match fs::DirBuilder::new()
         .mode(0o700)
@@ -573,19 +632,19 @@ fn account_directory(tree: &File, uid: u32) -> Result<File, String> {
     {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("create grant view directory: {error}")),
+        Err(error) => return Err(format!("create an account directory: {error}")),
     }
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(O_DIRECTORY | O_NOFOLLOW)
         .open(pinned(tree, &name))
-        .map_err(|e| format!("open grant view directory: {e}"))?;
+        .map_err(|e| format!("open an account directory: {e}"))?;
     let metadata = directory.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_dir() || metadata.uid() != 0 {
-        return Err("a grant view directory is not root's".into());
+    if !metadata.is_dir() || metadata.uid() != owner {
+        return Err("an account directory is not root's".into());
     }
     if metadata.gid() != uid || metadata.mode() & 0o7777 != grants::VIEWS_MODE {
-        std::os::unix::fs::fchown(&directory, Some(0), Some(uid)).map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&directory, Some(owner), Some(uid)).map_err(|e| e.to_string())?;
         directory
             .set_permissions(fs::Permissions::from_mode(grants::VIEWS_MODE))
             .map_err(|e| e.to_string())?;

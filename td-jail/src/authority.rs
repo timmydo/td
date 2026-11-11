@@ -2007,6 +2007,80 @@ fn granted_views(
         .and_then(|name| name.to_str())
         .and_then(|name| name.parse::<u32>().ok())
         .ok_or_else(|| invalid("invalid private application home"))?;
+    manifest_views(
+        mountinfo,
+        uid,
+        ViewPlacement::Application,
+        require_grant_target,
+        reserved,
+    )
+}
+
+/// The views a sandbox's or workspace's account `uid` binds in its
+/// workspace jail (APPLICATIONS.md §C, "The `workspace` kind"): those its
+/// manifest lists, each at the human's own path where the kind's
+/// `require_target` admits it, executable. An account with no manifest
+/// has none.
+pub(crate) fn workspace_views(
+    mountinfo: &str,
+    uid: u32,
+    require_target: fn(&Path) -> io::Result<()>,
+    reserved: &BTreeSet<MountIdentity>,
+) -> io::Result<Vec<FilesystemGrant>> {
+    if !crate::workload_accounts::WORKLOAD_UIDS.contains(&uid) {
+        return Err(invalid("workspace views belong to a sandbox or workspace"));
+    }
+    let views = manifest_views(
+        mountinfo,
+        uid,
+        ViewPlacement::Workspace,
+        require_target,
+        reserved,
+    )?;
+    let mut grants = crate::allocation::with_capacity(views.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    for view in views {
+        crate::allocation::push(&mut grants, view.grant)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    }
+    Ok(grants)
+}
+
+/// Where a jail binds the views its account's manifest lists, chosen by
+/// the launch kind and so by the account's: an application's below its
+/// private home, noexec; a sandbox's or workspace's at the human's own
+/// path, where td-sandbox's shares were, executable as td-authd published
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewPlacement {
+    Application,
+    Workspace,
+}
+
+impl ViewPlacement {
+    fn target(self, account: &crate::primary_account::PrimaryAccount, path: &str) -> PathBuf {
+        match self {
+            Self::Application => Path::new("/home/td").join(path),
+            Self::Workspace => account.persistent_home().join(path),
+        }
+    }
+
+    /// Whether a view must lack execution: an application's must carry
+    /// noexec; a workspace's need not, keeping one its source's mount set.
+    fn executable(self) -> bool {
+        self == Self::Workspace
+    }
+}
+
+/// The views of `uid`'s manifest as `placement` binds them, each target
+/// canonical and admitted by its kind's `require_target`.
+fn manifest_views(
+    mountinfo: &str,
+    uid: u32,
+    placement: ViewPlacement,
+    require_target: fn(&Path) -> io::Result<()>,
+    reserved: &BTreeSet<MountIdentity>,
+) -> io::Result<Vec<AdmittedView>> {
     let Some(manifest) = read_view_manifest(uid)? else {
         return Ok(Vec::new());
     };
@@ -2017,14 +2091,21 @@ fn granted_views(
         let view = directory.join(entry.index.to_string());
         // A target the jail keeps for itself is the table's and td-jail's
         // disagreement, not the launch's: the view is left out and said so.
-        let target = Path::new("/home/td").join(&entry.path);
+        let target = placement.target(&account, &entry.path);
         if let Err(error) =
-            validate_filesystem_target(&target).and_then(|()| require_grant_target(&target))
+            validate_filesystem_target(&target).and_then(|()| require_target(&target))
         {
             skip_view(&target, &error.to_string());
             continue;
         }
-        let identities = admit_view(mountinfo, &view, entry, &account, reserved)?;
+        let identities = admit_view(
+            mountinfo,
+            &view,
+            entry,
+            &account,
+            reserved,
+            placement.executable(),
+        )?;
         let metadata = fs::symlink_metadata(&view)?;
         if !metadata.file_type().is_dir() || metadata.uid() != uid || metadata.gid() != uid {
             return Err(invalid(format!(
@@ -2035,7 +2116,7 @@ fn granted_views(
         views.push(AdmittedView {
             grant: FilesystemGrant {
                 source: view,
-                target: Path::new("/home/td").join(&entry.path),
+                target,
                 read_only: entry.access == crate::workload_grants::Access::ReadOnly,
                 source_kind: FilesystemSourceKind::Directory,
                 source_device: metadata.dev(),
@@ -2056,24 +2137,22 @@ fn skip_view(target: &Path, why: &str) {
 }
 
 /// The view at `view` when it is what `entry` lists: one mount exactly
-/// there, carrying the entry's access with nosuid, nodev, noexec and its
-/// idmap, whose identity is the human's `entry.path` as the mount covering
-/// the home derives it and which holds no mount outside that directory or
-/// aliasing a reserved one. The identities of the mounts at and below it.
+/// there, carrying the entry's access with nosuid, nodev, its idmap and
+/// noexec exactly when it is not `executable` (td-authd publishes no
+/// executable view of a source on a noexec mount, which stage 2 would
+/// refuse as an executable grant), whose identity is the human's `entry.path`
+/// as the mount covering the home derives it and which holds no mount
+/// outside that directory or aliasing a reserved one. The identities of
+/// the mounts at and below it.
 fn admit_view(
     mountinfo: &str,
     view: &Path,
     entry: &crate::workload_grants::View,
     account: &crate::primary_account::PrimaryAccount,
     reserved: &BTreeSet<MountIdentity>,
+    executable: bool,
 ) -> io::Result<BTreeSet<MountIdentity>> {
-    let required = [
-        entry.access.as_str(),
-        "nosuid",
-        "nodev",
-        "noexec",
-        "idmapped",
-    ];
+    let required = [entry.access.as_str(), "nosuid", "nodev", "idmapped"];
     let mut found = false;
     for line in mountinfo.lines() {
         let left = line
@@ -2089,11 +2168,8 @@ fn admit_view(
         let options = fields
             .get(5)
             .ok_or_else(|| invalid("missing mount options"))?;
-        if found
-            || !required
-                .iter()
-                .all(|required| options.split(',').any(|option| option == *required))
-        {
+        let has = |wanted: &str| options.split(',').any(|option| option == wanted);
+        if found || !required.iter().all(|required| has(required)) || has("noexec") == executable {
             return Err(invalid(format!(
                 "grant view {} is stacked or lacks its access or mount restrictions",
                 view.display()
@@ -4325,7 +4401,7 @@ mod tests {
         };
         let one = published(rw, "/@var/home/alice/Downloads");
         assert_eq!(
-            admit_view(&one, view, &downloads, &account, &none).unwrap(),
+            admit_view(&one, view, &downloads, &account, &none, false).unwrap(),
             BTreeSet::from([shown.clone()])
         );
         admit_view(
@@ -4334,6 +4410,7 @@ mod tests {
             &documents,
             &account,
             &none,
+            false,
         )
         .unwrap();
         // The access must be the entry's, both ways.
@@ -4342,7 +4419,8 @@ mod tests {
             view,
             &documents,
             &account,
-            &none
+            &none,
+            false
         )
         .is_err());
         assert!(admit_view(
@@ -4350,7 +4428,8 @@ mod tests {
             view,
             &downloads,
             &account,
-            &none
+            &none,
+            false
         )
         .is_err());
         for missing in ["nosuid", "nodev", "noexec", "idmapped"] {
@@ -4365,25 +4444,27 @@ mod tests {
                     view,
                     &downloads,
                     &account,
-                    &none
+                    &none,
+                    false
                 )
                 .is_err(),
                 "{missing}"
             );
         }
         // Unpublished, stacked, another directory, another view's path.
-        assert!(admit_view(base, view, &downloads, &account, &none).is_err());
+        assert!(admit_view(base, view, &downloads, &account, &none, false).is_err());
         let stacked = format!(
             "{one}36 35 0:19 /@var/home/alice/Downloads {} {rw} - btrfs none rw\n",
             view.display()
         );
-        assert!(admit_view(&stacked, view, &downloads, &account, &none).is_err());
+        assert!(admit_view(&stacked, view, &downloads, &account, &none, false).is_err());
         assert!(admit_view(
             &published(rw, "/@var/home/alice/src"),
             view,
             &downloads,
             &account,
-            &none
+            &none,
+            false
         )
         .is_err());
         assert!(admit_view(
@@ -4391,7 +4472,8 @@ mod tests {
             Path::new("/var/lib/td/grant-views/65536/1"),
             &downloads,
             &account,
-            &none
+            &none,
+            false
         )
         .is_err());
         // A mount below the view that is not the human's directory, and a
@@ -4400,15 +4482,65 @@ mod tests {
             "{one}36 35 0:30 / {}/x rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n",
             view.display()
         );
-        assert!(admit_view(&nested, view, &downloads, &account, &none).is_err());
-        assert!(admit_view(&one, view, &downloads, &account, &BTreeSet::from([shown])).is_err());
+        assert!(admit_view(&nested, view, &downloads, &account, &none, false).is_err());
+        assert!(admit_view(
+            &one,
+            view,
+            &downloads,
+            &account,
+            &BTreeSet::from([shown]),
+            false
+        )
+        .is_err());
+        // A sandbox's or workspace's view is executable: admitted without
+        // noexec only where the placement says so, and never with it,
+        // which stage 2 would refuse; an application's must carry it.
+        let executable = published(
+            "rw,nosuid,nodev,relatime,idmapped",
+            "/@var/home/alice/Downloads",
+        );
+        assert!(admit_view(&executable, view, &downloads, &account, &none, false).is_err());
+        assert!(admit_view(&executable, view, &downloads, &account, &none, true).is_ok());
+        assert!(admit_view(&one, view, &downloads, &account, &none, true).is_err());
+        for missing in ["nosuid", "nodev", "idmapped", "rw"] {
+            let options = "rw,nosuid,nodev,relatime,idmapped"
+                .split(',')
+                .filter(|option| *option != missing)
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(
+                admit_view(
+                    &published(&options, "/@var/home/alice/Downloads"),
+                    view,
+                    &downloads,
+                    &account,
+                    &none,
+                    true
+                )
+                .is_err(),
+                "{missing}"
+            );
+        }
+        assert!(!ViewPlacement::Application.executable());
+        assert!(ViewPlacement::Workspace.executable());
+        // An application's view lies below its private home, a workspace's
+        // at the human's own path.
+        assert_eq!(
+            ViewPlacement::Application.target(&account, "src/x"),
+            Path::new("/home/td/src/x")
+        );
+        assert_eq!(
+            ViewPlacement::Workspace.target(&account, "src/x"),
+            Path::new("/var/home/alice/src/x")
+        );
         // A tree the jail's private home reserves is no target.
         assert!(admit_view(
             &published(rw, "/@var/home/alice/.cache/x"),
             view,
             &entry(Access::ReadWrite, ".cache/x"),
             &account,
-            &none
+            &none,
+            false
         )
         .is_err());
     }

@@ -6635,8 +6635,10 @@ fn parse_launcher(launcher: Option<&OsString>) -> io::Result<u32> {
         })
 }
 
-/// The launcher's channel: standard input and output are one stream socket.
-fn require_workspace_channel() -> io::Result<()> {
+/// The launcher's channel: standard input and output are one stream socket,
+/// a connection root's intake accepted when the caller is a ledger
+/// account's (`intake`).
+fn require_workspace_channel(intake: bool) -> io::Result<()> {
     let input = fs::File::from(io::stdin().as_fd().try_clone_to_owned()?).metadata()?;
     let output = fs::File::from(io::stdout().as_fd().try_clone_to_owned()?).metadata()?;
     if !input.file_type().is_socket() || (input.dev(), input.ino()) != (output.dev(), output.ino())
@@ -6647,7 +6649,7 @@ fn require_workspace_channel() -> io::Result<()> {
         ));
     }
     // Read in the launcher's network namespace, before the unshare.
-    workspace::require_stream_pair(&fs::read_to_string("/proc/net/unix")?, input.ino())
+    workspace::require_stream_pair(&fs::read_to_string("/proc/net/unix")?, input.ino(), intake)
 }
 
 /// Stage 2's side of it: its stdout is the channel, and no terminal
@@ -6681,7 +6683,7 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
             "workspace launch identity changed after admission",
         ));
     }
-    require_workspace_channel()?;
+    require_workspace_channel(plan.intake)?;
     // The caller is itself inside: worktrees keep their owner, so git's
     // ownership check and a listing read as they do outside.
     let inside_identity = outside_identity;
@@ -8111,6 +8113,7 @@ mod tests {
             shared: vec![grant("/d", true), grant("/e", false)],
             arguments: vec!["tool-host".into(), "--root".into()],
             runtime: None,
+            intake: false,
         };
         let identity = Identity {
             uid: 1000,

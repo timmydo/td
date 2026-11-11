@@ -3038,6 +3038,22 @@ compiled from td-install, with no descriptors. The controller source, its
 fixed child argv and the codec's freedom from unsafe and I/O are pinned by
 confinement tests. No instruction, syscall, option or allowance is added.
 
+### Workspace launch intake
+
+`td-authd/src/workspace.rs` is a further safe consumer: it calls only the
+fixed peer-UID query, on each accepted connection to the workspace
+intake, and receives nothing through the credentials/pidfd or SCM_RIGHTS
+wrappers. It passes the accepted socket as the fixed credential helper's
+stdin and stdout, and one end of a socketpair it creates as its stderr,
+through safe std `Stdio` from `OwnedFd`, keeps no copy of the connection,
+and forwards no other descriptor; the helper execs `workspace-exec`,
+which execs td-jail with those descriptors, so the connection becomes
+the jail's channel without a descriptor ever being sent. Root reads the
+helper's stderr through its own end. The controller source, its fixed
+helper and jail argv, its peer rule and its one call of each prior check
+are pinned by confinement tests. No instruction, syscall, option or
+allowance is added.
+
 ### Elevation: `deploy-rollback`
 
 `td-authd/src/rollback.rs` and `td-authd/src/elevation.rs` are safe std
@@ -3129,19 +3145,31 @@ exactly MOVE_MOUNT_F_EMPTY_PATH(4)|MOVE_MOUNT_T_EMPTY_PATH(0x40).
 The writable profile admits exactly MOUNT_ATTR_IDMAP|NOSUID|NODEV|NOEXEC
 (0x10000e), with the same zero clear and propagation fields. It does not
 clear an inherited read-only attribute; a resulting read-only view fails
-the required writable-view check. The one public wrapper takes a
-two-valued access (`ViewAccess::ReadOnly` or `Writable`) that selects one
-of these two fixed words; no caller supplies a flags word, and no profile
-clears NOEXEC, so there is no exec grant. The shared namespace helper may
-map human UID/GID 1000 to portal UID/GID 991 for the portal's read-only
-Downloads view, or to an application account in the ledger's application
-range for that account's grant views, which root publishes at its launch
-from the root-only workload grant table (td-authd/DESIGN.md, "Workload
-grant table"). It may also map the Firefox UID/GID to portal UID/GID 991
-for the portal's writable handoff view of Firefox's private `Opened`
-directory, the one use of the writable profile with a portal destination.
-Mapping, publication and release are root-only. The same instruction and
-adoption sites serve both mount profiles.
+the required writable-view check. Two executable profiles are the same
+words without NOEXEC: MOUNT_ATTR_IDMAP|RDONLY|NOSUID|NODEV (0x100007) and
+MOUNT_ATTR_IDMAP|NOSUID|NODEV (0x100006), with the same zero clear and
+propagation fields, so they add no execution a source's own mount
+forbids. The one public wrapper takes a four-valued access
+(`ViewAccess::ReadOnly`, `Writable`, `ReadOnlyExecutable` or
+`WritableExecutable`) that selects one of these four fixed words; no
+caller supplies a flags word, and no profile clears an attribute. The
+grant-view consumer selects an executable word only for a sandbox's or
+workspace's ledger account, by the account's kind (`executable_views`),
+never by a table row, a request or a caller; an application account's
+views stay noexec, and no row is an exec grant. A source whose own
+mount is noexec gets no executable view at all, since the view would
+inherit noexec. The shared namespace helper may map human UID/GID 1000
+to portal UID/GID 991 for the portal's read-only Downloads view, or to
+an application account in the ledger's application range, or a
+sandbox's account in its sandbox and workspace range, for that
+account's grant views, which root publishes at its launch from the
+root-only workload grant table (td-authd/DESIGN.md, "Workload grant
+table", "Workspace launch intake"). It may also map the Firefox UID/GID
+to portal UID/GID 991 for the portal's writable handoff view of
+Firefox's private `Opened` directory, the one use of the writable
+profile with a portal destination. Mapping, publication and release are
+root-only. The same instruction and
+adoption sites serve all four mount profiles.
 
 The wrappers accept neither paths nor flags. Safe std owns all descriptors
 and closes the detached mount on failure. No descriptor from this boundary

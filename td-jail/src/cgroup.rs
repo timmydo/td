@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DELEGATE_COMPONENT: &str = "td-user-1000";
-// An application account is the workload account ledger's (td-authd/DESIGN.md,
-// "Workload account ledger").
-use crate::workload_accounts::APPLICATION_UIDS;
+// A ledger account's delegation is the ledger's one spelling, by its range
+// (td-authd/DESIGN.md, "Workload account ledger"): `td-app-UID` for an
+// application, `td-workload-UID` for a sandbox or workspace.
+use crate::workload_accounts::{
+    delegation, APPLICATION_DELEGATION_PREFIX, WORKLOAD_DELEGATION_PREFIX,
+};
 
 struct Delegation {
     uid: u32,
@@ -20,15 +23,16 @@ struct Delegation {
 
 impl Delegation {
     fn for_uid(uid: u32) -> io::Result<Self> {
-        let component = match uid {
-            1000 => DELEGATE_COMPONENT.to_string(),
-            uid if APPLICATION_UIDS.contains(&uid) => format!("td-app-{uid}"),
-            _ => {
-                return Err(io::Error::new(
+        let component = if uid == 1000 {
+            DELEGATE_COMPONENT.to_string()
+        } else {
+            let name = delegation(uid).ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "identity has no configured application cgroup delegation",
-                ))
-            }
+                    "identity has no configured cgroup delegation",
+                )
+            })?;
+            crate::text(format_args!("{name}"))?
         };
         Ok(Self { uid, component })
     }
@@ -57,7 +61,8 @@ impl Delegation {
             1000
         } else {
             component
-                .strip_prefix("td-app-")
+                .strip_prefix(APPLICATION_DELEGATION_PREFIX)
+                .or_else(|| component.strip_prefix(WORKLOAD_DELEGATION_PREFIX))
                 .ok_or_else(invalid)?
                 .parse::<u32>()
                 .map_err(|_| invalid())?
@@ -1321,7 +1326,7 @@ mod tests {
     #[test]
     fn external_identities_select_disjoint_delegations() {
         let instance = "mail-0123456789abcdef";
-        for uid in [1000, 65536, 65537, 98303] {
+        for uid in [1000, 65536, 65537, 98303, 98304, 131071] {
             let delegation = Delegation::for_uid(uid).unwrap();
             let membership = membership_for_instance(instance, uid).unwrap();
             let (parsed, leaf) = Delegation::parse_membership(&membership).unwrap();
@@ -1347,18 +1352,19 @@ mod tests {
             Delegation::for_uid(65536).unwrap().root(),
             Delegation::for_uid(65537).unwrap().root()
         );
-        // A sandbox or workspace account is no application's.
-        for uid in [
-            0,
-            991,
-            1001,
-            65534,
-            65535,
-            98304,
-            131071,
-            2147483647,
-            u32::MAX,
-        ] {
+        // A sandbox's or workspace's account is the shared delegation's
+        // `td-workload-UID`, never an application's spelling.
+        assert_eq!(
+            membership_for_instance(instance, 98304).unwrap(),
+            "/td-workload-98304/mail-0123456789abcdef"
+        );
+        assert_eq!(
+            Delegation::for_uid(98304).unwrap().component,
+            crate::workload_accounts::delegation(98304)
+                .unwrap()
+                .to_string()
+        );
+        for uid in [0, 991, 1001, 65534, 65535, 131072, 2147483647, u32::MAX] {
             assert!(Delegation::for_uid(uid).is_err());
         }
         for component in [
@@ -1368,6 +1374,10 @@ mod tests {
             "td-app-65535",
             "td-app-2147483648",
             "td-app-98304",
+            "td-workload-65536",
+            "td-workload-098304",
+            "td-workload-131072",
+            "td-workload-1000",
             "td-user-1001",
         ] {
             assert!(

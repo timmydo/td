@@ -804,12 +804,18 @@ reinstall is allocated the same uid and finds its state.
 A sandbox's account (WORKLOADS.md, "Accounts") is allocated by
 `td-firstboot allocate-workload OWNER sandbox NAME`, which root runs as
 it runs `allocate-application` and which answers one line,
-`TD-WORKLOAD-ALLOCATED`, a tab and the uid. Nothing runs it yet: the
-root launch of a sandbox (WORKLOADS.md step 7) will, when td-sandbox asks
-for one. td-firstboot requires root credentials and the deployment
-enrolled and its accounts verified, as for an application; OWNER must be
-a session owner of the deployment's principal table, NAME a name in the
-ledger's grammar and the kind `sandbox`. td-sandbox's own names are 1 to
+`TD-WORKLOAD-ALLOCATED`, a tab and the uid. Nothing yet runs it:
+td-sandbox's creation through root will (WORKLOADS.md step 7). Root's
+workspace intake runs `td-firstboot prepare-workload OWNER sandbox
+NAME` instead at every launch ("Workspace launch intake"), which takes
+the same words and checks, finds the sandbox's row under the principal
+lock and refuses when there is none, never adding one, prepares its
+account again as an allocation that finds its row does, and answers
+`TD-WORKLOAD-PREPARED`, a tab and the uid. td-firstboot requires root
+credentials and the deployment enrolled and its accounts verified, as
+for an application; OWNER must be a session owner of the deployment's
+principal table, NAME a name in the ledger's grammar and the kind
+`sandbox`. td-sandbox's own names are 1 to
 32 lowercase letters, digits or hyphens: one that begins with a letter
 is a ledger name, and one that begins with a digit or a hyphen (`1box`,
 `-x`) is not, so td-sandbox's cutover to ledger accounts reports and
@@ -854,7 +860,9 @@ Whatever launches a sandbox through root must therefore prepare the
 delegation again on its first launch of each boot, as the allocation's
 preparation does, before td-login places the account; until then
 td-login's placement for `tdw<uid>` finds no `td-workload-UID` and warns,
-as for any account without one (td-login/THREAT-MODEL.md §2).
+as for any account without one (td-login/THREAT-MODEL.md §2). Root's
+workspace intake does so at every launch, through `prepare-workload`,
+and makes a failed placement fatal.
 
 ## Workload grant table
 
@@ -880,10 +888,12 @@ KIND<TAB>name<TAB>socket<TAB>SOCKET
 KIND<TAB>name<TAB>network<TAB>off|host
 ```
 
-Only an application's `directory` rows take effect today: a sandbox's
-directory and network rows are written ("Grant requests") but neither
-published nor applied until its launches go through root (WORKLOADS.md
-step 7). An account without a network row has no network; the writer
+An application's `directory` rows take effect at its launches through
+`application-start`, and a sandbox's directory and network rows
+("Grant requests") at its launches through root's workspace intake
+("Workspace launch intake"); td-sandbox's own launches, which run as
+the human until its cutover (WORKLOADS.md step 7), apply neither. An
+account without a network row has no network; the writer
 writes only `host` and removes the row to set `off`, and an `off` row an
 edit by hand left means the same. v1 parses socket rows, which nothing
 writes yet, for the same reason the ledger parses kinds it does not yet
@@ -937,7 +947,10 @@ admits, so a table and a jail cannot disagree on what is reserved. Every
 path it admits is a grant target td-jail accepts, apart from one meeting
 the application's own policy grants (Firefox's `Opened`, say): td-jail
 then leaves that view out of the launch with one line on its stderr and
-binds the policy's grant. There is no exec grant; every view is noexec.
+binds the policy's grant. No row asks for execution: an application's
+views are always noexec, and a sandbox's or workspace's views are
+executable, as td-sandbox's shares are, by the account's kind alone
+("Application filesystem grants").
 
 What fails the whole table is kept to what a later deployment will not
 loosen or tighten: the format line, row shape, strict order, the row,
@@ -1106,11 +1119,11 @@ The compositor ends the generation on an answer its verb cannot have,
 and on a listing whose `NETWORK` is not one the account's kind has.
 Revocation is not live: the running jail keeps its view until the
 account's next launch or shutdown releases it ("Application filesystem
-grants"). A sandbox's rows change only what root publishes and applies
-once its launches go through root (WORKLOADS.md step 7); until then
-nothing reads them. td-software shows an application's rows and asks for
-these changes from its folders panel (td-software/DESIGN.md §4.3); a
-sandbox's are td-ctl's.
+grants"). A sandbox's rows change what root publishes and applies at its
+next launch through the workspace intake ("Workspace launch intake"),
+and nothing td-sandbox launches itself. td-software shows an
+application's rows and asks for these changes from its folders panel
+(td-software/DESIGN.md §4.3); a sandbox's are td-ctl's.
 
 ## Fixed program launch prerequisite
 
@@ -1880,14 +1893,16 @@ td-software/DESIGN.md §3 accepts.
 
 `application-start` publishes an application account's grant views after
 admission and before its first process, when the application runs as an
-account of its own rather than as the human; no caller supplies a path,
-access or map. It reads the grant table as root reads it (an absent table
-refuses: boot seeds it) and takes the account's directory rows. What a
-view of each row must show is derived from mountinfo by the one function
-td-jail admits it by (`engine/src/mount_identity.rs`): the device and
-root of the mount covering the human's home (the topmost mount at the home
-or, failing one, at its nearest ancestor), joined with the home's path
-below that mount's mountpoint and then with the row's path. On the stock
+account of its own rather than as the human, and the workspace intake a
+sandbox account's ("Workspace launch intake"), through the same
+publication; no caller supplies a path, access, map or execution. It
+reads the grant table as root reads it (an absent table refuses: boot
+seeds it) and takes the account's directory rows. What a view of each
+row must show is derived from mountinfo by the one function td-jail
+admits it by (`engine/src/mount_identity.rs`): the device and root of
+the mount covering the human's home (the topmost mount at the home or,
+failing one, at its nearest ancestor), joined with the home's path below
+that mount's mountpoint and then with the row's path. On the stock
 layout the home is a plain directory below the `/var` subvolume's mount,
 so a view of `Downloads` shows `/@var/home/NAME/Downloads`.
 
@@ -1900,7 +1915,8 @@ The launch first takes the account's lock: a private root file in
 so none can open the lock to hold a launch up; it waits for the lock at
 most ten seconds and then fails closed. td-svc runs one unit per
 application, which already serialises its launches; the lock covers a
-launch racing a manual one. Under it the launch reconciles in an order
+launch racing a manual one, and a sandbox's launches, which may run side
+by side. Under it the launch reconciles in an order
 that keeps the manifest true of what is mounted throughout, and never
 removes it:
 
@@ -1912,7 +1928,8 @@ removes it:
    idmap, one with a mount stacked on it, and an empty mountpoint a
    failed launch left. A view accounts for a row while it is the one
    mount at its path showing the row's derived device and root, its
-   access, nosuid, nodev, noexec and `idmapped`.
+   access, nosuid, nodev and `idmapped`, and noexec exactly when the
+   account is an application's.
 2. Each row's source is opened below the human home, resolved through the
    same primary-account reader as portal preparation and jail admission,
    name by name through a retained parent without following links. Every
@@ -1930,9 +1947,17 @@ removes it:
    the source, idmapped through one namespace per launch from the root
    namespace helper, mapping filesystem UID/GID 1000 to the account, with
    read-only, nosuid, nodev and noexec for an `ro` row and nosuid, nodev
-   and noexec for an `rw` one, moved onto its empty mountpoint. Indices
-   run to 64, twice the rows, so a replacement goes up beside the view it
-   replaces.
+   and noexec for an `rw` one, moved onto its empty mountpoint. A
+   sandbox's or workspace's account takes the same words without noexec
+   (`UNSAFE.md` §16): its shell runs what the human shares with it, as
+   td-sandbox's executable shares let it, and the account's ledger kind
+   alone selects them, never a row, a request or a caller. They clear
+   nothing, so a view of a source whose own mount is noexec would be
+   noexec too, which td-jail refuses of an executable grant; such a
+   source is refused like any other, with no view and one line on
+   stderr, and the other rows publish.
+   Indices run to 64, twice the rows, so a replacement goes up beside the
+   view it replaces.
 3. A fresh mount table must show every new view as step 1 would keep it,
    with the source's inode, or the launch refuses with the manifest of
    step 1 in place. The manifest `td-grant-views-v1`, listing
@@ -1948,23 +1973,26 @@ mountpoint the retired boot unit left in Firefox's private home, when no
 mount covers it. Firefox's launch also brings the portal's Downloads view
 in line with its grant ("Portal file preparation").
 
-td-jail binds only what the manifest lists, at `/home/td/PATH` in the
-jail; it reads the manifest through the same root-owned directories
-without following links, requires each listed view to be exactly the one
-mount at its path with the options above and the identity it derives for
-the human's directory, and refuses the launch otherwise. A listed view
-whose target meets one of the application's own policy grants, or one
-td-jail keeps for itself, is left out with one line on td-jail's stderr.
-With no manifest an account has no views. Running jails keep their own
-copies of a view, since each jail's mount namespace is private: a
-revocation or a rename reaches the account at its next launch, not in a
-running one, and the root mount stays until that launch or shutdown
-releases it. The supervisor's shutdown runs `release-grant-views` after
-every service stops and before unmounting /var: it unmounts every mount
-below the view tree, deepest first, and reports any that remains. The
-portal's separate read-only Downloads view is unchanged; its writable
-handoff view maps the other way, Firefox's identity to the portal's
-("Portal handoff").
+td-jail binds only what the manifest lists, at `/home/td/PATH` in an
+application's jail and at the human's own path below `/var/home/NAME` in
+a sandbox's workspace jail (APPLICATIONS.md §C, "The `workspace` kind");
+it reads the manifest through the same root-owned directories without
+following links, requires each listed view to be exactly the one mount
+at its path with the options above and the identity it derives for the
+human's directory, noexec for an application's view and not for a
+sandbox's or workspace's, and refuses the launch otherwise. A listed
+view whose target meets one of the application's own policy grants, or
+one td-jail keeps for itself, is left out with one line on td-jail's
+stderr. With no manifest an account has no views. Running jails keep
+their own copies of a view, since each jail's mount namespace is
+private: a revocation or a rename reaches the account at its next
+launch, not in a running one, and the root mount stays until that launch
+or shutdown releases it. The supervisor's shutdown runs
+`release-grant-views` after every service stops and before unmounting
+/var: it unmounts every mount below the view tree, deepest first, and
+reports any that remains. The portal's separate read-only Downloads view
+is unchanged; its writable handoff view maps the other way, Firefox's
+identity to the portal's ("Portal handoff").
 
 Preparation is not live repair of a running jail or protection against a
 root mount-table editor. A writable view's grantee can change the shared
@@ -2032,6 +2060,148 @@ Nothing pins the source's name while its views exist. If the human
 renames or removes a granted directory, a running jail keeps showing the
 old directory, and the next launch releases the stale view and publishes
 the directory the row now names, or none.
+
+## Workspace launch intake
+
+Root starts a sandbox's shell as the sandbox's own account (WORKLOADS.md,
+"Launch path"), through `td-authd workspace-serve`, a root daemon td-svc
+runs on every desktop boot after firstboot (td-svc/DESIGN.md,
+`workspace-intake`). Its socket is
+`/run/td-authd/1000/workspace` (`WORKSPACE_INTAKE` in
+`engine/src/workload_accounts.rs`), beside the other intakes: owned by
+the primary human, UID 1000, at mode 0600 in the root-owned 0755
+`/run/td-authd/1000`, bound blocking and unlinked by the service that
+made it. Each accepted connection's `SO_PEERCRED` uid must be 1000;
+another's connection, root's, an application's or a sandbox's own
+account's included, is closed unanswered. At most 16 launches run at
+once, over every sandbox, each holding a thread until its shell ends; a
+connection past that is refused. A failed accept never ends the
+service, which would end every shell it launched: an interrupted one,
+or one whose peer gave up, is retried at once, and any other is logged
+and retried after a pause of 50 ms, doubled for each failure in a row
+up to one second.
+
+The peer sends one request, at most 256 bytes, within two seconds, read
+byte by byte to its newline so nothing after it is taken:
+
+```
+start NAME RUNTIME TERM
+```
+
+single spaces, `NAME` a ledger name (td-sandbox's names that begin with
+a digit or a hyphen are not), `RUNTIME` `native` or a declared Flathub
+runtime's td name (`flathub_app::FLATHUB_RUNTIMES`), which td-jail holds
+and binds as it does a td-sandbox profile's, and `TERM` a terminal type
+of td-sandbox's relay grammar (1 to 64 ASCII letters, digits, `-`, `_`,
+`.` or `+`). Anything else is refused. The socket's read timeout is
+cleared before the connection goes on. `start` is the one verb: creating
+and deleting a sandbox through root, and a command other than its shell,
+belong to td-sandbox's cutover (WORKLOADS.md step 7).
+
+For an admitted request root:
+
+1. reads the ledger as every consumer does and requires the sandbox's
+   own row, never an application's or a workspace's of the name; it adds
+   none;
+2. for a named runtime, requires its store's `current` below
+   `/var/lib/td/runtimes`, refusing with the applications that install
+   it, as td-jail would; td-jail still holds it at the launch and stays
+   the authority, and a collection between the two fails the launch
+   after the answer;
+3. runs `td-firstboot prepare-workload 1000 sandbox NAME` as it runs
+   `allocate-application`, with the same 30-second bound, which finds
+   that row under the principal lock, refusing when a deletion took it
+   since step 1, restores its home's mode and prepares its
+   `td-workload-UID` delegation again, which the volatile hierarchy lost
+   at the last shutdown ("Workload account ledger"); the uid it answers
+   must be the row's;
+4. publishes the account's grant views ("Application filesystem
+   grants"), executable by its kind, and reads its network row from the
+   same table;
+5. writes the launch's spec, root's at mode 0640 with the account's
+   group, one new link named by a launch counter in
+   `/run/td-authd/workspaces/UID`, root:UID mode 0710 below the root
+   0755 `/run/td-authd/workspaces` (`WORKSPACE_SPECS`), which the
+   service empties when it starts, since every jail ends with the
+   service that launched it:
+
+   ```
+   format=1
+   profile=development-offline
+   runtime=RUNTIME
+   entry=/td/store/...-td-sandbox/bin/td-sandbox
+   home=/var/lib/td/workloads/UID
+   ```
+
+   `profile=development` where the network row is `host` and
+   `development-offline` without one, which is how td-sandbox maps its
+   own `network` setting; `runtime` only for a declared runtime; the
+   entry `/bin/td-sandbox` resolved; the account's home. It names no
+   directory of the human's: the account reaches those only through its
+   manifest's views. A failure after the spec's creation removes it;
+6. answers `ok` and a newline, then runs `td-login exec-service-as
+   tdwUID -- /bin/td-authd workspace-exec UID PID SPEC TERM SHELL`, the
+   connection its standard input and output and a private socket pair's
+   end its stderr, in an empty environment at `/`. `PID` is the
+   service's own, the jail's launcher, and `SHELL` td's `/bin/sh`
+   resolved, never one a caller names. Root keeps no copy of the
+   connection, reads what the helper writes on stderr to its end, keeping
+   the last 512 bytes, and logs the last line with the exit status
+   however the launch ends, then removes the spec.
+
+A refusal at any step before the answer is `refused`, a space and the
+reason, one printable line of at most 200 bytes, and the connection
+closes. Everything that can fail after the answer reaches only root's
+log, `/var/log/svc/workspace-intake.log`: the helper's start, td-login's
+switch and placement, `workspace-exec`'s checks, td-jail's refusals (a
+view a concurrent launch is replacing among them, below), and the
+shell's end. The requester sees the connection close. td-sandbox's
+client, when it moves onto the intake (WORKLOADS.md step 7), must
+treat an end of the connection before the relay's first frame as a
+failed start and name that log.
+
+`workspace-exec`, run as the account, takes only a sandbox's or
+workspace's uid, a positive launcher pid, that uid's spec below root's
+tree, a terminal type and an absolute shell; checks, as
+`application-exec` does, that its credentials are the account's in every
+column with no other group and no capability and that it is in its own
+`td-workload-UID/session` leaf (by the shared `delegation`), so a failed
+placement is fatal; then execs `/bin/td-jail --workspace PID SPEC
+--inside pty TERM SHELL -i` with an empty environment at `/`.
+td-sandbox's relay inside the jail opens the PTY and runs the shell, as
+for its own launches (td-sandbox/DESIGN.md, "Process and terminal
+ownership"), and the requester speaks its framed relay protocol on the
+connection after the answer.
+
+td-jail's workspace kind admits that caller as a ledger account
+(APPLICATIONS.md §C, "The `workspace` kind"): root's spec, the account's
+home, its manifest's views at the human's paths and the intake's
+connection as its channel. The account and the jail share one identity:
+uid and gid the account's inside and out, as td-sandbox's are the
+human's. The jail's launcher is the service, whose launch thread waits
+for it, so stopping or restarting `workspace-intake` ends every shell it
+started. Two launches of one sandbox may run at once, each its own jail;
+their publications take the account's lock in turn. A jail that has
+bound its views keeps its own copies, whatever a later launch releases.
+One that has not yet bound them, because its td-jail is still starting
+while a second launch republishes after a revocation or a rename, may
+find a listed view released, or the manifest replaced, under it:
+td-jail then refuses that launch, after its answer, and the shell does
+not start. The race fails closed and is logged; nothing serialises a
+launch's binding against another's publication.
+
+Nothing calls the intake yet: td-sandbox still launches its jail itself,
+as the human, until its cutover, and its own launches apply none of a
+sandbox's rows. The service needs no human program's help to be reached,
+so any program running as UID 1000 may start a shell in any sandbox the
+ledger holds, with that sandbox's grants and network
+(td-login/THREAT-MODEL.md §1).
+
+The controller is safe std over the shared peer-uid query; its
+descriptors are the accepted socket and the stderr pair, handed to the
+child through std's `Stdio` (`UNSAFE.md` §16, "Workspace launch
+intake"). Confinement tests pin its source, its fixed helper and jail
+argv, the peer rule and its one use of each prior check.
 
 ## Immutable consent description prerequisite
 

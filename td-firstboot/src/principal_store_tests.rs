@@ -1297,6 +1297,45 @@ fn a_sandbox_allocation_takes_a_workload_uid_once() {
     temp.cleanup().unwrap();
 }
 
+/// A launch's preparation takes the sandbox's existing row, preparing it
+/// again under the lock, and never adds one: an absent row, or another
+/// kind's of the same name, refuses and leaves the ledger as it was.
+#[test]
+fn a_launch_prepares_an_existing_sandbox_row_and_adds_none() {
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let mut prepared = Vec::new();
+    let uid = allocate_sandbox(&directory, "default", BTreeSet::new(), &mut prepared).unwrap();
+    let before = account_ledger(&directory);
+    let mut again = Vec::new();
+    assert_eq!(
+        directory
+            .prepare_account(Kind::Sandbox, "default", |uid| {
+                again.push(uid);
+                Ok(())
+            })
+            .unwrap(),
+        uid
+    );
+    assert_eq!(again, [uid]);
+    for (kind, name) in [
+        (Kind::Sandbox, "tools"),
+        (Kind::Workspace, "default"),
+        (Kind::Application, "default"),
+    ] {
+        let refused = directory
+            .prepare_account(kind, name, |_| Err("prepared".into()))
+            .unwrap_err();
+        assert!(refused.contains("has no account"), "{refused}");
+    }
+    assert_eq!(account_ledger(&directory), before);
+    // A failed preparation is the launch's failure; the row stays.
+    assert!(directory
+        .prepare_account(Kind::Sandbox, "default", |_| Err("no cgroup".into()))
+        .is_err());
+    assert_eq!(account_ledger(&directory), before);
+    temp.cleanup().unwrap();
+}
+
 /// A sandbox's new row avoids every uid another row holds, whatever its
 /// kind, every id read outside the state directory (passwd, group, an
 /// account cgroup, a runtime directory) and every home left below

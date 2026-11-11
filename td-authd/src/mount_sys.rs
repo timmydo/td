@@ -13,6 +13,8 @@ const AT_EMPTY_PATH: usize = 0x1000;
 const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;
 const READ_ONLY_VIEW: u64 = 0x100000 | 1 | 2 | 4 | 8;
 const WRITABLE_VIEW: u64 = 0x100000 | 2 | 4 | 8;
+const READ_ONLY_EXECUTABLE_VIEW: u64 = 0x100000 | 1 | 2 | 4;
+const WRITABLE_EXECUTABLE_VIEW: u64 = 0x100000 | 2 | 4;
 const MOVE_FLAGS: usize = 4 | 0x40;
 
 #[repr(C)]
@@ -84,12 +86,16 @@ pub(crate) fn clone_directory(source: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(adopt(fd))
 }
 
-/// The two fixed attribute sets an idmapped view takes: both nosuid, nodev
-/// and noexec, one also read-only. No caller supplies a flags word.
+/// The four fixed attribute sets an idmapped view takes: all nosuid and
+/// nodev, two also read-only, and noexec but for a sandbox's or
+/// workspace's views, which the account's kind alone selects. No caller
+/// supplies a flags word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewAccess {
     ReadOnly,
     Writable,
+    ReadOnlyExecutable,
+    WritableExecutable,
 }
 
 impl ViewAccess {
@@ -97,6 +103,8 @@ impl ViewAccess {
         match self {
             Self::ReadOnly => READ_ONLY_VIEW,
             Self::Writable => WRITABLE_VIEW,
+            Self::ReadOnlyExecutable => READ_ONLY_EXECUTABLE_VIEW,
+            Self::WritableExecutable => WRITABLE_EXECUTABLE_VIEW,
         }
     }
 }

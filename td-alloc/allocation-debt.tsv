@@ -304,7 +304,7 @@ engine/src/tar_write.rs	allocation-macro	2
 engine/src/target_profile.rs	allocating-conversion	4
 engine/src/target_profile.rs	allocation-macro	4
 engine/src/workload_accounts.rs	allocating-conversion	10
-engine/src/workload_accounts.rs	allocation-macro	13
+engine/src/workload_accounts.rs	allocation-macro	14
 engine/src/workload_accounts.rs	unchecked-growth-or-clone	9
 engine/src/workload_grants.rs	allocating-constructor	1
 engine/src/workload_grants.rs	allocating-conversion	16
@@ -1110,7 +1110,7 @@ td-audio/src/wire.rs	allocating-conversion	2
 td-audio/src/wire.rs	unchecked-growth-or-clone	3
 td-authd/src/application.rs	allocating-constructor	1
 td-authd/src/application.rs	allocating-conversion	15
-td-authd/src/application.rs	allocation-macro	13
+td-authd/src/application.rs	allocation-macro	11
 td-authd/src/application.rs	unchecked-growth-or-clone	2
 td-authd/src/application_cache.rs	allocating-conversion	5
 td-authd/src/application_cache.rs	allocation-macro	22
@@ -1223,6 +1223,9 @@ td-authd/src/unlock.rs	allocating-constructor	2
 td-authd/src/unlock.rs	allocating-conversion	5
 td-authd/src/unlock.rs	allocation-macro	12
 td-authd/src/unlock.rs	unchecked-growth-or-clone	11
+td-authd/src/workspace.rs	allocating-conversion	3
+td-authd/src/workspace.rs	allocation-macro	1
+td-authd/src/workspace.rs	heap-owner	1
 td-av1/src/intra.rs	allocating-conversion	4
 td-av1/src/intra.rs	allocation-macro	6
 td-av1/src/intra.rs	unchecked-growth-or-clone	42
@@ -1858,7 +1861,7 @@ td-firstboot/src/principal_store.rs	heap-owner	1
 td-firstboot/src/principal_store.rs	unchecked-growth-or-clone	10
 td-firstboot/src/principal_store_tests.rs	allocating-conversion	45
 td-firstboot/src/principal_store_tests.rs	allocation-macro	24
-td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	9
+td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	10
 td-firstboot/src/principals.rs	allocating-conversion	24
 td-firstboot/src/principals.rs	allocation-macro	20
 td-firstboot/src/principals.rs	unchecked-growth-or-clone	12
@@ -2039,7 +2042,7 @@ td-jail/src/bus.rs	allocation-macro	20
 td-jail/src/bus.rs	heap-owner	1
 td-jail/src/bus.rs	unchecked-growth-or-clone	11
 td-jail/src/cgroup.rs	allocating-conversion	39
-td-jail/src/cgroup.rs	allocation-macro	69
+td-jail/src/cgroup.rs	allocation-macro	68
 td-jail/src/cgroup.rs	unchecked-growth-or-clone	2
 td-jail/src/firefox.rs	allocating-constructor	2
 td-jail/src/firefox.rs	allocating-conversion	17

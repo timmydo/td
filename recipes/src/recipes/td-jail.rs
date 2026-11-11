@@ -6,6 +6,8 @@ const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
 const ENGINE_DYNAMIC_APPLICATION_RS: &str =
     include_str!("../../../engine/src/dynamic_application.rs");
 const MODULES: &[(&str, &str)] = &[
+    // td-alloc's fallible growth, mounted by path.
+    ("allocation", include_str!("../../../td-alloc/src/lib.rs")),
     (
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),

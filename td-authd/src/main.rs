@@ -6,6 +6,11 @@
 #[path = "../../td-boot/src/admission.rs"]
 #[allow(dead_code, reason = "the record's writer is td-boot's")]
 mod admission;
+// td-alloc's fallible growth, mounted by path as direct-rustc consumers
+// mount it (td-alloc/DESIGN.md).
+#[path = "../../td-alloc/src/lib.rs"]
+#[allow(dead_code, reason = "td-authd formats and copies through it")]
+mod allocation;
 // Application declarations joined with the workload account ledger: a
 // credential binds the ledger's uid.
 #[path = "../../td-busd/src/app_policy.rs"]
@@ -95,6 +100,7 @@ mod unlock;
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(dead_code, reason = "the application policy reads the ledger")]
 mod workload_accounts;
+mod workspace;
 // The grant table the views are published from and the manifest td-jail
 // reads, one reviewed copy with td-firstboot's seed and td-jail's reader.
 #[path = "../../engine/src/workload_grants.rs"]
@@ -118,6 +124,7 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
      td-authd runtime-cache RUNTIME install|update|remove|status | \
+     td-authd workspace-serve | td-authd workspace-exec UID LAUNCHER SPEC TERM SHELL | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME | \
      td-authd time ACTION VALUE | td-authd volume add|remove ...";
 
@@ -166,12 +173,18 @@ fn run(arguments: &[String]) -> Result<(), String> {
     if arguments == ["release-grant-views"] {
         return grant_views::release_all();
     }
+    if arguments == ["workspace-serve"] {
+        return workspace::serve();
+    }
     if let Some((verb, rest)) = arguments.split_first() {
         if verb == "application-start" {
             return application::start(rest);
         }
         if verb == "application-exec" {
             return application::exec(rest);
+        }
+        if verb == "workspace-exec" {
+            return workspace::exec(rest);
         }
         if verb == "application-cache" || verb == "runtime-cache" {
             let output = if verb == "application-cache" {
@@ -236,6 +249,28 @@ fn entry() -> Result<(), String> {
         .map(|s| s.into_string().map_err(|_| "invalid argument encoding"))
         .collect::<Result<Vec<_>, _>>()?;
     run(&arguments)
+}
+
+/// Text formatted into fallibly grown storage (td-alloc/DESIGN.md). A
+/// refusal is an error with the empty message, the one String that needs
+/// no allocation.
+pub(crate) fn text(args: std::fmt::Arguments<'_>) -> Result<String, String> {
+    allocation::format(args).map_err(|_| String::new())
+}
+
+/// A diagnostic formatted as `text` formats; refused, it is empty.
+pub(crate) fn message(args: std::fmt::Arguments<'_>) -> String {
+    allocation::format(args).unwrap_or_default()
+}
+
+/// A copy of `value` in fallibly grown storage, refused as `text` is.
+pub(crate) fn owned(value: &str) -> Result<String, String> {
+    allocation::string(value).map_err(|_| String::new())
+}
+
+/// A td-alloc refusal as td-authd's error: the empty message.
+pub(crate) fn refused(_: allocation::Error) -> String {
+    String::new()
 }
 
 fn main() -> ExitCode {

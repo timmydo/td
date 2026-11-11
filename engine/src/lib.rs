@@ -407,6 +407,14 @@ mod account_ledger_reader {
         assert_eq!(Kind::Application.homes(), "applications");
         assert_eq!(Kind::Sandbox.homes(), "workloads");
         assert_eq!(Kind::Workspace.homes(), "workloads");
+        assert_eq!(
+            Kind::Sandbox.home(98304),
+            std::path::Path::new("/var/lib/td/workloads/98304")
+        );
+        assert_eq!(
+            Kind::Application.home(65536),
+            std::path::Path::new("/var/lib/td/applications/65536")
+        );
     }
 }
 

@@ -62,7 +62,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "storage.rs",
             "suspend.rs",
             "sys.rs",
-            "unlock.rs"
+            "unlock.rs",
+            "workspace.rs"
         ]
     );
     for (name, count) in [
@@ -102,6 +103,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("revocation.rs", 0),
         ("storage.rs", 0),
         ("suspend.rs", 0),
+        ("workspace.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -141,6 +143,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "notebook.rs"
                     | "notebook_token.rs"
                     | "stderr_tail.rs"
+                    | "workspace.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api =
@@ -1078,7 +1081,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x7b46c47b8b2fb584,
+        APPLICATION_FINGERPRINT,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1096,12 +1099,17 @@ fn the_production_source_and_raw_boundary_are_closed() {
         );
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
-    // The one td-firstboot child runs one of two fixed verbs: the launch
-    // admission and an install's allocation.
-    assert!(application.contains("            .args([check.verb, &owner.to_string(), name])\n"));
-    assert_eq!(application.matches("    verb: \"").count(), 2);
-    assert!(application.contains("    verb: \"check-launch-application\",\n"));
-    assert!(application.contains("    verb: \"allocate-application\",\n"));
+    // The one td-firstboot child runs one of three fixed verbs: the launch
+    // admission, an install's allocation and a sandbox launch's
+    // preparation of its existing row, whose kind is its one fixed word.
+    assert!(application.contains(
+        "            .arg(check.verb)\n            .arg(owner.to_string())\n            .args(check.words)\n            .arg(name)\n"
+    ));
+    assert_eq!(application.matches("    verb: \"").count(), 3);
+    assert!(application.contains("    verb: \"check-launch-application\",\n    words: &[],\n"));
+    assert!(application.contains("    verb: \"allocate-application\",\n    words: &[],\n"));
+    assert!(application.contains("    verb: \"prepare-workload\",\n    words: &[\"sandbox\"],\n"));
+    assert!(!application.contains("allocate-workload"));
     assert_eq!(application.matches("admit(&ALLOCATE, ").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
@@ -1492,7 +1500,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let mounts = include_str!("../src/mount_sys.rs");
     assert_eq!(
         fingerprint(mounts),
-        0xc82ef8c319e2b10b,
+        0x5348cf939e0013fa,
         "fixed mount boundary changed"
     );
     for constant in [
@@ -1505,6 +1513,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;",
         "const READ_ONLY_VIEW: u64 = 0x100000 | 1 | 2 | 4 | 8;",
         "const WRITABLE_VIEW: u64 = 0x100000 | 2 | 4 | 8;",
+        "const READ_ONLY_EXECUTABLE_VIEW: u64 = 0x100000 | 1 | 2 | 4;",
+        "const WRITABLE_EXECUTABLE_VIEW: u64 = 0x100000 | 2 | 4;",
         "const MOVE_FLAGS: usize = 4 | 0x40;",
     ] {
         assert!(mounts.contains(constant), "{constant}");
@@ -1515,8 +1525,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(mounts.matches("#[allow(unsafe_code)]").count(), 2);
     assert_eq!(mounts.matches("syscall5(").count(), 5);
     assert_eq!(mounts.matches("adopt(").count(), 2);
-    // The two attribute words are the only ones a view takes.
-    assert_eq!(mounts.matches("_VIEW: u64 = ").count(), 2);
+    // The four attribute words are the only ones a view takes, and only
+    // the two executable ones lack NOEXEC (8).
+    assert_eq!(mounts.matches("_VIEW: u64 = ").count(), 4);
+    assert_eq!(mounts.matches("_EXECUTABLE_VIEW: u64 = ").count(), 2);
     assert_eq!(mounts.matches("set_attributes(").count(), 2);
     let files = include_str!("../src/portal_files.rs");
     assert_eq!(
@@ -1588,7 +1600,77 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert_eq!(views.matches(call).count(), count, "grant_views.rs: {call}");
     }
-    assert!(views.contains("view_access(access)"));
+    assert!(views.contains("view_access(grant.access, grant.executable)"));
+    // The account's kind alone selects executable views; no row, request
+    // or caller does.
+    assert_eq!(
+        views.matches("executable: executable_views(kind),").count(),
+        1
+    );
+    assert!(views.contains(
+        "fn executable_views(kind: Kind) -> bool {\n    match kind {\n        Kind::Application => false,\n        Kind::Sandbox | Kind::Workspace => true,\n    }\n}"
+    ));
+    // The workspace intake: the primary human's peers alone, one fixed
+    // helper argv for the ledger account, one fixed jail argv, the
+    // accepted connection its only descriptors beside a private stderr.
+    let workspace = include_str!("../src/workspace.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        fingerprint(workspace),
+        WORKSPACE_FINGERPRINT,
+        "root workspace launch intake changed"
+    );
+    for (call, count) in [
+        ("Command::new(", 2),
+        ("Command::new(\"/bin/td-login\")", 1),
+        ("Command::new(\"/bin/td-jail\")", 1),
+        (".spawn(", 2),
+        (".exec()", 1),
+        ("crate::secret_sys::peer_uid(&stream)", 1),
+        (
+            "grant_views::publish(Kind::Sandbox, &request.name, uid)?",
+            1,
+        ),
+        ("application::admit(", 1),
+        ("&application::PREPARE_SANDBOX", 1),
+        ("application::require_process(", 1),
+        ("Stdio::from(OwnedFd::from(", 3),
+        ("unsafe", 0),
+    ] {
+        assert_eq!(
+            workspace.matches(call).count(),
+            count,
+            "workspace.rs: {call}"
+        );
+    }
+    assert!(workspace.contains("matches!(peer, Ok(uid) if uid == primary_account::UID)"));
+    // The service runs each connection through the real preparation and
+    // launch, checks what the human can mend before its answer, and never
+    // leaves its accept loop over a failed accept.
+    assert!(workspace.contains("                handle(stream, id, prepare, run);\n"));
+    assert_eq!(workspace.matches("handle(").count(), 2);
+    let prepare = workspace
+        .split("fn prepare(request: &Request, id: u64)")
+        .nth(1)
+        .unwrap();
+    let at = |needle: &str| prepare.find(needle).unwrap();
+    assert!(
+        at("sandbox_uid(&accounts::load()?, &request.name)?;")
+            < at("require_runtime(Path::new(flathub_app::RUNTIME_STORE), request.runtime)?;")
+            && at("require_runtime(") < at("application::admit(")
+            && at("application::admit(") < at("grant_views::publish(")
+            && at("grant_views::publish(") < at("specs().write(uid, id, &text)?")
+    );
+    let accepting = workspace
+        .split("pub(crate) fn serve()")
+        .nth(1)
+        .and_then(|serve| serve.split("    loop {").nth(1))
+        .unwrap();
+    assert_eq!(accepting.matches("return").count(), 0);
+    assert_eq!(accepting.matches("?;").count(), 0);
+    assert!(workspace.contains(".args([\"exec-service-as\", &format!(\"tdw{uid}\"), \"--\"])"));
     assert!(views.contains("format!(\"{}/{}/{index}\", grants::VIEW_ROOT, self.uid)"));
     // The portal's Downloads view: one lock for its two callers, and every
     // mount at it released before one is published.
@@ -1626,7 +1708,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x10849a59813c63f1;
-const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f5b8f042bdbb6c2;
+const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f8b0e4c319550d1;
+const WORKSPACE_FINGERPRINT: u64 = 0xe3adb45337f49998;
+const APPLICATION_FINGERPRINT: u64 = 0x51ed125bbbcde81a;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1641,7 +1725,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x33d421b9691fb2fb;
-const MAIN_FINGERPRINT: u64 = 0x62f0cc4717b69cc5;
+const MAIN_FINGERPRINT: u64 = 0x6a995c61506177a1;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 

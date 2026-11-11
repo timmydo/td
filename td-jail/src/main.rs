@@ -5,6 +5,11 @@
 //! development-host launch when no product configuration is installed.
 #![deny(unsafe_code)]
 
+// td-alloc's fallible growth, mounted by path as direct-rustc consumers
+// mount it (td-alloc/DESIGN.md).
+#[allow(dead_code, reason = "td-jail formats its diagnostics through it")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-alloc/src/lib.rs")]
+mod allocation;
 #[allow(dead_code, reason = "shared immutable application policy")]
 #[cfg_attr(
     not(feature = "target-recipe"),
@@ -67,6 +72,20 @@ use std::io::Write;
 use std::process::ExitCode;
 
 const RESERVED_LAUNCHER_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
+
+/// Text formatted into fallibly grown storage (td-alloc/DESIGN.md); a
+/// refusal is `OutOfMemory`, an error that allocates nothing.
+pub(crate) fn text(args: std::fmt::Arguments<'_>) -> std::io::Result<String> {
+    allocation::format(args).map_err(|_| std::io::ErrorKind::OutOfMemory.into())
+}
+
+/// A `kind` error carrying the formatted text, or `text`'s refusal.
+pub(crate) fn error(kind: std::io::ErrorKind, args: std::fmt::Arguments<'_>) -> std::io::Error {
+    match text(args) {
+        Ok(message) => std::io::Error::new(kind, message),
+        Err(refused) => refused,
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ApplicationLaunchKind {
@@ -417,10 +436,11 @@ mod confinement {
 
     /// The workspace kind (APPLICATIONS.md §C) is selected only by the exact
     /// `td-jail --workspace`, is refused where the product configuration is
-    /// installed to every identity but td's account, before its spec is
-    /// read, and ties the outer process to its launcher before anything
-    /// else; its stage 2 reads its plan back, then confines, then starts the
-    /// entry on the channel.
+    /// installed to every identity but td's account and a sandbox's or
+    /// workspace's ledger account, before its spec is read, and ties the
+    /// outer process to its launcher before anything else; its stage 2
+    /// reads its plan back, then confines, then starts the entry on the
+    /// channel.
     #[test]
     fn the_workspace_kind_is_a_hosts_or_tds_accounts_tied_and_ordered() {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
@@ -430,8 +450,10 @@ mod confinement {
         assert!(shipped_main.contains(
             "if kind == ApplicationLaunchKind::Workspace {\n            // `--workspace LAUNCHER-PID SPEC [ARG...]`\n            let arguments: Vec<std::ffi::OsString> = arguments.collect();\n            transition::tie_workspace_to_launcher(arguments.get(1))?;\n            return transition::spawn_application_session(argv0, arguments);"
         ));
-        // On td, its account's alone: the product configuration refuses
-        // every other identity, before the spec is read.
+        // On td, its account's and the ledger's sandbox and workspace
+        // accounts': the product configuration refuses every other
+        // identity, before the spec is read, whose owner the caller's
+        // class decides.
         assert!(WORKSPACE.contains("const TD_ACCOUNT_UID: u32 = 1000;"));
         assert!(WORKSPACE.contains("const UID_MAP: &str = \"/proc/self/uid_map\";"));
         assert!(WORKSPACE.contains("Ok(fields == [\"0\", \"0\", \"4294967295\"])"));
@@ -441,12 +463,24 @@ mod confinement {
             .map(|(body, _)| body)
             .unwrap();
         let account = resolve
-            .find("require_account(uid, Path::new(UID_MAP), Path::new(authority::CONFIG_PATH))?;")
+            .find("let caller = require_account(\n        (uid, gid),\n        Path::new(UID_MAP),\n        Path::new(authority::CONFIG_PATH),\n        crate::workload_accounts::load,\n    )?;")
             .unwrap();
-        assert!(account < resolve.find("read_spec(").unwrap());
+        assert!(account < resolve.find("read_spec(spec_path, uid, caller)?").unwrap());
         assert!(WORKSPACE.contains(
-            "    if uid == TD_ACCOUNT_UID && initial_user_namespace(uid_map)? {\n        return Ok(());\n    }\n    authority::require_no_configuration_at(\n        config,\n"
+            "    let initial = initial_user_namespace(uid_map)?;\n    if uid == TD_ACCOUNT_UID && initial {\n        return Ok(Caller::Human);\n    }\n    if WORKLOAD_UIDS.contains(&uid) && initial && configuration_installed(config)? {\n"
         ));
+        assert!(
+            WORKSPACE.contains("    authority::require_no_configuration_at(\n        config,\n")
+        );
+        // A ledger caller's spec is root's, its home its own, its grants
+        // its manifest's views, and its channel the intake's connection.
+        assert!(WORKSPACE.contains(
+            "        Caller::Account(_) if account_spec_path(path, uid) => read_spec_of(path, 0, true),\n"
+        ));
+        assert!(WORKSPACE.contains("        Caller::Human => read_spec_of(path, uid, false),\n"));
+        assert!(resolve.contains("        require_account_spec(&spec, kind, uid)?;\n"));
+        assert!(resolve.contains("        spec.views = authority::workspace_views(\n"));
+        assert!(resolve.contains("    plan.intake = matches!(caller, Caller::Account(_));\n"));
         assert!(AUTHORITY.contains(
             "pub(crate) fn require_no_configuration_at(path: &Path, what: &str) -> io::Result<()> {\n    match fs::symlink_metadata(path) {"
         ));
@@ -473,7 +507,7 @@ mod confinement {
             .unwrap()
             .0;
         assert!(
-            at(launch, "require_workspace_channel()?;")
+            at(launch, "require_workspace_channel(plan.intake)?;")
                 < at(launch, "sys::unshare_namespaces(!plan.shared_network)")
                 && at(launch, "sys::bring_up_loopback()")
                     < at(

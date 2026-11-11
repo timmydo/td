@@ -165,10 +165,11 @@ and workspace UIDs, 98304 through 131071, `td-workload-UID/session`. Every
 other non-root UID reports that no delegation is configured. Firstboot
 prepares only the installed, durably reserved application accounts'
 cgroups and, on the desktop, the runtime account's at sysinit, and a
-sandbox account's when root allocates it, as specified in
+sandbox account's when root allocates it or launches it, as specified in
 `td-authd/DESIGN.md`; this selector alone activates nothing.
-The root-configured td-authd application launcher makes a failed placement
-fatal before app code runs, as the terminal launcher does for the human
+The root-configured td-authd application launcher, and its workspace
+launch intake for a sandbox's account, make a failed placement fatal
+before workload code runs, as the terminal launcher does for the human
 session. Its active-account admission and post-switch checks are specified
 in `td-authd/DESIGN.md`; it uses this existing service-only credential path.
 
@@ -207,8 +208,51 @@ rows and bytes (td-authd/DESIGN.md, "Workload grant table"), so such a
 program can use it up, refusing further sandbox grants until the human
 revokes some, but cannot crowd out an application's. Nor can a request
 set an application's network, which the application's declaration
-fixes. A sandbox's grants and network take effect only once its launches
-go through root (WORKLOADS.md step 7); until then nothing applies them.
+fixes. A sandbox's grants and network take effect at its launches
+through root's workspace intake, its directory views executable by its
+account's kind (td-authd/DESIGN.md, "Workspace launch intake"); the
+launches td-sandbox still makes itself, as the human, apply neither.
+
+That intake is reachable by every program running as UID 1000, its
+socket the human's at mode 0600 and its peer check the kernel's
+credentials, with no PIN, token or secure attention. Such a program can
+start a shell in any sandbox the ledger holds, as that sandbox's
+account, with its grants and network, and speak to the shell over the
+connection. That is the same trust class as the grant request above:
+the program could already grant the sandbox those directories and that
+network, and holds them itself; what a launch adds is code it chooses
+running as the sandbox's account, which can do no more than the account
+already may, and the writable grant's way back into what the human runs
+is the grant's, not the launch's. The intake adds no account, so it
+spends no ledger row, and at most 16 launches run at once, so such a
+program can hold the intake's launches up until its shells end, but
+not crowd out an application's. Root admits only the request's fixed
+grammar, writes the jail's spec itself and runs only td's own
+td-sandbox relay and shell in the jail; no request names a path, a
+command, an environment or a descriptor, and the account the shell runs
+as cannot reach the intake: its socket's mode admits the human alone,
+and the peer check refuses any other uid.
+
+A writable grant is what lets a sandbox reach back into what the human
+runs, and its view's execute permission does not bear on that. The
+account can write scripts, git hooks, Makefiles, build files and
+entries in the human's `~/bin` or `.local/bin`, were the human to grant
+those, into a writable view; through the idmap the files land on disk
+owned by UID 1000, as if the human had written them, and run with the
+human's authority when the human later runs them outside any jail. The
+view's nosuid keeps a setuid or setgid bit from taking effect within
+the view, not when the human runs the file from its own path. Only the
+grant decides this; the human's later runs are not confined.
+
+The same intake makes one more socket that admits the human's kernel
+credentials and acts on them. Every workload that still runs as UID
+1000 (mail and news, td-sandbox's profiles and jailed td-agent
+workspaces, WORKLOADS.md steps 7 to 9) passes its peer check, so what
+keeps them from it is only that no jail binds `/run/td-authd`, its
+`1000` directory or the intake: the next paragraph's `/run`
+reservation, which a td-jail test pins for these paths as it does for
+the compositor's control socket. An unconfined td-agent workspace can
+reach it, as it can the control socket.
 
 Which workloads can ask is narrower than "anything but the human", and
 not yet by account. Firefox and td-web run as accounts of their own,
@@ -925,7 +969,9 @@ followed by digits, is an application account's reserved form, and
   from its allocation to shutdown; td-login only warns when the join
   fails (§1), and the root launchers that start applications, td-authd's
   among them, select only declared ones and make a failed placement
-  fatal. Nothing launches as a sandbox account yet (WORKLOADS.md step 7).
+  fatal. Root's workspace intake launches as a sandbox's account only
+  after preparing its delegation again and makes a failed placement
+  fatal (td-authd/DESIGN.md, "Workspace launch intake").
 - Every lookup, human or service, reads passwd and group whole and
   refuses when any entry is of either reserved form or holds a uid or gid
   in the ledger's ranges (65536 through 131071), or a group lists a

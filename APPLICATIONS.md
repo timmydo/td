@@ -3796,18 +3796,34 @@ td-jail --workspace LAUNCHER-PID SPEC [ARG...]
 
 under the exact `td-jail` argv[0], never inferred. On a development host
 any nonzero identity may launch it; wherever the product configuration
-is installed, td's, only td's account, uid 1000 as the initial user
-namespace knows it, may, whose td-agent launches it as a program of that
-account's (td-agent/DESIGN.md §8), and every other identity is refused
-before its spec is read. A uid is the caller's namespace's, so the
-caller's map must be the initial namespace's, each id itself: an
-application is uid 1000 in its own namespace and is refused by that,
-and, were it not, by its filter, which refuses every namespace and
-mount call. That grants nothing: td-jail is no more privileged than its
-caller, and the kind only narrows what the caller's own tools reach.
+is installed, td's, two caller classes may, as the initial user
+namespace knows them, and every other identity is refused before its
+spec is read:
+
+- td's account, uid 1000, whose td-agent and td-sandbox launch it as a
+  program of that account's (td-agent/DESIGN.md §8);
+- a ledger account, a uid in the sandbox and workspace range (98304
+  through 131071) that a `sandbox` or `workspace` row of the workload
+  account ledger holds, read through the shared reader
+  (`engine/src/workload_accounts.rs`), with gid equal to uid: root's
+  workspace launch intake starts it so (td-authd/DESIGN.md, "Workspace
+  launch intake"). A missing or unreadable ledger, an application's
+  row, or no row refuses.
+
+A uid is the caller's namespace's, so the caller's map must be the
+initial namespace's, each id itself: an application is uid 1000 in its
+own namespace and is refused by that, and, were it not, by its filter,
+which refuses every namespace and mount call. That grants nothing:
+td-jail is no more privileged than its caller, and the kind only
+narrows what the caller's own tools reach.
 Its policy
-is a spec its launcher writes: a direct regular file of the caller's that
-no one else can write, at most 64 KiB, and an exact, ordered keyfile:
+is a spec its launcher writes: for td's account a direct regular file of
+the caller's that no one else can write, and for a ledger account a
+direct regular file of root's that no one else can write, of one link,
+at `/run/td-authd/workspaces/UID/N` (the account's uid, `N` canonical
+decimal), in a directory of root's that neither group nor others can
+write, so neither the account nor a link it made stands in for root's;
+at most 64 KiB, and an exact, ordered keyfile:
 
 ```text
 format=1
@@ -3876,33 +3892,35 @@ with the kind's own departures:
 - **Runtime** (WORKLOADS.md, "Runtimes"). `runtime=` names a Flathub
   runtime by its td name in `flathub_app::FLATHUB_RUNTIMES`
   (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`); any other
-  value is refused. A td-sandbox profile's runtime (td-sandbox/DESIGN.md,
-  "Runtime") is written here, and a td-agent template's
-  (td-agent/DESIGN.md §8, Runtime), on its workspaces' development
-  instances alone. It is td's alone: where no product configuration is
-  installed it is refused, since it would replace the host's `/usr` and
-  the runtime store exists only on td. td-jail holds the runtime store's
-  `current` as an application launch holds it (§W.9, "What a launch
-  holds"), retrying three times while a collection races it, binds that
-  generation's tree, and keeps the lock through stage 1's descriptor
-  sweep until the instance ends; with no `current` it refuses, naming the
-  declared applications that install the runtime from td-software, or
-  saying that none does yet. A workspace installs no runtime. With a
-  runtime, no path directory or alias source may lie in `/usr`, `/lib`
-  or `/lib64`, which inside the jail would be the runtime's, and stage 2
-  refuses them again. Its confinement is weaker than an application's:
-  the runtime's code runs under the workspace kind's seccomp filter
-  (td-sandbox's development profile where that applies), as the caller,
-  the human (uid 1000), with the workspace's grants (its writable
-  worktrees and shares, its network and the host-local sockets that
-  reaches) until WORKLOADS.md step 7 gives workspaces accounts of their
-  own, and not behind the application kind's D-Bus, portal or Wayland
-  boundaries. td's own glibc programs in the workspace can load the
-  runtime's code too (the loader boundary below), so such a workspace is
-  no host for td's control plane (AGENTS.md, "Trust zones"), and
-  td-builder refuses there, as on any system whose os-release says td
-  and that has a `/usr` (td-agent/DESIGN.md §8, Runtime); `cargo` run
-  outside td-builder is not refused.
+  value is refused. A td-sandbox profile's runtime
+  (td-sandbox/DESIGN.md, "Runtime") is written here, and a td-agent
+  template's (td-agent/DESIGN.md §8, Runtime), on its workspaces'
+  development instances alone. It is td's alone: where no product
+  configuration is installed it is refused, since it would replace the
+  host's `/usr` and the runtime store exists only on td. td-jail holds
+  the runtime store's `current` as an application launch holds it (§W.9,
+  "What a launch holds"), retrying three times while a collection races
+  it, binds that generation's tree, and keeps the lock through stage 1's
+  descriptor sweep until the instance ends; with no `current` it
+  refuses, naming the declared applications that install the runtime
+  from td-software, or saying that none does yet. A workspace installs
+  no runtime. With a runtime, no path directory or alias source may lie
+  in `/usr`, `/lib` or `/lib64`, which inside the jail would be the
+  runtime's, and stage 2 refuses them again. Its confinement is weaker
+  than an application's: the runtime's code runs under the workspace
+  kind's seccomp filter (td-sandbox's development profile where that
+  applies), as the caller, the human (uid 1000) or, for a ledger caller,
+  the sandbox's account, with the workspace's grants (its writable
+  worktrees, shares or views, its network and the host-local sockets
+  that reaches), and not behind the application kind's D-Bus, portal or
+  Wayland boundaries; td-sandbox and td-agent still launch as the human
+  until WORKLOADS.md steps 7 and 8 move them onto their accounts. td's
+  own glibc programs in the workspace can load the runtime's code too
+  (the loader boundary below), so such a workspace is no host for td's
+  control plane (AGENTS.md, "Trust zones"), and td-builder refuses
+  there, as on any system whose os-release says td and that has a `/usr`
+  (td-agent/DESIGN.md §8, Runtime); `cargo` run outside td-builder is
+  not refused.
 - **Programs**, the entry first, are direct executable regular files,
   bound read-only and executable at `/opt/workspace/bin/<file name>`,
   their device and inode checked before and after the bind. The entry
@@ -3947,6 +3965,21 @@ with the kind's own departures:
   worktree, a `write` directory) may hold td-jail's own executable or a
   spec program, by path or by mount identity: td-jail runs outside every
   jail, and a launcher may run its entry unconfined.
+- **A ledger caller** names no directory of the human's: its spec has no
+  `scratch`, `worktree`, `checkout`, `repository`, `read` or `write`
+  line, and its home must be the account's own,
+  `/var/lib/td/workloads/UID`. What it reaches of the human's is its
+  grant views alone: those its manifest lists (td-authd/DESIGN.md,
+  "Application filesystem grants"), read and checked as an application
+  launch reads them, each the one mount at its view path with the
+  identity derived for the human's directory, and bound at the human's
+  own path below the human's home, where td-sandbox binds a share,
+  read-only or writable as listed. They join the shared directories'
+  admission: any two overlapping, by source or by target, any overlap
+  with the reserved trees, or one that is or contains the human's home,
+  which stands for the caller's here, refuses the launch. A listed view
+  whose target is reserved is left out with one line on stderr. With no
+  manifest the account has none.
 - **Git repositories** (td-agent/DESIGN.md §8, The git mount chain). A
   `checkout` is a worktree that is a git linked worktree: its `.git`
   must be a regular file of one name, bound read-only over it. A
@@ -3972,7 +4005,12 @@ with the kind's own departures:
   worktree is a `checkout`, whose `.git` is protected.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
   shared directories are `noexec` in the isolated profile; development's
-  private home and admitted shared directories are executable.
+  private home and admitted shared directories, a ledger caller's views
+  among them, are executable. A ledger caller's view must lack noexec,
+  and an application's must carry it: td-authd publishes a sandbox's
+  views without noexec and publishes none of a source whose own mount is
+  noexec (`UNSAFE.md` §16), which stage 2 would refuse as an executable
+  grant.
   Worktrees are executable, because the
   agent's shell runs what it builds there. `read` directories are
   read-only. The hardening loop keeps a flag the host already set on a
@@ -4086,7 +4124,13 @@ channel: td-jail checks that they are one socket and, in the launcher's
 `/proc/net/unix` before it leaves that network namespace, that it is an
 unnamed, connected Unix stream socket, since a datagram one could
 address any pathname socket on the host (an accepted socket, which
-carries its listener's name, is refused too). Stage 2 receives a clone
+carries its listener's name, is refused too). A ledger caller's channel
+is instead an accepted connection: a connected stream socket carrying
+exactly the intake's name, `/run/td-authd/1000/workspace`, and no
+other. The name proves the channel's shape, not its origin, since any
+namespace can bind a socket of that name; what makes it root's intake's
+is the caller's class, a ledger account in the initial namespace,
+which only root's launch starts. Stage 2 receives a clone
 as its
 stdout and checks it is a socket and that no terminal controls it, and
 the entry receives two clones as its standard input and output, with the

@@ -1560,6 +1560,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "volumes",
     "media",
     "sandbox-default",
+    "workspace-intake",
     "release-source",
     "rootcheck",
     "profiler",
@@ -1978,6 +1979,19 @@ fn build_desktop_td_svc_conf() -> String {
          timeout=30\n\
          log=/var/log/svc/sandbox-default.log\n\
          console=yes\n\
+         \n\
+         # Root's workspace launch intake (td-authd/DESIGN.md, \"Workspace\n\
+         # launch intake\"): the primary human's programs ask it for a\n\
+         # sandbox's shell, which it runs as the sandbox's ledger account.\n\
+         # Its leader stays in its leaf while each launch's td-login moves\n\
+         # into the account's delegation, so it declares no limits.\n\
+         [workspace-intake]\n\
+         type=daemon\n\
+         exec=/bin/td-authd workspace-serve\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         restart=on-failure\n\
+         log=/var/log/svc/workspace-intake.log\n\
          \n\
          [release-source]\n\
          type=oneshot\n\
@@ -8898,7 +8912,7 @@ mod tests {
             .find("let uid = admit(&LAUNCH, request.owner, &request.name)?;")
             .unwrap();
         let published = launch
-            .find("crate::grant_views::publish(&request.name, uid)?;")
+            .find("crate::grant_views::publish(Kind::Application, &request.name, uid)?;")
             .unwrap();
         let exec = launch.find(".exec();").unwrap();
         assert!(admitted < published && published < exec);
@@ -9848,6 +9862,35 @@ mod tests {
         assert_eq!(unit_key("wayland", "requires").as_deref(), Some("seat"));
     }
 
+    /// Root's workspace intake runs as root after firstboot seeds the
+    /// ledger, on every boot, and launches through td-login, so its leader
+    /// keeps its own leaf and declares no limits.
+    #[test]
+    fn the_workspace_intake_is_roots_daemon_after_firstboot() {
+        assert_eq!(
+            unit_key("workspace-intake", "exec").as_deref(),
+            Some("/bin/td-authd workspace-serve")
+        );
+        assert_eq!(
+            unit_key("workspace-intake", "type").as_deref(),
+            Some("daemon")
+        );
+        assert_eq!(
+            unit_key("workspace-intake", "requires").as_deref(),
+            Some("td-firstboot")
+        );
+        assert_eq!(unit_key("workspace-intake", "cgroup"), None);
+        assert_eq!(unit_key("workspace-intake", "memory-max"), None);
+        assert_eq!(unit_key("workspace-intake", "pids-max"), None);
+        assert_eq!(unit_key("workspace-intake", "unless-exists"), None);
+        assert_eq!(
+            unit_key("workspace-intake", "restart").as_deref(),
+            Some("on-failure")
+        );
+        assert!(ordered_before("td-firstboot", "workspace-intake"));
+        assert!(!unit_after("bootsuccess").contains(&"workspace-intake".to_owned()));
+    }
+
     #[test]
     fn vm_guest_helper_runs_without_root_in_the_standard_image() {
         assert_eq!(
@@ -9935,6 +9978,7 @@ mod tests {
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat", "sandbox-default"]),
             ("sandbox-default", vec!["td-firstboot"]),
+            ("workspace-intake", vec!["td-firstboot"]),
             ("terminal", vec!["wayland"]),
             ("media", vec!["td-firstboot"]),
             ("media-watch", vec!["wayland", "media"]),

@@ -133,6 +133,9 @@ const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
 const ALLOCATED_MARKER: &str = "TD-APPLICATION-ALLOCATED";
 /// `allocate-workload`'s reply, then a tab and the uid.
 const WORKLOAD_ALLOCATED_MARKER: &str = "TD-WORKLOAD-ALLOCATED";
+/// `prepare-workload`'s reply, then a tab and the uid: td-authd's
+/// workspace intake reads exactly this line.
+const WORKLOAD_PREPARED_MARKER: &str = "TD-WORKLOAD-PREPARED";
 /// `grant-table`'s replies, which td-authd's grant requests read exactly:
 /// a listing's first line, then a tab and its row count and, for a
 /// sandbox, a tab and its network, then one `ACCESS<TAB>PATH` line per
@@ -357,6 +360,7 @@ fn usage() -> String {
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
          td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n  \
          td-firstboot allocate-workload OWNER sandbox NAME allocates a sandbox's account when absent and prepares its home and cgroup\n  \
+         td-firstboot prepare-workload OWNER sandbox NAME prepares a sandbox's existing account's home and cgroup again, adding none\n  \
          td-firstboot grant-table OWNER list|grant|revoke|network KIND NAME [ro|rw] [PATH|off|host] lists an account's directory grants and a sandbox's network, grants or revokes one of the human's directories, or sets a sandbox's network\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
@@ -468,6 +472,19 @@ fn run_with_primary(
             // Written as it is formatted: once the account is allocated,
             // no allocation can fail its reply.
             return emit_args(format_args!("{WORKLOAD_ALLOCATED_MARKER}\t{uid}\n"))
+                .map_err(Failure::Failed);
+        }
+        Invocation::PrepareWorkload(owner, kind, name) => {
+            // A launch's: the row must exist; its home's mode and its
+            // delegation, which the volatile hierarchy loses at shutdown,
+            // are made again.
+            let uid = principal_store::prepare_workload(owner, kind, &name, |uid| {
+                application_state::create_workload(uid, false)?;
+                application_runtime::ensure(uid, false)
+            })
+            .map_err(Failure::Failed)?;
+            // As `allocate-workload`'s, written as it is formatted.
+            return emit_args(format_args!("{WORKLOAD_PREPARED_MARKER}\t{uid}\n"))
                 .map_err(Failure::Failed);
         }
         Invocation::GrantTable(owner, kind, name, verb) => {
@@ -648,6 +665,9 @@ enum Invocation {
     /// A workload account's allocation: the session owner, the kind and
     /// the name.
     AllocateWorkload(u32, workload_accounts::Kind, String),
+    /// A launch's preparation of an existing workload account: the session
+    /// owner, the kind and the name.
+    PrepareWorkload(u32, workload_accounts::Kind, String),
     /// A grant request: the session owner, and the account and verb.
     GrantTable(
         u32,
@@ -695,13 +715,14 @@ fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
     Ok(Invocation::GrantTable(uid, kind, name.clone(), verb))
 }
 
-/// `allocate-workload OWNER KIND NAME`: a canonical session owner, a known
-/// kind and a name in the ledger's grammar. Which kinds are allocated is
+/// `allocate-workload OWNER KIND NAME` or `prepare-workload OWNER KIND
+/// NAME`: a canonical session owner, a known kind and a name in the
+/// ledger's grammar. Which kinds are allocated or prepared is
 /// `principal_store`'s rule: a sandbox's account only, today.
-fn allocate_workload_invocation(args: &[String]) -> Result<Invocation, Failure> {
-    let [_, owner, kind, name] = args else {
+fn workload_invocation(args: &[String]) -> Result<Invocation, Failure> {
+    let [verb, owner, kind, name] = args else {
         return Err(Failure::Usage(
-            "allocate-workload requires OWNER KIND NAME".into(),
+            "allocate-workload and prepare-workload require OWNER KIND NAME".into(),
         ));
     };
     let uid =
@@ -712,7 +733,11 @@ fn allocate_workload_invocation(args: &[String]) -> Result<Invocation, Failure> 
         return Err(Failure::Usage("invalid workload account name".into()));
     }
     let name = allocation::string(name).map_err(|_| Failure::Failed(String::new()))?;
-    Ok(Invocation::AllocateWorkload(uid, kind, name))
+    match verb.as_str() {
+        "allocate-workload" => Ok(Invocation::AllocateWorkload(uid, kind, name)),
+        "prepare-workload" => Ok(Invocation::PrepareWorkload(uid, kind, name)),
+        _ => Err(Failure::Usage("unknown workload verb".into())),
+    }
 }
 
 /// A session owner's uid as td-authd spells it: canonical decimal in the
@@ -895,9 +920,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
     }
     if args
         .first()
-        .is_some_and(|first| first == "allocate-workload")
+        .is_some_and(|first| first == "allocate-workload" || first == "prepare-workload")
     {
-        return allocate_workload_invocation(args);
+        return workload_invocation(args);
     }
 
     if args
@@ -2052,6 +2077,7 @@ mod tests {
             | Invocation::CheckLaunchApplication(..)
             | Invocation::AllocateApplication(..)
             | Invocation::AllocateWorkload(..)
+            | Invocation::PrepareWorkload(..)
             | Invocation::GrantTable(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
@@ -2118,6 +2144,24 @@ mod tests {
             &["1000", "sandbox", ""],
         ] {
             assert!(parsed(arguments).is_err(), "{arguments:?}");
+        }
+        // A launch's preparation takes the same words and is its own verb.
+        let prepare = |arguments: &[&str]| {
+            let mut all = vec!["prepare-workload".to_string()];
+            all.extend(arguments.iter().map(|a| (*a).to_string()));
+            parse(&all)
+        };
+        assert!(matches!(
+            prepare(&["1000", "sandbox", "default"]),
+            Ok(Invocation::PrepareWorkload(1000, Kind::Sandbox, name)) if name == "default"
+        ));
+        for arguments in [
+            &["1000", "sandbox"][..],
+            &["01000", "sandbox", "default"],
+            &["1000", "Sandbox", "default"],
+            &["1000", "sandbox", "../default"],
+        ] {
+            assert!(prepare(arguments).is_err(), "{arguments:?}");
         }
     }
 

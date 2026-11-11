@@ -749,6 +749,29 @@ impl Directory {
         Ok(uid)
     }
 
+    /// The `kind` account `name` the published ledger already holds,
+    /// prepared again by `prepare` with its uid, under the lock: an absent
+    /// row refuses and none is added, so a launch never spends one, and a
+    /// row a concurrent writer is adding or removing is seen whole or not
+    /// at all.
+    fn prepare_account(
+        &self,
+        kind: Kind,
+        name: &str,
+        prepare: impl FnOnce(u32) -> Result<(), String>,
+    ) -> Result<u32, String> {
+        let _lock = self.lock()?;
+        let text = self
+            .read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)?
+            .ok_or("the workload account ledger is absent")?;
+        let uid = Ledger::parse(&text)?.uid_of(kind, name).ok_or_else(|| {
+            crate::allocation::format(format_args!("{} {name} has no account", kind.as_str()))
+                .unwrap_or_default()
+        })?;
+        prepare(uid)?;
+        Ok(uid)
+    }
+
     /// The uids of the homes below the children `applications` and
     /// `workloads`; none from one that is absent.
     fn homes(&self) -> Result<BTreeSet<u32>, String> {
@@ -1031,6 +1054,25 @@ pub(crate) fn allocate_workload(
     workload_allocatable(&desired, owner, kind)?;
     let outside = || outside_ids(delegated);
     directory.allocate_account(kind, name, outside, |_, _, _| Ok(()), prepare)
+}
+
+/// Root's preparation of a sandbox's existing account at its launch
+/// (td-authd/DESIGN.md, "Workspace launch intake"): with the deployment
+/// enrolled and its accounts verified, the ledger row of the session
+/// `owner`'s `kind` workload `name`, never added, and `prepare` run with
+/// its uid under the principal lock. A missing row refuses.
+pub(crate) fn prepare_workload(
+    owner: u32,
+    kind: Kind,
+    name: &str,
+    prepare: impl FnOnce(u32) -> Result<(), String>,
+) -> Result<u32, String> {
+    let desired = Registry::load()?;
+    let directory = state_directory()?;
+    let prior = directory.verify_enrolled(&desired)?;
+    prior.verify_installed_accounts(&desired)?;
+    workload_allocatable(&desired, owner, kind)?;
+    directory.prepare_account(kind, name, prepare)
 }
 
 /// The ids outside the state directory a new row avoids, read under the

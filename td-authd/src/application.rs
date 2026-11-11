@@ -1,6 +1,7 @@
 //! Fixed application execution after root-owned deployment admission.
 
 use crate::launch;
+use crate::{message, text};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -12,13 +13,16 @@ use std::time::{Duration, Instant};
 /// How long one wait for the check looks before draining its stderr again.
 const READ_STEP: Duration = Duration::from_millis(10);
 // An application account is the workload account ledger's.
-use crate::workload_accounts::APPLICATION_UIDS;
+use crate::workload_accounts::{Kind, APPLICATION_UIDS, WORKLOAD_UIDS};
 
-/// One fixed td-firstboot run root asks before it acts for an application:
-/// its verb, the prefix of its one reply line, its bound, and the uids that
-/// line may name.
-struct Check {
+/// One fixed td-firstboot run root asks before it acts for a workload: its
+/// verb, the fixed words between the owner and the name, the prefix of its
+/// one reply line, its bound, and the uids that line may name.
+pub(crate) struct Check {
+    /// What the check admits, as its errors name it.
+    what: &'static str,
     verb: &'static str,
+    words: &'static [&'static str],
     reply: &'static str,
     deadline: Duration,
     uid: fn(&str) -> Result<u32, String>,
@@ -27,7 +31,9 @@ struct Check {
 /// The read-only launch admission: the account an active application runs
 /// as, the human's for a personal one.
 const LAUNCH: Check = Check {
+    what: "application",
     verb: "check-launch-application",
+    words: &[],
     reply: "TD-LAUNCH-APPLICATION-CHECK-OK\t",
     deadline: Duration::from_secs(2),
     uid: launch_uid,
@@ -39,10 +45,27 @@ const LAUNCH: Check = Check {
 /// covers synced writes and cgroup setup under the principal lock, which
 /// another allocation may hold.
 const ALLOCATE: Check = Check {
+    what: "application",
     verb: "allocate-application",
+    words: &[],
     reply: "TD-APPLICATION-ALLOCATED\t",
     deadline: Duration::from_secs(30),
     uid: service_uid,
+};
+
+/// A sandbox's account prepared for a launch (td-authd/DESIGN.md,
+/// "Workspace launch intake"): its existing ledger row returned, never one
+/// added, its home's mode restored and its cgroup delegation, which the
+/// volatile hierarchy loses at shutdown, created again when absent, under
+/// the principal lock. The same bound as an application's allocation, for
+/// the same synced writes and lock.
+pub(crate) const PREPARE_SANDBOX: Check = Check {
+    what: "sandbox",
+    verb: "prepare-workload",
+    words: &["sandbox"],
+    reply: "TD-WORKLOAD-PREPARED\t",
+    deadline: Duration::from_secs(30),
+    uid: workload_uid,
 };
 
 struct Request {
@@ -51,15 +74,17 @@ struct Request {
     arguments: Vec<String>,
 }
 
-fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, String> {
+fn decimal(text: &str, range: std::ops::RangeInclusive<u32>, what: &str) -> Result<u32, String> {
     let value = text
         .parse::<u32>()
-        .map_err(|_| "invalid application identity")?;
+        .map_err(|_| message(format_args!("invalid {what} identity")))?;
     if !range.contains(&value) {
-        return Err("application identity is outside the supported range".into());
+        return Err(message(format_args!(
+            "{what} identity is outside the supported range"
+        )));
     }
     if value.to_string() != text {
-        return Err("noncanonical application identity".into());
+        return Err(message(format_args!("noncanonical {what} identity")));
     }
     Ok(value)
 }
@@ -69,7 +94,7 @@ impl Request {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
             return Err("application launch requires OWNER APP direct -- ARG...".into());
         };
-        let owner = decimal(owner, 1000..=1000)?;
+        let owner = decimal(owner, 1000..=1000, "application")?;
         if mode != "direct"
             || separator != "--"
             || !crate::consent::application_name(name)
@@ -152,34 +177,43 @@ fn launch_uid(text: &str) -> Result<u32, String> {
     if text == "1000" {
         Ok(1000)
     } else {
-        decimal(text, APPLICATION_UIDS)
+        decimal(text, APPLICATION_UIDS, "application")
     }
 }
 
 /// An application's own account, never the human's.
 fn service_uid(text: &str) -> Result<u32, String> {
-    decimal(text, APPLICATION_UIDS)
+    decimal(text, APPLICATION_UIDS, "application")
+}
+
+/// A sandbox's or workspace's account, never the human's or an
+/// application's.
+pub(crate) fn workload_uid(text: &str) -> Result<u32, String> {
+    decimal(text, WORKLOAD_UIDS, "workload")
 }
 
 fn reply_uid(check: &Check, text: &str) -> Result<u32, String> {
     let number = text
         .strip_prefix(check.reply)
         .and_then(|s| s.strip_suffix('\n'))
-        .ok_or("invalid application admission response")?;
+        .ok_or_else(|| message(format_args!("invalid {} admission response", check.what)))?;
     (check.uid)(number)
 }
 
-fn admit(check: &Check, owner: u32, name: &str) -> Result<u32, String> {
+pub(crate) fn admit(check: &Check, owner: u32, name: &str) -> Result<u32, String> {
     let deadline = Instant::now()
         .checked_add(check.deadline)
-        .ok_or("application check deadline overflow")?;
+        .ok_or_else(|| message(format_args!("{} check deadline overflow", check.what)))?;
     let (parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
     let (mut said, said_end) = crate::stderr_tail::Tail::pair()?;
     // The temporary Command drops its retained child endpoints here. Keeping
     // that Command alive would prevent the reply's required EOF.
     let mut checking = CheckedChild(
         Command::new("/bin/td-firstboot")
-            .args([check.verb, &owner.to_string(), name])
+            .arg(check.verb)
+            .arg(owner.to_string())
+            .args(check.words)
+            .arg(name)
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())
@@ -189,7 +223,7 @@ fn admit(check: &Check, owner: u32, name: &str) -> Result<u32, String> {
             .map_err(|e| format!("start td-firstboot {}: {e}", check.verb))?,
     );
     let checked = (|| {
-        let reply = read_reply(parent, deadline, &mut said)?;
+        let reply = read_reply(parent, deadline, &mut said, check.what)?;
         loop {
             said.drain();
             if Instant::now() >= deadline {
@@ -197,8 +231,9 @@ fn admit(check: &Check, owner: u32, name: &str) -> Result<u32, String> {
             }
             match checking.0.try_wait().map_err(|e| e.to_string())? {
                 Some(status) if status.success() => {
-                    let text = std::str::from_utf8(&reply)
-                        .map_err(|_| "invalid application admission encoding")?;
+                    let text = std::str::from_utf8(&reply).map_err(|_| {
+                        message(format_args!("invalid {} admission encoding", check.what))
+                    })?;
                     return reply_uid(check, text);
                 }
                 Some(status) => {
@@ -217,6 +252,7 @@ fn read_reply(
     mut parent: UnixStream,
     deadline: Instant,
     said: &mut crate::stderr_tail::Tail,
+    what: &str,
 ) -> Result<Vec<u8>, String> {
     let mut reply = Vec::with_capacity(97);
     let mut byte = [0u8; 1];
@@ -224,10 +260,12 @@ fn read_reply(
         said.drain();
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("application admission reply timed out".into());
+            return Err(message(format_args!("{what} admission reply timed out")));
         }
         if reply.len() > 96 {
-            return Err("application admission response exceeded 96 bytes".into());
+            return Err(message(format_args!(
+                "{what} admission response exceeded 96 bytes"
+            )));
         }
         parent
             .set_read_timeout(Some(remaining.min(READ_STEP)))
@@ -241,7 +279,7 @@ fn read_reply(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(e) => return Err(format!("application admission reply: {e}")),
+            Err(e) => return Err(message(format_args!("{what} admission reply: {e}"))),
         }
     }
 }
@@ -269,7 +307,7 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     // An application's own account gets the views its grants name, before
     // its first process; one running as the human needs none.
     if uid != request.owner {
-        crate::grant_views::publish(&request.name, uid)?;
+        crate::grant_views::publish(Kind::Application, &request.name, uid)?;
     }
     // No root log or inherited descriptor reaches the credential helper or
     // application.
@@ -284,7 +322,7 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     Err(format!("exec application credential helper: {error}"))
 }
 
-fn bounded(path: &str) -> Result<String, String> {
+pub(crate) fn bounded(path: &str) -> Result<String, String> {
     let mut text = String::new();
     File::open(path)
         .map_err(|e| e.to_string())?
@@ -297,23 +335,36 @@ fn bounded(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
-fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
+/// The process about to exec a workload's jail: `uid` in every column with
+/// no other group, no capability, and in its account's session leaf, the
+/// human's `td-user-1000` or the ledger account's own delegation, which
+/// td-login placed it in.
+pub(crate) fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
+    let what = if WORKLOAD_UIDS.contains(&uid) {
+        "workload"
+    } else {
+        "application"
+    };
     let expected = uid.to_string();
     for key in ["Uid:", "Gid:"] {
         let values = status
             .lines()
             .find_map(|line| line.strip_prefix(key))
-            .ok_or("application process lacks identity fields")?;
+            .ok_or_else(|| message(format_args!("{what} process lacks identity fields")))?;
         if values.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str(); 4] {
-            return Err("application process has the wrong credentials".into());
+            return Err(message(format_args!(
+                "{what} process has the wrong credentials"
+            )));
         }
     }
     let groups = status
         .lines()
         .find_map(|line| line.strip_prefix("Groups:"))
-        .ok_or("application process lacks its group set")?;
+        .ok_or_else(|| message(format_args!("{what} process lacks its group set")))?;
     if uid != 1000 && groups.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str()] {
-        return Err("application process has extra or missing groups".into());
+        return Err(message(format_args!(
+            "{what} process has extra or missing groups"
+        )));
     }
     for key in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
         if status
@@ -322,12 +373,26 @@ fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
             .map(str::trim)
             != Some("0000000000000000")
         {
-            return Err("application process retained capabilities".into());
+            return Err(message(format_args!(
+                "{what} process retained capabilities"
+            )));
         }
     }
-    let role = if uid == 1000 { "user" } else { "app" };
-    if cgroup != format!("0::/td-{role}-{uid}/session\n") {
-        return Err("application process is outside its assigned session cgroup".into());
+    // Exactly `0::/DELEGATION/session` and a newline.
+    let leaf = cgroup
+        .strip_prefix("0::/")
+        .and_then(|rest| rest.strip_suffix("/session\n"));
+    let inside = if uid == 1000 {
+        leaf == Some("td-user-1000")
+    } else {
+        let delegation = crate::workload_accounts::delegation(uid)
+            .ok_or("the process has no session delegation")?;
+        leaf == Some(text(format_args!("{delegation}"))?.as_str())
+    };
+    if !inside {
+        return Err(message(format_args!(
+            "{what} process is outside its assigned session cgroup"
+        )));
     }
     Ok(())
 }
@@ -383,7 +448,12 @@ mod tests {
             let (reader, mut writer) = UnixStream::pair().unwrap();
             writer.write_all(&bytes).unwrap();
             drop(writer);
-            let result = read_reply(reader, Instant::now() + Duration::from_secs(1), &mut said());
+            let result = read_reply(
+                reader,
+                Instant::now() + Duration::from_secs(1),
+                &mut said(),
+                "application",
+            );
             if bytes.len() > 96 {
                 assert!(result.unwrap_err().contains("96 bytes"));
             } else {
@@ -414,7 +484,13 @@ mod tests {
             }
         });
         let begin = Instant::now();
-        let error = read_reply(reader, begin + Duration::from_millis(40), &mut said()).unwrap_err();
+        let error = read_reply(
+            reader,
+            begin + Duration::from_millis(40),
+            &mut said(),
+            "application",
+        )
+        .unwrap_err();
         assert!(error.contains("timed out"));
         assert!(begin.elapsed() < Duration::from_secs(1));
         worker.join().unwrap();
@@ -425,7 +501,8 @@ mod tests {
         assert!(read_reply(
             reader,
             Instant::now() + Duration::from_millis(20),
-            &mut said()
+            &mut said(),
+            "application"
         )
         .unwrap_err()
         .contains("timed out"));
@@ -583,6 +660,52 @@ mod tests {
         ] {
             assert!(reply_uid(&ALLOCATE, text).is_err(), "{text:?}");
         }
+    }
+
+    /// A sandbox's launch asks td-firstboot to prepare its existing row,
+    /// whose reply names a sandbox's or workspace's account and nothing
+    /// else.
+    #[test]
+    fn a_sandbox_preparation_reply_names_one_workload_account() {
+        assert_eq!(PREPARE_SANDBOX.verb, "prepare-workload");
+        assert_eq!(PREPARE_SANDBOX.words, ["sandbox"]);
+        assert_eq!(
+            reply_uid(&PREPARE_SANDBOX, "TD-WORKLOAD-PREPARED\t98304\n").unwrap(),
+            98304
+        );
+        for text in [
+            "TD-WORKLOAD-PREPARED\t1000\n",
+            "TD-WORKLOAD-PREPARED\t65536\n",
+            "TD-WORKLOAD-PREPARED\t131072\n",
+            "TD-WORKLOAD-PREPARED\t098304\n",
+            "TD-WORKLOAD-ALLOCATED\t98304\n",
+            "TD-APPLICATION-ALLOCATED\t98304\n",
+        ] {
+            let refused = reply_uid(&PREPARE_SANDBOX, text).unwrap_err();
+            assert!(!refused.contains("application"), "{text:?}: {refused}");
+        }
+    }
+
+    /// A sandbox's account runs its jail from its own `td-workload-UID`
+    /// leaf, the shared delegation's spelling, never an application's.
+    #[test]
+    fn a_workload_process_is_in_its_own_delegation() {
+        let status = "Uid: 98304 98304 98304 98304\nGid: 98304 98304 98304 98304\nGroups: 98304\nCapInh: 0000000000000000\nCapPrm: 0000000000000000\nCapEff: 0000000000000000\nCapAmb: 0000000000000000\n";
+        require_process(98304, status, "0::/td-workload-98304/session\n").unwrap();
+        for membership in [
+            "0::/td-app-98304/session\n",
+            "0::/td-workload-98305/session\n",
+            "0::/td-user-1000/session\n",
+        ] {
+            let refused = require_process(98304, status, membership).unwrap_err();
+            assert_eq!(
+                refused,
+                "workload process is outside its assigned session cgroup"
+            );
+        }
+        // A uid outside the ledger has no delegation at all.
+        let other = status.replace("98304", "200000");
+        assert!(require_process(200000, &other, "0::/td-app-200000/session\n").is_err());
     }
 
     #[test]

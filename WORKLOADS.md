@@ -86,21 +86,24 @@ Already built and reused by this design:
 - td-portal's caller identity from the bus broker's uid and jail lineage
   (`APPLICATIONS.md` §E).
 
-Built for step 7 but not yet used: a sandbox's account, `tdw<uid>` from
-98304 up, which root's `td-firstboot allocate-workload OWNER sandbox
-NAME` allocates in the ledger with an empty home under
+Built for step 7 but not yet used by td-sandbox: a sandbox's account,
+`tdw<uid>` from 98304 up, which root's `td-firstboot allocate-workload
+OWNER sandbox NAME` allocates in the ledger with an empty home under
 `/var/lib/td/workloads` and a `td-workload-UID` delegation, and which
 td-login resolves from the ledger alone (td-authd/DESIGN.md, "Workload
-account ledger"); nothing calls it until td-sandbox's launches go through
-root. Nor does anything read a sandbox's directory and network rows,
-which grant requests write once it has an account, until root launches
-it.
+account ledger"); and root's workspace launch intake, which starts a
+sandbox's shell as that account in td-jail's workspace kind with the
+sandbox's directory rows published as executable views and its network
+row applied (td-authd/DESIGN.md, "Workspace launch intake"). Nothing
+asks the intake for a launch until td-sandbox's cutover, and nothing yet
+allocates a sandbox's row: td-sandbox's own launches still run as the
+human and read none of its rows.
 
 Not built: subordinate accounts, workspace accounts and their
 allocation, the `map-subuid` operation `APPLICATIONS.md` names, grant
 requests for workspace accounts (step 8), socket grants, whose rows the
-table already parses and no request writes, and the launch that applies
-a sandbox's grants and network (step 7).
+table already parses and no request writes, and td-sandbox asking root
+for its launches (step 7).
 
 ## A launch
 
@@ -221,7 +224,10 @@ Everything a workload reaches outside its runtime and home is a grant:
 
 - **a directory** of the human's: a detached idmapped bind mount mapping
   filesystem uid/gid 1000 to the workload's account, read-only or
-  writable, and always nosuid, nodev and noexec: there is no exec grant.
+  writable, and always nosuid and nodev. No row asks for execution: an
+  application's views are always noexec, and a sandbox's or workspace's
+  are executable, as td-sandbox's shares are, by its account's kind
+  alone (`UNSAFE.md` §16).
   Rows are validated (account, directory, mode) triples. td's own trees
   in the home (`.td` and every top-level `.td-*`, `.cache`, `.config`
   whole, `.local/share`, `.local/state`), the sensitive trees td-agent
@@ -266,7 +272,14 @@ All workload launches go through root:
 - workspaces: a new operation that checks the workspace's ledger row,
   applies its grants, and runs `td-jail --workspace` as that account.
   td-jail's workspace kind then requires its caller to be a workspace
-  account in the ledger rather than uid 1000.
+  account in the ledger rather than uid 1000. For a sandbox this is
+  root's workspace launch intake (td-authd/DESIGN.md, "Workspace launch
+  intake"): the human's connection, once admitted, becomes the jail's
+  channel, and td-jail admits the account's caller class beside the
+  human's (`APPLICATIONS.md` §C, "The `workspace` kind"). The account's
+  uid is the jail's inside as well as out, as td-sandbox's is the
+  human's today; uid 1000 inside comes with the jail's subordinate
+  mapping, which is not built.
 
 td-sandbox and td-agent stop launching td-jail themselves; they ask for a
 launch. td-agent's unconfined workspace, which runs tools as the human
@@ -340,29 +353,43 @@ account.
    sandbox accounts, with nothing launched as one yet (landed: one name
    form, `tdw<uid>`, for the sandbox and workspace kinds, which share a
    range; td-login resolves it from a sandbox or workspace row alone and
-   places it in `td-workload-UID/session`; every reserved-name list holds
-   it; td-firstboot's `allocate-workload` allocates a sandbox's row from
-   98304 up, avoiding every kind's leftovers, and prepares its empty
-   `/var/lib/td/workloads/UID` home and its delegation, but no
-   `/run/user/UID`, td-authd/DESIGN.md, "Workload account ledger"); grant
-   requests that admit the sandbox kind (landed: `grants`, `grant` and
-   `revoke` name a sandbox, and `network sandbox NAME off|host` sets its
-   one network row, `host` written and `off` no row, which `grants`
+   places it in `td-workload-UID/session`; every reserved-name list
+   holds it; td-firstboot's `allocate-workload` allocates a sandbox's
+   row from 98304 up, avoiding every kind's leftovers, and prepares its
+   empty `/var/lib/td/workloads/UID` home and its delegation, but no
+   `/run/user/UID`, td-authd/DESIGN.md, "Workload account ledger");
+   grant requests that admit the sandbox kind (landed: `grants`, `grant`
+   and `revoke` name a sandbox, and `network sandbox NAME off|host` sets
+   its one network row, `host` written and `off` no row, which `grants`
    lists; a sandbox's grant or `host` needs its ledger row and the
    primary human's session, and never allocates a row; sandbox and
    workspace rows together keep to half the grant table, 2048 rows and
    512 KiB; a workspace and an application's network are refused,
-   td-authd/DESIGN.md, "Grant requests"); the root workspace launch,
-   through a root intake socket whose connection becomes the jail's
-   channel, which prepares the account's delegation again each boot and
-   inherits the ledger's 2048-row bound on sandbox and workspace rows,
-   with td-jail's workspace kind admitting a ledger caller; then
-   td-sandbox's cutover, in which old profile homes are left untouched
-   and accounts start fresh, shares outside the home and profile names that are
-   not ledger names (one beginning with a digit or a hyphen) are
-   reported and dropped, and deleting a profile revokes its account's
-   grant rows, which are keyed by name and until then pass to a profile
-   created again under the same name.
+   td-authd/DESIGN.md, "Grant requests"); the root workspace launch
+   (landed: `td-authd workspace-serve`, root's daemon on
+   `/run/td-authd/1000/workspace`, admits only the primary human's
+   connections and one `start NAME RUNTIME TERM` request, requires the
+   sandbox's existing ledger row and adds none, prepares the account's
+   home and delegation again through `prepare-workload`, which refuses a
+   row a deletion took meanwhile, refuses a named runtime that is not
+   installed, publishes its directory rows as executable views, maps its
+   network row to the development or development-offline profile in a
+   root-owned spec, and runs `td-jail --workspace` as `tdw<uid>` through
+   `td-login exec-service-as` with the connection as the jail's channel;
+   td-jail's workspace kind admits a sandbox's or workspace's ledger
+   account as a second caller class, with root's spec, the account's
+   home and its manifest's views at the human's own paths,
+   td-authd/DESIGN.md, "Workspace launch intake"); then td-sandbox's
+   cutover, in which old profile homes are left untouched and accounts
+   start fresh, shares outside the home and profile names that are not
+   ledger names (one beginning with a digit or a hyphen) are reported
+   and dropped, deleting a profile revokes its account's grant rows,
+   which are keyed by name and until then pass to a profile created
+   again under the same name, and td-sandbox's client treats an end of
+   the intake's connection before the relay's first frame as a failed
+   start and names `/var/log/svc/workspace-intake.log`, since a failure
+   after root's answer reaches only that log, with an oracle that
+   launches a sandbox through the intake on a QEMU image.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is
    retired.
 9. mail and news on their reserved rows, with fetch services of their
