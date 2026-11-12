@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -1008,6 +1008,117 @@ fn fetch_concurrently(
     );
 }
 
+/// A fixed number of requests per already-established connection. Handshakes
+/// retain the normal fixture pace; timed API requests have no pacing or retry.
+fn method_working_memory(fixture: &Fixture, jmap: &Arc<Jmap>, desktop: &Service) {
+    let session = jmap.get("/.well-known/jmap");
+    assert_eq!(session.status, 200);
+    let session = td_json::parse_slice(&session.body).unwrap();
+    let account = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+        .as_str()
+        .unwrap();
+    let mailbox = method(&jmap.api(&td_json::json!({
+        "using":["urn:ietf:params:jmap:mail"],
+        "methodCalls":[["Mailbox/set",{"accountId":account,"create":{"scratch":{"name":"Performance drafts"}}},"m"]]
+    }).to_string()), "Mailbox/set");
+    let mailbox = mailbox["created"]["scratch"]["id"].as_str().unwrap();
+    let ids = (0..256).map(|n| format!("e{n:032x}")).collect::<Vec<_>>();
+    let get = td_json::json!({"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":account,"ids":ids,"properties":["id"]},"g"]]}).to_string();
+    let mut calls =
+        vec![td_json::json!(["Core/echo",{"ids":ids,"padding":"x".repeat(32768)},"source"])];
+    for n in 1..16 {
+        calls.push(td_json::json!(["Core/echo",{"#ids":{"resultOf":"source","name":"Core/echo","path":"/ids"}},format!("r{n}")]));
+    }
+    let references =
+        td_json::json!({"using":["urn:ietf:params:jmap:core"],"methodCalls":calls}).to_string();
+    let mut calls = Vec::new();
+    for n in 0..1 {
+        let key = format!("draft{n}");
+        calls.push(td_json::json!(["Email/set",{"accountId":account,"create":{key.as_str():{
+            "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},
+            "from":[{"name":"Sender","email":"sender@example.test"}],
+            "to":[{"name":null,"email":"recipient@example.test"}],
+            "subject":"Allocation performance", "messageId":["allocation-performance@example.test"], "sentAt":"2026-10-13T12:00:59Z",
+            "textBody":[{"partId":"text","type":"text/plain"}],
+            "bodyValues":{"text":{"value":"x".repeat(131072),"isEncodingProblem":false,"isTruncated":false}}
+        }}},key]));
+    }
+    let drafts =
+        td_json::json!({"using":["urn:ietf:params:jmap:mail"],"createdIds":{},"methodCalls":calls})
+            .to_string();
+    for (scenario, request, method_name, requests, methods, clients) in [
+        ("method_get_256", get, "Email/get", 32, 1, 2),
+        ("method_references_16", references, "Core/echo", 32, 16, 2),
+        ("method_draft_128k", drafts, "Email/set", 32, 1, 1),
+    ] {
+        let request = Arc::new(request);
+        let barrier = Arc::new(Barrier::new(clients + 1));
+        let mut workers = Vec::new();
+        desktop.report_phases(scenario);
+        let before = Database::read(fixture);
+        // Finish fallible setup before starting any barrier participant.
+        // A failed connection or TLS handshake must fail the test, not strand it.
+        let mut connections = Vec::new();
+        for _ in 0..clients {
+            jmap.pace();
+            let (tls, _) = super::smtp_transport::upgrade_protocol(
+                TcpStream::connect(jmap.address).unwrap(),
+                Arc::new(td_mta::clock::RuntimeClock::new()),
+                &jmap.ca,
+                td_crypto::TlsProtocol::Http1,
+            );
+            connections.push(BufReader::new(tls));
+        }
+        for mut tls in connections {
+            let (jmap, request, barrier) = (jmap.clone(), request.clone(), barrier.clone());
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let started = Instant::now();
+                let mut latencies = Vec::new();
+                for n in 0..requests {
+                    let begin = Instant::now();
+                    write!(tls.get_mut(), "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{}", jmap.address.port(), jmap.authorization, request.len(), if n + 1 == requests {"close"} else {"keep-alive"}, request).unwrap();
+                    tls.get_mut().flush().unwrap();
+                    let mut head = String::new();
+                    loop {
+                        let length = head.len();
+                        assert!(tls.read_line(&mut head).unwrap() > 0, "early HTTP EOF: {head}");
+                        assert!(head.len() <= 32768);
+                        if &head[length..] == "\r\n" { break; }
+                    }
+                    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+                    assert!(length <= 2 * 1024 * 1024);
+                    let mut body = vec![0; length];
+                    tls.read_exact(&mut body).unwrap();
+                    latencies.push(begin.elapsed().as_secs_f64() * 1000.0);
+                    let reply = td_json::parse_slice(&body).unwrap();
+                    let responses = reply["methodResponses"].as_array().unwrap();
+                    assert_eq!(responses.len(), methods, "{reply}");
+                    for response in responses {
+                        assert_eq!(response[0].as_str(), Some(method_name), "{reply}");
+                        if method_name == "Email/set" {
+                            assert_eq!(response[1]["created"].as_object().unwrap_or_else(|| panic!("{reply}")).len(), 1, "{reply}");
+                        }
+                    }
+                }
+                (latencies, started.elapsed().as_secs_f64())
+            }));
+        }
+        barrier.wait();
+        let mut latencies = Vec::new();
+        let mut elapsed = 0f64;
+        for worker in workers {
+            let (values, seconds) = worker.join().unwrap();
+            latencies.extend(values);
+            elapsed = elapsed.max(seconds);
+        }
+        let after = Database::read(fixture);
+        report(scenario, &format!("\"clients\":{clients},\"requests\":{},\"methods_per_request\":{methods},\"request_bytes\":{},\"seconds\":{elapsed:.3},\"requests_per_second\":{:.2},\"latency_ms\":{},{},\"database\":{{{}}}", latencies.len(), request.len(), latencies.len() as f64 / elapsed, distribution(&mut latencies), desktop.memory_fields(), after.since(before, elapsed)));
+        desktop.report_phases(scenario);
+    }
+}
+
 pub(super) fn exercise(
     fixture: &Fixture,
     smtp: TcpListener,
@@ -1058,6 +1169,15 @@ pub(super) fn exercise(
         ),
     );
     let desktop = Service::start(&local, &connection, "desktop");
+    match std::env::var("TD_MTA_PERF_METHODS_ONLY").as_deref() {
+        Ok("1") => {
+            let jmap = Arc::new(Jmap::new(fixture, https_address));
+            method_working_memory(fixture, &jmap, &desktop);
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => (),
+        _ => panic!("TD_MTA_PERF_METHODS_ONLY must be absent or 1"),
+    }
     idle(fixture, "idle_desktop", &[&desktop], knobs.idle_seconds);
     let cloud = Service::start(&local, &connection, "cloud");
     idle(
@@ -1078,6 +1198,7 @@ pub(super) fn exercise(
     desktop.report_phases("jmap_fetch");
     fetch_concurrently(fixture, &jmap, &mailbox, &desktop, knobs.readers);
     desktop.report_phases("jmap_concurrent");
+    method_working_memory(fixture, &jmap, &desktop);
     idle(
         fixture,
         "idle_after_intake",

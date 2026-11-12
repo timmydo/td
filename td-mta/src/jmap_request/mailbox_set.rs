@@ -33,7 +33,7 @@ pub trait MailboxMutator {
 
 struct Creation {
     key: Name,
-    name: String,
+    name: td_alloc::BudgetString,
     slot: usize,
 }
 impl Worker<'_, '_, '_, '_, '_> {
@@ -83,9 +83,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             })
             .transpose()?;
         let maximum = maximum.min(MAX_MAILBOX_CREATES);
-        let mut creates = Vec::new();
-        creates
-            .try_reserve_exact(maximum)
+        let mut creates = td_alloc::BudgetVec::with_capacity(self.budget, maximum)
             .map_err(|_| Error::ResponseCapacity)?;
         if let Some(create) = create.filter(|item| item.kind != scan::Kind::Null) {
             if create.kind != scan::Kind::Object {
@@ -97,7 +95,8 @@ impl Worker<'_, '_, '_, '_, '_> {
                     return Err(Error::RequestTooLarge);
                 }
                 item.key.id()?;
-                let mut name = String::new();
+                let mut name = td_alloc::BudgetString::new(self.budget)
+                    .map_err(|_| Error::ResponseCapacity)?;
                 let mut valid = item.kind == scan::Kind::Object;
                 if valid {
                     let mut properties = Children::new(item.range, scan::Kind::Object)?;
@@ -116,11 +115,13 @@ impl Worker<'_, '_, '_, '_, '_> {
                     name.clear();
                 }
                 // Empty is the native invalid-name marker, never a created folder.
-                creates.push(Creation {
-                    slot: 0,
-                    key: item.key,
-                    name,
-                });
+                creates
+                    .try_push(Creation {
+                        slot: 0,
+                        key: item.key,
+                        name,
+                    })
+                    .map_err(|_| Error::ResponseCapacity)?;
             }
         }
         if let Some(range) = destroy {
@@ -135,7 +136,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
         }
         let mut bound = 256 + account.bytes().len() + 2 * DataState::WIRE_BYTES;
-        for create in &creates {
+        for create in creates.iter() {
             bound = bound
                 .checked_add(create.key.bytes().len() + 160)
                 .ok_or(Error::ResponseCapacity)?;
@@ -146,23 +147,20 @@ impl Worker<'_, '_, '_, '_, '_> {
         if creates.len() > crate::jmap_request::creation_ids::MAX_CREATED {
             return Err(Error::ResponseCapacity);
         }
-        for create in &mut creates {
+        for create in creates.iter_mut() {
             create.slot = self.prepare_creation(create.key.bytes())?;
         }
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(bound)
+        let mut output = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        output.resize(bound, 0);
-        let mut names = Vec::new();
-        names
-            .try_reserve_exact(creates.len())
+        let mut names = td_alloc::BudgetVec::with_capacity(self.budget, creates.len())
             .map_err(|_| Error::ResponseCapacity)?;
-        for create in &creates {
-            names.push(create.name.as_str());
+        for create in creates.iter() {
+            names
+                .try_push(create.name.as_str())
+                .map_err(|_| Error::ResponseCapacity)?;
         }
         let reserved = self
             .retention
@@ -274,11 +272,8 @@ impl Worker<'_, '_, '_, '_, '_> {
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(bound)
+        let mut output = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        output.resize(bound, 0);
         let reserved = self
             .retention
             .reserve_mutation_output(bound)
@@ -336,7 +331,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             self.retention.finish_mutation_output(reserved, output.get(..length).ok_or(Error::State)?).map_err(Error::Storage)
         })().map_err(|error| if matches!(error, Error::State) { Error::ServerPartialFail } else { error })
     }
-    fn mailbox_name(&mut self, item: &Item) -> Result<Option<String>, Error> {
+    fn mailbox_name(&mut self, item: &Item) -> Result<Option<td_alloc::BudgetString>, Error> {
         const ENCODED: usize = crate::format::row::MAX_MAILBOX_NAME * 6 + 2;
         if item.kind != scan::Kind::String {
             return Ok(None);
@@ -371,10 +366,10 @@ impl Worker<'_, '_, '_, '_, '_> {
             return Ok(None);
         }
         let value = std::str::from_utf8(value).map_err(|_| Error::State)?;
-        let mut name = String::new();
-        name.try_reserve_exact(value.len())
+        let mut name = td_alloc::BudgetString::with_capacity(self.budget, value.len())
             .map_err(|_| Error::ResponseCapacity)?;
-        name.push_str(value);
+        name.try_push_str(value)
+            .map_err(|_| Error::ResponseCapacity)?;
         self.check()?;
         Ok(Some(name))
     }

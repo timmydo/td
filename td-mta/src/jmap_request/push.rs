@@ -133,8 +133,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             return self.append(if errors { b"null" } else { b"[]" });
         };
         let mut children = Children::new(value.range, scan::Kind::Array)?;
-        let mut seen = Vec::new();
-        seen.try_reserve_exact(maximum)
+        let mut seen = td_alloc::BudgetVec::with_capacity(self.budget, maximum)
             .map_err(|_| Error::ResponseCapacity)?;
         let mut count = 0usize;
         while let Some(item) = children.next(self)? {
@@ -145,7 +144,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             let id = self.push_string(&item)?;
             id.id()?;
             let mut duplicate = false;
-            for old in &seen {
+            for old in seen.iter() {
                 self.check()?;
                 if old == &id {
                     duplicate = true;
@@ -164,7 +163,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             if errors {
                 self.append(br#":{"type":"notFound"}"#)?;
             }
-            seen.push(id);
+            seen.try_push(id).map_err(|_| Error::ResponseCapacity)?;
         }
         if seen.is_empty() {
             self.append(if errors { b"null" } else { b"[]" })

@@ -63,11 +63,8 @@ impl Worker<'_, '_, '_, '_, '_> {
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(bound)
+        let mut output = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        output.resize(bound, 0);
         let before = access.state.ok_or(Error::State)?;
         if before.account != self.account || before.kind != DataType::Email {
             return Err(Error::State);

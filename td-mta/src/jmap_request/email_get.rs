@@ -242,7 +242,9 @@ impl Worker<'_, '_, '_, '_, '_> {
             let mut view = View::Postgres(super::reborrow_read(
                 &mut **read.as_mut().ok_or(Error::State)?,
             ));
-            let mut row = body::buffer(crate::format::MAX_VALUE_BYTES)?;
+            let mut row =
+                td_alloc::Buffer::filled(self.budget, crate::format::MAX_VALUE_BYTES, 0u8)
+                    .map_err(|_| Error::ResponseCapacity)?;
             if all {
                 match &mut view {
                     View::Postgres(view) => {
@@ -260,11 +262,13 @@ impl Worker<'_, '_, '_, '_, '_> {
                         }
                         for id in page.ids {
                             self.check()?;
-                            requested.push(Requested {
-                                name: None,
-                                id: Some(id),
-                                found: false,
-                            });
+                            requested
+                                .try_push(Requested {
+                                    name: None,
+                                    id: Some(id),
+                                    found: false,
+                                })
+                                .map_err(|_| Error::ResponseCapacity)?;
                         }
                     }
                 }
@@ -286,12 +290,16 @@ impl Worker<'_, '_, '_, '_, '_> {
             self.append(state.as_bytes())?;
             self.append(br#"","list":["#)?;
             let mut first = true;
-            let mut ids = Vec::new();
-            ids.try_reserve_exact(crate::postgres_body::MAX_METADATA_IDS)
-                .map_err(|_| Error::StorageCapacity)?;
+            let mut ids = td_alloc::BudgetVec::with_capacity(
+                self.budget,
+                crate::postgres_body::MAX_METADATA_IDS,
+            )
+            .map_err(|_| Error::ResponseCapacity)?;
             for window in requested.chunks_mut(crate::postgres_body::MAX_METADATA_IDS) {
                 ids.clear();
-                ids.extend(window.iter().filter_map(|item| item.id));
+                for id in window.iter().filter_map(|item| item.id) {
+                    ids.try_push(id).map_err(|_| Error::ResponseCapacity)?;
+                }
                 match &mut view {
                     View::Postgres(view) => view.prefetch_metadata(&ids, selected.stored)?,
                 }

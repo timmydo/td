@@ -19,13 +19,10 @@ impl Worker<'_, '_, '_, '_, '_> {
     ) -> Result<Range<u64>, Error> {
         let (mutator, device) = self.flags.ok_or(Error::UnknownMethod)?;
         let maximum = maximum.min(MAX_EMAIL_DESTROYS);
-        let mut inputs: Vec<Destroy> = Vec::new();
-        let mut local = Vec::new();
-        inputs
-            .try_reserve_exact(maximum)
-            .map_err(|_| Error::ResponseCapacity)?;
-        local
-            .try_reserve_exact(maximum)
+        let mut inputs: td_alloc::BudgetVec<Destroy> =
+            td_alloc::BudgetVec::with_capacity(self.budget, maximum)
+                .map_err(|_| Error::ResponseCapacity)?;
+        let mut local = td_alloc::BudgetVec::with_capacity(self.budget, maximum)
             .map_err(|_| Error::ResponseCapacity)?;
         let mut objects = Children::new(range, scan::Kind::Array)?;
         let mut count = 0;
@@ -37,7 +34,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             let name = self.push_string(&item)?;
             let id: Option<EmailId> = name.wire_id()?.local();
             let mut duplicate = false;
-            for input in &inputs {
+            for input in inputs.iter() {
                 self.check()?;
                 if input.name.bytes() == name.bytes() {
                     duplicate = true;
@@ -48,12 +45,14 @@ impl Worker<'_, '_, '_, '_, '_> {
                 continue;
             }
             if let Some(id) = id {
-                local.push(id);
+                local.try_push(id).map_err(|_| Error::ResponseCapacity)?;
             }
-            inputs.push(Destroy { name, local: id });
+            inputs
+                .try_push(Destroy { name, local: id })
+                .map_err(|_| Error::ResponseCapacity)?;
         }
         let mut bound = 256 + account.bytes().len() + 2 * DataState::WIRE_BYTES;
-        for input in &inputs {
+        for input in inputs.iter() {
             bound = bound
                 .checked_add(input.name.bytes().len() + 96)
                 .ok_or(Error::ResponseCapacity)?;
@@ -61,11 +60,8 @@ impl Worker<'_, '_, '_, '_, '_> {
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(bound)
+        let mut output = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        output.resize(bound, 0);
         let reserved = self
             .retention
             .reserve_mutation_output(bound)
@@ -120,7 +116,7 @@ impl Worker<'_, '_, '_, '_, '_> {
                 .map_err(|_| Error::State)?;
                 let mut first = true;
                 let mut results = complete.results.iter();
-                for input in &inputs {
+                for input in inputs.iter() {
                     let result = if input.local.is_some() {
                         *results.next().ok_or(Error::State)?
                     } else {

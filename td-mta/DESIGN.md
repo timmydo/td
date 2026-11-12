@@ -1286,22 +1286,33 @@ path and cold/warm state. These are performance goals, not permission to weaken
 durable publication or authorization. A server method timing alone does not
 establish the client-visible first-row target.
 
-JMAP request byte/token storage uses td-alloc owned buffers. One shared
-budget covers every account/origin on the HTTPS body-worker pool; each
-request gets a child capped at json_bytes plus json_tokens times Token's
-actual size plus its budget metadata. The aggregate admits that allowance
-for each body worker, plus root metadata. Both buffers are admitted before
-100 Continue, parsing or method effects. Refusal maps to the existing
-capacity/HTTP service-unavailable path. Parser, validation, dispatch and
-response owners carry the buffers and their charge through completion or
-cancellation; a recovered buffer remains charged until freed. Clearing or
-moving ownership cannot renew the allowance. This is a requested-layout cap
-for those two buffers, not a cap on method scratch, TLS, PostgreSQL, response
-files or total RSS. Existing response-effect admission remains unchanged.
-The HTTP Date formatter retains fixed scalar state and writes into caller
-storage, including refusal replies; it allocates no intermediate String.
-Source guards reject unbudgeted collection owners and recognized allocating
-operations in request-storage admission and HTTP date formatting.
+JMAP request byte/token storage and dispatch-owned method storage use
+one td-alloc child budget under the HTTPS body-worker pool's shared budget.
+The child limit includes json_bytes, json_tokens times Token's actual size,
+jmap_method_bytes and budget metadata; the aggregate covers that allowance
+for each body worker plus root metadata. Parser backing is admitted before
+100 Continue. Method storage is admitted on demand under the same child;
+it cannot acquire a fresh allowance after parsing or between methods.
+
+Covered method storage comprises the call list, result-reference entries,
+creation-ID overlay, typed /get ID and duplicate plans, metadata ID/row
+scratch, mutation plans and mailbox names, and complete mutation response
+buffers. Mutation response buffers and creation slots are admitted before
+the adapter can publish effects. A later method's refusal preserves earlier
+results and successful creation IDs. Method admission returns responseCapacity;
+initial parser admission retains the existing HTTP capacity refusal.
+Completed responses retain the overlay until encoding finishes or the owner
+drops. Recovered parser buffers retain their own charges. This cap counts
+requested live layout bytes, including growth overlap, not RSS.
+
+Projection/header selection, MIME/search/composition working memory, cached
+worker ownership, TLS, PostgreSQL adapters and response files remain separate
+contracts and allocation debt. No whole-request heap guarantee is implied.
+The HTTP Date formatter writes fixed scalar state into caller storage, including
+refusal replies. Source guards forbid standard heap collection owners in the
+migrated leaf method modules; the allocation-debt ratchet also covers their
+fixed-buffer methods, whose names resemble std growth calls. Request-storage
+admission and HTTP date formatting retain their stricter no-allocation guards.
 
 Prefer reusable buffers and borrowed views where they simplify ownership and
 streaming. Bounded per-request allocations are permitted. There is no global

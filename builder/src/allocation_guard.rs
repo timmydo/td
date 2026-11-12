@@ -98,6 +98,13 @@ fn operations(source: &str) -> BTreeMap<String, usize> {
                 .checked_sub(3)
                 .and_then(|n| tokens.get(n))
                 .is_some_and(|owner| ["td_alloc", "allocation"].contains(&owner.as_str()))
+            && !(i
+                .checked_sub(6)
+                .and_then(|n| tokens.get(n))
+                .is_some_and(|owner| owner == "td_alloc")
+                && i.checked_sub(3)
+                    .and_then(|n| tokens.get(n))
+                    .is_some_and(|owner| ["BudgetVec", "BudgetString"].contains(&owner.as_str())))
             && ["with_capacity", "from_iter"].contains(&token.as_str())
         {
             Some("allocating-constructor")
@@ -235,25 +242,66 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     for path in ["td-mta/src/https_api_storage.rs", "td-mta/src/http_date.rs"] {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
     }
+    for path in METHOD_STORAGE_SOURCES {
+        method_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
+            .map_err(|error| format!("{path}: {error}"))?;
+    }
     let recorded =
         fs::read_to_string(root.join(INVENTORY)).map_err(|e| format!("{INVENTORY}: {e}"))?;
     compare(&parse(&recorded)?, &inventory(root)?)
 }
 
+const METHOD_STORAGE_SOURCES: &[&str] = &[
+    "td-mta/src/jmap_request/creation_ids.rs",
+    "td-mta/src/jmap_request/email_create.rs",
+    "td-mta/src/jmap_request/email_destroy.rs",
+    "td-mta/src/jmap_request/email_set.rs",
+    "td-mta/src/jmap_request/mailbox_set.rs",
+    "td-mta/src/jmap_request/submission_set.rs",
+    "td-mta/src/jmap_request/get_ids.rs",
+    "td-mta/src/jmap_request/push.rs",
+    "td-mta/src/jmap_request/replica.rs",
+    "td-mta/src/jmap_request/mailbox_get.rs",
+    "td-mta/src/jmap_request/identity_get.rs",
+    "td-mta/src/jmap_request/submission_get.rs",
+    "td-mta/src/jmap_request/thread_get.rs",
+];
+fn standard_owners(code: &str, enum_variants: bool) -> bool {
+    let mut previous = "";
+    code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            let forbidden = [
+                "Vec", "String", "Box", "Arc", "Rc", "HashMap", "BTreeMap", "VecDeque",
+            ]
+            .contains(&word)
+                && !(enum_variants && word == "String" && previous == "Kind");
+            previous = word;
+            forbidden
+        })
+}
 fn budgeted_source(source: &str) -> Result<(), String> {
     let code =
         td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
-    if !operations(source).is_empty()
-        || code
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|word| {
-                [
-                    "Vec", "String", "Box", "Arc", "Rc", "HashMap", "BTreeMap", "VecDeque",
-                ]
-                .contains(&word)
-            })
-    {
+    if !operations(source).is_empty() || standard_owners(&code, false) {
         return Err("guarded request paths require budgeted or fixed storage; unbudgeted allocation is forbidden".into());
+    }
+    Ok(())
+}
+fn method_source(source: &str) -> Result<(), String> {
+    let code =
+        td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
+    // Fixed Name/retention methods share std growth names. Their existing
+    // counts, and admitted BudgetVec reservations, remain in the debt ratchet.
+    if standard_owners(&code, true)
+        || operations(source).keys().any(|kind| {
+            !matches!(
+                kind.as_str(),
+                "unchecked-growth-or-clone" | "direct-reservation"
+            )
+        })
+    {
+        return Err("guarded JMAP method storage requires td-alloc owners".into());
     }
     Ok(())
 }
@@ -439,12 +487,29 @@ mod tests {
     }
 
     #[test]
+    fn method_storage_refuses_standard_owners_and_conversions() {
+        for source in [
+            "fn f() { let x: Vec<u8> = Default::default(); }",
+            "fn f() { String::new(); }",
+            "fn f() { value.to_vec(); }",
+            "fn f() { std::sync::Arc::new(3); }",
+            "fn f() { vec![0; 42]; }",
+        ] {
+            assert!(method_source(source).is_err(), "{source}");
+        }
+        assert!(method_source("fn f() { let x = td_alloc::BudgetVec::with_capacity(b, 4); x.try_push(3); name.push(bytes); scan::Kind::String; }").is_ok());
+    }
+
+    #[test]
     fn discovery_checks_untracked_sources_and_refuses_missing_inventory() {
         let temp = crate::test_temp::TempDir::new("allocation-guard").unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("td-example/src")).unwrap();
         fs::create_dir_all(root.join("td-alloc/src")).unwrap();
-        fs::create_dir_all(root.join("td-mta/src")).unwrap();
+        fs::create_dir_all(root.join("td-mta/src/jmap_request")).unwrap();
+        for path in METHOD_STORAGE_SOURCES {
+            fs::write(root.join(path), "fn method() {}").unwrap();
+        }
         fs::write(root.join("td-mta/src/http_date.rs"), "fn date() {}").unwrap();
         fs::write(
             root.join("td-mta/src/https_api_storage.rs"),

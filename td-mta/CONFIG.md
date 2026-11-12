@@ -242,10 +242,17 @@ refuses; it does not allocate an extra message buffer.
 `smtp_sessions`, `smtp_per_peer`, `https_connections`, `tls_handshakes`,
 `event_streams`, `body_jobs`, `storage_views`, `message_bytes`,
 `header_bytes`, `mime_depth`, `mime_parts`, `smtp_recipients`, `json_bytes`,
-`json_methods`, `json_depth`, `json_tokens`, `objects_per_method`,
+`json_methods`, `json_depth`, `json_tokens`, `jmap_method_bytes`, `objects_per_method`,
 `query_page`, `index_cache_bytes`, `upload_disk_bytes`,
 `upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
+
+`jmap_method_bytes` caps additional dispatch-owned live heap per JMAP request
+(default 2097152 bytes; range 65536..33554432). It includes spare capacity
+and old/new allocation overlap. It does not bound database, TLS, MIME or
+composition internals. The method returns the existing responseCapacity error
+when admission fails, before its mutation effects; earlier methods remain valid.
+The process ledger includes one allowance per HTTPS body worker.
 
 `memory_budget_bytes` is the operator's positive process-planning limit in
 bytes, up to the platform's `usize` range. The provisional default is
@@ -259,7 +266,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 429573376 bytes (about 409.67 MiB), including the
+default plan is 435864832 bytes (about 415.67 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.

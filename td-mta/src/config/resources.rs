@@ -378,6 +378,7 @@ mod tests {
         let lines = [
             "[limits]",
             "message_bytes=16777216",
+            "jmap_method_bytes=1048576",
             "[disk]",
             "body_bytes=2147483648",
             "[work]",
@@ -419,7 +420,8 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 312_132_864);
+        assert_eq!(actual.resources().limits().jmap_method_bytes, 1_048_576);
+        assert_eq!(actual.resources().total_bytes(), 315_278_592);
     }
     #[test]
     fn operator_memory_budget_accepts_a_larger_bounded_configuration() {
@@ -438,7 +440,10 @@ mod tests {
             .unwrap();
         assert_eq!(actual.resources().limits().memory_budget_bytes, 536870912);
         assert_eq!(actual.resources().limits().https_connections, 32);
-        assert!(actual.resources().total_bytes() > 429573376);
+        assert!(
+            actual.resources().total_bytes()
+                > limits::Limits::default().plan().unwrap().total_bytes()
+        );
     }
 
     #[test]
@@ -641,6 +646,7 @@ mod tests {
                 "json_methods",
                 "json_depth",
                 "json_tokens",
+                "jmap_method_bytes",
                 "objects_per_method",
                 "query_page",
                 "index_cache_bytes",

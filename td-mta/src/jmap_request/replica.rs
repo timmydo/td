@@ -158,16 +158,15 @@ impl Worker<'_, '_, '_, '_, '_> {
                 kind: DataType::Email,
                 sequence: identity.committed_sequence,
             };
-            let mut selected = Vec::new();
-            selected
-                .try_reserve_exact(requested.len())
-                .map_err(|_| Error::StorageCapacity)?;
-            selected.extend(requested.iter().filter_map(|item| item.id));
+            let mut selected = td_alloc::BudgetVec::with_capacity(self.budget, requested.len())
+                .map_err(|_| Error::ResponseCapacity)?;
+            for id in requested.iter().filter_map(|item| item.id) {
+                selected.try_push(id).map_err(|_| Error::ResponseCapacity)?;
+            }
             view.prefetch_metadata(&selected, Stored::all())?;
-            let mut row = Vec::new();
-            row.try_reserve_exact(crate::format::MAX_VALUE_BYTES)
-                .map_err(|_| Error::StorageCapacity)?;
-            row.resize(crate::format::MAX_VALUE_BYTES, 0);
+            let mut row =
+                td_alloc::Buffer::filled(self.budget, crate::format::MAX_VALUE_BYTES, 0u8)
+                    .map_err(|_| Error::ResponseCapacity)?;
             let start = self.retention.len();
             self.append(br#"{"accountId":"#)?;
             self.push_id(&account)?;
@@ -177,7 +176,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             self.replica_state(state)?;
             self.append(br#"","list":["#)?;
             let mut first = true;
-            for item in &mut requested {
+            for item in requested.iter_mut() {
                 self.check()?;
                 let Some(id) = item.id else {
                     continue;
@@ -213,7 +212,12 @@ impl Worker<'_, '_, '_, '_, '_> {
                     return Err(Error::State);
                 }
                 self.append(br#", "receivedAtMs":""#)?;
-                self.append(metadata.received_at.to_string().as_bytes())?;
+                let mut timestamp = [0; 32];
+                let mut text = crate::bounded::TextBuffer::new(&mut timestamp);
+                text.format(format_args!("{}", metadata.received_at))
+                    .map_err(|_| Error::State)?;
+                let length = text.len();
+                self.append(timestamp.get(..length).ok_or(Error::State)?)?;
                 self.append(br#"","bodySha256":""#)?;
                 let mut digest = [0; 64];
                 wire::hex(&metadata.body.digest, &mut digest).map_err(|_| Error::State)?;

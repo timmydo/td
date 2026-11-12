@@ -65,7 +65,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         self.append(state.as_bytes())?;
         self.append(br#"","list":["#)?;
         let mut first = true;
-        for item in &mut requested {
+        for item in requested.iter_mut() {
             self.check()?;
             let Some(id) = item.id else {
                 continue;

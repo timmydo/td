@@ -228,11 +228,8 @@ impl Worker<'_, '_, '_, '_, '_> {
             .optional_end
             .checked_sub(frame as u64)
             .ok_or(Error::ResponseCapacity)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(bound)
+        let mut bytes = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        bytes.resize(bound, 0);
         let mut filing_bytes = [0; 2048];
         let reserved = self
             .retention

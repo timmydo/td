@@ -1,5 +1,5 @@
-//! Admission for JMAP request bytes and tokens, through their final owner.
-//! Method scratch, response files, TLS and PostgreSQL have separate contracts.
+//! Admission for JMAP input and dispatch-owned heap, through their final owner.
+//! Response files, TLS and PostgreSQL have separate contracts.
 use crate::{limits::ResourcePlan, ports::Error};
 use td_alloc::{Budget, Buffer};
 use td_json::arena::Token;
@@ -9,6 +9,7 @@ pub struct RequestMemory {
     budget: Budget,
     bytes: usize,
     tokens: usize,
+    methods: usize,
     request_limit: usize,
 }
 impl RequestMemory {
@@ -18,6 +19,7 @@ impl RequestMemory {
             .json_tokens
             .checked_mul(std::mem::size_of::<Token>())
             .and_then(|n| n.checked_add(limits.json_bytes))
+            .and_then(|n| n.checked_add(limits.jmap_method_bytes))
             .and_then(|n| n.checked_add(Budget::metadata_bytes()))
             .ok_or(Error::Capacity)?;
         let maximum = request_limit
@@ -28,6 +30,7 @@ impl RequestMemory {
             budget: Budget::new(maximum).map_err(|_| Error::Capacity)?,
             bytes: limits.json_bytes,
             tokens: limits.json_tokens,
+            methods: limits.jmap_method_bytes,
             request_limit,
         })
     }
@@ -44,6 +47,7 @@ impl RequestMemory {
     ) -> Result<(Buffer<u8>, Buffer<Token>), Error> {
         if self.bytes != resources.limits().json_bytes
             || self.tokens != resources.limits().json_tokens
+            || self.methods != resources.limits().jmap_method_bytes
         {
             return Err(Error::Capacity);
         }
@@ -86,13 +90,54 @@ mod tests {
         let memory = RequestMemory::new(&resources).unwrap();
         let mut held = Vec::new();
         for _ in 0..resources.https_body_workers() {
-            held.push(memory.allocate(&resources).unwrap());
+            let buffers = memory.allocate(&resources).unwrap();
+            let method_storage = td_alloc::Buffer::filled(
+                buffers.0.budget(),
+                resources.limits().jmap_method_bytes,
+                0u8,
+            )
+            .unwrap();
+            held.push((buffers, method_storage));
         }
         assert_eq!(memory.used(), memory.limit());
         assert!(memory.allocate(&resources).is_err());
         drop(held.pop());
         drop(memory.allocate(&resources).unwrap());
         drop(held);
+        assert_eq!(memory.used(), Budget::metadata_bytes());
+    }
+
+    #[test]
+    fn method_storage_cannot_borrow_another_requests_allowance() {
+        let resources = Limits::default().plan().unwrap();
+        let memory = RequestMemory::new(&resources).unwrap();
+        let (bytes, tokens) = memory.allocate(&resources).unwrap();
+        let backing = memory.used();
+        let methods = resources.limits().jmap_method_bytes;
+        let scratch = Buffer::filled(bytes.budget(), methods, 0u8).unwrap();
+        assert!(memory.used() < memory.limit());
+        assert!(Buffer::filled(bytes.budget(), 1, 0u8).is_err());
+        assert_eq!(memory.used(), backing + methods);
+        drop((bytes, tokens));
+        // A moved-out method owner retains the request child after cancellation.
+        assert_eq!(memory.used(), 2 * Budget::metadata_bytes() + methods);
+        drop(scratch);
+        assert_eq!(memory.used(), Budget::metadata_bytes());
+        drop(memory.allocate(&resources).unwrap());
+        assert_eq!(memory.used(), Budget::metadata_bytes());
+    }
+
+    #[test]
+    fn changed_method_allowance_requires_a_matching_pool() {
+        let resources = Limits::default().plan().unwrap();
+        let memory = RequestMemory::new(&resources).unwrap();
+        let changed = Limits {
+            jmap_method_bytes: resources.limits().jmap_method_bytes / 2,
+            ..Limits::default()
+        }
+        .plan()
+        .unwrap();
+        assert!(memory.allocate(&changed).is_err());
         assert_eq!(memory.used(), Budget::metadata_bytes());
     }
 

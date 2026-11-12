@@ -75,11 +75,17 @@ allocations remain migration debt.
 
 JMAP request byte and token backing uses owned child budgets under one
 HTTPS worker-pool budget. Parsing, validation, response emission and recovered
-buffers retain admission until their final owners drop. Method scratch,
-transport/library internals and response files retain separate limits; this
-is not a whole-request allocation guarantee. The request storage module and
+buffers retain admission until their final owners drop. JMAP dispatch-owned
+call/reference/ID plans, creation overlays, mutation plans and response
+buffers share that same child and its explicit method allowance. Projection,
+MIME/search/composition and transport/library internals and response files
+retain separate limits; this is not a whole-request allocation guarantee. The request storage module and
 the allocation-free HTTP date formatter have additional source guards that
 reject recognized allocation operations and standard heap collection names.
+Migrated leaf JMAP method modules forbid standard heap owners and recognized
+allocating constructors/conversions. Their fixed-buffer growth methods and
+budgeted reservations retain operation counts in the debt inventory.
+Mixed adapter/projection modules remain covered by the debt ratchet alone.
 
 The repository allocation guard is a source-level ratchet over production
 Rust. It excludes recognized test-only code and literals/comments, scans

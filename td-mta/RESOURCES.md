@@ -34,6 +34,7 @@ changing that validator requires an explicit atomic implementation update.
 | --- | ---: | ---: | ---: |
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
+| JMAP dispatch method heap | 3 | 2097152 | 6291456 |
 | Body/search jobs | 3 | 22298624 | 66895872 |
 | Storage read views | 6 | 1871872 | 11231232 |
 | Resident index cache | 1 | 4194304 | 4194304 |
@@ -56,10 +57,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **429573376** |
+| **Total** | | | **435864832** |
 
-The total is approximately 409.67 MiB against a 512 MiB configured budget;
-the remaining 107297536 bytes are unassigned headroom, not another cache.
+The total is approximately 415.67 MiB against a 512 MiB configured budget;
+the remaining 101006080 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent

@@ -10,18 +10,16 @@ struct Entry {
 }
 pub(super) const MAX_CREATED: usize = 64;
 pub(super) struct CreationIds {
-    entries: Vec<Entry>,
+    entries: td_alloc::BudgetVec<Entry>,
     sorted: [usize; MAX_CREATED],
 }
-impl Default for CreationIds {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            sorted: [0; MAX_CREATED],
-        }
-    }
-}
 impl CreationIds {
+    pub(super) fn new(budget: &td_alloc::Budget) -> Result<Self, Error> {
+        Ok(Self {
+            entries: td_alloc::BudgetVec::new(budget).map_err(|_| Error::ResponseCapacity)?,
+            sorted: [0; MAX_CREATED],
+        })
+    }
     /// A failed creation leaves its reserved slot empty, or its old value intact.
     /// No allocation or lookup is needed when the successful ID arrives.
     pub(super) fn prepare(
@@ -54,7 +52,7 @@ impl CreationIds {
             .checked_sub(charge as u64)
             .ok_or(Error::ResponseCapacity)?;
         self.entries
-            .try_reserve_exact(1)
+            .try_reserve(1)
             .map_err(|_| Error::ResponseCapacity)?;
         let index = self.entries.len();
         for position in (low..index).rev() {
@@ -62,10 +60,12 @@ impl CreationIds {
             *self.sorted.get_mut(position + 1).ok_or(Error::State)? = old;
         }
         *self.sorted.get_mut(low).ok_or(Error::State)? = index;
-        self.entries.push(Entry {
-            key: name,
-            value: Name::new(),
-        });
+        self.entries
+            .try_push(Entry {
+                key: name,
+                value: Name::new(),
+            })
+            .map_err(|_| Error::ResponseCapacity)?;
         *remaining = after;
         Ok(index)
     }
@@ -163,7 +163,7 @@ mod tests {
     }
     #[test]
     fn failed_replacements_leave_latest_success_and_empty_slots_stay_private() {
-        let mut map = CreationIds::default();
+        let mut map = CreationIds::new(&td_alloc::Budget::new(128 * 1024).unwrap()).unwrap();
         let mut budget = 10000;
         let first = map.prepare(b"draft", &mut budget, || Ok(())).unwrap();
         assert!(encoded(&map).is_empty());
@@ -182,7 +182,7 @@ mod tests {
     }
     #[test]
     fn capacity_and_deadline_refuse_before_reserving_and_ids_are_validated() {
-        let mut map = CreationIds::default();
+        let mut map = CreationIds::new(&td_alloc::Budget::new(128 * 1024).unwrap()).unwrap();
         assert_eq!(
             map.prepare(b"draft", &mut 0, || Ok(())),
             Err(Error::ResponseCapacity)
@@ -205,36 +205,89 @@ mod tests {
 }
 
 #[cfg(test)]
-#[test]
-#[allow(clippy::unwrap_used)]
-fn aggregate_bound_and_binary_lookup_preserve_prepared_slots() {
-    let mut map = CreationIds::default();
-    let mut budget = 100000;
-    let mut steps = 0;
-    for index in (0..MAX_CREATED).rev() {
-        let key = format!("key{index:02}");
-        let slot = map
-            .prepare(key.as_bytes(), &mut budget, || {
-                steps += 1;
-                Ok(())
-            })
+mod allocation_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn aggregate_bound_and_binary_lookup_preserve_prepared_slots() {
+        let mut map = CreationIds::new(&td_alloc::Budget::new(128 * 1024).unwrap()).unwrap();
+        let mut budget = 100000;
+        let mut steps = 0;
+        for index in (0..MAX_CREATED).rev() {
+            let key = format!("key{index:02}");
+            let slot = map
+                .prepare(key.as_bytes(), &mut budget, || {
+                    steps += 1;
+                    Ok(())
+                })
+                .unwrap();
+            map.created(slot, crate::ids::EmailId::from_bytes([index as u8; 16]))
+                .unwrap();
+        }
+        assert!(steps < MAX_CREATED * 8);
+        assert_eq!(
+            map.prepare(b"extra", &mut budget, || Ok(())),
+            Err(Error::ResponseCapacity)
+        );
+        let before = budget;
+        let slot = map.prepare(b"key00", &mut budget, || Ok(())).unwrap();
+        assert_eq!(budget, before);
+        map.created(slot, crate::ids::EmailId::from_bytes([99; 16]))
             .unwrap();
-        map.created(slot, crate::ids::EmailId::from_bytes([index as u8; 16]))
-            .unwrap();
+        assert_eq!(
+            map.entry(0).unwrap().unwrap().1,
+            b"e63636363636363636363636363636363"
+        );
+        assert_eq!(map.len(), MAX_CREATED);
     }
-    assert!(steps < MAX_CREATED * 8);
-    assert_eq!(
-        map.prepare(b"extra", &mut budget, || Ok(())),
-        Err(Error::ResponseCapacity)
-    );
-    let before = budget;
-    let slot = map.prepare(b"key00", &mut budget, || Ok(())).unwrap();
-    assert_eq!(budget, before);
-    map.created(slot, crate::ids::EmailId::from_bytes([99; 16]))
-        .unwrap();
-    assert_eq!(
-        map.entry(0).unwrap().unwrap().1,
-        b"e63636363636363636363636363636363"
-    );
-    assert_eq!(map.len(), MAX_CREATED);
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn allocation_refusal_leaves_prepared_slots_and_returns_budget_on_drop() {
+        let mut refused = false;
+        let mut succeeded = false;
+        for allowance in 0..8 {
+            let budget = td_alloc::Budget::new(128 * 1024).unwrap();
+            let mut map = CreationIds::new(&budget).unwrap();
+            let mut remaining = 100000;
+            let result = td_alloc::with_reservation_limit(allowance, || {
+                for index in 0..MAX_CREATED {
+                    let key = format!("key{index:02}");
+                    let length = map.len();
+                    let before = remaining;
+                    match map.prepare(key.as_bytes(), &mut remaining, || Ok(())) {
+                        Ok(slot) => {
+                            map.created(slot, crate::ids::EmailId::from_bytes([index as u8; 16]))?
+                        }
+                        Err(error) => {
+                            assert_eq!(map.len(), length);
+                            assert_eq!(remaining, before);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(())
+            });
+            assert!(budget.used() <= budget.limit());
+            if result.is_ok() {
+                let used = budget.used();
+                td_alloc::with_reservation_limit(0, || {
+                    let slot = map.prepare(b"key00", &mut remaining, || Ok(())).unwrap();
+                    map.created(slot, crate::ids::EmailId::from_bytes([99; 16]))
+                        .unwrap();
+                });
+                assert_eq!(budget.used(), used);
+                succeeded = true;
+            } else {
+                assert_eq!(result, Err(Error::ResponseCapacity));
+                refused = true;
+            }
+            drop(map);
+            assert_eq!(budget.used(), td_alloc::Budget::metadata_bytes());
+            if succeeded {
+                break;
+            }
+        }
+        assert!(refused && succeeded);
+    }
 }

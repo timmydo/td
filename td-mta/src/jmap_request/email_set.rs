@@ -134,9 +134,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
         }
         let maximum = maximum.min(MAX_EMAIL_UPDATES);
-        let mut updates = Vec::new();
-        updates
-            .try_reserve_exact(maximum)
+        let mut updates = td_alloc::BudgetVec::with_capacity(self.budget, maximum)
             .map_err(|_| Error::ResponseCapacity)?;
         if let Some(update) = update.filter(|item| item.kind != scan::Kind::Null) {
             let mut objects = Children::new(update.range, scan::Kind::Object)?;
@@ -196,19 +194,21 @@ impl Worker<'_, '_, '_, '_, '_> {
                         }
                     }
                 }
-                updates.push(Update {
-                    name: item.key,
-                    value,
-                    local: id.is_some(),
-                    valid,
-                    invalid_mailbox,
-                });
+                updates
+                    .try_push(Update {
+                        name: item.key,
+                        value,
+                        local: id.is_some(),
+                        valid,
+                        invalid_mailbox,
+                    })
+                    .map_err(|_| Error::ResponseCapacity)?;
             }
         }
         // Each ID is validated ASCII with no JSON escaping. Cover either result
         // map plus fixed account/state/framing fields before invoking storage.
         let mut bound = 256 + account.bytes().len() + 2 * DataState::WIRE_BYTES;
-        for update in &updates {
+        for update in updates.iter() {
             bound = bound
                 .checked_add(update.name.bytes().len() + 96)
                 .ok_or(Error::ResponseCapacity)?;
@@ -216,18 +216,15 @@ impl Worker<'_, '_, '_, '_, '_> {
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(bound)
+        let mut output = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        output.resize(bound, 0);
-        let mut changes = Vec::new();
-        changes
-            .try_reserve_exact(updates.len())
+        let mut changes = td_alloc::BudgetVec::with_capacity(self.budget, updates.len())
             .map_err(|_| Error::ResponseCapacity)?;
-        for update in &updates {
+        for update in updates.iter() {
             if update.valid && update.local {
-                changes.push(update.value);
+                changes
+                    .try_push(update.value)
+                    .map_err(|_| Error::ResponseCapacity)?;
             }
         }
         let reserved = self
@@ -294,7 +291,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             out.append("{").map_err(|_| Error::State)?;
             let mut found = completion.results.iter();
             let mut first = true;
-            for update in &updates {
+            for update in updates.iter() {
                 let result = if update.valid && update.local {
                     *found.next().ok_or(Error::State)?
                 } else {

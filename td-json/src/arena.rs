@@ -496,6 +496,12 @@ pub struct OwnedDocument {
     used: usize,
 }
 impl OwnedDocument {
+    /// Budget retained by the input byte storage. Token storage may use a
+    /// different budget when supplied independently by the caller.
+    pub fn input_budget(&self) -> &td_alloc::Budget {
+        self.bytes.budget()
+    }
+
     /// Exact ceilings that admitted this document; retained for protocol handoff.
     pub const fn parse_limits(&self) -> ParseLimits {
         self.limits

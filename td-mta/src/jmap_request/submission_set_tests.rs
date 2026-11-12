@@ -223,6 +223,13 @@ fn input(hook: bool) -> td_json::Json {
     td_json::json!({"using":[CORE,MAIL,SUBMISSION],"methodCalls":[["EmailSubmission/set",args,"call\n☃"]],"createdIds":{}})
 }
 fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> {
+    run_limited(input, service, None)
+}
+fn run_limited(
+    input: td_json::Json,
+    service: &Service,
+    allowance: Option<usize>,
+) -> Result<td_json::Json, Error> {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let spool = RequestSpool::open(&mut root, service.clock.clone(), deadline(100)).unwrap();
@@ -245,6 +252,8 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
         Limits::default(),
         &[CORE, MAIL, SUBMISSION],
     );
+    let memory = request.document.input_budget().try_clone().unwrap();
+    let backing = memory.used();
     let mut preflight = response::Preflight::new(request, "session", retention.maximum()).unwrap();
     while !preflight.step(&mut [0; 4096]).unwrap() {}
     let access = SubmissionAccess {
@@ -256,11 +265,39 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
         state: state(),
     };
     let plan = preflight.finish().unwrap();
-    let mut completed = if input["methodCalls"].as_array().unwrap().len() == 2 {
-        dispatch::run_with_postgres_send(plan, retention, deadline(90), access, service, service)
-    } else {
-        dispatch::run_with_postgres_submissions(plan, retention, deadline(90), access)
-    }?;
+    let dispatch = || {
+        if input["methodCalls"].as_array().unwrap().len() == 2 {
+            dispatch::run_with_postgres_send(
+                plan,
+                retention,
+                deadline(90),
+                access,
+                service,
+                service,
+            )
+        } else {
+            dispatch::run_with_postgres_submissions(plan, retention, deadline(90), access)
+        }
+    };
+    let result = match allowance {
+        Some(n) => td_alloc::with_reservation_limit(n, dispatch),
+        None => dispatch(),
+    };
+    let mut completed = match result {
+        Ok(completed) => completed,
+        Err(error) => {
+            assert_eq!(memory.used(), td_alloc::Budget::metadata_bytes());
+            assert_eq!(owner.used().unwrap(), 0);
+            return Err(error);
+        }
+    };
+    let retained = memory.used();
+    if service.drafts.load(Ordering::Relaxed) != 0 {
+        assert!(
+            retained > backing,
+            "successful creation must retain its overlay charge"
+        );
+    }
     let mut encoder = completed.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -268,6 +305,7 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
     loop {
         let mut buffer = [0; 7];
         let progress = encoder.poll_output(&mut buffer).unwrap();
+        assert_eq!(memory.used(), retained);
         bytes.extend_from_slice(&buffer[..progress.written]);
         if progress.complete {
             break;
@@ -277,6 +315,7 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
     assert_eq!(bytes.len() as u64, length);
     let result = td_json::parse_slice(&bytes).unwrap();
     drop(completed);
+    assert_eq!(memory.used(), td_alloc::Budget::metadata_bytes());
     assert_eq!(owner.used().unwrap(), 0);
     Ok(result)
 }
@@ -465,7 +504,8 @@ fn output_capacity_and_wrong_typed_overlays_refuse_before_effects() {
         let service = Service::new(0, 0);
         crate::jmap_request::resolution::tests::run(|coordinator, _, _| {
             let mut retention = coordinator.retain_response(deadline(100)).unwrap();
-            let mut created = super::super::super::creation_ids::CreationIds::default();
+            let budget = td_alloc::Budget::new(2 * 1024 * 1024).unwrap();
+            let mut created = super::super::super::creation_ids::CreationIds::new(&budget).unwrap();
             if shadow {
                 let slot = created.prepare(b"draft", &mut 10000, || Ok(())).unwrap();
                 created
@@ -473,6 +513,7 @@ fn output_capacity_and_wrong_typed_overlays_refuse_before_effects() {
                     .unwrap();
             }
             let mut worker = Worker {
+                budget: &budget,
                 retention: &mut retention,
                 execution: deadline(90),
                 optional_end: if shadow { 10000 } else { 1 },
@@ -992,4 +1033,55 @@ fn send_batch_rejects_cancellation_before_creating_a_draft() {
         assert_eq!(service.drafts.load(Ordering::Relaxed), 0);
         assert_eq!(service.cancels.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn allocation_refusal_precedes_effects_and_preserves_earlier_draft_success() {
+    let mut refused_before_draft = false;
+    let mut refused_after_draft = false;
+    let mut succeeded = false;
+    for allowance in 0..16 {
+        let service = Service::new(0, 0);
+        let result = run_limited(batch(), &service, Some(allowance));
+        let drafts = service.drafts.load(Ordering::Relaxed);
+        let submissions = service.creates.load(Ordering::Relaxed);
+        match result {
+            Err(Error::ResponseCapacity) => {
+                assert_eq!((drafts, submissions), (0, 0));
+                refused_before_draft = true;
+            }
+            Ok(result) => {
+                let responses = result["methodResponses"].as_array().unwrap();
+                if drafts == 0 {
+                    assert_eq!(submissions, 0);
+                    assert_eq!(
+                        responses[0][1]["description"].as_str(),
+                        Some("responseCapacity")
+                    );
+                    refused_before_draft = true;
+                } else {
+                    assert_eq!(drafts, 1);
+                    assert_eq!(responses[0][0].as_str(), Some("Email/set"));
+                    assert_eq!(
+                        result["createdIds"]["draft"].as_str(),
+                        Some(id(EMAIL).as_str())
+                    );
+                    if submissions == 0 {
+                        assert_eq!(
+                            responses[1][1]["description"].as_str(),
+                            Some("responseCapacity")
+                        );
+                        refused_after_draft = true;
+                    } else {
+                        assert_eq!(submissions, 1);
+                        succeeded = true;
+                        break;
+                    }
+                }
+            }
+            Err(error) => panic!("unexpected refusal at {allowance}: {error:?}"),
+        }
+    }
+    assert!(refused_before_draft && refused_after_draft && succeeded);
+    assert!(run(batch(), &Service::new(0, 0)).is_ok());
 }

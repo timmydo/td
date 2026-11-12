@@ -92,11 +92,8 @@ impl Worker<'_, '_, '_, '_, '_> {
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(bound)
+        let mut bytes = td_alloc::Buffer::filled(self.budget, bound, 0u8)
             .map_err(|_| Error::ResponseCapacity)?;
-        bytes.resize(bound, 0);
         let reserved = self
             .retention
             .reserve_mutation_output(bound)

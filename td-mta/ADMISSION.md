@@ -610,9 +610,12 @@ creation-map disk contract above. It holds at most 64 distinct prepared keys
 across Email and Mailbox creation in one request, including refused keys.
 Each entry holds two fixed bounded ID buffers; a separate fixed 64-slot index
 keeps sorted lookup while prepared slot numbers remain stable. This is an
-additional bounded request heap allowance, separate from the fixed HTTPS
-scratch partition. Growth may temporarily hold the old and new entry arrays,
-so its payload peak is at most twice the 64-entry ceiling plus the index.
+allocation charged to the original request's td-alloc child, within its
+jmap_method_bytes allowance and the aggregate body-worker budget. The fixed
+sorted index stays inline. Growth holds old and new entry arrays charged
+simultaneously, with capacity at most 64 entries; its payload peak is at most
+twice that ceiling plus the index. Returned completion owners retain the
+charge through encoding or cancellation; dropping the overlay releases it.
 It cannot grow with mailbox size or the initial creation map. Reservations
 charge each entry's resident metadata and worst-case output growth against
 the remaining response allowance before any mutation. Resource exhaustion

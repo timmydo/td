@@ -70,7 +70,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         &mut self,
         view: &mut dyn super::MailRead,
         account: &super::push::Name,
-        requested: &mut Vec<Requested<MailboxId>>,
+        requested: &mut td_alloc::BudgetVec<Requested<MailboxId>>,
         all: bool,
         maximum: usize,
         projection: Projection,
@@ -87,11 +87,13 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
             for row in &rows {
                 self.check()?;
-                requested.push(Requested {
-                    name: None,
-                    id: Some(row.id),
-                    found: false,
-                });
+                requested
+                    .try_push(Requested {
+                        name: None,
+                        id: Some(row.id),
+                        found: false,
+                    })
+                    .map_err(|_| Error::ResponseCapacity)?;
             }
         }
         let mut state_bytes = [0; DataState::WIRE_BYTES];
@@ -109,7 +111,9 @@ impl Worker<'_, '_, '_, '_, '_> {
         self.append(br#","state":""#)?;
         self.append(state.as_bytes())?;
         self.append(br#"","list":["#)?;
-        let mut output = vec![0; mailbox_response::MAX_OBJECT_BYTES];
+        let mut output =
+            td_alloc::Buffer::filled(self.budget, mailbox_response::MAX_OBJECT_BYTES, 0u8)
+                .map_err(|_| Error::ResponseCapacity)?;
         let mut first = true;
         for item in requested.iter_mut() {
             self.check()?;

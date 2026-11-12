@@ -442,11 +442,21 @@ which the services inherit. Each scenario prints one `td-mta-perf
   downloads and API calls contend for the bounded body-worker pool. It reports
   download and query latency, throughput, refusals per endpoint, RSS and
   the database deltas.
+- `method_get_256`, `method_references_16`, `method_draft_128k`: two read clients
+  reuse separate HTTPS connections for unpaced requests, without retries.
+  Draft creation uses one client because the account's mutation lease rejects
+  simultaneous writers.
+  They exercise 256 requested IDs, sixteen echo/result-reference calls, and
+  singleton draft creation with 128 KiB text respectively. Reports include
+  request size, concurrency, requests/second, latency distribution, RSS/HWM
+  and database deltas. Assertions require successful method results. The
+  timer excludes connection setup; per-request latency includes request and
+  response I/O, while throughput also includes client response validation.
 - `idle_after_intake`: the first idle window's measures again, with both
   profiles, after the JMAP scenarios.
 
-Every td-mta HTTPS response closes its connection, so each request is a
-new TLS connection from 127.0.0.1, and the server admits at most eight
+The fetch/concurrent harness cases explicitly close each response, so each
+of those requests uses a new TLS connection from 127.0.0.1, and the server admits at most eight
 authentication attempts per peer per second, counted after each
 handshake. The harness spaces connection starts evenly at six a second
 across all its clients, so that limiter is not expected to refuse; the
@@ -459,6 +469,12 @@ refusal at the full shared body-worker pool is a 429: one whose body names
 one a refused download. A 503 is a storage or service failure, not
 contention. Each is retried after 50 ms, at most 1000 times; any other
 status fails.
+
+`TD_MTA_PERF_METHODS_ONLY=1` runs just the three method-storage workloads
+against the real desktop profile, omitting SMTP, download and idle phases.
+Their connections follow the handshake pace, but timed requests do not. Each
+connection stays within the server's 32-request cap. They measure sustained
+throughput at the reported concurrency, not maximum supported capacity.
 
 This is a first slice of DESIGN section 15 and IMPLEMENTATION M23, not
 their qualification: no 1 GiB corpus, search, queue retry or

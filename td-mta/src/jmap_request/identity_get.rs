@@ -43,11 +43,13 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
             for id in catalog.ids() {
                 self.check()?;
-                requested.push(Requested {
-                    name: None,
-                    id: Some(id),
-                    found: false,
-                });
+                requested
+                    .try_push(Requested {
+                        name: None,
+                        id: Some(id),
+                        found: false,
+                    })
+                    .map_err(|_| Error::ResponseCapacity)?;
             }
         }
         let mut state_bytes = [0; IdentityState::WIRE_BYTES];
@@ -59,7 +61,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         self.append(state.as_bytes())?;
         self.append(br#"","list":["#)?;
         let mut first = true;
-        for item in &mut requested {
+        for item in requested.iter_mut() {
             self.check()?;
             let Some(id) = item.id else { continue };
             let Some(object) = catalog.object(id).map_err(|_| Error::State)? else {

@@ -140,6 +140,7 @@ limits! {
         json_methods: 16, 1, 64;
         json_depth: 32, 1, 64;
         json_tokens: 32768, 1, 131072;
+        jmap_method_bytes: 2 * MIB, 64 * KIB, 32 * MIB;
         objects_per_method: 256, 1, 1024;
         query_page: 256, 1, 1024;
         index_cache_bytes: 4 * MIB, 1, 32 * MIB;
@@ -179,7 +180,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 24],
+    reservations: [Reservation; 25],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -305,6 +306,15 @@ impl Limits {
                     "https slot",
                     &[self.json_bytes, json_descriptors, response_ids, 96 * KIB],
                 )?,
+            },
+            Reservation {
+                name: "JMAP method heap",
+                count: self
+                    .body_jobs
+                    .min(self.storage_views / 2)
+                    .min(self.https_connections)
+                    .min(3),
+                bytes_each: self.jmap_method_bytes,
             },
             Reservation {
                 name: "body jobs",
@@ -452,7 +462,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 429_573_376);
+        assert_eq!(plan.total_bytes(), 435_864_832);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,

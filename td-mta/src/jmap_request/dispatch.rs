@@ -891,6 +891,12 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         .checked_sub(plan.required_bytes())
         .ok_or(Error::State)?;
     let mut responses = result_index::Responses::new(plan.into_request());
+    let budget = responses
+        .request()
+        .document
+        .input_budget()
+        .try_clone()
+        .map_err(|_| Error::ResponseCapacity)?;
     let request = responses.request().view().map_err(|_| Error::State)?;
     let mut core = false;
     let mut mail = false;
@@ -905,20 +911,21 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         replication |= capability.as_string_bytes() == Some(REPLICATION.as_bytes());
         partial_search |= capability.as_string_bytes() == Some(PARTIAL_SEARCH.as_bytes());
     }
-    let mut calls = Vec::new();
-    calls
-        .try_reserve_exact(request.call_count())
+    let mut calls = td_alloc::BudgetVec::with_capacity(&budget, request.call_count())
         .map_err(|_| Error::ResponseCapacity)?;
     for call in request.calls {
         retention.admit_work_turn().map_err(Error::Storage)?;
-        calls.push(call.token_index());
+        calls
+            .try_push(call.token_index())
+            .map_err(|_| Error::ResponseCapacity)?;
     }
     let mut read = read;
     let mut worker = Worker {
         retention: &mut retention,
         execution,
         optional_end,
-        created: Default::default(),
+        budget: &budget,
+        created: super::creation_ids::CreationIds::new(&budget)?,
         account,
         flags,
         mailboxes,
@@ -931,7 +938,7 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         submissions,
         implicit: None,
     };
-    for (ordinal, token) in calls.into_iter().enumerate() {
+    for (ordinal, token) in calls.iter().copied().enumerate() {
         let result = worker.method(&responses, ordinal, token, core, mail, replication);
         let (name, range) = match result {
             Ok(result) => result,
@@ -1023,6 +1030,7 @@ struct Resolved {
     range: Range<u64>,
 }
 struct Worker<'io, 'c, 's, 'sr, 'a> {
+    budget: &'io td_alloc::Budget,
     retention: &'io mut ResponseRetention<'c, 's, 'sr, 'a>,
     execution: ports::Deadline,
     optional_end: u64,
@@ -1143,7 +1151,8 @@ impl Worker<'_, '_, '_, '_, '_> {
             .and_then(super::invocation)
             .ok_or(Error::State)?;
         self.collisions(call)?;
-        let mut resolved = Vec::new();
+        let mut resolved =
+            td_alloc::BudgetVec::new(self.budget).map_err(|_| Error::ResponseCapacity)?;
         let mut arguments = call.arguments.as_object().ok_or(Error::State)?;
         while let Some((key, value)) = arguments.next_bytes() {
             self.check()?;
@@ -1154,10 +1163,12 @@ impl Worker<'_, '_, '_, '_, '_> {
                 .try_reserve(1)
                 .map_err(|_| Error::ResponseCapacity)?;
             let range = self.reference(responses, ordinal, value)?;
-            resolved.push(Resolved {
-                value: value.token_index(),
-                range,
-            });
+            resolved
+                .try_push(Resolved {
+                    value: value.token_index(),
+                    range,
+                })
+                .map_err(|_| Error::ResponseCapacity)?;
         }
         if self.read.is_some()
             && !matches!(
@@ -1483,19 +1494,10 @@ pub(super) mod tests {
         limits: Limits,
         capabilities: &[&str],
     ) -> OwnedRequest {
-        let mut bytes = td_alloc::Buffer::filled(
-            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
-            limits.json_bytes,
-            0,
-        )
-        .unwrap();
+        let resources = limits.plan().unwrap();
+        let memory = crate::https_api_storage::RequestMemory::new(&resources).unwrap();
+        let (mut bytes, tokens) = memory.allocate(&resources).unwrap();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = td_alloc::Buffer::filled(
-            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
-            limits.json_tokens,
-            arena::Token::EMPTY,
-        )
-        .unwrap();
         let mut parser = arena::OwnedCursor::with_input_length(
             bytes,
             tokens,
@@ -1794,11 +1796,13 @@ pub(super) mod tests {
             let view = responses.request().view().unwrap();
             let value = view.calls().nth(1).unwrap().argument("#x").unwrap();
             clock.advance_until(50);
+            let budget = td_alloc::Budget::new(2 * 1024 * 1024).unwrap();
             let mut worker = Worker {
+                budget: &budget,
                 retention: &mut retention,
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
-                created: Default::default(),
+                created: crate::jmap_request::creation_ids::CreationIds::new(&budget).unwrap(),
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
@@ -2207,11 +2211,13 @@ pub(super) mod tests {
             retention.append(arguments.as_bytes()).unwrap();
             let end = retention.publish().unwrap();
             clock.advance_until(50);
+            let budget = td_alloc::Budget::new(2 * 1024 * 1024).unwrap();
             let mut worker = Worker {
+                budget: &budget,
                 retention: &mut retention,
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
-                created: Default::default(),
+                created: crate::jmap_request::creation_ids::CreationIds::new(&budget).unwrap(),
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,

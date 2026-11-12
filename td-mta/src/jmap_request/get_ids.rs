@@ -16,15 +16,13 @@ impl Worker<'_, '_, '_, '_, '_> {
         &mut self,
         ids: Option<Item>,
         maximum: usize,
-    ) -> Result<Vec<Requested<T>>, Error> {
-        let mut requested = Vec::<Requested<T>>::new();
-        requested
-            .try_reserve_exact(maximum)
-            .map_err(|_| Error::ResponseCapacity)?;
-        let mut local_ids = Vec::<[u8; 16]>::new();
-        local_ids
-            .try_reserve_exact(maximum)
-            .map_err(|_| Error::ResponseCapacity)?;
+    ) -> Result<td_alloc::BudgetVec<Requested<T>>, Error> {
+        let mut requested: td_alloc::BudgetVec<Requested<T>> =
+            td_alloc::BudgetVec::with_capacity(self.budget, maximum)
+                .map_err(|_| Error::ResponseCapacity)?;
+        let mut local_ids: td_alloc::BudgetVec<[u8; 16]> =
+            td_alloc::BudgetVec::with_capacity(self.budget, maximum)
+                .map_err(|_| Error::ResponseCapacity)?;
         if let Some(ids) = ids {
             let mut children = Children::new(ids.range, scan::Kind::Array)?;
             let mut count = 0usize;
@@ -40,7 +38,13 @@ impl Worker<'_, '_, '_, '_, '_> {
                     match local_ids.binary_search(id.storage_bytes()) {
                         Ok(_) => true,
                         Err(position) => {
-                            local_ids.insert(position, *id.storage_bytes());
+                            local_ids
+                                .try_push(*id.storage_bytes())
+                                .map_err(|_| Error::ResponseCapacity)?;
+                            local_ids
+                                .get_mut(position..)
+                                .ok_or(Error::State)?
+                                .rotate_right(1);
                             false
                         }
                     }
@@ -65,11 +69,13 @@ impl Worker<'_, '_, '_, '_, '_> {
                     duplicate
                 };
                 if !duplicate {
-                    requested.push(Requested {
-                        name: Some(item.range),
-                        id,
-                        found: false,
-                    });
+                    requested
+                        .try_push(Requested {
+                            name: Some(item.range),
+                            id,
+                            found: false,
+                        })
+                        .map_err(|_| Error::ResponseCapacity)?;
                 }
             }
         }

@@ -101,7 +101,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             let mut encoded = [0; wire::IdKind::WIRE_BYTES];
             let window = if members { MAX_THREAD_EMAILS } else { 1 };
             // Stored Thread values are empty; no row-value scratch is needed.
-            for item in &mut requested {
+            for item in requested.iter_mut() {
                 self.check()?;
                 let Some(id) = item.id else {
                     continue;
