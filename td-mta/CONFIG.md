@@ -249,7 +249,8 @@ refuses; it does not allocate an extra message buffer.
 
 `jmap_method_bytes` caps additional dispatch-owned live heap per JMAP request
 (default 2097152 bytes; range 65536..33554432). It includes spare capacity
-and old/new allocation overlap. It does not bound database, TLS, MIME or
+and old/new allocation overlap, including Email/get header selection and MIME
+projection scratch. It does not bound database, TLS, search or draft
 composition internals. The method returns the existing responseCapacity error
 when admission fails, before its mutation effects; earlier methods remain valid.
 The process ledger includes one allowance per HTTPS body worker.

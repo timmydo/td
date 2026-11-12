@@ -38,7 +38,7 @@ const DEFAULTS: &[&str] = &[
 /// Validated, bounded fields shared by the local and PostgreSQL adapters.
 pub struct Selection {
     stored: Stored,
-    headers: Vec<Name>,
+    headers: td_alloc::BudgetVec<Name>,
     text: bool,
     html: bool,
     attachments: bool,
@@ -46,16 +46,17 @@ pub struct Selection {
     values: bool,
 }
 impl Selection {
-    pub fn new() -> Self {
-        Self {
+    /// Retains the caller's budget for selection and every MIME scratch owner.
+    pub fn new(memory: &td_alloc::Budget) -> Result<Self, Error> {
+        Ok(Self {
             stored: Stored::id_only(),
-            headers: Vec::new(),
+            headers: td_alloc::BudgetVec::new(memory).map_err(|_| Error::ResponseCapacity)?,
             text: false,
             html: false,
             attachments: false,
             preview: false,
             values: false,
-        }
+        })
     }
     pub fn stored(&self) -> Stored {
         self.stored
@@ -77,22 +78,7 @@ impl Selection {
         work: &mut Meter,
         clock: &dyn Clock,
     ) -> Result<(), Error> {
-        let text = std::str::from_utf8(name.bytes()).map_err(|_| Error::InvalidArguments)?;
-        let mut parser = crate::email_property::Cursor::new(text);
-        let property = loop {
-            if let crate::email_property::Status::Complete(property) = parser
-                .poll(body::now(clock)?, work)
-                .map_err(|error| match error {
-                    crate::email_property::Error::Work(crate::admission::work::Stop::Deadline) => {
-                        Error::ExecutionDeadline
-                    }
-                    crate::email_property::Error::Work(_) => Error::StorageCapacity,
-                    _ => Error::InvalidArguments,
-                })?
-            {
-                break property.ok_or(Error::InvalidArguments)?;
-            }
-        };
+        let property = validate_name(&name, work, clock)?;
         match property {
             Property::Header(_) => {
                 if !self.headers.contains(&name) {
@@ -100,9 +86,8 @@ impl Selection {
                         return Err(Error::RequestTooLarge);
                     }
                     self.headers
-                        .try_reserve(1)
+                        .try_push(name)
                         .map_err(|_| Error::ResponseCapacity)?;
-                    self.headers.push(name);
                 }
             }
             Property::Field(field) => match field {
@@ -129,10 +114,28 @@ impl Selection {
         self.text || self.html || self.attachments || self.preview || self.values
     }
 }
-impl Default for Selection {
-    fn default() -> Self {
-        Self::new()
-    }
+fn validate_name<'a>(
+    name: &'a Name,
+    work: &mut Meter,
+    clock: &dyn Clock,
+) -> Result<Property<'a>, Error> {
+    let text = std::str::from_utf8(name.bytes()).map_err(|_| Error::InvalidArguments)?;
+    let mut parser = crate::email_property::Cursor::new(text);
+    let property = loop {
+        if let crate::email_property::Status::Complete(property) = parser
+            .poll(body::now(clock)?, work)
+            .map_err(|error| match error {
+                crate::email_property::Error::Work(crate::admission::work::Stop::Deadline) => {
+                    Error::ExecutionDeadline
+                }
+                crate::email_property::Error::Work(_) => Error::StorageCapacity,
+                _ => Error::InvalidArguments,
+            })?
+        {
+            break property.ok_or(Error::InvalidArguments)?;
+        }
+    };
+    Ok(property)
 }
 pub use body::collect_verified_search;
 pub(super) use body::search_verified;
@@ -215,7 +218,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
         }
         let account = account.ok_or(Error::InvalidArguments)?;
-        let mut selected = Selection::new();
+        let mut selected = Selection::new(self.budget)?;
         if let Some(properties) = properties.filter(|v| v.kind != scan::Kind::Null) {
             let mut fields = Children::new(properties.range, scan::Kind::Array)?;
             while let Some(item) = fields.next(self)? {

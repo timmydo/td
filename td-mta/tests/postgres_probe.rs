@@ -8464,7 +8464,8 @@ fn exercise_read(
                     Ok(())
                 }
             }
-            let mut selected = EmailProjection::new();
+            let memory = td_alloc::Budget::new(2 * 1024 * 1024).unwrap();
+            let mut selected = EmailProjection::new(&memory).unwrap();
             for field in ["from", "subject", "textBody", "htmlBody", "attachments", "preview", "bodyValues"] {
                 selected.include(field, &mut work, &Clock).unwrap();
             }

@@ -470,6 +470,16 @@ one a refused download. A 503 is a storage or service failure, not
 contention. Each is retried after 50 ms, at most 1000 times; any other
 status fails.
 
+`TD_MTA_PERF_PROJECTIONS_ONLY=1` seeds four distinct messages over SMTP and
+measures Email/get headers, previews, body values and attachment lists with
+two persistent HTTPS clients and 32 requests each per case. Each source nests
+plain text and HTML alternatives inside multipart/mixed alongside a base64
+binary attachment. Seeding and TLS setup are outside the timed interval.
+Every response must contain all four IDs and the expected projected fields;
+there are no timed retries. The report includes latency, throughput, process
+RSS/high-water memory and server phase counters under the same native release
+profile. Run identical workload code on both source revisions for comparison.
+
 `TD_MTA_PERF_METHODS_ONLY=1` runs just the three method-storage workloads
 against the real desktop profile, omitting SMTP, download and idle phases.
 Their connections follow the handshake pace, but timed requests do not. Each

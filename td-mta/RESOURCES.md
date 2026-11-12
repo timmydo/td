@@ -3738,11 +3738,21 @@ locator Candidate and list/selection membership cells; a compiled assertion
 bounds their combined representation. Part arrays are bounded by mime_parts,
 not message byte length or account size.
 
+Email/get header selections and per-message heap backing retain the original
+request child budget. Each message drops its scratch before the next message;
+capacity refusal releases every partially constructed buffer and the unpublished
+response tail follows ADMISSION.md. Cancellation uses the same drop path.
+The 2 MiB default method allowance is unchanged; larger configured MIME/header
+ceilings can require a larger method allowance or explicitly refuse. The body-job
+ledger remains a conservative planning reservation, not an additional allocatable
+heap allowance. Search retains its separate storage contract.
+
 Per-message storage includes one configured header arena; six metadata windows
-of at most 16 KiB plus 14 bytes; one 192 KiB generated part fragment; 6 KiB input
+of at most 16 KiB plus 14 bytes in one contiguous allocation; one 192 KiB generated part fragment; 6 KiB input
 and 2 KiB checkpoints; 3 KiB normalization scratch; and fixed parser/output
 state. Metadata backing is reused through short part borrows; the fragment allocation is
-reused for the next part. One 4 KiB staging buffer and 4 KiB source/output
+reused for the next part. At most 64 passive header descriptors borrow selected
+names in a fixed table of at most 4 KiB. One 4 KiB staging buffer and 4 KiB source/output
 buffer avoid per-scalar response file I/O. Requested stored rows reuse one
 64 KiB method buffer in the read-view allowance. There is never a retained
 collection of body strings or generated fragments for all parts/messages.

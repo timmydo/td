@@ -1046,11 +1046,25 @@ fn method_working_memory(fixture: &Fixture, jmap: &Arc<Jmap>, desktop: &Service)
     let drafts =
         td_json::json!({"using":["urn:ietf:params:jmap:mail"],"createdIds":{},"methodCalls":calls})
             .to_string();
-    for (scenario, request, method_name, requests, methods, clients) in [
-        ("method_get_256", get, "Email/get", 32, 1, 2),
-        ("method_references_16", references, "Core/echo", 32, 16, 2),
-        ("method_draft_128k", drafts, "Email/set", 32, 1, 1),
-    ] {
+    measure_methods(
+        fixture,
+        jmap,
+        desktop,
+        vec![
+            ("method_get_256", get, "Email/get", 32, 1, 2),
+            ("method_references_16", references, "Core/echo", 32, 16, 2),
+            ("method_draft_128k", drafts, "Email/set", 32, 1, 1),
+        ],
+    );
+}
+
+fn measure_methods(
+    fixture: &Fixture,
+    jmap: &Arc<Jmap>,
+    desktop: &Service,
+    scenarios: Vec<(&'static str, String, &'static str, usize, usize, usize)>,
+) {
+    for (scenario, request, method_name, requests, methods, clients) in scenarios {
         let request = Arc::new(request);
         let barrier = Arc::new(Barrier::new(clients + 1));
         let mut workers = Vec::new();
@@ -1097,6 +1111,24 @@ fn method_working_memory(fixture: &Fixture, jmap: &Arc<Jmap>, desktop: &Service)
                     assert_eq!(responses.len(), methods, "{reply}");
                     for response in responses {
                         assert_eq!(response[0].as_str(), Some(method_name), "{reply}");
+                        if scenario.starts_with("projection_") {
+                            let rows = response[1]["list"].as_array().unwrap();
+                            assert_eq!(rows.len(), 4, "{reply}");
+                            assert!(response[1]["notFound"].as_array().unwrap().is_empty());
+                            for row in rows {
+                                match scenario {
+                                    "projection_headers" => assert_eq!(row["subject"].as_str(), Some("Budget projection")),
+                                    "projection_preview" => assert!(row["preview"].as_str().unwrap().contains("Harvest")),
+                                    "projection_values" => {
+                                        assert_eq!(row["bodyValues"].as_object().unwrap().len(), 2);
+                                        assert_eq!(row["textBody"].as_array().unwrap().len(), 1);
+                                        assert_eq!(row["htmlBody"].as_array().unwrap().len(), 1);
+                                    }
+                                    "projection_attachments" => assert_eq!(row["attachments"].as_array().unwrap().len(), 1),
+                                    _ => panic!("unknown projection workload"),
+                                }
+                            }
+                        }
                         if method_name == "Email/set" {
                             assert_eq!(response[1]["created"].as_object().unwrap_or_else(|| panic!("{reply}")).len(), 1, "{reply}");
                         }
@@ -1117,6 +1149,52 @@ fn method_working_memory(fixture: &Fixture, jmap: &Arc<Jmap>, desktop: &Service)
         report(scenario, &format!("\"clients\":{clients},\"requests\":{},\"methods_per_request\":{methods},\"request_bytes\":{},\"seconds\":{elapsed:.3},\"requests_per_second\":{:.2},\"latency_ms\":{},{},\"database\":{{{}}}", latencies.len(), request.len(), latencies.len() as f64 / elapsed, distribution(&mut latencies), desktop.memory_fields(), after.since(before, elapsed)));
         desktop.report_phases(scenario);
     }
+}
+
+fn projection_working_memory(
+    fixture: &Fixture,
+    jmap: &Arc<Jmap>,
+    desktop: &Service,
+    smtp: SocketAddr,
+) {
+    // Seed outside the timed interval: mixed > alternative > text/html plus
+    // a binary attachment. Four distinct IDs exercise serial scratch reuse.
+    let (mut stream, _) = Stream::connect(smtp);
+    for n in 0..4 {
+        let mut body = format!("From: Sender <sender@example.test>\r\nTo: Main <main@example.test>\r\nSubject: Budget projection\r\nMessage-ID: <projection-{n}@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: multipart/alternative; boundary=y\r\n\r\n--y\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHarvest ");
+        for _ in 0..2048 {
+            body.push_str("the orchard after rain and sunshine.\r\n");
+        }
+        body.push_str("--y\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Harvest &amp; rain</p>\r\n--y--\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=report.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n");
+        for _ in 0..2048 {
+            body.push_str("YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU2Nzg5\r\n");
+        }
+        body.push_str("--x--\r\n.\r\n");
+        assert!(matches!(
+            stream.attempt(body.as_bytes()),
+            Attempt::Accepted(_)
+        ));
+    }
+    drop(stream);
+    let session = jmap.get("/.well-known/jmap");
+    assert_eq!(session.status, 200);
+    let session = td_json::parse_slice(&session.body).unwrap();
+    let account = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+        .as_str()
+        .unwrap();
+    let query = method(&jmap.api(&td_json::json!({"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{"accountId":account,"limit":4},"q"]]}).to_string()), "Email/query");
+    let ids = &query["ids"];
+    assert_eq!(ids.as_array().unwrap().len(), 4);
+    let scenarios = [
+        ("projection_headers", vec!["id", "subject", "from", "to", "header:Message-ID:asMessageIds"]),
+        ("projection_preview", vec!["id", "preview"]),
+        ("projection_values", vec!["id", "textBody", "htmlBody", "bodyValues"]),
+        ("projection_attachments", vec!["id", "attachments"]),
+    ].into_iter().map(|(name, properties)| {
+        let request = td_json::json!({"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":account,"ids":ids,"properties":properties,"fetchAllBodyValues":true,"maxBodyValueBytes":131072},"g"]]}).to_string();
+        (name, request, "Email/get", 32, 1, 2)
+    }).collect();
+    measure_methods(fixture, jmap, desktop, scenarios);
 }
 
 pub(super) fn exercise(
@@ -1169,6 +1247,17 @@ pub(super) fn exercise(
         ),
     );
     let desktop = Service::start(&local, &connection, "desktop");
+    match std::env::var("TD_MTA_PERF_PROJECTIONS_ONLY").as_deref() {
+        Ok("1") => {
+            let cloud = Service::start(&local, &connection, "cloud");
+            let jmap = Arc::new(Jmap::new(fixture, https_address));
+            projection_working_memory(fixture, &jmap, &desktop, smtp_address);
+            drop(cloud);
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => (),
+        _ => panic!("TD_MTA_PERF_PROJECTIONS_ONLY must be absent or 1"),
+    }
     match std::env::var("TD_MTA_PERF_METHODS_ONLY").as_deref() {
         Ok("1") => {
             let jmap = Arc::new(Jmap::new(fixture, https_address));

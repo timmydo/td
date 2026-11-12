@@ -1296,8 +1296,8 @@ it cannot acquire a fresh allowance after parsing or between methods.
 
 Covered method storage comprises the call list, result-reference entries,
 creation-ID overlay, typed /get ID and duplicate plans, metadata ID/row
-scratch, mutation plans and mailbox names, and complete mutation response
-buffers. Mutation response buffers and creation slots are admitted before
+scratch, mutation plans and mailbox names, complete mutation response
+buffers, and Email/get header selections and MIME projection scratch. Mutation response buffers and creation slots are admitted before
 the adapter can publish effects. A later method's refusal preserves earlier
 results and successful creation IDs. Method admission returns responseCapacity;
 initial parser admission retains the existing HTTP capacity refusal.
@@ -1305,8 +1305,8 @@ Completed responses retain the overlay until encoding finishes or the owner
 drops. Recovered parser buffers retain their own charges. This cap counts
 requested live layout bytes, including growth overlap, not RSS.
 
-Projection/header selection, MIME/search/composition working memory, cached
-worker ownership, TLS, PostgreSQL adapters and response files remain separate
+Search and draft composition working memory, cached worker ownership, TLS,
+PostgreSQL adapters and response files remain separate
 contracts and allocation debt. No whole-request heap guarantee is implied.
 The HTTP Date formatter writes fixed scalar state into caller storage, including
 refusal replies. Source guards forbid standard heap collection owners in the

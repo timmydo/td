@@ -254,6 +254,8 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
 const METHOD_STORAGE_SOURCES: &[&str] = &[
     "td-mta/src/jmap_request/creation_ids.rs",
     "td-mta/src/jmap_request/email_create.rs",
+    "td-mta/src/jmap_request/email_get.rs",
+    "td-mta/src/jmap_request/email_get_body.rs",
     "td-mta/src/jmap_request/email_destroy.rs",
     "td-mta/src/jmap_request/email_set.rs",
     "td-mta/src/jmap_request/mailbox_set.rs",

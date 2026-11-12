@@ -2,6 +2,30 @@
 use super::*;
 use crate::jmap_request::dispatch::email_search::{charge, Search, SearchFields, Sink};
 
+fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResponseCapacity)?;
+    result.resize(count, T::default());
+    Ok(result)
+}
+// Search keeps its existing separate storage contract. Header spelling is
+// fixed here; it does not need a request-owned projection selection.
+fn search_headers(work: &mut Meter, clock: &dyn Clock) -> Result<[super::super::Name; 5], Error> {
+    let mut names = std::array::from_fn(|_| super::super::Name::new());
+    for (name, text) in names.iter_mut().zip([
+        "header:From:asAddresses:all",
+        "header:To:asAddresses:all",
+        "header:Cc:asAddresses:all",
+        "header:Bcc:asAddresses:all",
+        "header:Subject:asText:all",
+    ]) {
+        name.push(text.as_bytes())?;
+        super::super::validate_name(name, work, clock)?;
+    }
+    Ok(names)
+}
 struct Headers<'a> {
     bytes: Vec<u8>,
     maximum: usize,
@@ -152,11 +176,7 @@ fn search_context(
 ) -> Result<(), Error> {
     let search = &mut *traversal.search;
     let budget = &mut *traversal.budget;
-    let mut selected = Selection::new();
-    for name in ["From", "To", "Cc", "Bcc"] {
-        selected.include(&format!("header:{name}:asAddresses:all"), work, clock)?;
-    }
-    selected.include("header:Subject:asText:all", work, clock)?;
+    let selected = search_headers(work, clock)?;
     let mut arena = buffer(
         limits
             .header_bytes
@@ -251,7 +271,9 @@ fn search_context(
             usize::try_from(original.header_bytes).map_err(|_| Error::MessageInterpretation)?,
         )
         .ok_or(Error::MessageInterpretation)?;
-    let mut metadata = Metadata::new(limits.header_bytes.min(16 * 1024))?;
+    let metadata_limit = limits.header_bytes.min(16 * 1024);
+    let mut metadata_storage = buffer(metadata_bytes(metadata_limit)?)?;
+    let mut metadata = Metadata::new(&mut metadata_storage, metadata_limit)?;
     let mut input = buffer(crate::mime_input::INPUT_BYTES)?;
     let mut checkpoints = crate::mime_input::Checkpoints::default();
     for index in 0..original.parts.len() {
@@ -749,20 +771,8 @@ mod tests {
             .unwrap());
             let whole = initial - budget.steps_remaining();
 
-            let mut selected = Selection::new();
             let mut meter = work(100_000_000);
-            for name in ["From", "To", "Cc", "Bcc"] {
-                selected
-                    .include(
-                        &format!("header:{name}:asAddresses:all"),
-                        &mut meter,
-                        &Fixed,
-                    )
-                    .unwrap();
-            }
-            selected
-                .include("header:Subject:asText:all", &mut meter, &Fixed)
-                .unwrap();
+            let selected = search_headers(&mut meter, &Fixed).unwrap();
             let mut budget = HeaderBudget::new();
             let mut arena = vec![0; limits.header_bytes + limits.mime_parts + 2];
             let mut output = Headers {
