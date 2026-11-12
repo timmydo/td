@@ -457,15 +457,16 @@ impl Directory {
     /// listed from the table as published, or changed under the lock,
     /// waited for until `wait` has passed, and published as boot publishes
     /// the seed. Application and sandbox accounts take grants; a
-    /// workspace's waits for its launches to go through root, and an
-    /// application's network is its declaration's. A grant, and a
-    /// sandbox's network set to the host's, first pass `admit`, the
-    /// session owner, an application's declaration and the source's early
-    /// check, and a sandbox's then needs its ledger row, which allocation
-    /// makes and a grant never does; a listing, a revocation, a network
-    /// set off and a sandbox's clear name any account, so a row an image no
-    /// longer declares, or a deleted sandbox's, can still be seen and
-    /// removed. An absent table refuses: boot seeds it.
+    /// workspace's waits for its launches to go through root, and takes
+    /// only the clear that frees its slot; an application's network is its
+    /// declaration's. A grant, and a sandbox's network set to the host's,
+    /// first pass `admit`, the session owner, an application's declaration
+    /// and the source's early check, and a sandbox's then needs its ledger
+    /// row, which allocation makes and a grant never does; a listing, a
+    /// revocation, a network set off and a sandbox's or workspace's clear
+    /// name any account, so a row an image no longer declares, or a deleted
+    /// sandbox's, can still be seen and removed. An absent table refuses:
+    /// boot seeds it.
     fn grants(
         &self,
         kind: Kind,
@@ -475,6 +476,7 @@ impl Directory {
         wait: Duration,
     ) -> Result<GrantReply, String> {
         match (kind, verb) {
+            (Kind::Workspace, GrantVerb::Clear) => {}
             (Kind::Workspace, _) => {
                 return Err(
                     "workspace accounts take no grants until their launches go through root".into(),
@@ -487,7 +489,9 @@ impl Directory {
                 )
             }
             (Kind::Application, GrantVerb::Clear) => {
-                return Err("only a sandbox's rows are cleared, when it is deleted".into())
+                return Err(
+                    "only a sandbox's or workspace's rows are cleared, when it is deleted".into(),
+                )
             }
             _ => {}
         }
@@ -784,11 +788,13 @@ impl Directory {
     }
 
     /// The uids of the homes below the children `applications` and
-    /// `workloads`; none from one that is absent.
+    /// `workloads`, and of the workspace scratch trees below
+    /// `workload-scratch`; none from one that is absent.
     fn homes(&self) -> Result<BTreeSet<u32>, String> {
         let mut uids = BTreeSet::new();
         self.uid_entries_into(Kind::Application.homes(), "", &mut uids)?;
         self.uid_entries_into(Kind::Sandbox.homes(), "", &mut uids)?;
+        self.uid_entries_into(workload_accounts::SCRATCH, "", &mut uids)?;
         Ok(uids)
     }
 
@@ -1024,33 +1030,54 @@ pub(crate) fn allocate_application(
     directory.allocate(owner, name, policy.declarations(), outside, prepare)
 }
 
-/// What root may allocate a workload account for: a sandbox of a session
-/// `owner` the deployment's principal table names. A workspace's account
-/// waits for td-agent's workspaces to launch through root (WORKLOADS.md
-/// step 8), and an application's is `allocate_application`'s.
-fn workload_allocatable(registry: &Registry, owner: u32, kind: Kind) -> Result<(), String> {
+/// What root may allocate or prepare a workload account for: a sandbox or a
+/// workspace of a session `owner` the deployment's principal table names,
+/// a workspace's `name` one of td-agent's slots
+/// (`workload_accounts::workspace_slot`), so a program spending workspace
+/// rows makes only slots td-agent adopts. An application's is
+/// `allocate_application`'s.
+fn workload_allocatable(
+    registry: &Registry,
+    owner: u32,
+    kind: Kind,
+    name: &str,
+) -> Result<(), String> {
     if !registry.sessions().any(|session| session.owner == owner) {
         return Err("workload allocation names another session".into());
     }
-    if kind != Kind::Sandbox {
+    if !matches!(kind, Kind::Sandbox | Kind::Workspace) {
         return Err(crate::allocation::format(format_args!(
-            "{} accounts are not allocated here; only a sandbox's is",
+            "{} accounts are not allocated here; only a sandbox's or a workspace's is",
             kind.as_str()
         ))
         .unwrap_or_default());
     }
+    // The text below names the pools' sizes.
+    const _: () =
+        assert!(workload_accounts::AGENT_SLOTS == 960 && workload_accounts::REVIEW_SLOTS == 64);
+    if kind == Kind::Workspace && workload_accounts::workspace_slot(name).is_none() {
+        return Err(
+            "a workspace's account is one of td-agent's slots, agent-1 through agent-960 \
+             or review-1 through review-64"
+                .into(),
+        );
+    }
     Ok(())
 }
 
-/// Root's allocation of a sandbox's account (td-authd/DESIGN.md, "Workload
-/// account ledger"): with the deployment enrolled and its accounts
-/// verified, the ledger row of the session `owner`'s `kind` workload
-/// `name`, added when absent from 98304 through 131071, and `prepare` run
-/// with its uid and whether the row is new, under the principal lock.
+/// Root's allocation of a sandbox's or workspace's account
+/// (td-authd/DESIGN.md, "Workload account ledger"): with the deployment
+/// enrolled and its accounts verified, the ledger row of the session
+/// `owner`'s `kind` workload `name`, added when absent from 98304 through
+/// 131071 while the sandbox and workspace rows number fewer than
+/// `WORKLOAD_ROWS` and the kind's fewer than `WORKLOAD_KIND_ROWS` (a
+/// workspace's name being one of td-agent's slots), and
+/// `prepare` run with its uid and whether the row is new, under the
+/// principal lock.
 /// `delegated` reads the uids of the account cgroups that exist, which a
 /// new row avoids, as do the homes, runtime directories, passwd and group
-/// ids and retained reservations an application's allocation avoids. No
-/// caller supplies a uid.
+/// ids and retained reservations an application's allocation avoids, and
+/// every workspace scratch tree left. No caller supplies a uid.
 pub(crate) fn allocate_workload(
     owner: u32,
     kind: Kind,
@@ -1062,16 +1089,16 @@ pub(crate) fn allocate_workload(
     let directory = state_directory()?;
     let prior = directory.verify_enrolled(&desired)?;
     prior.verify_installed_accounts(&desired)?;
-    workload_allocatable(&desired, owner, kind)?;
+    workload_allocatable(&desired, owner, kind, name)?;
     let outside = || outside_ids(delegated);
     directory.allocate_account(kind, name, outside, |_, _, _| Ok(()), prepare)
 }
 
-/// Root's preparation of a sandbox's existing account at its launch
-/// (td-authd/DESIGN.md, "Workspace launch intake"): with the deployment
-/// enrolled and its accounts verified, the ledger row of the session
-/// `owner`'s `kind` workload `name`, never added, and `prepare` run with
-/// its uid under the principal lock. A missing row refuses.
+/// Root's preparation of a sandbox's or workspace's existing account at its
+/// launch or deletion (td-authd/DESIGN.md, "Workspace launch intake"): with
+/// the deployment enrolled and its accounts verified, the ledger row of the
+/// session `owner`'s `kind` workload `name`, never added, and `prepare` run
+/// with its uid under the principal lock. A missing row refuses.
 pub(crate) fn prepare_workload(
     owner: u32,
     kind: Kind,
@@ -1082,7 +1109,7 @@ pub(crate) fn prepare_workload(
     let directory = state_directory()?;
     let prior = directory.verify_enrolled(&desired)?;
     prior.verify_installed_accounts(&desired)?;
-    workload_allocatable(&desired, owner, kind)?;
+    workload_allocatable(&desired, owner, kind, name)?;
     directory.prepare_account(kind, name, prepare)
 }
 

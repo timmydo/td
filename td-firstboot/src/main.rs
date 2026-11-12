@@ -361,9 +361,9 @@ fn usage() -> String {
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
          td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n  \
-         td-firstboot allocate-workload OWNER sandbox NAME allocates a sandbox's account when absent and prepares its home and cgroup\n  \
-         td-firstboot prepare-workload OWNER sandbox NAME prepares a sandbox's existing account's home and cgroup again, adding none\n  \
-         td-firstboot grant-table OWNER list|grant|revoke|network|clear KIND NAME [ro|rw] [PATH|off|host] lists an account's directory grants and a sandbox's network, grants or revokes one of the human's directories, sets a sandbox's network, or clears every row of a deleted sandbox\n",
+         td-firstboot allocate-workload OWNER sandbox|workspace NAME allocates a sandbox's or workspace's account when absent and prepares its home, a workspace's scratch tree and its cgroup\n  \
+         td-firstboot prepare-workload OWNER sandbox|workspace NAME prepares a sandbox's or workspace's existing account's home, scratch tree and cgroup again, adding none\n  \
+         td-firstboot grant-table OWNER list|grant|revoke|network|clear KIND NAME [ro|rw] [PATH|off|host] lists an account's directory grants and a sandbox's network, grants or revokes one of the human's directories, sets a sandbox's network, or clears every row of a deleted sandbox or workspace\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
     )
@@ -457,16 +457,16 @@ fn run_with_primary(
             return emit(&format!("{ALLOCATED_MARKER}\t{uid}\n")).map_err(Failure::Failed);
         }
         Invocation::AllocateWorkload(owner, kind, name) => {
-            // An empty home of its own and its delegation; /sys/fs/cgroup is
-            // volatile, so the root launch that runs it ensures the
-            // delegation again each boot.
+            // An empty home of its own, a workspace's scratch tree and its
+            // delegation; /sys/fs/cgroup is volatile, so the root launch
+            // that runs it ensures the delegation again each boot.
             let uid = principal_store::allocate_workload(
                 owner,
                 kind,
                 &name,
                 application_runtime::delegated_uids,
                 |uid, fresh| {
-                    application_state::create_workload(uid, fresh)?;
+                    application_state::create_workload(kind, uid, fresh)?;
                     application_runtime::ensure(uid, fresh)
                 },
             )
@@ -477,11 +477,11 @@ fn run_with_primary(
                 .map_err(Failure::Failed);
         }
         Invocation::PrepareWorkload(owner, kind, name) => {
-            // A launch's: the row must exist; its home's mode and its
-            // delegation, which the volatile hierarchy loses at shutdown,
-            // are made again.
+            // A launch's: the row must exist; its home's and scratch
+            // tree's modes and its delegation, which the volatile hierarchy
+            // loses at shutdown, are made again.
             let uid = principal_store::prepare_workload(owner, kind, &name, |uid| {
-                application_state::create_workload(uid, false)?;
+                application_state::create_workload(kind, uid, false)?;
                 application_runtime::ensure(uid, false)
             })
             .map_err(Failure::Failed)?;
@@ -683,7 +683,7 @@ enum Invocation {
 /// `grant-table OWNER list KIND NAME`, `grant-table OWNER grant KIND NAME
 /// ro|rw PATH`, `grant-table OWNER revoke KIND NAME PATH`, `grant-table
 /// OWNER network KIND NAME off|host` or `grant-table OWNER clear KIND
-/// NAME`, td-authd's grant requests and its sandbox deletion. The
+/// NAME`, td-authd's grant requests and its workload deletion. The
 /// path's rules and which kinds take which verb are the table writer's,
 /// checked when it is changed.
 fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
@@ -723,7 +723,7 @@ fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
 /// `allocate-workload OWNER KIND NAME` or `prepare-workload OWNER KIND
 /// NAME`: a canonical session owner, a known kind and a name in the
 /// ledger's grammar. Which kinds are allocated or prepared is
-/// `principal_store`'s rule: a sandbox's account only, today.
+/// `principal_store`'s rule: a sandbox's or a workspace's account.
 fn workload_invocation(args: &[String]) -> Result<Invocation, Failure> {
     let [verb, owner, kind, name] = args else {
         return Err(Failure::Usage(

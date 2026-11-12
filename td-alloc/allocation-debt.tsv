@@ -1859,9 +1859,10 @@ td-firstboot/src/principal_store.rs	allocating-conversion	15
 td-firstboot/src/principal_store.rs	allocation-macro	46
 td-firstboot/src/principal_store.rs	heap-owner	1
 td-firstboot/src/principal_store.rs	unchecked-growth-or-clone	10
-td-firstboot/src/principal_store_tests.rs	allocating-conversion	45
-td-firstboot/src/principal_store_tests.rs	allocation-macro	26
-td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	10
+td-firstboot/src/principal_store_tests.rs	allocating-conversion	48
+td-firstboot/src/principal_store_tests.rs	allocation-macro	30
+td-firstboot/src/principal_store_tests.rs	heap-owner	1
+td-firstboot/src/principal_store_tests.rs	unchecked-growth-or-clone	13
 td-firstboot/src/principals.rs	allocating-conversion	24
 td-firstboot/src/principals.rs	allocation-macro	20
 td-firstboot/src/principals.rs	unchecked-growth-or-clone	12

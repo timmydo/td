@@ -642,6 +642,30 @@ mod tests {
         assert_eq!(account_in(tdwalter, PASSWD, "tdwalter").unwrap().uid, 1000);
     }
 
+    /// A workspace slot root allocates, td-agent's `agent-N`, resolves as
+    /// `tdw<uid>` from its row alone, beside a sandbox of the same name at
+    /// another uid, with the workload account's fixed shape.
+    #[test]
+    fn an_allocated_workspace_slot_resolves_as_its_workload_account() {
+        let none = std::collections::BTreeSet::new();
+        let (ledger, sandbox, _) = ledger().allocate(Kind::Sandbox, "agent-1", &none).unwrap();
+        let (ledger, workspace, new) = ledger.allocate(Kind::Workspace, "agent-1", &none).unwrap();
+        assert!(new);
+        assert_ne!(sandbox, workspace);
+        assert_eq!(
+            ledger.account(&format!("tdw{workspace}")),
+            Some((Kind::Workspace, workspace))
+        );
+        let account = ledger_account_in(&ledger, PW, GR, &format!("tdw{workspace}")).unwrap();
+        assert_eq!(
+            (account.uid, account.gid, account.gecos.as_str()),
+            (workspace, workspace, "td workload")
+        );
+        assert_eq!(account.home, format!("/var/lib/td/workloads/{workspace}"));
+        assert_eq!(account.shell, "/bin/false");
+        assert!(ledger_account_in(&ledger, PW, GR, &format!("tda{workspace}")).is_err());
+    }
+
     /// Neither file may speak for a workload account, whatever is looked up:
     /// a passwd entry of the reserved form or with a workload id would be a
     /// second account policy for a uid the ledger allocates (an empty

@@ -607,11 +607,11 @@ privilege to resolve an account. The canonical format begins
 KIND<TAB>name<TAB>uid
 ```
 
-`KIND` is `application`, `sandbox` or `workspace`. Application and sandbox
-rows are written today; v1 parses workspace rows already, as it parsed
-sandbox rows before anything wrote one, because rows are permanent and a
-deployment that rolls back must still read the ledger a later one
-extended. Any further kind or format change is
+`KIND` is `application`, `sandbox` or `workspace`, and allocation writes
+all three. v1 parsed workspace and sandbox rows before anything wrote
+one, because rows are permanent and a deployment that rolls back must
+still read the ledger a later one extended. Any further kind or format
+change is
 `td-accounts-v2`, landed in two steps: first a deployment that reads both
 versions, then one that writes v2, which may not ship until the reader is
 the oldest deployment an install can retain as `previous`. Names follow the principal table's
@@ -634,15 +634,21 @@ invalid name, unsorted rows, a name held twice under one kind and a uid
 held by two rows. It bounds the ledger to 4096 rows and 256 KiB, a 64-byte
 average row, with the same headroom reason: a bound a later deployment
 outgrows strands the rollback. Allocation, not the parser, bounds
-sandbox and workspace rows together at 2048 (`WORKLOAD_ROWS`): rows are
-permanent, and any program running as the human can have root allocate
-a sandbox under any name through root's workspace intake, so cycling
-names would otherwise spend every row and leave no
-application install or carried row a place. At the bound a new sandbox
-or workspace is refused for good, an existing one is still returned, and
-applications keep the rest of the row and byte bounds (with long
-names the 256 KiB bound binds first, still far above the declared
-Flathub set). A ledger already holding more still parses.
+sandbox and workspace rows together at 2048 (`WORKLOAD_ROWS`) and each
+kind at half of that, 1024 (`WORKLOAD_KIND_ROWS`): rows are permanent,
+and any program running as the human can have root allocate a sandbox
+under any name through root's workspace intake, so cycling names would
+otherwise spend every row and leave no application install or carried
+row a place, and one kind's names would leave the other kind none,
+td-agent's workspaces none once sandboxes were cycled. A new row is
+refused for good once either bound is reached, an existing one is still
+returned, and applications keep the rest of the row and byte bounds
+(with long names the 256 KiB bound binds first, still far above the
+declared Flathub set). A ledger already holding more still parses: one
+an earlier deployment wrote may hold up to 2048 sandboxes, past the
+kind's bound, and then takes no new sandbox for good, since rows are
+never removed, nor any workspace while the two kinds hold 2048
+together.
 
 Every check that a uid is an application's uses the ledger's application
 range, 65536 through 98303 (`APPLICATION_UIDS`): td-login's and td-jail's
@@ -676,8 +682,8 @@ Rows are never removed. A removed application keeps its row, so a
 reinstall gets the same uid and no uid is ever reused. A lost ledger,
 restored offline from a copy missing later rows, forgets those
 allocations, but no allocation re-issues a uid whose home remains under
-`/var/lib/td/applications` or `/var/lib/td/workloads`, or whose cgroup or
-runtime directory remains; the forgotten account's state stays there,
+`/var/lib/td/applications` or `/var/lib/td/workloads`, or whose scratch
+tree, cgroup or runtime directory remains; the forgotten account's state stays there,
 owned by its uid, for that offline repair to restore. The ledger is
 assignment data, not authority: which workloads are installed and what
 they may do stays with their declarations and grants.
@@ -774,15 +780,16 @@ refuses: boot seeds it first) and returns an existing row unchanged, or
 adds the lowest uid of 66560 through 98303 that no row of any kind holds
 and that no retained principal row (of any owner), passwd uid or gid,
 group gid, entry of `/var/lib/td/applications` or `/var/lib/td/workloads`,
-`td-app-UID` or `td-workload-UID` cgroup at the unified root or
-`/run/user/UID` entry names: one taken set for every kind, so a uid one
-kind left behind is never another's. Each directory is read
+`td-app-UID` or `td-workload-UID` cgroup at the unified root,
+`/run/user/UID` entry or workspace scratch tree below
+`/var/lib/td/workload-scratch` names: one taken set for every kind, so
+a uid one kind left behind is never another's. Each directory is read
 under the lock, listed without following links, its names taken in
 canonical decimal after their prefix and bounded at 65536 entries; an
 absent directory names none, and a linked or unreadable one refuses, so
-an install fails closed on a damaged `workloads` as on a damaged
-`applications`. A new uid
-therefore has no home, cgroup or runtime directory to inherit. No
+an install fails closed on a damaged `workloads` or `workload-scratch`
+as on a damaged `applications`. A new uid therefore has no home, scratch
+tree, cgroup or runtime directory to inherit. No
 caller supplies a uid. Before
 publishing, it applies `check-launch-application`'s admission to the
 resulting ledger, so an install refuses exactly what a launch would,
@@ -801,39 +808,51 @@ next install, which finds the row, completes root's interrupted
 creation. A removed application keeps its row and home, so its
 reinstall is allocated the same uid and finds its state.
 
-A sandbox's account (WORKLOADS.md, "Accounts") is allocated by
-`td-firstboot allocate-workload OWNER sandbox NAME`, which root runs as
-it runs `allocate-application` and which answers one line,
+A sandbox's or workspace's account (WORKLOADS.md, "Accounts") is
+allocated by `td-firstboot allocate-workload OWNER KIND NAME`, the kind
+`sandbox` or `workspace`, which root runs as it runs
+`allocate-application` and which answers one line,
 `TD-WORKLOAD-ALLOCATED`, a tab and the uid. Root's workspace intake
-runs it for `create`, its one path to a sandbox's row, and runs
-`td-firstboot prepare-workload OWNER sandbox NAME` instead at every
+runs it for a sandbox's `create`, its one path to a sandbox's row, and
+runs `td-firstboot prepare-workload OWNER sandbox NAME` instead at every
 launch and deletion ("Workspace launch intake"), which takes
-the same words and checks, finds the sandbox's row under the principal
+the same words and checks, finds the kind's row under the principal
 lock and refuses when there is none, never adding one, prepares its
 account again as an allocation that finds its row does, and answers
 `TD-WORKLOAD-PREPARED`, a tab and the uid. td-firstboot requires root
 credentials and the deployment enrolled and its accounts verified, as
 for an application; OWNER must be a session owner of the deployment's
 principal table, NAME a name in the ledger's grammar and the kind
-`sandbox`. td-sandbox's names before sandbox accounts were 1 to 32
+`sandbox` or `workspace`; `application` is the install's.
+td-sandbox's names before sandbox accounts were 1 to 32
 lowercase letters, digits or hyphens: one that begins with a letter is
 a ledger name, and one that begins with a digit or a hyphen (`1box`,
 `-x`) is not, so td-sandbox's one-time import reports and drops such a
 profile, as the repository user decided (td-sandbox/DESIGN.md,
-"Import"); its names now are the ledger's. A workspace's
-account waits for td-agent's workspaces to launch through root
-(WORKLOADS.md step 8), and `application` is the install's. No caller
-supplies a uid. Under `.principals.lock` it reads the published ledger
-(an absent one refuses) and returns an existing `sandbox` row unchanged,
-or adds the lowest uid of 98304 through 131071 that no row of any kind
-holds and that the taken set above does not name, while sandbox and
-workspace rows together hold fewer than `WORKLOAD_ROWS`, then publishes
-the ledger as boot does. Rows are keyed by kind and name, not by human
-owner, as applications' are: a second session owner would share them.
-There is no launch admission to agree with: a sandbox's policy is the
-grants the human made for it, not a declaration, and a grant request
-admits a sandbox's grant only once this row exists and never allocates
-one ("Grant requests").
+"Import"); its names now are the ledger's. A workspace's account is a
+td-agent slot (WORKLOADS.md step 8), reused once a deletion frees it,
+and root admits no other workspace name, at allocation and preparation
+alike (`workspace_slot`): `agent-N`, a conversation's, for N from 1
+through 960 (`AGENT_SLOTS`), and `review-N`, a review's, for N from 1
+through 64 (`REVIEW_SLOTS`), N in canonical decimal. The slots number
+exactly the kind's 1024 rows, so a program that spends workspace rows
+through root can only make td-agent's own slots, which td-agent adopts
+and reuses, and never leave it none by spending them on other names. A
+sandbox keeps any ledger name, a slot's included. No root path asks for
+a workspace's account yet; when root's intake does, it will be through
+these two verbs. No caller supplies a uid. Under
+`.principals.lock` it reads the published ledger (an absent one
+refuses) and returns an existing row of the kind and name unchanged, or
+adds the lowest uid of 98304 through 131071 that no row of any kind
+holds and that the taken set above does not name, while the two kinds
+hold fewer than `WORKLOAD_ROWS` rows and the kind fewer than
+`WORKLOAD_KIND_ROWS`, then publishes the ledger as boot does. Rows are keyed by kind and name, not by human owner, as
+applications' are: a second session owner would share them, and a
+sandbox and a workspace of one name are two accounts. There is no
+launch admission to agree with: a sandbox's or workspace's policy is
+the grants the human made for it, not a declaration, and a grant
+request admits a sandbox's grant only once this row exists and never
+allocates one ("Grant requests").
 Still under the lock it prepares the account. Its home is
 `/var/lib/td/workloads/UID`, made below a root-owned mode-0755
 `workloads` created when absent, as `applications` is: an empty directory
@@ -853,6 +872,43 @@ interrupted creation. It gets no `/run/user/UID`: td-login sets no
 this allocation added, an existing home, delegation or `/run/user/UID`
 the account owns refuses, as for an application. A failed preparation
 leaves the row, and the next allocation completes it.
+
+A workspace's account also gets a scratch tree, the persistent `/tmp`,
+`/var/tmp`, `/dev/shm` and `/run` of its jails, which td-agent's tools
+need between calls, each call one jail, for temporary files and
+background jobs. It lies outside the home, since td-jail refuses a
+spec whose directories nest. A sandbox's shell is one launch, served by
+its jail's own temporary trees, so a sandbox has none
+(`Kind::scratch`). The tree is `/var/lib/td/workload-scratch/UID`
+(`SCRATCH`), below a root-owned mode-0755 `workload-scratch` created
+when absent: a directory of root's and the account's group at mode
+0710, holding `tmp`, `var-tmp`, `shm` and `run` (`SCRATCH_NAMES`, in the
+order td-jail binds a spec's scratch lines, which td-jail's tests tie to
+its targets), each the account's at mode 1777, as td-jail requires of
+persistent scratch. The tree's group keeps every other account from the
+1777 directories: no passwd or group entry may hold a gid of the
+ledger's ranges (`LEDGER_UIDS`, above), so only the account has its
+group. The account reaches its four directories by name and can neither
+list the tree nor add, rename or remove an entry of it, so it cannot put
+a link or another tree in one's place. Root makes the tree its own at
+0700, each directory its own, then the account's at 1777, and gives the
+tree to the account's group last. A published tree keeps what the
+directories hold, their modes set back to 1777 if the account changed
+them; root's interrupted creation is completed, a directory root made
+but did not give only while it is empty; a tree or directory of another
+owner or a wider mode, a link in a directory's place, or a file in a
+directory root made but did not give refuses. Root lists no further
+entry of the tree, which only root can add. For a row this allocation
+added any existing tree refuses; as for a home, the row and its home
+then stand, and the next allocation, finding the row, adopts the tree.
+`workspace-empty` empties the tree's directories as the account, beside
+its home ("Workspace launch intake"), and leaves them at 1777. td-jail
+admits no scratch line from a ledger account's spec yet, so no jail
+binds the tree until root's workspace launch (WORKLOADS.md step 8)
+writes them and td-jail admits them. A deployment from before the tree
+does not count it among the taken uids, so after a lost ledger such a
+deployment could give a forgotten workspace's uid to a new sandbox,
+whose account would then hold that tree's group.
 
 The unified hierarchy is volatile and boot iterates only applications,
 so a sandbox's delegation exists from its allocation until shutdown.
@@ -1055,18 +1111,21 @@ status, or is ended by a signal is root's failure, `ff 02`, so
 td-firstboot's usage text is never shown
 as a reason. The writer checks its own operands as root did (a grant's
 path by `validate_path`, a revoke's by `table_path`), refuses a
-workspace and an application's network itself, then:
+workspace's every verb but `clear`, and an application's network,
+itself, then:
 
 - lists without the lock, reading the table as it is published (a table
   renamed over while it read is still taken, "Workload grant table");
   every directory row is listed, an inert one too, and a sandbox's
   network with them, `off` without a row; an absent table refuses;
-- for `clear`, a sandbox's alone, under the lock below removes every row
-  of its kind and name, directory, socket and network alike, publishing
-  only when it removed one, and answers `TD-GRANT-CLEARED`, a tab and the
-  count; it admits nothing and needs no ledger row. Request `2c` has no
-  clear: only root's workspace intake asks it, deleting or creating a
-  sandbox ("Workspace launch intake"), through the same spawn path;
+- for `clear`, a sandbox's or a workspace's, under the lock below removes
+  every row of its kind and name, directory, socket and network alike,
+  publishing only when it removed one, and answers `TD-GRANT-CLEARED`, a
+  tab and the count; it admits nothing and needs no ledger row, and
+  leaves the other kind's rows of the name. Request `2c` has no clear:
+  only root's workspace intake asks it, deleting or creating a sandbox
+  ("Workspace launch intake"), through the same spawn path, and a
+  workspace's clear, which frees its slot, has no root caller yet;
 - for a grant, and for a sandbox's network set to `host`, first admits
   the request: an application must be one the image declares, owned by
   OWNER, with an account of its own (one that runs as the human is
@@ -2256,7 +2315,14 @@ requires it to be the account's, and removes everything below it
 iteratively, each directory opened by a handle that follows no link and
 given back its owner's mode first, links and files removed without being
 followed, refusing past 128 levels, and walking again, at most four
-times, until the home lists empty. Root walks no tree a workload wrote.
+times, until the home lists empty. When root made the account a scratch
+tree, a workspace's ("Workload account ledger"), it then empties each of
+the tree's four directories the same way and keeps them, set back to
+1777 through a handle that follows no link; a sandbox's account has no
+tree, and an absent one has nothing to empty. A workspace's background
+jobs outlive its launches, so whatever deletes a workspace must first
+end the processes of its `td-workload-UID` delegation, which no deletion
+here does yet. Root walks no tree a workload wrote.
 Root then marks the home deleted: a new file of root's, `.td-deleted`,
 made through the home's descriptor and never through a link. It answers
 `ok`. A refused clear stops the deletion before the home, and a home not

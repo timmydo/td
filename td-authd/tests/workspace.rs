@@ -1239,6 +1239,59 @@ fn emptying_a_home_removes_everything_below_it_and_follows_no_link() {
     temp.cleanup().unwrap();
 }
 
+/// A workspace's account empties each directory of its scratch tree as it
+/// empties its home, keeping the four directories; a link in one is never
+/// followed. An account without a tree, a sandbox's, has nothing more to
+/// empty; a tree of another account's directories, or one missing a
+/// directory, refuses.
+#[test]
+fn emptying_a_scratch_tree_empties_each_directory_and_keeps_it() {
+    let temp = crate::test_temp::TempDir::new("td-workspace-scratch").unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let me = fs::metadata(&base).unwrap().uid();
+    let outside = base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "kept").unwrap();
+    // No tree: nothing to empty.
+    empty_scratch(&base, me).unwrap();
+    assert!(!base.join(accounts::SCRATCH).exists());
+    let tree = base.join(accounts::SCRATCH).join(me.to_string());
+    fs::create_dir_all(&tree).unwrap();
+    for name in accounts::SCRATCH_NAMES {
+        let directory = tree.join(name);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o1777)).unwrap();
+        fs::create_dir_all(directory.join("job/sub")).unwrap();
+        fs::write(directory.join("job/sub/socket"), "x").unwrap();
+        fs::write(directory.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, directory.join("link")).unwrap();
+        fs::set_permissions(directory.join("job"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    empty_scratch(&base, me).unwrap();
+    for name in accounts::SCRATCH_NAMES {
+        let directory = tree.join(name);
+        assert!(directory.is_dir(), "{name}");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0, "{name}");
+        // Left at root's mode, not the walk's.
+        let mode = fs::symlink_metadata(&directory).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o1777, "{name}");
+    }
+    assert_eq!(fs::read_to_string(outside.join("kept")).unwrap(), "kept");
+    // Another account's directories are refused untouched.
+    fs::write(tree.join("tmp/mine"), "x").unwrap();
+    let theirs = base
+        .join(accounts::SCRATCH)
+        .join(me.wrapping_add(1).to_string());
+    fs::rename(&tree, &theirs).unwrap();
+    assert!(empty_scratch(&base, me.wrapping_add(1)).is_err());
+    assert!(theirs.join("tmp/mine").exists());
+    // A tree missing a directory refuses.
+    fs::rename(&theirs, &tree).unwrap();
+    fs::remove_dir_all(tree.join("run")).unwrap();
+    assert!(empty_scratch(&base, me).is_err());
+    temp.cleanup().unwrap();
+}
+
 /// The intake has one path to a new ledger row, td-firstboot's
 /// `allocate-workload` behind `ALLOCATE_SANDBOX`, which only `create`
 /// takes; launches and deletions prepare an existing row and add none.

@@ -4,9 +4,9 @@
 //! after an application's removal included. The file is std-only and uses
 //! no other module, so target programs include it by path: td-firstboot
 //! seeds the ledger at boot and allocates in it when td-authd installs an
-//! application or root asks for a sandbox's account, and `load` is the one
-//! live reader td-login and the bus policy's includers share. Parsing,
-//! seeding and allocation perform no I/O.
+//! application or root asks for a sandbox's or workspace's account, and
+//! `load` is the one live reader td-login and the bus policy's includers
+//! share. Parsing, seeding and allocation perform no I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -34,11 +34,24 @@ pub const O_NONBLOCK: i32 = 0x800;
 pub const MAX_BYTES: usize = 256 * 1024;
 const MAX_ROWS: usize = 4096;
 /// The sandbox and workspace rows allocation adds, together, at most. Rows
-/// are permanent and a session's programs can ask root for any sandbox
-/// name, so without this bound they could spend every row and leave no
-/// application install or carried row a place. Parsing does not apply it:
-/// a ledger that already holds more stays readable.
+/// are permanent and a session's programs can ask root for any sandbox or
+/// workspace name, so without this bound they could spend every row and
+/// leave no application install or carried row a place.
 pub const WORKLOAD_ROWS: usize = 2048;
+/// The rows allocation adds of either kind, sandbox or workspace: half of
+/// `WORKLOAD_ROWS` each, so a program cycling one kind's names cannot
+/// leave the other kind a row. Parsing applies neither bound: a ledger that
+/// already holds more stays readable, and one an earlier deployment filled
+/// with more sandboxes than this still keeps `WORKLOAD_ROWS` together.
+pub const WORKLOAD_KIND_ROWS: usize = WORKLOAD_ROWS / 2;
+/// td-agent's workspace slots, the only workspace names root allocates or
+/// prepares: `agent-N` for a conversation, N from 1 through this, and
+/// `review-N` for a review, N from 1 through `REVIEW_SLOTS`, in canonical
+/// decimal. Together they are `WORKLOAD_KIND_ROWS`, so a program spending
+/// workspace rows can only make td-agent's own slots, which td-agent
+/// adopts, never names that deny it one.
+pub const AGENT_SLOTS: u32 = 960;
+pub const REVIEW_SLOTS: u32 = 64;
 /// Application accounts.
 pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
 /// The application block the image reserves: the carried rows, the retained
@@ -49,9 +62,8 @@ pub const APPLICATION_UIDS: RangeInclusive<u32> = 65536..=98303;
 pub const CARRIED_UIDS: RangeInclusive<u32> = 65536..=66559;
 /// The application uids an install allocates: the rest of the range.
 pub const ALLOCATED_UIDS: RangeInclusive<u32> = 66560..=98303;
-/// Sandbox and workspace accounts, which share one range. td-firstboot
-/// allocates sandbox rows; v1 parses workspace rows so a deployment that
-/// writes them can roll back.
+/// Sandbox and workspace accounts, which share one range; td-firstboot
+/// allocates both kinds' rows from it.
 pub const WORKLOAD_UIDS: RangeInclusive<u32> = 98304..=131071;
 /// Every uid the ledger allocates, application through workspace: no
 /// passwd or group entry may hold one.
@@ -77,6 +89,44 @@ pub const WORKSPACE_INTAKE: &str = "/run/td-authd/1000/workspace";
 /// Root's directory of workspace launch specs, one root-owned directory of
 /// the account's group per account below it.
 pub const WORKSPACE_SPECS: &str = "/run/td-authd/workspaces";
+/// The directory below `DIRECTORY` holding each workspace account's
+/// scratch tree, named by its uid: the persistent `/tmp`, `/var/tmp`,
+/// `/dev/shm` and `/run` of its jails, outside its home, since a jail's
+/// directories may not nest (td-authd/DESIGN.md, "Workload account
+/// ledger"). A sandbox has none.
+pub const SCRATCH: &str = "workload-scratch";
+/// A scratch tree's directories, in the order td-jail binds a spec's
+/// scratch lines at `/tmp`, `/var/tmp`, `/dev/shm` and `/run`.
+pub const SCRATCH_NAMES: &[&str] = &["tmp", "var-tmp", "shm", "run"];
+
+/// Which of td-agent's slot pools a workspace slot belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotPool {
+    /// `agent-N`, a conversation's.
+    Agent,
+    /// `review-N`, a review's.
+    Review,
+}
+
+/// The pool and number of the workspace slot `name` names: `agent-N` with
+/// N in 1 through `AGENT_SLOTS` or `review-N` with N in 1 through
+/// `REVIEW_SLOTS`, N in canonical decimal. Any other name is none, and
+/// root allocates no workspace of it.
+pub fn workspace_slot(name: &str) -> Option<(SlotPool, u32)> {
+    [
+        (SlotPool::Agent, "agent-", AGENT_SLOTS),
+        (SlotPool::Review, "review-", REVIEW_SLOTS),
+    ]
+    .into_iter()
+    .find_map(|(pool, prefix, slots)| {
+        let digits = name.strip_prefix(prefix)?;
+        let number = digits
+            .parse::<u32>()
+            .ok()
+            .filter(|number| canonical_decimal(digits) && (1..=slots).contains(number))?;
+        Some((pool, number))
+    })
+}
 
 /// Whether `digits` spells a number in canonical decimal, as `to_string`
 /// would: digits only, no leading zero but zero's own. One copy for the
@@ -218,6 +268,14 @@ impl Kind {
     /// prepares it at and a launch binds.
     pub fn home(self, uid: u32) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("{DIRECTORY}/{}/{uid}", self.homes()))
+    }
+
+    /// Whether root makes this kind's accounts a scratch tree below
+    /// `SCRATCH`: a workspace's, whose tools run one jail per call and
+    /// keep their temporary files and background jobs between them. A
+    /// sandbox's shell is one launch, whose own temporary trees serve it.
+    pub fn scratch(self) -> bool {
+        matches!(self, Self::Workspace)
     }
 
     /// The part of `uids` allocation draws from.
@@ -366,7 +424,8 @@ impl Ledger {
     /// (td-authd/DESIGN.md, "Workload account ledger"). No caller supplies
     /// the uid. A new sandbox or workspace row is refused once those kinds
     /// hold `WORKLOAD_ROWS` together, so the rest of `MAX_ROWS` stays for
-    /// applications and carried rows.
+    /// applications and carried rows, or once its own kind holds
+    /// `WORKLOAD_KIND_ROWS`, so neither kind can take the other's half.
     pub fn allocate(
         &self,
         kind: Kind,
@@ -376,17 +435,20 @@ impl Ledger {
         if let Some(uid) = self.uid_of(kind, name) {
             return Ok((self.clone(), uid, false));
         }
-        if kind != Kind::Application
-            && self
-                .rows
-                .keys()
-                .filter(|(held, _)| *held != Kind::Application)
-                .count()
-                >= WORKLOAD_ROWS
-        {
+        let count =
+            |of: &dyn Fn(Kind) -> bool| self.rows.keys().filter(|(held, _)| of(*held)).count();
+        let full = if kind == Kind::Application {
+            None
+        } else if count(&|held| held != Kind::Application) >= WORKLOAD_ROWS {
+            Some((WORKLOAD_ROWS, "sandbox and workspace"))
+        } else if count(&|held| held == kind) >= WORKLOAD_KIND_ROWS {
+            Some((WORKLOAD_KIND_ROWS, kind.as_str()))
+        } else {
+            None
+        };
+        if let Some((bound, what)) = full {
             return Err(format!(
-                "the account ledger holds {WORKLOAD_ROWS} sandbox and workspace accounts, \
-                 its bound; refusing {name:?}"
+                "the account ledger holds {bound} {what} accounts, its bound; refusing {name:?}"
             ));
         }
         let held: BTreeSet<u32> = self.rows.values().copied().collect();

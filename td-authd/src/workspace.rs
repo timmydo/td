@@ -785,9 +785,10 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
     )))
 }
 
-/// `workspace-empty UID`, run as a deleted sandbox's account: its
-/// credentials and session leaf checked, then everything in its home
-/// removed, the home itself kept. Root never walks a tree the account
+/// `workspace-empty UID`, run as a deleted sandbox's or workspace's
+/// account: its credentials and session leaf checked, then everything in
+/// its home removed, the home itself kept, and the same in each directory
+/// of its scratch tree, a workspace's. Root never walks a tree the account
 /// controls; the account removes only what it may.
 pub(crate) fn empty(arguments: &[String]) -> Result<(), String> {
     let [uid] = arguments else {
@@ -799,7 +800,37 @@ pub(crate) fn empty(arguments: &[String]) -> Result<(), String> {
         &application::bounded("/proc/self/status")?,
         &application::bounded("/proc/self/cgroup")?,
     )?;
-    empty_home(&Kind::Sandbox.home(uid), uid)
+    empty_home(&Kind::Sandbox.home(uid), uid)?;
+    empty_scratch(Path::new(accounts::DIRECTORY), uid)
+}
+
+/// Empties each directory of the account `uid`'s scratch tree below
+/// `state`, as its home is emptied, keeping the directories, which only
+/// root may add or remove, at the mode 1777 root gave them: the tree a
+/// workspace's account holds. A sandbox's account has none, and an absent
+/// tree has nothing to empty.
+fn empty_scratch(state: &Path, uid: u32) -> Result<(), String> {
+    let trees = joined(state, accounts::SCRATCH.as_ref())?;
+    let tree = joined(&trees, text(format_args!("{uid}"))?.as_ref())?;
+    match fs::symlink_metadata(&tree) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(message(format_args!("inspect {}: {e}", tree.display()))),
+    }
+    for name in accounts::SCRATCH_NAMES {
+        let directory = joined(&tree, name.as_ref())?;
+        empty_home(&directory, uid)?;
+        // The walk opened it to its owner alone; it is a `/tmp` again,
+        // through a handle that follows no link.
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW | O_DIRECTORY)
+            .open(&directory)
+            .map_err(|e| message(format_args!("open {}: {e}", directory.display())))?;
+        fs::set_permissions(fd_path(&handle)?, fs::Permissions::from_mode(0o1777))
+            .map_err(|e| message(format_args!("reopen {}: {e}", directory.display())))?;
+    }
+    Ok(())
 }
 
 /// The command root runs to empty the home of the account `uid`: as the
@@ -1248,9 +1279,13 @@ fn delete(
     mark(uid)
 }
 
-/// Has the account `uid` empty its own home, and waits for it: its
-/// emptying ends when the tree it owns does, and nothing else runs as it
-/// while no launch of its sandbox does.
+/// Has the account `uid` empty its own home, and its scratch tree's
+/// directories when it has one, and waits for it: its emptying ends when
+/// the trees it owns do. A sandbox's account runs nothing while no launch
+/// of the sandbox does, since every jail ends with its launch; a
+/// workspace's background jobs outlive its calls, so a deletion of a
+/// workspace must first end the processes of its `td-workload-UID`
+/// delegation, which no deletion here does yet.
 fn empty_as(uid: u32) -> Result<(), String> {
     let mut command = emptier(uid);
     command

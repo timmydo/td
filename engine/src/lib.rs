@@ -334,14 +334,17 @@ mod account_ledger_reader {
         }
     }
 
-    /// Sandbox and workspace rows together stop at `WORKLOAD_ROWS`, so
-    /// cycling sandbox names cannot spend the ledger's rows: an application
-    /// is still allocated at the bound, an existing row still returned, and
-    /// a ledger already past it still parses.
+    /// Each of the sandbox and workspace kinds stops at
+    /// `WORKLOAD_KIND_ROWS`, half of `WORKLOAD_ROWS`, so cycling one kind's
+    /// names can spend neither the other kind's rows nor the ledger's: at
+    /// one kind's bound the other kind and an application are still
+    /// allocated, an existing row is still returned, and a ledger already
+    /// past the bound still parses.
     #[test]
-    fn workload_rows_stop_at_their_bound_and_leave_applications_room() {
-        use crate::workload_accounts::{Kind, Ledger, WORKLOAD_ROWS};
+    fn each_workload_kind_stops_at_its_half_and_leaves_the_rest_room() {
+        use crate::workload_accounts::{Kind, Ledger, WORKLOAD_KIND_ROWS, WORKLOAD_ROWS};
         use std::collections::BTreeSet;
+        assert_eq!(WORKLOAD_KIND_ROWS * 2, WORKLOAD_ROWS);
         let ledger = |sandboxes: usize, workspaces: usize| {
             let mut text = String::from("td-accounts-v1\napplication\tfirefox\t65536\n");
             for index in 0..sandboxes {
@@ -356,25 +359,129 @@ mod account_ledger_reader {
             Ledger::parse(&text).unwrap()
         };
         let none = BTreeSet::new();
-        let below = ledger(WORKLOAD_ROWS - 1001, 1000);
-        let (at, uid, new) = below.allocate(Kind::Sandbox, "last", &none).unwrap();
-        assert!(new);
-        assert_eq!(uid, 98304 + u32::try_from(WORKLOAD_ROWS).unwrap() - 1);
-        for full in [at, ledger(WORKLOAD_ROWS, 0), ledger(0, WORKLOAD_ROWS)] {
-            for kind in [Kind::Sandbox, Kind::Workspace] {
-                assert!(full.allocate(kind, "more", &none).is_err(), "{kind:?}");
-            }
-            let (_, uid, new) = full.allocate(Kind::Application, "photo", &none).unwrap();
-            assert_eq!((uid, new), (66560, true));
+        let next = |rows: usize| 98304 + u32::try_from(rows).unwrap();
+        // The last row of each kind, beside the other kind's whole half.
+        for (kind, sandboxes, workspaces) in [
+            (Kind::Sandbox, WORKLOAD_KIND_ROWS - 1, WORKLOAD_KIND_ROWS),
+            (Kind::Workspace, WORKLOAD_KIND_ROWS, WORKLOAD_KIND_ROWS - 1),
+        ] {
+            let (_, uid, new) = ledger(sandboxes, workspaces)
+                .allocate(kind, "last", &none)
+                .unwrap();
+            assert_eq!((uid, new), (next(WORKLOAD_ROWS - 1), true), "{kind:?}");
         }
-        let full = ledger(WORKLOAD_ROWS, 0);
-        assert_eq!(
-            full.allocate(Kind::Sandbox, "s00007", &none).unwrap(),
-            (full.clone(), 98311, false)
-        );
-        // Parsing never applies the bound.
-        let past = ledger(WORKLOAD_ROWS + 1, 0);
+        // One kind at its bound: refused for good, the other kind and an
+        // application still allocated, an existing row still returned.
+        for (full, other, sandboxes, workspaces, kept) in [
+            (
+                Kind::Sandbox,
+                Kind::Workspace,
+                WORKLOAD_KIND_ROWS,
+                0,
+                "s00007",
+            ),
+            (
+                Kind::Workspace,
+                Kind::Sandbox,
+                0,
+                WORKLOAD_KIND_ROWS,
+                "w00007",
+            ),
+        ] {
+            let at = ledger(sandboxes, workspaces);
+            assert!(at.allocate(full, "more", &none).is_err(), "{full:?}");
+            let (_, uid, new) = at.allocate(other, "more", &none).unwrap();
+            assert_eq!((uid, new), (next(WORKLOAD_KIND_ROWS), true), "{other:?}");
+            let (_, uid, new) = at.allocate(Kind::Application, "photo", &none).unwrap();
+            assert_eq!((uid, new), (66560, true));
+            assert_eq!(
+                at.allocate(full, kept, &none).unwrap(),
+                (at.clone(), 98311, false)
+            );
+        }
+        // Both kinds at their bounds: only applications are allocated.
+        let both = ledger(WORKLOAD_KIND_ROWS, WORKLOAD_KIND_ROWS);
+        for kind in [Kind::Sandbox, Kind::Workspace] {
+            assert!(both.allocate(kind, "more", &none).is_err(), "{kind:?}");
+        }
+        assert!(both.allocate(Kind::Application, "photo", &none).is_ok());
+        // Parsing never applies the bound; a kind past it takes no row,
+        // and the other kind still does.
+        let past = ledger(WORKLOAD_KIND_ROWS + 1, 0);
         assert!(past.allocate(Kind::Sandbox, "more", &none).is_err());
+        assert!(past.allocate(Kind::Workspace, "more", &none).is_ok());
+        // An earlier deployment's ledger holding the whole of
+        // `WORKLOAD_ROWS` in sandboxes takes no workspace either: the two
+        // kinds still keep to it together, and applications to the rest.
+        let earlier = ledger(WORKLOAD_ROWS, 0);
+        for kind in [Kind::Sandbox, Kind::Workspace] {
+            assert!(earlier.allocate(kind, "more", &none).is_err(), "{kind:?}");
+        }
+        let (_, uid, new) = earlier.allocate(Kind::Application, "photo", &none).unwrap();
+        assert_eq!((uid, new), (66560, true));
+        let below = ledger(WORKLOAD_ROWS - 1, 0);
+        assert!(below.allocate(Kind::Workspace, "more", &none).is_ok());
+    }
+
+    /// td-agent's slots are the only workspace names: `agent-1` through
+    /// `agent-960` and `review-1` through `review-64`, in canonical
+    /// decimal, together the workspace kind's rows.
+    #[test]
+    fn workspace_slots_are_a_closed_set_of_the_kinds_size() {
+        use crate::workload_accounts::{
+            valid_name, workspace_slot, SlotPool, AGENT_SLOTS, REVIEW_SLOTS, WORKLOAD_KIND_ROWS,
+        };
+        assert_eq!(
+            usize::try_from(AGENT_SLOTS + REVIEW_SLOTS).unwrap(),
+            WORKLOAD_KIND_ROWS
+        );
+        for (name, slot) in [
+            ("agent-1", (SlotPool::Agent, 1)),
+            ("agent-960", (SlotPool::Agent, 960)),
+            ("review-1", (SlotPool::Review, 1)),
+            ("review-64", (SlotPool::Review, 64)),
+        ] {
+            assert_eq!(workspace_slot(name), Some(slot), "{name}");
+            assert!(valid_name(name), "{name}");
+        }
+        for name in [
+            "agent-0",
+            "agent-961",
+            "agent-01",
+            "agent-+1",
+            "agent-",
+            "agent-1x",
+            "agent1",
+            "agent-4294967296",
+            "review-0",
+            "review-65",
+            "review-064",
+            "Agent-1",
+            "agents-1",
+            "default",
+            "",
+        ] {
+            assert_eq!(workspace_slot(name), None, "{name}");
+        }
+        let every = (1..=AGENT_SLOTS)
+            .map(|n| format!("agent-{n}"))
+            .chain((1..=REVIEW_SLOTS).map(|n| format!("review-{n}")))
+            .filter(|name| workspace_slot(name).is_some())
+            .count();
+        assert_eq!(every, WORKLOAD_KIND_ROWS);
+    }
+
+    /// Only a workspace's account has a scratch tree, whose directories
+    /// stand in td-jail's order of its persistent scratch targets: `/tmp`,
+    /// `/var/tmp`, `/dev/shm` and `/run`.
+    #[test]
+    fn only_a_workspace_has_a_scratch_tree() {
+        use crate::workload_accounts::{Kind, SCRATCH, SCRATCH_NAMES};
+        assert!(Kind::Workspace.scratch());
+        assert!(!Kind::Sandbox.scratch());
+        assert!(!Kind::Application.scratch());
+        assert_eq!(SCRATCH_NAMES, ["tmp", "var-tmp", "shm", "run"]);
+        assert_ne!(SCRATCH, Kind::Workspace.homes());
     }
 
     /// A reserved name resolves only to a row of a kind its form names:

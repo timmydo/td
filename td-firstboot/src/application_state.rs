@@ -3,7 +3,7 @@
 //! application whose account predates the workload account ledger, or empty
 //! for one an install allocated, then, while the human's session runs, by
 //! the install. A sandbox's or workspace's is made empty when root
-//! allocates its account.
+//! allocates its account, and a workspace's scratch tree beside it.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
@@ -252,13 +252,118 @@ pub(crate) fn create(application: &str, uid: u32, fresh: bool) -> Result<(), Str
 /// mode 0700, below a root-owned mode-0755 `workloads` made when absent.
 /// Nothing of the human's is moved in; a published home is left as it
 /// stands, root's interrupted creation, empty, is completed, and a `fresh`
-/// account refuses any existing home, as `create` does. The caller holds
-/// the principal lock.
-pub(crate) fn create_workload(uid: u32, fresh: bool) -> Result<(), String> {
-    if !crate::workload_accounts::WORKLOAD_UIDS.contains(&uid) {
+/// account refuses any existing home, as `create` does. A kind with a
+/// scratch tree (`Kind::scratch`, a workspace's) then gets `scratch`'s.
+/// The caller holds the principal lock.
+pub(crate) fn create_workload(
+    kind: crate::workload_accounts::Kind,
+    uid: u32,
+    fresh: bool,
+) -> Result<(), String> {
+    if !crate::workload_accounts::WORKLOAD_UIDS.contains(&uid)
+        || kind == crate::workload_accounts::Kind::Application
+    {
         return Err("invalid workload account uid".into());
     }
-    home(&LIVE, Purpose::Workload, (uid, uid), fresh)
+    workload(&LIVE, kind, (uid, uid), fresh)
+}
+
+/// `create_workload`'s preparation below `place`.
+fn workload(
+    place: &Place,
+    kind: crate::workload_accounts::Kind,
+    account: Owner,
+    fresh: bool,
+) -> Result<(), String> {
+    home(place, Purpose::Workload, account, fresh)?;
+    if kind.scratch() {
+        scratch(place, account, fresh)?;
+    }
+    Ok(())
+}
+
+/// The scratch tree of a workspace's account, `workload-scratch/UID`
+/// (td-authd/DESIGN.md, "Workload account ledger"), below a root-owned
+/// mode-0755 `workload-scratch` made when absent: root's directory of the
+/// account's group at mode 0710, holding `SCRATCH_NAMES`, each the
+/// account's at mode 1777, which its jails bind at `/tmp`, `/var/tmp`,
+/// `/dev/shm` and `/run`. The tree's group keeps every other account out,
+/// since no passwd or group entry may hold a ledger gid; the account
+/// reaches its four directories by name and can neither list the tree nor
+/// add, rename or remove an entry of it, so it cannot replace one. A mode
+/// it changed on one of its own is restored and what it holds kept. The tree is made root's at 0700 and given to the account's group
+/// last, each directory made root's, then given; root's interrupted
+/// creation, its directories empty, is completed, and a `fresh` account
+/// refuses any existing tree. The caller holds the principal lock.
+fn scratch(place: &Place, account: Owner, fresh: bool) -> Result<(), String> {
+    let (root, ids) = (place.root, place.ids);
+    let shared = (root.0, account.1);
+    let result = (|| {
+        let base = root_chain(place, crate::workload_accounts::SCRATCH)?;
+        let name = crate::allocation::format(format_args!("{}", account.0))
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let tree = match directory(&at(&base, &name)) {
+            Ok(_) if fresh => {
+                return Err(invalid("a new account's scratch tree already exists"));
+            }
+            Ok(existing) => {
+                let metadata = existing.metadata()?;
+                if !(matches_owner(ids, &metadata, shared) || matches_owner(ids, &metadata, root))
+                    || metadata.mode() & 0o7777 & !0o710 != 0
+                {
+                    return Err(invalid("scratch tree has invalid ownership or permissions"));
+                }
+                existing
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                root_child(ids, &base, &name, 0o700, root)?
+            }
+            Err(error) => return Err(error),
+        };
+        for child in crate::workload_accounts::SCRATCH_NAMES {
+            let made = match directory(&at(&tree, child)) {
+                Ok(existing) => {
+                    let metadata = existing.metadata()?;
+                    if !matches_owner(ids, &metadata, account) {
+                        // Root's interrupted creation, which nothing else
+                        // could reach: complete it only empty.
+                        if !matches_owner(ids, &metadata, root)
+                            || metadata.mode() & 0o7777 & !0o700 != 0
+                        {
+                            return Err(invalid(
+                                "scratch directory has invalid ownership or permissions",
+                            ));
+                        }
+                        require_empty(&existing)?;
+                        ids.give(&existing, account)?;
+                    }
+                    existing
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let made = root_child(ids, &tree, child, 0o700, root)?;
+                    ids.give(&made, account)?;
+                    made
+                }
+                Err(error) => return Err(error),
+            };
+            if made.metadata()?.mode() & 0o7777 != 0o1777 {
+                made.set_permissions(Permissions::from_mode(0o1777))?;
+            }
+            made.sync_all()?;
+        }
+        // Every directory is the account's before the tree opens to it.
+        ids.give(&tree, shared)?;
+        tree.set_permissions(Permissions::from_mode(0o710))?;
+        tree.sync_all()?;
+        base.sync_all()
+    })();
+    result.map_err(|error| {
+        crate::allocation::format(format_args!(
+            "prepare workload account {} scratch tree: {error}",
+            account.0
+        ))
+        .unwrap_or_default()
+    })
 }
 
 /// Whose home `home` prepares.
@@ -587,6 +692,7 @@ fn matches_owner(ids: &dyn Ownership, metadata: &Metadata, owner: Owner) -> bool
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::workload_accounts::Kind;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -719,7 +825,18 @@ mod tests {
         }
 
         fn workload(&self, fresh: bool) -> Result<(), String> {
-            home(&self.place(), Purpose::Workload, WORKLOAD, fresh)
+            workload(&self.place(), Kind::Sandbox, WORKLOAD, fresh)
+        }
+
+        fn workspace(&self, fresh: bool) -> Result<(), String> {
+            workload(&self.place(), Kind::Workspace, WORKLOAD, fresh)
+        }
+
+        fn scratch_tree(&self) -> PathBuf {
+            self.temp
+                .path()
+                .join("workload-scratch")
+                .join(WORKLOAD.0.to_string())
         }
 
         fn workload_home(&self) -> PathBuf {
@@ -810,12 +927,123 @@ mod tests {
         // human's state where it was.
         assert_eq!(fs::read_dir(&workloads).unwrap().count(), 1);
         assert!(!homes.temp.path().join("applications").exists());
+        // A sandbox has no scratch tree.
+        assert!(!homes.temp.path().join("workload-scratch").exists());
         assert_eq!(fs::read(&record).unwrap(), b"the human's");
         fs::write(home.join("kept"), b"state").unwrap();
         homes.workload(false).unwrap();
         assert_eq!(fs::read(home.join("kept")).unwrap(), b"state");
         assert!(homes.workload(true).is_err());
         assert_eq!(fs::read(home.join("kept")).unwrap(), b"state");
+    }
+
+    /// A workspace's account also gets its scratch tree: a root-owned 0755
+    /// `workload-scratch` made when absent, holding the account's tree,
+    /// root's of the account's group at 0710, whose four directories are
+    /// the account's at 1777 and empty. A repeat keeps what they hold and
+    /// restores the modes the account changed; a new row refuses the tree
+    /// as another's leftover.
+    #[test]
+    fn a_workspace_gets_a_scratch_tree_of_four_directories_of_its_own() {
+        let homes = Homes::new();
+        homes.workspace(true).unwrap();
+        assert_eq!(homes.owner(&homes.workload_home()), WORKLOAD);
+        let base = homes.temp.path().join("workload-scratch");
+        assert_eq!(homes.owner(&base), homes.root);
+        assert_eq!(fs::metadata(&base).unwrap().mode() & 0o7777, 0o755);
+        let tree = homes.scratch_tree();
+        assert_eq!(homes.owner(&tree), (homes.root.0, WORKLOAD.1));
+        assert_eq!(fs::metadata(&tree).unwrap().mode() & 0o7777, 0o710);
+        let mut names: Vec<String> = fs::read_dir(&tree)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["run", "shm", "tmp", "var-tmp"]);
+        for name in crate::workload_accounts::SCRATCH_NAMES {
+            let path = tree.join(name);
+            assert_eq!(homes.owner(&path), WORKLOAD, "{name}");
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o1777);
+            assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+        }
+        fs::write(tree.join("tmp/kept"), b"state").unwrap();
+        for (name, mode) in [("tmp", 0o700), ("run", 0o2755), ("shm", 0o500)] {
+            fs::set_permissions(tree.join(name), Permissions::from_mode(mode)).unwrap();
+        }
+        homes.workspace(false).unwrap();
+        assert_eq!(fs::read(tree.join("tmp/kept")).unwrap(), b"state");
+        for name in crate::workload_accounts::SCRATCH_NAMES {
+            let path = tree.join(name);
+            assert_eq!(homes.owner(&path), WORKLOAD, "{name}");
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o1777);
+        }
+        assert_eq!(fs::metadata(&tree).unwrap().mode() & 0o7777, 0o710);
+        // A new row refuses the tree, whose home it refuses first; the
+        // tree's own preparation refuses it too, apart from the home's.
+        assert!(homes.workspace(true).is_err());
+        assert!(scratch(&homes.place(), WORKLOAD, true).is_err());
+        assert_eq!(fs::read(tree.join("tmp/kept")).unwrap(), b"state");
+    }
+
+    /// A scratch tree root left unpublished is completed when its
+    /// directories are empty, and a directory root made but did not give
+    /// is given; a planted file, a directory or tree of another owner or
+    /// wider mode, and a link in a directory's place refuse.
+    #[test]
+    fn a_scratch_tree_completes_only_an_empty_interrupted_creation() {
+        let interrupted = || {
+            let homes = Homes::new();
+            let base = homes.temp.path().join("workload-scratch");
+            homes.left(&base, homes.root);
+            fs::set_permissions(&base, Permissions::from_mode(0o755)).unwrap();
+            let tree = homes.scratch_tree();
+            homes.left(&tree, homes.root);
+            homes.left(&tree.join("tmp"), homes.root);
+            homes.left(&tree.join("var-tmp"), WORKLOAD);
+            (homes, tree)
+        };
+        let (homes, tree) = interrupted();
+        assert!(scratch(&homes.place(), WORKLOAD, true).is_err());
+        assert_eq!(homes.owner(&tree), homes.root);
+        scratch(&homes.place(), WORKLOAD, false).unwrap();
+        assert_eq!(homes.owner(&tree), (homes.root.0, WORKLOAD.1));
+        for name in crate::workload_accounts::SCRATCH_NAMES {
+            assert_eq!(homes.owner(&tree.join(name)), WORKLOAD, "{name}");
+            let mode = fs::metadata(tree.join(name)).unwrap().mode() & 0o7777;
+            assert_eq!(mode, 0o1777, "{name}");
+        }
+
+        let (homes, tree) = interrupted();
+        homes.record(&tree.join("tmp/planted"), HUMAN);
+        assert!(scratch(&homes.place(), WORKLOAD, false).is_err());
+        assert_eq!(homes.owner(&tree.join("tmp")), homes.root);
+        assert_eq!(homes.owner(&tree), homes.root);
+
+        let (homes, tree) = interrupted();
+        homes.set(&tree.join("tmp"), HUMAN);
+        assert!(scratch(&homes.place(), WORKLOAD, false).is_err());
+
+        let (homes, tree) = interrupted();
+        fs::set_permissions(tree.join("tmp"), Permissions::from_mode(0o755)).unwrap();
+        assert!(scratch(&homes.place(), WORKLOAD, false).is_err());
+
+        let (homes, tree) = interrupted();
+        let elsewhere = homes.temp.path().join("elsewhere");
+        homes.left(&elsewhere, WORKLOAD);
+        std::os::unix::fs::symlink(&elsewhere, tree.join("shm")).unwrap();
+        assert!(scratch(&homes.place(), WORKLOAD, false).is_err());
+
+        for owner in [HUMAN, WORKLOAD, ACCOUNT] {
+            let (homes, tree) = interrupted();
+            homes.set(&tree, owner);
+            assert!(
+                scratch(&homes.place(), WORKLOAD, false).is_err(),
+                "{owner:?}"
+            );
+        }
+        let (homes, tree) = interrupted();
+        fs::set_permissions(&tree, Permissions::from_mode(0o750)).unwrap();
+        assert!(scratch(&homes.place(), WORKLOAD, false).is_err());
     }
 
     /// A workload home root left unpublished is completed when empty and
@@ -898,13 +1126,19 @@ mod tests {
     }
 
     #[test]
-    fn a_workload_home_takes_only_a_workload_uid() {
-        for uid in [0, 1000, 65536, 98303, 131072, u32::MAX] {
-            assert_eq!(
-                create_workload(uid, true).unwrap_err(),
-                "invalid workload account uid"
-            );
+    fn a_workload_home_takes_only_a_workload_uid_and_kind() {
+        for kind in [Kind::Sandbox, Kind::Workspace] {
+            for uid in [0, 1000, 65536, 98303, 131072, u32::MAX] {
+                assert_eq!(
+                    create_workload(kind, uid, true).unwrap_err(),
+                    "invalid workload account uid"
+                );
+            }
         }
+        assert_eq!(
+            create_workload(Kind::Application, 98304, true).unwrap_err(),
+            "invalid workload account uid"
+        );
     }
 
     /// A run killed before publication leaves root-owned state, which a

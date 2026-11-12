@@ -165,8 +165,9 @@ and workspace UIDs, 98304 through 131071, `td-workload-UID/session`. Every
 other non-root UID reports that no delegation is configured. Firstboot
 prepares only the installed, durably reserved application accounts'
 cgroups and, on the desktop, the runtime account's at sysinit, and a
-sandbox account's when root allocates it or launches it, as specified in
-`td-authd/DESIGN.md`; this selector alone activates nothing.
+sandbox or workspace account's when root allocates or prepares it,
+as specified in `td-authd/DESIGN.md`; this selector alone activates
+nothing.
 The root-configured td-authd application launcher, and its workspace
 launch intake for a sandbox's account, make a failed placement fatal
 before workload code runs, as the terminal launcher does for the human
@@ -232,19 +233,24 @@ grant's, not the launch's. A deletion destroys what the sandbox's home
 held, which no program of the human's could reach before: the human's
 programs act for the human, and the human may delete a sandbox. A
 creation adds a permanent ledger row, so such a program can spend the
-sandbox and workspace rows by cycling names, after which a new sandbox
-is refused for good, but not crowd out an application's row
-(td-authd/DESIGN.md, "Workload account ledger"). At most 20 connections
-are served at once, at most 16 of them launches, so such a program can
-hold the intake's launches up until its shells end and its other verbs
-for as long as each takes, but not an application's launch. Root admits only the
-request's fixed grammar, writes the jail's spec itself and runs only
-td's own td-sandbox relay in the jail, with the shell root names or the
-command the request names inside it; a request names no environment,
-descriptor or spec, and a path only as a grant row the writer
-validates. The account a sandbox runs as cannot reach the intake: its
-socket's mode admits the human alone, and the peer check refuses any
-other uid.
+sandbox rows, half of the sandbox and workspace rows, by cycling names,
+after which a new sandbox is refused for good, but not crowd out a
+workspace's row or an application's (td-authd/DESIGN.md, "Workload
+account ledger"). Once the intake creates workspaces (WORKLOADS.md step
+8), such a program can spend the workspace rows too, but root admits
+only td-agent's own slot names for them, so it can make td-agent's
+slots before td-agent does, which td-agent adopts, and not deny it one
+unless an earlier deployment's sandboxes already hold `WORKLOAD_ROWS`.
+At most 20 connections are served at once, at most 16 of them launches,
+so such a program can hold the intake's launches up until its shells end
+and its other verbs for as long as each takes, but not an application's
+launch. Root admits only the request's fixed grammar, writes the jail's
+spec itself and runs only td's own td-sandbox relay in the jail, with
+the shell root names or the command the request names inside it; a
+request names no environment, descriptor or spec, and a path only as a
+grant row the writer validates. The account a sandbox runs as cannot
+reach the intake: its socket's mode admits the human alone, and the peer
+check refuses any other uid.
 
 A writable grant is what lets a sandbox reach back into what the human
 runs, and its view's execute permission does not bear on that. The

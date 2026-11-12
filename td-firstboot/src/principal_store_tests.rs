@@ -1406,22 +1406,190 @@ fn a_sandbox_allocation_avoids_rows_ids_and_left_homes() {
     temp.cleanup().unwrap();
 }
 
-/// Only a session owner's sandbox is allocated here: a workspace's waits
-/// for step 8, and an application's is the install's.
+/// Only a session owner's sandbox or workspace is allocated here; an
+/// application's is the install's.
 #[test]
-fn only_a_sessions_sandbox_is_allocatable_as_a_workload() {
+fn only_a_sessions_sandbox_or_workspace_is_allocatable_as_a_workload() {
     let registry = Registry::parse(SESSION).unwrap();
-    workload_allocatable(&registry, 1000, Kind::Sandbox).unwrap();
-    for (owner, kind) in [
-        (1001, Kind::Sandbox),
-        (1000, Kind::Workspace),
-        (1000, Kind::Application),
+    workload_allocatable(&registry, 1000, Kind::Sandbox, "default").unwrap();
+    workload_allocatable(&registry, 1000, Kind::Workspace, "agent-1").unwrap();
+    for (owner, kind, name) in [
+        (1001, Kind::Sandbox, "default"),
+        (1001, Kind::Workspace, "agent-1"),
+        (1000, Kind::Application, "photo"),
     ] {
         assert!(
-            workload_allocatable(&registry, owner, kind).is_err(),
+            workload_allocatable(&registry, owner, kind, name).is_err(),
             "{owner} {kind:?}"
         );
     }
+}
+
+/// A workspace's account is one of td-agent's slots, `agent-1` through
+/// `agent-960` and `review-1` through `review-64`; any other name is
+/// refused for a workspace, and a sandbox keeps any ledger name, a slot's
+/// included.
+#[test]
+fn a_workspace_account_is_one_of_td_agents_slots() {
+    let registry = Registry::parse(SESSION).unwrap();
+    for name in ["agent-1", "agent-960", "review-1", "review-64"] {
+        workload_allocatable(&registry, 1000, Kind::Workspace, name).unwrap();
+        workload_allocatable(&registry, 1000, Kind::Sandbox, name).unwrap();
+    }
+    for name in [
+        "agent-0",
+        "agent-961",
+        "agent-01",
+        "review-0",
+        "review-65",
+        "review-064",
+        "default",
+        "agent",
+        "junk-1",
+    ] {
+        let refused = workload_allocatable(&registry, 1000, Kind::Workspace, name).unwrap_err();
+        assert!(refused.contains("td-agent's slots"), "{name}: {refused}");
+    }
+    workload_allocatable(&registry, 1000, Kind::Sandbox, "default").unwrap();
+}
+
+/// `directory`'s allocation of the workspace `name`, as `allocate_sandbox`.
+fn allocate_workspace(
+    directory: &Directory,
+    name: &str,
+    outside: BTreeSet<u32>,
+    prepared: &mut Vec<(u32, bool)>,
+) -> Result<u32, String> {
+    directory.allocate_account(
+        Kind::Workspace,
+        name,
+        || Ok(outside),
+        |_, _, _| Ok(()),
+        |uid, fresh| {
+            prepared.push((uid, fresh));
+            Ok(())
+        },
+    )
+}
+
+/// A workspace's account, td-agent's slot, takes the lowest free uid of the
+/// range sandboxes share, beside a sandbox of the same name and never at
+/// its uid; a repeat returns the row and prepares again, not as new, and a
+/// launch's preparation finds it and adds none.
+#[test]
+fn a_workspace_allocation_takes_a_workload_uid_once() {
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let mut prepared = Vec::new();
+    assert_eq!(
+        allocate_sandbox(&directory, "agent-1", BTreeSet::new(), &mut prepared).unwrap(),
+        98304
+    );
+    assert_eq!(
+        allocate_workspace(&directory, "agent-1", BTreeSet::new(), &mut prepared).unwrap(),
+        98305
+    );
+    assert_eq!(
+        allocate_workspace(&directory, "agent-1", BTreeSet::new(), &mut prepared).unwrap(),
+        98305
+    );
+    assert_eq!(prepared, [(98304, true), (98305, true), (98305, false)]);
+    assert_eq!(
+        account_ledger(&directory).unwrap(),
+        format!("{SEEDED}sandbox\tagent-1\t98304\nworkspace\tagent-1\t98305\n")
+    );
+    let before = account_ledger(&directory);
+    let mut again = Vec::new();
+    assert_eq!(
+        directory
+            .prepare_account(Kind::Workspace, "agent-1", |uid| {
+                again.push(uid);
+                Ok(())
+            })
+            .unwrap(),
+        98305
+    );
+    assert_eq!(again, [98305]);
+    let refused = directory
+        .prepare_account(Kind::Workspace, "review-1", |_| Err("prepared".into()))
+        .unwrap_err();
+    assert!(refused.contains("has no account"), "{refused}");
+    assert_eq!(account_ledger(&directory), before);
+    temp.cleanup().unwrap();
+}
+
+/// A ledger whose workspace rows fill their half refuses a new workspace,
+/// publishing and preparing nothing, and still allocates a sandbox, and
+/// the reverse: neither kind can spend the other's rows.
+#[test]
+fn a_full_workload_kind_refuses_and_leaves_the_other_its_rows() {
+    for (full, other) in [
+        (Kind::Workspace, Kind::Sandbox),
+        (Kind::Sandbox, Kind::Workspace),
+    ] {
+        let mut text = String::from(SEEDED);
+        for index in 0..workload_accounts::WORKLOAD_KIND_ROWS {
+            text.push_str(&format!(
+                "{}\tf{index:05}\t{}\n",
+                full.as_str(),
+                98304 + index
+            ));
+        }
+        let ledger = Ledger::parse(&text).unwrap();
+        let (temp, directory) =
+            allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(&ledger.encode()));
+        let before = account_ledger(&directory);
+        let refused = directory
+            .allocate_account(
+                full,
+                "more",
+                no_ids,
+                |_, _, _| Ok(()),
+                |_, _| Err("prepared".into()),
+            )
+            .unwrap_err();
+        assert!(refused.contains("bound"), "{full:?}: {refused}");
+        assert_eq!(account_ledger(&directory), before);
+        let uid = directory
+            .allocate_account(other, "more", no_ids, |_, _, _| Ok(()), |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(uid, 98304 + 1024, "{other:?}");
+        temp.cleanup().unwrap();
+    }
+}
+
+/// A workspace's new row avoids every scratch tree left below
+/// `workload-scratch`, as it avoids a home: a lost ledger forgot those
+/// accounts, whose trees remain. A sandbox's does too, and a linked
+/// `workload-scratch` refuses.
+#[test]
+fn a_workload_allocation_avoids_left_scratch_trees() {
+    for kind in [Kind::Workspace, Kind::Sandbox] {
+        let (temp, directory) =
+            allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+        let trees = temp.path().join(workload_accounts::SCRATCH);
+        DirBuilder::new().mode(0o755).create(&trees).unwrap();
+        for name in ["98304", "98306", "098305"] {
+            DirBuilder::new()
+                .mode(0o710)
+                .create(trees.join(name))
+                .unwrap();
+        }
+        let uid = directory
+            .allocate_account(kind, "agent-1", no_ids, |_, _, _| Ok(()), |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(uid, 98305, "{kind:?}");
+        temp.cleanup().unwrap();
+    }
+    let (temp, directory) = allocation_fixture(&Registry::parse(SESSION).unwrap(), Some(SEEDED));
+    let elsewhere = notebook_temp::TempDir::new("td-workload-scratch").unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path(),
+        temp.path().join(workload_accounts::SCRATCH),
+    )
+    .unwrap();
+    assert!(allocate_workspace(&directory, "agent-1", BTreeSet::new(), &mut Vec::new()).is_err());
+    assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    temp.cleanup().unwrap();
 }
 
 /// A grant request's table: the seed published as boot publishes it.
@@ -1538,7 +1706,7 @@ fn grant_requests_refuse_and_change_nothing() {
         read_only("Pictures"),
         GrantVerb::Revoke("Pictures".into()),
         GrantVerb::Network(Network::Host),
-        GrantVerb::Clear,
+        GrantVerb::Network(Network::Off),
     ] {
         let error = directory
             .grants(
@@ -1773,6 +1941,58 @@ fn a_sandbox_clear_takes_its_directories_and_network_and_keeps_its_account() {
     let error = grant(&directory, &GrantVerb::Clear).unwrap_err();
     assert!(error.contains("only a sandbox"), "{error}");
     assert_eq!(listed(&directory), ["rw\tDownloads"]);
+    temp.cleanup().unwrap();
+}
+
+/// A workspace's slot is freed by clearing every row of its name,
+/// directory, socket and network alike, as a sandbox's deletion clears its
+/// rows: admitting nothing, needing no ledger row, and leaving a sandbox of
+/// the same name and another workspace's rows. Nothing else of a
+/// workspace's is changed or listed here yet.
+#[test]
+fn a_workspace_clear_takes_every_row_of_its_name_alone() {
+    let temp = notebook_temp::TempDir::new("td-grant-workspace").unwrap();
+    let directory = account_directory(&temp);
+    let rows = concat!(
+        "sandbox\tagent-1\tnetwork\thost\n",
+        "workspace\tagent-1\tdirectory\trw\tsrc\n",
+        "workspace\tagent-1\tnetwork\thost\n",
+        "workspace\tagent-1\tsocket\twayland\n",
+        "workspace\tagent-2\tnetwork\thost\n",
+    );
+    public_file(
+        &directory.path(workload_grants::FILE_NAME),
+        &format!("{GRANTS_SEED}{rows}"),
+        0o600,
+    );
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    let clear = |name: &str| {
+        directory.grants(
+            Kind::Workspace,
+            name,
+            &GrantVerb::Clear,
+            || Err("admitted".into()),
+            Duration::from_secs(1),
+        )
+    };
+    assert_eq!(clear("agent-1").unwrap(), GrantReply::Cleared(3));
+    assert_eq!(
+        grant_table(&directory).unwrap(),
+        format!(
+            "{GRANTS_SEED}sandbox\tagent-1\tnetwork\thost\nworkspace\tagent-2\tnetwork\thost\n"
+        )
+    );
+    let published = fs::metadata(directory.path(workload_grants::FILE_NAME)).unwrap();
+    assert_eq!(clear("agent-1").unwrap(), GrantReply::Cleared(0));
+    assert_eq!(clear("review-1").unwrap(), GrantReply::Cleared(0));
+    assert_eq!(
+        fs::metadata(directory.path(workload_grants::FILE_NAME))
+            .unwrap()
+            .ino(),
+        published.ino()
+    );
     temp.cleanup().unwrap();
 }
 

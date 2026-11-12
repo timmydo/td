@@ -302,7 +302,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/workload_accounts.rs",
-        "host and target-static td-firstboot's workload account ledger seeding and allocation (an application's at install, a sandbox's), and its readers: td-login's workload accounts, target-static td-sandbox's sandbox names, intake socket and account homes, and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
+        "host and target-static td-firstboot's workload account ledger seeding and allocation (an application's at install, a sandbox's or workspace's, with a workspace's scratch tree), and its readers: td-login's workload accounts, target-static td-authd's emptying of that tree, target-static td-sandbox's sandbox names, intake socket and account homes, and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
     ),
     (
         "engine/src/workload_grants.rs",

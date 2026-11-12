@@ -1536,6 +1536,22 @@ mod tests {
     }
 
     #[test]
+    fn persistent_scratch_targets_follow_the_ledgers_scratch_names() {
+        // Root makes a workspace account's scratch tree in the ledger's
+        // order (engine/src/workload_accounts.rs `SCRATCH_NAMES`), which a
+        // spec's scratch lines will follow onto these targets.
+        let named: Vec<String> = crate::workload_accounts::SCRATCH_NAMES
+            .iter()
+            .map(|name| match *name {
+                "var-tmp" => "/var/tmp".to_string(),
+                "shm" => "/dev/shm".to_string(),
+                other => format!("/{other}"),
+            })
+            .collect();
+        assert_eq!(named, SCRATCH_TARGETS);
+    }
+
+    #[test]
     fn persistent_scratch_requires_development_and_all_four_sources() {
         let scratch = "scratch=/a\nscratch=/b\nscratch=/c\nscratch=/d\n";
         assert!(parse_spec(&format!("format=1\nentry=/e\nhome=/h\n{scratch}")).is_err());

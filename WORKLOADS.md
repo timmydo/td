@@ -20,6 +20,26 @@ No workload runs as the human. Each runs as an account of its own, sees a
 read-only runtime, owns a private writable home, and reaches anything of
 the human's only through a grant the human made and td-authd performed.
 
+One exception is deliberate, and the repository user chose it:
+td-agent's unconfined workspace, which the human picks for a
+conversation, or which is all the chooser offers where td-jail cannot
+run and the human enabled `unconfined_without_jail` (td-agent/DESIGN.md
+§8, "Unconfined workspaces"), runs its tools as the human with no jail.
+The model drives those tools and its input can be hostile, so this is
+the workload the decision otherwise forbids, with everything the human
+holds: the whole home, the SSH keys and agent, td-agent's key file, its
+store and the repositories it publishes; the compositor's control
+socket, whose human-credential check is the one this decision keeps
+workloads from passing, so it can grant any application or sandbox any
+of the human's directories, or a sandbox the host's network; td-agent's
+own control socket, so it can answer its own cards; root's workspace
+intake, so it
+can create, delete and launch any sandbox and spend workload rows, and
+from step 8 empty or enter any confined conversation's slot; and no
+bound on the processes it leaves (td-login/THREAT-MODEL.md §1). Every
+other td-agent workspace is jailed and, from step 8, runs as an account
+of its own.
+
 The alternative, every workload as the human with sharing by plain bind
 mounts, is simpler and was rejected. Its jail is then the only wall: an
 escape from Firefox, a sandbox or an agent's tools holds the human's whole
@@ -105,10 +125,15 @@ their old homes left in place (td-sandbox/DESIGN.md, "Import").
 td-sandbox calls no td-jail, and td-jail refuses td's account the
 sandbox's offline profile.
 
-Not built: subordinate accounts, workspace accounts and their
-allocation, the `map-subuid` operation `APPLICATIONS.md` names, grant
-requests for workspace accounts (step 8), and socket grants, whose rows
-the table already parses and no request writes.
+Step 8 began: td-firstboot allocates and prepares a workspace's account
+as it does a sandbox's, with a scratch tree beside its home, and each
+kind keeps to half of the workload rows; nothing asks for one yet.
+
+Not built: subordinate accounts, launches as a workspace account and
+root's verbs for them (step 8), the `map-subuid` operation
+`APPLICATIONS.md` names, grant requests for workspace accounts (step 8),
+and socket grants, whose rows the table already parses and no request
+writes.
 
 ## A launch
 
@@ -199,7 +224,12 @@ A workload account's home is root-created at mode 0700:
 `/var/lib/td/applications/<uid>` for applications, as today, and
 `/var/lib/td/workloads/<uid>` for sandboxes and workspaces. A sandbox's
 home is there; the per-profile homes td-sandbox kept before stay where
-they were, untouched (td-sandbox/DESIGN.md, "Import").
+they were, untouched (td-sandbox/DESIGN.md, "Import"). A workspace's
+account also has a scratch tree, `/var/lib/td/workload-scratch/<uid>`,
+root's with four directories of the account's, the persistent `/tmp`,
+`/var/tmp`, `/dev/shm` and `/run` of its jails, outside the home since a
+jail's directories may not nest (td-authd/DESIGN.md, "Workload account
+ledger").
 
 The ledger is `/var/lib/td/accounts.tsv`, root:root mode 0644, with one
 `KIND<TAB>NAME<TAB>UID` row per account (td-authd/DESIGN.md, "Workload
@@ -220,9 +250,11 @@ every application row the reservation ledger retains, so a former
 install's Claude Code keeps 65539. Rows are keyed by kind and name,
 not by human owner, sandboxes' and workspaces' as applications': a
 second human would share them, and serving one is a later decision.
-Sandbox and workspace rows together stop at 2048, so a session that
-cycles sandbox names cannot spend the rows applications need
-(td-authd/DESIGN.md, "Workload account ledger").
+Sandbox and workspace rows stop at 2048 together and at 1024 each, so a
+session that cycles sandbox names can spend neither the rows
+applications need nor td-agent's workspace rows; a workspace's name is
+one of td-agent's own slots, so spending those only makes slots
+td-agent adopts (td-authd/DESIGN.md, "Workload account ledger").
 
 ## Grants
 
@@ -287,8 +319,9 @@ All workload launches go through root:
 
 td-sandbox launches no jail itself; it asks root's intake for a launch,
 and td-agent will (step 8). td-agent's unconfined workspace, which runs tools as the human
-with no jail, is retired: every agent workspace is jailed under its own
-account.
+with no jail, stays as the decision's one deliberate exception, with
+what it holds (above); every other agent workspace is jailed under its
+own account.
 
 ## Landing order
 
@@ -402,8 +435,39 @@ account.
    account the sandbox's offline profile; and the `sandbox-evidence`
    oracle runs a sandbox through the intake on a QEMU image,
    td-sandbox/DESIGN.md).
-8. td-agent workspaces on ledger accounts; the unconfined workspace is
-   retired.
+8. td-agent workspaces on ledger accounts. The repository user decided:
+   only confined workspaces move, to `workspace` rows; the unconfined
+   workspace stays as the human, the exception named above. A workspace
+   account is a reusable per-conversation slot, `agent-N`: deleting a
+   conversation empties its slot (its home and scratch tree, as the
+   account) and clears its rows, freeing it, and the next conversation
+   creates it again fresh, as a deleted sandbox is created again. The
+   human's directories reach the account as per-launch views from
+   td-agent's plan. A built-in "diagnose" template follows, and reviews
+   move through root onto a `review-N` slot pool, retiring td-jail's
+   uid-1000 workspace class. In six landings:
+   workspace accounts in the ledger, with nothing launched as one (landed:
+   `allocate-workload` and `prepare-workload` admit the `workspace` kind,
+   only td-agent's slots, `agent-1` through `agent-960` and `review-1`
+   through `review-64`, exactly the kind's rows, so a program spending
+   them can only make slots td-agent adopts; the two kinds keep to 2048
+   workload rows together and each to 1024; a
+   workspace's account gets a scratch tree
+   `/var/lib/td/workload-scratch/UID`, root's of the account's group at
+   0710 with `tmp`, `var-tmp`, `shm` and `run` the account's at 1777,
+   which the allocator's taken set counts as it counts homes, a new row
+   refusing a leftover; `workspace-empty` empties the tree's
+   directories as the account and leaves them at 1777, and the grant
+   table's writer clears a
+   workspace's rows; td-login already resolves `tdw<uid>` from a
+   workspace row, td-authd/DESIGN.md, "Workload account ledger"); root
+   launching a workspace instance (the intake's workspace verbs, a
+   per-launch plan and its views, td-jail's role lines and its admitting
+   a ledger account's scratch lines, a deletion that ends the slot's
+   processes before its account empties it, and workspace grants, which
+   share the sandbox and workspace half of the grant table); td-agent's intake client, unused; td-agent's cutover, with a
+   VM oracle; reviews on the `review-N` pool through root; and the
+   diagnose template.
 9. mail and news on their reserved rows, with fetch services of their
    own as td-web has (td-web/DESIGN.md §3).
 10. td-software's runtime view (its folders panel landed with step 6).

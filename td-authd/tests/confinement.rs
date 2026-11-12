@@ -1692,6 +1692,17 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(
         workspace.contains(".args([\"/bin/td-authd\", \"workspace-empty\", &uid.to_string()]);")
     );
+    // The account's emptying, after its credentials are checked, walks its
+    // home and then its scratch tree's directories, each by the one walk.
+    assert!(workspace.contains(
+        "    empty_home(&Kind::Sandbox.home(uid), uid)?;\n    empty_scratch(Path::new(accounts::DIRECTORY), uid)\n}"
+    ));
+    assert!(workspace.contains(
+        "        empty_home(&directory, uid)?;\n        // The walk opened it to its owner alone; it is a `/tmp` again,\n        // through a handle that follows no link.\n        let handle = OpenOptions::new()\n            .read(true)\n            .custom_flags(O_PATH | O_NOFOLLOW | O_DIRECTORY)\n            .open(&directory)\n"
+    ));
+    assert!(workspace
+        .contains("fs::set_permissions(fd_path(&handle)?, fs::Permissions::from_mode(0o1777))"));
+    assert_eq!(workspace.matches("empty_scratch(").count(), 2);
     let accepting = workspace
         .split("pub(crate) fn serve()")
         .nth(1)
@@ -1743,7 +1754,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x780971233c3be771;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f8b0e4c319550d1;
-const WORKSPACE_FINGERPRINT: u64 = 0x865229cd5a76475a;
+const WORKSPACE_FINGERPRINT: u64 = 0x9a5c9f207a502360;
 const APPLICATION_FINGERPRINT: u64 = 0xf4b2603ba8d7144b;
 
 fn fingerprint(source: &str) -> u64 {
