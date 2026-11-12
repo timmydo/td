@@ -244,6 +244,7 @@ pub(super) fn exercise(
     .unwrap();
     let pending = td_mta::postgres_http_updates::Pending::default();
     let backend = td_mta::postgres_http_api::Service {
+        memory: &td_mta::https_api_storage::RequestMemory::new(resources).unwrap(),
         loaded: &loaded,
         executable,
         binding,

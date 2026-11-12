@@ -1483,9 +1483,19 @@ pub(super) mod tests {
         limits: Limits,
         capabilities: &[&str],
     ) -> OwnedRequest {
-        let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        let mut bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_bytes,
+            0,
+        )
+        .unwrap();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = vec![arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            arena::Token::EMPTY,
+        )
+        .unwrap();
         let mut parser = arena::OwnedCursor::with_input_length(
             bytes,
             tokens,

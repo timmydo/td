@@ -189,6 +189,7 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    steps.extend(crate::shared::allocation_sources());
     let profile = [
         "--edition",
         "2021",
@@ -213,10 +214,16 @@ pub fn recipe() -> Recipe {
             &[][..],
         ),
         (
+            "td_alloc",
+            "{src}/td-alloc/src/owned.rs",
+            "{root}/libtd_alloc.rlib",
+            &[][..],
+        ),
+        (
             "td_json",
             "{src}/td-json/src/lib.rs",
             "{root}/libtd_json.rlib",
-            &[][..],
+            &["--extern", "td_alloc={root}/libtd_alloc.rlib"],
         ),
         (
             "td_luks",
@@ -273,7 +280,7 @@ mod tests {
     fn every_crate_source_is_staged() {
         crate::shared::assert_sibling_sources_staged(
             super::recipe(),
-            &["td-luks", "td-fido", "td-json"],
+            &["td-luks", "td-fido", "td-json", "td-alloc"],
         );
     }
 }

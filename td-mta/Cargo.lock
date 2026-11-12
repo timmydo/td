@@ -600,6 +600,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-civil"
 version = "0.1.0"
 
@@ -628,6 +632,9 @@ version = "0.1.0"
 [[package]]
 name = "td-json"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-mime"
@@ -642,6 +649,7 @@ dependencies = [
 name = "td-mta"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-civil",
  "td-crypto",
  "td-fs",

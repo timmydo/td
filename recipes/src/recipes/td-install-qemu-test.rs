@@ -60,42 +60,66 @@ pub fn recipe() -> Recipe {
         "td-btrfs",
         "tzdata",
     ]);
-    let mut steps = Vec::new();
+    let mut steps = crate::shared::allocation_sources();
     for mut step in recipe.steps.take().unwrap_or_default() {
         if let Step::Run { argv, .. } = &mut step {
             if argv
                 .first()
                 .is_some_and(|program| program.ends_with("/rustc"))
             {
-                steps.push(
-                    crate::shared::target_rustc(
-                        "{src}",
-                        "{in:rust-toolchain}/bin/rustc",
-                        &[
-                            "--edition",
-                            "2021",
-                            "--crate-type",
-                            "rlib",
-                            "--crate-name",
-                            "td_json",
-                            "-C",
-                            "opt-level=s",
-                            "--target",
-                            "x86_64-unknown-linux-gnu",
-                            "-C",
-                            "target-feature=+crt-static",
-                            "-C",
-                            "relocation-model=static",
-                            "-C",
-                            "panic=abort",
-                            "-o",
-                            "{root}/libtd_json.rlib",
-                            "{src}/td-json/src/lib.rs",
-                        ],
-                    )
-                    .env("SOURCE_DATE_EPOCH", "1"),
-                );
-                argv.extend(["--extern".into(), "td_json={root}/libtd_json.rlib".into()]);
+                for (name, source, output, externs) in [
+                    (
+                        "td_alloc",
+                        "{src}/td-alloc/src/owned.rs",
+                        "{root}/libtd_alloc.rlib",
+                        &[][..],
+                    ),
+                    (
+                        "td_json",
+                        "{src}/td-json/src/lib.rs",
+                        "{root}/libtd_json.rlib",
+                        &["--extern", "td_alloc={root}/libtd_alloc.rlib"],
+                    ),
+                ] {
+                    let mut args = vec![
+                        "--edition",
+                        "2021",
+                        "--crate-type",
+                        "rlib",
+                        "--crate-name",
+                        name,
+                        "-C",
+                        "opt-level=s",
+                        "--target",
+                        "x86_64-unknown-linux-gnu",
+                        "-C",
+                        "target-feature=+crt-static",
+                        "-C",
+                        "relocation-model=static",
+                        "-C",
+                        "panic=abort",
+                        "-L",
+                        "dependency={root}",
+                        "-o",
+                        output,
+                        source,
+                    ];
+                    args.extend_from_slice(externs);
+                    steps.push(
+                        crate::shared::target_rustc(
+                            "{src}",
+                            "{in:rust-toolchain}/bin/rustc",
+                            &args,
+                        )
+                        .env("SOURCE_DATE_EPOCH", "1"),
+                    );
+                }
+                argv.extend([
+                    "--extern".into(),
+                    "td_json={root}/libtd_json.rlib".into(),
+                    "-L".into(),
+                    "dependency={root}".into(),
+                ]);
             }
         }
         steps.push(step);

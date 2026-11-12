@@ -112,6 +112,7 @@ pub struct Service<'s, 'sr, 'a> {
     pub pending: &'s crate::postgres_http_updates::Pending,
     pub responses: &'s ResponseCoordinator<'sr, 'a>,
     pub resources: &'s ResourcePlan,
+    pub memory: &'s crate::https_api_storage::RequestMemory,
     pub session: &'s Session,
     pub response_maximum: u64,
     pub clock: &'s RuntimeClock,
@@ -491,6 +492,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             return Err(Error::Forbidden.into());
         }
         let exchange = Exchange {
+            memory: self.memory,
             capabilities: self.session.capabilities(),
             resources: self.resources,
             session: self.session,

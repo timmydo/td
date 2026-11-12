@@ -118,7 +118,7 @@ encoded-header adapters or combined service RSS.
   fixed state, including the parser cursor, fits 8 KiB of the same scratch.
   Activation must check live admission between turns and avoid unbounded
   scalar-view, object-lookup and serialization helpers on worker turns.
-  The shared OwnedCursor can move preallocated boxed request/token arenas
+  The shared OwnedCursor can move preallocated budgeted request/token arenas
   between worker turns and returns those same arenas after completion,
   cancellation or refusal. Its completed owner lends immutable document
   views. It adds no arena copy, allocation or parser state allowance;
@@ -135,7 +135,7 @@ encoded-header adapters or combined service RSS.
   throughout all phases.
   Shared OwnedEmitter supplies bounded value serialization in at most
   8 KiB of the 16 KiB spool-walker/escaping partition. Its existing document
-  boxes remain the request/token arenas, not a second copy. Its caller's
+  buffers remain the request/token arenas, not a second copy. Its caller's
   output uses the separate 16 KiB JSON-output partition. Each turn has at
   most 256 transitions, each copying at most 256 number bytes, five literal
   bytes, or at most 32 shared string-frame scalar/escape steps. Exact counting uses

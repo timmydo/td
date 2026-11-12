@@ -6,6 +6,7 @@ use std::io::Read;
 use std::path::Path;
 
 pub(crate) const LOCAL_SOURCES: &[&str] = &[
+    "td-alloc",
     "td-civil",
     "td-crypto",
     "td-fs",
@@ -33,13 +34,14 @@ pub(crate) fn admitted(name: &str) -> bool {
 
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
+        "td-alloc" => "07b5c782ce2647c93f6b40d95ef7f65fe9850f87091f9be8738e8f9e965ec5f1",
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "720198b066801724a9d45a0cdc85d9c61f20033a6610795bb7cd897fe165b443",
-        "td-mta" => "14be5df8fd752afec8e1382e0349c85aef2db59ac7795355ba859e331b4301ed",
+        "td-mta" => "7df4048742b09def988eb623c7344f10ba331852db6dd434f669d219f887f8e8",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
-        "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
+        "td-json" => "31684b6cb14691bd585ec01f6711c55d34917ec6e3c26ce67126b7874f7a0cf1",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
         "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
         "td-primitives" => "056b2c47072b8e101730f86e33fbe79a00917aaa91a12aa17a7a801070bd4b85",
@@ -56,15 +58,16 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
+        "td-alloc" => "6e733ef9f5e41869811c445314731457bb3766722c67b72ef251deb67db18e95",
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "63993ee6fdf15482e7a8493c2509e078aade1fe064bc65f46245999b368f66f2",
-        "td-mta" => "a0c044651f624d1a0a6851d659c301301b684a15976d0e287052a6686d39892b",
+        "td-mta" => "469387987e976c0e3d2af5bf964cd42329fd151d2d4bbd135cff0116dd77bf42",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
-        "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
+        "td-json" => "6a5fb6c2c104c61c446b9ae3adb39d9276a95b05ef2be37a661ebd756e1270f7",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
-        "td-mime" => "72893a76d9ecfaad70a4bcf8447386fa5a0d2127ec5c4c770c9ac14438c0a7ed",
+        "td-mime" => "a3d5ea3d17240084cb6ca106dd6fa95841fac5ee2200fbe0a0b92c47de9db183",
         "td-primitives" => "388616b0ea8bc440730c90424f57a66dd8921b6c6b08ab2518d51d6da561fd13",
         "td-source-scan" => "1b14eed16717e72e43ad4e8bbc33976a11fc3039bff763852ca1cb1a23010542",
         "td-tls-provider" => "46e710a0aaab04b17090c56ce3c7dcb46de35c18b4016ef2091f9969328cb389",
@@ -257,6 +260,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     if name == "td-mta" {
         expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
+            "td-alloc",
             "td-civil",
             "td-fs",
             "td-header",
@@ -412,6 +416,7 @@ mod tests {
     fn std_source_pins_refuse_dependency_changes() {
         let root = root();
         for name in [
+            "td-alloc",
             "td-civil",
             "td-fs",
             "td-header",
@@ -625,8 +630,10 @@ mod tests {
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
         let fs = root.join("td-fs").canonicalize().unwrap();
+        let alloc = root.join("td-alloc").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\ntd-fs v0.1.0 ({})|\n",
+            "{graph}{POSTGRES_ACTIVE}td-alloc v0.1.0 ({})|\ntd-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\ntd-fs v0.1.0 ({})|\n",
+            alloc.display(),
             civil.display(),
             mail.display(),
             json.display(),

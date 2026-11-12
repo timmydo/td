@@ -7,7 +7,7 @@ normal/build features
 for the x86-64 Linux GNU/musl host targets. PORTABLE.md owns the portable
 musl artifact's pins.
 
-The mail lock additionally includes local std-only td-civil, td-fs, td-header,
+The mail lock additionally includes local std-only td-alloc, td-civil, td-fs, td-header,
 td-html, td-json, td-mime and td-nfc. They add no registry source or private backend input; their exact
 manifests, locks and source staging are admitted alongside td-crypto and
 td-mta.

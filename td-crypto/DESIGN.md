@@ -31,10 +31,11 @@ The target dependency graph is:
 
 ```text
 td-mta (library and packaging executable)
+  -> td-alloc (fallible storage with shared request budgets)
   -> td-civil (std-only civil time and timestamp parsing)
   -> td-header (std-only bounded header lexical cursors)
   -> td-html (std-only bounded HTML text extraction)
-  -> td-json (std-only bounded JSON string framing)
+  -> td-json (bounded JSON framing and td-alloc owned parser backing)
   -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
   -> tokio-postgres (private PostgreSQL backend, runtime disabled)
@@ -79,7 +80,7 @@ checkout's root `.cargo/config.toml` is required. Ancestor
 `.cargo/config.toml` files are accepted only when each matches that same
 compiled pin, allowing nested worktrees to use their own runner. Legacy
 `.cargo/config` files remain refused at every level. Automatic build.rs
-files are refused for all twelve local source packages: td-civil,
+files are refused for all thirteen local source packages: td-civil,
 td-crypto, td-fs, td-header, td-html, td-json, td-mime, td-nfc, td-mta,
 td-primitives, td-source-scan and td-tls-provider. Their exact manifests
 and locks are pinned; td-civil, td-fs, td-header, td-html, td-json,

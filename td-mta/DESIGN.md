@@ -106,7 +106,7 @@ foreground serving and local status/stop; POSTGRES.md owns database
 administration. Local SQLite initialization, verification, backup/restore,
 file-configuration checks and file-backed device commands are removed.
 Its direct
-dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
+dependencies are the local `td-alloc`, `td-civil`, `td-crypto`, `td-header`, `td-html`,
 `td-json`, `td-mime`, `td-nfc` and `td-fs` crates, plus the approved private
 tokio-postgres 0.7.18 closure with default features disabled. Std-only
 `td-fs` owns bounded private Unix socket dialing and disposable fixture
@@ -1285,6 +1285,23 @@ under a small concurrent workload, including the reader/sender counts, network
 path and cold/warm state. These are performance goals, not permission to weaken
 durable publication or authorization. A server method timing alone does not
 establish the client-visible first-row target.
+
+JMAP request byte/token storage uses td-alloc owned buffers. One shared
+budget covers every account/origin on the HTTPS body-worker pool; each
+request gets a child capped at json_bytes plus json_tokens times Token's
+actual size plus its budget metadata. The aggregate admits that allowance
+for each body worker, plus root metadata. Both buffers are admitted before
+100 Continue, parsing or method effects. Refusal maps to the existing
+capacity/HTTP service-unavailable path. Parser, validation, dispatch and
+response owners carry the buffers and their charge through completion or
+cancellation; a recovered buffer remains charged until freed. Clearing or
+moving ownership cannot renew the allowance. This is a requested-layout cap
+for those two buffers, not a cap on method scratch, TLS, PostgreSQL, response
+files or total RSS. Existing response-effect admission remains unchanged.
+The HTTP Date formatter retains fixed scalar state and writes into caller
+storage, including refusal replies; it allocates no intermediate String.
+Source guards reject unbudgeted collection owners and recognized allocating
+operations in request-storage admission and HTTP date formatting.
 
 Prefer reusable buffers and borrowed views where they simplify ownership and
 streaming. Bounded per-request allocations are permitted. There is no global

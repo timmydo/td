@@ -593,6 +593,7 @@ mod crypto_boundary_tests {
         assert_eq!(
             dependencies,
             [
+                r#"td-alloc = { path = "../td-alloc" }"#,
                 r#"tokio = { version = "=1.54.1", default-features = false, features = ["io-util"] }"#,
                 r#"tokio-postgres = { version = "=0.7.18", default-features = false }"#,
                 r#"td-civil = { path = "../td-civil" }"#,

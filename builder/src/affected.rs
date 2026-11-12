@@ -5720,7 +5720,7 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
-/// whole list without the list changing. td-mta reads td-civil, td-crypto, td-header,
+/// whole list without the list changing. td-mta reads td-alloc, td-civil, td-crypto, td-header,
 /// td-html, td-json, td-mime and td-nfc directly, td-fs for fixtures,
 /// and td-mail through its native
 /// read fixture. td-agent left the
@@ -5728,6 +5728,7 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
     "td-mta",
     &[
+        "td-alloc",
         "td-civil",
         "td-crypto",
         "td-fs",
@@ -11031,6 +11032,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         for name in [
             "td-mta",
+            "td-alloc",
             "td-civil",
             "td-crypto",
             "td-fs",

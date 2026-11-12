@@ -320,7 +320,7 @@ The ordinary Cargo preflight still qualifies the host build; it does not
 silently claim to have run this separately provisioned portable command.
 
 The driver stages manifests, locks, `src/` and optional `tests/` for
-every pinned local source package (DESIGN.md names the twelve), plus the
+every pinned local source package (DESIGN.md names the thirteen), plus the
 three test-only
 oracle files listed below. It refuses symlinks and special files. It
 rechecks staged manifest/lock pins, reconstructs the verified vendor tree,

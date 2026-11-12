@@ -65,6 +65,8 @@ impl std::error::Error for Refusal {
     }
 }
 impl OwnedEmitter {
+    // Refusal returns the admitted backing; boxing an error would allocate.
+    #[allow(clippy::result_large_err)]
     pub fn new(document: arena::OwnedDocument, index: usize, limit: u64) -> Result<Self, Refusal> {
         if !document
             .view()
@@ -117,6 +119,8 @@ impl OwnedEmitter {
         self.emitter = Emitter::new(index, limit);
         Ok(())
     }
+    // Preserve ownership on refusal without another allocation.
+    #[allow(clippy::result_large_err)]
     pub fn finish(self) -> Result<arena::OwnedDocument, Refusal> {
         let error = self
             .emitter
@@ -558,8 +562,17 @@ mod tests {
         }
     }
     fn owned(input: &str) -> (arena::OwnedDocument, (*const u8, *const arena::Token)) {
-        let bytes = input.as_bytes().to_vec().into_boxed_slice();
-        let tokens = vec![arena::Token::EMPTY; 4096].into_boxed_slice();
+        let bytes = td_alloc::Buffer::copy(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            input.as_bytes(),
+        )
+        .unwrap();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            4096,
+            arena::Token::EMPTY,
+        )
+        .unwrap();
         let pointers = (bytes.as_ptr(), tokens.as_ptr());
         let mut parser = arena::OwnedCursor::with_input_length(
             bytes,

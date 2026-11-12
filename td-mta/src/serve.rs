@@ -342,6 +342,8 @@ fn run_once(
                     authentication_accounts.push((account.username, binding));
                 }
             }
+            let request_memory = td_mta::https_api_storage::RequestMemory::new(resources)
+                .map_err(|error| adapter("request-memory", error))?;
             let mut api_services = Vec::new();
             api_services
                 .try_reserve_exact(sessions.len())
@@ -351,6 +353,7 @@ fn run_once(
                     .as_ref()
                     .ok_or_else(|| config_failure("https", "invariant"))?;
                 api_services.push(td_mta::postgres_http_api::Service {
+                    memory: &request_memory,
                     loaded: &loaded,
                     executable: &executable,
                     binding,

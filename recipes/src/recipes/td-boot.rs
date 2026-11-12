@@ -523,6 +523,7 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    steps.extend(crate::shared::allocation_sources());
     for dest in [
         "{root}/profile-repro-a/source",
         "{root}/profile-repro-b/source",
@@ -538,7 +539,12 @@ pub fn recipe() -> Recipe {
     let library = |root: &str, name: &str, krate: &str, externs: &[&str]| {
         let source = format!("{root}/source");
         let output = format!("{root}/lib{name}.rlib");
-        let lib = format!("{source}/{krate}/src/lib.rs");
+        let entry = if name == "td_alloc" {
+            "owned.rs"
+        } else {
+            "lib.rs"
+        };
+        let lib = format!("{source}/{krate}/src/{entry}");
         // A dependency's own dependencies, td-tpm's td-fido, are found here.
         let mut externs: Vec<String> = externs
             .iter()
@@ -621,7 +627,8 @@ pub fn recipe() -> Recipe {
         steps.push(library(root, "td_fido", "td-fido", &[]));
         steps.push(library(root, "td_fat", "td-fat", &[]));
         steps.push(library(root, "td_tpm", "td-tpm", &["td_fido"]));
-        steps.push(library(root, "td_json", "td-json", &[]));
+        steps.push(library(root, "td_alloc", "td-alloc", &[]));
+        steps.push(library(root, "td_json", "td-json", &["td_alloc"]));
         steps.push(library(root, "td_luks", "td-luks", &["td_fido", "td_json"]));
         steps.push(library(
             root,
@@ -672,6 +679,7 @@ mod tests {
                 "td-tpm",
                 "td-fido",
                 "td-json",
+                "td-alloc",
                 "td-luks",
                 "td-encoding",
                 "td-protector",

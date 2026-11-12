@@ -1,4 +1,4 @@
-//! A dependency-free JSON value, parser, writer, and `json!` macro — the
+//! A td-owned JSON value, parser, writer, and `json!` macro — the
 //! `serde_json` replacement for td's applications, one crate they all
 //! depend on by path (AGENTS.md principle 2).
 //!

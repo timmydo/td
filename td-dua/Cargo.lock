@@ -22,6 +22,9 @@ dependencies = [
 [[package]]
 name = "td-json"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-ui"

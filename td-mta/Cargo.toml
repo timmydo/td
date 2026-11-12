@@ -12,6 +12,7 @@ description = "Bounded personal mail service using the local td-crypto boundary"
 clippy-all-targets = true
 
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 tokio = { version = "=1.54.1", default-features = false, features = ["io-util"] }
 tokio-postgres = { version = "=0.7.18", default-features = false }
 td-civil = { path = "../td-civil" }

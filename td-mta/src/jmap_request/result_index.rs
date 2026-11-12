@@ -341,8 +341,17 @@ mod tests {
             ..Limits::default()
         };
         let input_len = input.len();
-        let bytes = input.into_bytes().into_boxed_slice();
-        let tokens = vec![Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let bytes = td_alloc::Buffer::copy(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            &input.into_bytes(),
+        )
+        .unwrap();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            Token::EMPTY,
+        )
+        .unwrap();
         let pointers = (bytes.as_ptr(), tokens.as_ptr());
         let mut parser = OwnedCursor::with_input_length(
             bytes,

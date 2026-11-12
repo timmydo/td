@@ -560,6 +560,7 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    steps.extend(crate::shared::allocation_sources());
     // The sibling libraries, dependencies first, under the binary's profile.
     for (name, lib, externs) in [
         ("td_fido", "{src}/td-fido/src/lib.rs", &[][..]),
@@ -569,7 +570,17 @@ pub fn recipe() -> Recipe {
             "{src}/td-tpm/src/lib.rs",
             &["--extern", "td_fido={root}/libtd_fido.rlib"],
         ),
-        ("td_json", "{src}/td-json/src/lib.rs", &[]),
+        ("td_alloc", "{src}/td-alloc/src/owned.rs", &[]),
+        (
+            "td_json",
+            "{src}/td-json/src/lib.rs",
+            &[
+                "--extern",
+                "td_alloc={root}/libtd_alloc.rlib",
+                "-L",
+                "dependency={root}",
+            ],
+        ),
         (
             "td_luks",
             "{src}/td-luks/src/lib.rs",
@@ -578,6 +589,8 @@ pub fn recipe() -> Recipe {
                 "td_fido={root}/libtd_fido.rlib",
                 "--extern",
                 "td_json={root}/libtd_json.rlib",
+                "-L",
+                "dependency={root}",
             ],
         ),
         (
@@ -679,6 +692,7 @@ mod tests {
                 "td-tpm",
                 "td-fido",
                 "td-json",
+                "td-alloc",
                 "td-luks",
                 "td-encoding",
                 "td-protector",

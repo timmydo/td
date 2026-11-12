@@ -431,12 +431,12 @@ mod tests {
                 );
             }
             if stem == "td-boot" {
-                // Its td-fido, td-fat, td-tpm, td-json, td-luks and
+                // Its td-fido, td-fat, td-tpm, td-alloc, td-json, td-luks and
                 // td-protector rlibs, then the binary, under each of two
                 // roots.
                 assert_eq!(
                     remap_sources.len(),
-                    14,
+                    16,
                     "td-boot must build its libraries and binary at two roots"
                 );
                 let mut roots = remap_sources.clone();
@@ -446,7 +446,7 @@ mod tests {
                 for root in &roots {
                     assert_eq!(
                         remap_sources.iter().filter(|seen| *seen == root).count(),
-                        7,
+                        8,
                         "td-boot must build its libraries and binary under each root"
                     );
                 }
@@ -981,6 +981,11 @@ mod named_dirs_tests {
         assert_eq!(
             shared_embeds(),
             [
+                "td-alloc".to_string(),
+                file("td-alloc", "src/budget.rs"),
+                file("td-alloc", "src/lib.rs"),
+                file("td-alloc", "src/raw.rs"),
+                file("td-alloc", "src/storage.rs"),
                 file("td-boot", "src/protocol.rs"),
                 file("td-civil", "src/tzif.rs"),
                 file("td-fs", "src/real_file.rs"),

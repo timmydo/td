@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-fat"
 version = "0.1.0"
 
@@ -29,6 +33,9 @@ dependencies = [
 [[package]]
 name = "td-json"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-luks"

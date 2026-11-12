@@ -2,9 +2,9 @@
 
 td-alloc owns fallible growth and budgeted storage. It depends only on std.
 Cargo consumers use `src/owned.rs`, whose private raw allocation boundary is
-recorded in UNSAFE.md section 28. The control plane and direct-rustc consumers
-mount the safe-only helpers in `src/lib.rs`; they do not compile the owned
-allocation boundary. A program uses one instance for code sharing a
+recorded in UNSAFE.md section 28. The control plane and consumers needing only reservation helpers
+mount the safe-only helpers in `src/lib.rs`. Direct-rustc consumers of
+td-json compile the owned crate root, just as Cargo does. A program uses one instance for code sharing a
 reservation scope.
 
 ## Allocation contract
@@ -72,6 +72,14 @@ input/output/work bounds. The raw inflater's legacy String-returning
 wrappers and image encoders are outside the allocation-free error
 guarantee. General UI, fetch, navigation and other existing subsystem
 allocations remain migration debt.
+
+JMAP request byte and token backing uses owned child budgets under one
+HTTPS worker-pool budget. Parsing, validation, response emission and recovered
+buffers retain admission until their final owners drop. Method scratch,
+transport/library internals and response files retain separate limits; this
+is not a whole-request allocation guarantee. The request storage module and
+the allocation-free HTTP date formatter have additional source guards that
+reject recognized allocation operations and standard heap collection names.
 
 The repository allocation guard is a source-level ratchet over production
 Rust. It excludes recognized test-only code and literals/comments, scans

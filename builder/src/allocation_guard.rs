@@ -232,9 +232,30 @@ fn parse(text: &str) -> Result<Inventory, String> {
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     check_owned_boundary(root)?;
+    for path in ["td-mta/src/https_api_storage.rs", "td-mta/src/http_date.rs"] {
+        budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
+    }
     let recorded =
         fs::read_to_string(root.join(INVENTORY)).map_err(|e| format!("{INVENTORY}: {e}"))?;
     compare(&parse(&recorded)?, &inventory(root)?)
+}
+
+fn budgeted_source(source: &str) -> Result<(), String> {
+    let code =
+        td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
+    if !operations(source).is_empty()
+        || code
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| {
+                [
+                    "Vec", "String", "Box", "Arc", "Rc", "HashMap", "BTreeMap", "VecDeque",
+                ]
+                .contains(&word)
+            })
+    {
+        return Err("guarded request paths require budgeted or fixed storage; unbudgeted allocation is forbidden".into());
+    }
+    Ok(())
 }
 
 fn check_owned_boundary(root: &Path) -> Result<(), String> {
@@ -353,6 +374,21 @@ mod tests {
     }
 
     #[test]
+    fn request_storage_cannot_restore_unbudgeted_owners() {
+        budgeted_source("fn f() { Buffer::filled(&budget, 16, 0u8)?; }").unwrap();
+        for source in [
+            "fn f() { Vec::new(); }",
+            "fn f() { vec![0; 16]; }",
+            "use std::vec::Vec as Other;",
+            "fn f() { String::new(); }",
+            "fn f() { bytes.try_reserve(16); }",
+            "fn f() { std::alloc::alloc(layout); }",
+        ] {
+            assert!(budgeted_source(source).is_err());
+        }
+    }
+
+    #[test]
     fn code_only_scan_covers_spacing_generics_and_macros() {
         let counts = operations(
             r###"
@@ -408,6 +444,13 @@ mod tests {
         let root = temp.path();
         fs::create_dir_all(root.join("td-example/src")).unwrap();
         fs::create_dir_all(root.join("td-alloc/src")).unwrap();
+        fs::create_dir_all(root.join("td-mta/src")).unwrap();
+        fs::write(root.join("td-mta/src/http_date.rs"), "fn date() {}").unwrap();
+        fs::write(
+            root.join("td-mta/src/https_api_storage.rs"),
+            "fn storage() {}",
+        )
+        .unwrap();
         fs::write(
             root.join("td-alloc/Cargo.toml"),
             include_str!("../../td-alloc/Cargo.toml"),

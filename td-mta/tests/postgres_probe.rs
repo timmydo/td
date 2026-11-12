@@ -6597,9 +6597,19 @@ fn exercise_read_dispatch(
         header_bytes: smallest_body - 1,
         ..Limits::default()
     };
-    let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
+    let mut bytes = td_alloc::Buffer::filled(
+        &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+        limits.json_bytes,
+        0,
+    )
+    .unwrap();
     bytes[..input.len()].copy_from_slice(input.as_bytes());
-    let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+    let tokens = td_alloc::Buffer::filled(
+        &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+        limits.json_tokens,
+        td_json::arena::Token::EMPTY,
+    )
+    .unwrap();
     let mut parser = td_json::arena::OwnedCursor::with_input_length(
         bytes,
         tokens,
@@ -6955,6 +6965,7 @@ fn exercise_http_read(
     .unwrap();
     let pending = td_mta::postgres_http_updates::Pending::default();
     let service = td_mta::postgres_http_api::Service {
+        memory: &td_mta::https_api_storage::RequestMemory::new(&resources).unwrap(),
         loaded: &loaded,
         executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
         binding,
@@ -11430,9 +11441,19 @@ fn exercise_submission_get_dispatch(
         ]}}"##
         );
         let limits = Limits::default();
-        let mut input_bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        let mut input_bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_bytes,
+            0,
+        )
+        .unwrap();
         input_bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            td_json::arena::Token::EMPTY,
+        )
+        .unwrap();
         let mut parser = td_json::arena::OwnedCursor::with_input_length(
             input_bytes,
             tokens,
@@ -12431,9 +12452,19 @@ fn exercise_submission_query_dispatch(
         ]}}"##
         );
         let limits = Limits::default();
-        let mut input_bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        let mut input_bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_bytes,
+            0,
+        )
+        .unwrap();
         input_bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            td_json::arena::Token::EMPTY,
+        )
+        .unwrap();
         let mut parser = td_json::arena::OwnedCursor::with_input_length(
             input_bytes,
             tokens,
@@ -12659,9 +12690,19 @@ fn exercise_submission_set_dispatch(
         }
         let input = input.to_string();
         let limits = Limits::default();
-        let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        let mut bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_bytes,
+            0,
+        )
+        .unwrap();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            td_json::arena::Token::EMPTY,
+        )
+        .unwrap();
         let mut parser = td_json::arena::OwnedCursor::with_input_length(
             bytes,
             tokens,

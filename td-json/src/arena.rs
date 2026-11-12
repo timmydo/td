@@ -431,29 +431,29 @@ struct Sort {
 mod sealed {
     pub trait Pair<T> {}
     impl Pair<&mut [super::Token]> for &mut [u8] {}
-    impl Pair<Box<[super::Token]>> for Box<[u8]> {}
+    impl Pair<td_alloc::Buffer<super::Token>> for td_alloc::Buffer<u8> {}
     pub trait Storage {}
     impl<T> Storage for &mut [T] {}
-    impl<T> Storage for Box<[T]> {}
+    impl<T> Storage for td_alloc::Buffer<T> {}
 }
-/// Stable caller-provided backing. Sealed to slices and boxed slices so a
+/// Stable caller-provided backing. Sealed to slices and budgeted buffers so a
 /// storage implementation cannot substitute a different arena between turns.
 pub trait Storage<T>: sealed::Storage + std::ops::Deref<Target = [T]> + std::ops::DerefMut {}
 impl<T> Storage<T> for &mut [T] {}
-impl<T> Storage<T> for Box<[T]> {}
+impl<T> Storage<T> for td_alloc::Buffer<T> {}
 
 /// Supported complete parser backing pairs. Mixed owned/borrowed pairs have
 /// no completion API and cannot be constructed.
 pub trait StoragePair<T>: sealed::Pair<T> {}
 impl StoragePair<&mut [Token]> for &mut [u8] {}
-impl StoragePair<Box<[Token]>> for Box<[u8]> {}
+impl StoragePair<td_alloc::Buffer<Token>> for td_alloc::Buffer<u8> {}
 
 /// Borrowed parser; existing callers retain ownership of both buffers.
 pub type Cursor<'a> = Parser<&'a mut [u8], &'a mut [Token]>;
-/// Moveable parser owning preallocated boxes, suitable for a queued worker job.
-pub type OwnedCursor = Parser<Box<[u8]>, Box<[Token]>>;
+/// Moveable parser owning preallocated budgeted buffers, suitable for a queued worker job.
+pub type OwnedCursor = Parser<td_alloc::Buffer<u8>, td_alloc::Buffer<Token>>;
 /// Owned backings returned after a constructor or completion refusal.
-pub type OwnedRefusal = Refusal<Box<[u8]>, Box<[Token]>>;
+pub type OwnedRefusal = Refusal<td_alloc::Buffer<u8>, td_alloc::Buffer<Token>>;
 
 /// A refusal returns the same backings without publishing a partial document.
 /// Debug output is redacted; buffers may contain credentials or mail.
@@ -487,11 +487,11 @@ impl<B, T> std::error::Error for Refusal<B, T> {
 }
 
 /// Valid JSON with exclusively owned storage. Views borrow this owner; the
-/// boxes can be recovered for another request only after those borrows end.
+/// buffers can be recovered for another request only after those borrows end.
 pub struct OwnedDocument {
     limits: ParseLimits,
-    bytes: Box<[u8]>,
-    tokens: Box<[Token]>,
+    bytes: td_alloc::Buffer<u8>,
+    tokens: td_alloc::Buffer<Token>,
     input_len: usize,
     used: usize,
 }
@@ -513,7 +513,7 @@ impl OwnedDocument {
             tokens: self.tokens.get(..self.used).ok_or(error)?,
         })
     }
-    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+    pub fn into_buffers(self) -> (td_alloc::Buffer<u8>, td_alloc::Buffer<Token>) {
         (self.bytes, self.tokens)
     }
 }
@@ -1196,11 +1196,18 @@ mod tests {
 
     #[test]
     fn occupied_limit_is_independent_of_capacity_and_storage_errors_win() {
-        let mut bytes = vec![0xff; 64].into_boxed_slice();
+        let mut bytes =
+            td_alloc::Buffer::filled(&td_alloc::Budget::new(64 * 1024 * 1024).unwrap(), 64, 0xff)
+                .unwrap();
         bytes[..3].copy_from_slice(b"[1]");
         let mut ceiling = limits();
         ceiling.max_bytes = 3;
-        let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            8,
+            Token::EMPTY,
+        )
+        .unwrap();
         let mut cursor = OwnedCursor::with_input_length(bytes, tokens, 3, ceiling).unwrap();
         while !cursor.step().unwrap() {}
         let (bytes, tokens) = cursor.finish().unwrap().into_buffers();
@@ -1213,8 +1220,15 @@ mod tests {
     #[test]
     fn string_and_escape_reads_stop_at_occupied_prefix() {
         for (input, length) in [(br#""abc""#.as_slice(), 4), (br#""\u0041""#.as_slice(), 5)] {
-            let bytes = input.to_vec().into_boxed_slice();
-            let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+            let bytes =
+                td_alloc::Buffer::copy(&td_alloc::Budget::new(64 * 1024 * 1024).unwrap(), input)
+                    .unwrap();
+            let tokens = td_alloc::Buffer::filled(
+                &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+                8,
+                Token::EMPTY,
+            )
+            .unwrap();
             let mut cursor =
                 OwnedCursor::with_input_length(bytes, tokens, length, limits()).unwrap();
             loop {
@@ -1267,8 +1281,18 @@ mod tests {
         fn is_send<T: Send>() {}
         is_send::<OwnedCursor>();
         is_send::<OwnedDocument>();
-        let mut bytes = vec![0xff; 8192].into_boxed_slice();
-        let mut tokens = vec![Token::EMPTY; 32].into_boxed_slice();
+        let mut bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            8192,
+            0xff,
+        )
+        .unwrap();
+        let mut tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            32,
+            Token::EMPTY,
+        )
+        .unwrap();
         let byte_ptr = bytes.as_ptr();
         let token_ptr = tokens.as_ptr();
         for input in [
@@ -1300,8 +1324,15 @@ mod tests {
 
     #[test]
     fn owned_refusals_return_buffers_without_disclosing_contents() {
-        let bytes = b"secret".to_vec().into_boxed_slice();
-        let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+        let bytes =
+            td_alloc::Buffer::copy(&td_alloc::Budget::new(64 * 1024 * 1024).unwrap(), b"secret")
+                .unwrap();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            8,
+            Token::EMPTY,
+        )
+        .unwrap();
         let pointers = (bytes.as_ptr(), tokens.as_ptr());
         let refusal = OwnedCursor::with_input_length(bytes, tokens, 7, limits())
             .err()
@@ -1338,8 +1369,15 @@ mod tests {
             (b"null false".as_slice(), 4),
             (b"\"\xc3\xa9\"".as_slice(), 2),
         ] {
-            let bytes = input.to_vec().into_boxed_slice();
-            let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+            let bytes =
+                td_alloc::Buffer::copy(&td_alloc::Budget::new(64 * 1024 * 1024).unwrap(), input)
+                    .unwrap();
+            let tokens = td_alloc::Buffer::filled(
+                &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+                8,
+                Token::EMPTY,
+            )
+            .unwrap();
             let mut cursor =
                 OwnedCursor::with_input_length(bytes, tokens, length, limits()).unwrap();
             if length == 4 {

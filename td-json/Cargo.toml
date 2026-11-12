@@ -9,7 +9,7 @@ license = "MIT"
 # a worktree nested under it (see the root Cargo.toml). A consumer names this
 # crate as `td-json = { path = "../td-json" }`, the one sibling-dependency
 # spelling the lock guard admits (AGENTS.md 'Rust code'); this crate itself
-# depends on nothing but `std`.
+# uses `std` and td-alloc for owned arena storage.
 [workspace]
 
 # No doc tests: the `json!` example never ran as one in any former carrier
@@ -29,3 +29,6 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
+
+[dependencies]
+td-alloc = { path = "../td-alloc" }

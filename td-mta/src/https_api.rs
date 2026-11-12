@@ -86,19 +86,12 @@ fn body_error(error: http_request::Error) -> ApiError {
         _ => ApiError::Io(Error::Invalid),
     }
 }
-fn buffer<T: Clone>(length: usize, value: T) -> Result<Box<[T]>, Error> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| Error::Capacity)?;
-    bytes.resize(length, value);
-    Ok(bytes.into_boxed_slice())
-}
 /// Shared bounded HTTP/JMAP framing. Storage admission and fresh authorization
 /// remain with the backend that owns the response and dispatch snapshot.
 pub(crate) struct Exchange<'a> {
     pub(crate) capabilities: &'static [&'static str],
     pub(crate) resources: &'a ResourcePlan,
+    pub(crate) memory: &'a crate::https_api_storage::RequestMemory,
     pub(crate) session: &'a Session,
     pub(crate) response_maximum: u64,
     pub(crate) timeouts: &'a TimeoutPlan,
@@ -142,8 +135,7 @@ impl<'a> Exchange<'a> {
             .ok_or(Error::Capacity)?;
         let mut body = BodyReader::new(request.framing, limits.json_bytes as u64, wire_max)
             .map_err(body_error)?;
-        let mut bytes = buffer(limits.json_bytes, 0u8)?;
-        let tokens = buffer(limits.json_tokens, arena::Token::EMPTY)?;
+        let (mut bytes, tokens) = self.memory.allocate(self.resources)?;
         let transfer = timers::deadline(
             start,
             self.timeouts

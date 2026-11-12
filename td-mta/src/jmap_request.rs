@@ -269,6 +269,8 @@ pub struct OwnedValidation<'c> {
     envelope: Envelope,
 }
 impl<'c> OwnedValidation<'c> {
+    // Return the admitted buffers on refusal without allocating an error box.
+    #[allow(clippy::result_large_err)]
     pub fn new(
         document: arena::OwnedDocument,
         resources: &ResourcePlan,
@@ -310,6 +312,8 @@ impl<'c> OwnedValidation<'c> {
             self.capabilities,
         )
     }
+    // Refusal preserves storage ownership and its charge without allocating.
+    #[allow(clippy::result_large_err)]
     pub fn finish(self) -> Result<OwnedRequest, ValidationRefusal> {
         let result = self
             .document
@@ -327,7 +331,7 @@ impl<'c> OwnedValidation<'c> {
             }),
         }
     }
-    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+    pub fn into_buffers(self) -> (td_alloc::Buffer<u8>, td_alloc::Buffer<Token>) {
         self.document.into_buffers()
     }
 }
@@ -340,7 +344,7 @@ impl ValidationRefusal {
     pub fn error(&self) -> Error {
         self.error
     }
-    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+    pub fn into_buffers(self) -> (td_alloc::Buffer<u8>, td_alloc::Buffer<Token>) {
         self.document.into_buffers()
     }
 }
@@ -380,7 +384,7 @@ impl OwnedRequest {
         self.envelope
             .request(&self.document.view().map_err(parser_error)?)
     }
-    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+    pub fn into_buffers(self) -> (td_alloc::Buffer<u8>, td_alloc::Buffer<Token>) {
         self.document.into_buffers()
     }
 }
@@ -823,9 +827,19 @@ mod tests {
     }
     fn owned_fixture(input: &str) -> (OwnedValidation<'static>, (*const u8, *const Token)) {
         let limits = Limits::default();
-        let mut bytes = vec![0xff; limits.json_bytes].into_boxed_slice();
+        let mut bytes = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_bytes,
+            0xff,
+        )
+        .unwrap();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
-        let tokens = vec![Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let tokens = td_alloc::Buffer::filled(
+            &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+            limits.json_tokens,
+            Token::EMPTY,
+        )
+        .unwrap();
         let pointers = (bytes.as_ptr(), tokens.as_ptr());
         let mut parser = arena::OwnedCursor::with_input_length(
             bytes,
@@ -900,8 +914,15 @@ mod tests {
             ),
             (expected, 8, Error::Storage),
         ] {
-            let bytes = b"{}".to_vec().into_boxed_slice();
-            let tokens = vec![Token::EMPTY; capacity].into_boxed_slice();
+            let bytes =
+                td_alloc::Buffer::copy(&td_alloc::Budget::new(64 * 1024 * 1024).unwrap(), b"{}")
+                    .unwrap();
+            let tokens = td_alloc::Buffer::filled(
+                &td_alloc::Budget::new(64 * 1024 * 1024).unwrap(),
+                capacity,
+                Token::EMPTY,
+            )
+            .unwrap();
             let pointers = (bytes.as_ptr(), tokens.as_ptr());
             let mut parser =
                 arena::OwnedCursor::with_input_length(bytes, tokens, 2, parser_limits).unwrap();

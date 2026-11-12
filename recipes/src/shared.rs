@@ -11,6 +11,27 @@
 use crate::types::{Recipe, Step};
 
 pub use crate::td_boot_protocol::{EFI_BOOT_FILE, EFI_INITRD_PATH};
+/// Shared allocation library source for direct-rustc JSON consumers.
+pub fn allocation_sources() -> Vec<Step> {
+    let mut steps = vec![Step::MkDir {
+        path: "{src}/td-alloc/src".into(),
+    }];
+    for (name, content) in [
+        ("owned.rs", include_str!("../../td-alloc/src/owned.rs")),
+        ("lib.rs", include_str!("../../td-alloc/src/lib.rs")),
+        ("raw.rs", include_str!("../../td-alloc/src/raw.rs")),
+        ("budget.rs", include_str!("../../td-alloc/src/budget.rs")),
+        ("storage.rs", include_str!("../../td-alloc/src/storage.rs")),
+    ] {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/td-alloc/src/{name}"),
+            content: content.into(),
+            exec: false,
+        });
+    }
+    steps
+}
+
 pub fn efi_default_cmdline() -> String {
     // Linux's EFI loader normalizes slashes; td-boot refuses backslashes.
     let path = EFI_INITRD_PATH.replace('\\', "/");

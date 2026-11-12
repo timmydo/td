@@ -1994,54 +1994,7 @@ fn buffer<const N: usize>() -> Result<Box<[u8; N]>, Error> {
 fn deadline(now: Tick, seconds: u64) -> Result<Deadline, Error> {
     timers::deadline(now, seconds).map_err(|_| Error::Invalid)
 }
-pub(crate) fn http_date(utc_ms: i64) -> Result<String, Error> {
-    let seconds = u64::try_from(utc_ms).map_err(|_| Error::Invalid)? / 1000;
-    if seconds > 253402300799 {
-        return Err(Error::Invalid);
-    }
-    let day = seconds / 86400;
-    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
-        .get((day % 7) as usize)
-        .ok_or(Error::Invalid)?;
-    let mut remaining = day;
-    let mut year = 1970;
-    let leap = |year| year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    loop {
-        let days = if leap(year) { 366 } else { 365 };
-        if remaining < days {
-            break;
-        }
-        remaining -= days;
-        year += 1;
-    }
-    let months = [
-        ("Jan", 31),
-        ("Feb", if leap(year) { 29 } else { 28 }),
-        ("Mar", 31),
-        ("Apr", 30),
-        ("May", 31),
-        ("Jun", 30),
-        ("Jul", 31),
-        ("Aug", 31),
-        ("Sep", 30),
-        ("Oct", 31),
-        ("Nov", 30),
-        ("Dec", 31),
-    ];
-    for (month, days) in months {
-        if remaining < days {
-            return Ok(format!(
-                "{weekday}, {:02} {month} {year:04} {:02}:{:02}:{:02} GMT",
-                remaining + 1,
-                seconds / 3600 % 24,
-                seconds / 60 % 60,
-                seconds % 60
-            ));
-        }
-        remaining -= days;
-    }
-    Err(Error::Invalid)
-}
+pub(crate) use crate::http_date::http_date;
 
 #[cfg(test)]
 mod tests {
@@ -2145,18 +2098,5 @@ mod tests {
         assert!(input[remaining..].iter().all(|byte| *byte == 0));
         assert!(retain_tail(&mut input, 1, 2).is_err());
         assert!(retain_tail(&mut input, QUANTUM + 1, 0).is_err());
-    }
-    #[test]
-    fn date_uses_imf_fixdate_across_leap_and_century_boundaries() {
-        for (millis, expected) in [
-            (0, "Thu, 01 Jan 1970 00:00:00 GMT"),
-            (951782400000, "Tue, 29 Feb 2000 00:00:00 GMT"),
-            (4107542400000, "Mon, 01 Mar 2100 00:00:00 GMT"),
-            (253402300799000, "Fri, 31 Dec 9999 23:59:59 GMT"),
-        ] {
-            assert_eq!(http_date(millis).ok().as_deref(), Some(expected));
-        }
-        assert!(http_date(-1).is_err());
-        assert!(http_date(i64::MAX).is_err());
     }
 }

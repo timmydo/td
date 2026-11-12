@@ -117,6 +117,11 @@ impl<T> DerefMut for BudgetVec<T> {
 /// ownership extraction is exposed. Views remain borrowed from this owner.
 pub struct Buffer<T>(BudgetVec<T>);
 impl<T: Copy> Buffer<T> {
+    pub fn copy(budget: &Budget, values: &[T]) -> Result<Self, BudgetError> {
+        let mut out = BudgetVec::with_capacity(budget, values.len())?;
+        out.try_extend_from_slice(values)?;
+        Ok(out.freeze())
+    }
     pub fn filled(budget: &Budget, len: usize, value: T) -> Result<Self, BudgetError> {
         Ok(BudgetVec::filled(budget, len, value)?.freeze())
     }
