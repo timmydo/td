@@ -244,7 +244,8 @@ keeps its leaf.
 
 There is a third case the model does not carry: a unit whose leader stays but
 whose real work moves on. `firefox-evidence`, `firefox-input`, `greeter`,
-`software-evidence`, `grant-request`, `grant-evidence`, `firefox-fetch`
+`software-evidence`, `grant-request`, `grant-evidence`, `sandbox-evidence`,
+`firefox-fetch`
 (whose leader, root's
 `application-cache` operation, waits while td-login runs td-app) and
 `workspace-intake` (root's daemon whose launch threads wait while

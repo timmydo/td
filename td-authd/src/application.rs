@@ -53,6 +53,20 @@ const ALLOCATE: Check = Check {
     uid: service_uid,
 };
 
+/// A sandbox's account, allocated when td-sandbox creates the sandbox
+/// through the workspace intake (td-authd/DESIGN.md, "Workload account
+/// ledger"): its ledger row added from 98304 up when absent, or the
+/// existing one returned, with its empty home and its delegation. The
+/// intake's one path to a new row.
+pub(crate) const ALLOCATE_SANDBOX: Check = Check {
+    what: "sandbox",
+    verb: "allocate-workload",
+    words: &["sandbox"],
+    reply: "TD-WORKLOAD-ALLOCATED\t",
+    deadline: Duration::from_secs(30),
+    uid: workload_uid,
+};
+
 /// A sandbox's account prepared for a launch (td-authd/DESIGN.md,
 /// "Workspace launch intake"): its existing ledger row returned, never one
 /// added, its home's mode restored and its cgroup delegation, which the
@@ -683,6 +697,31 @@ mod tests {
         ] {
             let refused = reply_uid(&PREPARE_SANDBOX, text).unwrap_err();
             assert!(!refused.contains("application"), "{text:?}: {refused}");
+        }
+    }
+
+    /// Creating a sandbox asks td-firstboot to allocate its row, whose
+    /// reply names a sandbox's or workspace's account and nothing else;
+    /// it is the one Check whose verb adds a workload row.
+    #[test]
+    fn a_sandbox_allocation_reply_names_one_workload_account() {
+        assert_eq!(ALLOCATE_SANDBOX.verb, "allocate-workload");
+        assert_eq!(ALLOCATE_SANDBOX.words, ["sandbox"]);
+        assert_eq!(
+            reply_uid(&ALLOCATE_SANDBOX, "TD-WORKLOAD-ALLOCATED\t98304\n").unwrap(),
+            98304
+        );
+        for text in [
+            "TD-WORKLOAD-ALLOCATED\t1000\n",
+            "TD-WORKLOAD-ALLOCATED\t65536\n",
+            "TD-WORKLOAD-ALLOCATED\t098304\n",
+            "TD-WORKLOAD-PREPARED\t98304\n",
+            "TD-APPLICATION-ALLOCATED\t98304\n",
+        ] {
+            assert!(reply_uid(&ALLOCATE_SANDBOX, text).is_err(), "{text:?}");
+        }
+        for check in [&LAUNCH, &ALLOCATE, &PREPARE_SANDBOX] {
+            assert_ne!(check.verb, "allocate-workload");
         }
     }
 

@@ -15,7 +15,7 @@ needs them:
 - To find or bump outdated pins (sources, the Rust toolchain, the Debian
   build root, Cargo locks), read `UPDATING.md`.
 - For application packaging or confinement, read `APPLICATIONS.md`.
-- For the account a workload (an application, a td-sandbox profile or a
+- For the account a workload (an application, a td-sandbox sandbox or a
   td-agent workspace) runs as, shared runtimes, or grants of the human's
   files to a workload, read `WORKLOADS.md`.
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
@@ -185,11 +185,12 @@ outside every closure and source-bootstrap claim, and runs only through
 the same confinement or, for a runtime a td workspace names, inside that
 workspace's jail (`APPLICATIONS.md` §C). That jail confines less than
 an application's: the runtime's code runs under the workspace kind's
-seccomp filter (td-sandbox's development profile where that applies), as
-the human (uid 1000) with the workspace's grants (its writable worktrees
-and shares, its network and the host-local sockets that reaches) until
-WORKLOADS.md step 7 gives workspaces accounts of their own, and not behind
-the application kind's D-Bus, portal or Wayland boundaries. td's own
+seccomp filter (the development profile where that applies), with the
+workspace's grants (its writable worktrees and shares, its network and
+the host-local sockets that reaches), as the sandbox's own account for a
+td-sandbox sandbox and as the human (uid 1000) for a td-agent workspace
+until WORKLOADS.md step 8, and not behind the application kind's D-Bus,
+portal or Wayland boundaries. td's own
 glibc programs in such a workspace can load the runtime's code too: td's
 imported glibc keeps its compiled-in `/usr` paths, so its gconv modules,
 its locale data and whatever a program loads or `dlopen`s by name after

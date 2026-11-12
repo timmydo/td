@@ -2,12 +2,13 @@
 name = "td-sandbox"
 version = "0.1.0"
 edition = "2021"
-description = "Persistent private-home development sandboxes over td-jail"
+description = "Development sandboxes, each run as its own account by root's workspace intake"
 license = "MIT"
 
 [workspace]
 
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-fs = { path = "../td-fs" }
 td-ui = { path = "../td-ui" }
 

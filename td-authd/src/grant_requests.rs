@@ -1,15 +1,17 @@
 //! The human's grant requests, root's serving half (td-authd/DESIGN.md,
-//! "Grant requests"): request `2c` runs td-firstboot's `grant-table`, the
-//! grant table's one writer, for one validated account and directory or
-//! a sandbox's network, waits for it within a bound, and answers with the
+//! "Grant requests"): request `2c`, and the workspace intake's grant
+//! verbs and its deletion of a sandbox, run td-firstboot's `grant-table`,
+//! the grant table's one writer, for one validated account and directory
+//! or a sandbox's network, wait for it within a bound, and read back the
 //! account's directory rows and a sandbox's network, or what the request
-//! changed. Nothing here elevates: a grant delegates the human's
-//! authority over the human's own files.
+//! changed. This file is the one place root runs the writer. Nothing here
+//! elevates: a grant delegates the human's authority over the human's own
+//! files.
 
 use crate::stderr_tail;
 use crate::workload_accounts::Kind;
 use crate::workload_grants::{self, Access, Network};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
@@ -27,7 +29,7 @@ const READ_STEP: Duration = Duration::from_millis(10);
 /// directory row an account may hold at the longest path.
 const OUTPUT_BYTES: usize = 64 * 1024;
 /// A grant path's bound, the table's.
-const PATH_BYTES: usize = 1024;
+pub(crate) const PATH_BYTES: usize = 1024;
 /// A frame's payload bound (td-authd/DESIGN.md, "Private channel").
 const FRAME_BYTES: usize = crate::channel::MAX_MESSAGE;
 /// The longest refusal reason an answer carries.
@@ -40,6 +42,8 @@ const OUTCOMES: &[(&str, u8)] = &[
     ("TD-GRANT-UNCHANGED\n", 2),
     ("TD-GRANT-REVOKED\n", 3),
 ];
+/// A clear's answer, then how many rows it took and a newline.
+const CLEARED: &str = "TD-GRANT-CLEARED\t";
 /// A listing's network byte for an application, whose network its
 /// declaration sets, not the table.
 const NETWORK_DECLARED: u8 = 0xff;
@@ -56,6 +60,23 @@ pub(crate) enum Verb {
     Revoke(Vec<u8>),
     /// A sandbox's network, off or the host's.
     Network(Network),
+    /// Every row of a sandbox, directory, socket and network alike, when
+    /// the workspace intake deletes it; no `2c` request names it.
+    Clear,
+}
+
+impl Verb {
+    /// A copy of this verb in fallibly grown storage.
+    pub(crate) fn copy(&self) -> Result<Self, String> {
+        let path = |path: &[u8]| crate::allocation::copy(path).map_err(crate::refused);
+        Ok(match self {
+            Self::List { start } => Self::List { start: *start },
+            Self::Grant(access, granted) => Self::Grant(*access, path(granted)?),
+            Self::Revoke(revoked) => Self::Revoke(path(revoked)?),
+            Self::Network(network) => Self::Network(*network),
+            Self::Clear => Self::Clear,
+        })
+    }
 }
 
 /// One request: a verb, and an account by kind, `application` or
@@ -119,24 +140,22 @@ impl Request {
 /// The writer's run for `request`, or the refusal its path earns without
 /// one: the fixed program, the owner, and the peer's verb, kind, name,
 /// access or network and path, validated, as its arguments.
-fn writer(owner: u32, request: &Request) -> Result<Command, Vec<u8>> {
+fn writer(owner: u32, request: &Request) -> Result<Command, String> {
     // A grant names a path this deployment publishes; a revoke any row the
     // table can hold, so one a later validator refuses can be taken back.
     let path = match &request.verb {
-        Verb::List { .. } | Verb::Network(_) => None,
+        Verb::List { .. } | Verb::Network(_) | Verb::Clear => None,
         Verb::Grant(_, path) => Some(path),
         Verb::Revoke(path) => {
-            workload_grants::table_path(path).map_err(|why| refusal(&why))?;
+            workload_grants::table_path(path)?;
             Some(path)
         }
     };
     if let Verb::Grant(_, path) = &request.verb {
-        workload_grants::validate_path(path).map_err(|why| refusal(&why))?;
+        workload_grants::validate_path(path)?;
     }
     let path = match path {
-        Some(path) => {
-            Some(std::str::from_utf8(path).map_err(|_| refusal("the path is not UTF-8"))?)
-        }
+        Some(path) => Some(std::str::from_utf8(path).map_err(|_| "the path is not UTF-8")?),
         None => None,
     };
     let (verb, word) = match &request.verb {
@@ -144,6 +163,7 @@ fn writer(owner: u32, request: &Request) -> Result<Command, Vec<u8>> {
         Verb::Grant(access, _) => ("grant", Some(access.as_str())),
         Verb::Revoke(_) => ("revoke", None),
         Verb::Network(network) => ("network", Some(network.as_str())),
+        Verb::Clear => ("clear", None),
     };
     let mut command = Command::new("/bin/td-firstboot");
     command.args([
@@ -161,18 +181,23 @@ fn writer(owner: u32, request: &Request) -> Result<Command, Vec<u8>> {
 
 /// `8b` and the reason, printable ASCII, cut to its bound.
 fn refusal(reason: &str) -> Vec<u8> {
+    let mut answer = vec![0x8b];
+    answer.extend_from_slice(refusal_text(reason).as_bytes());
+    answer
+}
+
+/// A refusal's reason as the human is shown it: printable ASCII, cut to
+/// its bound, never empty.
+pub(crate) fn refusal_text(reason: &str) -> String {
     let reason: String = crate::flathub_app::reason_text(reason)
         .chars()
         .take(REASON_BYTES)
         .collect();
-    let reason = if reason.is_empty() {
+    if reason.is_empty() {
         "the grant table's writer refused".to_string()
     } else {
         reason
-    };
-    let mut answer = vec![0x8b];
-    answer.extend_from_slice(reason.as_bytes());
-    answer
+    }
 }
 
 /// What the writer left: its output, its last diagnostic bytes and its
@@ -181,6 +206,67 @@ struct Ran {
     code: Option<i32>,
     output: Vec<u8>,
     said: Vec<u8>,
+}
+
+/// What a successful writer said, read exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Written {
+    /// The account's directory rows, and a sandbox's network (none for an
+    /// application, whose network its declaration sets); `rows` is the
+    /// listing as the writer printed it, which a page's digest covers.
+    Listed {
+        network: Option<Network>,
+        directories: Vec<(Access, String)>,
+        rows: String,
+    },
+    /// A change's outcome as `8a` carries it: `00` added, `01` changed,
+    /// `02` unchanged or `03` revoked; a network's is `01` or `02`.
+    Changed(u8),
+    /// How many rows a clear took.
+    Cleared(usize),
+}
+
+/// Why a request did not get the writer's answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Failed {
+    /// Root's validation or the writer refused, saying why: the human's to
+    /// read.
+    Refused(String),
+    /// Root could not run the writer, it outran its bound, a signal ended
+    /// it, it refused root's own arguments or it said what root cannot
+    /// read: root's failure, which root logs and the human is not shown.
+    Root(String),
+}
+
+/// Runs the writer for `request`, as every authority child runs, and reads
+/// exactly what it said.
+pub(crate) fn perform(owner: u32, request: &Request) -> Result<Written, Failed> {
+    perform_with(owner, request, run)
+}
+
+fn perform_with(
+    owner: u32,
+    request: &Request,
+    run: impl FnOnce(Command) -> Result<Ran, String>,
+) -> Result<Written, Failed> {
+    let command = writer(owner, request).map_err(Failed::Refused)?;
+    let ran = run(command).map_err(Failed::Root)?;
+    match ran.code {
+        Some(0) => interpret(request, &ran.output).map_err(Failed::Root),
+        Some(USAGE_EXIT) => Err(Failed::Root(
+            "td-firstboot grant-table refused root's arguments".into(),
+        )),
+        None => Err(Failed::Root(
+            "td-firstboot grant-table ended by a signal".into(),
+        )),
+        Some(_) => {
+            let line = stderr_tail::last_reason(&ran.said).unwrap_or_default();
+            Err(Failed::Refused(crate::message(format_args!(
+                "{}",
+                line.strip_prefix("td-firstboot: ").unwrap_or(&line)
+            ))))
+        }
+    }
 }
 
 /// Root's answer to `2c`: a listing's page (`89`), what a change did
@@ -195,41 +281,36 @@ fn answer_with(
     request: &Request,
     run: impl FnOnce(Command) -> Result<Ran, String>,
 ) -> Vec<u8> {
-    let command = match writer(owner, request) {
-        Ok(command) => command,
-        Err(answer) => return answer,
-    };
-    let interpreted = run(command).and_then(|ran| {
-        match ran.code {
-            Some(USAGE_EXIT) => {
-                return Err("td-firstboot grant-table refused root's arguments".into())
-            }
-            None => return Err("td-firstboot grant-table ended by a signal".into()),
-            Some(_) => {}
+    let answered = perform_with(owner, request, run)
+        .and_then(|written| page(request, &written).map_err(Failed::Root));
+    match answered {
+        Ok(answer) => answer,
+        Err(Failed::Refused(reason)) => refusal(&reason),
+        Err(Failed::Root(why)) => {
+            let _ = writeln!(std::io::stderr().lock(), "td-authd: grant request: {why}");
+            vec![0xff, 2]
         }
-        if ran.code != Some(0) {
-            let line = stderr_tail::last_reason(&ran.said).unwrap_or_default();
-            return Ok(refusal(
-                line.strip_prefix("td-firstboot: ").unwrap_or(&line),
-            ));
-        }
-        interpret(request, &ran.output)
-    });
-    interpreted.unwrap_or_else(|why| {
-        let _ = std::io::Write::write_all(
-            &mut std::io::stderr().lock(),
-            format!("td-authd: grant request: {why}\n").as_bytes(),
-        );
-        vec![0xff, 2]
-    })
+    }
 }
 
-/// The answer a successful writer's exact `output` makes for `request`.
-fn interpret(request: &Request, output: &[u8]) -> Result<Vec<u8>, String> {
-    let malformed = || "td-firstboot grant-table answered malformed".to_string();
+/// What a successful writer's exact `output` says for `request`.
+fn interpret(request: &Request, output: &[u8]) -> Result<Written, String> {
+    let malformed = || crate::message(format_args!("td-firstboot grant-table answered malformed"));
     let text = std::str::from_utf8(output).map_err(|_| malformed())?;
-    let start = match &request.verb {
-        Verb::List { start } => *start,
+    match &request.verb {
+        Verb::List { .. } => {}
+        Verb::Clear => {
+            let count = text
+                .strip_prefix(CLEARED)
+                .and_then(|rest| rest.strip_suffix('\n'))
+                .ok_or_else(malformed)?;
+            return count
+                .parse::<usize>()
+                .ok()
+                .filter(|_| crate::workload_accounts::canonical_decimal(count))
+                .map(Written::Cleared)
+                .ok_or_else(malformed);
+        }
         verb => {
             let outcome = OUTCOMES
                 .iter()
@@ -242,14 +323,14 @@ fn interpret(request: &Request, output: &[u8]) -> Result<Vec<u8>, String> {
                 Verb::Grant(..) => outcome <= 2,
                 Verb::Revoke(_) => outcome == 3,
                 Verb::Network(_) => matches!(outcome, 1 | 2),
-                Verb::List { .. } => false,
+                Verb::List { .. } | Verb::Clear => false,
             };
             if !fits {
                 return Err(malformed());
             }
-            return Ok(vec![0x8a, outcome]);
+            return Ok(Written::Changed(outcome));
         }
-    };
+    }
     let (head, rows) = text
         .strip_prefix(LISTED)
         .and_then(|rest| rest.split_once('\n'))
@@ -259,36 +340,67 @@ fn interpret(request: &Request, output: &[u8]) -> Result<Vec<u8>, String> {
     let (count, network) = match request.kind {
         Kind::Sandbox => {
             let (count, network) = head.split_once('\t').ok_or_else(malformed)?;
-            match Network::parse(network).ok_or_else(malformed)? {
-                Network::Off => (count, 0),
-                Network::Host => (count, 1),
-            }
+            (count, Some(Network::parse(network).ok_or_else(malformed)?))
         }
-        Kind::Application => (head, NETWORK_DECLARED),
+        Kind::Application => (head, None),
         // `decode` admits no workspace.
         Kind::Workspace => return Err(malformed()),
     };
     let total = count
         .parse::<usize>()
         .ok()
-        .filter(|total| total.to_string() == count && *total <= workload_grants::MAX_DIRECTORIES)
+        .filter(|total| {
+            crate::workload_accounts::canonical_decimal(count)
+                && *total <= workload_grants::MAX_DIRECTORIES
+        })
         .ok_or_else(malformed)?;
-    let mut listed = Vec::with_capacity(total);
+    let mut directories = crate::allocation::with_capacity(total).map_err(crate::refused)?;
     for row in rows.split_terminator('\n') {
         let (access, path) = row.split_once('\t').ok_or_else(malformed)?;
         let access = Access::parse(access).ok_or_else(malformed)?;
         // Every row the table holds, one a later validator refuses too.
         workload_grants::table_path(path.as_bytes()).map_err(|_| malformed())?;
-        listed.push((access, path));
+        crate::allocation::push(&mut directories, (access, crate::owned(path)?))
+            .map_err(crate::refused)?;
     }
-    if listed.len() != total || !(rows.is_empty() || rows.ends_with('\n')) {
+    if directories.len() != total || !(rows.is_empty() || rows.ends_with('\n')) {
         return Err(malformed());
     }
-    let mut answer = vec![0x89, u8::try_from(total).map_err(|_| malformed())?, network];
+    Ok(Written::Listed {
+        network,
+        directories,
+        rows: crate::owned(rows)?,
+    })
+}
+
+/// `2c`'s answer for what the writer said: `8a` and a change's outcome,
+/// or a listing's page from the request's start row, as many rows as fit
+/// a frame.
+fn page(request: &Request, written: &Written) -> Result<Vec<u8>, String> {
+    let malformed = || crate::message(format_args!("td-firstboot grant-table answered malformed"));
+    let (start, network, directories, rows) = match (&request.verb, written) {
+        (_, Written::Changed(outcome)) => return Ok(vec![0x8a, *outcome]),
+        (
+            Verb::List { start },
+            Written::Listed {
+                network,
+                directories,
+                rows,
+            },
+        ) => (*start, network, directories, rows),
+        _ => return Err(malformed()),
+    };
+    let network = match network {
+        Some(Network::Off) => 0,
+        Some(Network::Host) => 1,
+        None => NETWORK_DECLARED,
+    };
+    let total = u8::try_from(directories.len()).map_err(|_| malformed())?;
+    let mut answer = vec![0x89, total, network];
     // The whole listing's digest, so pages read from two tables of one
     // count do not pass for one listing.
     answer.extend_from_slice(&listing_digest(rows.as_bytes()).to_be_bytes());
-    for (access, path) in listed.iter().skip(start) {
+    for (access, path) in directories.iter().skip(start) {
         let length = u16::try_from(path.len()).map_err(|_| malformed())?;
         if answer.len() + 3 + path.len() > FRAME_BYTES {
             break;
@@ -609,12 +721,93 @@ mod tests {
                     assert!(answer.is_ok(), "{path:?}");
                     continue;
                 }
-                let answer = answer.unwrap_err();
+                let reason = answer.unwrap_err();
+                assert!(!reason.is_empty(), "{path:?}");
+                // A writer that ran would answer `ff 02`, never the refusal.
+                let answer = answer_with(1000, &request, |_| Err("the writer ran".into()));
                 assert_eq!(answer[0], 0x8b, "{path:?}");
                 assert!(answer[1..].iter().all(|b| (b' '..=b'~').contains(b)));
                 assert!(answer.len() <= 1 + REASON_BYTES);
             }
         }
+    }
+
+    /// The intake's deletion clears a sandbox's rows through the same
+    /// writer, with the fixed word `clear` and no path, and reads back
+    /// how many rows it took; no `2c` request names it.
+    #[test]
+    fn a_clear_runs_the_writer_and_reads_back_its_count() {
+        let clear = Request {
+            verb: Verb::Clear,
+            kind: Kind::Sandbox,
+            name: "oracle".into(),
+        };
+        assert_eq!(
+            args(&writer(1000, &clear).unwrap()),
+            ["grant-table", "1000", "clear", "sandbox", "oracle"]
+        );
+        let perform = |output: &str| perform_with(1000, &clear, |_| ran(true, output, ""));
+        assert_eq!(perform("TD-GRANT-CLEARED\t3\n"), Ok(Written::Cleared(3)));
+        assert_eq!(perform("TD-GRANT-CLEARED\t0\n"), Ok(Written::Cleared(0)));
+        for output in [
+            "TD-GRANT-CLEARED\t03\n",
+            "TD-GRANT-CLEARED\t3",
+            "TD-GRANT-CLEARED\t\n",
+            "TD-GRANT-REVOKED\n",
+            "TD-GRANTS\t0\toff\n",
+        ] {
+            assert!(
+                matches!(perform(output), Err(Failed::Root(_))),
+                "{output:?}"
+            );
+        }
+        assert_eq!(
+            perform_with(1000, &clear, |_| ran(false, "", "td-firstboot: busy\n")),
+            Err(Failed::Refused("busy".into()))
+        );
+        // No `2c` operands decode to a clear.
+        for verb in 0..=255u8 {
+            if let Ok(request) = Request::decode(&account(verb, 1, "oracle", &[0])) {
+                assert_ne!(request.verb, Verb::Clear);
+            }
+        }
+        // A clear has no page: `2c` never asked for one.
+        assert!(page(&clear, &Written::Cleared(1)).is_err());
+    }
+
+    /// The intake's listing and changes read exactly what `2c` reads.
+    #[test]
+    fn the_intake_reads_what_2c_reads() {
+        let list = Request {
+            verb: Verb::List { start: 0 },
+            kind: Kind::Sandbox,
+            name: "oracle".into(),
+        };
+        assert_eq!(
+            perform_with(1000, &list, |_| ran(
+                true,
+                "TD-GRANTS\t1\thost\nrw\tsrc\n",
+                ""
+            )),
+            Ok(Written::Listed {
+                network: Some(Network::Host),
+                directories: vec![(Access::ReadWrite, "src".into())],
+                rows: "rw\tsrc\n".into(),
+            })
+        );
+        let grant = Request {
+            verb: Verb::Grant(Access::ReadOnly, b"src".to_vec()),
+            kind: Kind::Sandbox,
+            name: "oracle".into(),
+        };
+        assert_eq!(
+            perform_with(1000, &grant, |_| ran(true, "TD-GRANT-ADDED\n", "")),
+            Ok(Written::Changed(0))
+        );
+        assert!(matches!(
+            perform_with(1000, &grant, |_| Err("did not answer in time".into())),
+            Err(Failed::Root(_))
+        ));
     }
 
     fn ran(success: bool, output: &str, said: &str) -> Result<Ran, String> {

@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use td_ui::pty::{ChildCommand, Pty, RelayTerminal};
 
-pub struct Running(pub Child);
+struct Running(Child);
 impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -28,9 +28,14 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
         .unwrap_or_else(|| u8::try_from(128 + status.signal().unwrap_or(1)).unwrap_or(1))
 }
 
+/// Relays the human's terminal or pipes over `channel`, the intake's
+/// connection once root answered `ok`, until the exit frame, a stop, or a
+/// signal. A channel that ends before its first frame, which the inside
+/// sends empty once its command runs, means the command never started;
+/// one that ends later, that it ended without saying how. Root's log says
+/// why either way.
 pub fn outside(
     mut channel: UnixStream,
-    child: &mut Running,
     stop: &std::os::unix::net::UnixListener,
     terminal: bool,
 ) -> io::Result<u8> {
@@ -107,6 +112,7 @@ pub fn outside(
     let mut pending_output = None;
     let mut outstanding = 0usize;
     let mut exit = None;
+    let mut started = false;
     loop {
         if stop.accept().is_ok() {
             return Ok(143);
@@ -167,25 +173,35 @@ pub fn outside(
             if exit.is_some() {
                 break;
             }
-            match rx.try_recv() {
+            let frame = rx.try_recv();
+            // Any frame, the inside's empty first one included, says the
+            // command started.
+            started |= matches!(frame, Ok(Ok(_)));
+            match frame {
                 Ok(Ok((kind @ (wire::OUTPUT | wire::ERROR), bytes))) => {
                     pending_output = Some((kind, bytes))
                 }
                 Ok(Ok((wire::EXIT, bytes))) if bytes.len() == 1 => exit = bytes.first().copied(),
                 Ok(Ok(_)) => return Err(err("unexpected jail relay frame")),
-                Ok(Err(e)) => {
-                    return match child.0.try_wait()? {
-                        Some(status) if !status.success() => Ok(exit_code(status)),
-                        _ => Err(e),
-                    };
+                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(ended(started));
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(err("jail ended without an exit frame"))
-                }
             }
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Why a channel ended without its exit frame.
+fn ended(started: bool) -> io::Error {
+    let log = crate::intake::LOG;
+    if started {
+        crate::failure(format_args!(
+            "the sandbox's relay ended without an exit status; {log} says why"
+        ))
+    } else {
+        crate::failure(format_args!("the sandbox did not start; {log} says why"))
     }
 }
 
@@ -254,8 +270,8 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
             break;
         }
     }
-    // The chosen shell is supplied by the trusted outer launcher for shell mode;
-    // direct commands discover shells on the admitted PATH as usual.
+    // Root names td's shell for shell mode; a command discovers shells on
+    // the admitted PATH as usual.
     if program
         .file_name()
         .is_some_and(|n| n == "bash" || n == "zsh" || n == "sh" || n == "td-sh")
@@ -319,6 +335,9 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
             wire::ERROR,
         ));
     }
+    // An empty first frame: the command runs, so a channel that ends from
+    // here on is a session that ended, not one that never started.
+    output(&output_channel, wire::OUTPUT, &[])?;
     let (tx, rx) = mpsc::sync_channel(128);
     std::thread::spawn(move || {
         let mut input = io::stdin();

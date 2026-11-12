@@ -3049,9 +3049,20 @@ through safe std `Stdio` from `OwnedFd`, keeps no copy of the connection,
 and forwards no other descriptor; the helper execs `workspace-exec`,
 which execs td-jail with those descriptors, so the connection becomes
 the jail's channel without a descriptor ever being sent. Root reads the
-helper's stderr through its own end. The controller source, its fixed
-helper and jail argv, its peer rule and its one call of each prior check
-are pinned by confinement tests. No instruction, syscall, option or
+helper's stderr through its own end. Its grant verbs and a deletion's
+clear run the grant table's writer through `grant_requests.rs`'s one
+spawn path. A deletion's emptying of a sandbox's home runs as the
+account, through the same credential helper, as `workspace-empty`: safe
+std opens each directory by an `O_PATH | O_NOFOLLOW | O_DIRECTORY`
+handle, restores its owner's mode through that handle's procfs path,
+reads it through a second open of that path, and removes entries
+without following links. Root reads a sandbox's home only by its
+top-level listing and one fixed name in it, the deletion mark
+`.td-deleted`, through an `O_NOFOLLOW | O_DIRECTORY` descriptor of the
+home's, and makes or removes that mark through the same descriptor's
+procfs path, created exclusively with `O_NOFOLLOW`. The controller source, its fixed helper, jail
+and emptier argv, its peer rule and its one call of each prior check are
+pinned by confinement tests. No instruction, syscall, option or
 allowance is added.
 
 ### Elevation: `deploy-rollback`

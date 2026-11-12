@@ -1099,17 +1099,19 @@ fn the_production_source_and_raw_boundary_are_closed() {
         );
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
-    // The one td-firstboot child runs one of three fixed verbs: the launch
-    // admission, an install's allocation and a sandbox launch's
-    // preparation of its existing row, whose kind is its one fixed word.
+    // The one td-firstboot child runs one of four fixed verbs: the launch
+    // admission, an install's allocation, a sandbox's allocation when
+    // td-sandbox creates it, and a sandbox launch's or deletion's
+    // preparation of its existing row, the kind its one fixed word.
     assert!(application.contains(
         "            .arg(check.verb)\n            .arg(owner.to_string())\n            .args(check.words)\n            .arg(name)\n"
     ));
-    assert_eq!(application.matches("    verb: \"").count(), 3);
+    assert_eq!(application.matches("    verb: \"").count(), 4);
     assert!(application.contains("    verb: \"check-launch-application\",\n    words: &[],\n"));
     assert!(application.contains("    verb: \"allocate-application\",\n    words: &[],\n"));
     assert!(application.contains("    verb: \"prepare-workload\",\n    words: &[\"sandbox\"],\n"));
-    assert!(!application.contains("allocate-workload"));
+    assert!(application.contains("    verb: \"allocate-workload\",\n    words: &[\"sandbox\"],\n"));
+    assert_eq!(application.matches("allocate-workload").count(), 1);
     assert_eq!(application.matches("admit(&ALLOCATE, ").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
@@ -1313,11 +1315,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for forbidden in ["fs::read", "fs::write", "OpenOptions", "remove_"] {
         assert!(!software.contains(forbidden), "software.rs: {forbidden}");
     }
-    // Request `2c` runs the grant table's one writer, td-firstboot, with
-    // the owner, a fixed verb, the kind the peer's byte selects from two
-    // fixed words, and the peer's validated name, access or network and
-    // path: one fixed program, null stdin, no environment, no credential
-    // change, waited for within its bound by one sleep loop.
+    // Request `2c`, and the workspace intake's grant verbs and deletion,
+    // run the grant table's one writer, td-firstboot, with the owner, a
+    // fixed verb, the kind from two fixed words, and the peer's validated
+    // name, access or network and path: one fixed program, null stdin, no
+    // environment, no credential change, waited for within its bound by
+    // one sleep loop. `perform` is its one entry; `2c` pages what it reads.
     let grants = include_str!("../src/grant_requests.rs")
         .split("#[cfg(test)]")
         .next()
@@ -1370,13 +1373,18 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // a grant's by `validate_path`, a revoke's by `table_path`, which still
     // reaches an inert row.
     for check in [
-        "workload_grants::validate_path(path).map_err(|why| refusal(&why))?;",
-        "workload_grants::table_path(path).map_err(|why| refusal(&why))?;",
+        "workload_grants::validate_path(path)?;",
+        "workload_grants::table_path(path)?;",
     ] {
         assert_eq!(grants.matches(check).count(), 1, "{check}");
         assert!(grants.find(check).unwrap() < grants.find("Command::new(").unwrap());
     }
     assert_eq!(grants.matches(".spawn()").count(), 1);
+    assert_eq!(
+        grants.matches("perform_with(owner, request, run)").count(),
+        2
+    );
+    assert_eq!(grants.matches("perform_with(").count(), 3);
     assert_eq!(grants.matches(".env_clear()").count(), 1);
     assert_eq!(grants.matches(".stdin(Stdio::null())").count(), 1);
     assert!(grants.contains("    drop(command);\n"));
@@ -1611,8 +1619,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "fn executable_views(kind: Kind) -> bool {\n    match kind {\n        Kind::Application => false,\n        Kind::Sandbox | Kind::Workspace => true,\n    }\n}"
     ));
     // The workspace intake: the primary human's peers alone, one fixed
-    // helper argv for the ledger account, one fixed jail argv, the
-    // accepted connection its only descriptors beside a private stderr.
+    // helper argv for the ledger account, one fixed jail argv and one
+    // fixed emptier argv, the accepted connection a launch's only
+    // descriptors beside a private stderr. It allocates only at `create`,
+    // prepares an existing row for a launch and a deletion, and reaches
+    // the grant table only through grant_requests' writer.
     let workspace = include_str!("../src/workspace.rs")
         .split("#[cfg(test)]")
         .next()
@@ -1623,20 +1634,21 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "root workspace launch intake changed"
     );
     for (call, count) in [
-        ("Command::new(", 2),
-        ("Command::new(\"/bin/td-login\")", 1),
+        ("Command::new(", 3),
+        ("Command::new(\"/bin/td-login\")", 2),
         ("Command::new(\"/bin/td-jail\")", 1),
         (".spawn(", 2),
         (".exec()", 1),
+        ("stderr_tail::status(&mut command)", 1),
         ("crate::secret_sys::peer_uid(&stream)", 1),
-        (
-            "grant_views::publish(Kind::Sandbox, &request.name, uid)?",
-            1,
-        ),
-        ("application::admit(", 1),
-        ("&application::PREPARE_SANDBOX", 1),
-        ("application::require_process(", 1),
+        ("grant_views::publish(Kind::Sandbox, name, uid)?", 1),
+        ("application::admit(", 3),
+        ("&application::PREPARE_SANDBOX", 2),
+        ("&application::ALLOCATE_SANDBOX", 1),
+        ("grant_requests::perform(", 1),
+        ("application::require_process(", 2),
         ("Stdio::from(OwnedFd::from(", 3),
+        ("fs::remove_dir_all(", 1),
         ("unsafe", 0),
     ] {
         assert_eq!(
@@ -1649,19 +1661,36 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // The service runs each connection through the real preparation and
     // launch, checks what the human can mend before its answer, and never
     // leaves its accept loop over a failed accept.
-    assert!(workspace.contains("                handle(stream, id, prepare, run);\n"));
+    assert!(workspace.contains("                handle(stream, id, &active, &Root);\n"));
     assert_eq!(workspace.matches("handle(").count(), 2);
     let prepare = workspace
-        .split("fn prepare(request: &Request, id: u64)")
+        .split(
+            "fn prepare(&self, name: &str, launch: &Launch, id: u64) -> Result<Prepared, String> {",
+        )
         .nth(1)
         .unwrap();
     let at = |needle: &str| prepare.find(needle).unwrap();
     assert!(
-        at("sandbox_uid(&accounts::load()?, &request.name)?;")
-            < at("require_runtime(Path::new(flathub_app::RUNTIME_STORE), request.runtime)?;")
+        at("sandbox_uid(&accounts::load()?, name)?;")
+            < at("require_runtime(Path::new(flathub_app::RUNTIME_STORE), launch.runtime)?;")
             && at("require_runtime(") < at("application::admit(")
             && at("application::admit(") < at("grant_views::publish(")
             && at("grant_views::publish(") < at("specs().write(uid, id, &text)?")
+    );
+    // A deletion clears the rows before anything else, and the account,
+    // not root, empties its home.
+    let delete = workspace
+        .split("fn delete(\n    name: &str,")
+        .nth(1)
+        .unwrap();
+    let at = |needle: &str| delete.find(needle).unwrap();
+    assert!(
+        at("match clear(&request) {") < at("let Some(uid) = account()? else {")
+            && at("account()?") < at("if prepare()? != uid {")
+            && at("prepare()?") < at("empty(uid)")
+    );
+    assert!(
+        workspace.contains(".args([\"/bin/td-authd\", \"workspace-empty\", &uid.to_string()]);")
     );
     let accepting = workspace
         .split("pub(crate) fn serve()")
@@ -1670,7 +1699,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(accepting.matches("return").count(), 0);
     assert_eq!(accepting.matches("?;").count(), 0);
-    assert!(workspace.contains(".args([\"exec-service-as\", &format!(\"tdw{uid}\"), \"--\"])"));
+    assert_eq!(
+        workspace
+            .matches(".args([\"exec-service-as\", &format!(\"tdw{uid}\"), \"--\"])")
+            .count(),
+        2
+    );
     assert!(views.contains("format!(\"{}/{}/{index}\", grants::VIEW_ROOT, self.uid)"));
     // The portal's Downloads view: one lock for its two callers, and every
     // mount at it released before one is published.
@@ -1707,10 +1741,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
-const GRANT_REQUESTS_FINGERPRINT: u64 = 0x10849a59813c63f1;
+const GRANT_REQUESTS_FINGERPRINT: u64 = 0x780971233c3be771;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f8b0e4c319550d1;
-const WORKSPACE_FINGERPRINT: u64 = 0xe3adb45337f49998;
-const APPLICATION_FINGERPRINT: u64 = 0x51ed125bbbcde81a;
+const WORKSPACE_FINGERPRINT: u64 = 0x865229cd5a76475a;
+const APPLICATION_FINGERPRINT: u64 = 0xf4b2603ba8d7144b;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1725,7 +1759,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x33d421b9691fb2fb;
-const MAIN_FINGERPRINT: u64 = 0x6a995c61506177a1;
+const MAIN_FINGERPRINT: u64 = 0xed3640ea05832242;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 

@@ -19,6 +19,9 @@ const MAGIC: &str = "td-grants-v1\n";
 pub const FILE_NAME: &str = "grants.tsv";
 /// The published table's exact mode: root alone reads it.
 pub const MODE: u32 = 0o600;
+/// The writer's refusal when another change held the table past its wait:
+/// the one refusal of the writer's that asking again can change.
+pub const BUSY: &str = "the grant table is busy with another change; ask again";
 /// Rows stay until the human revokes them, and a rolled-back deployment
 /// must still read what a later one wrote, so the v1 bounds are generous.
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -388,6 +391,31 @@ impl Table {
             ));
         }
         Self::of_rows(rows)
+    }
+
+    /// Whether the `kind` account `name` holds any row, directory, socket
+    /// or network: a sandbox holding one is not created again over.
+    pub fn holds_any(&self, kind: Kind, name: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.kind == kind && row.name == name)
+    }
+
+    /// The table without any row of the `kind` account `name`, directory,
+    /// socket and network alike, and how many it held: what deleting a
+    /// sandbox does, since rows are keyed by name and a sandbox created
+    /// again under it must inherit none. Holding none changes nothing.
+    pub fn clear(&self, kind: Kind, name: &str) -> Result<(Self, usize), String> {
+        if !valid_name(name) {
+            return Err("invalid grant account name".into());
+        }
+        let rows = self.kept(|row| !(row.kind == kind && row.name == name));
+        let cleared = self.rows.len() - rows.len();
+        // Holding none, the rows kept are this table's own, in its order.
+        if cleared == 0 {
+            return Ok((Self { rows }, 0));
+        }
+        Ok((Self::of_rows(rows)?, cleared))
     }
 
     /// The rows `keep` keeps, copied: what a change that takes rows away
@@ -1241,6 +1269,35 @@ mod tests {
             assert_eq!(Network::parse(word).unwrap().as_str(), word);
         }
         assert!(Network::parse("on").is_none());
+    }
+
+    /// Clearing an account takes every row it holds, its network and
+    /// sockets with its directories, and no other account's, a same-named
+    /// account of another kind included; one holding none is unchanged.
+    #[test]
+    fn clearing_an_account_takes_every_row_it_holds_and_no_other() {
+        let base = Table::parse(
+            "td-grants-v1\napplication\tdefault\tdirectory\trw\tDownloads\nsandbox\tdefault\tdirectory\tro\tsrc\nsandbox\tdefault\tdirectory\trw\twork\nsandbox\tdefault\tnetwork\thost\nsandbox\tdefault\tsocket\tfetch\nsandbox\ttools\tnetwork\thost\nworkspace\tdefault\tdirectory\tro\tsrc\n",
+        )
+        .unwrap();
+        let (cleared, count) = base.clear(Kind::Sandbox, "default").unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(
+            cleared.encode(),
+            "td-grants-v1\napplication\tdefault\tdirectory\trw\tDownloads\nsandbox\ttools\tnetwork\thost\nworkspace\tdefault\tdirectory\tro\tsrc\n"
+        );
+        assert_eq!(cleared.network(Kind::Sandbox, "default"), Network::Off);
+        assert!(cleared.held(Kind::Sandbox, "default").is_empty());
+        assert!(base.holds_any(Kind::Sandbox, "default"));
+        assert!(!cleared.holds_any(Kind::Sandbox, "default"));
+        // A socket row alone, or a network row alone, is a row held.
+        assert!(base.holds_any(Kind::Sandbox, "tools"));
+        let socket = Table::parse("td-grants-v1\nsandbox\tx\tsocket\tfetch\n").unwrap();
+        assert!(socket.holds_any(Kind::Sandbox, "x"));
+        assert!(!socket.holds_any(Kind::Workspace, "x"));
+        let (again, count) = cleared.clear(Kind::Sandbox, "default").unwrap();
+        assert_eq!((again, count), (cleared.clone(), 0));
+        assert!(base.clear(Kind::Sandbox, "Default").is_err());
     }
 
     /// Sandbox and workspace rows together stop at half the table's rows

@@ -124,7 +124,9 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
      td-authd runtime-cache RUNTIME install|update|remove|status | \
-     td-authd workspace-serve | td-authd workspace-exec UID LAUNCHER SPEC TERM SHELL | \
+     td-authd workspace-serve | \
+     td-authd workspace-exec UID LAUNCHER SPEC pty|pipes TERM -- PROGRAM [ARG...] | \
+     td-authd workspace-empty UID | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME | \
      td-authd time ACTION VALUE | td-authd volume add|remove ...";
 
@@ -185,6 +187,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
         }
         if verb == "workspace-exec" {
             return workspace::exec(rest);
+        }
+        if verb == "workspace-empty" {
+            return workspace::empty(rest);
         }
         if verb == "application-cache" || verb == "runtime-cache" {
             let output = if verb == "application-cache" {

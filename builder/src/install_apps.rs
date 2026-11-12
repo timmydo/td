@@ -40,7 +40,6 @@ const APPS: &[&str] = &[
     "td-photo",
     "td-pinentry",
     "td-review",
-    "td-sandbox",
     "td-taskmgr",
     "td-term",
     "td-web",

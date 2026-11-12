@@ -306,6 +306,9 @@ const TD_SOFTWARE_INSTALL_MARKER: &str = td_recipe::shared::TD_SOFTWARE_INSTALL_
 // The grant request path: the control socket's grant, Firefox's launch
 // publishing it, and its revoke (td-authd/DESIGN.md, "Grant requests").
 const TD_GRANT_REQUEST_MARKER: &str = td_recipe::shared::TD_GRANT_REQUEST_MARKER;
+// A sandbox created, granted, run as its own account and deleted through
+// root's workspace intake (td-authd/DESIGN.md, "Workspace launch intake").
+const TD_SANDBOX_ACCOUNT_MARKER: &str = td_recipe::shared::TD_SANDBOX_ACCOUNT_MARKER;
 const TD_NEWS_BOOT_MARKER: &str = td_recipe::shared::TD_NEWS_BOOT_MARKER;
 // Printed by the `web-evidence` unit as mail's and news's are, td-jail asked as
 // td-web's own account, whose cgroup holds the jail.
@@ -656,6 +659,7 @@ struct ConsoleEvidence {
     td_fetch_ok: bool,
     td_software_install: bool,
     td_grant_request: bool,
+    td_sandbox_account: bool,
     td_mail_running: bool,
     td_news_running: bool,
     td_web_running: bool,
@@ -2491,6 +2495,23 @@ fn validate_system_boot(
              serial output:\n{}",
             tail(&result.console, 80)
         ));
+    }
+    if !result.evidence.td_sandbox_account {
+        // Refused, the complaint is empty, which still fails the boot.
+        return Err(td_engine::allocation::format(format_args!(
+            "the {ordinal} boot reached the greeter, but the sandbox account marker \
+             ({TD_SANDBOX_ACCOUNT_MARKER:?}) was absent — td-sandbox's create, share, network, \
+             adopt or delete through root's workspace intake, the commands run as the \
+             sandbox's own account with its granted directory executable and nothing else of \
+             the human's or the network, the idmapped view's owner on disk, the refusal of a \
+             create over the held sandbox, the grant rows the delete must revoke, the emptied \
+             home, or the seeded default's ~/sandbox failed (td-authd/DESIGN.md, \
+             \"Workspace launch intake\"; \
+             td-sandbox/DESIGN.md); a failure after the intake answered is in \
+             /var/log/svc/workspace-intake.log. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ))
+        .unwrap_or_default());
     }
     if !result.evidence.td_firefox_content {
         return Err(format!(
@@ -6805,6 +6826,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FETCH_BOOT_MARKER),
         exact_line_window(TD_SOFTWARE_INSTALL_MARKER),
         exact_line_window(TD_GRANT_REQUEST_MARKER),
+        exact_line_window(TD_SANDBOX_ACCOUNT_MARKER),
         exact_line_window(TD_MAIL_BOOT_MARKER),
         exact_line_window(TD_NEWS_BOOT_MARKER),
         exact_line_window(TD_WEB_BOOT_MARKER),
@@ -7371,6 +7393,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_grant_request,
         buf,
         TD_GRANT_REQUEST_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_sandbox_account,
+        buf,
+        TD_SANDBOX_ACCOUNT_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -11877,6 +11905,7 @@ mod tests {
         evidence.td_fetch_ok = true;
         evidence.td_software_install = true;
         evidence.td_grant_request = true;
+        evidence.td_sandbox_account = true;
         evidence.td_mail_running = true;
         evidence.td_news_running = true;
         evidence.td_web_running = true;
@@ -12486,6 +12515,16 @@ mod tests {
             "the rejection must name the grant marker: {complaint}"
         );
 
+        let mut without_sandbox = healthy_evidence();
+        without_sandbox.td_sandbox_account = false;
+        let complaint = validate(&boot(without_sandbox))
+            .expect_err("a boot missing the sandbox account marker must be rejected");
+        assert!(
+            complaint.contains(&format!("({TD_SANDBOX_ACCOUNT_MARKER:?})"))
+                && complaint.contains("/var/log/svc/workspace-intake.log"),
+            "the rejection must name the sandbox marker and the intake's log: {complaint}"
+        );
+
         let mut without_mail = healthy_evidence();
         without_mail.td_mail_running = false;
         let complaint = validate(&boot(without_mail))
@@ -12537,6 +12576,7 @@ mod tests {
                 evidence.td_applications_placed,
                 evidence.td_software_install,
                 evidence.td_grant_request,
+                evidence.td_sandbox_account,
             ]
         };
         for (index, marker) in [
@@ -12547,6 +12587,7 @@ mod tests {
             TD_APPLICATIONS_PLACED_MARKER,
             TD_SOFTWARE_INSTALL_MARKER,
             TD_GRANT_REQUEST_MARKER,
+            TD_SANDBOX_ACCOUNT_MARKER,
         ]
         .into_iter()
         .enumerate()
@@ -12559,7 +12600,7 @@ mod tests {
                 format!("\n..{marker}\n"),
             ] {
                 latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
-                assert_eq!(latched(&evidence), [false; 7], "accepted {noise:?}");
+                assert_eq!(latched(&evidence), [false; 8], "accepted {noise:?}");
             }
             // Both line endings the console can carry.
             let terminator = if index == 1 { "\n" } else { "\r\n" };
@@ -12568,7 +12609,7 @@ mod tests {
                 format!("\n{marker}{terminator}").as_bytes(),
                 b"target",
             );
-            let mut expected = [false; 7];
+            let mut expected = [false; 8];
             if let Some(slot) = expected.get_mut(index) {
                 *slot = true;
             }

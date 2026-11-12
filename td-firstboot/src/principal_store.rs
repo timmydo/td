@@ -45,6 +45,9 @@ pub(crate) enum GrantVerb {
     Revoke(String),
     /// A sandbox's network, which its one network row holds.
     Network(Network),
+    /// Every row of a sandbox, directory, socket and network alike: what
+    /// deleting it does (td-authd/DESIGN.md, "Workspace launch intake").
+    Clear,
 }
 
 /// What it found or did.
@@ -59,6 +62,8 @@ pub(crate) enum GrantReply {
     Granted(Change),
     Revoked,
     Networked(NetworkChange),
+    /// How many rows a clear took; none is a clear that changed nothing.
+    Cleared(usize),
 }
 
 /// What setting a sandbox's network did: it changes or stands, never adds
@@ -439,9 +444,7 @@ impl Directory {
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(LOCK_POLL);
                 }
-                Err(TryLockError::WouldBlock) => {
-                    return Err("the grant table is busy with another change; ask again".into())
-                }
+                Err(TryLockError::WouldBlock) => return Err(workload_grants::BUSY.into()),
                 Err(TryLockError::Error(error)) => {
                     return Err(format!("lock principal enrollment: {error}"))
                 }
@@ -459,9 +462,10 @@ impl Directory {
     /// sandbox's network set to the host's, first pass `admit`, the
     /// session owner, an application's declaration and the source's early
     /// check, and a sandbox's then needs its ledger row, which allocation
-    /// makes and a grant never does; a listing, a revocation and a network
-    /// set off name any account, so a row an image no longer declares can
-    /// still be seen and removed. An absent table refuses: boot seeds it.
+    /// makes and a grant never does; a listing, a revocation, a network
+    /// set off and a sandbox's clear name any account, so a row an image no
+    /// longer declares, or a deleted sandbox's, can still be seen and
+    /// removed. An absent table refuses: boot seeds it.
     fn grants(
         &self,
         kind: Kind,
@@ -481,6 +485,9 @@ impl Directory {
                     "an application's network is its declaration's; only a sandbox's is set here"
                         .into(),
                 )
+            }
+            (Kind::Application, GrantVerb::Clear) => {
+                return Err("only a sandbox's rows are cleared, when it is deleted".into())
             }
             _ => {}
         }
@@ -517,7 +524,7 @@ impl Directory {
                 admit()?;
             }
             GrantVerb::Network(Network::Host) => admit()?,
-            GrantVerb::Network(Network::Off) => {}
+            GrantVerb::Network(Network::Off) | GrantVerb::Clear => {}
             GrantVerb::Revoke(path) => workload_grants::table_path(path.as_bytes())?,
         }
         let deadline = Instant::now()
@@ -547,6 +554,10 @@ impl Directory {
                     return Ok(GrantReply::Networked(NetworkChange::Unchanged))
                 }
                 (next, _) => (next, GrantReply::Networked(NetworkChange::Changed)),
+            },
+            GrantVerb::Clear => match table.clear(kind, name)? {
+                (_, 0) => return Ok(GrantReply::Cleared(0)),
+                (next, count) => (next, GrantReply::Cleared(count)),
             },
         };
         self.publish_as(

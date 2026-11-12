@@ -1,6 +1,7 @@
 use crate::types::Recipe;
 
-/// The private-home launcher shares the PTY and host PATH implementations.
+/// The sandbox client shares the PTY implementation and the engine's runtime
+/// and workload ledger declarations.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-sandbox", "0.1.0")
         .local_source("td-sandbox")

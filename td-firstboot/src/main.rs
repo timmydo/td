@@ -146,6 +146,8 @@ const GRANT_ADDED: &str = "TD-GRANT-ADDED";
 const GRANT_CHANGED: &str = "TD-GRANT-CHANGED";
 const GRANT_UNCHANGED: &str = "TD-GRANT-UNCHANGED";
 const GRANT_REVOKED: &str = "TD-GRANT-REVOKED";
+/// A deleted sandbox's clear, then a tab and how many rows it took.
+const GRANT_CLEARED: &str = "TD-GRANT-CLEARED";
 const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 /// `render-primary-sshd`'s server form: the policy also names the root-owned
 /// provisioned keys (td-svc/DESIGN.md §10, "Profiles").
@@ -361,7 +363,7 @@ fn usage() -> String {
          td-firstboot allocate-application OWNER APP allocates a declared Flathub application's account when absent and prepares its home, cgroup and runtime directory\n  \
          td-firstboot allocate-workload OWNER sandbox NAME allocates a sandbox's account when absent and prepares its home and cgroup\n  \
          td-firstboot prepare-workload OWNER sandbox NAME prepares a sandbox's existing account's home and cgroup again, adding none\n  \
-         td-firstboot grant-table OWNER list|grant|revoke|network KIND NAME [ro|rw] [PATH|off|host] lists an account's directory grants and a sandbox's network, grants or revokes one of the human's directories, or sets a sandbox's network\n",
+         td-firstboot grant-table OWNER list|grant|revoke|network|clear KIND NAME [ro|rw] [PATH|off|host] lists an account's directory grants and a sandbox's network, grants or revokes one of the human's directories, sets a sandbox's network, or clears every row of a deleted sandbox\n",
         policy = ssh_render::POLICY,
         record = cutover::RECORD,
     )
@@ -490,7 +492,7 @@ fn run_with_primary(
         Invocation::GrantTable(owner, kind, name, verb) => {
             let reply =
                 principal_store::grant_table(owner, kind, &name, &verb).map_err(Failure::Failed)?;
-            return emit(&grant_reply(&reply)).map_err(Failure::Failed);
+            return emit(&grant_reply(&reply)?).map_err(Failure::Failed);
         }
         Invocation::Provision(config) => config,
     };
@@ -679,15 +681,17 @@ enum Invocation {
 }
 
 /// `grant-table OWNER list KIND NAME`, `grant-table OWNER grant KIND NAME
-/// ro|rw PATH`, `grant-table OWNER revoke KIND NAME PATH` or `grant-table
-/// OWNER network KIND NAME off|host`, td-authd's grant requests. The
+/// ro|rw PATH`, `grant-table OWNER revoke KIND NAME PATH`, `grant-table
+/// OWNER network KIND NAME off|host` or `grant-table OWNER clear KIND
+/// NAME`, td-authd's grant requests and its sandbox deletion. The
 /// path's rules and which kinds take which verb are the table writer's,
 /// checked when it is changed.
 fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
     let usage = || {
         Failure::Usage(
             "grant-table requires OWNER list KIND NAME, OWNER grant KIND NAME ro|rw PATH, \
-             OWNER revoke KIND NAME PATH or OWNER network KIND NAME off|host"
+             OWNER revoke KIND NAME PATH, OWNER network KIND NAME off|host or \
+             OWNER clear KIND NAME"
                 .into(),
         )
     };
@@ -710,6 +714,7 @@ fn grant_table_invocation(args: &[String]) -> Result<Invocation, Failure> {
         ("network", [network]) => principal_store::GrantVerb::Network(
             workload_grants::Network::parse(network).ok_or_else(usage)?,
         ),
+        ("clear", []) => principal_store::GrantVerb::Clear,
         _ => return Err(usage()),
     };
     Ok(Invocation::GrantTable(uid, kind, name.clone(), verb))
@@ -750,11 +755,12 @@ fn session_owner(owner: &str) -> Option<u32> {
 }
 
 /// What `grant-table` prints for td-authd: a listing's count, a sandbox's
-/// network and the rows, or what a change did, one marker line.
-fn grant_reply(reply: &principal_store::GrantReply) -> String {
+/// network and the rows, or what a change did, one marker line. A refused
+/// allocation fails the process, as `allocate-workload`'s does.
+fn grant_reply(reply: &principal_store::GrantReply) -> Result<String, Failure> {
     use principal_store::{GrantReply, NetworkChange};
     use workload_grants::Change;
-    match reply {
+    Ok(match reply {
         GrantReply::List {
             directories,
             network,
@@ -783,7 +789,11 @@ fn grant_reply(reply: &principal_store::GrantReply) -> String {
             format!("{GRANT_UNCHANGED}\n")
         }
         GrantReply::Revoked => format!("{GRANT_REVOKED}\n"),
-    }
+        GrantReply::Cleared(count) => {
+            allocation::format(format_args!("{GRANT_CLEARED}\t{count}\n"))
+                .map_err(|_| Failure::Failed(String::new()))?
+        }
+    })
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
@@ -2216,6 +2226,11 @@ mod tests {
                 Kind::Sandbox,
                 GrantVerb::Network(workload_grants::Network::Off),
             ),
+            (
+                &["1000", "clear", "sandbox", "default"],
+                Kind::Sandbox,
+                GrantVerb::Clear,
+            ),
         ] {
             match parsed(arguments) {
                 Ok(Invocation::GrantTable(1000, parsed_kind, name, verb)) => {
@@ -2250,6 +2265,8 @@ mod tests {
             &["1000", "network", "sandbox", "default"],
             &["1000", "network", "sandbox", "default", "on"],
             &["1000", "network", "sandbox", "default", "host", "x"],
+            &["1000", "clear", "sandbox"],
+            &["1000", "clear", "sandbox", "default", "x"],
         ] {
             assert!(
                 matches!(parsed(arguments), Err(Failure::Usage(_))),
@@ -2281,14 +2298,16 @@ mod tests {
             grant_reply(&GrantReply::List {
                 directories: rows(),
                 network: None
-            }),
+            })
+            .unwrap(),
             "TD-GRANTS\t2\nro\tMy Pictures\nrw\tDownloads\n"
         );
         assert_eq!(
             grant_reply(&GrantReply::List {
                 directories: Vec::new(),
                 network: None
-            }),
+            })
+            .unwrap(),
             "TD-GRANTS\t0\n"
         );
         // A sandbox's listing carries its network after the count.
@@ -2296,14 +2315,16 @@ mod tests {
             grant_reply(&GrantReply::List {
                 directories: rows(),
                 network: Some(Network::Host)
-            }),
+            })
+            .unwrap(),
             "TD-GRANTS\t2\thost\nro\tMy Pictures\nrw\tDownloads\n"
         );
         assert_eq!(
             grant_reply(&GrantReply::List {
                 directories: Vec::new(),
                 network: Some(Network::Off)
-            }),
+            })
+            .unwrap(),
             "TD-GRANTS\t0\toff\n"
         );
         for (reply, line) in [
@@ -2322,9 +2343,17 @@ mod tests {
                 GrantReply::Networked(NetworkChange::Unchanged),
                 "TD-GRANT-UNCHANGED\n",
             ),
+            (GrantReply::Cleared(3), "TD-GRANT-CLEARED\t3\n"),
+            (GrantReply::Cleared(0), "TD-GRANT-CLEARED\t0\n"),
         ] {
-            assert_eq!(grant_reply(&reply), line);
+            assert_eq!(grant_reply(&reply).unwrap(), line);
         }
+        // A refused allocation fails the process rather than print an
+        // empty reply.
+        assert!(matches!(
+            allocation::with_reservation_limit(0, || grant_reply(&GrantReply::Cleared(3))),
+            Err(Failure::Failed(why)) if why.is_empty()
+        ));
     }
 
     #[test]

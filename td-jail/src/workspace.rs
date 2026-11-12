@@ -236,10 +236,13 @@ pub(crate) struct WorkspacePlan {
 /// instance takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Caller {
-    /// td's account, the human, launching itself (td-agent, and
-    /// td-sandbox until it launches through root), or any nonzero identity
-    /// on a development host: its own spec, its passwd home, the spec's
-    /// directories, and a socket pair to its launcher.
+    /// td's account, the human, launching itself (td-agent's workspaces,
+    /// until WORKLOADS.md step 8 gives them accounts), or any nonzero
+    /// identity on a development host: its own spec, its passwd home, the
+    /// spec's directories, and a socket pair to its launcher. Its spec may
+    /// not name the offline profile, which only a sandbox's names: root's
+    /// intake starts a sandbox as its account, and td-sandbox calls no
+    /// td-jail.
     Human,
     /// A sandbox's or workspace's ledger account, which root's workspace
     /// intake started (td-authd/DESIGN.md, "Workspace launch intake"):
@@ -509,6 +512,9 @@ where
     let spec_path = Path::new(spec_path);
     let text = read_spec(spec_path, uid, caller)?;
     let mut spec = parse_spec(&text)?;
+    if caller == Caller::Human {
+        require_human_spec(&spec)?;
+    }
     if let Caller::Account(kind) = caller {
         require_account_spec(&spec, kind, uid)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
@@ -669,6 +675,19 @@ fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
                 kind.home(uid).display(),
                 spec.home.display()
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// A spec of td's account may not name `development-offline`: that is a
+/// sandbox's profile, and a sandbox runs as its own account through
+/// root's workspace intake (td-sandbox/DESIGN.md), never as the human.
+fn require_human_spec(spec: &Spec) -> io::Result<()> {
+    if spec.development && !spec.shared_network {
+        return Err(invalid(
+            "profile=development-offline is a sandbox's, which runs as its own account \
+             through root's workspace intake, not as td's account",
         ));
     }
     Ok(())
@@ -1726,6 +1745,43 @@ mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
         assert!(read_spec_of(&path, me.wrapping_add(1), true).is_err());
         temp.cleanup().unwrap();
+    }
+
+    /// td's account may not name the offline profile, which only a
+    /// sandbox's spec names: td-jail refuses it for that caller, td-agent
+    /// writes only the online one, and td-sandbox calls no td-jail of its
+    /// own.
+    #[test]
+    fn td_accounts_specs_may_not_name_the_sandbox_profile() {
+        let spec =
+            |profile: &str| parse_spec(&format!("format=1\n{profile}entry=/e\nhome=/h\n")).unwrap();
+        assert!(require_human_spec(&spec("profile=development\n")).is_ok());
+        assert!(require_human_spec(&spec("")).is_ok());
+        let refused = require_human_spec(&spec("profile=development-offline\n")).unwrap_err();
+        assert!(refused.to_string().contains("its own account"), "{refused}");
+        let production = include_str!("workspace.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production.contains(
+            "    if caller == Caller::Human {\n        require_human_spec(&spec)?;\n    }\n"
+        ));
+        let agent = include_str!("../../td-agent/src/jail.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(agent.contains("text.push_str(\"profile=development\\n\");"));
+        assert!(!agent.contains("development-offline"));
+        for (file, source) in [
+            ("main.rs", include_str!("../../td-sandbox/src/main.rs")),
+            ("relay.rs", include_str!("../../td-sandbox/src/relay.rs")),
+            ("intake.rs", include_str!("../../td-sandbox/src/intake.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for absent in ["td-jail", "--workspace", "development-offline"] {
+                assert!(!production.contains(absent), "td-sandbox {file}: {absent}");
+            }
+        }
     }
 
     /// Root writes a ledger caller's spec with the account's own home and

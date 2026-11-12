@@ -1538,6 +1538,7 @@ fn grant_requests_refuse_and_change_nothing() {
         read_only("Pictures"),
         GrantVerb::Revoke("Pictures".into()),
         GrantVerb::Network(Network::Host),
+        GrantVerb::Clear,
     ] {
         let error = directory
             .grants(
@@ -1716,6 +1717,62 @@ fn a_sandbox_the_ledger_holds_takes_grants_and_its_network() {
     );
     assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
     assert_eq!(account_ledger(&directory), ledger);
+    temp.cleanup().unwrap();
+}
+
+/// Deleting a sandbox clears every row it holds, its network row with its
+/// directories, under the lock and without admission, and keeps its ledger
+/// row; root creates no sandbox over a row, so none is inherited. An
+/// application's rows are never cleared, and a clear that takes nothing
+/// writes nothing.
+#[test]
+fn a_sandbox_clear_takes_its_directories_and_network_and_keeps_its_account() {
+    let (temp, directory) = grant_fixture();
+    allocate_sandbox(&directory, "default", BTreeSet::new(), &mut Vec::new()).unwrap();
+    allocate_sandbox(&directory, "tools", BTreeSet::new(), &mut Vec::new()).unwrap();
+    let ledger = account_ledger(&directory);
+    let path = directory.path(workload_grants::FILE_NAME);
+    for (name, verb) in [
+        ("default", read_only("src")),
+        (
+            "default",
+            GrantVerb::Grant(Access::ReadWrite, "work".into()),
+        ),
+        ("default", GrantVerb::Network(Network::Host)),
+        ("tools", GrantVerb::Network(Network::Host)),
+    ] {
+        sandbox(&directory, name, &verb, || Ok(())).unwrap();
+    }
+    assert_eq!(
+        sandbox(&directory, "default", &GrantVerb::Clear, || Err(
+            "admitted".into()
+        ))
+        .unwrap(),
+        GrantReply::Cleared(3)
+    );
+    assert_eq!(
+        grant_table(&directory).unwrap(),
+        format!("{GRANTS_SEED}sandbox\ttools\tnetwork\thost\n")
+    );
+    assert_eq!(
+        sandbox_listed(&directory, "default"),
+        (vec![], Some(Network::Off))
+    );
+    assert_eq!(account_ledger(&directory), ledger);
+    let published = fs::metadata(&path).unwrap();
+    assert_eq!(
+        sandbox(&directory, "default", &GrantVerb::Clear, || Ok(())).unwrap(),
+        GrantReply::Cleared(0)
+    );
+    // A name without an account clears too: rows are keyed by name.
+    assert_eq!(
+        sandbox(&directory, "gone", &GrantVerb::Clear, || Ok(())).unwrap(),
+        GrantReply::Cleared(0)
+    );
+    assert_eq!(fs::metadata(&path).unwrap().ino(), published.ino());
+    let error = grant(&directory, &GrantVerb::Clear).unwrap_err();
+    assert!(error.contains("only a sandbox"), "{error}");
+    assert_eq!(listed(&directory), ["rw\tDownloads"]);
     temp.cleanup().unwrap();
 }
 

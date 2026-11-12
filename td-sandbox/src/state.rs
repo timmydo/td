@@ -1,56 +1,65 @@
+//! The human's own record of each sandbox: its name, the runtime it asks
+//! for, and, for one imported from before sandbox accounts, where its old
+//! home lies. Its account, grants and network are root's (td-authd's
+//! ledger and grant table), never kept here.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-pub const MAX_SHARES: usize = 30;
-pub struct State {
+/// A record's first line.
+const RECORD_FORMAT: &str = "td-sandbox-profile-v1";
+/// The most profiles listed or imported.
+pub const MAX_PROFILES: usize = 1024;
+
+/// One sandbox's record, locked while it is open: a session, or a change
+/// to it, holds the lock.
+pub struct Profile {
     pub root: PathBuf,
-    pub home: PathBuf,
-    pub network: bool,
-    /// A runtime's td name; none for a native workspace. Only setting it
-    /// asks whether it is declared: one a later system no longer declares
-    /// still opens, shows and clears, and td-jail refuses its launch.
+    /// A declared runtime's td name; none for a native sandbox. Only
+    /// setting it asks whether it is declared: one a later system no
+    /// longer declares still opens, shows and clears, and root refuses
+    /// its launch.
     pub runtime: Option<String>,
-    pub shares: Vec<(PathBuf, bool)>,
-    _lock: File,
+    /// The home of the profile this one was imported from, which the
+    /// import left as it was.
+    pub old_home: Option<PathBuf>,
+    _lock: Option<File>,
 }
 
-/// A declared runtime's td name, as the spec and policy carry it.
+/// A declared runtime's td name.
 pub fn runtime(name: &str) -> io::Result<&'static str> {
     crate::flathub_app::flathub_runtime(name)
         .map(|runtime| runtime.name)
-        .ok_or_else(|| io::Error::other(format!("{name} is no declared runtime")))
+        .ok_or_else(|| crate::failure(format_args!("{name} is no declared runtime")))
 }
 
-/// A runtime name as a policy line may carry it: a declaration's td name,
-/// declared now or not.
-fn runtime_name(name: &str) -> io::Result<&str> {
-    if !crate::flathub_app::valid_name(name) {
-        return Err(io::Error::other("invalid runtime policy"));
-    }
-    Ok(name)
-}
-
+/// A sandbox's name: the ledger's grammar, since root's account is kept
+/// under it.
 pub fn name(name: &str) -> io::Result<()> {
-    if name.is_empty()
-        || name.len() > 32
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    if !crate::workload_accounts::valid_name(name) {
         return Err(io::Error::other(
-            "sandbox name must be 1–32 lowercase letters, digits or hyphens",
+            "a sandbox's name is 1–64 lowercase letters, digits, '.', '_' or '-', \
+             beginning with a letter",
         ));
     }
     Ok(())
 }
 
-pub fn base() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unset"))?;
-    let root = PathBuf::from(home).join(".local/share/td-sandbox");
+/// `~/.local/share/td-sandbox`, private, canonical.
+pub fn base(home: &Path) -> io::Result<PathBuf> {
+    let root = home.join(".local/share/td-sandbox");
     td_fs::private_dir(&root)?;
     fs::canonicalize(root)
+}
+
+/// Where the records lie below `base`: a name no profile from before
+/// sandbox accounts could have taken, since theirs held no `.`.
+pub fn profiles(base: &Path) -> io::Result<PathBuf> {
+    let profiles = base.join(".profiles");
+    td_fs::private_dir(&profiles)?;
+    Ok(profiles)
 }
 
 pub fn text(path: &Path) -> io::Result<&str> {
@@ -80,316 +89,316 @@ fn open_private(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-impl State {
-    pub fn create(base: &Path, name_: &str) -> io::Result<()> {
-        Self::create_initial(base, name_, "format=1\nnetwork=off\n", None)
-    }
-
-    fn create_initial(
-        base: &Path,
-        name_: &str,
-        policy: &str,
-        shared: Option<&Path>,
-    ) -> io::Result<()> {
-        name(name_)?;
-        let root = base.join(name_);
-        fs::DirBuilder::new().mode(0o700).create(&root)?;
-        let result = (|| {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(root.join("home"))?;
-            if let Some(shared) = shared {
-                std::os::unix::fs::symlink(shared, root.join("home/sandbox"))?;
+/// The names of the records below `profiles`, sorted.
+pub fn list(profiles: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(profiles)?.take(MAX_PROFILES) {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Some(n) = entry.file_name().to_str().filter(|n| name(n).is_ok()) {
+                td_alloc::push(&mut names, crate::owned(n)?).map_err(crate::refused)?;
             }
-            let mut file = open_private(&root.join("policy"))?;
-            file.write_all(policy.as_bytes())?;
-            file.sync_all()
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&root);
         }
-        result
     }
+    // Directory entries' names are distinct, so no order among equals is
+    // lost by an unstable sort, which allocates nothing.
+    names.sort_unstable();
+    Ok(names)
+}
 
-    /// Seed only a missing profile; existing policy belongs to the user.
-    pub fn init_default(base: &Path, account_home: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(base.join("default")) {
-            Ok(_) => return Self::open(base, "default").map(|_| ()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let shared = account_home.join("sandbox");
-        td_fs::private_dir(&shared)?;
-        let shared = fs::canonicalize(shared)?;
-        if shared.starts_with(base) || base.starts_with(&shared) {
-            return Err(io::Error::other("default share overlaps sandbox storage"));
-        }
-        let policy = format!("format=1\nnetwork=off\nwrite={}\n", text(&shared)?);
-        Self::create_initial(base, "default", &policy, Some(&shared))
+/// Whether a record for `name` exists below `profiles`.
+pub fn exists(profiles: &Path, name_: &str) -> io::Result<bool> {
+    name(name_)?;
+    match fs::symlink_metadata(profiles.join(name_)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
+}
 
-    pub fn open(base: &Path, name_: &str) -> io::Result<Self> {
+/// A record held for its removal, readable or not: its lock taken, so no
+/// session or change of it runs meanwhile.
+pub struct Removal {
+    root: PathBuf,
+    _lock: File,
+}
+
+impl Removal {
+    pub fn remove(self) -> io::Result<()> {
+        fs::remove_dir_all(&self.root)
+    }
+}
+
+/// The record of `name` held for removal, none when there is none. An
+/// incomplete or unreadable record is held all the same, so it can be
+/// deleted.
+pub fn removal(profiles: &Path, name_: &str) -> io::Result<Option<Removal>> {
+    if !exists(profiles, name_)? {
+        return Ok(None);
+    }
+    let root = profiles.join(name_);
+    td_fs::check_private_dir(&root)?;
+    let lock = open_private(&root.join("lock"))?;
+    lock.try_lock()
+        .map_err(|e| crate::failure(format_args!("sandbox is active or being changed: {e}")))?;
+    Ok(Some(Removal { root, _lock: lock }))
+}
+
+impl Profile {
+    /// A new record, refused when one exists: a crash before it is
+    /// complete may leave an incomplete record for the human to delete.
+    pub fn create(
+        profiles: &Path,
+        name_: &str,
+        runtime: Option<String>,
+        old_home: Option<PathBuf>,
+    ) -> io::Result<Self> {
         name(name_)?;
-        let root = base.join(name_);
-        td_fs::check_private_dir(&root)?;
-        td_fs::check_private_dir(&root.join("home"))?;
-        let lock = open_private(&root.join("lock"))?;
-        lock.try_lock()
-            .map_err(|e| io::Error::other(format!("sandbox is active or being changed: {e}")))?;
-        let policy = td_fs::read_bounded_real_file(&root.join("policy"), "sandbox policy", 65536)?;
-        let policy = String::from_utf8(policy).map_err(io::Error::other)?;
-        let (network, runtime, shares) = parse(&policy)?;
-        Ok(Self {
-            home: root.join("home"),
+        let root = profiles.join(name_);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => match crate::text(format_args!(
+                    "a sandbox named {name_} already exists here: `td-sandbox inspect \
+                     {name_}` shows it, `td-sandbox delete {name_}` deletes it"
+                )) {
+                    Ok(message) => io::Error::new(e.kind(), message),
+                    Err(refusal) => refusal,
+                },
+                _ => e,
+            })?;
+        let profile = Self {
             root,
-            network,
             runtime,
-            shares,
-            _lock: lock,
+            old_home,
+            _lock: None,
+        };
+        let written = (|| {
+            let lock = open_private(&profile.root.join("lock"))?;
+            lock.try_lock()
+                .map_err(|e| crate::failure(format_args!("sandbox is being changed: {e}")))?;
+            let mut record = open_private(&profile.root.join("record"))?;
+            record.write_all(profile.render()?.as_bytes())?;
+            record.sync_all()?;
+            Ok(lock)
+        })();
+        match written {
+            Ok(lock) => Ok(Self {
+                _lock: Some(lock),
+                ..profile
+            }),
+            Err(e) => {
+                let _ = fs::remove_dir_all(&profile.root);
+                Err(e)
+            }
+        }
+    }
+
+    /// The record of `name`, locked: refused while a session or another
+    /// change holds it.
+    pub fn open(profiles: &Path, name_: &str) -> io::Result<Self> {
+        let mut profile = Self::read(profiles, name_)?;
+        let lock = open_private(&profile.root.join("lock"))?;
+        lock.try_lock()
+            .map_err(|e| crate::failure(format_args!("sandbox is active or being changed: {e}")))?;
+        profile._lock = Some(lock);
+        Ok(profile)
+    }
+
+    /// The record of `name`, unlocked, to show.
+    pub fn read(profiles: &Path, name_: &str) -> io::Result<Self> {
+        name(name_)?;
+        let root = profiles.join(name_);
+        td_fs::check_private_dir(&root).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => crate::failure(format_args!("no sandbox named {name_}")),
+            _ => e,
+        })?;
+        let record = td_fs::read_bounded_real_file(&root.join("record"), "sandbox record", 8192)?;
+        let record = String::from_utf8(record).map_err(io::Error::other)?;
+        let (runtime, old_home) = parse(&record)?;
+        Ok(Self {
+            root,
+            runtime,
+            old_home,
+            _lock: None,
         })
     }
 
     pub fn save(&self) -> io::Result<()> {
-        td_fs::replace(&self.root.join("policy"), self.render()?.as_bytes(), 0o600)
+        td_fs::replace(&self.root.join("record"), self.render()?.as_bytes(), 0o600)
+    }
+
+    /// The record removed, with its lock and stop socket.
+    pub fn remove(self) -> io::Result<()> {
+        fs::remove_dir_all(&self.root)
     }
 
     fn render(&self) -> io::Result<String> {
-        let mut policy = format!(
-            "format=1\nnetwork={}\n",
-            if self.network { "host" } else { "off" }
-        );
+        let mut record = crate::text(format_args!("{RECORD_FORMAT}\n"))?;
         if let Some(runtime) = &self.runtime {
-            policy.push_str(&format!("runtime={runtime}\n"));
+            let line = crate::text(format_args!("runtime={runtime}\n"))?;
+            td_alloc::push_str(&mut record, &line).map_err(crate::refused)?;
         }
-        for (path, write) in &self.shares {
-            policy.push_str(&format!(
-                "{}={}\n",
-                if *write { "write" } else { "read" },
-                text(path)?
-            ));
+        if let Some(home) = &self.old_home {
+            let line = crate::text(format_args!("old-home={}\n", text(home)?))?;
+            td_alloc::push_str(&mut record, &line).map_err(crate::refused)?;
         }
-        Ok(policy)
-    }
-
-    pub fn share(&mut self, base: &Path, path: &Path, write: bool) -> io::Result<()> {
-        let path = fs::canonicalize(path)?;
-        text(&path)?;
-        if !path.is_dir() || path.starts_with(base) || base.starts_with(&path) {
-            return Err(io::Error::other(
-                "share must be a directory outside sandbox management storage",
-            ));
-        }
-        if self
-            .shares
-            .iter()
-            .any(|(other, _)| path.starts_with(other) || other.starts_with(&path))
-            || self.shares.len() >= MAX_SHARES
-        {
-            return Err(io::Error::other(
-                "shares overlap or exceed the 30-directory limit",
-            ));
-        }
-        self.shares.push((path, write));
-        self.save()
+        Ok(record)
     }
 }
 
-type Policy = (bool, Option<String>, Vec<(PathBuf, bool)>);
-
-/// `format=1`, `network`, an optional `runtime`, then the shares.
-fn parse(policy: &str) -> io::Result<Policy> {
-    let mut lines = policy.lines().peekable();
-    if lines.next() != Some("format=1") {
-        return Err(io::Error::other("unsupported sandbox policy"));
+/// The format line, an optional `runtime`, then an optional `old-home`.
+fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
+    let invalid = || io::Error::other("invalid sandbox record");
+    let mut lines = record.lines().peekable();
+    if lines.next() != Some(RECORD_FORMAT) {
+        return Err(invalid());
     }
-    let network = match lines.next() {
-        Some("network=host") => true,
-        Some("network=off") => false,
-        _ => return Err(io::Error::other("invalid network policy")),
-    };
     let runtime = match lines.peek().and_then(|line| line.strip_prefix("runtime=")) {
-        Some(name) => {
-            let name = runtime_name(name)?.to_string();
+        Some(runtime) if crate::flathub_app::valid_name(runtime) => {
+            let runtime = crate::owned(runtime)?;
             lines.next();
-            Some(name)
+            Some(runtime)
         }
+        Some(_) => return Err(invalid()),
         None => None,
     };
-    let mut shares = Vec::new();
-    for line in lines {
-        let (key, path) = line
-            .split_once('=')
-            .ok_or_else(|| io::Error::other("invalid share"))?;
-        if !matches!(key, "read" | "write")
-            || !Path::new(path).is_absolute()
-            || shares.len() >= MAX_SHARES
-        {
-            return Err(io::Error::other("invalid share"));
-        }
-        text(Path::new(path))?;
-        shares.push((PathBuf::from(path), key == "write"));
+    let old_home = match lines.next().map(|line| line.strip_prefix("old-home=")) {
+        Some(Some(path)) if Path::new(path).is_absolute() => Some(PathBuf::from(path)),
+        Some(_) => return Err(invalid()),
+        None => None,
+    };
+    if lines.next().is_some() {
+        return Err(invalid());
     }
-    Ok((network, runtime, shares))
+    Ok((runtime, old_home))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A profile name that begins with a letter is a ledger name, so its
-    /// sandbox account can be allocated under it; one that begins with a
-    /// digit or a hyphen is not, and the cutover to ledger accounts reports
-    /// and drops it.
     #[test]
-    fn a_profile_name_beginning_with_a_letter_is_a_ledger_name() {
-        use crate::workload_accounts::valid_name as ledger_name;
-        let alphabet = "abz09-";
-        let mut checked = 0;
-        for first in alphabet.chars() {
-            for second in alphabet.chars() {
-                for tail in ["", "x", "-1", &"a".repeat(30)] {
-                    let candidate = format!("{first}{second}{tail}");
-                    if name(&candidate).is_ok() && first.is_ascii_lowercase() {
-                        assert!(ledger_name(&candidate), "{candidate}");
-                        checked += 1;
-                    }
-                }
-            }
-        }
-        assert!(checked > 50, "{checked}");
-        for profile in ["1box", "-x", "9", "0-tools", "-"] {
-            assert!(name(profile).is_ok(), "{profile}");
-            assert!(!ledger_name(profile), "{profile}");
-        }
-        assert!(ledger_name(&"a".repeat(32)) && name(&"a".repeat(32)).is_ok());
-    }
-
-    #[test]
-    fn default_seeds_the_share_once_and_preserves_user_changes() -> io::Result<()> {
-        let home = td_fs::TempDir::new("sandbox-default")?;
-        let base = home.join(".local/share/td-sandbox");
-        td_fs::private_dir(&base)?;
-        State::init_default(&base, &home)?;
-        let shared = fs::canonicalize(home.join("sandbox"))?;
-        td_fs::check_private_dir(&shared)?;
-        let mut state = State::open(&base, "default")?;
-        assert!(!state.network);
-        assert_eq!(state.shares, [(shared.clone(), true)]);
-        assert_eq!(fs::read_link(state.home.join("sandbox"))?, shared);
-        fs::write(state.home.join("sandbox/from-private-home"), "shared")?;
+    fn a_record_is_private_locked_and_round_trips() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-record")?;
+        let profiles = profiles(&base)?;
+        let created = Profile::create(&profiles, "tools", None, None)?;
+        assert!(Profile::open(&profiles, "tools").is_err());
+        assert!(Profile::create(&profiles, "tools", None, None).is_err());
+        drop(created);
+        let mut profile = Profile::open(&profiles, "tools")?;
         assert_eq!(
-            fs::read_to_string(home.join("sandbox/from-private-home"))?,
-            "shared"
+            (profile.runtime.as_deref(), profile.old_home.as_deref()),
+            (None, None)
         );
-        state.network = true;
-        state.shares.clear();
-        state.save()?;
-        fs::write(state.home.join("keep"), "private")?;
-        drop(state);
-        State::init_default(&base, &home)?;
-        let state = State::open(&base, "default")?;
-        assert!(state.network);
-        assert!(state.shares.is_empty());
-        assert_eq!(fs::read_to_string(state.home.join("keep"))?, "private");
-        Ok(())
-    }
-
-    #[test]
-    fn default_refuses_links_and_incomplete_existing_profiles() -> io::Result<()> {
-        let home = td_fs::TempDir::new("sandbox-default-invalid")?;
-        let other = td_fs::TempDir::new("sandbox-default-outside")?;
-        let base = home.join("state");
-        td_fs::private_dir(&base)?;
-        std::os::unix::fs::symlink(other.path(), home.join("sandbox"))?;
-        assert!(State::init_default(&base, &home).is_err());
-        assert!(!base.join("default").exists());
-        fs::remove_file(home.join("sandbox"))?;
-        std::os::unix::fs::symlink(other.path(), base.join("default"))?;
-        assert!(State::init_default(&base, &home).is_err());
-        fs::remove_file(base.join("default"))?;
-        td_fs::private_dir(&base.join("default"))?;
-        assert!(State::init_default(&base, &home).is_err());
-        assert!(!base.join("default/policy").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn state_is_private_and_serialized() -> io::Result<()> {
-        let base = td_fs::TempDir::new("sandbox-state")?;
-        State::create(&base, "tools")?;
-        let mut state = State::open(&base, "tools")?;
-        assert!(State::open(&base, "tools").is_err());
-        assert!(state.share(&base, &base, true).is_err());
-        state.network = true;
-        state.save()?;
-        drop(state);
-        assert!(State::open(&base, "tools")?.network);
-        assert!(name("../escape").is_err());
-        assert!(parse("format=1\nnetwork=host\nentry=/bin/sh\n").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn a_runtime_is_one_declared_name_after_the_network() -> io::Result<()> {
-        let base = td_fs::TempDir::new("sandbox-runtime")?;
-        State::create(&base, "tools")?;
-        let mut state = State::open(&base, "tools")?;
-        assert_eq!(state.runtime, None);
-        state.runtime = Some(runtime("freedesktop-sdk-25-08")?.to_string());
-        state.shares.push((PathBuf::from("/w"), true));
-        state.save()?;
-        drop(state);
+        profile.runtime = Some(runtime("freedesktop-sdk-25-08")?.to_string());
+        profile.save()?;
+        drop(profile);
         assert_eq!(
-            fs::read_to_string(base.join("tools/policy"))?,
-            "format=1\nnetwork=off\nruntime=freedesktop-sdk-25-08\nwrite=/w\n"
+            fs::read_to_string(profiles.join("tools/record"))?,
+            "td-sandbox-profile-v1\nruntime=freedesktop-sdk-25-08\n"
         );
-        let mut state = State::open(&base, "tools")?;
-        assert_eq!(state.runtime.as_deref(), Some("freedesktop-sdk-25-08"));
-        state.runtime = None;
-        assert_eq!(state.render()?, "format=1\nnetwork=off\nwrite=/w\n");
+        // Reading takes no lock: a session does not hide its record.
+        let session = Profile::open(&profiles, "tools")?;
         assert_eq!(
-            parse("format=1\nnetwork=host\nruntime=freedesktop-platform-25-08\nread=/r\n")?,
-            (
-                true,
-                Some("freedesktop-platform-25-08".to_string()),
-                vec![(PathBuf::from("/r"), false)]
-            )
+            Profile::read(&profiles, "tools")?.runtime.as_deref(),
+            Some("freedesktop-sdk-25-08")
         );
-        assert!(runtime("firefox").is_err());
-        for bad in [
-            "format=1\nruntime=freedesktop-platform-25-08\nnetwork=off\n",
-            "format=1\nnetwork=off\nruntime=Org.Freedesktop\n",
-            "format=1\nnetwork=off\nruntime=../x\n",
-            "format=1\nnetwork=off\nruntime=\n",
-            "format=1\nnetwork=off\nruntime=freedesktop-platform-25-08\nruntime=freedesktop-platform-25-08\n",
-            "format=1\nnetwork=off\nwrite=/w\nruntime=freedesktop-platform-25-08\n",
-        ] {
-            assert!(parse(bad).is_err(), "{bad:?}");
-        }
+        drop(session);
+        let imported = Profile::create(
+            &profiles,
+            "default",
+            None,
+            Some(PathBuf::from("/h/.local/share/td-sandbox/default/home")),
+        )?;
+        drop(imported);
+        assert_eq!(
+            fs::read_to_string(profiles.join("default/record"))?,
+            "td-sandbox-profile-v1\nold-home=/h/.local/share/td-sandbox/default/home\n"
+        );
+        assert_eq!(list(&profiles)?, ["default", "tools"]);
+        let again = Profile::create(&profiles, "default", None, None).err();
+        assert!(again.is_some_and(|e| e.to_string().contains("already exists")));
+        Profile::open(&profiles, "tools")?.remove()?;
+        assert_eq!(list(&profiles)?, ["default"]);
+        assert!(!exists(&profiles, "tools")?);
+        assert!(Profile::read(&profiles, "tools").is_err());
         Ok(())
     }
 
-    /// A runtime a later system no longer declares leaves the profile
-    /// usable: it opens and shows the name, clears to native, and deletes.
+    /// A record that cannot be read, a crash's half-written one, is still
+    /// removed, under its lock; none is nothing to remove.
     #[test]
-    fn a_retired_runtime_still_opens_clears_and_deletes() -> io::Result<()> {
+    fn an_unreadable_record_is_still_removed() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-record-broken")?;
+        let profiles = profiles(&base)?;
+        assert!(removal(&profiles, "tools")?.is_none());
+        drop(Profile::create(&profiles, "tools", None, None)?);
+        fs::remove_file(profiles.join("tools/record"))?;
+        assert!(Profile::read(&profiles, "tools").is_err());
+        let session = removal(&profiles, "tools")?;
+        assert!(removal(&profiles, "tools").is_err());
+        session
+            .ok_or_else(|| io::Error::other("no removal"))?
+            .remove()?;
+        assert!(!exists(&profiles, "tools")?);
+        Ok(())
+    }
+
+    /// A runtime a later system no longer declares leaves the record
+    /// usable: it opens and shows the name, and clears to native.
+    #[test]
+    fn a_retired_runtime_still_opens_and_clears() -> io::Result<()> {
         let base = td_fs::TempDir::new("sandbox-retired-runtime")?;
-        State::create(&base, "tools")?;
+        let profiles = profiles(&base)?;
+        drop(Profile::create(&profiles, "tools", None, None)?);
         td_fs::replace(
-            &base.join("tools/policy"),
-            b"format=1\nnetwork=off\nruntime=freedesktop-platform-24-08\n",
+            &profiles.join("tools/record"),
+            b"td-sandbox-profile-v1\nruntime=freedesktop-platform-24-08\n",
             0o600,
         )?;
         assert!(runtime("freedesktop-platform-24-08").is_err());
-        let mut state = State::open(&base, "tools")?;
-        assert_eq!(state.runtime.as_deref(), Some("freedesktop-platform-24-08"));
-        state.runtime = None;
-        state.save()?;
-        drop(state);
-        let state = State::open(&base, "tools")?;
-        assert_eq!(state.runtime, None);
-        fs::remove_dir_all(&state.root)?;
-        assert!(!base.join("tools").exists());
+        let mut profile = Profile::open(&profiles, "tools")?;
+        assert_eq!(
+            profile.runtime.as_deref(),
+            Some("freedesktop-platform-24-08")
+        );
+        profile.runtime = None;
+        profile.save()?;
+        drop(profile);
+        assert_eq!(Profile::read(&profiles, "tools")?.runtime, None);
         Ok(())
+    }
+
+    #[test]
+    fn records_and_names_are_exact() {
+        for bad in [
+            "",
+            "format=1\nnetwork=off\n",
+            "td-sandbox-profile-v1\nnetwork=off\n",
+            "td-sandbox-profile-v1\nruntime=Org.Freedesktop\n",
+            "td-sandbox-profile-v1\nruntime=\n",
+            "td-sandbox-profile-v1\nold-home=relative\n",
+            "td-sandbox-profile-v1\nold-home=/a\nruntime=freedesktop-sdk-25-08\n",
+            "td-sandbox-profile-v1\nold-home=/a\nold-home=/b\n",
+            "td-sandbox-profile-v1\nwrite=/w\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        for good in ["tools", "a", "my.box_1-2", &"a".repeat(64)] {
+            assert!(name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "1box",
+            "-x",
+            "Tools",
+            "../x",
+            ".profiles",
+            "",
+            &"a".repeat(65),
+        ] {
+            assert!(name(bad).is_err(), "{bad}");
+        }
     }
 }

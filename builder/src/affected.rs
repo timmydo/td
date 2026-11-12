@@ -302,7 +302,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/workload_accounts.rs",
-        "host and target-static td-firstboot's workload account ledger seeding and allocation (an application's at install, a sandbox's), and its readers: td-login's workload accounts and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
+        "host and target-static td-firstboot's workload account ledger seeding and allocation (an application's at install, a sandbox's), and its readers: td-login's workload accounts, target-static td-sandbox's sandbox names, intake socket and account homes, and the application policy td-busd, td-portal, td-jail, td-compositor, td-audio, td-authd and td-secret include",
     ),
     (
         "engine/src/workload_grants.rs",
@@ -2473,6 +2473,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!(
         "engine/src/workload_accounts.rs",
         "td-login's workload accounts"
+    );
+    assert_contains!(
+        "engine/src/workload_accounts.rs",
+        "td-sandbox's sandbox names"
     );
     assert_contains!(
         "engine/src/workload_grants.rs",

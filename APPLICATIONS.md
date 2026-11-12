@@ -3800,8 +3800,10 @@ is installed, td's, two caller classes may, as the initial user
 namespace knows them, and every other identity is refused before its
 spec is read:
 
-- td's account, uid 1000, whose td-agent and td-sandbox launch it as a
-  program of that account's (td-agent/DESIGN.md §8);
+- td's account, uid 1000, whose td-agent launches it as a program of
+  that account's (td-agent/DESIGN.md §8); td-sandbox no longer calls
+  td-jail, and a spec of this caller's may not name
+  `profile=development-offline`, which only a sandbox's names;
 - a ledger account, a uid in the sandbox and workspace range (98304
   through 131071) that a `sandbox` or `workspace` row of the workload
   account ledger holds, read through the shared reader
@@ -3892,8 +3894,9 @@ with the kind's own departures:
 - **Runtime** (WORKLOADS.md, "Runtimes"). `runtime=` names a Flathub
   runtime by its td name in `flathub_app::FLATHUB_RUNTIMES`
   (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`); any other
-  value is refused. A td-sandbox profile's runtime
-  (td-sandbox/DESIGN.md, "Runtime") is written here, and a td-agent
+  value is refused. A td-sandbox sandbox's runtime
+  (td-sandbox/DESIGN.md, "Runtime") is written here by root's intake,
+  and a td-agent
   template's (td-agent/DESIGN.md §8, Runtime), on its workspaces'
   development instances alone. It is td's alone: where no product
   configuration is installed it is refused, since it would replace the
@@ -3908,13 +3911,13 @@ with the kind's own departures:
   in `/usr`, `/lib` or `/lib64`, which inside the jail would be the
   runtime's, and stage 2 refuses them again. Its confinement is weaker
   than an application's: the runtime's code runs under the workspace
-  kind's seccomp filter (td-sandbox's development profile where that
-  applies), as the caller, the human (uid 1000) or, for a ledger caller,
-  the sandbox's account, with the workspace's grants (its writable
+  kind's seccomp filter (the development profile where that applies),
+  as the caller, the sandbox's account for a td-sandbox sandbox or the
+  human (uid 1000) for a td-agent workspace until WORKLOADS.md step 8
+  moves it onto its account, with the workspace's grants (its writable
   worktrees, shares or views, its network and the host-local sockets
   that reaches), and not behind the application kind's D-Bus, portal or
-  Wayland boundaries; td-sandbox and td-agent still launch as the human
-  until WORKLOADS.md steps 7 and 8 move them onto their accounts. td's
+  Wayland boundaries. td's
   own glibc programs in the workspace can load the runtime's code too
   (the loader boundary below), so such a workspace is no host for td's
   control plane (AGENTS.md, "Trust zones"), and td-builder refuses
@@ -3973,8 +3976,7 @@ with the kind's own departures:
   "Application filesystem grants"), read and checked as an application
   launch reads them, each the one mount at its view path with the
   identity derived for the human's directory, and bound at the human's
-  own path below the human's home, where td-sandbox binds a share,
-  read-only or writable as listed. They join the shared directories'
+  own path below the human's home, read-only or writable as listed. They join the shared directories'
   admission: any two overlapping, by source or by target, any overlap
   with the reserved trees, or one that is or contains the human's home,
   which stands for the caller's here, refuses the launch. A listed view
@@ -12608,23 +12610,27 @@ what has to be reopened rather than worked around.
 
 ## Private-home development frontend
 
-`td-sandbox` is the named, persistent private-home frontend specified in
-`td-sandbox/DESIGN.md`. It invokes the existing workspace kind, with no
-application identity or package-registry authority. The optional exact
-`profile=development-offline` selects the development syscall and executable
-home policy with an isolated network namespace and loopback up. Existing
-`profile=development` still shares networking; omitted profile still selects
-the confined review policy. Profile spelling is exact and ordered as before.
+`td-sandbox` is the named, persistent development-sandbox frontend specified in
+`td-sandbox/DESIGN.md`. Each sandbox runs as a ledger account of its own,
+which root's workspace launch intake starts in the workspace kind
+(td-authd/DESIGN.md, "Workspace launch intake"); td-sandbox launches no
+jail and holds no application identity or package-registry authority.
+The optional exact `profile=development-offline`, which root's spec names
+for a sandbox without a network row, selects the development syscall and
+executable home policy with an isolated network namespace and loopback up;
+td's account may not name it. Existing `profile=development` still shares
+networking; omitted profile still selects the confined review policy.
+Profile spelling is exact and ordered as before.
 
 Development workspace instances now include the generic /dev/tty character
 node (5,0), bound with the existing device flags and verified in both mount
 stages. No controlling terminal is inherited: the socket channel contract
 and stage-2 no-terminal check remain. An entry may create its own PTY and
 session; /dev/tty then resolves only that session's controlling terminal.
-The new frontend's terminal bridge does exactly that, with no host terminal
-file descriptor passed through the jail. Its metadata is outside every
-mounted directory, and its same-UID and host-network limitations are the
-workspace kind's. Runtime installations in its executable private home are
+The frontend's terminal bridge does exactly that over the intake's
+connection, with no host terminal file descriptor passed through the jail.
+Its records are outside every mounted directory, and its host-network
+limitation is the workspace kind's. Runtime installations in its executable private home are
 not target build inputs. No foreign runtime acquisition is added here.
 
 

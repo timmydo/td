@@ -1409,6 +1409,17 @@ pub const TD_SOFTWARE_INSTALL_MARKER: &str = "TD-SOFTWARE-INSTALL-OK";
 // and the human's `revoke` then took the row out of a listing that kept
 // the seeded `Downloads` (td-authd/DESIGN.md, "Grant requests").
 pub const TD_GRANT_REQUEST_MARKER: &str = "TD-GRANT-REQUEST-OK";
+// Printed by the `sandbox-evidence` unit under the autotest token once
+// the human's td-sandbox created the sandbox `oracle` through root's
+// workspace intake, granted it a home directory writable with its network
+// off, and ran a command in it that proved it runs as the sandbox's own
+// account, writes and executes in the granted directory through an
+// idmapped view the human owns on disk, reads no ungranted file of the
+// human's and has no network but lo; then root's grant table held its
+// directory and network rows, and after td-sandbox deleted it held none
+// while the ledger kept its account (td-authd/DESIGN.md, "Workspace launch
+// intake"; td-sandbox/DESIGN.md).
+pub const TD_SANDBOX_ACCOUNT_MARKER: &str = "TD-SANDBOX-ACCOUNT-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows
 // it active, the applications' workspace occupied, and one window on the

@@ -33,9 +33,9 @@ use crate::shared::{
     TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
     TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
     TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
-    TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
-    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER,
-    TD_WEB_ENTRY, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
+    TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_ACCOUNT_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_SETUP_LIVE_MARKER, TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER, TD_WEB_ENTRY, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1561,6 +1561,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "media",
     "sandbox-default",
     "workspace-intake",
+    "sandbox-evidence",
     "release-source",
     "rootcheck",
     "profiler",
@@ -1690,6 +1691,21 @@ mod svc_timeouts {
     pub const GRANT_REQUEST: u32 = 60;
     /// Two reads, a revoke through the control socket and a listing.
     pub const GRANT_EVIDENCE: u32 = 30;
+    /// td-sandbox's `init-default`: its bounded wait for root's workspace
+    /// intake; the import of old profiles, on the first boot after
+    /// sandbox accounts, each a status read, an allocation (30 seconds) and
+    /// grants (3 seconds each), which a run cut short by this bound
+    /// completes on the next boot; then the default sandbox's creation,
+    /// which reads its state and allocates through `allocate-workload`
+    /// (30 seconds), and one grant (3 seconds).
+    pub const SANDBOX_DEFAULT: u32 = 120;
+    /// sandbox-evidence: a delete, a create, three grant-table changes,
+    /// three runs, a refused create, an adoption and a final delete through
+    /// root's intake. Each delete clears the name's rows through root's
+    /// writer and prepares and empties the account; the create allocates.
+    /// Each account preparation and allocation is bounded at 30 seconds,
+    /// each grant-table change at 3; each run starts a jail and a command.
+    pub const SANDBOX_EVIDENCE: u32 = 480;
     /// An oracle's first fetch of an application or runtime from the host's
     /// feed: about a gigabyte over QEMU's user network, materialized and
     /// validated in the VM.
@@ -1970,13 +1986,19 @@ fn build_desktop_td_svc_conf() -> String {
          restart=on-failure\n\
          log=/var/log/svc/media.log\n\
          \n\
+         # The default sandbox, created through root's workspace intake\n\
+         # (td-sandbox/DESIGN.md, \"Image default profile\"): the human's\n\
+         # td-sandbox asks it to allocate the account and grant ~/sandbox, so\n\
+         # it runs once the intake is up; its own connect waits a bounded\n\
+         # while for the socket. An allocation and a grant through root's\n\
+         # bounded children fit its bound.\n\
          [sandbox-default]\n\
          type=oneshot\n\
          cgroup=session\n\
          exec=/bin/td-login exec-primary -- /bin/td-sandbox init-default\n\
-         after=td-firstboot\n\
+         after=td-firstboot,workspace-intake\n\
          requires=td-firstboot\n\
-         timeout=30\n\
+         timeout={sandbox_default}\n\
          log=/var/log/svc/sandbox-default.log\n\
          console=yes\n\
          \n\
@@ -1992,6 +2014,33 @@ fn build_desktop_td_svc_conf() -> String {
          requires=td-firstboot\n\
          restart=on-failure\n\
          log=/var/log/svc/workspace-intake.log\n\
+         \n\
+         # The sandbox account oracle (td-sandbox/DESIGN.md; td-authd/DESIGN.md,\n\
+         # \"Workspace launch intake\"), on an oracle's boot only: as the\n\
+         # human, td-sandbox creates the sandbox `oracle` through root's\n\
+         # intake, grants it a private directory of the home writable and\n\
+         # its network off, and runs a command in it, which proves its uid\n\
+         # is a sandbox account's, writes and runs a script in the granted\n\
+         # directory, lists the human's home (0700, so only the jail's\n\
+         # view of it can be listed) as the grant alone, cannot read a\n\
+         # world-readable ungranted file of it, sees no interface but lo\n\
+         # and fills its own home, a directory of it mode 000. Root finds\n\
+         # the script the human's on\n\
+         # disk through the idmapped view. With the record lost, a create\n\
+         # over the held sandbox is refused, its home kept, and adopt\n\
+         # records it; with network host a run sees an interface beyond lo,\n\
+         # and the grant table holds both rows. After the delete no row of\n\
+         # it remains, the ledger keeps its account and its home holds only\n\
+         # root's mark; then the seeded default writes and runs in\n\
+         # ~/sandbox. A pty session is not driven: no tool in /bin opens\n\
+         # one. A run the intake refused after its answer is in\n\
+         # /var/log/svc/workspace-intake.log.\n\
+         [sandbox-evidence]\n\
+         type=oneshot\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; old=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1); /bin/td-login exec-primary -- /bin/mkdir -p -m 0700 \"$home/sandbox-oracle\" || exit 1; /bin/td-login exec-primary -- /bin/touch \"$home/sandbox-oracle-public\" || exit 1; /bin/td-login exec-primary -- /bin/chmod 0644 \"$home/sandbox-oracle-public\" || exit 1; real=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle\") || exit 1; public=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle-public\") || exit 1; canon=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home\") || exit 1; seeded=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox\") || exit 1; /bin/td-login exec-primary -- /bin/rm -f \"$real/probe\" \"$seeded/sandbox-oracle-probe\" || exit 1; said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the create failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox share oracle \"$real\" --write 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the share failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle off 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network off failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"u=; while read -r k a b; do case \\\"\\$k\\\" in Uid:) u=\\$a;; esac; done </proc/self/status; [ \\\"\\$u\\\" -ge 98304 ] && [ \\\"\\$u\\\" -le 131071 ] || {{ echo \\\"the run is no sandbox account: uid \\$u\\\"; exit 1; }}; /bin/td-util printf \\\"#!/bin/sh\\\\necho sandbox-ran\\\\n\\\" > \\\"$real/probe\\\" && /bin/chmod 0755 \\\"$real/probe\\\" && r=\\$(\\\"$real/probe\\\") && [ \\\"\\$r\\\" = sandbox-ran ] || {{ echo \\\"the granted directory is not writable and executable\\\"; exit 1; }}; if /bin/cat \\\"$public\\\"; then echo \\\"the run read a world-readable file of the home it was not granted\\\"; exit 1; fi; l=\\$(/bin/ls -A \\\"$canon\\\") && [ \\\"\\$l\\\" = sandbox-oracle ] || {{ echo \\\"the home lists more than the grant, or nothing: \\$l\\\"; exit 1; }}; o=; while read -r l; do case \\\"\\$l\\\" in lo:*) :;; *:*) o=\\\"\\$o \\$l\\\";; esac; done </proc/net/dev; [ -z \\\"\\$o\\\" ] || {{ echo \\\"the run reaches a network beyond lo:\\$o\\\"; exit 1; }}; /bin/mkdir -p \\\"\\$HOME/a/b\\\" && /bin/td-util printf x > \\\"\\$HOME/a/b/f\\\" && /bin/chmod 000 \\\"\\$HOME/a\\\" || {{ echo \\\"the run cannot fill its own home\\\"; exit 1; }}; echo sandbox-inside-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-inside-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; owner=$(/bin/ls -ln \"$real/probe\" 2>&1); case \"$owner\" in *\" 1000 1000 \"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the probe the sandbox wrote is not owned by the human on disk: %s\\n\" \"$owner\"; exit 1; }};; esac; uid=$(/bin/rg -o -r \"\\$1\" \"^sandbox\\toracle\\t([0-9]+)$\" /var/lib/td/accounts.tsv) || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger holds no row of the oracle\"; exit 1; }}; /bin/td-login exec-primary -- /bin/rm -rf \"$home/.local/share/td-sandbox/.profiles/oracle\" || exit 1; if said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: a create went over the held sandbox: %s\\n\" \"$said\"; exit 1; }}; fi; case \"$said\" in *\"td-sandbox adopt oracle\"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the create over the held sandbox said: %s\\n\" \"$said\"; exit 1; }};; esac; [ -e \"/var/lib/td/workloads/$uid/a\" ] || {{ /bin/td-util printf \"sandbox-evidence: the refused create lost the home: %s\\n\" \"$uid\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox adopt oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the adopt failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle host 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network host failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"o=; while read -r l; do case \\\"\\$l\\\" in lo:*) :;; *:*) o=\\\"\\$o \\$l\\\";; esac; done </proc/net/dev; [ -n \\\"\\$o\\\" ] || {{ echo \\\"the host network shows no interface beyond lo\\\"; exit 1; }}; echo sandbox-host-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the host run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-host-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the host run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/rg -q \"^sandbox\\toracle\\tdirectory\\trw\\tsandbox-oracle$\" /var/lib/td/grants.tsv && /bin/rg -q \"^sandbox\\toracle\\tnetwork\\thost$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: the grant table lacks the rows of the oracle: %s\\n\" \"$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1)\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the delete failed: %s\\n\" \"$said\"; exit 1; }}; /bin/rg -q \"^td-grants-v1$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the grant table is unreadable\"; exit 1; }}; if left=$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: rows remain after the delete: %s\\n\" \"$left\"; exit 1; }}; fi; /bin/rg -q \"^sandbox\\toracle\\t$uid$\" /var/lib/td/accounts.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger lost the row of the oracle\"; exit 1; }}; left=$(/bin/ls -A \"/var/lib/td/workloads/$uid\" 2>&1); [ \"$left\" = .td-deleted ] || {{ /bin/td-util printf \"sandbox-evidence: the deleted home holds more than the deletion mark: %s\\n\" \"$left\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run default -- /bin/sh -c \"/bin/td-util printf \\\"#!/bin/sh\\\\necho default-ran\\\\n\\\" > \\\"$seeded/sandbox-oracle-probe\\\" && /bin/chmod 0755 \\\"$seeded/sandbox-oracle-probe\\\" && r=\\$(\\\"$seeded/sandbox-oracle-probe\\\") && [ \\\"\\$r\\\" = default-ran ] || {{ echo \\\"the default sandbox cannot write and run in ~/sandbox\\\"; exit 1; }}; echo sandbox-default-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the default run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-default-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the default run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/td-login exec-primary -- /bin/rm -f \"$seeded/sandbox-oracle-probe\" || exit 1; /bin/echo {sandbox_marker}'\n\
+         after=sandbox-default,workspace-intake\n\
+         timeout={sandbox_evidence}\n\
          \n\
          [release-source]\n\
          type=oneshot\n\
@@ -2790,6 +2839,9 @@ fn build_desktop_td_svc_conf() -> String {
         grant_directory = GRANT_EVIDENCE_DIRECTORY,
         firefox_grant_views = FIREFOX_GRANT_VIEWS,
         grant_marker = TD_GRANT_REQUEST_MARKER,
+        sandbox_default = svc_timeouts::SANDBOX_DEFAULT,
+        sandbox_evidence = svc_timeouts::SANDBOX_EVIDENCE,
+        sandbox_marker = TD_SANDBOX_ACCOUNT_MARKER,
         firefox_runtime = FIREFOX_RUNTIME,
         firefox_deploys = FIREFOX_DEPLOYS,
         placed_marker = TD_APPLICATIONS_PLACED_MARKER,
@@ -9631,6 +9683,7 @@ mod tests {
                                     | "software-evidence"
                                     | "grant-request"
                                     | "grant-evidence"
+                                    | "sandbox-evidence"
                                     | "applications-workspace"
                                     | "mail"
                                     | "news"
@@ -9666,6 +9719,7 @@ mod tests {
             "software-evidence",
             "grant-request",
             "grant-evidence",
+            "sandbox-evidence",
             "terminal",
             "web",
             "web-evidence",
@@ -9858,8 +9912,137 @@ mod tests {
         );
         assert_eq!(unit_key("sandbox-default", "unless-exists"), None);
         assert!(ordered_before("td-firstboot", "sandbox-default"));
+        // It creates the default sandbox through root's workspace intake.
+        assert!(ordered_before("workspace-intake", "sandbox-default"));
+        assert_eq!(
+            unit_key("sandbox-default", "timeout"),
+            Some(svc_timeouts::SANDBOX_DEFAULT.to_string())
+        );
+        // Its wait for the intake, one imported profile's allocation and
+        // grant, the default's allocation and grant.
+        assert!(10 + (30 + 3) + (30 + 3) + 5 <= svc_timeouts::SANDBOX_DEFAULT);
         assert!(ordered_before("sandbox-default", "wayland"));
         assert_eq!(unit_key("wayland", "requires").as_deref(), Some("seat"));
+    }
+
+    /// The sandbox account oracle: as the human, td-sandbox creates a
+    /// sandbox through root's intake, grants it a directory writable with
+    /// its network off and runs a command in it as the sandbox's account;
+    /// root then checks the view's owner on disk and the grant table's
+    /// rows, and after the delete that no row is left while the ledger row
+    /// stays. It runs on an oracle's boot only, off the Firefox path.
+    #[test]
+    fn the_sandbox_oracle_runs_as_the_sandboxs_account_through_the_intake() {
+        let exec = unit_key("sandbox-evidence", "exec").unwrap_or_default();
+        assert!(exec.starts_with(&format!(
+            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac;"
+        )));
+        assert!(!exec.contains("/dev/null"));
+        let human = "/bin/td-login exec-primary -- /bin/td-sandbox";
+        for step in [
+            "delete oracle 2>&1);",
+            "create oracle 2>&1) ||",
+            r#"share oracle "$real" --write 2>&1) ||"#,
+            "network oracle off 2>&1) ||",
+            r#"run oracle -- /bin/sh -c ""#,
+            "create oracle 2>&1); then",
+            "adopt oracle 2>&1) ||",
+            "network oracle host 2>&1) ||",
+            r#"run default -- /bin/sh -c ""#,
+        ] {
+            assert!(exec.contains(&format!("{human} {step}")), "{step}");
+        }
+        // Every td-sandbox step runs as the human; root itself only reads.
+        assert_eq!(
+            exec.matches("/bin/td-sandbox ").count(),
+            exec.matches(&format!("{human} ")).count()
+        );
+        // Inside: a sandbox account's uid, a script written and run in the
+        // granted directory, a world-readable file of the home it was not
+        // granted unread, no interface but lo, and its own home filled,
+        // a directory of it mode 000.
+        for inside in [
+            r#"done </proc/self/status; [ \"\$u\" -ge 98304 ] && [ \"\$u\" -le 131071 ] ||"#,
+            r#"> \"$real/probe\" && /bin/chmod 0755 \"$real/probe\" && r=\$(\"$real/probe\")"#,
+            r#"/bin/chmod 0644 "$home/sandbox-oracle-public" || exit 1;"#,
+            r#"if /bin/cat \"$public\"; then"#,
+            // The proof: the human's home, 0700 and the human's on disk,
+            // lists exactly the grant, which only the jail's view of it
+            // can; bare, it would refuse the sandbox's uid.
+            r#"canon=$(/bin/td-login exec-primary -- /bin/readlink -f "$home") || exit 1;"#,
+            r#"l=\$(/bin/ls -A \"$canon\") && [ \"\$l\" = sandbox-oracle ] ||"#,
+            r#"case \"\$l\" in lo:*) :;; *:*) o="#,
+            r#"[ -z \"\$o\" ] ||"#,
+            r#"/bin/mkdir -p \"\$HOME/a/b\" && /bin/td-util printf x > \"\$HOME/a/b/f\" && /bin/chmod 000 \"\$HOME/a\""#,
+            r#"echo sandbox-inside-ok" 2>&1)"#,
+            // With network host, an interface beyond lo.
+            r#"[ -n \"\$o\" ] ||"#,
+            r#"echo sandbox-host-ok" 2>&1)"#,
+            // The seeded default writes and runs in ~/sandbox.
+            r#"> \"$seeded/sandbox-oracle-probe\" && /bin/chmod 0755 \"$seeded/sandbox-oracle-probe\""#,
+            r#"echo sandbox-default-ok" 2>&1)"#,
+        ] {
+            assert!(exec.contains(inside), "{inside}");
+        }
+        // A lost record: the create over the held sandbox is refused, its
+        // home kept, and adopt records it.
+        let lost = exec
+            .find(r#"/bin/rm -rf "$home/.local/share/td-sandbox/.profiles/oracle""#)
+            .unwrap_or(usize::MAX);
+        let refused = exec.find("create oracle 2>&1); then").unwrap_or_default();
+        assert!(lost < refused);
+        assert!(exec.contains(r#"case "$said" in *"td-sandbox adopt oracle"*) :;;"#));
+        assert!(exec.contains(r#"[ -e "/var/lib/td/workloads/$uid/a" ] ||"#));
+        assert!(exec.contains(r#"case "$ran" in *sandbox-inside-ok*) :;;"#));
+        assert!(exec.contains(r#"case "$owner" in *" 1000 1000 "*) :;;"#));
+        assert!(exec.contains(
+            r#"/bin/rg -q "^sandbox\toracle\tdirectory\trw\tsandbox-oracle$" /var/lib/td/grants.tsv && /bin/rg -q "^sandbox\toracle\tnetwork\thost$" /var/lib/td/grants.tsv ||"#
+        ));
+        // After the last delete: no row of the sandbox, its ledger row kept.
+        let deleted = exec
+            .rfind(&format!("{human} delete oracle 2>&1) ||"))
+            .unwrap_or_default();
+        assert!(deleted > exec.find("network oracle host").unwrap_or(usize::MAX));
+        let after = exec.get(deleted..).unwrap_or_default();
+        assert!(after.contains(
+            r#"if left=$(/bin/rg "^sandbox\toracle\t" /var/lib/td/grants.tsv 2>&1); then"#
+        ));
+        assert!(
+            after.contains(r#"/bin/rg -q "^sandbox\toracle\t$uid$" /var/lib/td/accounts.tsv ||"#)
+        );
+        // The deleted home holds root's mark alone.
+        assert!(after.contains(r#"left=$(/bin/ls -A "/var/lib/td/workloads/$uid" 2>&1);"#));
+        assert!(after.contains(r#"[ "$left" = .td-deleted ] ||"#));
+        assert!(exec.ends_with(&format!("/bin/echo {TD_SANDBOX_ACCOUNT_MARKER}'")));
+        assert_eq!(exec.matches("/bin/echo ").count(), 1);
+        assert!(td_engine::workload_grants::validate_path(b"sandbox-oracle").is_ok());
+        // An oracle's boot only, as the grant oracle's units, and off the
+        // Firefox path: nothing waits for it.
+        assert_eq!(
+            unit_key("sandbox-evidence", "unless-exists").as_deref(),
+            Some(APPLICATIONS_ON_DEMAND)
+        );
+        assert_eq!(
+            unit_after("sandbox-evidence"),
+            ["sandbox-default", "workspace-intake"]
+        );
+        for unit in TD_SVC_UNITS {
+            assert!(
+                !unit_after(unit).contains(&"sandbox-evidence".to_string()),
+                "{unit}"
+            );
+        }
+        assert_eq!(
+            unit_key("sandbox-evidence", "timeout"),
+            Some(svc_timeouts::SANDBOX_EVIDENCE.to_string())
+        );
+        // Six account preparations or allocations at 30 seconds (the first
+        // delete's, the create's, the three runs', the last delete's), five
+        // grant-table changes at 3 (two clears, the share and two network
+        // changes), three jails started and run, and two homes emptied as
+        // the account.
+        assert!(30 * 6 + 3 * 5 + 60 * 3 + 20 * 2 <= svc_timeouts::SANDBOX_EVIDENCE);
+        assert!(TD_SVC_UNITS.contains(&"sandbox-evidence"));
     }
 
     /// Root's workspace intake runs as root after firstboot seeds the
@@ -9977,8 +10160,12 @@ mod tests {
             ("portal", vec!["busd", "portal-files", "firefox-handoff"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat", "sandbox-default"]),
-            ("sandbox-default", vec!["td-firstboot"]),
+            ("sandbox-default", vec!["td-firstboot", "workspace-intake"]),
             ("workspace-intake", vec!["td-firstboot"]),
+            (
+                "sandbox-evidence",
+                vec!["sandbox-default", "workspace-intake"],
+            ),
             ("terminal", vec!["wayland"]),
             ("media", vec!["td-firstboot"]),
             ("media-watch", vec!["wayland", "media"]),

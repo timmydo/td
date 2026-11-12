@@ -4517,7 +4517,7 @@ replaces): a name this system does not declare loads, with a note
 saying the template's tools are refused, so a runtime a later system
 retires leaves the file readable and the other templates usable. A
 declared one in a file read on a development host, which has no
-`/etc/td-app.conf` (the test td-jail and td-sandbox make), loads with a
+`/etc/td-app.conf` (the test td-jail makes), loads with a
 note too, since td-jail refuses it there. The window shows a lone note
 of the configuration's itself, and several as a count. The name is
 checked again when a spec is written, so it can never break a line.
@@ -4532,8 +4532,9 @@ workspace can be unconfined, and neither has a template, so
 unconfined workspace with one, and `jail::launch_unjailed` refuses a
 policy that names one, since nothing would bind it.
 
-The runtime runs as td-sandbox's does (APPLICATIONS.md §C, Runtime):
-inside the workspace jail, as the human with the workspace's worktrees,
+The runtime runs as in any workspace jail (APPLICATIONS.md §C, Runtime),
+but as the human rather than a sandbox's account until WORKLOADS.md
+step 8: inside the workspace jail, as the human with the workspace's worktrees,
 shared directories, network and the host-local sockets that reaches,
 outside the application kind's bus, portal and Wayland boundaries, and
 td's own glibc programs there can load its code. Its workspace is

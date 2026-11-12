@@ -16,7 +16,7 @@ pub fn recipe() -> Recipe {
             },
             Step::WriteFile {
                 path: "{out}/result".into(),
-                content: "PASS: static private-home launcher executes\n".into(),
+                content: "PASS: static sandbox client executes\n".into(),
                 exec: false,
             },
         ])
