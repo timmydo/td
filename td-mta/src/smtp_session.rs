@@ -39,11 +39,14 @@ pub struct Envelope {
     pub declared_bytes: Option<u64>,
 }
 
-/// Classification of our own fixed SMTP replies, never peer text.
+/// Classification of our own fixed SMTP replies, with bounded RCPT diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rejection {
     status: u16,
     reason: &'static str,
+    recipient: [u8; 96],
+    recipient_len: u8,
+    recipient_truncated: bool,
 }
 impl Rejection {
     pub fn status(self) -> u16 {
@@ -51,6 +54,41 @@ impl Rejection {
     }
     pub fn reason(self) -> &'static str {
         self.reason
+    }
+    pub fn recipient(&self) -> Option<(&str, bool)> {
+        if self.recipient_len == 0 {
+            return None;
+        }
+        let bytes = self.recipient.get(..usize::from(self.recipient_len))?;
+        Some((std::str::from_utf8(bytes).ok()?, self.recipient_truncated))
+    }
+    /// Only a complete, syntactically valid RCPT path may enter diagnostics.
+    pub(crate) fn with_command(mut self, command: &str) -> Self {
+        if !matches!(
+            self.reason,
+            "unknown_recipient" | "routing_unavailable" | "recipient_limit"
+        ) {
+            return self;
+        }
+        let Some((verb, arg)) = command.split_once(' ') else {
+            return self;
+        };
+        if !verb.eq_ignore_ascii_case("RCPT") {
+            return self;
+        }
+        let Some((address, "")) = path(arg, "TO:", false) else {
+            return self;
+        };
+        let length = address.len().min(self.recipient.len());
+        if let (Some(target), Some(source)) = (
+            self.recipient.get_mut(..length),
+            address.as_bytes().get(..length),
+        ) {
+            target.copy_from_slice(source);
+            self.recipient_len = length as u8;
+            self.recipient_truncated = length < address.len();
+        }
+        self
     }
     pub(crate) fn from_reply(bytes: &[u8]) -> Option<Self> {
         let status = match bytes.get(..3)? {
@@ -81,7 +119,13 @@ impl Rejection {
             b"554 5.5.0 Buffered plaintext at STARTTLS\r\n" => "starttls_buffered_plaintext",
             _ => "command_refused",
         };
-        Some(Self { status, reason })
+        Some(Self {
+            status,
+            reason,
+            recipient: [0; 96],
+            recipient_len: 0,
+            recipient_truncated: false,
+        })
     }
 }
 
@@ -211,6 +255,21 @@ impl<'a> Session<'a> {
             self.envelope.as_ref().ok_or(Error::Invalid)?,
             self.extended,
         ))
+    }
+    pub(crate) fn rejection(&self) -> Option<Rejection> {
+        let Pending::Reply { bytes, .. } = self.pending() else {
+            return None;
+        };
+        let rejection = Rejection::from_reply(bytes)?;
+        let command = self
+            .line
+            .get(..self.used)
+            .and_then(|line| line.strip_suffix(b"\r\n"))
+            .and_then(|line| std::str::from_utf8(line).ok());
+        Some(match command {
+            Some(command) => rejection.with_command(command),
+            None => rejection,
+        })
     }
     /// Native root-header admission can discover a permanent size refusal
     /// while writing the final line or finishing an EOF-terminated header block.

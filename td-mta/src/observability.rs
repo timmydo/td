@@ -207,7 +207,7 @@ fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
         Error::Indeterminate => "indeterminate",
     }
 }
-/// No free-form strings, addresses, credentials or message fields are accepted.
+/// Only SMTP refusal diagnostics admit a bounded, validated recipient spelling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     SmtpDataInterrupted {
@@ -470,7 +470,18 @@ impl fmt::Display for EventJson<'_> {
         if let Some(action) = e.kind.action() {
             write!(f, "\"{action}\"")?;
         }
-        f.write_str("],\"untrusted\":[]}\n")
+        f.write_str("],\"untrusted\":[")?;
+        if let Kind::SmtpRejected { reply, .. } = &e.kind {
+            if let Some((address, truncated)) = reply.recipient() {
+                write!(
+                    f,
+                    "{{\"source\":\"smtp_recipient\",\"truncated\":{truncated},\"text\":"
+                )?;
+                quoted(f, address)?;
+                f.write_str("}")?;
+            }
+        }
+        f.write_str("]}\n")
     }
 }
 fn prefix(f: &mut fmt::Formatter<'_>, record: &'static str, c: &Context) -> fmt::Result {
@@ -629,6 +640,18 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn kinds() -> Vec<Kind> {
         let mut result = vec![
+            Kind::SmtpRejected {
+                reply: crate::smtp_session::Rejection::from_reply(
+                    b"550 5.1.1 Unknown local recipient\r\n",
+                )
+                .unwrap()
+                .with_command(&format!(
+                    "RCPT TO:<\"{}\"@{}.test>",
+                    "\\\"".repeat(30),
+                    "a".repeat(63)
+                )),
+                peer: std::net::IpAddr::V6(std::net::Ipv6Addr::from([u16::MAX; 8])),
+            },
             Kind::SmtpRejected {
                 reply: crate::smtp_session::Rejection::from_reply(
                     b"554 5.6.0 Message line too long\r\n",
@@ -802,6 +825,26 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn recipient_is_escaped_and_labeled_as_untrusted() -> Result<(), Box<dyn std::error::Error>> {
+        let reply =
+            crate::smtp_session::Rejection::from_reply(b"550 5.1.1 Unknown local recipient\r\n")
+                .ok_or("missing refusal")?
+                .with_command("RCPT TO:<\"a\\\"b\"@example.test>");
+        let mut bytes = [0; MAX_EVENT_BYTES];
+        let mut out = TextBuffer::new(&mut bytes);
+        Event {
+            context: fullest(),
+            kind: Kind::SmtpRejected {
+                reply,
+                peer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            },
+        }
+        .encode(&mut out)?;
+        assert!(out.as_str()?.contains(r#""untrusted":[{"source":"smtp_recipient","truncated":false,"text":"\"a\\\"b\"@example.test"}]"#));
+        assert_eq!(out.as_str()?.lines().count(), 1);
+        Ok(())
+    }
+    #[test]
     fn all_event_variants_fit_and_failed_append_keeps_visible_prefix() -> Result<(), bounded::Error>
     {
         assert!(std::mem::size_of::<Option<Event>>() <= 256);
@@ -971,8 +1014,14 @@ mod tests {
             assert!(out.as_str()?.contains(&format!(
                 "\"facts\":{{\"code\":\"{code}\",\"severity\":\"{severity}\""
             )));
+            let untrusted = match kind {
+                Kind::SmtpRejected { reply, .. } if reply.recipient().is_some() => {
+                    "[{\"source\":\"smtp_recipient\",\"truncated\":true,\"text\":"
+                }
+                _ => "[]",
+            };
             assert!(out.as_str()?.contains(&format!(
-                "\"recommended_actions\":{actions},\"untrusted\":[]"
+                "\"recommended_actions\":{actions},\"untrusted\":{untrusted}"
             )));
         }
         let mut bytes = [0; MAX_EVENT_BYTES];

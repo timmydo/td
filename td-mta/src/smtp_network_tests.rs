@@ -641,3 +641,38 @@ fn refusal_observation_is_once_per_reply_even_when_transport_stalls() {
         assert_eq!(n.take_rejection(), Some(refusal));
     });
 }
+
+#[cfg(test)]
+mod recipient_diagnostics {
+    use super::*;
+
+    #[test]
+    fn refused_recipients_follow_each_pipelined_command_without_leaking_other_input() {
+        fixture(|routes, plan, timer| {
+            let mut n = network(routes, plan, timer);
+            let mut w = Wire::default();
+            w.input.extend(b"EHLO sender.test\r\nMAIL FROM:<>\r\nRCPT TO:<one@example.test>\r\nRCPT TO:<two@example.test>\r\nRSET\r\nAUTH secret@example.test\r\nQUIT\r\n");
+            let mut observations = Vec::new();
+            for _ in 0..200 {
+                if let Some(reply) = n.take_rejection() {
+                    observations.push((
+                        reply.status(),
+                        reply.recipient().map(|(s, t)| (s.to_owned(), t)),
+                    ));
+                    assert!(n.take_rejection().is_none());
+                }
+                if n.advance(&mut w, timer).unwrap() == Progress::Closed {
+                    break;
+                }
+            }
+            assert_eq!(
+                observations,
+                vec![
+                    (550, Some(("one@example.test".to_owned(), false))),
+                    (550, Some(("two@example.test".to_owned(), false))),
+                    (500, None),
+                ]
+            );
+        });
+    }
+}

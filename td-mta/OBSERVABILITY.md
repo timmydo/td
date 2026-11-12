@@ -30,7 +30,7 @@ u64/i64 exactly. Optional correlation fields are omitted when irrelevant.
 | `submission_id` | Optional 32-digit lowercase hex submission ID |
 | `facts` | Trusted fixed schema values and typed numeric facts |
 | `recommended_actions` | Array of fixed advisory codes; never executable commands |
-| `untrusted` | Array: empty for events/status; one labeled source-text object for inspection |
+| `untrusted` | Array: empty for status and most events; one labeled source-text object for inspection or an eligible RCPT rejection |
 
 `BootId` is distinct from persistent `InstanceId`. The runtime obtains a fresh
 boot ID from its entropy adapter before emitting events; parsing/constructing an
@@ -48,11 +48,13 @@ that operation, including an old retained snapshot during reload.
 
 ## Default events
 
-`Event` contains only `Context` and the closed `Kind` enum. It has no free-form
-strings, peer addresses, credential/AUTH/Authorization contents, subject,
-recipient address or message body fields. Redaction is enforced by the default
-input shape; it is not a substring filter. Normal events always have empty
-`untrusted`. Their `facts` object begins with `code` and `severity`.
+`Event` contains only `Context` and the closed `Kind` enum. It has no arbitrary
+free-form strings, credential/AUTH/Authorization contents, subject or message
+body fields. SMTP refusal diagnostics admit a typed numeric peer address and,
+for eligible RCPT rejections, a bounded validated recipient spelling as
+untrusted text. Other events have empty `untrusted`. Redaction is enforced by
+the input shape, not a substring filter. The `facts` object begins with `code`
+and `severity`.
 
 | Code | Additional facts | Severity | Recommended action |
 | --- | --- | --- | --- |
@@ -355,17 +357,28 @@ and deferred local delivery notices (fixed error class, without a submission
 ID when the notice producer has not returned one).
 Connection/request correlation is not yet emitted by these producers; the
 broader protocol/TLS/outcome event vocabulary above remains available to future
-instrumentation. No peer SMTP text, email addresses, credentials, subjects or
-message bodies enter these default records. SMTP refusal diagnostics additionally
-record the numeric socket peer IP, for correlation with a sender's delivery
-report. Treat that field as private operational metadata; it is not sender
-identity and never selects a logging rate bucket.
+instrumentation. No arbitrary peer SMTP text, credentials, subjects or message
+bodies enter these default records. SMTP refusal diagnostics additionally
+record the numeric socket peer IP and eligible refused recipient below, for
+correlation with a sender's delivery report. Treat these fields as private
+operational metadata; neither establishes sender identity or selects a logging
+rate bucket.
 
 `smtp_rejected` reports a locally queued 4xx/5xx reply once per reply,
 including `smtp_status`, a fixed `reason`, `peer_ip` and `reply_queued:true`.
 It does not prove that the peer received the reply. DATA reasons distinguish
 line length, framing, undeclared 8-bit data, header/message size and storage
 unavailability; other command syntax refusals have `command_refused`.
+For `unknown_recipient`, `routing_unavailable` and `recipient_limit`, the
+complete pending RCPT command is revalidated with the protocol path parser.
+Its recipient spelling (without brackets or obsolete source routes) appears
+in `untrusted` as `{"source":"smtp_recipient","truncated":false,"text":"..."}`.
+Only the first 96 ASCII bytes are retained; a longer address sets `truncated`
+to true. JSON escaping preserves one-line records. Invalid paths, parameters,
+other commands and DATA refusals emit no recipient text. This bounded copy
+fits the existing 256-byte event cell, 96 KiB queue and 1,024-byte encoded
+event ceilings, including maximal context and escaped quoted local parts.
+It adds no allocation, per-address bucket or complete delivery ledger.
 `smtp_data_interrupted` records network-reported closure/error during admitted
 DATA with a numeric
 peer and fixed error class; `error:none` means the transport owner closed

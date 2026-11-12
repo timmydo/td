@@ -130,6 +130,45 @@ fn sequence_routes_aliases_and_reset() {
         assert_eq!(s.pending(), Pending::Closed);
     });
 }
+
+#[cfg(test)]
+mod recipient_diagnostics {
+    use super::*;
+
+    #[test]
+    fn rejection_only_retains_valid_recipient_paths_and_marks_truncation() {
+        let refusal = Rejection::from_reply(b"550 5.1.1 Unknown local recipient\r\n").unwrap();
+        for command in [
+            "AUTH secret@example.test",
+            "RCPT TO:<bad address@example.test>",
+            "RCPT TO:<valid@example.test> SECRET=credential",
+            "RCPT TO:<valid@example.test>\r\nAUTH secret",
+        ] {
+            assert_eq!(refusal.with_command(command).recipient(), None);
+        }
+        let address = format!(
+            "{}@{}.{}.test",
+            "a".repeat(64),
+            "b".repeat(63),
+            "c".repeat(63)
+        );
+        let retained = refusal.with_command(&format!("RCPT TO:<{address}>"));
+        assert_eq!(retained.recipient(), Some((&address[..96], true)));
+        assert_eq!(
+            refusal
+                .with_command("RCPT TO:<@old.test:united@timmyd.info>")
+                .recipient(),
+            Some(("united@timmyd.info", false))
+        );
+        let data = Rejection::from_reply(b"554 5.6.0 Invalid message framing\r\n").unwrap();
+        assert_eq!(
+            data.with_command("RCPT TO:<private@example.test>")
+                .recipient(),
+            None
+        );
+    }
+}
+
 #[test]
 fn transcript_every_split_preserves_octets_and_waits_for_publication() {
     fixture(|routes| {

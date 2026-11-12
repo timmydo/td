@@ -100,10 +100,7 @@ impl<'a> Network<'a> {
         if self.refusal_reported {
             return None;
         }
-        let Pending::Reply { bytes, .. } = self.session.pending() else {
-            return None;
-        };
-        let rejection = crate::smtp_session::Rejection::from_reply(bytes)?;
+        let rejection = self.session.rejection()?;
         self.refusal_reported = true;
         Some(rejection)
     }

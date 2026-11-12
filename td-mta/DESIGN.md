@@ -2414,8 +2414,11 @@ Emit versioned JSON Lines with bounded event sizes, fixed event codes, severity,
 UTC time, process boot ID, config generation, connection/request ID, transaction
 sequence and submission ID when relevant. Escape/control-character encode all
 peer strings. Structured fields have documented meaning and stable enum values.
-Default logs omit credentials, Authorization/AUTH contents, message bodies,
-subjects, and recipient addresses; authorized inspection can retrieve details.
+Default logs omit credentials, Authorization/AUTH contents, message bodies
+and subjects. RCPT rejections for unknown recipients, unavailable routing or
+recipient limits include up to 96 bytes of the validated recipient spelling,
+explicitly labeled as untrusted with truncation reported. Other recipient
+details remain available through authorized inspection.
 
 Service writers retain up to 30 days in PostgreSQL, bounded by a 65,536-row
 ring, 1,024-byte events, a shared ingestion rate and a 96 MiB relation-size
