@@ -1162,6 +1162,21 @@ and `TD_MTA_PERF_JMAP_READERS` (2, at most 6) size it; the defaults take
 about six minutes. Its `td-mta-perf` lines are the report;
 td-mta/CONFORMANCE.md says what each measures.
 
+## TLS session contention harness
+
+td-crypto's session contention run is on demand too:
+
+```text
+td-builder gate-crates crypto-cargo perf --manifest-path td-crypto/Cargo.toml
+```
+
+It runs the one ignored `tls_session::tests::session_contention` case in
+release, through the same bounded output and passing-summary check, in
+about half a minute. It needs no database and no network, and six free
+hardware threads: run it on an otherwise idle host. Its `td-crypto-perf`
+lines are the report; td-crypto/DESIGN.md says what it measures and
+records results.
+
 ## Timing-leakage harness
 
 The timing-leakage measurement of td-primitives' secret paths and

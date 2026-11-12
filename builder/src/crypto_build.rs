@@ -83,8 +83,8 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         "td-tls-provider/Cargo.toml" => "td-tls-provider",
         _ => return Err("manifest has no crypto admission".into()),
     };
-    if action == "perf" && name != "td-mta" {
-        return Err("crypto-cargo perf measures only td-mta".into());
+    if action == "perf" && !matches!(name, "td-mta" | "td-crypto") {
+        return Err("crypto-cargo perf measures only td-mta and td-crypto".into());
     }
     validate(root)?;
     let home = Scratch::create(root)?;
@@ -185,6 +185,21 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let graph =
         std::str::from_utf8(&output.stdout).map_err(|e| format!("crypto graph UTF-8: {e}"))?;
     crate::crypto_policy::active_graph(root, name, graph)?;
+    if action == "perf" && name == "td-crypto" {
+        // On demand only: the session contention run, in release.
+        let mut cmd = command("test", manifest);
+        cmd.args([
+            "--release",
+            "--lib",
+            "--",
+            "--exact",
+            "tls_session::tests::session_contention",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(Stdio::piped());
+        return crate::native_tests::run_cases(cmd).map(|()| None);
+    }
     if action == "perf" {
         // On demand only: no gate selects it. Release, as td-mta M23 measures,
         // with the release build's profile so the two share artifacts.
@@ -410,19 +425,20 @@ mod tests {
 
     /// Refused before validation reads the root, so no checkout is needed.
     #[test]
-    fn on_demand_actions_take_their_one_manifest_and_unknown_actions_refuse() {
+    fn on_demand_actions_take_their_manifests_and_unknown_actions_refuse() {
         let root = Path::new("/nonexistent-td-root");
-        assert_eq!(
-            run_inner(root, "perf", "td-crypto/Cargo.toml")
-                .err()
-                .as_deref(),
-            Some("crypto-cargo perf measures only td-mta")
+        // td-crypto passes the perf gate and fails only at validation.
+        let crypto = run_inner(root, "perf", "td-crypto/Cargo.toml").err();
+        assert!(crypto.is_some());
+        assert_ne!(
+            crypto.as_deref(),
+            Some("crypto-cargo perf measures only td-mta and td-crypto")
         );
         assert_eq!(
             run_inner(root, "perf", "td-tls-provider/Cargo.toml")
                 .err()
                 .as_deref(),
-            Some("crypto-cargo perf measures only td-mta")
+            Some("crypto-cargo perf measures only td-mta and td-crypto")
         );
         assert_eq!(
             run_inner(root, "leakage", "td-crypto/Cargo.toml")

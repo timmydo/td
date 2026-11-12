@@ -1948,9 +1948,12 @@ remain open. What remains of M07:
   evidence and `check_gateway_policy` exist, but `serve` refuses gateway
   listeners and receiving refuses a session carrying gateway evidence;
   M12 owns that listener;
-- contention across handshake and established workers in the integrated
-  service, per-operation sampling of the serialized clock included
-  (td-crypto/DESIGN.md);
+- the shared clock's serialized callback, which td-crypto's session
+  contention run finds cuts four busy established sessions' record
+  throughput to under a third of what private clocks give
+  (td-crypto/DESIGN.md, "Health and clock contention"); removing it
+  changes `UtcClock`'s contract. Its cost at service load is M23's to
+  measure;
 - M07e's accounting of retained peer state, decoded-message expansion and
   separate header/body polling, and the concurrent-session and
   simultaneous-traffic admission M07e4d and M07e4e leave pending;
@@ -2851,9 +2854,12 @@ goals and establish a measured release profile. If those goals are missed,
 identify the causes and review tuning or revised goals from actual service
 evidence; do not repair a speculative ledger to simulate a memory result.
 Repeated ingestion, queries, retries, renewals and reloads show no unexplained
-retained growth. Saturation yields defined refusals and reserves progress for
-health and accepted work. Disk full and checkpoint pressure cannot corrupt
-mail. Fix concrete violations in their owning modules with focused tests.
+retained growth. Report TLS record latency in the running service with and
+without concurrent handshakes, which carries td-crypto's session contention run
+(td-crypto/DESIGN.md, "Health and clock contention") to service load.
+Saturation yields defined refusals and reserves progress for health and
+accepted work. Disk full and checkpoint pressure cannot corrupt mail. Fix
+concrete violations in their owning modules with focused tests.
 
 ## M24 — Crash matrix and protocol robustness release gate
 

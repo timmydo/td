@@ -3497,7 +3497,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates names");
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy|build --manifest-path CRATE/Cargo.toml");
             eprintln!(
-                "       td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml"
+                "       td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml|td-crypto/Cargo.toml"
             );
             eprintln!(
                 "       td-builder gate-crates crypto-musl-notice --archive musl-1.2.5.tar.gz"

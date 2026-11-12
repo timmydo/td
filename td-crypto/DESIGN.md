@@ -1295,6 +1295,8 @@ x86-64 host build. The reviewers ran no mutation testing of their own.
 The review holds for the code it read; a change to a reviewed path needs
 it again.
 
+### Health and clock contention
+
 Selected-key health and shared-clock health read a retirement flag and
 their mutex's poison state without taking the key's or the clock's mutex. A
 server session checks key health before work, after backend calls and at
@@ -1320,9 +1322,48 @@ record work still waits behind other sessions' clock callbacks, as the clock
 figures above show under that load. Signing serializes too: concurrent
 handshakes on one identity take turns at its key, which bounds one key at
 roughly 770 to 2500 signatures a second on that host. These are component
-measurements on one machine, not a latency bound. Contention across complete
-handshake and established sessions in the integrated service, per-operation
-clock sampling included, is not measured and remains open.
+measurements on one machine, not a latency bound.
+
+The session contention run (`tls_session::tests::session_contention`,
+on demand; DEVELOPMENT.md says how to run it) measures those locks through
+complete sessions. Four established server sessions time each 16 KiB
+record's `receive_record` and `read_plaintext` while two threads complete
+TLS 1.3 handshakes, each a signature and several clock callbacks, for four
+seconds a phase. In a shared phase every thread uses one identity,
+configuration and clock whose callback reads system and monotonic time, as
+td-mta's workers share theirs; in a private phase each thread has its own,
+so the difference is what sharing costs.
+
+On the development host above, in release, two runs on a quiet host agreed
+and a third, beside other load, showed the same pattern with longer tails.
+With no handshakes, shared records took p50 84 to 85 µs and p99 182 to 186
+µs, at 89,000 to 92,000 records a phase, before and after the handshake
+phases; private records took p50 23 to 24 µs and p99 28 µs, at 320,000 to
+326,000, about 3.5 times as many. Unpaced handshakes, about 1400 a second
+shared and up to 1870 private, moved shared records to p50 94 µs and p99
+215 µs with 11% fewer records, and private ones by at most a few
+microseconds. At twenty a second each, shared records matched their idle
+phases. One scratch run with `ClockHandle::now`'s mutex bypassed, its
+callback still reading both clocks, made every shared phase match the
+private ones, p50 24 µs, and raised the shared handshake rate to about 1840
+a second. So the shared clock's serialized callback is the whole of what
+sharing costs record work and handshakes alike; with the health flags, the
+shared key and configuration add nothing measurable at two handshake
+threads. On b5c76b298, the tree before the health flags, with this test
+applied, unpaced shared handshakes moved records to p50 144 µs and p99 671
+µs, at 52,553 records against its idle 84,768, and the private phases were
+unchanged.
+
+Like the component figures, these are not a latency bound. Each established
+thread also does its client's work, untimed and through the same shared
+clock, so the loop is closed: a stall shows as one long sample and fewer
+records, not as queued arrivals, and the percentiles pool four threads. The
+run needs six free hardware threads. Its shared records stream about 375
+MB/s, far above td-mta's ordinary load, so the clock's cost at a service's
+rate, with its sockets, workers and other processes, is M23's to measure.
+Removing the cost needs callbacks that run concurrently, a change to
+`UtcClock`'s contract, which serializes them so an unwinding callback
+leaves no state another caller could see.
 
 ### td-primitives backend qualification
 

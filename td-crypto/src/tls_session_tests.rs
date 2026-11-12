@@ -1149,3 +1149,197 @@ fn client_session_ticket_flight_capacity_is_terminal_after_finished() {
         }
     }
 }
+
+/// The on-demand contention run (td-crypto/DESIGN.md, "Health and clock
+/// contention"): four established server sessions time each 16 KiB record's
+/// receive and read while two threads complete handshakes. In a shared phase
+/// every thread uses one identity, configuration and clock, as a service
+/// does; in a private phase each thread has its own, so the difference is
+/// what sharing costs. Ignored, so no gate runs it; its lines are the report
+/// and nothing in it is a threshold.
+#[test]
+#[ignore = "on demand: timing is noisy and machine-specific"]
+fn session_contention() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant, SystemTime};
+    const ESTABLISHED: usize = 4;
+    const HANDSHAKERS: usize = 2;
+    const PHASE: Duration = Duration::from_secs(4);
+    type Configs = (Arc<ServerConfig>, Arc<ClientConfig>);
+    // Each callback reads system and monotonic time, then answers the
+    // fixture's certificate time.
+    struct SystemRead;
+    impl UtcClock for SystemRead {
+        fn now(&self) -> Option<u64> {
+            std::hint::black_box(SystemTime::now());
+            std::hint::black_box(Instant::now());
+            Some(NOW)
+        }
+    }
+    // A fresh identity, trust root and clock, with configurations over them.
+    fn configs() -> Configs {
+        let (identity, roots) = fixture();
+        let clock = Arc::new(ClockHandle::new(SystemRead));
+        let server = ServerConfig::new(
+            &[identity],
+            TlsProtocol::Smtp,
+            IdentitySelection::DefaultIdentity,
+            None,
+            clock.clone(),
+        )
+        .unwrap();
+        let client = ClientConfig::new(&roots, clock, TlsProtocol::Smtp).unwrap();
+        (Arc::new(server), Arc::new(client))
+    }
+    // Move every complete record from one session's output to the other.
+    fn transfer(from: &mut TlsSession, to: &mut TlsSession, wire: &mut Vec<u8>) {
+        let mut chunk = [0; 4096];
+        while from.status().ciphertext_pending != 0 {
+            let count = from.drain_ciphertext(&mut chunk).unwrap();
+            wire.extend_from_slice(&chunk[..count]);
+        }
+        let mut offset = 0;
+        while let Some(header) = wire.get(offset..offset + 5) {
+            let end = offset + 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+            if end > wire.len() {
+                break;
+            }
+            // A receiver with its own flight to send first takes this later.
+            if to.receive_record(&wire[offset..end], false).unwrap()
+                != TlsProgress::Bytes(end - offset)
+            {
+                break;
+            }
+            offset = end;
+        }
+        wire.drain(..offset);
+    }
+    fn connect((server, client): &Configs) -> (TlsSession, TlsSession) {
+        let mut server = TlsSession::server(server.clone()).unwrap();
+        let mut client = TlsSession::client(client.clone(), "localhost").unwrap();
+        let (mut outward, mut inward) = (Vec::new(), Vec::new());
+        for _ in 0..50 {
+            transfer(&mut client, &mut server, &mut outward);
+            transfer(&mut server, &mut client, &mut inward);
+            if let (Some(info), Some(_)) = (server.status().handshake, client.status().handshake) {
+                assert_eq!(info.version, TlsVersion::V13);
+                return (server, client);
+            }
+        }
+        panic!("the fixture pair did not complete a handshake");
+    }
+    let shared = configs();
+    // Phase name, handshake threads, their pace a second each (zero is
+    // unpaced), and whether every thread shares one identity and clock.
+    for (phase, handshakers, pace, sharing) in [
+        ("idle_shared", 0, 0u64, true),
+        ("idle_private", 0, 0, false),
+        ("handshakes_unpaced_shared", HANDSHAKERS, 0, true),
+        ("handshakes_unpaced_private", HANDSHAKERS, 0, false),
+        ("handshakes_20_per_second_shared", HANDSHAKERS, 20, true),
+        ("idle_shared_after", 0, 0, true),
+    ] {
+        let setup = |shared: &Configs| if sharing { shared.clone() } else { configs() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let handshaking: Vec<_> = (0..handshakers)
+            .map(|_| {
+                let (configs, stop) = (setup(&shared), stop.clone());
+                std::thread::spawn(move || {
+                    let (mut completed, began) = (0u64, Instant::now());
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        drop(connect(&configs));
+                        completed += 1;
+                        if let Some(micros) = 1_000_000u64.checked_div(pace) {
+                            let period = Duration::from_micros(micros);
+                            if let Some(rest) = period.checked_sub(started.elapsed()) {
+                                std::thread::sleep(rest);
+                            }
+                        }
+                    }
+                    (completed, began.elapsed())
+                })
+            })
+            .collect();
+        let established: Vec<_> = (0..ESTABLISHED)
+            .map(|_| {
+                let configs = setup(&shared);
+                std::thread::spawn(move || {
+                    let (mut server, mut client) = connect(&configs);
+                    let payload = [0x5a; 16 * 1024];
+                    let mut plaintext = [0; 16 * 1024];
+                    let mut chunk = [0; 4096];
+                    let mut wire = Vec::new();
+                    let mut elapsed = Vec::new();
+                    let until = Instant::now() + PHASE;
+                    while Instant::now() < until {
+                        assert_eq!(
+                            client.queue_plaintext(&payload).unwrap(),
+                            TlsProgress::Bytes(payload.len())
+                        );
+                        while client.status().ciphertext_pending != 0 {
+                            let count = client.drain_ciphertext(&mut chunk).unwrap();
+                            wire.extend_from_slice(&chunk[..count]);
+                        }
+                        let mut offset = 0;
+                        while let Some(header) = wire.get(offset..offset + 5) {
+                            let end = offset
+                                + 5
+                                + usize::from(u16::from_be_bytes([header[3], header[4]]));
+                            if end > wire.len() {
+                                break;
+                            }
+                            let started = Instant::now();
+                            assert_eq!(
+                                server.receive_record(&wire[offset..end], false).unwrap(),
+                                TlsProgress::Bytes(end - offset)
+                            );
+                            while let TlsProgress::Bytes(1..) =
+                                server.read_plaintext(&mut plaintext).unwrap()
+                            {
+                            }
+                            elapsed.push(started.elapsed());
+                            offset = end;
+                        }
+                        wire.drain(..offset);
+                    }
+                    elapsed
+                })
+            })
+            .collect();
+        let mut elapsed: Vec<Duration> = established
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        let (mut handshakes, mut handshake_time) = (0u64, Duration::ZERO);
+        for thread in handshaking {
+            let (completed, time) = thread.join().unwrap();
+            handshakes += completed;
+            handshake_time = handshake_time.max(time);
+        }
+        assert!(!elapsed.is_empty());
+        assert_eq!(handshakes == 0, handshakers == 0);
+        elapsed.sort();
+        let at = |q: f64| elapsed[((elapsed.len() - 1) as f64 * q) as usize].as_micros();
+        let rate = if handshakes == 0 {
+            0
+        } else {
+            (handshakes as f64 / handshake_time.as_secs_f64()) as u64
+        };
+        println!(
+            "td-crypto-perf {{\"phase\":\"{phase}\",\"shared\":{sharing},\
+             \"established\":{ESTABLISHED},\"handshake_threads\":{handshakers},\
+             \"pace_per_thread\":{pace},\"seconds\":{},\"records\":{},\
+             \"handshakes\":{handshakes},\"handshakes_per_second\":{rate},\
+             \"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{}}}",
+            PHASE.as_secs(),
+            elapsed.len(),
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            at(0.999),
+            at(1.0),
+        );
+    }
+}

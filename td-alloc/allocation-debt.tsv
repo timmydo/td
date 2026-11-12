@@ -1583,10 +1583,10 @@ td-crypto/src/tls_session.rs	direct-reservation	1
 td-crypto/src/tls_session.rs	heap-owner	2
 td-crypto/src/tls_session.rs	unchecked-growth-or-clone	4
 td-crypto/src/tls_session_tests.rs	allocating-constructor	2
-td-crypto/src/tls_session_tests.rs	allocating-conversion	4
+td-crypto/src/tls_session_tests.rs	allocating-conversion	9
 td-crypto/src/tls_session_tests.rs	allocation-macro	12
-td-crypto/src/tls_session_tests.rs	heap-owner	14
-td-crypto/src/tls_session_tests.rs	unchecked-growth-or-clone	23
+td-crypto/src/tls_session_tests.rs	heap-owner	18
+td-crypto/src/tls_session_tests.rs	unchecked-growth-or-clone	32
 td-crypto/src/tls_signer.rs	direct-reservation	2
 td-crypto/src/tls_signer.rs	heap-owner	3
 td-crypto/src/tls_signer.rs	unchecked-growth-or-clone	8
