@@ -74,6 +74,21 @@ service, or a separately supervised private cluster. The MTA installer never
 assumes ownership of an existing cluster. A failed startup is retried by the
 service manager. Readiness does not depend on remote delivery succeeding.
 
+`serve`, `acme` and `postgres replica-follow` each first read one byte
+from `/dev/random`, which on Linux 5.6 or newer waits only until the
+kernel's random generator is initialized. The read precedes each one's
+database connection and signal blocking, and in `serve` its control socket;
+`acme` reads its connection file and public roots first. On a host whose
+generator is still initializing, the generated services therefore show an
+active process that is not ready, which SIGTERM ends at once (under an
+inherited default disposition). Meanwhile `serve`'s `status` reports no
+running process, and `acme-status` and `replica-follow-status` show their
+previous state. With `Type=exec` and no Shepherd PID file, neither the
+systemd nor the Shepherd definition bounds that wait. It normally ends within the first seconds of
+boot, and every later read on the host returns at once. On an older kernel
+`/dev/random` can block again when the kernel's entropy estimate runs low,
+including after signals are blocked; use Linux 5.6 or newer.
+
 ## Native certificate service
 
 For a public deployment with a prepared PostgreSQL runtime login, generate

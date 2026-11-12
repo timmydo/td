@@ -97,11 +97,18 @@ fn scan(root: &Path, path: &Path) {
                     source.find("signal_sys::block()").unwrap()
                         < source.find("Endpoint::bind(").unwrap()
                 );
+                // The first randomness draw precedes the database and signals.
+                let entropy = source.find("SystemEntropy::try_new()").unwrap();
+                assert!(entropy < source.find("Loaded::open(").unwrap());
+                assert!(entropy < source.find("signal_sys::block()").unwrap());
             }
             "td-mta/src/acme_command.rs" => {
                 assert_eq!(source.matches("super::signal_sys::block()").count(), 1);
                 assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
                 assert_eq!(words(&source, "signal_sys"), 2);
+                let entropy = source.find("SystemEntropy::try_new()").unwrap();
+                assert!(entropy < source.find("let mut first_claim").unwrap());
+                assert!(entropy < source.find("signal_sys::block()").unwrap());
             }
             "td-mta/src/postgres/replica/follow.rs" => {
                 assert_eq!(source.matches("crate::signal_sys::block()").count(), 1);
@@ -111,6 +118,9 @@ fn scan(root: &Path, path: &Path) {
                     source.find("signal_sys::block()").unwrap()
                         < source.find("while !stopped()?").unwrap()
                 );
+                let entropy = source.find("SystemEntropy::try_new()").unwrap();
+                assert!(entropy < source.find("FileState::open_follow(").unwrap());
+                assert!(entropy < source.find("signal_sys::block()").unwrap());
             }
             "td-mta/src/control.rs" => {
                 assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);

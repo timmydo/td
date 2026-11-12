@@ -331,6 +331,9 @@ fn observe_status(
     Ok(state)
 }
 fn run_inner(settings: Settings) -> Result<(), Failure> {
+    // The first draw waits for the kernel's random generator, which no later
+    // draw does. Take it before signals are blocked, so SIGTERM ends a wait.
+    td_crypto::SystemEntropy::try_new().map_err(|_| ("startup", "entropy"))?;
     let file = FileState::open_follow(&settings.directory)
         .map_err(|_| ("state", "status-root-or-lock"))?;
     let mut state = match file

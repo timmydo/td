@@ -189,12 +189,21 @@ and reads exactly the requested bytes, so a process using td-crypto needs
 not, construction and every fill return Entropy. Since Linux 5.6 that read blocks only until the
 kernel's CRNG is initialized, so the constructor's fill, and any fill before
 that point, can wait without a deadline; this constructor supplies no timeout
-or cancellation mechanism, and M07 must qualify startup ordering and
-supervision around it. The handle holds no state and no Rust heap buffer;
-there is no per-thread or process-wide generator state, no reseeding and no
-exit-time cleanup. Each fill opens and closes one file descriptor, so
-descriptor exhaustion is a returned failure. Constructor success establishes
-no bound on later elapsed time.
+or cancellation mechanism. A process that may wait therefore draws first,
+before it blocks SIGTERM and SIGINT or opens anything a stop must reach;
+td-mta's `serve`, `acme` and `postgres replica-follow` do, a source test
+pins it, and td-mta/DEPLOYMENT.md says what an operator sees. On Linux 5.6
+or newer, once that read returns no later read on the system waits, so
+worker handles, handshakes and per-operation handles cannot block, though
+each can still fail; worker start waits with no stop check, such as
+receiving's wait for its two workers, rely on that. On an older kernel
+`/dev/random` can block again whenever the kernel's entropy estimate runs
+low, and nothing here prevents it. The handle holds no state and no Rust
+heap buffer; there is no per-thread or process-wide generator state, no
+reseeding and no exit-time cleanup. Each fill opens and closes one file
+descriptor, so descriptor exhaustion is a returned failure. Beyond the
+generator wait above, constructor success establishes no bound on later
+elapsed time.
 
 An open or read failure, a short read among them, maps to fixed
 `Error::Entropy` and clears the entire caller slice. Callers must still

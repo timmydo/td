@@ -83,6 +83,8 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
     let executable = std::env::current_exe().map_err(|_| config_failure("acme", "executable"))?;
     let trust = TrustStore::public_roots().map_err(|_| config_failure("acme", "trust"))?;
     let mut owner = [0; 16];
+    // The first draw, and the only one that can wait for the kernel's random
+    // generator: it stays before the database claim and signal blocking.
     SystemEntropy::try_new()
         .and_then(|mut rng| rng.fill(&mut owner))
         .map_err(|_| config_failure("acme", "entropy"))?;

@@ -60,6 +60,10 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
 }
 
 pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
+    // The first draw waits for the kernel's random generator, which no later
+    // draw does. Take it before signals are blocked and the control socket
+    // exists, so SIGTERM still ends a wait and status finds no process.
+    td_crypto::SystemEntropy::try_new().map_err(|_| config_failure("startup", "entropy"))?;
     // Bound once and kept across reloads: a request arriving between two
     // generations waits for the next one, and the socket's absence means that
     // no process holds it.
