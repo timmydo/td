@@ -425,12 +425,13 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   service use or inferred whole-service/transient-peak bound.
 - `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
   qualification process; never an installed executable or service dependency.
-- `td-mta`: the installed receiving-only executable. Its supported store,
-  configuration, `serve --smtp-only`, status and stop commands and remaining
-  service limits are documented in td-mta/CONFIG.md and STORAGE.md.
-- `td-mta.debug`: the matching receiver symbols, without line tables, mode 0644.
+- `td-mta`: the installed executable. Its configuration, `serve`, status
+  and stop commands and remaining service limits are documented in
+  td-mta/CONFIG.md and STORAGE.md; this artifact's process suite checks
+  its arguments and does not qualify serving.
+- `td-mta.debug`: the matching symbols, without line tables, mode 0644.
   Retain it with the executable; it is not a separate download.
-- `td-mta-cli-smoke`: the existing store/configuration/receiver process suite,
+- `td-mta-cli-smoke`: the three-test help and argument process suite above,
   selecting this exact `td-mta` under the separate fixture described above.
   It is a test controller, never a service dependency.
 - `td-crypto-smoke`: separate qualification test executable, not a service

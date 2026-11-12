@@ -704,8 +704,9 @@ Construction catches Rust unwinds and publishes no partial provider. Cold
 suite and group vectors allocate; the entropy, key, abort/OOM and hook limits
 are unchanged. This is an algorithm policy component, not a configuration
 handle, key-signing bridge or session API. Version selection, role policy,
-SNI, ALPN, clock, resumption and resource qualification still require their
-following increments before service use. td-tls-provider's key provider is
+SNI, ALPN, clock and resumption followed in later increments; resource
+qualification, also set before service use, remains open
+(td-mta/IMPLEMENTATION.md, M07 "Status"). td-tls-provider's key provider is
 not restricted by these algorithm lists; it loads only one P-256 PKCS#8
 shape. Production configurations use the owned P-256 signing bridge and
 never load keys through with_single_cert or equivalent APIs.
@@ -867,8 +868,9 @@ full repeated TLS 1.2/1.3 handshakes against a resumption-enabled client,
 mandatory-client proof and typed certificate/count/size refusals, supplied
 verification time and the raw-IP SNI hazard. Backend connections in these
 fixtures do not substitute for public session enforcement. Constructors and
-provider work allocate within the still-unqualified TLS allowance; no service
-is enabled until M07c/M07d/M07e complete their remaining contracts.
+provider work allocate within the still-unqualified TLS allowance. td-mta
+enabled service before M07e completed its remaining contracts, which stay
+open (td-mta/IMPLEMENTATION.md, M07 "Status").
 
 ### Socket-free client sessions
 
@@ -1280,8 +1282,9 @@ publication, so established record work can wait behind another session's
 signing operation. These repeated acquisitions preserve shared retirement
 semantics; they are not qualified as nonblocking or latency-bounded. M07e must
 measure contention across handshake and established workers, along with the
-shared clock callback, before service admission. Any later lock-free health
-optimization must independently preserve those retirement fences.
+shared clock callback. That measurement was to precede service admission,
+which came first; it remains open. Any later lock-free health optimization
+must independently preserve those retirement fences.
 
 ### td-primitives backend qualification
 

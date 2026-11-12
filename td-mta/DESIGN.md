@@ -120,8 +120,8 @@ no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
 specifies the TLS policy and session contract. ClientConfig, ServerConfig,
 shared clock and public client/server sessions are implemented. The mail
-record pump composes them; admitted transport integration and
-service/resource qualification remain pending.
+record pump composes them, and td-mta's listeners and relay serve through
+it; their qualification remains open (IMPLEMENTATION.md, M07).
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
@@ -130,8 +130,8 @@ cryptography td-primitives through td-tls-provider, and no other crate
 does. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
 mail-format digest fixtures. M07a3 adds worker-local entropy initialization;
 M07a4 implements the Crypto factory and opaque P-256 operations.
-TLS sessions and bounded mail record progress are implemented; admitted
-service integration and resource qualification remain pending.
+TLS sessions and bounded mail record progress are implemented and serve;
+qualification remains open (IMPLEMENTATION.md, M07).
 Direct streaming digests use td-owned inline SHA-256 without heap allocation
 or provider calls.
 No Rustls, td-tls-provider or td-primitives public types, re-exports or
@@ -1865,7 +1865,8 @@ connection and releases native state and handshake capacity on the
 worker; there is no plaintext fallback. Borrowed wire buffers are
 released and owned buffers are freed on refusal. A local real-TLS
 fixture exercises post-handshake EHLO reset and encrypted commands;
-the fixed receiving workers and `serve --smtp-only` now activate that path.
+the fixed receiving workers and `serve` with a receive role activate
+that path.
 
 Implement a bounded SMTP state machine with EHLO/HELO, MAIL, RCPT, DATA, RSET,
 NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise

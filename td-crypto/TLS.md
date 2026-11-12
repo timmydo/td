@@ -11,10 +11,10 @@ Admitted identities retain a private TLS signer sharing the same owned
 key and retirement state. The private algorithm provider implements the
 fixed suite/group/signature lists below; configurations apply their
 fixed policies and immutable name routing. DESIGN.md records implemented
-acceptance and output contracts. The existing private TLS fixtures
-qualify selected backend behavior only. Implementations must satisfy
-this contract and the resource/failure qualification in DESIGN.md before
-td-mta enables a listener or an outgoing connection through them.
+acceptance and output contracts. td-mta's listeners and outgoing
+connections use them (td-mta/IMPLEMENTATION.md, M07 "Status"). The
+resource/failure qualification in DESIGN.md and rows 1 and 5 below, which
+were to precede that use, remain open.
 
 All public types are td-owned and expose only std or td-crypto types.
 Backend configuration, certificate, verifier, error and connection objects
@@ -517,6 +517,9 @@ records; the adapter also closes the socket. Close/abort are idempotent.
 5. Measure Rust allocations, stack and whole-process RSS for complete
    generations, all admitted sessions and worker warm-up. Qualify
    normal and refused peers on the isolated musl artifact, then enable service.
+
+td-mta enabled service after row 4 with rows 1 and 5 incomplete; their
+qualification remains open (td-mta/IMPLEMENTATION.md, M07 "Status").
 
 No row authorizes new dependencies or unsafe surfaces. Every implementation
 increment receives the normal review and ready workflow. Tests contact only

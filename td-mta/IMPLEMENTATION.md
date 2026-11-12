@@ -1916,34 +1916,62 @@ opaque APIs; td-mta's transport, policy-generation and resource integration.
 
 **Partial implementation:** M07a1 supplies opaque, fallible streaming SHA-256
 inside td-crypto, with terminal failure state. Its direct operation now uses
-the owned fixed-state SHA-256 primitive brought forward from F04, without
-heap allocation or provider calls. Known-answer, differential and failure tests
-run in the portable harness. This leaves the remaining native operations
-unchanged. M07a2
-compares the real facade with existing mail-format container, cross-file,
-blob and import snapshot digest fixtures on the host and portable artifact.
-This is hash-coverage qualification, not a production container verifier.
-M07a3 adds a worker-local entropy handle with nonempty cold initialization,
-fixed returned-error handling and explicit native-abort limits. M07a4 supplies
-the concrete Crypto factory, fixed-size provider comparison and opaque P-256
-key generation/loading/signing, with bounded PKCS#8 admission and independent
-test-only ES256 verification. M07a5 qualifies mandatory client certificates
-on local TLS 1.2/1.3 peers, including exact refusal cases and full handshakes
+the owned fixed-state SHA-256 primitive brought forward from F04, without heap
+allocation or provider calls. Known-answer, differential and failure tests run
+in the portable harness; F04 later moved every other direct operation to
+td-primitives. M07a2 compares the real facade with existing mail-format
+container, cross-file, blob and import snapshot digest fixtures on the host
+and portable artifact. This is hash-coverage qualification, not a production
+container verifier. M07a3 adds a worker-local entropy handle with nonempty
+cold initialization and fixed returned-error handling; since F04 each nonempty
+fill reads `/dev/random` (td-crypto/DESIGN.md). M07a4 supplies the concrete
+Crypto factory, fixed-size provider comparison and opaque P-256 key
+generation/loading/signing, with bounded PKCS#8 admission and independent
+test-only ES256 verification. M07a5 qualifies mandatory client certificates on
+local TLS 1.2/1.3 peers, including exact refusal cases and full handshakes
 with resumption disabled. Opaque TLS sessions and bounded mail record progress
-are now implemented. Gateway authorization, native allocation and service
-resource qualification remain pending; these fixtures do not complete M07
-or enable service.
+are implemented.
+
+**Status:** the facade and its mail adapters are implemented and serve.
+`td-mta serve` (CONFIG.md, "Foreground PostgreSQL service") runs direct
+SMTP receiving with STARTTLS (M11), HTTPS (M13c) and relay over verified
+implicit TLS or required STARTTLS (M17) through them, and takes
+ACME-managed certificates by drain and reload (M18, ACME.md). Since F04
+td-crypto's backend is td-primitives and td-tls-provider, and its heap
+goes through Rust's allocator, which the Rust probe counts; no
+libc-boundary allocator diagnostic remains. td-crypto/DESIGN.md,
+td-crypto/TLS.md and M07e set every item below but the first as a
+condition of service admission; service was enabled first, and they
+remain open. What remains of M07:
+
+- gateway authorization reaches no runtime. Verified pin and peer-address
+  evidence and `check_gateway_policy` exist, but `serve` refuses gateway
+  listeners and receiving refuses a session carrying gateway evidence;
+  M12 owns that listener;
+- selected-key lock contention measured across handshake and established
+  workers, with the shared clock callback, and qualified startup ordering
+  and supervision around the blocking entropy read (td-crypto/DESIGN.md);
+- M07e's accounting of retained peer state, decoded-message expansion and
+  separate header/body polling, and the concurrent-session and
+  simultaneous-traffic admission M07e4d and M07e4e leave pending;
+- handshake, certificate and backend allocation qualification, which
+  td-crypto/DESIGN.md keeps separate, and TLS.md's row 5 measurement of
+  complete generations, all admitted sessions and worker warm-up.
+
+The sub-items below record each increment as it landed: a sentence saying
+one enables no service, or leaves later work pending, describes that
+increment, and the later sub-items and milestones say what followed.
 
 The TLS contract is specified in td-crypto/TLS.md, including explicit
 algorithm sets, local P-256 PEM identity admission, trust/SNI/time policy,
 bounded record progress and failure/close behavior. Material admission and
 immutable client/server configurations and socket-free client/server progress
-are implemented. M07d2 composes record progress; admitted mail adapters and
-complete resource qualification remain pending. Direct Crypto/Entropy
-operations are implemented inside td-crypto. Rustls provider/configuration/verifier/key types never leave
-that crate. Implement the conformance, explicit-provider confinement, algorithm
-baseline, key compatibility and native allocation/failure qualification in
-`td-crypto/DESIGN.md`, retaining its independent fixtures for F04.
+are implemented. M07d composes record progress into the admitted mail adapters
+the Status paragraph names. Direct Crypto/Entropy operations are implemented
+inside td-crypto. Rustls provider/configuration/verifier/key types never leave
+that crate. Implement the conformance, explicit-provider confinement,
+algorithm baseline, key compatibility and allocation/failure qualification in
+`td-crypto/DESIGN.md`, whose independent fixtures F04 retained.
 
 The mail adapters implement a staged factory and TlsTransport through that
 facade. They own implicit-TLS and STARTTLS handoff, socket/deadline
@@ -1965,8 +1993,10 @@ Implement the remaining work as independently reviewable increments:
 - **M07b2 — identity admission:** local key/leaf agreement, chain consistency,
   dates, SAN coverage and usage checks; explicit private/public trust handling.
   Use local generated fixtures for wrong keys, missing names, stale clocks,
-  expired/misordered/unsupported chains and trust replacement. Keep service
-  loading disabled until full generation allocation qualification.
+  expired/misordered/unsupported chains and trust replacement. Service
+  loading was to wait for generation allocation qualification; M07e4's
+  generation observations and planning ledger preceded serving, and do not
+  prove the allowance (M07e4f, M07e4j).
   - **M07b2a — local identity:** implemented owned ServerIdentity admission,
     P-256 key/leaf agreement, bounded certificate metadata, supplied-chain
     signatures/constraints, validity and SAN/usage checks. Includes fixed TLS
@@ -2097,9 +2127,9 @@ Implement the remaining work as independently reviewable increments:
             no server policy can be resolved. Both modes share one two-slot
             generation domain. Local fixtures cover absent/expired identities,
             strict client trust refusal and an old outbound session completing
-            across publication of a complete table. M18/M19 must still integrate
-            issuance, health gates, expiry and atomic runtime publication before
-            service; constructors alone never issue certificates.
+            across publication of a complete table. Constructors alone never
+            issue certificates; M18's ACME worker issues and renews them, and
+            serving instances take a new one by drain and reload (ACME.md).
           - **Socket handoff:** implemented consuming TCP handoff with fixed
             deadlines, plaintext-tail refusal and exact buffer recovery. The
             bounded pump retains generation/count owners, publishes role-checked
@@ -2112,7 +2142,7 @@ Implement the remaining work as independently reviewable increments:
             retention, clock failure and missing-client-certificate denial.
             Private process-peer fixtures now qualify positive gateway mTLS
             under TLS 1.2/1.3 with current/next pins, wrong verified leaf pins
-            and actual peer CIDR refusal. Exact STARTTLS transitions remain
+            and actual peer CIDR refusal. Exact STARTTLS transitions follow in
             M07d3c.
     - **M07d3c — protocol integration:** complete STARTTLS flush/tail handling,
       parser/EHLO/auth reset and local HTTPS/SMTP transitions. Gateway mTLS
@@ -2124,17 +2154,18 @@ Implement the remaining work as independently reviewable increments:
         EHLO extension syntax excludes the initial greeting. Boundary, malformed,
         fragmented, aggregate-cap and tail fixtures run on host and musl.
         The parser does not own sockets, deadlines or command state. STARTTLS
-        inbound reply ownership is described next; complete reset/dispatch and
-        outbound protocol drivers remain pending.
+        inbound reply ownership is described next; M11's receiving driver
+        and M17's relay connection supply reset, dispatch and the outbound
+        driver.
       - **Inbound reply ownership:** implemented ServerStartTls consuming the
         prepared session and socket before 220. Validate the framed bare command,
         tail, receiving role and deadlines. One bounded operation per advance
         writes/drains the complete reply before TLS handoff; refusal/cancellation
         recover both wire reservations and release native/generation/count owners.
         Direct local and private gateway process fixtures qualify the boundary,
-        including TLS 1.2/1.3 pin acceptance/refusal. Full command sequencing,
-        SMTP state reset and actual-current fencing remain protocol integration
-        work.
+        including TLS 1.2/1.3 pin acceptance/refusal. M11 sequences commands
+        and resets SMTP after the handshake; actual-current gateway fencing
+        waits for M12's listener.
       - **Outbound reply ownership:** implemented EhloReader/StartTlsOffer and
         ClientStartTls for required-STARTTLS relay policies. Consume the complete
         advertisement and prepared session, write/flush STARTTLS, then require
@@ -2142,8 +2173,9 @@ Implement the remaining work as independently reviewable increments:
         Two borrowed 512-byte reservations retain fragmented input and reply
         state; refusal/cancellation return native wire buffers and permits.
         Local fixtures cover both owners through verified TLS, malformed/tailed
-        replies and admission cleanup. Full greeting/EHLO/AUTH dispatch and
-        post-TLS state reset remain M17; M07e owns whole-session accounting.
+        replies and admission cleanup. M17's relay connection supplies
+        greeting, EHLO and AUTH dispatch and the fresh EHLO after TLS; M07e
+        owns whole-session accounting.
 - **M07e — component resource evidence:** measure representative generation
   overlap, session/handshake lifecycles and worker entropy on the portable
   artifact. Investigate concrete retained growth or unsafe stack use; never
@@ -2167,8 +2199,8 @@ Implement the remaining work as independently reviewable increments:
     storage or pointer access. Collision, saturation, resize ownership and
     concurrent tests exercise the table; snapshots are coherent through its
     shared guard. Deletion closes probe-chain gaps without accumulating
-    tombstones; model traces cover wrapped and full tables. Libc interception
-    remains pending.
+    tombstones; model traces cover wrapped and full tables. M07e2c added the
+    libc interception, and F04 retired both.
   - **M07e2c — native allocator diagnostic foundation:** a separate musl
     executable wraps six libc entry points only at its final link. Positive
     controls, recursion suppression and symbol confinement precede any TLS
@@ -2420,11 +2452,13 @@ retains one static configuration and checks Inbox and exact TLS bindings
 before readiness. Offline `store init` now creates a new store whose
 schema transaction also commits one account and its canonical Inbox, the
 store the runtime's startup Inbox check requires; process fixtures verify
-and reopen it. `serve --smtp-only` now activates this path with protected
-configuration, initialized storage and a separate ingress child. Its process
-fixture verifies accepted-mail survival after killing another DATA transfer.
+and reopen it. `serve --smtp-only` activated this path with protected
+configuration, initialized storage and a separate ingress child; its
+process fixture verified accepted-mail survival after killing another
+DATA transfer, and it enabled no HTTPS or gateway serving. `serve` with a
+receive role (CONFIG.md, "Foreground PostgreSQL service") replaced it.
 Graceful operational control and the complete release fault matrix remain
-separate; HTTPS and gateway serving are not enabled by this profile.
+separate.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,
