@@ -11,6 +11,9 @@ description = "Bounded WHATWG legacy text decoding and charset sniffing"
 [package.metadata.td-gate]
 clippy-all-targets = true
 
+[dependencies]
+td-alloc = { path = "../td-alloc" }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

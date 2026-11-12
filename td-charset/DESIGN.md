@@ -46,7 +46,8 @@ gap. Shift_JIS includes halfwidth Katakana, U+0080 and the EUDC private range;
 EUC-KR includes the Windows extensions in the WHATWG index.
 
 `decode` is a convenience whole-input wrapper with a caller-chosen maximum
-UTF-8 output length. It uses fallible allocation and returns OutputLimit for
+UTF-8 output length. It grows through td-alloc's fallible reservation
+(`td-alloc/DESIGN.md`), its one dependency, and returns OutputLimit for
 length, arithmetic or allocation refusal, publishing no partial string.
 The limit bounds string length, not allocator capacity or RSS; callers with
 strict resident-memory budgets use the allocation-free streaming API.
@@ -86,8 +87,10 @@ opt into HTML scanning merely because it contains a tag-like string.
 
 This library is independently consumable by td-web, td-mail and td-news.
 It currently changes no consumer and enters no distribution recipe.
-Adoption must stage this crate in the consumer's recipe and respect that
-consumer's deadlines, work budgets and charset policy. In particular
+Adoption must stage this crate and td-alloc in the consumer's recipe, as
+the one td-alloc instance the consumer already shares (`td-alloc/DESIGN.md`)
+so that one reservation scope covers both, and respect that consumer's
+deadlines, work budgets and charset policy. In particular
 `td-mime`'s strict ASCII/Latin-1 semantics and admitted labels cannot be
 replaced by WHATWG aliases without an explicit policy change.
 The existing `td-encoding` crate continues to own hex/base64 byte encodings.

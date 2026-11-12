@@ -64,11 +64,12 @@ bypasses these helpers.
 
 ## Adoption and enforcement
 
-Picture decoding, raw DEFLATE decoding and picture fitting use the shared
-reservation path. Their codecs retain input/output/work bounds. The raw
-inflater's legacy String-returning wrappers and image encoders are outside
-the allocation-free error guarantee. General UI, fetch, navigation and
-other existing subsystem allocations remain migration debt.
+Picture decoding, raw DEFLATE decoding, picture fitting and td-charset's
+whole-input `decode` use the shared reservation path. Their codecs retain
+input/output/work bounds. The raw inflater's legacy String-returning
+wrappers and image encoders are outside the allocation-free error
+guarantee. General UI, fetch, navigation and other existing subsystem
+allocations remain migration debt.
 
 The repository allocation guard is a source-level ratchet over production
 Rust. It excludes recognized test-only code and literals/comments, scans

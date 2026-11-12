@@ -1357,6 +1357,14 @@ td-busd/src/transport.rs	heap-owner	3
 td-busd/src/transport.rs	unchecked-growth-or-clone	27
 td-busd/src/wire.rs	allocation-macro	13
 td-busd/src/wire.rs	unchecked-growth-or-clone	34
+td-charset/src/lib.rs	unchecked-growth-or-clone	1
+td-charset/src/tests.rs	allocating-conversion	4
+td-charset/src/tests.rs	allocation-macro	1
+td-charset/src/tests.rs	unchecked-growth-or-clone	7
+td-charset/tools/generate.rs	allocating-conversion	4
+td-charset/tools/generate.rs	allocation-macro	2
+td-charset/tools/generate.rs	heap-owner	1
+td-charset/tools/generate.rs	unchecked-growth-or-clone	8
 td-civil/src/lib.rs	allocating-constructor	1
 td-civil/src/lib.rs	allocating-conversion	3
 td-civil/src/lib.rs	allocation-macro	6

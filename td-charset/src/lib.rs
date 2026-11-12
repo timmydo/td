@@ -81,10 +81,7 @@ fn append(out: &mut Text, decoded: Decoded, limit: usize) -> Result<(), OutputLi
         if length > limit {
             return Err(OutputLimit);
         }
-        out.text
-            .try_reserve(ch.len_utf8())
-            .map_err(|_| OutputLimit)?;
-        out.text.push(ch);
+        td_alloc::push_str(&mut out.text, ch.encode_utf8(&mut [0; 4])).map_err(|_| OutputLimit)?;
     }
     out.had_errors |= decoded.had_errors;
     Ok(())

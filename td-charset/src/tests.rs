@@ -380,3 +380,48 @@ fn every_two_byte_input_is_bounded_and_finishes() {
         }
     }
 }
+
+/// td-alloc's reservation seam: with too few admissions `decode` refuses
+/// with OutputLimit and returns nothing; with enough it returns the whole
+/// text; and a later unrestricted call is unaffected. Every third byte is
+/// 0x80, the Euro sign, so appends are one and three UTF-8 bytes.
+#[test]
+fn decode_refuses_when_reservation_is_refused() {
+    let bytes: Vec<u8> = (0..300u32)
+        .map(|i| {
+            if i % 3 == 0 {
+                0x80
+            } else {
+                b'a' + (i % 26) as u8
+            }
+        })
+        .collect();
+    let limit = bytes.len() * 3;
+    let expected = decode(Encoding::Windows1252, &bytes, limit).unwrap();
+    assert_eq!(
+        expected.text.chars().filter(|&c| c == '\u{20ac}').count(),
+        100
+    );
+    assert_eq!(expected.text.len(), 500);
+    let mut refused = 0;
+    let mut admitted = None;
+    for admissions in 0..64 {
+        let outcome = td_alloc::with_reservation_limit(admissions, || {
+            decode(Encoding::Windows1252, &bytes, limit)
+        });
+        match outcome {
+            Err(OutputLimit) => refused += 1,
+            Ok(text) => {
+                assert_eq!(text, expected);
+                admitted = Some(admissions);
+                break;
+            }
+        }
+    }
+    assert!(refused > 0);
+    assert!(admitted.is_some());
+    assert_eq!(
+        decode(Encoding::Windows1252, &bytes, limit).unwrap(),
+        expected
+    );
+}
