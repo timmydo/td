@@ -4366,9 +4366,9 @@ td-vm/src/vm_provision.rs	unchecked-growth-or-clone	1
 td-vm/src/vm_workspace.rs	allocating-conversion	4
 td-vm/src/vm_workspace.rs	allocation-macro	6
 td-vm/src/vm_workspace.rs	unchecked-growth-or-clone	9
-td-web/src/app.rs	allocating-conversion	6
+td-web/src/app.rs	allocating-conversion	7
 td-web/src/app.rs	allocation-macro	19
-td-web/src/app.rs	heap-owner	3
+td-web/src/app.rs	heap-owner	4
 td-web/src/app.rs	unchecked-growth-or-clone	19
 td-web/src/document.rs	allocating-constructor	7
 td-web/src/document.rs	allocating-conversion	11

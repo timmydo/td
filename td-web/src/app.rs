@@ -4,11 +4,15 @@
 //! to be decoded, a page rendered into logical lines, and waits for it,
 //! its document taken when the window next polls. Wrapping those lines
 //! at the page's width in pixels, the ones near those shown, is the
-//! window's.
+//! window's. A save into Downloads runs on a worker's thread too.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::fmt;
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use td_ui::chrome::{Status, TextEntry, ROW};
@@ -23,6 +27,7 @@ use td_url::{Reference, Url};
 
 use crate::document::{self, Document, Place, Rendered, Renderer};
 use crate::fetch::{self, Fetcher};
+use crate::save;
 use crate::view::{self, Pane, Selection, View};
 
 /// The longest address the row holds, in characters.
@@ -32,7 +37,7 @@ const MAX_QUERY: usize = 256;
 /// The most pages kept behind or ahead.
 pub const MAX_HISTORY: usize = 100;
 /// The most fetches running at once, stopped ones included: a stopped
-/// fetch runs on until the service answers or times out.
+/// fetch runs on until the service answers or times out. A save is one.
 pub const MAX_WORKERS: usize = 4;
 /// How long a turn waits while a fetch is out, and otherwise.
 const LOADING_WAIT_MS: u64 = 50;
@@ -86,6 +91,22 @@ enum Motion {
 
 /// A navigation's answer: the document and the fragment it names.
 type Arrival = (Document, Option<String>);
+
+/// Where a save is (`Saving::state`): fetching its body, which `Escape`
+/// and closing the window drop it in; writing its file, which `Escape`
+/// leaves to finish and closing waits for; or stopped before it wrote,
+/// which its worker then ends at.
+const FETCHING: u8 = 0;
+const WRITING: u8 = 1;
+const STOPPED: u8 = 2;
+
+/// A save out on its worker's thread.
+struct Saving {
+    /// What the status row says once it has run.
+    answer: Receiver<Option<String>>,
+    state: Arc<AtomicU8>,
+    thread: JoinHandle<()>,
+}
 
 /// A fetch out on its thread. Dropping it, as stopping, overtaking or
 /// taking its answer does, tells its worker to skip any rendering or
@@ -235,6 +256,10 @@ pub struct App {
     loading: Option<Loading>,
     /// What the last input made happen, said until the next input.
     message: Option<String>,
+    /// A save out on its worker's thread.
+    saving: Option<Saving>,
+    /// The home whose Downloads a save goes to (`save::downloads`).
+    home: Option<PathBuf>,
     pointer: Option<(i64, i64)>,
     hover: Option<usize>,
     title: String,
@@ -277,18 +302,109 @@ fn arrive(
     stopped: &Arc<AtomicBool>,
 ) -> Option<Arrival> {
     match fetch::navigate(fetcher, url.clone()) {
-        Ok(loaded) => {
+        Ok(mut loaded) => {
             let content_type = loaded.reply.header("content-type").map(str::to_string);
-            let doc = renderer.document(
+            // Moved out, not copied: it names a saved file.
+            let disposition = loaded
+                .reply
+                .headers
+                .iter()
+                .position(|(name, _)| name == "content-disposition")
+                .map(|at| loaded.reply.headers.swap_remove(at).1);
+            let mut doc = renderer.document(
                 loaded.url,
                 loaded.reply.status,
                 content_type.as_deref(),
                 loaded.reply.body,
                 stopped,
             )?;
+            doc.disposition = disposition;
             Some((doc, loaded.fragment.or(fragment)))
         }
         Err(why) => Some((Document::error(Some(url), &why), fragment)),
+    }
+}
+
+/// A status row's text, none without memory for it.
+fn said(text: fmt::Arguments<'_>) -> Option<String> {
+    td_alloc::format(text).ok()
+}
+
+/// `url` as the status row names what a save took: without its scheme,
+/// at most `MAX_SAVED_URL` characters.
+fn short(url: &Url) -> Option<String> {
+    let text = url.text();
+    let bare = text
+        .strip_prefix("https://")
+        .or_else(|| text.strip_prefix("http://"))
+        .unwrap_or(&text);
+    match bare.char_indices().nth(MAX_SAVED_URL) {
+        Some((cut, _)) => said(format_args!("{}…", bare.get(..cut).unwrap_or(bare))),
+        None => said(format_args!("{bare}")),
+    }
+}
+
+/// The most characters of a URL the status row names a save by.
+const MAX_SAVED_URL: usize = 60;
+
+/// Saves into `directory` the body `held` of a reply td-web does not
+/// show, with its `content-disposition`, else `url` fetched again as a
+/// reload fetches it; what the status row says once it has run, none
+/// once `state` says it was stopped before it began to write.
+fn saved(
+    fetcher: &dyn Fetcher,
+    directory: &File,
+    url: Url,
+    held: Option<(Vec<u8>, Option<String>)>,
+    state: &AtomicU8,
+) -> Option<String> {
+    let (name, body, from) = match held {
+        Some((body, disposition)) => (save::name(disposition.as_deref(), &url), body, url),
+        None => match fetch::navigate(fetcher, url) {
+            Ok(loaded) if (200..300).contains(&loaded.reply.status) => (
+                save::name(loaded.reply.header("content-disposition"), &loaded.url),
+                loaded.reply.body,
+                loaded.url,
+            ),
+            Ok(loaded) => {
+                return said(format_args!(
+                    "not saved: the server answered {}",
+                    loaded.reply.status
+                ))
+            }
+            Err(why) => return said(format_args!("not saved: {why}")),
+        },
+    };
+    // Stopped while it fetched: nothing is written. From here on the
+    // window waits for the write rather than dropping it.
+    if state
+        .compare_exchange(FETCHING, WRITING, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+        && state.load(Ordering::SeqCst) != WRITING
+    {
+        return None;
+    }
+    let Ok(name) = name else {
+        return said(format_args!("{}", save::Refusal::Memory));
+    };
+    let from = short(&from).unwrap_or_default();
+    match save::store(directory, &name, &body) {
+        Ok(save::Stored {
+            name,
+            unsynced: None,
+        }) => said(format_args!(
+            "saved {} bytes of {from} in Downloads as {name}",
+            body.len()
+        )),
+        Ok(save::Stored {
+            name,
+            unsynced: Some(why),
+        }) => said(format_args!(
+            "saved {} bytes of {from} in Downloads as {name}, but Downloads could not be \
+             synced: {why}",
+            body.len()
+        )),
+        Err(why) => said(format_args!("{why}")),
     }
 }
 
@@ -323,6 +439,8 @@ impl App {
             forward: Vec::new(),
             loading: None,
             message: None,
+            saving: None,
+            home: None,
             pointer: None,
             hover: None,
             title: "td-web".into(),
@@ -576,13 +694,134 @@ impl App {
         }
     }
 
+    /// Stops the navigation in flight, else a save still fetching, which
+    /// writes nothing; a save already writing its file is left to finish.
+    /// Whether one was stopped.
     fn stop(&mut self) -> bool {
-        let stopped = self.loading.take().is_some();
-        if stopped {
+        if self.loading.take().is_some() {
             self.message = Some("stopped".into());
             self.show_address();
+            return true;
+        }
+        // A save that has answered says what became of it, a failure
+        // included, rather than being called stopped.
+        self.settle_save();
+        let Some(saving) = &self.saving else {
+            return false;
+        };
+        let stopped = saving
+            .state
+            .compare_exchange(FETCHING, STOPPED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if stopped {
+            // Its worker keeps its slot until its fetch returns.
+            self.saving = None;
+            self.message = said(format_args!("save stopped: nothing was written"));
         }
         stopped
+    }
+
+    /// What closing the window waits for: a save writing its file is
+    /// waited for, its write and syncs unbounded in time; one still
+    /// fetching is dropped and writes nothing.
+    fn finish_saving(&mut self) {
+        let Some(saving) = self.saving.take() else {
+            return;
+        };
+        let dropped = saving
+            .state
+            .compare_exchange(FETCHING, STOPPED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if !dropped {
+            let _ = saving.thread.join();
+        }
+    }
+
+    /// Saves the document shown into Downloads (DESIGN.md §5, "Saving")
+    /// on a worker's thread, once Downloads is found writable: the body
+    /// kept of a reply td-web does not show, else the document fetched
+    /// again, as a reload fetches it.
+    fn save(&mut self) {
+        if self.saving.is_some() {
+            self.message = said(format_args!("a save is under way"));
+            return;
+        }
+        let doc = &self.current.doc;
+        if doc.url.is_none() {
+            self.message = said(format_args!("nothing to save: this page is td-web's own"));
+            return;
+        }
+        if doc.status == 0 {
+            self.message = said(format_args!("not saved: the page could not be fetched"));
+            return;
+        }
+        if !(200..300).contains(&doc.status) {
+            self.message = said(format_args!(
+                "not saved: the server answered {}",
+                doc.status
+            ));
+            return;
+        }
+        if self.workers.load(Ordering::SeqCst) >= MAX_WORKERS {
+            self.message = said(format_args!(
+                "earlier pages are still loading; try again shortly"
+            ));
+            return;
+        }
+        let directory = match save::downloads(self.home.as_deref()) {
+            Ok(directory) => directory,
+            Err(why) => {
+                self.message = said(format_args!("{why}"));
+                return;
+            }
+        };
+        let Some(Entry { url, .. }) = self.entry() else {
+            return;
+        };
+        // A kept body is given up here: a save that then fails, or never
+        // starts, leaves the next one to fetch it again.
+        let doc = &mut self.current.doc;
+        let held = doc.take_held().map(|body| (body, doc.disposition.take()));
+        // A kept body has nothing to fetch: it is writing from the start.
+        let begun = if held.is_some() { WRITING } else { FETCHING };
+        let state = Arc::new(AtomicU8::new(begun));
+        let told = Arc::clone(&state);
+        let (send, answer) = mpsc::channel();
+        let fetcher = Arc::clone(&self.fetcher);
+        self.workers.fetch_add(1, Ordering::SeqCst);
+        let worker = Worker(Arc::clone(&self.workers));
+        let spawned = std::thread::Builder::new()
+            .name("td-web save".into())
+            .spawn(move || {
+                let _worker = worker;
+                let _ = send.send(saved(fetcher.as_ref(), &directory, url, held, &told));
+            });
+        match spawned {
+            Ok(thread) => {
+                self.saving = Some(Saving {
+                    answer,
+                    state,
+                    thread,
+                })
+            }
+            Err(why) => self.message = said(format_args!("not saved: {why}")),
+        }
+    }
+
+    /// Takes a finished save's answer into the status row.
+    fn settle_save(&mut self) {
+        let Some(saving) = &self.saving else {
+            return;
+        };
+        let answered = match saving.answer.try_recv() {
+            Ok(answered) => answered,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                said(format_args!("not saved: the save ended without an answer"))
+            }
+        };
+        self.saving = None;
+        self.message = answered;
     }
 
     /// The address row says where the page is, or where it is going.
@@ -867,6 +1106,7 @@ impl App {
             }
             "C-f" => return self.open_find(),
             "C-c" => return self.copy(clipboard),
+            "C-s" => return self.save(),
             "F8" => return self.toggle_body(),
             _ => {}
         }
@@ -1128,6 +1368,9 @@ impl App {
         if let Some(loading) = &self.loading {
             return format!("loading {}", loading.url.text());
         }
+        if self.saving.is_some() {
+            return said(format_args!("saving in Downloads")).unwrap_or_default();
+        }
         let link = self.hover.or(self.current.view.focus);
         if let Some(shown) = link.and_then(|link| self.current.rendered.page.shown(link)) {
             return shown;
@@ -1195,7 +1438,7 @@ const PAGE_KEYS: &[(&str, &str)] = &[
     ("Ctrl+A", "select the page"),
     (
         "Escape",
-        "stop loading, else clear focus, find and selection",
+        "stop loading or a save fetching, else clear focus, find and selection",
     ),
 ];
 const BROWSER_KEYS: &[(&str, &str)] = &[
@@ -1206,6 +1449,7 @@ const BROWSER_KEYS: &[(&str, &str)] = &[
         "Ctrl+C",
         "copy the selection, else the link's or page's address",
     ),
+    ("Ctrl+S", "save the document in Downloads"),
     ("F8", "body text in Sans or Serif"),
     ("Ctrl+Q, Ctrl+W", "close"),
 ];
@@ -1268,6 +1512,10 @@ impl Handler for App {
             self.settle();
             self.redraw = true;
         }
+        if self.saving.is_some() {
+            self.settle_save();
+            self.redraw = true;
+        }
         self.drag_scroll(now);
         self.flow()
     }
@@ -1275,7 +1523,7 @@ impl Handler for App {
     fn wait_ms(&self, _now: u64) -> u64 {
         if self.drag_past().is_some() {
             DRAG_SCROLL_MS
-        } else if self.loading.is_some() {
+        } else if self.loading.is_some() || self.saving.is_some() {
             LOADING_WAIT_MS
         } else {
             IDLE_WAIT_MS
@@ -1400,11 +1648,15 @@ pub fn run(start: Option<String>) -> Result<(), String> {
     let typeface = td_ui::pinned_face::load_or_note("td-web", setting.as_deref());
     let prose = td_ui::pinned_face::prose_or_note("td-web", setting.as_deref(), typeface.as_ref());
     let mut app = App::new(Arc::new(fetch::Service), surface, prose.clone())?;
+    app.home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(start) = start {
         app.open(&start);
     }
-    td_ui::window::run_with_prose(&mut app, stream, std::env::temp_dir(), typeface, prose)
-        .map_err(|why| why.to_string())
+    let ran =
+        td_ui::window::run_with_prose(&mut app, stream, std::env::temp_dir(), typeface, prose)
+            .map_err(|why| why.to_string());
+    app.finish_saving();
+    ran
 }
 
 #[cfg(test)]
@@ -1434,6 +1686,7 @@ mod tests {
     use crate::document::Wrapped;
     use crate::fetch::tests::Table;
     use crate::fetch::Reply;
+    use std::path::Path;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -1711,6 +1964,327 @@ mod tests {
             "https://example.org/a",
             "said until the next input"
         );
+    }
+
+    /// Waits for the save out to answer; what the status row then says.
+    fn save_done(app: &mut App) -> String {
+        for _ in 0..1000 {
+            app.poll(0);
+            if app.saving.is_none() {
+                return app.status_text();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the save did not answer");
+    }
+
+    fn downloads_site() -> Table {
+        Table::default()
+            .reply(
+                "https://example.org/report",
+                200,
+                &[
+                    ("content-type", "application/pdf"),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"Q3 report.pdf\"",
+                    ),
+                ],
+                b"%PDF-1.7 body",
+            )
+            .page("https://example.org/notes.txt", "text/plain", "some notes")
+            .reply(
+                "https://example.org/gone",
+                404,
+                &[("content-type", "application/zip")],
+                b"PK",
+            )
+    }
+
+    /// A home with an empty Downloads, as a host run's or a granted view.
+    fn home() -> td_fs::TempDir {
+        let temp = td_fs::TempDir::new("td-web-app-save").unwrap();
+        std::fs::create_dir(temp.join("Downloads")).unwrap();
+        temp
+    }
+
+    #[test]
+    fn ctrl_s_saves_a_reply_not_shown_as_it_came_then_fetches_it_again() {
+        let temp = home();
+        let table = Arc::new(downloads_site());
+        let mut app = app_over(table.clone());
+        app.home = Some(temp.to_path_buf());
+        typed(&mut app, "example.org/report");
+        key(&mut app, "C-s");
+        assert_eq!(app.status_text(), "saving in Downloads");
+        assert_eq!(
+            save_done(&mut app),
+            "saved 13 bytes of example.org/report in Downloads as Q3 report.pdf"
+        );
+        let saved = temp.join("Downloads/Q3 report.pdf");
+        assert_eq!(std::fs::read(saved).unwrap(), b"%PDF-1.7 body");
+        assert_eq!(table.reach().len(), 1, "the body kept, not fetched again");
+        // Given up once: the next save fetches it again, as a reload
+        // would, and takes the next free name.
+        key(&mut app, "C-s");
+        assert_eq!(
+            save_done(&mut app),
+            "saved 13 bytes of example.org/report in Downloads as Q3 report (2).pdf"
+        );
+        assert_eq!(
+            table.reach(),
+            [
+                ("https://example.org/report".to_string(), false),
+                ("https://example.org/report".to_string(), false)
+            ]
+        );
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_saves_a_page_shown_as_its_server_sends_it_again() {
+        let temp = home();
+        let table = Arc::new(downloads_site());
+        let mut app = app_over(table.clone());
+        app.home = Some(temp.to_path_buf());
+        typed(&mut app, "example.org/notes.txt");
+        key(&mut app, "C-s");
+        assert_eq!(
+            save_done(&mut app),
+            "saved 10 bytes of example.org/notes.txt in Downloads as notes.txt"
+        );
+        let saved = temp.join("Downloads/notes.txt");
+        assert_eq!(std::fs::read(saved).unwrap(), b"some notes");
+        assert_eq!(table.reach().len(), 2);
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
+    fn nothing_is_saved_without_a_document_success_or_a_grant() {
+        let temp = home();
+        let table = Arc::new(downloads_site());
+        let mut app = app_over(table.clone());
+        app.home = Some(temp.to_path_buf());
+        key(&mut app, "C-s");
+        assert!(app.saving.is_none());
+        assert!(
+            app.status_text().starts_with("nothing to save"),
+            "{}",
+            app.status_text()
+        );
+        typed(&mut app, "example.org/gone");
+        key(&mut app, "C-s");
+        assert_eq!(app.status_text(), "not saved: the server answered 404");
+        // In td-jail's home, Downloads is the human's only as a mounted
+        // grant view, which this host has none of: nothing is fetched or
+        // written, the body is kept, and the status row says how to grant.
+        typed(&mut app, "example.org/report");
+        app.home = Some(PathBuf::from(save::JAIL_HOME));
+        if !Path::new("/home/td/Downloads").exists() {
+            key(&mut app, "C-s");
+            assert!(app.saving.is_none());
+            let said = app.status_text();
+            assert!(said.contains(save::GRANT), "{said}");
+        }
+        app.home = None;
+        key(&mut app, "C-s");
+        assert_eq!(
+            app.status_text(),
+            "not saved: HOME is not set to an absolute path"
+        );
+        app.home = Some(temp.to_path_buf());
+        key(&mut app, "C-s");
+        save_done(&mut app);
+        assert_eq!(table.reach().len(), 2, "the two navigations alone");
+        let names: Vec<_> = std::fs::read_dir(temp.join("Downloads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["Q3 report.pdf"]);
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
+    fn one_save_at_a_time_and_the_status_row_says_so() {
+        let temp = home();
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: downloads_site(),
+            release: Mutex::new(held),
+        }));
+        app.home = Some(temp.to_path_buf());
+        type_address(&mut app, "example.org/notes.txt");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-s");
+        app.poll(0);
+        assert_eq!(app.status_text(), "saving in Downloads");
+        assert_eq!(app.wait_ms(0), LOADING_WAIT_MS);
+        key(&mut app, "C-s");
+        assert_eq!(app.status_text(), "a save is under way");
+        release.send(()).unwrap();
+        assert_eq!(
+            save_done(&mut app),
+            "saved 10 bytes of example.org/notes.txt in Downloads as notes.txt"
+        );
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    /// The files a home's Downloads holds.
+    fn downloaded(temp: &td_fs::TempDir) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(temp.join("Downloads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `Escape` stops a save still fetching at once, so a stalled server
+    /// holds no later save back, and the stopped one writes nothing; its
+    /// worker's slot is free once its fetch returns.
+    #[test]
+    fn escape_stops_a_save_still_fetching() {
+        let temp = home();
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: downloads_site(),
+            release: Mutex::new(held),
+        }));
+        app.home = Some(temp.to_path_buf());
+        type_address(&mut app, "example.org/notes.txt");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-s");
+        assert!(app.saving.is_some());
+        key(&mut app, "Escape");
+        assert!(app.saving.is_none());
+        assert_eq!(app.status_text(), "save stopped: nothing was written");
+        // Another save starts at once, beside the stopped one's fetch.
+        key(&mut app, "C-s");
+        assert!(app.saving.is_some());
+        assert_eq!(app.workers.load(Ordering::SeqCst), 2);
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            save_done(&mut app),
+            "saved 10 bytes of example.org/notes.txt in Downloads as notes.txt"
+        );
+        idle(&app);
+        assert_eq!(
+            downloaded(&temp),
+            ["notes.txt"],
+            "the stopped one wrote nothing"
+        );
+        temp.cleanup().unwrap();
+    }
+
+    /// Closing the window drops a save still fetching and waits for one
+    /// writing its file; a kept body writes from the start.
+    #[test]
+    fn closing_waits_for_a_write_not_for_a_fetch() {
+        let temp = home();
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: downloads_site(),
+            release: Mutex::new(held),
+        }));
+        app.home = Some(temp.to_path_buf());
+        type_address(&mut app, "example.org/notes.txt");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-s");
+        app.finish_saving();
+        assert!(app.saving.is_none());
+        release.send(()).unwrap();
+        idle(&app);
+        assert!(downloaded(&temp).is_empty(), "dropped while it fetched");
+        type_address(&mut app, "example.org/report");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-s");
+        app.finish_saving();
+        assert_eq!(downloaded(&temp), ["Q3 report.pdf"], "written whole");
+        assert_eq!(
+            std::fs::read(temp.join("Downloads/Q3 report.pdf")).unwrap(),
+            b"%PDF-1.7 body"
+        );
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    /// `Escape` does not stop a save writing its file: it clears the
+    /// selection as it would with no save out, and the file is written.
+    #[test]
+    fn escape_leaves_a_write_to_finish_and_clears_as_ever() {
+        let temp = home();
+        let mut app = app(downloads_site());
+        app.home = Some(temp.to_path_buf());
+        typed(&mut app, "example.org/report");
+        key(&mut app, "C-a");
+        assert!(app.current.view.selection.is_some());
+        // A kept body writes from the start.
+        key(&mut app, "C-s");
+        key(&mut app, "Escape");
+        assert!(app.current.view.selection.is_none());
+        assert_ne!(app.status_text(), "save stopped: nothing was written");
+        assert_eq!(
+            save_done(&mut app),
+            "saved 13 bytes of example.org/report in Downloads as Q3 report.pdf"
+        );
+        assert_eq!(downloaded(&temp), ["Q3 report.pdf"]);
+        idle(&app);
+        temp.cleanup().unwrap();
+    }
+
+    /// A save that has answered but not yet been shown is shown by
+    /// `Escape`, a failure as itself, not as stopped; the selection is
+    /// cleared as ever.
+    #[test]
+    fn escape_shows_a_failed_save_rather_than_calling_it_stopped() {
+        let temp = home();
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: downloads_site(),
+            release: Mutex::new(held),
+        }));
+        app.home = Some(temp.to_path_buf());
+        type_address(&mut app, "example.org/notes.txt");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-a");
+        key(&mut app, "C-s");
+        // Downloads goes while the save fetches, so it fails to create.
+        std::fs::remove_dir(temp.join("Downloads")).unwrap();
+        release.send(()).unwrap();
+        idle(&app);
+        assert!(app.saving.is_some(), "answered, not yet shown");
+        key(&mut app, "Escape");
+        assert!(app.saving.is_none());
+        let said = app.status_text();
+        assert!(said.starts_with("not saved: "), "{said}");
+        assert!(!said.contains("stopped"), "{said}");
+        assert!(app.current.view.selection.is_none());
+        temp.cleanup().unwrap();
+    }
+
+    #[test]
+    fn a_page_that_could_not_be_fetched_is_not_saved() {
+        let temp = home();
+        let mut app = app(site());
+        app.home = Some(temp.to_path_buf());
+        typed(&mut app, "example.org/missing");
+        key(&mut app, "C-s");
+        assert!(app.saving.is_none());
+        assert_eq!(
+            app.status_text(),
+            "not saved: the page could not be fetched"
+        );
+        temp.cleanup().unwrap();
     }
 
     #[test]

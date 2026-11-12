@@ -43,3 +43,7 @@ td-png = { path = "../td-png" }
 td-ui = { path = "../td-ui" }
 td-url = { path = "../td-url" }
 td-webp = { path = "../td-webp" }
+
+# Test scratch, owned by td-fs's TempDir guard (AGENTS.md "Parallel work").
+[dev-dependencies]
+td-fs = { path = "../td-fs" }

@@ -26,10 +26,11 @@ executable memory and never carries a JIT (§2).
 
 What td-web does not do, so a reader can say so: it runs no script,
 plugin or WebAssembly; it does not speak to the bus, the portal or the
-audio service; it keeps no cookie, cache, history or download on disk
-in its first increments (§6); it has no GPU path (td-ui renders in
-software, td-ui/DESIGN.md "The GPU path"); and it is not registered as
-`BROWSER` or as the OpenURI target.
+audio service; it keeps no cookie, cache or history on disk in its
+first increments (§6), and writes no file but one the person saves into
+a Downloads the human granted it (§5, "Saving"); it has no GPU path
+(td-ui renders in software, td-ui/DESIGN.md "The GPU path"); and it is
+not registered as `BROWSER` or as the OpenURI target.
 
 ## 2. Trust and build
 
@@ -108,8 +109,26 @@ td-web keeps nothing between runs, and a later increment that does keeps
 its state in the account's own home, which is private to it. In
 WORKLOADS.md's terms td-web is already the target shape: an account of
 its own (its reserved row carries into the workload ledger), a private
-home, and no grant of the human's files. No bus
+home, and none of the human's files but what the human grants. No bus
 names, no environment and no terminal.
+
+**Downloads.** The human's files reach td-web only through the workload
+grant table (WORKLOADS.md, "Grants"; td-authd/DESIGN.md, "Workload grant
+table"), as Firefox's Downloads does, and td-web asks for no other way:
+no portal, no prompt of its own. `web` is a declared application with an
+account of its own, so root admits a directory row for it; td-software's
+folders panel lists Flathub applications alone, so the human grants it
+with `td-ctl grant application web rw Downloads`, and takes it back
+with `td-ctl revoke application web Downloads`; an `ro` row is no grant
+to save into. From td-web's next launch `application-start`
+publishes the row as a detached idmapped view, nosuid, nodev and noexec,
+listed in the account's manifest, and td-jail binds it at
+`/home/td/Downloads`; a running td-web keeps what it was launched with.
+That view is the one place td-web can reach of the human's: it saves
+there (§5, "Saving") and nowhere else, and reads nothing there. td-jail makes `Downloads` in the account's own home as the
+view's mountpoint and leaves it after a revoke, so td-web takes
+`/home/td/Downloads` for the human's only while its own mount table
+shows a mount there.
 
 **Memory.** The bounds hold td-web's own memory; a body at
 `MAX_DOCUMENT` (16 MiB) for each fetch out, held at its own length; one
@@ -127,9 +146,10 @@ largest output td supports, beside its window's shared-memory buffers,
 9, 20 or 32 MB each, of which td-ui keeps up to three: 50, 95 or 144 MB
 in all. The most it holds while a reply is made into a document beside
 the one shown is then those 144 MB; 67 MB of bodies (`MAX_WORKERS` of
-`MAX_DOCUMENT`); on the render thread the larger of td-html's rule for a
-rendering's peak, 100 bytes a byte of input read and 1.25 a byte of
-budget (td-html/DESIGN.md, "Resident rendering cost"), 252 MB at
+`MAX_DOCUMENT`, a save's among them, §5); on the render thread the
+larger of td-html's rule for a rendering's peak, 100 bytes a byte of
+input read and 1.25 a byte of budget (td-html/DESIGN.md, "Resident
+rendering cost"), 252 MB at
 `HTML_LIMITS` (238 MB at most measured), and the costliest decoding, a
 16-bit RGBA PNG of 16 Mi pixels inflated at 8 bytes a pixel beside its
 4-byte RGBA, 201 MB (201 measured; a JPEG of as many pixels some 112
@@ -140,7 +160,9 @@ most 19 MB measured), or a text page, whose tabs are expanded, at most
 tabs 41 to a line), with the lines of it laid on the window's thread,
 only those near the ones shown however long the page, 19.3 MB at most
 measured and taken as 24 (§5), 70 MB; or a picture's 67 MB with its copy
-fitted to the pane, 33 MB at 3840x2160, 100 MB, the larger: 564 MB. That
+fitted to the pane, 33 MB at 3840x2160, 100 MB; or a reply td-web does
+not show, whose body it keeps for a save, at most `MAX_DOCUMENT` beside
+a page of a few lines, 18 MB; the largest: 564 MB. That
 is why `memory-high` is 640 MiB (671 MB), 107 MB above the sum, so that
 pages as large as long Wikipedia articles render whole: under 512 MiB
 (537 MB) with the same room the sum fits only with markup cut at some
@@ -186,7 +208,12 @@ td static application shares, without td-kv's `fdatasync`, which mail
 and news add and td-web does not link. What is off it answers `ENOSYS`;
 `socket` is `AF_UNIX` alone and `ioctl` `FIONBIO` alone. A change that
 reaches for another operating-system facility, in td-web or a crate it
-links, derives the list again, or that path fails in the jail.
+links, derives the list again, or that path fails in the jail. Saving
+(§5) is held to that list: it reads its mount table and creates,
+writes, syncs, empties and unlinks a file (`openat`, `read`, `write`,
+`fsync`, `ftruncate`, `statx`, `unlink`), calls td-ui's shared-memory
+buffers and theme file already make, and renames and links nothing,
+which would want `renameat2` or `linkat`.
 
 **Its own fetch service.** A service-account jail takes the fetch
 socket only from its own runtime directory, owned by its own UID
@@ -324,7 +351,95 @@ is text or binary"), text:
   not all allocations in fetching, navigation, fonts or window management;
   those remain separate migration work.
 - Anything else is not shown: the page names the type and size and
-  says that Firefox opens it. Downloads are a later increment (§11).
+  says that Firefox opens it, and, when the server answered `2xx`, that
+  `Ctrl+S` saves it, its body kept for that (below, "Saving").
+
+**Saving.** `Ctrl+S` saves the document shown into the human's
+Downloads; nothing else td-web does writes a file. It saves the body as
+the fetch service hands it, its content coding undone (§4), at most
+`MAX_DOCUMENT` as every body is: a larger reply is refused by the
+service for saving as for showing (§11). A reply td-web does not show,
+answered `2xx`, keeps its body in its document for this, and the first
+save takes it, so it is not fetched twice. A page, text or a picture,
+whose body decoding consumes (§3), and a kept body once given up, are
+fetched again as a reload fetches them, a navigation (§4), and saved
+when that answer is `2xx`. A kept body is given up when its save
+starts: a save that then fails, or whose thread could not start, leaves
+the next to fetch it again rather than restoring it. Only what a server
+answered with success is saved; a page that could not be fetched and
+td-web's own pages are not. The save runs on a worker's thread of its
+own, counted in `MAX_WORKERS` (§8), one at a time; the status row says
+`saving in Downloads` while it runs and then what it saved, `saved N
+bytes of HOST/PATH in Downloads as NAME`, its URL without the scheme and
+cut to 60 characters so a save that ends during a navigation is not
+read as the new page's, or why not.
+
+A save fetching its body is stopped by `Escape` on the page when no
+navigation is in flight (§8): it is let go at once, so a server that
+stalls holds no later save back, and writes nothing, its worker keeping
+its slot until its fetch returns. A save writing its file, which a kept
+body does from the start, is not stopped, and `Escape` then clears as
+it would with no save out; a save that has answered but not yet been
+shown is shown first, so a failure reads as itself, not as stopped.
+Closing the window (`Ctrl+Q`, `Ctrl+W`, the compositor's close)
+likewise drops a save still fetching and waits for one writing: for the
+write and both syncs, with no time bound, so a host Downloads on a
+network filesystem that stalls holds the close.
+
+Downloads is `$HOME/Downloads`; a `HOME` that is unset, empty or not
+absolute is none. In td-web's jail `HOME` is td-jail's application
+home, `/home/td`, the account's own, where the human's Downloads is
+only the grant view (§3): td-web saves there only while its mount table
+(`/proc/self/mountinfo`) shows one mount at `/home/td/Downloads`,
+without `ro`. td-jail refuses a grant mountpoint the table repeats
+(`grant_mount_rows`), so one listed twice is no view it made, and no
+grant. With none, or a read-only one, nothing is fetched or written and
+the status row says how to grant it, `td-ctl grant application web rw
+Downloads`, from td-web's next start. Run on a host as the human (§7),
+`HOME` is the human's and Downloads is its own; a host account whose
+home is `/home/td` is taken for the jail and saves only into a mount
+there. Either way Downloads is opened once, as a directory and without
+following a link, before anything is fetched.
+
+The name is the `content-disposition`'s `filename*` (RFC 8187, in UTF-8
+or ISO-8859-1), else its `filename`, a quoted string's escapes undone,
+else the last segment of the URL's path percent-decoded as UTF-8, else
+`download`, each bounded already by the fetch service's 8 KiB head line
+or td-url's URL; whichever is taken loses its control characters and
+the format characters td's grant paths refuse (td-authd/DESIGN.md,
+"Workload grant table"), has each `/` and `\` made `_`, drops dots and
+spaces from its start, in any mix, until neither leads, and spaces from
+its end, so it is one name in Downloads and no hidden file, `.` or
+`..`, and is cut at a character to `MAX_NAME` (200) bytes, an extension
+of at most 16 bytes kept however long the name; one with nothing left
+falls to the next. A save never overwrites: the file is created
+exclusively (`O_CREAT`, `O_EXCL`, `O_NOFOLLOW`, mode 0600, the human's
+alone and every grantee's through its own idmapped view) under the
+first free one of `NAME`, `NAME (2)` up to `NAME (100)` (`MAX_COPIES`),
+the counter before the extension, in the directory opened, named
+through `/proc/self/fd` so a link in its place is never followed or
+replaced and a rename of Downloads meanwhile does not move the save;
+all taken, nothing is saved. A name that is empty, `.`, `..` or holds a
+`/` is refused there again, though none reaches it. The body is written
+whole and synced, then the directory is synced so the name lasts too;
+a directory that cannot be synced is said beside the save.
+
+There is no rename into place, which would want `renameat2`'s
+`RENAME_NOREPLACE` or `linkat` beside the shared allowlist (§3): the
+file holds its final name while it is written, so until the write ends
+it is visible there part written. The whole body is in memory before
+the file is made, so that is the disk's time, not the network's. A
+write or sync that fails empties the file through its own descriptor,
+which a full disk may refuse, then removes it while its name still
+names it, emptied or not, the descriptor held open until then so its
+inode cannot be another file's; the status row says it was removed, or
+left under the name, emptied or partly written, when it could not be,
+or that something moved it away from the name first, naming no other
+file as td-web's. The look at the name and the unlink are two steps: a
+writer to Downloads that puts a file at the name between them loses it,
+a narrow race only an unlink by descriptor would close, which Linux
+lacks. td-web ended during a write, its jail killed or the machine
+stopped, leaves the part written under the final name.
 
 **Encodings.** Markup and text are decoded to UTF-8 on the render thread
 before anything reads them, td-html and the title included, through
@@ -514,9 +629,11 @@ and the places of the view above it with it.
 A td-web window keeps, in memory only: its back and forward history
 (each entry a URL and the scroll position it was left at), the current
 document and its rendering. Nothing is written to disk in the first
-increments: no cookie, cache, history, bookmark or download. Closing
-the window forgets everything. A later increment that keeps state
-writes it under the account's own home, never in the login user's.
+increments, no cookie, cache, history or bookmark, but a file the
+person saves into Downloads (§5, "Saving"), which is the human's, not
+td-web's state. Closing the window forgets everything. A later
+increment that keeps state writes it under the account's own home,
+never in the login user's.
 
 ## 7. Other programs
 
@@ -532,8 +649,9 @@ of handler, is a later decision and an amendment to td-portal's design.
 One td-ui window: an address row on top, the page below, a status row
 at the bottom. The status row says, first that applies: what the last
 input made happen (a link not followed, a refusal, a copy), until the
-next key, click, wheel turn or paste; what is loading; where the link under the pointer, else the
-focused link, goes; the response's status, the place in the page, the
+next key, click, wheel turn or paste, and what a save did, once it
+ends, until the same; what is loading; that a save runs; where the link
+under the pointer, else the focused link, goes; the response's status, the place in the page, the
 encoding its text was decoded from when not UTF-8 (§5), and any cut.
 The place, said only of a page not shown whole, is `N of M lines`: the
 logical line the last line shown is part of, of the page's
@@ -555,8 +673,9 @@ URL, then ` - td-web`.
 | `Shift+Left`, `Shift+Right` (page) | move the selection's end a character; with `Ctrl`, to the word before's start or the word after's end |
 | `Shift+Up`, `Shift+Down` (page) | move it to its logical line's start or end, from there the line before's start or the line after's end |
 | `Ctrl+A` (page) | select the page |
-| `Escape` (page) | stop loading, else clear the focused link, find's marks and the selection |
+| `Escape` (page) | stop loading, else a save still fetching (§5), else clear the focused link, find's marks and the selection |
 | `Ctrl+C` | copy the address or find row's selection while it has focus, else the page's selection, else the focused link's URL, else the page's |
+| `Ctrl+S` | save the document into Downloads (§5, "Saving") |
 | `F8` | body text in Noto Sans or Noto Serif, for this run |
 | `Ctrl+Q`, `Ctrl+W` | close |
 | `?`, `F1` | the key list (`F1` is the window's own) |
@@ -585,8 +704,9 @@ page stops waiting for it; laying out the lines near those shown at
 the page's width, again on a resize or `F8`, is the window's. A
 stopped fetch runs on until the service answers or times out, so
 td-web keeps at most `MAX_WORKERS` (4)
-fetches out, stopped ones included, and asks the person to wait past
-that; a navigation overtaken by another is stopped. The history keeps
+fetches out, stopped ones included, a save among them (§5), and asks
+the person to wait past that; a navigation overtaken by another is
+stopped. The history keeps
 at most 100 pages each way, each at the text its top line began with,
 and moves only when a page arrives: a step back or forward that is
 stopped, refused or overtaken leaves it as it was. A resize or `F8`
@@ -657,8 +777,8 @@ is.
   focused link go and `Tab` clears the selection, so `Ctrl+C` copies
   the one there is (the precedence in the table above). `Escape` on
   the page clears the selection with the focus and find's marks,
-  unless it stops a load. A page arriving, by any navigation, reload
-  or history step, starts with none, a press held over the page before
+  unless it stops a load or a save still fetching. A page arriving, by any
+  navigation, reload or history step, starts with none, a press held over the page before
   it is dropped, and the history keeps no selection.
 - **Painting.** Each glyph of a line laid whose character lies between
   the two places is drawn on `SELECTED` in paper ink, as the focused
@@ -855,7 +975,10 @@ are both charged while both live, the shown one kept until the new one
 is installed rather than let go when a reply arrives, which would give
 the new one all of `PAGES` but leave a blank pane when `Escape` stops
 it. A page's charges are held in it and returned when it drops: charges
-follow ownership.
+follow ownership. The body a reply td-web does not show keeps for a
+save (§5, "Saving"), at most `MAX_DOCUMENT`, is charged to its page's
+budget as that page's tree is, and returned when a save takes it, its
+worker's body then one of the navigations' bodies below.
 
 **Admission by declared charge.** td-html, td-dom, td-css and
 td-layout allocate through std, not td-alloc; each bounds what it
@@ -918,8 +1041,9 @@ shown leaves it too little.
   buffers) rounded up, as its test takes it;
 - `ATLAS`, td-ui's atlas pages for prose at sizes other than its own,
   8 MiB in all (estimate; td-ui's cap, increment 6);
-- the navigations' bodies, 67 MB (`MAX_WORKERS` of `MAX_DOCUMENT`), a
-  page's decoded text standing in its body's place (§3);
+- the navigations' bodies, 67 MB (`MAX_WORKERS` of `MAX_DOCUMENT`, a
+  save's among them, §5), a page's decoded text standing in its body's
+  place (§3);
 - the subresources' bodies, 16 MiB (`MAX_SUBRESOURCES` of
   `MAX_SUBRESOURCE`, below, "Subresources");
 - `WORKING`, td-layout's `WORKING_BYTES` (64 MiB): a cascade's
@@ -1436,9 +1560,31 @@ order; each is its own design amendment when it starts:
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
 - **Pictures.** `srcset` and `<picture>`; an SVG subset.
-- **Downloads** to `~/Downloads`, through a directory grant of
-  WORKLOADS.md ("Grants") or td-portal's FileChooser, which today admits
-  Firefox alone; td-web's account owns no file of the human's.
+- **Downloads past `MAX_DOCUMENT`.** The fetch service already streams
+  a reply in frames to a `stream` request, `public` ones included, so a
+  larger save needs no protocol: td-fetch-client's `get_stream` taking
+  `public`, a navigation whose reply td-web does not show handed to a
+  save before its body is whole, written as its frames come on the
+  save's worker, with progress in the status row and `Escape` or a key
+  of its own to stop it, the partial file then removed as a failed
+  write's is (§5).
+- **Saving atomically**: a save written under a hidden name, then made
+  its own by `linkat` (failing on an existing name) or `renameat2` with
+  `RENAME_NOREPLACE`, so no partial file ever holds the final name: one
+  of those calls added to td-web's allowlist, with the probe's witness
+  (APPLICATIONS.md, "Per-application allowlists"; UNSAFE.md §9).
+- **More of saving**: a `content-disposition` of `attachment` on a type
+  td-web shows offered for saving rather than shown; a name and place
+  chosen through td-portal's FileChooser, which today admits Firefox
+  alone; saving the page as shown (its text) beside its source.
+- **Evidence in the image.** A boot oracle that grants `web` a writable
+  Downloads through `td-ctl`, starts td-web, saves a reply it does not
+  show and a page, and checks from the human's side each file's owner
+  (1000), mode (0600), name and bytes; then the same with an `ro` row
+  and with the row revoked, each refused with nothing written and the
+  status row naming the grant. Nothing yet exercises the jail's branch
+  (the mount table, the view) or the realized static binary under its
+  allowlist: §5's tests run on the host and fake the mount table.
 - **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
   agent can operate td-web through the verbs td-ui's other programs
   take, and an oracle can boot it in the image. Reading a page back

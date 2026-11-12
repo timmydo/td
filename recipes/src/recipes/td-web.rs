@@ -5,8 +5,9 @@ use crate::types::Recipe;
 /// static Cargo build of its own tree with its path dependencies staged
 /// beside it, td-compositor for the font and wire sources td-ui mounts,
 /// engine for td-png's checksums, td-inflate for its decoder and td-util for its DEFLATE
-/// encoder, the `td-web-source` seed pinned by the compiled local-source
-/// roster, and the crate's committed lock naming itself and those crates.
+/// encoder, the dev-only td-fs its tests' scratch comes from, the
+/// `td-web-source` seed pinned by the compiled local-source roster, and the
+/// crate's committed lock naming itself and those crates.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-web", "0.1.0")
         .local_source("td-web")
@@ -15,6 +16,7 @@ pub fn recipe() -> Recipe {
             "td-avif",
             "td-charset",
             "td-fetch-client",
+            "td-fs",
             "td-gif",
             "td-html",
             "td-jpeg",
@@ -53,6 +55,7 @@ mod tests {
                 "td-avif".into(),
                 "td-charset".into(),
                 "td-fetch-client".into(),
+                "td-fs".into(),
                 "td-gif".into(),
                 "td-html".into(),
                 "td-jpeg".into(),
@@ -96,6 +99,7 @@ mod tests {
                 "td-avif",
                 "td-charset",
                 "td-fetch-client",
+                "td-fs",
                 "td-gif",
                 "td-html",
                 "td-jpeg",

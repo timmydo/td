@@ -1366,7 +1366,13 @@ pub struct Document {
     /// What the status row says once it has nothing better to say: the
     /// page was cut short, say.
     pub note: Option<String>,
+    /// The reply's `content-disposition`, which names a saved file.
+    pub disposition: Option<String>,
     body: Body,
+    /// A reply td-web does not show, kept as it arrived for a save
+    /// (DESIGN.md §5, "Saving"): at most `MAX_DOCUMENT` beside a page of
+    /// a few lines.
+    held: Option<Vec<u8>>,
 }
 
 impl Document {
@@ -1416,7 +1422,7 @@ impl Document {
         }
         let size = body.len();
         let base = Some(url.clone());
-        let (page, title, note) = match kind {
+        let (page, title, note, held) = match kind {
             Kind::Html | Kind::Text => {
                 // Markup is cut here, not by td-html's input limit, so
                 // td-html's notice means only its budget: the note says
@@ -1441,9 +1447,14 @@ impl Document {
                 let note = noted(decoded.encoding, decoded.read, size);
                 let text = decoded.text;
                 if kind == Kind::Text {
-                    (plain(&text, true, base), None, note)
+                    (plain(&text, true, base), None, note, None)
                 } else {
-                    (html(text.as_bytes(), base), title(text.as_bytes()), note)
+                    (
+                        html(text.as_bytes(), base),
+                        title(text.as_bytes()),
+                        note,
+                        None,
+                    )
                 }
             }
             Kind::Picture(format) => match picture::decode(format, &body) {
@@ -1453,7 +1464,9 @@ impl Document {
                         status,
                         title: None,
                         note: None,
+                        disposition: None,
                         body: Body::Picture(picture),
+                        held: None,
                     });
                 }
                 Err(why) if why.resources() => {
@@ -1462,10 +1475,12 @@ impl Document {
                         status,
                         title: None,
                         note: None,
+                        disposition: None,
                         body: Body::PictureResources,
+                        held: None,
                     });
                 }
-                Err(why) => (plain(&why.to_string(), false, base), None, None),
+                Err(why) => (plain(&why.to_string(), false, base), None, None, None),
             },
             Kind::Other => {
                 let named = if media.is_empty() {
@@ -1473,11 +1488,19 @@ impl Document {
                 } else {
                     visible(&media)
                 };
+                // Only what the server answered with success is offered
+                // for saving, and kept for it.
+                let held = ((200..300).contains(&status) && !body.is_empty()).then_some(body);
+                let offer = if held.is_some() {
+                    "Ctrl+S saves it in Downloads.\n\n"
+                } else {
+                    ""
+                };
                 let said = format!(
-                    "This is {named}, {size} bytes.\n\ntd-web shows HTML, text, PNG, \
+                    "This is {named}, {size} bytes.\n\n{offer}td-web shows HTML, text, PNG, \
                      JPEG, GIF, WebP and AVIF; Firefox opens the rest."
                 );
-                (plain(&said, false, base), None, None)
+                (plain(&said, false, base), None, None, held)
             }
         };
         Some(Self {
@@ -1485,7 +1508,9 @@ impl Document {
             status,
             title,
             note,
+            disposition: None,
             body: Body::Page(Arc::new(page)),
+            held,
         })
     }
 
@@ -1497,13 +1522,21 @@ impl Document {
             status: 0,
             title: None,
             note: None,
+            disposition: None,
             body: Body::Page(Arc::new(page)),
+            held: None,
         }
     }
 
     /// The start page.
     pub fn blank() -> Self {
         Self::error(None, "")
+    }
+
+    /// The body of a reply td-web does not show, given up to be saved;
+    /// a later save fetches it again.
+    pub fn take_held(&mut self) -> Option<Vec<u8>> {
+        self.held.take()
     }
 
     pub fn picture_resources(&self) -> bool {
@@ -1915,7 +1948,9 @@ pub(crate) mod tests {
             status: 200,
             title: None,
             note: None,
+            disposition: None,
             body: super::Body::PictureResources,
+            held: None,
         };
         assert!(doc.picture_resources());
         assert!(doc.picture().is_none());
@@ -2787,7 +2822,10 @@ pub(crate) mod tests {
         let decoding = MAX_PICTURE_PIXELS * (8 + 4);
         let page = HTML_LIMITS.output.max(TEXT_PAGE) + WRAP;
         let picture = MAX_PICTURE_PIXELS * 4 + FITTED;
-        let most = BASELINE + bodies + rendering.max(decoding) + page.max(picture);
+        // A reply td-web does not show keeps its body for a save, beside a
+        // page of a few lines; a save's own body is one of `bodies`.
+        let held = crate::fetch::MAX_DOCUMENT as usize + 1_000_000;
+        let most = BASELINE + bodies + rendering.max(decoding) + page.max(picture).max(held);
         assert!(most + 20_000_000 < MEMORY_HIGH, "{most}");
     }
 
@@ -3002,10 +3040,21 @@ pub(crate) mod tests {
 
     #[test]
     fn another_type_is_named_and_not_shown() {
-        let doc = Document::from_reply(base(), 200, Some("application/pdf"), vec![1; 10]);
+        let mut doc = Document::from_reply(base(), 200, Some("application/pdf"), vec![1; 10]);
         let lines = text_of(&cells(&doc, 200));
         assert_eq!(lines[0], "This is application/pdf, 10 bytes.");
-        assert!(lines[2].contains("Firefox opens the rest"));
+        assert_eq!(lines[2], "Ctrl+S saves it in Downloads.");
+        assert!(lines[4].contains("Firefox opens the rest"));
+        assert_eq!(doc.take_held(), Some(vec![1; 10]), "kept for a save");
+        assert_eq!(doc.take_held(), None, "given up once");
+        // What the server answered without success is neither offered nor
+        // kept; nor is a page td-web shows.
+        let mut doc = Document::from_reply(base(), 404, Some("application/pdf"), vec![1; 10]);
+        let lines = text_of(&cells(&doc, 200));
+        assert!(lines[2].contains("Firefox opens the rest"), "{lines:?}");
+        assert_eq!(doc.take_held(), None);
+        let mut doc = Document::from_reply(base(), 200, Some("text/plain"), b"x".to_vec());
+        assert_eq!(doc.take_held(), None);
     }
 
     #[test]

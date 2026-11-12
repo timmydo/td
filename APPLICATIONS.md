@@ -3681,9 +3681,13 @@ td-secret reach and td-news and td-open do not; mail and news add td-kv's
 no number td-news's does not: its render and fetch threads (`clone`, glibc having
 tried `clone3`), each thread's malloc arena (`mmap`, `mprotect`, `madvise`), its
 decoders and the unwinding that catches a rendering's panic reach only listed calls,
-and the spawn and resolver code it links is left out as above. td-charset, which
-decodes its pages' legacy encodings, is std-only and does no I/O: its decoders call
-nothing, and td-web's decoded strings come from the allocator its threads already
+and the spawn and resolver code it links is left out as above. Its saves into a
+granted Downloads (td-web/DESIGN.md §5, "Saving") read its own mount table and
+create, write, sync, empty and unlink a file (`openat`, `read`, `write`, `fsync`,
+`ftruncate`, `statx`, `unlink`), calls td-ui's shared-memory buffers and theme file
+already reach, and rename and link nothing, so `renameat2` and `linkat` stay off.
+td-charset, which decodes its pages' legacy encodings, is std-only and does no I/O:
+its decoders call nothing, and td-web's decoded strings come from the allocator its threads already
 use, so it adds no number.
 
 **What proves it.** The interpreter holds each program to exactly its list across

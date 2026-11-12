@@ -8,6 +8,7 @@ mod charset;
 mod document;
 mod fetch;
 mod picture;
+mod save;
 mod view;
 
 use std::process::ExitCode;
