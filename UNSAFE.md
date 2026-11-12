@@ -3060,10 +3060,22 @@ without following links. Root reads a sandbox's home only by its
 top-level listing and one fixed name in it, the deletion mark
 `.td-deleted`, through an `O_NOFOLLOW | O_DIRECTORY` descriptor of the
 home's, and makes or removes that mark through the same descriptor's
-procfs path, created exclusively with `O_NOFOLLOW`. The controller source, its fixed helper, jail
-and emptier argv, its peer rule and its one call of each prior check are
-pinned by confinement tests. No instruction, syscall, option or
-allowance is added.
+procfs path, created exclusively with `O_NOFOLLOW`. A workspace slot's
+instance (td-authd/DESIGN.md, "Workspace instances") passes the same two
+descriptors the same way and no other; its views are published through
+`grant_views.rs`'s one publication path below. A deletion first ends the
+account's processes through plain files of its `td-workload-UID`
+delegation: safe std opens the delegation by an `O_NOFOLLOW |
+O_DIRECTORY` descriptor, writes `1` to its `cgroup.kill` and reads its
+`cgroup.events` into a fixed 4 KiB buffer, each opened with `O_NOFOLLOW`
+through that descriptor's procfs path, and sleeps between reads to a
+deadline; it signals no process itself. Root reads a workspace's scratch
+tree's four directories only by their top-level listings, each through
+an `O_NOFOLLOW | O_DIRECTORY` descriptor that must be the account's. The
+controller source, its fixed helper, jail and emptier argv, its peer
+rule, its one kill write and its one call of each prior check are pinned
+by confinement tests. No instruction, syscall, option or allowance is
+added.
 
 ### Elevation: `deploy-rollback`
 
@@ -3172,10 +3184,12 @@ mount is noexec gets no executable view at all, since the view would
 inherit noexec. The shared namespace helper may map human UID/GID 1000
 to portal UID/GID 991 for the portal's read-only Downloads view, or to
 an application account in the ledger's application range, or a
-sandbox's account in its sandbox and workspace range, for that
-account's grant views, which root publishes at its launch from the
-root-only workload grant table (td-authd/DESIGN.md, "Workload grant
-table", "Workspace launch intake"). It may also map the Firefox UID/GID
+sandbox's or workspace's account in its sandbox and workspace range, for
+that account's grant views, which root publishes at its launch from the
+root-only workload grant table, or for a workspace's account from the
+plans of its running instances, which root admitted by the same path
+validator (td-authd/DESIGN.md, "Workload grant table", "Workspace launch
+intake", "Workspace instances"). It may also map the Firefox UID/GID
 to portal UID/GID 991 for the portal's writable handoff view of
 Firefox's private `Opened` directory, the one use of the writable
 profile with a portal destination. Mapping, publication and release are
@@ -3187,8 +3201,10 @@ and closes the detached mount on failure. No descriptor from this boundary
 is received over D-Bus or the attention channel. The portal consumer
 selects the fixed human Downloads source and read-only portal destination,
 only while Firefox holds the Downloads grant; the grant-view consumer
-selects a source only from a root-only table row, validated by the one
-shared path validator, opened below the human home without following
+selects a source only from a root-only table row or a running workspace
+instance's plan entry held in root's memory, validated by the one shared
+path validator (for a workspace's account, or td-agent's own trees in
+their exact shapes, `validate_view`), opened below the human home without following
 links and on the home's own mount, and a destination only below
 `/var/lib/td/grant-views/UID`, a root-owned tree outside every
 workload-writable home; the handoff consumer selects only Firefox's

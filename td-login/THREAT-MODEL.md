@@ -169,7 +169,7 @@ sandbox or workspace account's when root allocates or prepares it,
 as specified in `td-authd/DESIGN.md`; this selector alone activates
 nothing.
 The root-configured td-authd application launcher, and its workspace
-launch intake for a sandbox's account, make a failed placement fatal
+launch intake for a sandbox's or workspace's account, make a failed placement fatal
 before workload code runs, as the terminal launcher does for the human
 session. Its active-account admission and post-switch checks are specified
 in `td-authd/DESIGN.md`; it uses this existing service-only credential path.
@@ -236,21 +236,43 @@ creation adds a permanent ledger row, so such a program can spend the
 sandbox rows, half of the sandbox and workspace rows, by cycling names,
 after which a new sandbox is refused for good, but not crowd out a
 workspace's row or an application's (td-authd/DESIGN.md, "Workload
-account ledger"). Once the intake creates workspaces (WORKLOADS.md step
-8), such a program can spend the workspace rows too, but root admits
+account ledger"). The intake creates workspace slots too (WORKLOADS.md
+step 8), so such a program can spend the workspace rows, but root admits
 only td-agent's own slot names for them, so it can make td-agent's
 slots before td-agent does, which td-agent adopts, and not deny it one
 unless an earlier deployment's sandboxes already hold `WORKLOAD_ROWS`.
-At most 20 connections are served at once, at most 16 of them launches,
-so such a program can hold the intake's launches up until its shells end
-and its other verbs for as long as each takes, but not an application's
+
+The same program can create, delete and start an instance in any
+workspace slot, with any plan root admits of the human's home: any
+directory a grant may name, read-only or writable by its role, and
+td-agent's own repositories, object stores and conversation scratch
+trees, td-agent's own state that no grant reaches, each in its one role;
+deleting a slot ends every process its account runs and empties its
+home and scratch tree, so such a program can end another conversation's
+instance's leftovers and destroy what its slot held. That is the same
+trust class as request `2c` and td-ctl: the program already reads and
+writes everything a plan can name, td-agent's trees among them, as the
+human, and what an instance adds is td-agent's tool host, root's fixed
+entry, running as the slot's account with those directories, whose
+writable ones are the same way back into what the human runs as a
+writable grant's (below). A plan also holds the slot account's views for
+as long as its instance runs, so such a program can keep a directory
+from another instance of the same slot at the other access until its
+own ends, and fill a slot's 32 instances and the 128 in all, but not a
+sandbox's launches.
+At most 148 connections are served at once, at most 16 of them sandbox
+launches and 128 workspace instances, so such a program can hold the
+intake's launches up until its shells and instances end and its other
+verbs for as long as each takes, but not an application's
 launch. Root admits only the request's fixed grammar, writes the jail's
 spec itself and runs only td's own td-sandbox relay in the jail, with
-the shell root names or the command the request names inside it; a
-request names no environment, descriptor or spec, and a path only as a
-grant row the writer validates. The account a sandbox runs as cannot
-reach the intake: its socket's mode admits the human alone, and the peer
-check refuses any other uid.
+the shell root names or the command the request names inside it, or
+td's own td-agent with td-txt beside it and the arguments the request
+names; a request names no environment, descriptor or spec, and a path
+only as a grant row the writer validates or a plan entry root
+validates. The account a sandbox or slot runs as cannot reach the
+intake: its socket's mode admits the human alone, and the peer check
+refuses any other uid.
 
 A writable grant is what lets a sandbox reach back into what the human
 runs, and its view's execute permission does not bear on that. The

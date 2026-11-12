@@ -479,7 +479,15 @@ mod confinement {
         ));
         assert!(WORKSPACE.contains("        Caller::Human => read_spec_of(path, uid, false),\n"));
         assert!(resolve.contains("        require_account_spec(&spec, kind, uid)?;\n"));
-        assert!(resolve.contains("        spec.views = authority::workspace_views(\n"));
+        assert!(resolve.contains("        let views = authority::workspace_views(\n            &mountinfo,\n            uid,\n            kind,\n"));
+        // A workspace examines and binds the views its lines name; a
+        // sandbox, all.
+        assert!(resolve.contains(
+            "            &|target| kind != Kind::Workspace || spec.names_directory(target),\n"
+        ));
+        assert!(resolve.contains("            Kind::Workspace => select_views(\n"));
+        assert!(resolve
+            .contains("            Kind::Sandbox | Kind::Application => spec.views = views,\n"));
         assert!(resolve.contains("    plan.intake = matches!(caller, Caller::Account(_));\n"));
         assert!(AUTHORITY.contains(
             "pub(crate) fn require_no_configuration_at(path: &Path, what: &str) -> io::Result<()> {\n    match fs::symlink_metadata(path) {"

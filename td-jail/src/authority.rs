@@ -2013,19 +2013,24 @@ fn granted_views(
         ViewPlacement::Application,
         require_grant_target,
         reserved,
+        &|_| true,
     )
 }
 
-/// The views a sandbox's or workspace's account `uid` binds in its
-/// workspace jail (APPLICATIONS.md §C, "The `workspace` kind"): those its
-/// manifest lists, each at the human's own path where the kind's
-/// `require_target` admits it, executable. An account with no manifest
-/// has none.
+/// The views a sandbox's or workspace's account `uid`, of `kind`, binds
+/// in its workspace jail (APPLICATIONS.md §C, "The `workspace` kind"):
+/// those its manifest lists, admitted for its kind, each at the human's
+/// own path where the kind's `require_target` admits it, executable, of
+/// those whose target `wanted` takes: a workspace's spec lines name the
+/// views it binds, and one they do not name, another running instance's,
+/// is never examined. An account with no manifest has none.
 pub(crate) fn workspace_views(
     mountinfo: &str,
     uid: u32,
+    kind: crate::workload_accounts::Kind,
     require_target: fn(&Path) -> io::Result<()>,
     reserved: &BTreeSet<MountIdentity>,
+    wanted: &dyn Fn(&Path) -> bool,
 ) -> io::Result<Vec<FilesystemGrant>> {
     if !crate::workload_accounts::WORKLOAD_UIDS.contains(&uid) {
         return Err(invalid("workspace views belong to a sandbox or workspace"));
@@ -2033,9 +2038,10 @@ pub(crate) fn workspace_views(
     let views = manifest_views(
         mountinfo,
         uid,
-        ViewPlacement::Workspace,
+        ViewPlacement::Workspace(kind),
         require_target,
         reserved,
+        wanted,
     )?;
     let mut grants = crate::allocation::with_capacity(views.len())
         .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
@@ -2050,48 +2056,58 @@ pub(crate) fn workspace_views(
 /// the launch kind and so by the account's: an application's below its
 /// private home, noexec; a sandbox's or workspace's at the human's own
 /// path, where td-sandbox's shares were, executable as td-authd published
-/// them.
+/// them. A workspace placement carries its account's kind: a workspace's
+/// manifest may list td-agent's own trees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewPlacement {
     Application,
-    Workspace,
+    Workspace(crate::workload_accounts::Kind),
 }
 
 impl ViewPlacement {
     fn target(self, account: &crate::primary_account::PrimaryAccount, path: &str) -> PathBuf {
         match self {
             Self::Application => Path::new("/home/td").join(path),
-            Self::Workspace => account.persistent_home().join(path),
+            Self::Workspace(_) => account.persistent_home().join(path),
         }
     }
 
     /// Whether a view must lack execution: an application's must carry
     /// noexec; a workspace's need not, keeping one its source's mount set.
     fn executable(self) -> bool {
-        self == Self::Workspace
+        matches!(self, Self::Workspace(_))
+    }
+
+    /// The kind whose manifest it reads.
+    fn kind(self) -> crate::workload_accounts::Kind {
+        match self {
+            Self::Application => crate::workload_accounts::Kind::Application,
+            Self::Workspace(kind) => kind,
+        }
     }
 }
 
 /// The views of `uid`'s manifest as `placement` binds them, each target
-/// canonical and admitted by its kind's `require_target`.
+/// canonical and admitted by its kind's `require_target`; a view whose
+/// target `wanted` refuses is passed over unexamined.
 fn manifest_views(
     mountinfo: &str,
     uid: u32,
     placement: ViewPlacement,
     require_target: fn(&Path) -> io::Result<()>,
     reserved: &BTreeSet<MountIdentity>,
+    wanted: &dyn Fn(&Path) -> bool,
 ) -> io::Result<Vec<AdmittedView>> {
-    let Some(manifest) = read_view_manifest(uid)? else {
+    let Some(manifest) = read_view_manifest(uid, placement.kind())? else {
         return Ok(Vec::new());
     };
     let account = crate::primary_account::load()?;
     let directory = Path::new(crate::workload_grants::VIEW_ROOT).join(uid.to_string());
     let mut views = Vec::new();
-    for entry in manifest.views() {
+    for (entry, target) in wanted_views(&manifest, placement, &account, wanted)? {
         let view = directory.join(entry.index.to_string());
         // A target the jail keeps for itself is the table's and td-jail's
         // disagreement, not the launch's: the view is left out and said so.
-        let target = placement.target(&account, &entry.path);
         if let Err(error) =
             validate_filesystem_target(&target).and_then(|()| require_target(&target))
         {
@@ -2126,6 +2142,25 @@ fn manifest_views(
         });
     }
     Ok(views)
+}
+
+/// The entries of `manifest` whose targets, where `placement` binds them,
+/// `wanted` takes, each with that target: the only ones a launch examines.
+fn wanted_views<'a>(
+    manifest: &'a crate::workload_grants::Manifest,
+    placement: ViewPlacement,
+    account: &crate::primary_account::PrimaryAccount,
+    wanted: &dyn Fn(&Path) -> bool,
+) -> io::Result<Vec<(&'a crate::workload_grants::View, PathBuf)>> {
+    let mut chosen = Vec::new();
+    for entry in manifest.views() {
+        let target = placement.target(account, &entry.path);
+        if wanted(&target) {
+            crate::allocation::push(&mut chosen, (entry, target))
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        }
+    }
+    Ok(chosen)
 }
 
 /// One line saying a listed view is left out of this launch and why.
@@ -2195,12 +2230,16 @@ fn admit_view(
 /// group, mode 0710) and the manifest in it (root, the account's group,
 /// mode 0640, one link, bounded). None when any of the last three is
 /// absent: nothing was published for the account.
-fn read_view_manifest(uid: u32) -> io::Result<Option<crate::workload_grants::Manifest>> {
+fn read_view_manifest(
+    uid: u32,
+    kind: crate::workload_accounts::Kind,
+) -> io::Result<Option<crate::workload_grants::Manifest>> {
     read_view_manifest_at(
         Path::new("/var/lib/td"),
         uid,
         ((0, 0), uid),
         crate::workload_grants::VIEWS_MODE,
+        kind,
     )
 }
 
@@ -2219,6 +2258,7 @@ fn read_view_manifest_at(
     uid: u32,
     owners: ((u32, u32), u32),
     views_mode: u32,
+    kind: crate::workload_accounts::Kind,
 ) -> io::Result<Option<crate::workload_grants::Manifest>> {
     let ((owner, group), account_group) = owners;
     use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
@@ -2268,7 +2308,9 @@ fn read_view_manifest_at(
     let mut text = String::new();
     file.take(grants::MAX_MANIFEST_BYTES as u64 + 1)
         .read_to_string(&mut text)?;
-    grants::Manifest::parse(&text).map(Some).map_err(invalid)
+    grants::Manifest::parse_for(kind, &text)
+        .map(Some)
+        .map_err(invalid)
 }
 
 /// A manifest td-authd wrote for the account: a single-link regular file
@@ -4058,6 +4100,7 @@ mod tests {
 
     use super::*;
     use crate::permissions::PermissionSocket;
+    use crate::workload_accounts::Kind;
     use std::ops::Deref;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4288,7 +4331,7 @@ mod tests {
         let owner = ((shown.uid(), shown.gid()), shown.gid());
         let read = |mode: u32| {
             fs::set_permissions(&account, fs::Permissions::from_mode(mode)).unwrap();
-            let result = read_view_manifest_at(&state, 65536, owner, mode);
+            let result = read_view_manifest_at(&state, 65536, owner, mode, Kind::Application);
             fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
             result
         };
@@ -4308,14 +4351,34 @@ mod tests {
         // A mode other than the one required, another owner, and no
         // manifest or no account directory.
         fs::set_permissions(&account, fs::Permissions::from_mode(0o710)).unwrap();
-        assert!(read_view_manifest_at(&state, 65536, owner, 0o750).is_err());
+        assert!(read_view_manifest_at(&state, 65536, owner, 0o750, Kind::Application).is_err());
+        assert!(read_view_manifest_at(
+            &state,
+            65536,
+            (owner.0, owner.1.wrapping_add(1)),
+            0o710,
+            Kind::Application
+        )
+        .is_err());
         assert!(
-            read_view_manifest_at(&state, 65536, (owner.0, owner.1.wrapping_add(1)), 0o710)
-                .is_err()
+            read_view_manifest_at(&state, 65537, owner, 0o710, Kind::Application)
+                .unwrap()
+                .is_none()
         );
-        assert!(read_view_manifest_at(&state, 65537, owner, 0o710)
+        // td-agent's own trees: a workspace's manifest lists them, no other
+        // kind's does.
+        fs::write(
+            &manifest,
+            "td-grant-views-v1\n0\trw\t.local/share/td-agent/ws/w/r.git\n",
+        )
+        .unwrap();
+        for kind in [Kind::Application, Kind::Sandbox] {
+            assert!(read_view_manifest_at(&state, 65536, owner, 0o710, kind).is_err());
+        }
+        let listed = read_view_manifest_at(&state, 65536, owner, 0o710, Kind::Workspace)
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(listed.views().len(), 1);
         fs::remove_file(&manifest).unwrap();
         assert!(read(0o100).unwrap().is_none());
         fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4522,7 +4585,7 @@ mod tests {
             );
         }
         assert!(!ViewPlacement::Application.executable());
-        assert!(ViewPlacement::Workspace.executable());
+        assert!(ViewPlacement::Workspace(crate::workload_accounts::Kind::Sandbox).executable());
         // An application's view lies below its private home, a workspace's
         // at the human's own path.
         assert_eq!(
@@ -4530,8 +4593,42 @@ mod tests {
             Path::new("/home/td/src/x")
         );
         assert_eq!(
-            ViewPlacement::Workspace.target(&account, "src/x"),
+            ViewPlacement::Workspace(crate::workload_accounts::Kind::Workspace)
+                .target(&account, "src/x"),
             Path::new("/var/home/alice/src/x")
+        );
+        // A workspace launch examines only the views its lines name: one
+        // another running instance holds, released or not yet published,
+        // is passed over.
+        let listed = crate::workload_grants::Manifest::parse_for(
+            Kind::Workspace,
+            "td-grant-views-v1\n0\trw\tsrc\n1\tro\tgone\n2\trw\tnew\n",
+        )
+        .unwrap();
+        let placement = ViewPlacement::Workspace(Kind::Workspace);
+        let named = |target: &Path| target == Path::new("/var/home/alice/src");
+        let chosen = wanted_views(&listed, placement, &account, &named).unwrap();
+        let chosen: Vec<(usize, &Path)> = chosen
+            .iter()
+            .map(|(entry, target)| (entry.index, target.as_path()))
+            .collect();
+        assert_eq!(chosen, [(0, Path::new("/var/home/alice/src"))]);
+        assert_eq!(
+            wanted_views(&listed, placement, &account, &|_| true)
+                .unwrap()
+                .len(),
+            3
+        );
+        // Only the filter stands between the manifest and admission.
+        let views = include_str!("authority.rs")
+            .split("fn manifest_views(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            views
+                .find("wanted_views(&manifest, placement, &account, wanted)?")
+                .unwrap()
+                < views.find("admit_view(").unwrap()
         );
         // A tree the jail's private home reserves is no target.
         assert!(admit_view(

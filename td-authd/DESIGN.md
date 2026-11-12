@@ -838,9 +838,9 @@ through 64 (`REVIEW_SLOTS`), N in canonical decimal. The slots number
 exactly the kind's 1024 rows, so a program that spends workspace rows
 through root can only make td-agent's own slots, which td-agent adopts
 and reuses, and never leave it none by spending them on other names. A
-sandbox keeps any ledger name, a slot's included. No root path asks for
-a workspace's account yet; when root's intake does, it will be through
-these two verbs. No caller supplies a uid. Under
+sandbox keeps any ledger name, a slot's included. Root's workspace
+intake asks for a workspace's account through these two verbs alone
+("Workspace instances"). No caller supplies a uid. Under
 `.principals.lock` it reads the published ledger (an absent one
 refuses) and returns an existing row of the kind and name unchanged, or
 adds the lowest uid of 98304 through 131071 that no row of any kind
@@ -902,10 +902,11 @@ entry of the tree, which only root can add. For a row this allocation
 added any existing tree refuses; as for a home, the row and its home
 then stand, and the next allocation, finding the row, adopts the tree.
 `workspace-empty` empties the tree's directories as the account, beside
-its home ("Workspace launch intake"), and leaves them at 1777. td-jail
-admits no scratch line from a ledger account's spec yet, so no jail
-binds the tree until root's workspace launch (WORKLOADS.md step 8)
-writes them and td-jail admits them. A deployment from before the tree
+its home ("Workspace launch intake"), and leaves them at 1777. Root's
+spec for a `development` instance names the four directories as its
+scratch lines, and td-jail admits those from a workspace account's spec
+alone, and only its own tree's, whole and in order (APPLICATIONS.md §C,
+"The `workspace` kind"). A deployment from before the tree
 does not count it among the taken uids, so after a lost ledger such a
 deployment could give a forgotten workspace's uid to a new sandbox,
 whose account would then hold that tree's group.
@@ -917,8 +918,10 @@ delegation again on its first launch of each boot, as the allocation's
 preparation does, before td-login places the account; until then
 td-login's placement for `tdw<uid>` finds no `td-workload-UID` and warns,
 as for any account without one (td-login/THREAT-MODEL.md §2). Root's
-workspace intake does so at every launch, through `prepare-workload`,
-and makes a failed placement fatal.
+workspace intake does so at every sandbox launch, and at a workspace's
+first instance since the service started and after each creation or
+deletion of its slot, through `prepare-workload`, and makes a failed
+placement fatal.
 
 ## Workload grant table
 
@@ -1075,8 +1078,8 @@ sandbox with an account, and give such a sandbox the host's network
 
 `VERB` is `00` list, `01` grant read-only, `02` grant writable, `03`
 revoke or `04` network. `KIND` is `00` application or `01` sandbox; a
-workspace's account takes no requests until its launches go through
-root (WORKLOADS.md step 8). `NAME` is 1 to 64 bytes in the registry
+workspace's account takes no requests: its views come from its
+instances' plans ("Workspace instances"). `NAME` is 1 to 64 bytes in the registry
 grammar, which the ledger's shares. A list's `TAIL` is one start row
 below 32; a grant's or revoke's is the path, 1 to 1024 bytes; a
 network's is one byte, `00` off or `01` host, and only a sandbox's
@@ -1123,9 +1126,9 @@ itself, then:
   publishing only when it removed one, and answers `TD-GRANT-CLEARED`, a
   tab and the count; it admits nothing and needs no ledger row, and
   leaves the other kind's rows of the name. Request `2c` has no clear:
-  only root's workspace intake asks it, deleting or creating a sandbox
-  ("Workspace launch intake"), through the same spawn path, and a
-  workspace's clear, which frees its slot, has no root caller yet;
+  only root's workspace intake asks it, deleting a sandbox or a slot
+  ("Workspace launch intake"), through the same spawn path, a slot's
+  clear freeing it for the next conversation;
 - for a grant, and for a sandbox's network set to `host`, first admits
   the request: an application must be one the image declares, owned by
   OWNER, with an account of its own (one that runs as the human is
@@ -1973,7 +1976,13 @@ account of its own rather than as the human, and the workspace intake a
 sandbox account's ("Workspace launch intake"), through the same
 publication; no caller supplies a path, access, map or execution. It
 reads the grant table as root reads it (an absent table refuses: boot
-seeds it) and takes the account's directory rows. What a view of each
+seeds it) and takes the account's directory rows. A workspace account's
+views are never the table's: the intake publishes them through the same
+reconciliation from the union of its running instances' plans, read
+under the account's lock ("Workspace instances"), each admitted by
+`workload_grants::validate_view` for its kind, which alone admits
+td-agent's own trees, and only for a workspace; the manifest lists them
+in the same format, read by td-jail for that kind. What a view of each
 row must show is derived from mountinfo by the one function td-jail
 admits it by (`engine/src/mount_identity.rs`): the device and root of
 the mount covering the human's home (the topmost mount at the home or,
@@ -2143,18 +2152,23 @@ Root runs every sandbox (WORKLOADS.md, "Launch path"; td-sandbox/DESIGN.md)
 through `td-authd workspace-serve`, a root daemon td-svc runs on every
 desktop boot after firstboot (td-svc/DESIGN.md, `workspace-intake`): it
 creates and deletes sandboxes, lists and changes their grants and network,
-and starts a shell or a command in one as the sandbox's own account. Its
+and starts a shell or a command in one as the sandbox's own account; and
+it creates and deletes td-agent's workspace slots and starts a workspace
+instance, td-agent's jailed tool host, in one as the slot's own account
+("Workspace instances"). Its
 socket is `/run/td-authd/1000/workspace` (`WORKSPACE_INTAKE` in
 `engine/src/workload_accounts.rs`), beside the other intakes: owned by
 the primary human, UID 1000, at mode 0600 in the root-owned 0755
 `/run/td-authd/1000`, bound blocking and unlinked by the service that
 made it. Each accepted connection's `SO_PEERCRED` uid must be 1000;
 another's connection, root's, an application's or a sandbox's own
-account's included, is closed unanswered. At most 20 connections are
-served at once, over every sandbox, and at most 16 of them launches, each
-holding its thread until its shell or command ends, so open shells never
-keep another verb, answered and gone, from being served; a connection
-past either bound is refused. A failed accept never ends the service, which would end every
+account's included, is closed unanswered. At most 148 connections are
+served at once, over every sandbox and slot: at most 16 of them sandbox
+launches and at most 128 workspace instances, 32 of them in one slot,
+each holding its thread until its shell, command or instance ends, so
+open shells and instances never keep another verb, answered and gone,
+from being served, nor fill each other's places; a connection past any
+bound is refused. A failed accept never ends the service, which would end every
 shell it launched: an interrupted one, or one whose peer gave up, is
 retried at once, and any other is logged and retried after a pause of
 50 ms, doubled for each failure in a row up to one second.
@@ -2173,6 +2187,10 @@ grants NAME
 grant NAME ro|rw PATH
 revoke NAME PATH
 network NAME off|host
+workspace create SLOT
+workspace delete SLOT
+workspace status SLOT
+workspace launch SLOT development|isolated RUNTIME WORD...
 ```
 
 `NAME` is a ledger name (td-sandbox's old names that begin with a digit
@@ -2182,16 +2200,23 @@ td-sandbox's relay grammar (1 to 64 ASCII letters, digits, `-`, `_`, `.`
 or `+`). A `run` word is `x` and its argument's UTF-8 bytes in lowercase
 hex, no NUL, at most 128 words, the first not empty, so any argument is
 one word. `PATH` is the rest of the line, relative to the human's home,
-at most the grant table's path bound; the writer validates it. Anything
-else is refused. The socket's read timeout is cleared before the
-connection goes on.
+at most the grant table's path bound; the writer validates it. `SLOT` is
+one of td-agent's slots, `agent-1` to `agent-960` or `review-1` to
+`review-64` (`workload_accounts::workspace_slot`), never a sandbox's
+name: the `workspace` verbs name the ledger's workspace rows and the
+others its sandbox rows. A `workspace launch` line may be up to 64 KiB
+and its plan follows it ("Workspace instances"); every other line stays
+within 8192 bytes. Anything else is refused. The socket's read timeout is
+cleared before the connection goes on.
 
-Requests on one sandbox are ordered in memory: a `create` or `delete`
-runs only while none of the sandbox's launches, grant reads or changes
-and `status` runs, since either reads or changes its home and rows, and
-no other request on it starts while one does. Two launches of one
-sandbox, and its grant reads and changes, may run at once. Request `2c`
-runs in another root process and is not ordered with them (below).
+Requests on one sandbox or slot are ordered in memory, keyed by kind and
+name, so a sandbox and a slot never share an order: a `create` or
+`delete` runs only while none of its launches or instances, grant reads
+or changes and `status` runs, since either reads or changes its home and
+rows, and no other request on it starts while one does. Two launches of
+one sandbox or instances of one slot, and a sandbox's grant reads and
+changes, may run at once. Request `2c` runs in another root process and
+is not ordered with them (below).
 
 ### Launches
 
@@ -2259,13 +2284,15 @@ its exit frame as an unreported end, and names that log for both.
 
 `workspace-exec`, run as the account, takes only a sandbox's or
 workspace's uid, a positive launcher pid, that uid's spec below root's
-tree, `pty` or `pipes`, a terminal type and, after `--`, a command of at
-most 128 words; checks, as `application-exec` does, that its credentials
-are the account's in every column with no other group and no capability
-and that it is in its own `td-workload-UID/session` leaf (by the shared
-`delegation`), so a failed placement is fatal; then execs
-`/bin/td-jail --workspace PID SPEC --inside MODE TERM PROGRAM [ARG...]`
-with an empty environment at `/`. td-sandbox's relay inside the jail
+tree, for a sandbox `pty` or `pipes` and a terminal type, and, after
+`--`, a command of at most 128 words; checks, as `application-exec` does,
+that its credentials are the account's in every column with no other
+group and no capability and that it is in its own
+`td-workload-UID/session` leaf (by the shared `delegation`), so a failed
+placement is fatal; then execs `/bin/td-jail --workspace PID SPEC
+--inside MODE TERM PROGRAM [ARG...]`, or for a workspace instance, which
+names no relay, `/bin/td-jail --workspace PID SPEC ARG...`, with an empty
+environment at `/`. td-sandbox's relay inside the jail
 opens the PTY, or the pipes, and runs the command (td-sandbox/DESIGN.md,
 "Process and terminal ownership"), and the requester speaks its framed
 relay protocol on the connection after the answer.
@@ -2287,28 +2314,149 @@ answer, and the command does not start. The race fails closed and is
 logged; nothing serialises a launch's binding against another's
 publication.
 
+### Workspace instances
+
+A workspace instance is td-agent's jailed tool host (td-agent/DESIGN.md)
+run in a slot as the slot's `workspace` ledger account `tdwUID`
+(WORKLOADS.md, step 8), reaching the human's directories only through
+views root publishes for it from the instance's plan. The unconfined
+td-agent workspace stays the human's and never comes here. `workspace
+launch SLOT PROFILE RUNTIME WORD...` names td-jail's profile,
+`development` (the host's network) or `isolated` (its own with loopback
+alone), `native` or a declared runtime, which only `development` may
+name, and the entry's arguments, words as `run`'s are. Its plan follows,
+one line per directory and then a line `end`, all of it within the line's
+64 KiB and the request's two seconds:
+
+```
+ROLE PATH
+end
+```
+
+`ROLE` is a td-jail spec key, `worktree`, `checkout`, `repository`,
+`read` or `write` (`workload_grants::Role`), and `PATH` the rest of the
+line, relative to the human's home. Root admits each by
+`workload_grants::validate_role`: a path `validate_path` admits, the
+directories every grant refuses refused, or one of td-agent's own trees
+below the `.local/share` and `.local/state` it reserves, each only in its
+one role:
+
+- `.local/share/td-agent/ws/W/R.git`, a workspace repository, as
+  `repository`;
+- `.local/share/td-agent/store/S.git/objects`, the shared object store,
+  as `read`;
+- `.local/state/td-agent/jail/ID/scratch`, ID 32 lowercase hex digits, a
+  conversation's scratch worktree, as `worktree`.
+
+Each name is 1 to 255 ASCII letters, digits, `-`, `_` or `.`, the first a
+letter or digit, a `.git` name with a stem. No two entries may be one
+directory or nested, and a plan names at most 32. A refused plan is
+refused `final: ` and the reason. For an admitted instance root:
+
+1. requires the slot's own `workspace` ledger row, adding none;
+2. requires a named runtime's store, as a sandbox launch does;
+3. runs `td-firstboot prepare-workload 1000 workspace SLOT` at the
+   account's first instance since the service started, and not again
+   until a `create` or `delete` of the slot, or an instance of it that
+   failed, forgets it: the delegation and the home's mode last the boot,
+   a slot deleted and created again is prepared again, and an account
+   whose tools changed its own home's or scratch tree's mode has it
+   restored at the instance after the one td-jail refused for it. An
+   instance fails when its helper or td-jail cannot start or it exits
+   unsuccessfully;
+4. holds the plan among the plans of the account's running instances,
+   kept in the service's memory by launch: one directory is shared only
+   in one role, so a plan that names a directory another running
+   instance holds in another role (at the other access, or with or
+   without a repository's read-only chain over its hooks and config),
+   or one nested with it, is refused until that instance ends, and so
+   is one that would take the account past 32 directories in all;
+5. publishes the account's views from the union of those plans
+   ("Application filesystem grants"), under the account's lock, the
+   union read under it, so the last publication always lists every
+   running instance's directories: a directory two instances name is one
+   view, and stays while either runs. It requires each plan entry among
+   the published views at its role's access, refusing one that is absent
+   or not the human's own, which td-agent may make and ask again. No
+   grant table row is read or written, and nothing of the human's moves;
+6. writes the instance's spec as a sandbox launch's is written:
+
+   ```
+   format=1
+   profile=development
+   runtime=RUNTIME
+   entry=/td/store/...-td-agent/bin/td-agent
+   program=/td/store/...-td-txt/bin/td-txt
+   home=/var/lib/td/workloads/UID
+   scratch=/var/lib/td/workload-scratch/UID/tmp
+   scratch=/var/lib/td/workload-scratch/UID/var-tmp
+   scratch=/var/lib/td/workload-scratch/UID/shm
+   scratch=/var/lib/td/workload-scratch/UID/run
+   ROLE=/HOME/PATH
+   ```
+
+   `profile` and the four `scratch` lines, the account's own tree
+   ("Workload account ledger"), only for `development`; `runtime` only
+   for a declared one; `/bin/td-agent` and `/bin/td-txt` resolved, never
+   a program the caller names; then a line per plan entry, by role in
+   that order, naming the human's directory at its persistent path;
+7. answers `ok` and runs the jail as a sandbox launch does, with no
+   relay: the entry's arguments follow `--`, and td-agent's tool host
+   speaks on the connection itself.
+
+When the instance ends, failed or not, root takes its plan from the
+account's and publishes the account's views again from the rest, so a
+view only it named is released and one another running instance names
+stays; a refusal after step 4, or a panic of its thread, does the same
+before its answer. A failed republication is logged and leaves the views
+until the account's next instance or shutdown. td-jail examines and
+binds, of the views the manifest lists, only those the spec's lines name
+(APPLICATIONS.md §C, "The `workspace` kind"), so an instance never binds
+another's directories and a sibling's publication or release never
+fails its launch. A view a running instance bound is never released
+under its jail, which holds its own bind; a republication may release a
+view whose source has gone, which only a later instance would bind.
+
+`workspace-exec` takes its relay-less form only for a uid the ledger's
+`workspace` rows hold, and its relay form only for a `sandbox` row's.
+
 ### Creation, deletion and grants
 
-A sandbox the ledger holds is **held** when the grant table holds any
-row of its name or its account's home anything but root's deletion mark.
-Root reads the home's top-level listing alone, through a descriptor that
-follows no link and must be the account's, and walks nothing. `status`
-answers `ok absent`, `ok free UID` or `ok held UID`.
+A sandbox or slot the ledger holds is **held** when the grant table
+holds any row of its name or its account's home anything but root's
+deletion mark; a slot is held, too, while any directory of its scratch
+tree lists anything or its delegation's `cgroup.events` says `populated
+1`, which a conversation that ended without deleting its slot leaves for
+the next to refuse rather than inherit. Root reads each top-level
+listing alone, through a descriptor that follows no link and must be the
+account's, and walks nothing. `status` answers `ok absent`, `ok free UID`
+or `ok held UID`.
 
-`create` never goes over a held sandbox: it answers `refused exists`, a
-reason td-sandbox reads by its word, for the human to adopt the sandbox
-or delete it. Otherwise it runs `td-firstboot allocate-workload 1000
-sandbox NAME` under the same 30-second bound, the one path by which the
-intake adds a ledger row, which finds an existing row rather than adding
-one and prepares its home, takes a deletion's mark from the home, and
-answers `ok UID`: a free sandbox, a deleted one among them, is created
-again with nothing lost.
+`create` never goes over a held sandbox or slot: it answers `refused
+exists`, a reason td-sandbox and td-agent read by its word, for the human
+to adopt it or delete it. Otherwise it runs `td-firstboot
+allocate-workload 1000 sandbox NAME`, or `workspace SLOT`, under the same
+30-second bound, the one path by which the intake adds a ledger row,
+which finds an existing row rather than adding one and prepares its home,
+takes a deletion's mark from the home, and answers `ok UID`: a free
+sandbox or slot, a deleted one among them, is created again with nothing
+lost, and a slot's account is prepared again at its next instance.
 
-`delete` clears every grant row of the sandbox's name, directories,
-sockets and network, through the grant table's one writer
-(`td-firstboot grant-table 1000 clear sandbox NAME`, "Workload grant
-table"); then, when the ledger holds the name, it prepares the account as
-a launch does and has it empty its home as itself: `td-login
+`delete` runs only while no launch or instance of the name does (the
+order above), and, when the ledger holds the name, first ends every process of
+the account's `td-workload-UID` delegation, its own subtree included, by
+writing `1` to the delegation's `cgroup.kill`, root's, which no process
+of the account can escape since it can move none out of its delegation,
+and waits up to ten seconds, by `cgroup.events`, for it to hold none; an
+absent or empty delegation is written nothing, and processes still
+there at the deadline refuse the deletion before anything else, which
+may be asked again. What ends is what its launches and instances left:
+a workspace's background jobs. It clears every
+grant row of the name, directories, sockets and network, through the
+grant table's one writer (`td-firstboot grant-table 1000 clear sandbox
+NAME`, or `workspace`, "Workload grant table"); then, when the ledger
+holds the name, it prepares the account as a launch does and has it
+empty its home as itself: `td-login
 exec-service-as tdwUID -- /bin/td-authd workspace-empty UID`, whose
 checks are `workspace-exec`'s, opens the home without following a link,
 requires it to be the account's, and removes everything below it
@@ -2319,20 +2467,19 @@ times, until the home lists empty. When root made the account a scratch
 tree, a workspace's ("Workload account ledger"), it then empties each of
 the tree's four directories the same way and keeps them, set back to
 1777 through a handle that follows no link; a sandbox's account has no
-tree, and an absent one has nothing to empty. A workspace's background
-jobs outlive its launches, so whatever deletes a workspace must first
-end the processes of its `td-workload-UID` delegation, which no deletion
-here does yet. Root walks no tree a workload wrote.
+tree, and an absent one has nothing to empty. Root walks no tree a
+workload wrote.
 Root then marks the home deleted: a new file of root's, `.td-deleted`,
 made through the home's descriptor and never through a link. It answers
 `ok`. A refused clear stops the deletion before the home, and a home not
-emptied is not marked; a name without a ledger row has nothing more. The
-ledger row stays, since rows are permanent. A marked sandbox takes no
-launch and no `grant`, `revoke` or `network`, each refused `deleted`,
-until it is created again; its listing and `status` still answer. Views
-an earlier launch published stay mounted until the account's next
-launch republishes or shutdown, and no launch of the deleted sandbox
-runs to use them.
+emptied is not marked; a name without a ledger row has nothing to end
+or empty. The ledger row stays, since rows are permanent. A marked
+sandbox or slot takes no launch or instance and no `grant`, `revoke` or
+`network`, each refused `deleted`, until it is created again; its
+listing and `status` still answer. Views an earlier launch published
+stay mounted until the account's next launch republishes or shutdown,
+and no launch of the deleted sandbox runs to use them; a slot's were
+released when its last instance ended.
 
 `grants` answers `ok UID NETWORK COUNT` and COUNT lines of `ACCESS`, a
 tab and `PATH`, every directory row of the sandbox, after the account's
@@ -2354,16 +2501,19 @@ fails closed: the name is held, and creating it again is refused
 The service needs no human program's help to be reached, so any program
 running as UID 1000 may create a sandbox that is not held, delete and
 change any sandbox and start a shell or command in any the ledger holds
-that is not deleted, with that sandbox's grants and network
-(td-login/THREAT-MODEL.md §1).
+that is not deleted, with that sandbox's grants and network; and may
+create, delete and start an instance in any workspace slot, with any plan
+root admits of the human's home (td-login/THREAT-MODEL.md §1).
 
 The controller is safe std over the shared peer-uid query; its
 descriptors are the accepted socket and the stderr pair, handed to the
-child through std's `Stdio` (`UNSAFE.md` §16, "Workspace launch
-intake"). Confinement tests pin its source, its fixed helper, jail and
-emptier argv, the peer rule, its one allocation at `create` after the
-held check and without any deletion, its deletion order, and its one use
-of each prior check.
+child through std's `Stdio`, and its kill and population reads are plain
+files of the delegation opened through its descriptor (`UNSAFE.md` §16,
+"Workspace launch intake"). Confinement tests pin its source, its fixed
+helper, jail and emptier argv, the peer rule, its one allocation per
+kind at `create` after the held check and without any deletion, its
+instance order, its deletion order with the processes ended first, its
+views published only from plans, and its one use of each prior check.
 
 ## Immutable consent description prerequisite
 

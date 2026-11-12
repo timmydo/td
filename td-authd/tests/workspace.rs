@@ -52,6 +52,7 @@ fn a_request_is_one_exact_bounded_line() {
     assert_eq!(
         request,
         Request {
+            kind: Kind::Sandbox,
             name: "default".into(),
             verb: shell(None, "xterm-256color"),
         }
@@ -77,6 +78,7 @@ fn a_request_is_one_exact_bounded_line() {
     assert_eq!(
         Request::parse(line.as_bytes()).unwrap(),
         Request {
+            kind: Kind::Sandbox,
             name: "oracle".into(),
             verb: Verb::Launch(Launch {
                 runtime: None,
@@ -139,6 +141,7 @@ fn a_request_is_one_exact_bounded_line() {
         assert_eq!(
             Request::parse(line.as_bytes()).unwrap(),
             Request {
+                kind: Kind::Sandbox,
                 name: "default".into(),
                 verb
             },
@@ -305,9 +308,9 @@ fn a_launch_needs_the_sandboxs_own_ledger_row() {
         "workspace\tagent\t98305\n",
     ))
     .unwrap();
-    assert_eq!(sandbox_uid(&ledger, "default"), Ok(98304));
+    assert_eq!(account_uid(&ledger, Kind::Sandbox, "default"), Ok(98304));
     for name in ["firefox", "agent", "tools"] {
-        let error = sandbox_uid(&ledger, name).unwrap_err();
+        let error = account_uid(&ledger, Kind::Sandbox, name).unwrap_err();
         assert!(error.contains("has no account"), "{error}");
     }
 }
@@ -352,7 +355,7 @@ fn the_launch_runs_the_jail_as_the_sandboxs_account() {
             vec!["/bin/sh".to_string(), "-c".into(), "id -u; exit 3".into()],
         ),
     ] {
-        let helper = helper(98304, 4242, &spec, mode, term, &command);
+        let helper = helper(98304, 4242, &spec, Some((mode, term)), &command);
         assert_eq!(helper.get_program(), "/bin/td-login");
         let mut expected: Vec<String> = [
             "exec-service-as",
@@ -467,19 +470,23 @@ fn launches_are_bounded_and_give_their_place_back() {
     let shells: Vec<Claim<'_>> = (0..MAX_LAUNCHES)
         .map(|index| {
             claims
-                .claim(&format!("s{index}"), &shell(None, "xterm"))
+                .claim(Kind::Sandbox, &format!("s{index}"), &shell(None, "xterm"))
                 .unwrap()
         })
         .collect();
     let refused = claims
-        .claim("other", &shell(None, "xterm"))
+        .claim(Kind::Sandbox, "other", &shell(None, "xterm"))
         .err()
         .unwrap_or_default();
     assert!(refused.contains("too many"), "{refused}");
-    drop(claims.claim("other", &Verb::Status).unwrap());
-    drop(claims.claim("other", &Verb::Create).unwrap());
+    drop(claims.claim(Kind::Sandbox, "other", &Verb::Status).unwrap());
+    drop(claims.claim(Kind::Sandbox, "other", &Verb::Create).unwrap());
     drop(shells);
-    drop(claims.claim("other", &shell(None, "xterm")).unwrap());
+    drop(
+        claims
+            .claim(Kind::Sandbox, "other", &shell(None, "xterm"))
+            .unwrap(),
+    );
 }
 
 /// A failed accept never ends the service, whose shells would end with
@@ -623,6 +630,15 @@ fn failing<T>(why: &Option<String>, ok: T) -> Result<T, String> {
     }
 }
 
+/// A name as the fake records it: a sandbox's bare, a slot's after its
+/// kind.
+fn named(kind: Kind, name: &str) -> String {
+    match kind {
+        Kind::Sandbox => name.to_string(),
+        _ => format!("{} {name}", kind.as_str()),
+    }
+}
+
 impl Serve for Fake {
     fn prepare(&self, name: &str, launch: &Launch, id: u64) -> Result<Prepared, String> {
         self.asked(format!("prepare {name} {id} {:?}", launch.mode));
@@ -631,10 +647,35 @@ impl Serve for Fake {
             Prepared {
                 uid: 98304,
                 spec: self.spec.clone(),
+                relay: Some((launch.mode, launch.term.clone())),
                 command: launch
                     .command
                     .clone()
                     .unwrap_or_else(|| vec!["/bin/sh".into(), "-i".into()]),
+                held: None,
+            },
+        )
+    }
+
+    fn instance(&self, slot: &str, instance: &Instance, id: u64) -> Result<Prepared, String> {
+        let plan: Vec<String> = instance
+            .plan
+            .iter()
+            .map(|entry| format!("{}={}", entry.role.as_str(), entry.path))
+            .collect();
+        self.asked(format!(
+            "instance {slot} {id} {:?} {}",
+            instance.profile,
+            plan.join(",")
+        ));
+        failing(
+            &self.prepare,
+            Prepared {
+                uid: 98305,
+                spec: self.spec.clone(),
+                relay: None,
+                command: instance.arguments.clone(),
+                held: Some(id),
             },
         )
     }
@@ -643,14 +684,13 @@ impl Serve for Fake {
         &self,
         mut stream: UnixStream,
         prepared: &Prepared,
-        launch: &Launch,
     ) -> Result<(ExitStatus, String), String> {
         assert!(prepared.spec.exists());
-        self.asked(format!(
-            "run {} {}",
-            launch.term,
-            prepared.command.join(" ")
-        ));
+        let relay = prepared
+            .relay
+            .as_ref()
+            .map_or("direct", |(_, term)| term.as_str());
+        self.asked(format!("run {relay} {}", prepared.command.join(" ")));
         // The channel is the connection, past the request.
         let mut first = [0u8; 1];
         stream.read_exact(&mut first).unwrap();
@@ -658,17 +698,28 @@ impl Serve for Fake {
         failing(&self.run, (ExitStatus::from_raw(0), String::new()))
     }
 
-    fn state(&self, _name: &str) -> Result<Option<State>, String> {
+    fn release(&self, prepared: &Prepared, failed: bool) {
+        if let Some(id) = prepared.held {
+            let how = if failed { "failed" } else { "ended" };
+            self.asked(format!("release {id} {how}"));
+        }
+    }
+
+    fn deleted(&self, _kind: Kind, _name: &str) -> Result<bool, String> {
+        Ok(self.state.is_some_and(|state| state.deleted))
+    }
+
+    fn state(&self, _kind: Kind, _name: &str) -> Result<Option<State>, String> {
         Ok(self.state)
     }
 
-    fn create(&self, name: &str) -> Result<u32, String> {
-        self.asked(format!("create {name}"));
+    fn create(&self, kind: Kind, name: &str) -> Result<u32, String> {
+        self.asked(format!("create {}", named(kind, name)));
         failing(&self.create, 98304)
     }
 
-    fn delete(&self, name: &str) -> Result<(), String> {
-        self.asked(format!("delete {name}"));
+    fn delete(&self, kind: Kind, name: &str) -> Result<(), String> {
+        self.asked(format!("delete {}", named(kind, name)));
         failing(&self.delete, ())
     }
 
@@ -836,20 +887,24 @@ fn every_other_verb_is_answered_once() {
 fn a_deletion_and_a_launch_of_one_sandbox_exclude_each_other() {
     let active = Active::default();
     let launch = shell(None, "xterm");
-    let held = active.claim("default", &launch).unwrap();
+    let held = active.claim(Kind::Sandbox, "default", &launch).unwrap();
     let refused = active
-        .claim("default", &Verb::Delete)
+        .claim(Kind::Sandbox, "default", &Verb::Delete)
         .err()
         .unwrap_or_default();
     assert!(refused.contains("is running"), "{refused}");
     // Another sandbox is untouched, and a second launch of this one may
     // run beside the first.
-    drop(active.claim("tools", &Verb::Delete).unwrap());
-    let second = active.claim("default", &launch).unwrap();
+    drop(active.claim(Kind::Sandbox, "tools", &Verb::Delete).unwrap());
+    let second = active.claim(Kind::Sandbox, "default", &launch).unwrap();
     drop(held);
-    assert!(active.claim("default", &Verb::Delete).is_err());
+    assert!(active
+        .claim(Kind::Sandbox, "default", &Verb::Delete)
+        .is_err());
     drop(second);
-    let deleting = active.claim("default", &Verb::Delete).unwrap();
+    let deleting = active
+        .claim(Kind::Sandbox, "default", &Verb::Delete)
+        .unwrap();
     let launch_again = || shell(None, "xterm");
     for verb in [
         launch,
@@ -858,30 +913,47 @@ fn a_deletion_and_a_launch_of_one_sandbox_exclude_each_other() {
         Verb::Status,
         Verb::Grants(grant_requests::Verb::Network(Network::Host)),
     ] {
-        let refused = active.claim("default", &verb).err().unwrap_or_default();
+        let refused = active
+            .claim(Kind::Sandbox, "default", &verb)
+            .err()
+            .unwrap_or_default();
         assert!(
             refused.contains("being created or deleted"),
             "{verb:?}: {refused}"
         );
     }
     // A creation runs alone as a deletion does.
-    let creating = active.claim("tools", &Verb::Create).unwrap();
-    assert!(active.claim("tools", &launch_again()).is_err());
+    let creating = active.claim(Kind::Sandbox, "tools", &Verb::Create).unwrap();
+    assert!(active
+        .claim(Kind::Sandbox, "tools", &launch_again())
+        .is_err());
     drop(creating);
     drop(deleting);
     // A grant read or change holds its sandbox against a creation or a
     // deletion, beside its launches and other changes.
     let change = Verb::Grants(grant_requests::Verb::Network(Network::Off));
-    let changing = active.claim("default", &change).unwrap();
+    let changing = active.claim(Kind::Sandbox, "default", &change).unwrap();
     let refused = active
-        .claim("default", &Verb::Create)
+        .claim(Kind::Sandbox, "default", &Verb::Create)
         .err()
         .unwrap_or_default();
     assert!(refused.contains("being read or changed"), "{refused}");
-    drop(active.claim("default", &Verb::Status).unwrap());
-    drop(active.claim("default", &launch_again()).unwrap());
+    drop(
+        active
+            .claim(Kind::Sandbox, "default", &Verb::Status)
+            .unwrap(),
+    );
+    drop(
+        active
+            .claim(Kind::Sandbox, "default", &launch_again())
+            .unwrap(),
+    );
     drop(changing);
-    drop(active.claim("default", &Verb::Delete).unwrap());
+    drop(
+        active
+            .claim(Kind::Sandbox, "default", &Verb::Delete)
+            .unwrap(),
+    );
     let busy = active.busy();
     assert!(busy.launches.is_empty() && busy.changes.is_empty() && busy.exclusive.is_empty());
     assert_eq!(busy.running, 0);
@@ -889,58 +961,93 @@ fn a_deletion_and_a_launch_of_one_sandbox_exclude_each_other() {
     // Through `handle`: a delete while a shell runs is refused, and
     // nothing is deleted.
     let fake = Fake::default();
-    let running = active.claim("default", &shell(None, "xterm")).unwrap();
+    let running = active
+        .claim(Kind::Sandbox, "default", &shell(None, "xterm"))
+        .unwrap();
     assert_eq!(
         exchange(b"delete default\n", &active, &fake),
-        b"refused a shell or command of sandbox default is running; end it first\n"
+        b"refused a shell, command or instance of sandbox default is running; end it first\n"
     );
     assert!(fake.asked.borrow().is_empty());
     drop(running);
 }
 
-/// A deletion clears every grant row the name holds through the writer
-/// first, then has the account, prepared again, empty its home; a refused
-/// clear stops it before the home, a name without an account has nothing
-/// more, and the ledger is never written.
+/// A deletion of a sandbox or a workspace slot first ends every process
+/// of its account's delegation, then clears every grant row the name
+/// holds through the writer, then has the account, prepared again, empty
+/// its home; a failed stop or a refused clear stops it before the home, a
+/// name without an account has nothing to stop or empty, and the ledger
+/// is never written.
 #[test]
-fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
-    let steps = RefCell::new(Vec::new());
-    let clear = |request: &grant_requests::Request| {
-        assert_eq!(request.verb, grant_requests::Verb::Clear);
+fn a_deletion_ends_the_processes_then_clears_the_rows_before_the_home() {
+    for kind in [Kind::Sandbox, Kind::Workspace] {
+        let steps = RefCell::new(Vec::new());
+        let step = |what: String| steps.borrow_mut().push(what);
+        let clear = |request: &grant_requests::Request| {
+            assert_eq!(request.verb, grant_requests::Verb::Clear);
+            assert_eq!((request.kind, request.name.as_str()), (kind, "agent-1"));
+            step("clear".into());
+            Ok(Written::Cleared(2))
+        };
+        delete(
+            kind,
+            "agent-1",
+            || {
+                step("account".into());
+                Ok(Some(98304))
+            },
+            |uid| {
+                step(format!("stop {uid}"));
+                Ok(())
+            },
+            clear,
+            || {
+                step("prepare".into());
+                Ok(98304)
+            },
+            |uid| {
+                step(format!("empty {uid}"));
+                Ok(())
+            },
+            |uid| {
+                step(format!("mark {uid}"));
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(
-            (request.kind, request.name.as_str()),
-            (Kind::Sandbox, "oracle")
+            *steps.borrow(),
+            [
+                "account",
+                "stop 98304",
+                "clear",
+                "prepare",
+                "empty 98304",
+                "mark 98304"
+            ]
         );
-        steps.borrow_mut().push("clear".to_string());
-        Ok(Written::Cleared(2))
-    };
-    let account = || {
-        steps.borrow_mut().push("account".to_string());
-        Ok(Some(98304))
-    };
-    let prepare = || {
-        steps.borrow_mut().push("prepare".to_string());
-        Ok(98304)
-    };
-    let empty = |uid: u32| {
-        steps.borrow_mut().push(format!("empty {uid}"));
-        Ok(())
-    };
-    let mark = |uid: u32| {
-        steps.borrow_mut().push(format!("mark {uid}"));
-        Ok(())
-    };
-    delete("oracle", clear, account, prepare, empty, mark).unwrap();
-    assert_eq!(
-        *steps.borrow(),
-        ["clear", "account", "prepare", "empty 98304", "mark 98304"]
-    );
+    }
+    // Processes that would not end stop the deletion before anything else.
+    let refused = delete(
+        Kind::Workspace,
+        "agent-1",
+        || Ok(Some(98304)),
+        |_| Err("the account's processes did not end".into()),
+        |_| panic!("cleared before the processes ended"),
+        || panic!("prepared before the processes ended"),
+        |_| panic!("emptied before the processes ended"),
+        |_| panic!("marked before the processes ended"),
+    )
+    .unwrap_err();
+    assert!(refused.contains("did not end"), "{refused}");
 
     let emptied = Cell::new(false);
     let refused = delete(
+        Kind::Sandbox,
         "oracle",
+        || Ok(Some(98304)),
+        |_| Ok(()),
         |_| Err(Failed::Refused(workload_grants::BUSY.into())),
-        || panic!("the ledger read after a refused clear"),
         || panic!("prepared after a refused clear"),
         |_| {
             emptied.set(true);
@@ -952,9 +1059,11 @@ fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
     assert_eq!(refused, workload_grants::BUSY);
     assert!(!emptied.get());
     let failed = delete(
+        Kind::Sandbox,
         "oracle",
-        |_| Err(Failed::Root("ended by a signal".into())),
         || Ok(Some(98304)),
+        |_| Ok(()),
+        |_| Err(Failed::Root("ended by a signal".into())),
         || Ok(98304),
         |_| Ok(()),
         |_| Ok(()),
@@ -963,9 +1072,11 @@ fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
     assert!(failed.contains(LOG), "{failed}");
     // A clear answered with anything else is no clear.
     assert!(delete(
+        Kind::Sandbox,
         "oracle",
-        |_| Ok(Written::Changed(3)),
         || Ok(Some(98304)),
+        |_| Ok(()),
+        |_| Ok(Written::Changed(3)),
         || Ok(98304),
         |_| Ok(()),
         |_| Ok(()),
@@ -973,9 +1084,11 @@ fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
     .is_err());
     // Rows are keyed by name: one without an account is cleared and done.
     delete(
+        Kind::Sandbox,
         "gone",
-        |_| Ok(Written::Cleared(0)),
         || Ok(None),
+        |_| panic!("stopped a name without an account"),
+        |_| Ok(Written::Cleared(0)),
         || panic!("prepared a name without an account"),
         |_| panic!("emptied a name without an account"),
         |_| panic!("marked a name without an account"),
@@ -983,9 +1096,11 @@ fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
     .unwrap();
     // td-firstboot's account must be the ledger's.
     assert!(delete(
+        Kind::Sandbox,
         "oracle",
-        |_| Ok(Written::Cleared(0)),
         || Ok(Some(98304)),
+        |_| Ok(()),
+        |_| Ok(Written::Cleared(0)),
         || Ok(98305),
         |_| panic!("emptied another account's home"),
         |_| panic!("marked another account's home"),
@@ -993,9 +1108,11 @@ fn a_deletion_clears_the_rows_before_the_account_empties_its_home() {
     .is_err());
     // A home not emptied is not marked deleted.
     let failed = delete(
+        Kind::Sandbox,
         "oracle",
-        |_| Ok(Written::Cleared(0)),
         || Ok(Some(98304)),
+        |_| Ok(()),
+        |_| Ok(Written::Cleared(0)),
         || Ok(98304),
         |_| Err("the home nests too deep".into()),
         |_| panic!("marked a home not emptied"),
@@ -1020,6 +1137,7 @@ fn a_creation_never_goes_over_a_held_sandbox() {
             Some(state),
             || panic!("allocated over a held sandbox"),
             |_| panic!("unmarked a held sandbox"),
+            |_| panic!("forgot a held sandbox"),
         )
         .unwrap_err();
         assert_eq!(refused, EXISTS);
@@ -1049,17 +1167,27 @@ fn a_creation_never_goes_over_a_held_sandbox() {
                 steps.borrow_mut().push(format!("unmark {uid}"));
                 Ok(())
             },
+            |uid| steps.borrow_mut().push(format!("forget {uid}")),
         )
         .unwrap();
         assert_eq!(uid, 98304);
-        assert_eq!(*steps.borrow(), ["allocate", "unmark 98304"]);
+        assert_eq!(
+            *steps.borrow(),
+            ["allocate", "forget 98304", "unmark 98304"]
+        );
     }
     let free = Some(State {
         uid: 98304,
         deleted: true,
         held: false,
     });
-    assert!(create(free, || Ok(98305), |_| panic!("unmarked another")).is_err());
+    assert!(create(
+        free,
+        || Ok(98305),
+        |_| panic!("unmarked another"),
+        |_| panic!("forgot another")
+    )
+    .is_err());
     // Through `handle`, the refusal is the one word td-sandbox reads.
     let fake = Fake {
         create: Some(EXISTS.into()),
@@ -1167,7 +1295,7 @@ fn status_names_a_sandbox_held_free_or_absent_and_a_deleted_one_refuses() {
     assert_eq!(exchange(b"delete x\n", &active, &raced), b"ok\n");
     assert_eq!(*raced.asked.borrow(), ["delete x"]);
     assert_eq!(
-        create(state(true, true), || Ok(98304), |_| Ok(())),
+        create(state(true, true), || Ok(98304), |_| Ok(()), |_| ()),
         Err(EXISTS.into())
     );
 }
@@ -1303,18 +1431,21 @@ fn the_intake_allocates_only_at_create_and_writes_grants_only_through_the_writer
         .next()
         .unwrap();
     assert_eq!(source.matches("ALLOCATE_SANDBOX").count(), 1);
+    assert_eq!(source.matches("ALLOCATE_WORKSPACE").count(), 1);
     let create = source
-        .split("fn create(&self, name: &str) -> Result<u32, String> {")
+        .split("fn create(&self, kind: Kind, name: &str) -> Result<u32, String> {")
         .nth(1)
         .unwrap()
         .split("\n    }\n")
         .next()
         .unwrap();
-    assert!(create.contains("application::admit(&application::ALLOCATE_SANDBOX,"));
+    assert!(create.contains("Kind::Workspace => &application::ALLOCATE_WORKSPACE,"));
+    assert!(create.contains("_ => &application::ALLOCATE_SANDBOX,"));
+    assert!(create.contains("application::admit(allocate, primary_account::UID, name)"));
     // A creation reads the sandbox's state and destroys nothing: it
     // neither deletes, clears nor empties, so it cannot go over a held
     // sandbox; the free `create` refuses one before allocating.
-    assert!(create.contains("self.state(name)?,"));
+    assert!(create.contains("self.state(kind, name)?,"));
     for absent in ["delete", "clear", "empty", "Clear"] {
         assert!(!create.contains(absent), "{absent}");
     }
@@ -1327,6 +1458,7 @@ fn the_intake_allocates_only_at_create_and_writes_grants_only_through_the_writer
         .unwrap();
     assert!(free.find("return Err(EXISTS.into());").unwrap() < free.find("allocate()?").unwrap());
     assert_eq!(source.matches("PREPARE_SANDBOX").count(), 2);
+    assert_eq!(source.matches("PREPARE_WORKSPACE").count(), 2);
     for absent in [
         "allocate-workload",
         "allocate-application",
@@ -1346,4 +1478,676 @@ fn the_intake_allocates_only_at_create_and_writes_grants_only_through_the_writer
         assert!(!text.contains("\"grant-table\""), "{file}");
     }
     assert!(include_str!("../src/grant_requests.rs").contains("\"grant-table\","));
+}
+
+/// A launch request as td-agent would send one: the line, then the plan,
+/// then `end`.
+fn instance_request(head: &str, plan: &[&str]) -> Vec<u8> {
+    let mut request = format!("workspace launch {head}\n");
+    for line in plan {
+        request.push_str(line);
+        request.push('\n');
+    }
+    request.push_str("end\n");
+    request.into_bytes()
+}
+
+/// A workspace slot's verbs name one of td-agent's slots, never a
+/// sandbox's name; a launch names its profile, a runtime only with
+/// `development`, and the entry's arguments encoded as `run`'s are.
+#[test]
+fn a_workspace_request_names_a_slot_and_its_launch() {
+    for (line, verb) in [
+        ("workspace create agent-1\n", Verb::Create),
+        ("workspace delete review-64\n", Verb::Delete),
+        ("workspace status agent-960\n", Verb::Status),
+    ] {
+        let request = Request::parse(line.as_bytes()).unwrap();
+        assert_eq!(request.kind, Kind::Workspace, "{line}");
+        assert_eq!(request.verb, verb, "{line}");
+    }
+    let tool_host = format!("{} {}", word("tool-host"), word("--root"));
+    let request = Request::parse(
+        format!("workspace launch agent-2 development native {tool_host}\n").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        request,
+        Request {
+            kind: Kind::Workspace,
+            name: "agent-2".into(),
+            verb: Verb::Instance(Instance {
+                profile: Profile::Development,
+                runtime: None,
+                arguments: vec!["tool-host".into(), "--root".into()],
+                plan: Vec::new(),
+            }),
+        }
+    );
+    let isolated = Request::parse(
+        format!("workspace launch agent-2 isolated native {tool_host}\n").as_bytes(),
+    )
+    .unwrap();
+    assert!(matches!(
+        isolated.verb,
+        Verb::Instance(Instance {
+            profile: Profile::Isolated,
+            ..
+        })
+    ));
+    let runtime =
+        format!("workspace launch agent-2 development freedesktop-sdk-25-08 {tool_host}\n");
+    assert!(Request::parse(runtime.as_bytes()).is_ok());
+    let refused =
+        Request::parse(runtime.replace("development", "isolated").as_bytes()).unwrap_err();
+    assert!(refused.contains("development"), "{refused}");
+    for wrong in [
+        "workspace create agent-0\n".to_string(),
+        "workspace create agent-961\n".into(),
+        "workspace create review-65\n".into(),
+        "workspace create default\n".into(),
+        "workspace create agent-01\n".into(),
+        "workspace status agent-1 agent-2\n".into(),
+        "workspace grants agent-1\n".into(),
+        "workspace launch agent-1 development native\n".into(),
+        format!("workspace launch agent-1 offline native {tool_host}\n"),
+        format!("workspace launch agent-1 development nosuch {tool_host}\n"),
+        format!("workspace launch agent-1 development native {tool_host} tool-host\n"),
+        format!("workspace launch default development native {tool_host}\n"),
+    ] {
+        assert!(Request::parse(wrong.as_bytes()).is_err(), "{wrong}");
+    }
+    // A sandbox's verbs never name a slot's account.
+    assert_eq!(
+        Request::parse(b"create agent-1\n").map(|request| request.kind),
+        Ok(Kind::Sandbox)
+    );
+}
+
+/// The plan follows the launch's line, a `ROLE PATH` line per directory
+/// and `end`, read exactly to its end, so what follows is the channel's:
+/// each path one a plan admits in its role, td-agent's own trees in theirs
+/// alone, none overlapping another, at most `MAX_PLAN`, and all of it
+/// within `MAX_INSTANCE_REQUEST`.
+#[test]
+fn a_workspace_plan_is_read_exactly_and_admitted_by_role() {
+    let head = format!("agent-1 development native {}", word("tool-host"));
+    let read = |plan: &[&str], tail: &[u8]| {
+        let (mut root, mut peer) = UnixStream::pair().unwrap();
+        let mut bytes = instance_request(&head, plan);
+        bytes.extend_from_slice(tail);
+        let writer = std::thread::spawn(move || {
+            let _ = peer.write_all(&bytes);
+            peer
+        });
+        let request = read_request(&mut root);
+        let mut rest = vec![0u8; tail.len()];
+        if request.is_ok() {
+            root.read_exact(&mut rest).unwrap();
+            assert_eq!(rest, tail);
+            assert_eq!(root.read_timeout().unwrap(), None);
+        }
+        drop(root);
+        drop(writer.join().unwrap());
+        request.map(|request| match request.verb {
+            Verb::Instance(instance) => instance.plan,
+            _ => panic!("not an instance"),
+        })
+    };
+    let plan = read(
+        &[
+            "worktree .local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch",
+            "checkout src/td",
+            "repository .local/share/td-agent/ws/w/r.git",
+            "read .local/share/td-agent/store/s.git/objects",
+            "read Documents/notes with spaces",
+            "write out",
+        ],
+        b"\x01\x02",
+    )
+    .unwrap();
+    let roles: Vec<(Role, &str)> = plan
+        .iter()
+        .map(|entry| (entry.role, entry.path.as_str()))
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            (
+                Role::Worktree,
+                ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch"
+            ),
+            (Role::Checkout, "src/td"),
+            (Role::Repository, ".local/share/td-agent/ws/w/r.git"),
+            (Role::Read, ".local/share/td-agent/store/s.git/objects"),
+            (Role::Read, "Documents/notes with spaces"),
+            (Role::Write, "out"),
+        ]
+    );
+    assert_eq!(read(&[], b"\x01").unwrap(), []);
+    for wrong in [
+        "objects src",
+        "write ../x",
+        "write /etc",
+        "write .ssh",
+        "write src/./x",
+        "worktree",
+        "write .local/share/td-agent/ws/w/r.git",
+        "read .local/share/td-agent/ws/w/r.git",
+        "worktree .local/share/td-agent/store/s.git/objects",
+        "write .local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch",
+        "worktree .local/state/td-agent/jail/0123/scratch",
+    ] {
+        assert!(read(&[wrong], b"").is_err(), "{wrong}");
+    }
+    let refused = read(&["write src", "read src/td"], b"").unwrap_err();
+    assert!(refused.contains("overlap"), "{refused}");
+    assert!(refused.starts_with(FINAL), "{refused}");
+    let many: Vec<String> = (0..=MAX_PLAN).map(|n| format!("read d{n}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(read(&many[..MAX_PLAN], b"").is_ok());
+    assert!(read(&many, b"").unwrap_err().contains("more than"));
+    // The whole request is bounded, the plan's lines included.
+    let long = format!("read {}", "a/".repeat(MAX_INSTANCE_REQUEST / 2));
+    assert!(read(&[&long], b"").unwrap_err().contains("too long"));
+    // A plan without its end is given up at the close.
+    let (mut root, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(format!("workspace launch {head}\nwrite out\n").as_bytes())
+        .unwrap();
+    drop(peer);
+    assert!(read_request(&mut root).unwrap_err().contains("ended early"));
+    // A sandbox's line stays within `MAX_REQUEST`.
+    let (mut root, mut peer) = UnixStream::pair().unwrap();
+    let writer = std::thread::spawn(move || {
+        let line = format!(
+            "run default native pipes dumb {}\n",
+            "x61".repeat(MAX_REQUEST)
+        );
+        let _ = peer.write_all(line.as_bytes());
+        peer
+    });
+    assert!(read_request(&mut root).unwrap_err().contains("too long"));
+    drop(root);
+    drop(writer.join().unwrap());
+}
+
+/// An instance's spec names its profile, its runtime, td-agent with td-txt
+/// beside it, its account's home, for `development` its own scratch tree's
+/// four directories, and each plan entry by role in the spec's order, as
+/// the human's directory: td-jail binds each from the view of it.
+#[test]
+fn an_instance_spec_names_the_account_its_scratch_and_its_plan_by_role() {
+    let entry = |role, path: &str| Entry {
+        role,
+        path: path.into(),
+    };
+    let mut instance = Instance {
+        profile: Profile::Development,
+        runtime: Some("freedesktop-sdk-25-08"),
+        arguments: vec!["tool-host".into()],
+        plan: vec![
+            entry(Role::Read, ".local/share/td-agent/store/s.git/objects"),
+            entry(Role::Repository, ".local/share/td-agent/ws/w/r.git"),
+            entry(Role::Checkout, "src/td"),
+            entry(Role::Write, "out"),
+        ],
+    };
+    let home = Kind::Workspace.home(98305);
+    let places = Places {
+        home: &home,
+        scratch: Path::new("/var/lib/td/workload-scratch/98305"),
+        human: Path::new("/var/home/alice"),
+    };
+    let agent = Path::new("/td/store/a-td-agent/bin/td-agent");
+    let txt = Path::new("/td/store/t-td-txt/bin/td-txt");
+    assert_eq!(
+        instance_spec(&instance, agent, txt, &places).unwrap(),
+        concat!(
+            "format=1\n",
+            "profile=development\n",
+            "runtime=freedesktop-sdk-25-08\n",
+            "entry=/td/store/a-td-agent/bin/td-agent\n",
+            "program=/td/store/t-td-txt/bin/td-txt\n",
+            "home=/var/lib/td/workloads/98305\n",
+            "scratch=/var/lib/td/workload-scratch/98305/tmp\n",
+            "scratch=/var/lib/td/workload-scratch/98305/var-tmp\n",
+            "scratch=/var/lib/td/workload-scratch/98305/shm\n",
+            "scratch=/var/lib/td/workload-scratch/98305/run\n",
+            "checkout=/var/home/alice/src/td\n",
+            "repository=/var/home/alice/.local/share/td-agent/ws/w/r.git\n",
+            "read=/var/home/alice/.local/share/td-agent/store/s.git/objects\n",
+            "write=/var/home/alice/out\n",
+        )
+    );
+    instance.profile = Profile::Isolated;
+    instance.runtime = None;
+    instance.plan.truncate(1);
+    assert_eq!(
+        instance_spec(&instance, agent, txt, &places).unwrap(),
+        concat!(
+            "format=1\n",
+            "entry=/td/store/a-td-agent/bin/td-agent\n",
+            "program=/td/store/t-td-txt/bin/td-txt\n",
+            "home=/var/lib/td/workloads/98305\n",
+            "read=/var/home/alice/.local/share/td-agent/store/s.git/objects\n",
+        )
+    );
+    // A line cannot be smuggled through a path.
+    instance.plan = vec![entry(Role::Write, "a\nwrite=/etc")];
+    assert!(instance_spec(&instance, agent, txt, &places).is_err());
+}
+
+/// A workspace instance runs the jail as its account with no relay: the
+/// entry's arguments follow `--` and td-jail starts the entry with them.
+#[test]
+fn an_instance_runs_the_jail_as_its_account_with_no_relay() {
+    let spec = spec_path(98305, 5).unwrap();
+    let command = vec!["tool-host".to_string(), "--root".into(), "/r".into()];
+    let helper = helper(98305, 4242, &spec, None, &command);
+    let mut expected: Vec<String> = [
+        "exec-service-as",
+        "tdw98305",
+        "--",
+        "/bin/td-authd",
+        "workspace-exec",
+        "98305",
+        "4242",
+        "/run/td-authd/workspaces/98305/5",
+        "--",
+    ]
+    .map(String::from)
+    .to_vec();
+    expected.extend(command.iter().cloned());
+    assert_eq!(words(&helper), expected);
+    let exec = Exec::parse(&words(&helper).split_off(5)).unwrap();
+    assert!(exec.relay.is_none());
+    let mut expected: Vec<String> = ["--workspace", "4242", "/run/td-authd/workspaces/98305/5"]
+        .map(String::from)
+        .to_vec();
+    expected.extend(command.iter().cloned());
+    assert_eq!(words(&exec.jail()), expected);
+}
+
+/// The plans an account's running instances hold, whose union its views
+/// are: a directory two hold is one view and stays until neither does; a
+/// plan naming one a running instance holds at another access, or nested
+/// with one, is refused until that instance ends; and the union stays
+/// within `MAX_PLAN`.
+#[test]
+fn instance_plans_hold_views_while_any_running_instance_names_them() {
+    let entry = |role, path: &str| Entry {
+        role,
+        path: path.into(),
+    };
+    let union = |instances: &Instances| -> Vec<(Access, String)> {
+        instances
+            .union(98305)
+            .unwrap()
+            .into_iter()
+            .map(|directory| (directory.access, directory.path))
+            .collect()
+    };
+    let instances = Instances::default();
+    instances
+        .hold(
+            98305,
+            1,
+            &[entry(Role::Worktree, "src"), entry(Role::Read, "doc")],
+        )
+        .unwrap();
+    instances
+        .hold(98305, 2, &[entry(Role::Worktree, "src")])
+        .unwrap();
+    // Another account's are its own.
+    instances
+        .hold(98306, 1, &[entry(Role::Write, "doc")])
+        .unwrap();
+    assert_eq!(
+        union(&instances),
+        [
+            (Access::ReadWrite, "src".to_string()),
+            (Access::ReadOnly, "doc".into())
+        ]
+    );
+    // Another role is refused even at the same access: a repository's
+    // chain makes its hooks read-only, which a writable tree of the same
+    // directory would not.
+    for wrong in [
+        entry(Role::Write, "doc"),
+        entry(Role::Read, "src/a"),
+        entry(Role::Write, "src"),
+        entry(Role::Repository, "src"),
+    ] {
+        let refused = instances.hold(98305, 3, &[wrong]).unwrap_err();
+        assert!(refused.contains("end it first"), "{refused}");
+    }
+    // Releasing the first keeps what the second still names.
+    instances.drop_plan(98305, 1);
+    assert_eq!(union(&instances), [(Access::ReadWrite, "src".to_string())]);
+    instances.drop_plan(98305, 2);
+    assert!(union(&instances).is_empty());
+    assert!(!instances.plans().contains_key(&98305));
+    // The union's bound counts a shared directory once.
+    let many: Vec<Entry> = (0..MAX_PLAN)
+        .map(|n| entry(Role::Read, &format!("d{n}")))
+        .collect();
+    instances.hold(98305, 4, &many).unwrap();
+    instances.hold(98305, 5, &many[..1]).unwrap();
+    let refused = instances
+        .hold(98305, 6, &[entry(Role::Read, "more")])
+        .unwrap_err();
+    assert!(refused.contains("more than"), "{refused}");
+}
+
+/// td-firstboot prepares a workspace's account at its first launch since
+/// the service started and not again, until a creation or a deletion
+/// forgets it: a slot deleted and created again is prepared again. A
+/// preparation naming another account is refused and not remembered.
+#[test]
+fn an_account_is_prepared_once_until_created_or_deleted_again() {
+    let instances = Instances::default();
+    let prepared = Cell::new(0);
+    let prepare = |uid| {
+        prepared.set(prepared.get() + 1);
+        Ok(uid)
+    };
+    instances.prepare_once(98305, || prepare(98305)).unwrap();
+    instances.prepare_once(98305, || prepare(98305)).unwrap();
+    assert_eq!(prepared.get(), 1);
+    instances.forget(98305);
+    instances.prepare_once(98305, || prepare(98305)).unwrap();
+    assert_eq!(prepared.get(), 2);
+    assert!(instances.prepare_once(98306, || prepare(98307)).is_err());
+    instances.prepare_once(98306, || prepare(98306)).unwrap();
+    assert_eq!(prepared.get(), 4);
+    // Root's creation and deletion both forget the account, a deletion
+    // before it ends the account's processes.
+    let source = include_str!("../src/workspace.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(source.contains("            |uid| self.instances.forget(uid),\n"));
+    assert!(source.contains(
+        "            |uid| {\n                self.instances.forget(uid);\n                end_processes(Path::new(CGROUPS), uid, STOP_DEADLINE)\n            },\n"
+    ));
+    assert_eq!(source.matches("self.instances.forget(").count(), 3);
+    assert_eq!(source.matches("self.instances.prepare_once(").count(), 1);
+    // A failed instance has its account prepared again at the next, since
+    // what failed may be its own home's or scratch tree's mode; one that
+    // ended well does not. Its release republishes, which here fails and
+    // is logged.
+    let root = Root {
+        instances: &instances,
+    };
+    let instance = |held| Prepared {
+        uid: 98305,
+        spec: PathBuf::new(),
+        relay: None,
+        command: Vec::new(),
+        held,
+    };
+    instances.hold(98305, 7, &[]).unwrap();
+    root.release(&instance(Some(7)), false);
+    assert!(instances.prepared().contains_key(&98305));
+    instances.hold(98305, 8, &[]).unwrap();
+    root.release(&instance(Some(8)), true);
+    assert!(!instances.prepared().contains_key(&98305));
+    assert!(!instances.plans().contains_key(&98305));
+    // A sandbox's launch holds nothing and forgets nothing.
+    instances.prepare_once(98305, || prepare(98305)).unwrap();
+    root.release(&instance(None), true);
+    assert!(instances.prepared().contains_key(&98305));
+}
+
+/// `workspace-exec`'s form follows the account's kind: a relay only for a
+/// sandbox's row, none only for a workspace slot's.
+#[test]
+fn workspace_exec_takes_the_form_of_its_accounts_kind() {
+    let ledger = accounts::Ledger::parse(concat!(
+        "td-accounts-v1\n",
+        "sandbox\tdefault\t98304\n",
+        "workspace\tagent-1\t98305\n",
+    ))
+    .unwrap();
+    let exec = |uid: u32, relay: bool| {
+        let mut words = vec![
+            uid.to_string(),
+            "4242".into(),
+            format!("/run/td-authd/workspaces/{uid}/3"),
+        ];
+        if relay {
+            words.extend(["pty".into(), "xterm".into()]);
+        }
+        words.extend(["--".into(), "tool-host".into()]);
+        Exec::parse(&words).unwrap()
+    };
+    require_form(&ledger, &exec(98304, true)).unwrap();
+    require_form(&ledger, &exec(98305, false)).unwrap();
+    assert!(require_form(&ledger, &exec(98304, false)).is_err());
+    assert!(require_form(&ledger, &exec(98305, true)).is_err());
+    assert!(require_form(&ledger, &exec(98306, false)).is_err());
+}
+
+/// A deletion ends the account's processes through its delegation's
+/// `cgroup.kill` and waits, bounded, until its events say it is empty; an
+/// absent or empty delegation is written nothing.
+#[test]
+fn a_deletion_ends_the_delegations_processes_within_its_deadline() {
+    let temp = crate::test_temp::TempDir::new("td-workspace-cgroups").unwrap();
+    let cgroups = temp.path();
+    end_processes(cgroups, 98305, Duration::ZERO).unwrap();
+    let delegation = cgroups.join("td-workload-98305");
+    fs::create_dir(&delegation).unwrap();
+    let events = delegation.join("cgroup.events");
+    let kill = delegation.join("cgroup.kill");
+    fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
+    fs::write(&kill, "").unwrap();
+    end_processes(cgroups, 98305, Duration::ZERO).unwrap();
+    assert_eq!(fs::read_to_string(&kill).unwrap(), "");
+    // Processes that never end refuse the deletion at its deadline.
+    fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+    let begun = Instant::now();
+    let refused = end_processes(cgroups, 98305, Duration::from_millis(100)).unwrap_err();
+    assert!(refused.contains("did not end"), "{refused}");
+    assert!(begun.elapsed() >= Duration::from_millis(100));
+    assert_eq!(fs::read_to_string(&kill).unwrap(), "1");
+    // Processes that end once killed let it go on.
+    fs::write(&kill, "").unwrap();
+    let ended = {
+        let (events, kill) = (events.clone(), kill.clone());
+        std::thread::spawn(move || {
+            while fs::read_to_string(&kill).unwrap() != "1" {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
+        })
+    };
+    end_processes(cgroups, 98305, Duration::from_secs(5)).unwrap();
+    ended.join().unwrap();
+    // Events without a population are no answer.
+    fs::write(&events, "frozen 0\n").unwrap();
+    assert!(end_processes(cgroups, 98305, Duration::ZERO).is_err());
+    // A link in the delegation's place is not followed.
+    fs::remove_dir_all(&delegation).unwrap();
+    std::os::unix::fs::symlink(temp.path(), &delegation).unwrap();
+    assert!(end_processes(cgroups, 98305, Duration::ZERO).is_err());
+    // Only a workload account has a delegation.
+    assert!(end_processes(cgroups, 1000, Duration::ZERO).is_err());
+    temp.cleanup().unwrap();
+}
+
+/// A workspace's scratch tree holds files when any of its directories
+/// lists anything; an absent tree holds none, and a directory that is
+/// not the account's refuses.
+#[test]
+fn a_scratch_tree_holds_files_by_its_listings() {
+    let temp = crate::test_temp::TempDir::new("td-workspace-scratch-holds").unwrap();
+    let state = temp.path();
+    let uid = fs::metadata(state).unwrap().uid();
+    let other = uid.wrapping_add(1);
+    assert!(!scratch_holds(state, uid).unwrap());
+    let tree = state.join(accounts::SCRATCH).join(uid.to_string());
+    for name in accounts::SCRATCH_NAMES {
+        fs::create_dir_all(tree.join(name)).unwrap();
+    }
+    assert!(!scratch_holds(state, uid).unwrap());
+    fs::write(tree.join("shm/left"), b"").unwrap();
+    assert!(scratch_holds(state, uid).unwrap());
+    assert!(!scratch_holds(state, other).unwrap());
+    let theirs = state.join(accounts::SCRATCH).join(other.to_string());
+    fs::create_dir_all(theirs.join("tmp")).unwrap();
+    assert!(scratch_holds(state, other).is_err());
+    temp.cleanup().unwrap();
+}
+
+/// Workspace instances have pools of their own: at most `MAX_INSTANCES`
+/// in all and `MAX_SLOT_INSTANCES` in one slot, apart from the sandboxes'
+/// `MAX_LAUNCHES`; a slot with a running instance is neither created nor
+/// deleted, and a sandbox of the same name is another account.
+#[test]
+fn workspace_instances_have_pools_of_their_own() {
+    let instance = || {
+        Verb::Instance(Instance {
+            profile: Profile::Development,
+            runtime: None,
+            arguments: vec!["tool-host".into()],
+            plan: Vec::new(),
+        })
+    };
+    const { assert!(MAX_REQUESTS > MAX_LAUNCHES + MAX_INSTANCES) };
+    let claims = Active::default();
+    let one: Vec<Claim<'_>> = (0..MAX_SLOT_INSTANCES)
+        .map(|_| {
+            claims
+                .claim(Kind::Workspace, "agent-1", &instance())
+                .unwrap()
+        })
+        .collect();
+    let refused = claims
+        .claim(Kind::Workspace, "agent-1", &instance())
+        .err()
+        .unwrap_or_default();
+    assert!(
+        refused.contains("too many instances of workspace agent-1"),
+        "{refused}"
+    );
+    for verb in [Verb::Delete, Verb::Create] {
+        assert!(claims.claim(Kind::Workspace, "agent-1", &verb).is_err());
+    }
+    drop(
+        claims
+            .claim(Kind::Sandbox, "agent-1", &Verb::Delete)
+            .unwrap(),
+    );
+    let rest: Vec<Claim<'_>> = (0..MAX_INSTANCES - MAX_SLOT_INSTANCES)
+        .map(|n| {
+            let slot = format!("agent-{}", 2 + n / MAX_SLOT_INSTANCES);
+            claims.claim(Kind::Workspace, &slot, &instance()).unwrap()
+        })
+        .collect();
+    let refused = claims
+        .claim(Kind::Workspace, "agent-900", &instance())
+        .err()
+        .unwrap_or_default();
+    assert!(
+        refused.contains("too many workspace instances"),
+        "{refused}"
+    );
+    // Sandboxes keep every place of theirs.
+    let shells: Vec<Claim<'_>> = (0..MAX_LAUNCHES)
+        .map(|n| {
+            claims
+                .claim(Kind::Sandbox, &format!("s{n}"), &shell(None, "xterm"))
+                .unwrap()
+        })
+        .collect();
+    drop((one, rest, shells));
+    let busy = claims.busy();
+    assert_eq!((busy.running, busy.instances), (0, 0));
+    assert!(busy.launches.is_empty());
+}
+
+/// A workspace instance is answered `ok` once root prepared it, runs with
+/// the connection as its channel and no relay, and gives back its plan's
+/// hold and its spec when it ends, failed or not; one refused before its
+/// answer holds nothing to give back.
+#[test]
+fn an_instance_answers_once_runs_and_releases_its_plan() {
+    let temp = crate::test_temp::TempDir::new("td-workspace-instance").unwrap();
+    let active = Active::default();
+    let head = format!(
+        "agent-3 development native {} {}",
+        word("tool-host"),
+        word("--root")
+    );
+    for succeeds in [true, false] {
+        let spec = temp.path().join(format!("spec-{succeeds}"));
+        fs::write(&spec, "format=1\n").unwrap();
+        let fake = Fake {
+            spec: spec.clone(),
+            run: (!succeeds).then(|| "start the workspace helper: no such file".into()),
+            ..Fake::default()
+        };
+        let mut request = instance_request(&head, &["checkout src/td", "read doc"]);
+        request.push(1);
+        assert_eq!(exchange(&request, &active, &fake), STARTED);
+        let release = if succeeds {
+            "release 9 ended"
+        } else {
+            "release 9 failed"
+        };
+        assert_eq!(
+            *fake.asked.borrow(),
+            [
+                "instance agent-3 9 Development checkout=src/td,read=doc",
+                "run direct tool-host --root",
+                release
+            ]
+        );
+        assert!(!spec.exists());
+    }
+    let fake = Fake {
+        prepare: Some("workspace agent-3 has no account".into()),
+        ..Fake::default()
+    };
+    assert_eq!(
+        exchange(&instance_request(&head, &[]), &active, &fake),
+        b"refused workspace agent-3 has no account\n"
+    );
+    assert_eq!(*fake.asked.borrow(), ["instance agent-3 9 Development "]);
+    // A deleted slot takes no instance.
+    let fake = Fake {
+        state: Some(State {
+            uid: 98305,
+            deleted: true,
+            held: false,
+        }),
+        ..Fake::default()
+    };
+    assert_eq!(
+        exchange(&instance_request(&head, &[]), &active, &fake),
+        b"refused deleted\n"
+    );
+    assert!(fake.asked.borrow().is_empty());
+    // A slot's other verbs reach root with their kind.
+    let fake = Fake::default();
+    assert_eq!(
+        exchange(b"workspace create agent-3\n", &active, &fake),
+        b"ok 98304\n"
+    );
+    assert_eq!(
+        exchange(b"workspace delete agent-3\n", &active, &fake),
+        b"ok\n"
+    );
+    assert_eq!(
+        *fake.asked.borrow(),
+        ["create workspace agent-3", "delete workspace agent-3"]
+    );
+    assert_eq!(
+        exchange(b"workspace status agent-3\n", &active, &fake),
+        b"ok absent\n"
+    );
+    assert!(active.busy().launches.is_empty());
+    assert_eq!(active.busy().instances, 0);
+    temp.cleanup().unwrap();
 }

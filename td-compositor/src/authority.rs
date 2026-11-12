@@ -99,7 +99,7 @@ impl GrantAccess {
 }
 
 /// The kind of account a grant request names. A workspace's takes no
-/// grants until its launches go through root (WORKLOADS.md step 8).
+/// grants: its views come from its launches' plans (WORKLOADS.md step 8).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GrantKind {
     Application,

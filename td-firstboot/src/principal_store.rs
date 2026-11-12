@@ -477,11 +477,10 @@ impl Directory {
     ) -> Result<GrantReply, String> {
         match (kind, verb) {
             (Kind::Workspace, GrantVerb::Clear) => {}
-            (Kind::Workspace, _) => {
-                return Err(
-                    "workspace accounts take no grants until their launches go through root".into(),
-                )
-            }
+            (Kind::Workspace, _) => return Err(
+                "workspace accounts take no grants: their views come from their launches' plans"
+                    .into(),
+            ),
             (Kind::Application, GrantVerb::Network(_)) => {
                 return Err(
                     "an application's network is its declaration's; only a sandbox's is set here"

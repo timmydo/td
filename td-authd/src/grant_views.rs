@@ -1,6 +1,8 @@
 //! Root publication of a launching account's grant views
 //! (td-authd/DESIGN.md, "Application filesystem grants"): each directory
-//! row the workload grant table holds for the account becomes a detached,
+//! row the workload grant table holds for an application's or a sandbox's
+//! account, or each directory the plans of a workspace account's running
+//! instances name ("Workspace instances"), becomes a detached,
 //! nonrecursive idmapped clone of the human's directory, mapping filesystem
 //! uid/gid 1000 to the account, nosuid, nodev, read-only unless the row is
 //! `rw`, and noexec for an application's account but not a sandbox's or a
@@ -11,7 +13,7 @@ use crate::mount_identity::{self, MountIdentity, MountRow};
 use crate::mount_sys::{self, ViewAccess};
 use crate::portal_files::{self, pinned};
 use crate::workload_accounts::{Kind, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
-use crate::workload_grants::{self as grants, Access, Manifest, Table, View};
+use crate::workload_grants::{self as grants, Access, Directory, Manifest, Table, View};
 use crate::{launch, primary_account};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
@@ -112,6 +114,15 @@ pub(crate) fn human_directory(
     owner: (u32, u32),
 ) -> Result<Option<Source>, String> {
     grants::validate_path(path.as_bytes())?;
+    open_human_directory(home, path, owner)
+}
+
+/// `human_directory` for a path its caller admitted.
+fn open_human_directory(
+    home: &File,
+    path: &str,
+    owner: (u32, u32),
+) -> Result<Option<Source>, String> {
     let mount = mount_id(home)?;
     let mut current = home.try_clone().map_err(|e| e.to_string())?;
     for name in path.split('/') {
@@ -225,6 +236,9 @@ struct Grant {
     access: Access,
     path: String,
     identity: MountIdentity,
+    /// The account's, which decides what its manifest may list
+    /// (`workload_grants::validate_view`).
+    kind: Kind,
     /// By the account's kind (`executable_views`).
     executable: bool,
 }
@@ -251,19 +265,18 @@ fn shows(view: &Present, grant: &Grant) -> bool {
         && view_options(&mount.options, grant.access, grant.executable)
 }
 
-/// The `kind` account `name`'s directory rows, each with what a view of it
-/// must show below `home` by the derivation td-jail admits it by: the root
-/// of the mount covering the home, the home's path below that mount's
-/// mountpoint, and the row's path.
+/// The `kind` account's `directories`, each with what a view of it must
+/// show below `home` by the derivation td-jail admits it by: the root of
+/// the mount covering the home, the home's path below that mount's
+/// mountpoint, and the directory's path.
 fn grants_for(
-    table: &Table,
+    directories: Vec<Directory>,
     kind: Kind,
-    name: &str,
     mountinfo: &str,
     home: &Path,
 ) -> Result<Vec<Grant>, String> {
     let mut grants = Vec::new();
-    for directory in table.directories(kind, name) {
+    for directory in directories {
         let identity =
             mount_identity::human_source_identity(mountinfo, home, Path::new(&directory.path))
                 .map_err(|e| e.to_string())?;
@@ -271,6 +284,7 @@ fn grants_for(
             access: directory.access,
             path: directory.path,
             identity,
+            kind,
             executable: executable_views(kind),
         });
     }
@@ -287,10 +301,11 @@ trait Host {
     type Source;
     /// The views below the account's directory now, each with its mounts.
     fn present(&mut self) -> Result<Vec<Present>, String>;
-    /// The human's directory a row names, opened and checked, with its
-    /// device and inode; None when it is absent. An `executable` view's
-    /// source must also lie on a mount that lets it execute.
-    fn source(&mut self, path: &str, executable: bool) -> Result<Found<Self::Source>, String>;
+    /// The human's directory a row names, admitted for its account's kind
+    /// and access, opened and checked, with its device and inode; None
+    /// when it is absent. An executable view's source must also lie on a
+    /// mount that lets it execute.
+    fn source(&mut self, grant: &Grant) -> Result<Found<Self::Source>, String>;
     fn publish(&mut self, index: usize, source: &Self::Source, grant: &Grant)
         -> Result<(), String>;
     /// Unmounts every mount at the view and removes its mountpoint.
@@ -300,7 +315,11 @@ trait Host {
     fn warn(&mut self, message: &str);
 }
 
-fn manifest_of(listed: &[(usize, usize)], grants: &[Grant]) -> Result<Manifest, String> {
+fn manifest_of(
+    kind: Kind,
+    listed: &[(usize, usize)],
+    grants: &[Grant],
+) -> Result<Manifest, String> {
     let mut views = Vec::new();
     for (index, at) in listed {
         let grant = grants.get(*at).ok_or("grant view plan names no grant")?;
@@ -310,7 +329,7 @@ fn manifest_of(listed: &[(usize, usize)], grants: &[Grant]) -> Result<Manifest, 
             path: grant.path.clone(),
         });
     }
-    Manifest::new(views)
+    Manifest::new_for(kind, views)
 }
 
 /// One launch's publication of `uid`'s views of `grants`, in an order that
@@ -327,7 +346,14 @@ fn manifest_of(listed: &[(usize, usize)], grants: &[Grant]) -> Result<Manifest, 
 ///    is kept; any other row gets a new view at a free index.
 /// 3. The new views are checked as mounted, the manifest replaced, and the
 ///    views it no longer lists released.
-fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), String> {
+///
+/// Returns the manifest published: what a launch may bind.
+fn reconcile<H: Host>(
+    host: &mut H,
+    kind: Kind,
+    uid: u32,
+    grants: &[Grant],
+) -> Result<Manifest, String> {
     let present = host.present()?;
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     for view in &present {
@@ -338,7 +364,7 @@ fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), St
             candidates.push((view.index, at));
         }
     }
-    host.write_manifest(&manifest_of(&candidates, grants)?)?;
+    host.write_manifest(&manifest_of(kind, &candidates, grants)?)?;
     for view in &present {
         if !candidates.iter().any(|(index, _)| *index == view.index) {
             host.release(view.index)?;
@@ -348,7 +374,7 @@ fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), St
     let mut listed: Vec<(usize, usize)> = Vec::new();
     let mut expected: Vec<(usize, (u64, u64, u32, u32))> = Vec::new();
     for (at, grant) in grants.iter().enumerate() {
-        let (source, (device, inode)) = match host.source(&grant.path, grant.executable) {
+        let (source, (device, inode)) = match host.source(grant) {
             Ok(Some(found)) => found,
             Ok(None) => continue,
             Err(error) => {
@@ -388,13 +414,14 @@ fn reconcile<H: Host>(host: &mut H, uid: u32, grants: &[Grant]) -> Result<(), St
             }
         }
     }
-    host.write_manifest(&manifest_of(&listed, grants)?)?;
+    let manifest = manifest_of(kind, &listed, grants)?;
+    host.write_manifest(&manifest)?;
     for (index, _) in &candidates {
         if !listed.iter().any(|(listing, _)| listing == index) {
             host.release(*index)?;
         }
     }
-    Ok(())
+    Ok(manifest)
 }
 
 /// The system `reconcile` runs against for one account.
@@ -412,11 +439,12 @@ impl Host for Live<'_> {
         present_views(self.views, self.uid, &mount_rows(&mount_table()?)?)
     }
 
-    fn source(&mut self, path: &str, executable: bool) -> Result<Found<File>, String> {
-        let Some(source) = human_directory(self.home, path, (HUMAN, HUMAN))? else {
+    fn source(&mut self, grant: &Grant) -> Result<Found<File>, String> {
+        grants::validate_view(grant.kind, grant.access, grant.path.as_bytes())?;
+        let Some(source) = open_human_directory(self.home, &grant.path, (HUMAN, HUMAN))? else {
             return Ok(None);
         };
-        if executable {
+        if grant.executable {
             executable_source(&mount_rows(&mount_table()?)?, mount_id(&source.file)?)?;
         }
         Ok(Some((source.file, (source.device, source.inode))))
@@ -474,18 +502,73 @@ impl Host for Live<'_> {
 /// the views were published from, whose network row a workspace launch
 /// applies.
 pub(crate) fn publish(kind: Kind, name: &str, uid: u32) -> Result<Table, String> {
+    require_kind_uid(kind, uid)?;
+    if kind == Kind::Workspace {
+        return Err("a workspace's views come from its launch's plan, not the grant table".into());
+    }
+    let table = read_table()?;
+    with_account(kind, uid, |live, td, mountinfo, home| {
+        let grants = grants_for(table.directories(kind, name), kind, mountinfo, home)?;
+        // A row this deployment's validator refuses is held, never
+        // published.
+        for (directory, why) in &table.refused(kind, name) {
+            live.warn(&format!("row {:?} is not published: {why}", directory.path));
+        }
+        reconcile(live, kind, uid, &grants)?;
+        if kind == Kind::Application {
+            remove_retired_mountpoint(td, uid, &mount_rows(mountinfo)?, live);
+            if name == portal_files::FILE_CHOOSER_APPLICATION {
+                if let Err(error) = portal_files::sync_downloads(&table) {
+                    live.warn(&format!("the portal's Downloads view: {error}"));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(table)
+}
+
+/// Publishes the views of the workspace account `uid` from the
+/// directories `held` names, read under the account's lock: the union of
+/// the plans its running launches hold (td-authd/DESIGN.md, "Workspace
+/// instances"), never a grant table row. A launch adds its plan before it
+/// publishes and takes it away when it ends, then publishes again, so a
+/// view another running launch named stays mounted until no launch names
+/// it. Returns the manifest published.
+pub(crate) fn publish_plan(
+    uid: u32,
+    held: impl FnOnce() -> Result<Vec<Directory>, String>,
+) -> Result<Manifest, String> {
+    with_account(Kind::Workspace, uid, |live, _, mountinfo, home| {
+        let grants = grants_for(held()?, Kind::Workspace, mountinfo, home)?;
+        reconcile(live, Kind::Workspace, uid, &grants)
+    })
+}
+
+/// Views are published only for a uid of the account's kind, checked
+/// before anything is read.
+fn require_kind_uid(kind: Kind, uid: u32) -> Result<(), String> {
     if !kind.uids().contains(&uid) {
         return Err("grant views belong to a ledger account of the launch's kind".into());
     }
-    let table = read_table()?;
+    Ok(())
+}
+
+/// Runs `publish` for the `kind` account `uid` under its lock, against
+/// its view directory and the human's home: `/var/lib/td` (to hand on),
+/// the mount table as it was read and the home's path.
+fn with_account<T>(
+    kind: Kind,
+    uid: u32,
+    publish: impl FnOnce(&mut Live<'_>, &File, &str, &Path) -> Result<T, String>,
+) -> Result<T, String> {
+    require_kind_uid(kind, uid)?;
     let account = primary_account::load().map_err(|error| error.to_string())?;
     let root = portal_files::directory(Path::new("/"), 0, true)?;
     let var = portal_files::child(&root, "var", 0, true)?;
     let homes = portal_files::child(&var, "home", 0, true)?;
     let home = portal_files::child(&homes, account.name(), HUMAN, true)?;
     let mountinfo = mount_table()?;
-    let grants = grants_for(&table, kind, name, &mountinfo, &account.persistent_home())?;
-    let refused = table.refused(kind, name);
     let lib = portal_files::child(&var, "lib", 0, true)?;
     let td = portal_files::child(&lib, "td", 0, true)?;
     let tree = portal_files::ensure_root_child(&td, grants::VIEW_ROOT_NAME)?;
@@ -498,20 +581,7 @@ pub(crate) fn publish(kind: Kind, name: &str, uid: u32) -> Result<Table, String>
         home: &home,
         namespace: None,
     };
-    // A row this deployment's validator refuses is held, never published.
-    for (directory, why) in &refused {
-        live.warn(&format!("row {:?} is not published: {why}", directory.path));
-    }
-    reconcile(&mut live, uid, &grants)?;
-    if kind == Kind::Application {
-        remove_retired_mountpoint(&td, uid, &mount_rows(&mountinfo)?, &mut live);
-        if name == portal_files::FILE_CHOOSER_APPLICATION {
-            if let Err(error) = portal_files::sync_downloads(&table) {
-                live.warn(&format!("the portal's Downloads view: {error}"));
-            }
-        }
-    }
-    Ok(table)
+    publish(&mut live, &td, &mountinfo, &account.persistent_home())
 }
 
 /// The empty root-owned `Downloads` mountpoint the retired boot unit made

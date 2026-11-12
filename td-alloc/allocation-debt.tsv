@@ -2063,7 +2063,7 @@ td-jail/src/transition.rs	allocating-conversion	114
 td-jail/src/transition.rs	allocation-macro	374
 td-jail/src/transition.rs	heap-owner	3
 td-jail/src/transition.rs	unchecked-growth-or-clone	122
-td-jail/src/workspace.rs	allocating-conversion	29
+td-jail/src/workspace.rs	allocating-conversion	18
 td-jail/src/workspace.rs	allocation-macro	43
 td-jail/src/workspace.rs	unchecked-growth-or-clone	36
 td-jpeg/src/lib.rs	allocating-constructor	4

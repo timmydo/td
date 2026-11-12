@@ -461,11 +461,21 @@ own account.
    table's writer clears a
    workspace's rows; td-login already resolves `tdw<uid>` from a
    workspace row, td-authd/DESIGN.md, "Workload account ledger"); root
-   launching a workspace instance (the intake's workspace verbs, a
-   per-launch plan and its views, td-jail's role lines and its admitting
-   a ledger account's scratch lines, a deletion that ends the slot's
-   processes before its account empties it, and workspace grants, which
-   share the sandbox and workspace half of the grant table); td-agent's intake client, unused; td-agent's cutover, with a
+   launching a workspace instance (landed: the intake's `workspace
+   create`, `delete`, `status` and `launch` verbs on td-agent's slots; a
+   launch's plan of the human's directories by td-jail's roles,
+   td-agent's own trees admitted in their exact shapes and roles alone;
+   the slot account's views published from the union of its running
+   instances' plans, held in root's memory, so none is released under a
+   running instance, with no grant table row read or written and nothing
+   moved; td-jail examining and binding, of a workspace account's views,
+   only those its spec's role lines name, its repositories' git chains
+   from the views, and admitting its own scratch tree's lines; the
+   account prepared once a boot and again after a creation, a deletion
+   or a failed instance; separate pools of 128 instances, 32 a slot; and
+   a deletion, of a sandbox too, refused while a launch or instance of it
+   runs, that first ends what they left in the account's delegation
+   through `cgroup.kill`, td-authd/DESIGN.md, "Workspace instances"); td-agent's intake client, unused; td-agent's cutover, with a
    VM oracle; reviews on the `review-N` pool through root; and the
    diagnose template.
 9. mail and news on their reserved rows, with fetch services of their

@@ -3972,20 +3972,36 @@ with the kind's own departures:
   worktree, a `write` directory) may hold td-jail's own executable or a
   spec program, by path or by mount identity: td-jail runs outside every
   jail, and a launcher may run its entry unconfined.
-- **A ledger caller** names no directory of the human's: its spec has no
-  `scratch`, `worktree`, `checkout`, `repository`, `read` or `write`
-  line, and its home must be the account's own,
-  `/var/lib/td/workloads/UID`. What it reaches of the human's is its
+- **A ledger caller**'s home must be the account's own,
+  `/var/lib/td/workloads/UID`, and what it reaches of the human's is its
   grant views alone: those its manifest lists (td-authd/DESIGN.md,
   "Application filesystem grants"), read and checked as an application
-  launch reads them, each the one mount at its view path with the
-  identity derived for the human's directory, and bound at the human's
-  own path below the human's home, read-only or writable as listed. They join the shared directories'
-  admission: any two overlapping, by source or by target, any overlap
-  with the reserved trees, or one that is or contains the human's home,
-  which stands for the caller's here, refuses the launch. A listed view
-  whose target is reserved is left out with one line on stderr. With no
-  manifest the account has none.
+  launch reads them, admitted for the account's kind (a workspace's may
+  list td-agent's own trees, `workload_grants::validate_view`), each the
+  one mount at its view path with the identity derived for the human's
+  directory, and bound at the human's own path below the human's home,
+  read-only or writable as listed. A sandbox's spec has no `scratch`,
+  `worktree`, `checkout`, `repository`, `read` or `write` line, and every
+  view its manifest lists is bound as a shared directory. A workspace's
+  (td-authd/DESIGN.md, "Workspace instances") may have, with
+  `development`, exactly the four `scratch` lines of its own tree,
+  `/var/lib/td/workload-scratch/UID/{tmp,var-tmp,shm,run}` in that order,
+  and any role lines naming the human's directories by their persistent
+  paths: each must be a view its manifest lists, at the access its role
+  takes (`read` read-only, the rest writable), of a path
+  `workload_grants::validate_role` admits in that role, and each view
+  answers one line. `read` and `write` views are bound as shared
+  directories; `worktree`, `checkout` and `repository` views are bound at
+  the human's paths as those directories, and a checkout's `.git` and a
+  repository's chain below are checked and bound from the view, at the
+  same names below the human's path. A view no line names, another
+  running instance's, is neither examined nor bound, and a line no
+  view answers refuses the launch. Every view joins the directories' admission: any two
+  overlapping, by source or by target, any overlap with the reserved
+  trees, or one that is or contains the human's home, which stands for
+  the caller's here, refuses the launch. A listed view whose target is
+  reserved is left out with one line on stderr. With no manifest the
+  account has none.
 - **Git repositories** (td-agent/DESIGN.md §8, The git mount chain). A
   `checkout` is a worktree that is a git linked worktree: its `.git`
   must be a regular file of one name, bound read-only over it. A

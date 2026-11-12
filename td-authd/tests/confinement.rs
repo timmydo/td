@@ -817,10 +817,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
             include_str!("../../engine/src/mount_identity.rs"),
         ),
     ] {
+        // A workspace plan's `write` role names td-jail's spec key, a word
+        // and no file operation: its one literal is taken out first.
         let production: String = shared
             .split("#[cfg(test)]")
             .next()
             .unwrap()
+            .replacen("Self::Write => \"write\",", "", 1)
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect();
@@ -1099,19 +1102,25 @@ fn the_production_source_and_raw_boundary_are_closed() {
         );
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
-    // The one td-firstboot child runs one of four fixed verbs: the launch
-    // admission, an install's allocation, a sandbox's allocation when
-    // td-sandbox creates it, and a sandbox launch's or deletion's
+    // The one td-firstboot child runs one of six fixed verbs: the launch
+    // admission, an install's allocation, a sandbox's or a workspace
+    // slot's allocation when td-sandbox or td-agent creates it, and a
+    // sandbox launch's, a slot's first instance's or either's deletion's
     // preparation of its existing row, the kind its one fixed word.
     assert!(application.contains(
         "            .arg(check.verb)\n            .arg(owner.to_string())\n            .args(check.words)\n            .arg(name)\n"
     ));
-    assert_eq!(application.matches("    verb: \"").count(), 4);
+    assert_eq!(application.matches("    verb: \"").count(), 6);
     assert!(application.contains("    verb: \"check-launch-application\",\n    words: &[],\n"));
     assert!(application.contains("    verb: \"allocate-application\",\n    words: &[],\n"));
-    assert!(application.contains("    verb: \"prepare-workload\",\n    words: &[\"sandbox\"],\n"));
-    assert!(application.contains("    verb: \"allocate-workload\",\n    words: &[\"sandbox\"],\n"));
-    assert_eq!(application.matches("allocate-workload").count(), 1);
+    for kind in ["sandbox", "workspace"] {
+        for verb in ["prepare-workload", "allocate-workload"] {
+            assert!(application.contains(&format!(
+                "    verb: \"{verb}\",\n    words: &[\"{kind}\"],\n"
+            )));
+        }
+    }
+    assert_eq!(application.matches("allocate-workload").count(), 2);
     assert_eq!(application.matches("admit(&ALLOCATE, ").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
@@ -1605,9 +1614,23 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("remove_file(directory, STAGED_MANIFEST)?", 1),
         ("grants::MANIFEST_NAME)", 1),
         ("mount_identity::human_source_identity(", 1),
+        ("with_account(", 2),
     ] {
         assert_eq!(views.matches(call).count(), count, "grant_views.rs: {call}");
     }
+    // A workspace's views come from its running instances' plans, under
+    // its account's lock, and never from the grant table; every view is
+    // admitted for its account's kind, td-agent's own trees for a
+    // workspace's alone.
+    assert!(views.contains(
+        "    with_account(Kind::Workspace, uid, |live, _, mountinfo, home| {\n        let grants = grants_for(held()?, Kind::Workspace, mountinfo, home)?;\n"
+    ));
+    assert!(views.contains(
+        "    require_kind_uid(kind, uid)?;\n    if kind == Kind::Workspace {\n        return Err("
+    ));
+    assert!(views.contains(
+        "        grants::validate_view(grant.kind, grant.access, grant.path.as_bytes())?;\n"
+    ));
     assert!(views.contains("view_access(grant.access, grant.executable)"));
     // The account's kind alone selects executable views; no row, request
     // or caller does.
@@ -1622,8 +1645,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // helper argv for the ledger account, one fixed jail argv and one
     // fixed emptier argv, the accepted connection a launch's only
     // descriptors beside a private stderr. It allocates only at `create`,
-    // prepares an existing row for a launch and a deletion, and reaches
-    // the grant table only through grant_requests' writer.
+    // prepares an existing row for a launch, a slot's first instance and
+    // a deletion, reaches the grant table only through grant_requests'
+    // writer, and publishes a slot's views only from its plans.
     let workspace = include_str!("../src/workspace.rs")
         .split("#[cfg(test)]")
         .next()
@@ -1642,9 +1666,18 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("stderr_tail::status(&mut command)", 1),
         ("crate::secret_sys::peer_uid(&stream)", 1),
         ("grant_views::publish(Kind::Sandbox, name, uid)?", 1),
-        ("application::admit(", 3),
+        ("grant_views::publish(", 1),
+        (
+            "grant_views::publish_plan(uid, || self.instances.union(uid))",
+            2,
+        ),
+        ("application::admit(", 4),
         ("&application::PREPARE_SANDBOX", 2),
         ("&application::ALLOCATE_SANDBOX", 1),
+        ("&application::PREPARE_WORKSPACE", 2),
+        ("&application::ALLOCATE_WORKSPACE", 1),
+        (".open(pinned(&directory, \"cgroup.kill\"))", 1),
+        ("std::thread::sleep(STOP_POLL)", 1),
         ("grant_requests::perform(", 1),
         ("application::require_process(", 2),
         ("Stdio::from(OwnedFd::from(", 3),
@@ -1658,10 +1691,24 @@ fn the_production_source_and_raw_boundary_are_closed() {
         );
     }
     assert!(workspace.contains("matches!(peer, Ok(uid) if uid == primary_account::UID)"));
+    // workspace-exec's form is its ledger row's kind's, checked before the
+    // process; a failed instance's account is prepared again; a launch's
+    // hold and spec are given back by a guard, a panic included.
+    assert!(workspace.contains(
+        "    let launch = Exec::parse(arguments)?;\n    require_form(&accounts::load()?, &launch)?;\n    application::require_process(\n"
+    ));
+    assert!(workspace.contains(
+        "            self.release_views(prepared.uid, id);\n            if failed {\n                self.instances.forget(prepared.uid);\n            }\n"
+    ));
+    assert!(workspace.contains(
+        "impl<S: Serve> Drop for Launched<'_, S> {\n    fn drop(&mut self) {\n        self.serve.release(&self.prepared, self.failed);\n        let _ = fs::remove_file(&self.prepared.spec);\n"
+    ));
     // The service runs each connection through the real preparation and
     // launch, checks what the human can mend before its answer, and never
     // leaves its accept loop over a failed accept.
-    assert!(workspace.contains("                handle(stream, id, &active, &Root);\n"));
+    assert!(workspace.contains(
+        "                let root = Root {\n                    instances: &active.instances,\n                };\n                handle(stream, id, &active, &root);\n"
+    ));
     assert_eq!(workspace.matches("handle(").count(), 2);
     let prepare = workspace
         .split(
@@ -1671,22 +1718,41 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     let at = |needle: &str| prepare.find(needle).unwrap();
     assert!(
-        at("sandbox_uid(&accounts::load()?, name)?;")
+        at("account_uid(&accounts::load()?, Kind::Sandbox, name)?;")
             < at("require_runtime(Path::new(flathub_app::RUNTIME_STORE), launch.runtime)?;")
             && at("require_runtime(") < at("application::admit(")
             && at("application::admit(") < at("grant_views::publish(")
             && at("grant_views::publish(") < at("specs().write(uid, id, &text)?")
     );
-    // A deletion clears the rows before anything else, and the account,
-    // not root, empties its home.
+    // A slot's instance: its own row, its runtime, its account prepared
+    // once a boot, its plan held, then its views and spec; a refusal
+    // or a panic after the hold gives it back, through its guard.
+    let instance = workspace
+        .split("fn instance(&self, slot: &str, instance: &Instance, id: u64) -> Result<Prepared, String> {")
+        .nth(1)
+        .unwrap();
+    let at = |needle: &str| instance.find(needle).unwrap();
+    assert!(
+        at("account_uid(&accounts::load()?, Kind::Workspace, slot)?;")
+            < at("require_runtime(Path::new(flathub_app::RUNTIME_STORE), instance.runtime)?;")
+            && at("require_runtime(") < at("self.instances.prepare_once(uid, ||")
+            && at("prepare_once(") < at("self.instances.hold(uid, id, &instance.plan)?;")
+            && at("hold(") < at("let hold = PlanHold {")
+            && at("let hold = PlanHold {") < at("self.launch_instance(uid, instance, id)?;")
+            && at("launch_instance(") < at("std::mem::forget(hold);")
+    );
+    // A deletion first ends the account's processes, then clears the
+    // rows, and the account, not root, empties its home.
     let delete = workspace
-        .split("fn delete(\n    name: &str,")
+        .split("fn delete(\n    kind: Kind,\n    name: &str,")
         .nth(1)
         .unwrap();
     let at = |needle: &str| delete.find(needle).unwrap();
     assert!(
-        at("match clear(&request) {") < at("let Some(uid) = account()? else {")
-            && at("account()?") < at("if prepare()? != uid {")
+        at("let account = account()?;") < at("stop(uid)?;")
+            && at("stop(uid)?;") < at("match clear(&request) {")
+            && at("match clear(&request) {") < at("let Some(uid) = account else {")
+            && at("let Some(uid) = account else {") < at("if prepare()? != uid {")
             && at("prepare()?") < at("empty(uid)")
     );
     assert!(
@@ -1752,10 +1818,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
-const GRANT_REQUESTS_FINGERPRINT: u64 = 0x780971233c3be771;
-const GRANT_VIEWS_FINGERPRINT: u64 = 0x1f8b0e4c319550d1;
-const WORKSPACE_FINGERPRINT: u64 = 0x9a5c9f207a502360;
-const APPLICATION_FINGERPRINT: u64 = 0xf4b2603ba8d7144b;
+const GRANT_REQUESTS_FINGERPRINT: u64 = 0x8d1f61d7a37a8d2c;
+const GRANT_VIEWS_FINGERPRINT: u64 = 0xea86f6e9834554d2;
+const WORKSPACE_FINGERPRINT: u64 = 0x7d94d5b3d4e0b810;
+const APPLICATION_FINGERPRINT: u64 = 0xc03468866b2802cb;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {

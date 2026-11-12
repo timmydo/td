@@ -5,6 +5,17 @@ use crate::test_temp::TempDir;
 use std::collections::BTreeMap;
 use std::os::unix::fs::symlink;
 
+/// The table's rows of the `kind` account `name`, as `publish` takes them.
+fn table_grants(
+    table: &Table,
+    kind: Kind,
+    name: &str,
+    mountinfo: &str,
+    home: &Path,
+) -> Result<Vec<Grant>, String> {
+    grants_for(table.directories(kind, name), kind, mountinfo, home)
+}
+
 fn owner(path: &Path) -> (u32, u32) {
     let metadata = fs::metadata(path).unwrap();
     (metadata.uid(), metadata.gid())
@@ -177,12 +188,12 @@ fn the_accounts_kind_alone_makes_views_executable() {
         "td-grants-v1\napplication\tdefault\tdirectory\tro\tMusic\nsandbox\tdefault\tdirectory\trw\tsandbox\n",
     )
     .unwrap();
-    let sandbox = grants_for(&table, Kind::Sandbox, "default", STOCK, Path::new(HOME)).unwrap();
+    let sandbox = table_grants(&table, Kind::Sandbox, "default", STOCK, Path::new(HOME)).unwrap();
     assert_eq!(sandbox.len(), 1);
     assert_eq!(sandbox[0].path, "sandbox");
     assert!(sandbox[0].executable);
     let application =
-        grants_for(&table, Kind::Application, "default", STOCK, Path::new(HOME)).unwrap();
+        table_grants(&table, Kind::Application, "default", STOCK, Path::new(HOME)).unwrap();
     assert_eq!(application.len(), 1);
     assert_eq!(application[0].path, "Music");
     assert!(!application[0].executable);
@@ -274,7 +285,8 @@ fn the_derivation_keeps_the_homes_offset_below_its_mount() {
     )
     .unwrap();
     assert_eq!(table.refused(Kind::Application, "firefox").len(), 1);
-    let grants = grants_for(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
+    let grants =
+        table_grants(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
     assert_eq!(
         grants
             .iter()
@@ -295,13 +307,13 @@ fn the_derivation_keeps_the_homes_offset_below_its_mount() {
     );
     // A home that is its own mount contributes no offset.
     let own = format!("{STOCK}30 25 0:31 /@home/alice {HOME} rw - btrfs /dev/vdb rw\n");
-    let grants = grants_for(&table, Kind::Application, "firefox", &own, Path::new(HOME)).unwrap();
+    let grants = table_grants(&table, Kind::Application, "firefox", &own, Path::new(HOME)).unwrap();
     assert_eq!(
         grants[1].identity,
         identity("0:31", "/@home/alice/Downloads")
     );
     // A view the kernel shows for the stock layout is kept as is.
-    let stock = grants_for(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
+    let stock = table_grants(&table, Kind::Application, "firefox", STOCK, Path::new(HOME)).unwrap();
     let downloads = &stock[1..];
     let mut host = Fake::new(&[("Downloads", 11)]);
     host.mount(0, &grant(Access::ReadWrite, "Downloads"), RW, 11);
@@ -336,6 +348,7 @@ fn grant(access: Access, path: &str) -> Grant {
         access,
         path: path.into(),
         identity: identity("0:19", &format!("/@var/home/alice/{path}")),
+        kind: Kind::Application,
         executable: false,
     }
 }
@@ -413,9 +426,11 @@ impl Host for Fake {
         Ok(self.views.values().cloned().collect())
     }
 
-    fn source(&mut self, path: &str, executable: bool) -> Result<Found<(String, u64)>, String> {
+    fn source(&mut self, grant: &Grant) -> Result<Found<(String, u64)>, String> {
+        let path = grant.path.as_str();
         self.calls.push(format!("source {path}"));
-        if executable && self.noexec.iter().any(|name| name == path) {
+        grants::validate_view(grant.kind, grant.access, path.as_bytes())?;
+        if grant.executable && self.noexec.iter().any(|name| name == path) {
             return Err("its mount is noexec".into());
         }
         match self.sources.iter().find(|(name, _)| name == path) {
@@ -488,7 +503,8 @@ impl Host for Fake {
 
 fn run(host: &mut Fake, grants: &[Grant]) -> Result<(), String> {
     host.grants = grants.to_vec();
-    reconcile(host, UID, grants)
+    let kind = grants.first().map_or(Kind::Application, |grant| grant.kind);
+    reconcile(host, kind, UID, grants).map(drop)
 }
 
 /// A first launch publishes every present source from index 0 and lists
@@ -669,6 +685,55 @@ fn a_stale_view_is_released_and_its_row_published_again() {
     assert_eq!(host.calls.last().map(String::as_str), Some("manifest [0]"));
 }
 
+/// A workspace's views come from its launch's plan, never the table:
+/// td-agent's own trees below reserved ones publish, executable, at their
+/// role's access and are listed; at another access, or as any other
+/// kind's rows, they get no view.
+#[test]
+fn a_workspaces_plan_publishes_td_agents_own_trees_only_for_it() {
+    let repository = ".local/share/td-agent/ws/w-01234567/td.git";
+    let objects = ".local/share/td-agent/store/local-x-0123456789abcdef.git/objects";
+    let workspace = |access, path: &str| Grant {
+        kind: Kind::Workspace,
+        executable: true,
+        ..grant(access, path)
+    };
+    let plan = [
+        workspace(Access::ReadWrite, repository),
+        workspace(Access::ReadOnly, objects),
+        workspace(Access::ReadWrite, "src"),
+    ];
+    let mut host = Fake::new(&[(repository, 11), (objects, 12), ("src", 13)]);
+    run(&mut host, &plan).unwrap();
+    assert_eq!(
+        host.calls.last().map(String::as_str),
+        Some("manifest [0,1,2]")
+    );
+    assert!(!host.calls.iter().any(|call| call.starts_with("warn")));
+    for refused in [
+        workspace(Access::ReadWrite, objects),
+        workspace(Access::ReadOnly, repository),
+        grant(Access::ReadWrite, repository),
+        Grant {
+            kind: Kind::Sandbox,
+            executable: true,
+            ..grant(Access::ReadWrite, repository)
+        },
+    ] {
+        let mut host = Fake::new(&[(repository, 11), (objects, 12)]);
+        run(&mut host, std::slice::from_ref(&refused)).unwrap();
+        assert_eq!(
+            host.calls.last().map(String::as_str),
+            Some("manifest []"),
+            "{refused:?}"
+        );
+        assert!(host.calls.iter().any(|call| call.starts_with("warn")));
+    }
+    // The table's publication takes no workspace: its views are its plan's.
+    let refused = publish(Kind::Workspace, "agent-1", 98304).unwrap_err();
+    assert!(refused.contains("plan"), "{refused}");
+}
+
 /// A published view that does not show its source refuses the launch, and
 /// the manifest stays the one written before it.
 #[test]
@@ -679,8 +744,8 @@ fn a_published_view_that_shows_something_else_refuses() {
         fn present(&mut self) -> Result<Vec<Present>, String> {
             self.0.present()
         }
-        fn source(&mut self, path: &str, executable: bool) -> Result<Found<Self::Source>, String> {
-            self.0.source(path, executable)
+        fn source(&mut self, grant: &Grant) -> Result<Found<Self::Source>, String> {
+            self.0.source(grant)
         }
         fn publish(
             &mut self,
@@ -704,7 +769,13 @@ fn a_published_view_that_shows_something_else_refuses() {
     let downloads = grant(Access::ReadWrite, "Downloads");
     let mut host = Wrong(Fake::new(&[("Downloads", 11)]));
     host.0.grants = vec![downloads.clone()];
-    assert!(reconcile(&mut host, UID, std::slice::from_ref(&downloads)).is_err());
+    assert!(reconcile(
+        &mut host,
+        Kind::Application,
+        UID,
+        std::slice::from_ref(&downloads)
+    )
+    .is_err());
     assert_eq!(host.0.calls.last().map(String::as_str), Some("present"));
     assert!(
         host.0

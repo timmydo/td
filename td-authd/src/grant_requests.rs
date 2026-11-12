@@ -81,7 +81,7 @@ impl Verb {
 
 /// One request: a verb, and an account by kind, `application` or
 /// `sandbox`, and a name in the registry grammar. A workspace's account
-/// takes no grants until its launches go through root.
+/// takes no grants: its views come from its instances' plans.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub verb: Verb,

@@ -710,6 +710,140 @@ pub fn validate_path(relative: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// What td-jail binds a directory of a workspace launch's plan as
+/// (td-authd/DESIGN.md, "Workspace instances"): its spec key. Every role
+/// but `read` is writable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    /// Read-write and executable: what the tools build and run.
+    Worktree,
+    /// A git linked worktree, its `.git` bound read-only over it.
+    Checkout,
+    /// A workspace repository, with its git mount chain over it.
+    Repository,
+    /// Read-only: a shared directory, or the store objects a repository
+    /// borrows.
+    Read,
+    Write,
+}
+
+impl Role {
+    /// In the order td-jail's spec keeps them.
+    pub const ALL: &[Self] = &[
+        Self::Worktree,
+        Self::Checkout,
+        Self::Repository,
+        Self::Read,
+        Self::Write,
+    ];
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|role| role.as_str() == text)
+    }
+
+    /// The spec key td-jail reads it by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Worktree => "worktree",
+            Self::Checkout => "checkout",
+            Self::Repository => "repository",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+
+    pub fn access(self) -> Access {
+        match self {
+            Self::Read => Access::ReadOnly,
+            Self::Worktree | Self::Checkout | Self::Repository | Self::Write => Access::ReadWrite,
+        }
+    }
+}
+
+/// The role in which a workspace's plan may name one of td-agent's own
+/// trees below td's reserved `.local/share` and `.local/state`
+/// (td-agent/DESIGN.md §7, Layout; §8), each of one exact shape: a
+/// workspace repository `.local/share/td-agent/ws/W/R.git`, read-write
+/// with its chain; a store's objects a repository borrows,
+/// `.local/share/td-agent/store/S.git/objects`, read-only; and a
+/// conversation's scratch worktree `.local/state/td-agent/jail/ID/scratch`.
+/// W, R and S are td-agent's names, ASCII letters, digits, `-`, `_` and
+/// `.` beginning with a letter or digit; ID is 32 lowercase hexadecimal
+/// digits. None for any other path.
+fn agent_tree(path: &str) -> Option<Role> {
+    let plain = |name: &str| {
+        name.len() <= MAX_NAME_BYTES
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let git =
+        |name: &str| name.len() <= MAX_NAME_BYTES && name.strip_suffix(".git").is_some_and(plain);
+    let id = |name: &str| {
+        name.len() == 32
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let mut names = path.split('/');
+    let mut name = || names.next();
+    let shape = [name(), name(), name(), name(), name(), name(), name()];
+    match shape {
+        [Some(".local"), Some("share"), Some("td-agent"), Some("ws"), Some(workspace), Some(repository), None]
+            if plain(workspace) && git(repository) =>
+        {
+            Some(Role::Repository)
+        }
+        [Some(".local"), Some("share"), Some("td-agent"), Some("store"), Some(store), Some("objects"), None]
+            if git(store) =>
+        {
+            Some(Role::Read)
+        }
+        [Some(".local"), Some("state"), Some("td-agent"), Some("jail"), Some(conversation), Some("scratch"), None]
+            if id(conversation) =>
+        {
+            Some(Role::Worktree)
+        }
+        _ => None,
+    }
+}
+
+/// A directory a workspace launch's plan names in `role`: one of td-agent's
+/// own trees in its one role (`agent_tree`), or a path `validate_path`
+/// admits. Those trees lie below reserved ones, which no other role and no
+/// other shape reaches.
+pub fn validate_role(role: Role, relative: &[u8]) -> Result<(), String> {
+    match std::str::from_utf8(relative).ok().and_then(agent_tree) {
+        Some(own) if own == role => Ok(()),
+        Some(_) => Err("td-agent's own tree is named in a role it does not take".into()),
+        None => validate_path(relative),
+    }
+}
+
+/// A view a `kind` account's manifest may list with `access`: a path
+/// `validate_path` admits, and for a workspace's account also td-agent's
+/// own trees at their role's access, as its launch's plan named them.
+pub fn validate_view(kind: Kind, access: Access, relative: &[u8]) -> Result<(), String> {
+    let own = std::str::from_utf8(relative).ok().and_then(agent_tree);
+    match (kind, own) {
+        (Kind::Workspace, Some(role)) if role.access() == access => Ok(()),
+        (Kind::Workspace, Some(_)) => {
+            Err("td-agent's own tree is listed at an access its role does not take".into())
+        }
+        _ => validate_path(relative),
+    }
+}
+
+/// Whether two directories below the home, as views name them, are one or
+/// nest: what keeps one account's views apart.
+pub fn overlapping(left: &str, right: &str) -> bool {
+    nested(left, right)
+}
+
 /// One published view: its index below the account's view directory, its
 /// access and the directory below the human's home it shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -729,17 +863,23 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new(mut views: Vec<View>) -> Result<Self, String> {
+    /// An application's or a sandbox's manifest.
+    pub fn new(views: Vec<View>) -> Result<Self, String> {
+        Self::new_for(Kind::Application, views)
+    }
+
+    /// A `kind` account's manifest, each view admitted by `validate_view`.
+    pub fn new_for(kind: Kind, mut views: Vec<View>) -> Result<Self, String> {
         views.sort_by_key(|view| view.index);
         let mut manifest = Self::default();
         for view in views {
-            manifest.admit(view)?;
+            manifest.admit(kind, view)?;
         }
         Ok(manifest)
     }
 
-    fn admit(&mut self, view: View) -> Result<(), String> {
-        validate_path(view.path.as_bytes())?;
+    fn admit(&mut self, kind: Kind, view: View) -> Result<(), String> {
+        validate_view(kind, view.access, view.path.as_bytes())?;
         if view.index >= MAX_VIEWS
             || self.views.len() >= MAX_DIRECTORIES
             || self
@@ -763,7 +903,13 @@ impl Manifest {
         Ok(())
     }
 
+    /// An application's or a sandbox's manifest.
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_for(Kind::Application, text)
+    }
+
+    /// A `kind` account's manifest, each view admitted by `validate_view`.
+    pub fn parse_for(kind: Kind, text: &str) -> Result<Self, String> {
         if text.len() > MAX_MANIFEST_BYTES || !text.ends_with('\n') {
             return Err("grant view manifest is oversized or not newline-terminated".into());
         }
@@ -781,11 +927,14 @@ impl Manifest {
                 .ok()
                 .filter(|number| number.to_string() == *index)
                 .ok_or("noncanonical grant view index")?;
-            manifest.admit(View {
-                index: number,
-                access: Access::parse(access).ok_or("unknown grant view access")?,
-                path: (*path).to_string(),
-            })?;
+            manifest.admit(
+                kind,
+                View {
+                    index: number,
+                    access: Access::parse(access).ok_or("unknown grant view access")?,
+                    path: (*path).to_string(),
+                },
+            )?;
         }
         Ok(manifest)
     }
@@ -1497,5 +1646,108 @@ mod tests {
         };
         Manifest::new(views(MAX_DIRECTORIES)).unwrap();
         assert!(Manifest::new(views(MAX_DIRECTORIES + 1)).is_err());
+    }
+
+    const REPOSITORY: &str = ".local/share/td-agent/ws/td-agent-01234567/td-2.git";
+    const OBJECTS: &str = ".local/share/td-agent/store/github.com-x_y-0123456789abcdef.git/objects";
+    const SCRATCH: &str = ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch";
+
+    /// A workspace's plan reaches td-agent's own trees below reserved ones
+    /// only in their exact shapes and their one role each; every other
+    /// path takes the shared validator, whatever its role.
+    #[test]
+    fn a_plan_names_td_agents_own_trees_in_one_shape_and_role_each() {
+        for (path, role) in [
+            (REPOSITORY, Role::Repository),
+            (OBJECTS, Role::Read),
+            (SCRATCH, Role::Worktree),
+        ] {
+            validate_role(role, path.as_bytes()).unwrap();
+            for other in Role::ALL.iter().filter(|other| **other != role) {
+                assert!(
+                    validate_role(*other, path.as_bytes()).is_err(),
+                    "{path} as {other:?}"
+                );
+            }
+        }
+        for role in Role::ALL {
+            validate_role(*role, b"src/td").unwrap();
+            assert_eq!(Role::parse(role.as_str()), Some(*role));
+        }
+        assert_eq!(Role::parse("objects"), None);
+        for refused in [
+            // The trees around and above them.
+            ".local/share/td-agent",
+            ".local/share/td-agent/ws",
+            ".local/share/td-agent/ws/td-agent-01234567",
+            ".local/share/td-agent/store/x.git",
+            ".local/share/td-agent/store/x.git/objects/info",
+            ".local/share/td-agent/publish/n/r.git",
+            ".local/share/td-agent/ws/n/r.git/objects",
+            ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef",
+            ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/home",
+            ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/runtime/tmp",
+            // Wrong names.
+            ".local/share/td-agent/ws/n/r",
+            ".local/share/td-agent/ws/n/.git",
+            ".local/share/td-agent/ws/-n/r.git",
+            ".local/share/td-agent/ws/../r.git",
+            ".local/share/td-agent/ws/n/r .git",
+            ".local/share/td-agent/store/.git/objects",
+            ".local/state/td-agent/jail/0123456789ABCDEF0123456789abcdef/scratch",
+            ".local/state/td-agent/jail/0123/scratch",
+            ".local/share/td-agent//ws/n/r.git",
+            // Shapes elsewhere, and the rest the validator refuses.
+            ".local/share/other/ws/n/r.git",
+            ".ssh",
+            "a/../b",
+            "",
+        ] {
+            for role in Role::ALL {
+                assert!(
+                    validate_role(*role, refused.as_bytes()).is_err(),
+                    "{refused:?} as {role:?}"
+                );
+            }
+        }
+        // A `.git` name is bounded whole, its suffix included.
+        let stem = "a".repeat(MAX_NAME_BYTES - 4);
+        let longest = format!(".local/share/td-agent/ws/n/{stem}.git");
+        validate_role(Role::Repository, longest.as_bytes()).unwrap();
+        let longer = format!(".local/share/td-agent/ws/n/a{stem}.git");
+        assert!(validate_role(Role::Repository, longer.as_bytes()).is_err());
+    }
+
+    /// Only a workspace's manifest lists td-agent's trees, each at its
+    /// role's access; an application's or a sandbox's is unchanged.
+    #[test]
+    fn only_a_workspaces_manifest_lists_td_agents_trees() {
+        let row = |access: Access, path: &str| {
+            format!("td-grant-views-v1\n0\t{}\t{path}\n", access.as_str())
+        };
+        for (path, access) in [
+            (REPOSITORY, Access::ReadWrite),
+            (OBJECTS, Access::ReadOnly),
+            (SCRATCH, Access::ReadWrite),
+        ] {
+            let other = match access {
+                Access::ReadOnly => Access::ReadWrite,
+                Access::ReadWrite => Access::ReadOnly,
+            };
+            Manifest::parse_for(Kind::Workspace, &row(access, path)).unwrap();
+            assert!(Manifest::parse_for(Kind::Workspace, &row(other, path)).is_err());
+            for kind in [Kind::Application, Kind::Sandbox] {
+                assert!(Manifest::parse_for(kind, &row(access, path)).is_err());
+            }
+            assert!(Manifest::parse(&row(access, path)).is_err());
+        }
+        assert!(Manifest::parse_for(Kind::Workspace, &row(Access::ReadOnly, ".ssh")).is_err());
+        Manifest::parse_for(Kind::Workspace, &row(Access::ReadOnly, "src")).unwrap();
+        // Two views of a workspace still never nest.
+        let nested =
+            format!("td-grant-views-v1\n0\trw\t{REPOSITORY}\n1\tro\t{REPOSITORY}/objects\n");
+        assert!(Manifest::parse_for(Kind::Workspace, &nested).is_err());
+        assert!(overlapping("src", "src/td") && overlapping("src", "src"));
+        assert!(!overlapping("src", "srcs"));
     }
 }

@@ -232,15 +232,15 @@ impl GrantPath {
 }
 
 /// The account kind a grant request names: `application` or `sandbox`;
-/// a workspace takes no grants until its launches go through root
+/// a workspace takes no grants, its views coming from its launches' plans
 /// (WORKLOADS.md, "Landing order", step 8).
 fn grant_kind(word: Option<&str>, verb: &str) -> Result<GrantKind, String> {
     match word {
         Some("application") => Ok(GrantKind::Application),
         Some("sandbox") => Ok(GrantKind::Sandbox),
-        Some("workspace") => {
-            Err("workspace accounts take no grants until their launches go through root".into())
-        }
+        Some("workspace") => Err(
+            "workspace accounts take no grants: their views come from their launches' plans".into(),
+        ),
         Some(other) => Err(format!(
             "'{other}' is not an account kind; try application or sandbox"
         )),

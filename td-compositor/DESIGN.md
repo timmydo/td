@@ -5831,9 +5831,10 @@ the home, with no control character: one is refused before anything is
 sent, td-ctl's own parse included, so a newline cannot end the
 directory early. A line that begins `grant ` or `revoke ` may therefore
 be up to 2048 bytes; every other request keeps the socket's 1024.
-`workspace` is refused by name until its launches go through root
-(WORKLOADS.md step 8). The compositor checks the grammar and bounds
-alone, and that a listing's network byte is the one its kind has; the
+`workspace` is refused by name: a workspace takes its views from its
+launches' plans, never grant rows (WORKLOADS.md step 8). The
+compositor checks the grammar and bounds alone, and that a listing's
+network byte is the one its kind has; the
 path's rules, the account's admission (an application's declaration, a
 sandbox's ledger row) and the source's checks are root's, whose refusal
 is an `error` carrying its reason. A grant changes what the account's

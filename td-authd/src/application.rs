@@ -82,6 +82,30 @@ pub(crate) const PREPARE_SANDBOX: Check = Check {
     uid: workload_uid,
 };
 
+/// A td-agent workspace slot's account, allocated when td-agent creates
+/// the slot through the workspace intake, as a sandbox's is: its ledger row
+/// added from 98304 up when absent, or the existing one returned, with its
+/// empty home, its scratch tree and its delegation.
+pub(crate) const ALLOCATE_WORKSPACE: Check = Check {
+    what: "workspace",
+    verb: "allocate-workload",
+    words: &["workspace"],
+    reply: "TD-WORKLOAD-ALLOCATED\t",
+    deadline: Duration::from_secs(30),
+    uid: workload_uid,
+};
+
+/// A workspace slot's account prepared for its first instance of a boot
+/// or a deletion, as a sandbox's is for each launch.
+pub(crate) const PREPARE_WORKSPACE: Check = Check {
+    what: "workspace",
+    verb: "prepare-workload",
+    words: &["workspace"],
+    reply: "TD-WORKLOAD-PREPARED\t",
+    deadline: Duration::from_secs(30),
+    uid: workload_uid,
+};
+
 struct Request {
     owner: u32,
     name: String,

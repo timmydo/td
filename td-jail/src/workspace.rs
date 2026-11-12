@@ -18,7 +18,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -338,6 +338,29 @@ struct Spec {
     write: Vec<PathBuf>,
     /// A ledger caller's views, root's, bound as `write` and `read` are.
     views: Vec<FilesystemGrant>,
+    /// Whether the spec's directories are bound from views alone: a
+    /// workspace account's, whose lines name the human's directories.
+    views_only: bool,
+    /// Its worktrees, its checkouts last, and its repositories, each the
+    /// view its line names, bound at the human's path from the view.
+    viewed_trees: Vec<FilesystemGrant>,
+    viewed_repositories: Vec<FilesystemGrant>,
+}
+
+impl Spec {
+    /// Whether a `worktree`, `checkout`, `repository`, `read` or `write`
+    /// line names `target`.
+    fn names_directory(&self, target: &Path) -> bool {
+        [
+            &self.worktrees,
+            &self.checkouts,
+            &self.repositories,
+            &self.read,
+            &self.write,
+        ]
+        .iter()
+        .any(|lines| lines.iter().any(|line| line == target))
+    }
 }
 
 /// The exact, ordered keyfile: `format=1`, an optional `profile`, an
@@ -518,12 +541,25 @@ where
     if let Caller::Account(kind) = caller {
         require_account_spec(&spec, kind, uid)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        spec.views = authority::workspace_views(
+        // A workspace binds, and examines, only the views its spec's lines
+        // name: another running instance's may be released or published
+        // under it. A sandbox binds every view its manifest lists.
+        let views = authority::workspace_views(
             &mountinfo,
             uid,
+            kind,
             require_view_target,
             &reserved_identities(&mountinfo, RESERVED)?,
+            &|target| kind != Kind::Workspace || spec.names_directory(target),
         )?;
+        match kind {
+            Kind::Workspace => select_views(
+                &mut spec,
+                views,
+                &crate::primary_account::load()?.persistent_home(),
+            )?,
+            Kind::Sandbox | Kind::Application => spec.views = views,
+        }
     }
     let runtime = spec.runtime;
     // A ledger account's home is the spec's, its own; the human's is the
@@ -652,20 +688,34 @@ fn configuration_installed(config: &Path) -> io::Result<bool> {
     }
 }
 
-/// A ledger caller's spec, which root wrote: the account's own home, and no
-/// directory of the caller's to bind, since the account has none; what it
-/// reaches of the human's is its manifest's views.
+/// A ledger caller's spec, which root wrote: the account's own home. A
+/// sandbox's names no directory, since the account has none of its own and
+/// reaches the human's through every view its manifest lists. A
+/// workspace's may name the four persistent scratch directories of its own
+/// tree, in their order (`account_scratch`), and directories of the human's
+/// by role, each of which must be a view its manifest lists
+/// (`select_views`).
 fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
-    if !(spec.scratch.is_empty()
-        && spec.worktrees.is_empty()
+    let names_directories = !(spec.worktrees.is_empty()
         && spec.checkouts.is_empty()
         && spec.repositories.is_empty()
         && spec.read.is_empty()
-        && spec.write.is_empty())
-    {
-        return Err(invalid(
-            "a ledger account's workspace spec names no directory; its grants are its views",
-        ));
+        && spec.write.is_empty());
+    match kind {
+        Kind::Workspace => {
+            if !spec.scratch.is_empty() && !account_scratch(&spec.scratch, uid) {
+                return Err(invalid(
+                    "a workspace account's persistent scratch is its own scratch tree's",
+                ));
+            }
+        }
+        Kind::Sandbox | Kind::Application => {
+            if !spec.scratch.is_empty() || names_directories {
+                return Err(invalid(
+                    "a ledger account's workspace spec names no directory; its grants are its views",
+                ));
+            }
+        }
     }
     if spec.home != kind.home(uid) {
         return Err(crate::error(
@@ -677,6 +727,98 @@ fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
             ),
         ));
     }
+    Ok(())
+}
+
+/// Whether `scratch` is exactly the workspace account `uid`'s persistent
+/// scratch directories, root's tree of them below
+/// `/var/lib/td/workload-scratch/UID` (td-authd/DESIGN.md, "Workload
+/// account ledger"), in the order a spec's scratch lines bind them. Spec
+/// paths are canonical, so their names compare exactly.
+fn account_scratch(scratch: &[PathBuf], uid: u32) -> bool {
+    use crate::workload_accounts::{DIRECTORY, SCRATCH, SCRATCH_NAMES};
+    let ours = |path: &Path, name: &str| {
+        let Ok(below) = path.strip_prefix(DIRECTORY) else {
+            return false;
+        };
+        let mut names = below.iter().map(OsStr::to_str);
+        let account = |digits: &str| {
+            canonical_decimal(digits) && digits.parse::<u32>().is_ok_and(|n| n == uid)
+        };
+        names.next() == Some(Some(SCRATCH))
+            && names.next().flatten().is_some_and(account)
+            && names.next() == Some(Some(name))
+            && names.next().is_none()
+    };
+    scratch.len() == SCRATCH_NAMES.len()
+        && scratch
+            .iter()
+            .zip(SCRATCH_NAMES)
+            .all(|(path, name)| ours(path, name))
+}
+
+/// A workspace account's directories, each its line's view: for every
+/// `worktree`, `checkout`, `repository`, `read` and `write` line, the view
+/// its manifest lists whose target, the human's directory below `human`,
+/// the line names, at the access its role takes, of a path the role admits
+/// (`workload_grants::validate_role`, td-agent's own trees in their one
+/// role each). A line no view answers refuses the launch; a view no line
+/// names, another running instance's, is not bound. Read and write views
+/// become shared directories; the rest are bound from their views at the
+/// paths their lines name.
+fn select_views(spec: &mut Spec, mut views: Vec<FilesystemGrant>, human: &Path) -> io::Result<()> {
+    use crate::workload_grants::{validate_role, Access, Role};
+    let oom = |_| io::Error::from(io::ErrorKind::OutOfMemory);
+    spec.views_only = true;
+    for role in Role::ALL {
+        let targets = match role {
+            Role::Worktree => &spec.worktrees,
+            Role::Checkout => &spec.checkouts,
+            Role::Repository => &spec.repositories,
+            Role::Read => &spec.read,
+            Role::Write => &spec.write,
+        };
+        for target in targets {
+            let relative = target
+                .strip_prefix(human)
+                .ok()
+                .and_then(Path::to_str)
+                .ok_or_else(|| {
+                    crate::error(
+                        io::ErrorKind::InvalidInput,
+                        format_args!(
+                            "workspace {} {} is not below the human's home",
+                            role.as_str(),
+                            target.display()
+                        ),
+                    )
+                })?;
+            validate_role(*role, relative.as_bytes()).map_err(invalid)?;
+            let read_only = role.access() == Access::ReadOnly;
+            let at = views
+                .iter()
+                .position(|view| view.target == *target && view.read_only == read_only)
+                .ok_or_else(|| {
+                    crate::error(
+                        io::ErrorKind::InvalidInput,
+                        format_args!(
+                            "workspace {} {} is no view the account's manifest lists at its access",
+                            role.as_str(),
+                            target.display()
+                        ),
+                    )
+                })?;
+            let view = views.swap_remove(at);
+            let into = match role {
+                Role::Read | Role::Write => &mut spec.views,
+                Role::Worktree | Role::Checkout => &mut spec.viewed_trees,
+                Role::Repository => &mut spec.viewed_repositories,
+            };
+            crate::allocation::push(into, view).map_err(oom)?;
+        }
+    }
+    spec.read.clear();
+    spec.write.clear();
     Ok(())
 }
 
@@ -846,43 +988,54 @@ fn admit(
             spec.home.display()
         )));
     }
-    let worktrees = spec
-        .worktrees
-        .iter()
-        .chain(spec.checkouts.iter())
-        .map(|tree| admit_directory(tree, false))
-        .collect::<io::Result<Vec<_>>>()?;
-    let repositories = spec
-        .repositories
-        .iter()
-        .map(|tree| admit_directory(tree, false))
-        .collect::<io::Result<Vec<_>>>()?;
+    // A workspace account's are its views, bound at the human's paths; any
+    // other caller's are its own directories.
+    let worktrees = if spec.views_only {
+        std::mem::take(&mut spec.viewed_trees)
+    } else {
+        spec.worktrees
+            .iter()
+            .chain(spec.checkouts.iter())
+            .map(|tree| admit_directory(tree, false))
+            .collect::<io::Result<Vec<_>>>()?
+    };
+    let repositories = if spec.views_only {
+        std::mem::take(&mut spec.viewed_repositories)
+    } else {
+        spec.repositories
+            .iter()
+            .map(|tree| admit_directory(tree, false))
+            .collect::<io::Result<Vec<_>>>()?
+    };
     // Beside repositories, a git worktree is a checkout, whose `.git` is
     // protected: a plain worktree's could be pointed at a repository the
     // jail made.
-    if !spec.repositories.is_empty() {
-        for tree in &spec.worktrees {
-            match fs::symlink_metadata(tree.join(".git")) {
+    if !repositories.is_empty() {
+        for tree in worktrees.iter().take(spec.worktrees.len()) {
+            match fs::symlink_metadata(joined(&tree.source, ".git".as_ref())?) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 _ => {
                     return Err(invalid(format!(
                     "workspace worktree {} holds a `.git` beside repositories; name it a checkout",
-                    tree.display()
+                    tree.target.display()
                 )))
                 }
             }
         }
     }
+    // Each chain bound from its tree's source, a view's for a workspace
+    // account, at its tree's target.
     let mut chain = Vec::new();
-    for checkout in &spec.checkouts {
+    for checkout in worktrees.iter().skip(spec.worktrees.len()) {
         chain.push(admit_git_entry(
-            &checkout.join(".git"),
+            joined(&checkout.source, ".git".as_ref())?,
+            joined(&checkout.target, ".git".as_ref())?,
             FilesystemSourceKind::File,
             true,
         )?);
     }
-    for repository in &spec.repositories {
-        chain.extend(repository_chain(repository)?);
+    for repository in &repositories {
+        chain.extend(repository_chain(&repository.source, &repository.target)?);
     }
     if chain.len() > MAX_CHAIN {
         return Err(invalid(format!(
@@ -1018,8 +1171,15 @@ fn admit(
         identities.push((grant.source.clone(), mounts));
     }
     // A view binds at the human's path, not at its source's, so its target
-    // must meet no other bind's either.
-    for view in shared.iter().skip(first_view) {
+    // must meet no other bind's either: a workspace account's worktrees
+    // and repositories are views too.
+    let viewed = |trees: usize| if spec.views_only { trees } else { 0 };
+    for view in shared
+        .iter()
+        .skip(first_view)
+        .chain(worktrees.iter().take(viewed(worktrees.len())))
+        .chain(repositories.iter().take(viewed(repositories.len())))
+    {
         let met = all
             .iter()
             .filter(|grant| paths_overlap(&grant.target, &view.target))
@@ -1143,21 +1303,31 @@ fn check_plan_bytes<'a>(paths: impl Iterator<Item = &'a PathBuf>, most: usize) -
 /// read-only; and each `worktrees/<id>/` read-write on that, with its
 /// protected files read-only. Every protected entry must exist: its
 /// launcher creates them before any instance binds the repository, and an
-/// absent one cannot be protected.
-fn repository_chain(repository: &Path) -> io::Result<Vec<FilesystemGrant>> {
+/// absent one cannot be protected. Each entry is reached below `source`,
+/// a workspace account's view of the repository or the repository itself,
+/// and bound at the same name below `target`, where the repository is.
+fn repository_chain(source: &Path, target: &Path) -> io::Result<Vec<FilesystemGrant>> {
     use FilesystemSourceKind::{Directory, File};
+    let entry = |name: &OsStr, kind, read_only| {
+        admit_git_entry(
+            joined(source, name)?,
+            joined(target, name)?,
+            kind,
+            read_only,
+        )
+    };
     let mut chain = vec![
-        admit_git_entry(&repository.join("objects"), Directory, false)?,
-        admit_git_entry(&repository.join("objects/info"), Directory, true)?,
+        entry("objects".as_ref(), Directory, false)?,
+        entry("objects/info".as_ref(), Directory, true)?,
     ];
     for name in REPOSITORY_FILES {
-        chain.push(admit_git_entry(&repository.join(name), File, true)?);
+        chain.push(entry(name.as_ref(), File, true)?);
     }
     for name in REPOSITORY_DIRECTORIES {
-        chain.push(admit_git_entry(&repository.join(name), Directory, true)?);
+        chain.push(entry(name.as_ref(), Directory, true)?);
     }
-    let linked = repository.join("worktrees");
-    chain.push(admit_git_entry(&linked, Directory, true)?);
+    let linked = joined(source, "worktrees".as_ref())?;
+    chain.push(entry("worktrees".as_ref(), Directory, true)?);
     let mut ids = fs::read_dir(&linked)?
         .take(MAX_TREES + 1)
         .map(|entry| entry.map(|entry| entry.file_name()))
@@ -1165,28 +1335,52 @@ fn repository_chain(repository: &Path) -> io::Result<Vec<FilesystemGrant>> {
     if ids.len() > MAX_TREES {
         return Err(invalid(format!(
             "workspace repository {} has more than {MAX_TREES} linked worktrees",
-            repository.display()
+            target.display()
         )));
     }
     ids.sort();
     for id in ids {
-        let entry = linked.join(id);
-        chain.push(admit_git_entry(&entry, Directory, false)?);
+        let linked = joined("worktrees".as_ref(), &id)?;
+        chain.push(entry(linked.as_os_str(), Directory, false)?);
         for name in LINKED_FILES {
-            chain.push(admit_git_entry(&entry.join(name), File, true)?);
+            chain.push(entry(
+                joined(&linked, name.as_ref())?.as_os_str(),
+                File,
+                true,
+            )?);
         }
     }
     Ok(chain)
 }
 
-/// One entry of a git chain: present, of its kind, not a link, and a
-/// file with no other name.
+/// `base` joined with the relative `name`, as `Path::join` joins them, in
+/// fallibly grown storage.
+fn joined(base: &Path, name: &OsStr) -> io::Result<PathBuf> {
+    let oom = |_| io::Error::from(io::ErrorKind::OutOfMemory);
+    let (base, name) = (base.as_os_str().as_bytes(), name.as_bytes());
+    let slash = !base.is_empty() && !base.ends_with(b"/");
+    let mut bytes = crate::allocation::with_capacity(base.len() + usize::from(slash) + name.len())
+        .map_err(oom)?;
+    crate::allocation::extend_from_slice(&mut bytes, base).map_err(oom)?;
+    if slash {
+        crate::allocation::push(&mut bytes, b'/').map_err(oom)?;
+    }
+    crate::allocation::extend_from_slice(&mut bytes, name).map_err(oom)?;
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// One entry of a git chain: present at `source`, of its kind, not a
+/// link, and a file with no other name; bound at `target`, the same name
+/// where the instance sees its repository or checkout.
 fn admit_git_entry(
-    path: &Path,
+    source: PathBuf,
+    target: PathBuf,
     kind: FilesystemSourceKind,
     read_only: bool,
 ) -> io::Result<FilesystemGrant> {
+    let path = source.as_path();
     authority::validate_filesystem_target(path)
+        .and_then(|()| authority::validate_filesystem_target(&target))
         .map_err(|_| invalid(format!("workspace git entry {path:?} is not canonical")))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| invalid(format!("workspace git entry {}: {error}", path.display())))?;
@@ -1212,8 +1406,8 @@ fn admit_git_entry(
         )));
     }
     Ok(FilesystemGrant {
-        source: path.to_path_buf(),
-        target: path.to_path_buf(),
+        source,
+        target,
         read_only,
         source_kind: kind,
         source_device: metadata.dev(),
@@ -1832,6 +2026,49 @@ mod tests {
         )
         .unwrap();
         assert!(require_account_spec(&other, Kind::Sandbox, 98304).is_err());
+        // A workspace's spec may name directories by role, which only its
+        // views can answer (`select_views`), and its own scratch tree,
+        // whole and in order; a sandbox's names neither.
+        let scratch = |uid: u32| {
+            crate::workload_accounts::SCRATCH_NAMES
+                .iter()
+                .map(|name| format!("scratch=/var/lib/td/workload-scratch/{uid}/{name}\n"))
+                .collect::<String>()
+        };
+        let workspace = |extra: &str| {
+            parse_spec(&format!(
+                "format=1\nprofile=development\nentry=/td/store/x/bin/td-agent\nhome=/var/lib/td/workloads/98305\n{extra}"
+            ))
+            .unwrap()
+        };
+        let roles = "worktree=/var/home/alice/src\nrepository=/var/home/alice/r.git\nread=/var/home/alice/doc\nwrite=/var/home/alice/out\n";
+        let ours = scratch(98305) + roles;
+        assert!(require_account_spec(&workspace(&ours), Kind::Workspace, 98305).is_ok());
+        assert!(require_account_spec(&workspace(roles), Kind::Workspace, 98305).is_ok());
+        let sandbox = format!(
+            "format=1\nprofile=development\nentry=/td/store/x/bin/td-sandbox\nhome={home}\n{}",
+            scratch(98304)
+        );
+        assert!(
+            require_account_spec(&parse_spec(&sandbox).unwrap(), Kind::Sandbox, 98304).is_err()
+        );
+        let another = scratch(98306);
+        let reordered: String = scratch(98305)
+            .lines()
+            .rev()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for wrong in [
+            another.as_str(),
+            reordered.as_str(),
+            "scratch=/var/lib/td/workload-scratch/098305/tmp\nscratch=/var/lib/td/workload-scratch/098305/var-tmp\nscratch=/var/lib/td/workload-scratch/098305/shm\nscratch=/var/lib/td/workload-scratch/098305/run\n",
+            "scratch=/var/lib/td/workloads/98305/tmp\nscratch=/var/lib/td/workloads/98305/var-tmp\nscratch=/var/lib/td/workloads/98305/shm\nscratch=/var/lib/td/workloads/98305/run\n",
+        ] {
+            assert!(
+                require_account_spec(&workspace(wrong), Kind::Workspace, 98305).is_err(),
+                "{wrong}"
+            );
+        }
         assert!(require_view_target(Path::new("/var/home/alice/sandbox")).is_ok());
         for reserved in ["/run/x", "/tmp/x", "/etc", "/opt/workspace", "/"] {
             assert!(
@@ -2037,6 +2274,7 @@ mod tests {
             read: read.iter().map(|path| path.to_path_buf()).collect(),
             write: Vec::new(),
             views: Vec::new(),
+            ..Spec::default()
         };
         let spec_path = base.join("spec");
         let admit_spec = |spec: Spec| {
@@ -2170,6 +2408,150 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A workspace account binds, of its manifest's views, those its
+    /// spec's role lines name, each at its role's access and of a path its
+    /// role admits; a line no view answers refuses, and a view no line
+    /// names, another instance's, stays unbound.
+    #[test]
+    fn a_workspace_binds_the_views_its_lines_name_in_their_roles() {
+        let human = Path::new("/var/home/alice");
+        let view = |index: u32, path: &str, read_only: bool| FilesystemGrant {
+            source: PathBuf::from(format!("/var/lib/td/grant-views/98305/{index}")),
+            target: human.join(path),
+            read_only,
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: 1,
+            source_inode: u64::from(index),
+        };
+        let views = || {
+            vec![
+                view(0, "src", false),
+                view(1, ".local/share/td-agent/ws/w/r.git", false),
+                view(2, ".local/share/td-agent/store/s.git/objects", true),
+                view(3, "doc", true),
+                view(4, "other", false),
+                view(
+                    5,
+                    ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch",
+                    false,
+                ),
+            ]
+        };
+        let lines = |text: &str| {
+            parse_spec(&format!(
+                "format=1\nprofile=development\nentry=/td/store/x/bin/td-agent\nhome=/var/lib/td/workloads/98305\n{text}"
+            ))
+            .unwrap()
+        };
+        let mut spec = lines(
+            "worktree=/var/home/alice/.local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch\ncheckout=/var/home/alice/src\nrepository=/var/home/alice/.local/share/td-agent/ws/w/r.git\nread=/var/home/alice/.local/share/td-agent/store/s.git/objects\nread=/var/home/alice/doc\n",
+        );
+        select_views(&mut spec, views(), human).unwrap();
+        assert!(spec.views_only);
+        let sources = |grants: &[FilesystemGrant]| {
+            grants
+                .iter()
+                .map(|grant| grant.source_inode)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sources(&spec.viewed_trees), [5, 0]);
+        assert_eq!(sources(&spec.viewed_repositories), [1]);
+        assert_eq!(sources(&spec.views), [2, 3]);
+        assert!(spec.read.is_empty() && spec.write.is_empty());
+        assert_eq!(spec.checkouts, [human.join("src")]);
+        // Each refusal: no view at that path, a view at another access, a
+        // td-agent tree in another role, a path outside the human's home
+        // or not one a plan admits.
+        for wrong in [
+            "worktree=/var/home/alice/absent\n",
+            "write=/var/home/alice/doc\n",
+            "read=/var/home/alice/src\n",
+            "write=/var/home/alice/.local/share/td-agent/ws/w/r.git\n",
+            "worktree=/var/home/alice/.local/share/td-agent/ws/w/r.git\n",
+            "read=/var/home/alice/.local/share/td-agent/ws/w/r.git\n",
+            "write=/var/home/alice/.local/share/td-agent/store/s.git/objects\n",
+            "worktree=/var/home/bob/src\n",
+            "worktree=/var/home/alice/.ssh\n",
+        ] {
+            let mut spec = lines(wrong);
+            assert!(select_views(&mut spec, views(), human).is_err(), "{wrong}");
+        }
+        // One view answers one line.
+        let mut twice = lines("read=/var/home/alice/doc\nread=/var/home/alice/doc\n");
+        assert!(select_views(&mut twice, views(), human).is_err());
+    }
+
+    /// A workspace account's repository and checkout are bound from their
+    /// views at the human's paths, and so is every entry of their git
+    /// chain: checked where the view shows it, bound where the instance
+    /// sees the repository.
+    #[test]
+    fn a_workspace_accounts_git_chain_is_bound_from_its_views() {
+        let temp = crate::test_temp::TempDir::new("td-jail-chain-views").unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let uid = fs::metadata(&base).unwrap().uid();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let entry = base.join("td-agent");
+        fs::write(&entry, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+        let (repository, checkout) = (base.join("views/1"), base.join("views/2"));
+        lay_out_repository(&repository, &checkout);
+        let human = base.join("human");
+        let viewed = |source: &Path, target: &str| {
+            let metadata = fs::metadata(source).unwrap();
+            FilesystemGrant {
+                source: source.to_path_buf(),
+                target: human.join(target),
+                read_only: false,
+                source_kind: FilesystemSourceKind::Directory,
+                source_device: metadata.dev(),
+                source_inode: metadata.ino(),
+            }
+        };
+        let spec = Spec {
+            programs: vec![entry.clone()],
+            home: home.clone(),
+            checkouts: vec![human.join("tree/r")],
+            repositories: vec![human.join("ws/r.git")],
+            views_only: true,
+            viewed_trees: vec![viewed(&checkout, "tree/r")],
+            viewed_repositories: vec![viewed(&repository, "ws/r.git")],
+            ..Spec::default()
+        };
+        let plan = admit(
+            spec,
+            &base.join("spec"),
+            uid,
+            uid,
+            &[PathBuf::from("/nonexistent-td-jail-home")],
+            Vec::new(),
+            &["/proc"],
+        )
+        .unwrap();
+        assert_eq!(plan.working_directory(), human.join("tree/r"));
+        let relative = |path: &Path| path.strip_prefix(&base).unwrap().display().to_string();
+        let chain: Vec<(String, String)> = plan
+            .chain
+            .iter()
+            .map(|grant| (relative(&grant.source), relative(&grant.target)))
+            .collect();
+        assert_eq!(chain.len(), 16);
+        assert_eq!(
+            chain.first().unwrap(),
+            &("views/2/.git".to_string(), "human/tree/r/.git".to_string())
+        );
+        assert!(chain.contains(&(
+            "views/1/worktrees/id/gitdir".to_string(),
+            "human/ws/r.git/worktrees/id/gitdir".to_string()
+        )));
+        for (source, target) in &chain {
+            assert!(source.starts_with("views/"), "{source}");
+            assert!(target.starts_with("human/"), "{target}");
+        }
     }
 
     /// A workspace repository as td-agent lays it out, with one linked
