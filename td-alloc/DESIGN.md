@@ -184,6 +184,10 @@ separate allocation-free errors. Callers use existing/static refusal paths
 and reserve completion capacity before durable effects. The operation-count
 failure-injection scope also covers both raw allocations in this boundary;
 it remains thread-local test admission, not byte accounting.
+td-web's page budgets (td-web/DESIGN.md §10, increment 6) need first
+`Charge::shrink_to`, which returns the difference between a charged
+ceiling and the actual, so a caller need not release the whole charge
+and charge the actual anew.
 
 Every migrated application scenario needs before/after performance evidence
 under the same build profile and workload, covering representative latency,

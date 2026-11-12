@@ -4287,7 +4287,11 @@ text, mark positioning (a combining mark draws at the pen with its own
 advance, zero in these faces), hyphenation, and faces beyond Latin,
 Greek and Cyrillic (Noto's CJK faces are CFF collections, which `sfnt`
 refuses by name). A scalar outside the families' coverage still draws:
-from the monospace face, its stand-in or Unifont. Nor does the seam
+from the monospace face, its stand-in or Unifont. Nor is prose
+measured and drawn at sizes other than `SIZE`, within a named size
+bound, with `OVERHANG` an em at each size and their atlas pages
+capped, which td-web's styled pages need first (td-web/DESIGN.md §10,
+increment 6). Nor does the seam
 read prose back over proportional faces: `driven::text` reads the cell
 grid, so a
 consumer whose text matters to an agent says it through its own verbs

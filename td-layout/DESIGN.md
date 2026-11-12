@@ -390,4 +390,14 @@ siblings. Timing and RSS are deliberately not assertions in the gate.
 
 Tables, flexbox, float exclusion, advanced text, painting and td-web
 integration need subsequent designs. No existing consumer switches to this
-library as part of these increments.
+library as part of these increments. td-web's integration
+(td-web/DESIGN.md §10, increment 6) needs first a styled document that
+holds its document by shared ownership, intrinsic sizes for replaced
+elements supplied by the caller, list markers as a fragment kind, a
+basic automatic table layout (rows and cells, colspan and rowspan
+within bounds), an input limit the caller sets (up to 4 MiB for a text
+page), a page-wide cascade work ceiling summing each element's match
+steps and var() substitution charges, a cancel flag checked between
+elements, a line past MAX_LINE_SCALARS cut and marked rather than
+refused, eight-column tab stops where white space is preserved, a
+cascade without style attributes, and a byte limit per layout request.

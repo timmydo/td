@@ -443,6 +443,13 @@ counts, plus substitution component and byte charges, even on refusal. Candidate
 completion; consumed steps exclude the charge that refused. `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
+td-web's styled pages (td-web/DESIGN.md §10, increment 6) need first a
+caller-set admission ceiling charged while a StyleSet compiles, with
+the compiled set's charge reported, a refusal naming the sheet it arose
+in, a media condition per sheet, the `background` shorthand's colour,
+and rgb()/hsl() and CSS Color 4's extended named colours, and will use
+an answer to whether a changed environment changes which of its rules
+apply.
 
 `cascade` exports `StyleSet`, `Origin`, `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
