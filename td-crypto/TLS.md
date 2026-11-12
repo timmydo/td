@@ -75,7 +75,8 @@ interoperability qualification. Set and test the accepted groups
 explicitly.
 
 Certificate signatures may use ECDSA with P-256, P-384 or P-521 and SHA-256,
-SHA-384 or SHA-512; Ed25519; or RSA with 2048..8192-bit keys and SHA-256,
+SHA-384 or SHA-512; Ed25519, with no small-order key; or RSA with
+2048..8192-bit keys and SHA-256,
 SHA-384 or SHA-512 using PKCS#1 v1.5 or PSS. RSA PSS here uses rsaEncryption
 public keys, not restricted RSASSA-PSS SubjectPublicKeyInfo. Require MGF1
 with the same hash, salt length equal to the digest length and trailer field
@@ -89,8 +90,11 @@ Handshake signature scheme preference is ecdsa_secp384r1_sha384,
 ecdsa_secp256r1_sha256, ecdsa_secp521r1_sha512, ed25519,
 rsa_pss_rsae_sha512, rsa_pss_rsae_sha384, rsa_pss_rsae_sha256,
 rsa_pkcs1_sha512, rsa_pkcs1_sha384, rsa_pkcs1_sha256. The last three are TLS
-1.2 only. TLS 1.2 ECDSA scheme hash selection does not constrain the signing
-curve; TLS 1.3 requires the named curve. The TLS 1.2 client accepts a
+1.2 only. As for certificate signatures, ed25519 takes no small-order key:
+a leaf a CA issued to one verifies as a chain, and its CertificateVerify or
+ServerKeyExchange signature is what is refused. TLS 1.2 ECDSA scheme hash
+selection does not constrain the signing curve; TLS 1.3 requires the named
+curve. The TLS 1.2 client accepts a
 server ECDSA key on any admitted curve, including one not among the
 groups it offered: RFC 8422 section 5.1 puts that compliance on the
 server, and the client tolerates its absence. Certificate-path

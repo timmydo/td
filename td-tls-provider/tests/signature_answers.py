@@ -11,9 +11,9 @@ and RSA rows too: four of the curve and hash pairs are ones AWS-LC will not sign
 
 `REFUSED_` rows are signatures no verifier may take: ECDSA r or s of 0 or n or more, or
 not strict DER; RSA moduli outside 2048 to 8192 bits and exponents that are 1, even or
-over 33 bits; Ed25519 S of L or more. A second RSA_PKCS1_SHA256 row has the largest
-exponent taken, 33 bits. SMALL_ORDER_ED25519 is a signature under the identity key,
-which verifies for any message whose R is rB and S is r.
+over 33 bits; Ed25519 S of L or more, and a signature under the identity key, of
+order one, which cofactorless verification would take for any message whose R is rB
+and S is r. A second RSA_PKCS1_SHA256 row has the largest exponent taken, 33 bits.
 
 One OpenPGP row for net/src/openpgp.rs, `PGP_SHORT_MPI n e data subpackets value`: a
 v4 binary signature whose value has a leading zero octet, which its MPI drops, as
@@ -332,12 +332,13 @@ def ed25519_row():
     s_plus_l = (r + k * a) % order + order
     signature = big_r + s_plus_l.to_bytes(32, "little")
     print(f"REFUSED_ED25519_S_PLUS_L {public.hex()} {message.hex()} {signature.hex()}")
-    # The identity, of order one: R = rB, S = r verifies any message under it.
+    # The identity, of order one: R = rB, S = r verifies any message under it, so
+    # the verifiers refuse every small-order key.
     identity = encode((0, 1))
     message = b"td verifier table SMALL_ORDER_ED25519"
     r = int.from_bytes(hashlib.sha512(message).digest(), "little") % order
     signature = encode(times(r, base)) + r.to_bytes(32, "little")
-    print(f"SMALL_ORDER_ED25519 {identity.hex()} {message.hex()} {signature.hex()}")
+    print(f"REFUSED_ED25519_SMALL_ORDER {identity.hex()} {message.hex()} {signature.hex()}")
 
 
 def pgp_row(n, e, d):

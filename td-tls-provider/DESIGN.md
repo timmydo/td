@@ -47,8 +47,12 @@ The provider carries, in this order:
   SHA-384, Ed25519, RSA-PSS and PKCS#1 v1.5 with SHA-256, SHA-384 and
   SHA-512, PKCS#1 also under its OID without the NULL parameters, which
   certificates in the wild carry. ECDSA takes only the uncompressed form.
-  TLS 1.3 holds each scheme to its first listed verifier, so to its own
-  curve;
+  Ed25519 refuses a small-order key (td-primitives'
+  `ed25519::is_small_order`): td-primitives' verification is cofactorless
+  and takes, under such a key, a signature anyone can make, so a
+  certificate holding one, issued or presented, vouches for nothing. A
+  mixed-order key is taken. TLS 1.3 holds each scheme to its first listed
+  verifier, so to its own curve;
 - entropy from td-primitives' `random` (`/dev/random`), which refuses
   rather than falls back;
 - a key provider that loads only that P-256 PKCS#8 shape, whose public half
@@ -93,13 +97,17 @@ an error made the same way on both would still connect. The tests therefore
 also hold it to answers it did not compute: records written by ring, RFC
 7748 and RFC 5903 shared secrets, HKDF, PRF and HMAC values from Python's
 `hmac`, and signatures made with big integers by `tests/signature_answers.py`:
-one row per verifier, a signature under the small-order Ed25519 identity key,
-which verification takes for any message, and `REFUSED_` rows no verifier may
-take (ECDSA r or s out of range or not strict DER, RSA moduli outside 2048
-to 8192 bits and exponents of 1, even or over 33 bits, Ed25519 S of L or
-more). ring verified the signed rows it has the algorithm for, and AWS-LC
-gave the same answer for every row when it was td-crypto's backend;
-td-crypto's tests hold its policy's verifiers to these rows. The tests pin each
+one row per verifier, and `REFUSED_` rows no verifier may take (ECDSA r or
+s out of range or not strict DER, RSA moduli outside 2048 to 8192 bits and
+exponents of 1, even or over 33 bits, Ed25519 S of L or more, and a
+signature under the small-order identity key that cofactorless verification
+takes for any message). ring verified the signed rows it has the algorithm
+for, and AWS-LC gave the same answer for every row when it was td-crypto's
+backend but the small-order one, which it took; td-crypto's tests hold its
+policy's verifiers to these rows. Under each of the eight small-order
+points, a test finds a signature td-primitives' `verify` takes and holds
+the Ed25519 verifier, as `provider()` and `verifiers` both reach it, to
+refusing it. The tests pin each
 `verifiers` export's name and identifiers, that its Ed25519 and RSA exports
 are `provider()`'s statics and its ECDSA ones are not, and that each takes its
 rows with the key in either point form and refuses the other y, the hybrid

@@ -307,7 +307,9 @@ a change to any of these reds:
   verifies forgeries anyone can make. A caller admitting key material asks
   `ed25519::is_small_order`, true of all fourteen small-order encodings: the
   eight torsion points and the six spellings of them `verify` refuses anyway.
-  td-crypto does, for trust anchors and local issuers. It says nothing of
+  td-crypto does, for trust anchors and local issuers; td-tls-provider's
+  Ed25519 verifier does, for every certificate and handshake signature it
+  checks; td-ssh does wherever it takes key material. It says nothing of
   mixed-order keys, and need not: without the discrete log of the prime-order
   part nobody forges for one, and cofactorless verification only fails some of
   its own holder's signatures.

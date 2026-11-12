@@ -205,8 +205,6 @@ struct Signed {
     message: Vec<u8>,
     signature: Vec<u8>,
     own: Vec<usize>,
-    /// Under a small-order key, which takes it for any message.
-    any_message: bool,
 }
 
 fn signatures(text: &str, source: &str) -> Vec<Signed> {
@@ -217,9 +215,8 @@ fn signatures(text: &str, source: &str) -> Vec<Signed> {
             let [name, public, message, signature] = fields[..] else {
                 panic!("malformed row: {line}");
             };
-            let algorithm = name.strip_prefix("SMALL_ORDER_").unwrap_or(name);
             let own = (0..NAMES.len())
-                .filter(|&i| NAMES[i] == algorithm || NAMES[i] == format!("{algorithm}_BARE"))
+                .filter(|&i| NAMES[i] == name || NAMES[i] == format!("{name}_BARE"))
                 .collect::<Vec<_>>();
             assert_eq!(own.is_empty(), name.starts_with("REFUSED_"), "{name}");
             Signed {
@@ -228,7 +225,6 @@ fn signatures(text: &str, source: &str) -> Vec<Signed> {
                 message: unhex(message),
                 signature: unhex(signature),
                 own,
-                any_message: algorithm != name,
             }
         })
         .collect()
@@ -238,7 +234,9 @@ fn signatures(text: &str, source: &str) -> Vec<Signed> {
 /// the policy's nineteen verifiers: taken exactly by the signer's algorithm
 /// (PKCS#1 also under its identifier without NULL), EC keys uncompressed or
 /// compressed, never in another form, and no refused row by any. These are
-/// the answers AWS-LC gave for the same inputs when it was the backend.
+/// the answers AWS-LC gave for the same inputs when it was the backend, but
+/// for the signature under the small-order Ed25519 identity key, which it
+/// took and the policy refuses.
 #[test]
 fn policy_verifiers_take_exactly_their_own_signatures() {
     let policy = policy();
@@ -248,9 +246,10 @@ fn policy_verifiers_take_exactly_their_own_signatures() {
     assert_eq!(inputs.len(), 12);
     inputs.extend(signatures(SIGNATURE_ANSWERS, "answer"));
     // ECDSA r or s of 0 or n or more, or not strict DER; RSA moduli outside
-    // 2048..8192 bits, exponents of 1, even or over 33 bits; Ed25519 S >= L.
+    // 2048..8192 bits, exponents of 1, even or over 33 bits; Ed25519 S >= L
+    // and a small-order key.
     let refused = inputs.iter().filter(|input| input.own.is_empty()).count();
-    assert_eq!(refused, 14);
+    assert_eq!(refused, 15);
     let mut exercised = vec![0usize; NAMES.len()];
     for input in &inputs {
         let mut keys = vec![("as signed", input.public.clone(), true)];
@@ -282,11 +281,10 @@ fn policy_verifiers_take_exactly_their_own_signatures() {
                 exercised[index] += 1;
                 let mut message = input.message.clone();
                 message[0] ^= 1;
-                assert_eq!(
+                assert!(
                     verifier
                         .verify_signature(key, &message, &input.signature)
-                        .is_ok(),
-                    input.any_message,
+                        .is_err(),
                     "{context}, changed message"
                 );
                 for at in [0, input.signature.len() / 2, input.signature.len() - 1] {

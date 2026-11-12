@@ -630,12 +630,12 @@ decoded here, except a small-order point in any of its fourteen spellings
 so such an anchor or issuer would verify a forgery anyone can make. A
 mixed-order key is taken, as nobody without its prime-order discrete log
 forges for it, and a key on no point is taken and verifies nothing. A
-peer's leaf or intermediate key does not pass through this admission, so
-a small-order one would verify forged signatures; that needs a trusted CA
-to have issued it a certificate. RSA uses the minimal PKCS#1 public
-encoding already checked above, which td-primitives' RSA public-key
-parser must accept: an odd modulus of
-2048 through 8192 bits and an odd exponent of at least 3 and at most 33
+peer's leaf or intermediate key does not pass through this admission; the
+policy's Ed25519 verifier, td-tls-provider's, refuses a small-order one
+wherever it would check a signature, so a certificate a CA issued to such
+a key verifies nothing. RSA uses the minimal PKCS#1 public encoding
+already checked above, which td-primitives' RSA public-key parser must
+accept: an odd modulus of 2048 through 8192 bits and an odd exponent of at least 3 and at most 33
 bits. These are the keys AWS-LC admitted when it was the backend. Nested SPKI,
 trailing bytes and incompatible encodings are Invalid. Local identity
 issuers share these checks; the local P-256 leaf remains uncompressed only.
@@ -1251,7 +1251,8 @@ Opus read only the public-key extraction and `rsa_size`. Neither found a
 disagreement or a blocking defect. The repository user accepted these
 two model-run reviews as F04's independent cryptographic review; no human
 has reviewed this cryptography. Their findings are answered: a
-small-order Ed25519 key is refused as an anchor or local issuer (above);
+small-order Ed25519 key is refused as an anchor or local issuer, and
+later by td-tls-provider's verifier wherever it signs (above);
 td-primitives reports which hardware backends a test run reached and can
 require all of them; ECDSA signing's nonce retries, and `bignum` at 4, 6
 and 9 limbs, have known answers from Python; and td-primitives/DESIGN.md
@@ -1308,7 +1309,9 @@ needs no AWS-LC at test time:
   identifier without NULL parameters), with an EC key uncompressed or
   compressed but never in another form, refused after a changed message or
   signature byte, and no refused row may be taken by any verifier: the
-  answers AWS-LC gave for the same inputs.
+  answers AWS-LC gave for the same inputs, but for the signature under the
+  small-order Ed25519 identity key, which AWS-LC took and td-tls-provider's
+  verifier refuses.
 - `certificate_paths.txt`: twenty AWS-LC-signed paths, a P-256 leaf under a
   root for each algorithm it signs with and each EC root's key in both point
   forms, which verify under the policy's certificate algorithms, and fail

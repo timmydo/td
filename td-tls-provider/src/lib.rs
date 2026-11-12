@@ -786,9 +786,14 @@ fn pss<D: Digest>(public: &[u8], message: &[u8], signature: &[u8]) -> Result<(),
 }
 
 fn ed25519(public: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Refused> {
-    use td_primitives::curve25519::ed25519::{verify, PUBLIC_LEN, SIGNATURE_LEN};
+    use td_primitives::curve25519::ed25519::{is_small_order, verify, PUBLIC_LEN, SIGNATURE_LEN};
     let public: &[u8; PUBLIC_LEN] = public.try_into().map_err(|_| Refused)?;
     let signature: &[u8; SIGNATURE_LEN] = signature.try_into().map_err(|_| Refused)?;
+    // Cofactorless verification takes a signature anyone can make under a
+    // small-order key, so a certificate holding one would vouch for nothing.
+    if is_small_order(public) {
+        return Err(Refused);
+    }
     verify(public, message, signature)
 }
 
@@ -1822,16 +1827,10 @@ mod tests {
     }
 
     // tests/signature_answers.py made these with big integers. ring verified each
-    // signed row it has the algorithm for; td-crypto's differential tests hold
-    // every row to AWS-LC, the P-521, SHA-512 ECDSA and refused ones included.
+    // signed row it has the algorithm for, and AWS-LC gave every row the answer
+    // td-crypto's tests hold it to, P-521, SHA-512 ECDSA and refused rows
+    // included, but REFUSED_ED25519_SMALL_ORDER, which AWS-LC took.
     const SIGNATURES: &str = include_str!("../tests/signature_answers.txt");
-
-    /// The algorithm a row signs under: a SMALL_ORDER_ row is a signature under
-    /// a small-order key, which verification takes, for any message. Every
-    /// REFUSED_ row is no algorithm's.
-    fn row_algorithm(name: &str) -> &str {
-        name.strip_prefix("SMALL_ORDER_").unwrap_or(name)
-    }
 
     /// SEC 1's compressed form of an uncompressed point, by y's parity.
     fn compressed(point: &[u8]) -> Vec<u8> {
@@ -1920,11 +1919,10 @@ mod tests {
                 hybrid[0] = 6 | (public[public.len() - 1] & 1);
                 keys.extend([(short, true), (negated, false), (hybrid, false)]);
             }
-            let algorithm = row_algorithm(name);
             for verifier in &all {
                 let verifier_name = format!("{verifier:?}");
-                let own =
-                    verifier_name == algorithm || verifier_name == format!("{algorithm}_BARE");
+                // Every REFUSED_ row is no verifier's.
+                let own = verifier_name == name || verifier_name == format!("{name}_BARE");
                 for (form, (key, is_own_key)) in keys.iter().enumerate() {
                     assert_eq!(
                         verifier.verify_signature(key, &message, &signature).is_ok(),
@@ -1937,9 +1935,10 @@ mod tests {
                     for (key, _) in keys.iter().filter(|(_, own_key)| *own_key) {
                         let mut changed = message.clone();
                         changed[0] ^= 1;
-                        assert_eq!(
-                            verifier.verify_signature(key, &changed, &signature).is_ok(),
-                            algorithm != name,
+                        assert!(
+                            verifier
+                                .verify_signature(key, &changed, &signature)
+                                .is_err(),
                             "{name} over another message"
                         );
                         let mut changed = signature.clone();
@@ -2099,12 +2098,10 @@ mod tests {
             };
             let unhex = |text| from_hex(text).unwrap();
             let (public, message, signature) = (unhex(public), unhex(message), unhex(signature));
-            let algorithm = row_algorithm(name);
             for verifier in all {
                 let verifier_name = format!("{verifier:?}");
                 // The _BARE names are the same algorithm's other spelling.
-                let own =
-                    verifier_name == algorithm || verifier_name == format!("{algorithm}_BARE");
+                let own = verifier_name == name || verifier_name == format!("{name}_BARE");
                 assert_eq!(
                     verifier
                         .verify_signature(&public, &message, &signature)
@@ -2116,12 +2113,10 @@ mod tests {
                     exercised.insert(verifier_name.clone());
                     let mut changed = message.clone();
                     changed[0] ^= 1;
-                    // A small-order key's signature verifies any message.
-                    assert_eq!(
+                    assert!(
                         verifier
                             .verify_signature(&public, &changed, &signature)
-                            .is_ok(),
-                        algorithm != name,
+                            .is_err(),
                         "{name} over another message"
                     );
                     let mut changed = signature.clone();
@@ -2137,6 +2132,79 @@ mod tests {
             }
         }
         assert_eq!(exercised.len(), all.len(), "{exercised:?}");
+    }
+
+    /// The eight small-order points' canonical encodings: the identity, the
+    /// point of order two, the two of order four and the four of order eight.
+    const SMALL_ORDER: &[&str] = &[
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    ];
+
+    /// Under each small-order key, a signature anyone can make: R a small-order
+    /// point and S zero, so [S]B = R + [k]A holds when R = -[k]A, which is
+    /// one of these eight. td-primitives' cofactorless `verify` takes it; the
+    /// one ED25519 verifier, which certificate chains and handshakes reach
+    /// through `provider()` and `verifiers` alike, must not.
+    #[test]
+    fn ed25519_refuses_every_small_order_key_whose_forgeries_verify() {
+        use td_primitives::curve25519::ed25519;
+        let points: Vec<[u8; 32]> = SMALL_ORDER
+            .iter()
+            .map(|text| from_hex(text).unwrap().try_into().unwrap())
+            .collect();
+        // One static: held here so the two cannot part unnoticed.
+        let verifiers = [
+            verifiers::ED25519,
+            *SIGNATURE_ALGORITHMS
+                .all
+                .iter()
+                .find(|v| format!("{v:?}") == "ED25519")
+                .unwrap(),
+        ];
+        for key in &points {
+            assert!(ed25519::is_small_order(key));
+            let forged = (0u8..)
+                .take(64)
+                .find_map(|counter| {
+                    let message = [b'm', counter];
+                    points.iter().find_map(|r| {
+                        let mut signature = [0u8; 64];
+                        signature[..32].copy_from_slice(r);
+                        ed25519::verify(key, &message, &signature)
+                            .is_ok()
+                            .then_some((message, signature))
+                    })
+                })
+                .expect("cofactorless verify takes a forgery under a small-order key");
+            let (message, signature) = forged;
+            for verifier in verifiers {
+                assert!(verifier
+                    .verify_signature(key, &message, &signature)
+                    .is_err());
+            }
+        }
+        // A prime-order key's own signature still verifies.
+        let row = SIGNATURES
+            .lines()
+            .find(|line| line.starts_with("ED25519 "))
+            .unwrap();
+        let fields: Vec<Vec<u8>> = row
+            .split(' ')
+            .skip(1)
+            .map(|f| from_hex(f).unwrap())
+            .collect();
+        for verifier in verifiers {
+            assert!(verifier
+                .verify_signature(&fields[0], &fields[1], &fields[2])
+                .is_ok());
+        }
     }
 
     #[test]
