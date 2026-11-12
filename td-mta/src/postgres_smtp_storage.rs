@@ -436,8 +436,7 @@ impl Delivery<'_, '_> {
         if self.backend.stopped() {
             return Err(Failure::Refused(Error::WriterStopped));
         }
-        if !matches!(self.stage, Stage::Writing) || bytes.len() > 1000 || !bytes.ends_with(b"\r\n")
-        {
+        if !matches!(self.stage, Stage::Writing) || bytes.len() > 1000 || bytes.is_empty() {
             return Err(Failure::Refused(Error::Invalid));
         }
         charge(

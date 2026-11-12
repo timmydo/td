@@ -367,8 +367,10 @@ rate bucket.
 `smtp_rejected` reports a locally queued 4xx/5xx reply once per reply,
 including `smtp_status`, a fixed `reason`, `peer_ip` and `reply_queued:true`.
 It does not prove that the peer received the reply. DATA reasons distinguish
-line length, framing, undeclared 8-bit data, header/message size and storage
-unavailability; other command syntax refusals have `command_refused`.
+framing, header/message size and storage unavailability; other command syntax
+refusals have `command_refused`. Historical `data_line_too_long` and
+`undeclared_8bit_data` reasons remain readable; current local receiving tolerates
+long lines and undeclared non-NUL 8-bit DATA.
 For `unknown_recipient`, `routing_unavailable` and `recipient_limit`, the
 complete pending RCPT command is revalidated with the protocol path parser.
 Its recipient spelling (without brackets or obsolete source routes) appears

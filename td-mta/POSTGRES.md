@@ -1945,11 +1945,13 @@ trusted connection owner supplies envelope/socket facts and must already have
 admitted the peer, gateway and recipient routes under the selected profile.
 Passive receipt facts confer no authority. The receiving service supplies this trusted connection owner.
 
-Preparation validates bounded SMTP metadata, complete CRLF lines of at most
-1000 bytes, the selected message ceiling and a root-header ceiling of at most
-1 MiB. It uses the shared receiving header and trace formatter: prepend the
+Preparation validates bounded SMTP metadata, non-NUL DATA with complete CRLF
+lines of arbitrary length within the selected message ceiling, and a root-header
+ceiling of at most 1 MiB. It uses the shared receiving header and trace formatter: prepend the
 server Return-Path/Received fields, strip supplied Return-Path fields, retain
-root identifiers and keep body bytes unchanged. Original work/deadline limits
+root identifiers and keep body bytes unchanged. The header scanner borrows the already admitted immutable DATA, so tentative
+field-name bytes that become body consume work but no extra header backing
+or recognized-header allowance. Original work/deadline limits
 cover filtering and identifier replay. Input reserves the trace allowance
 within the message ceiling. Prepared bytes, IDs, provenance and the request
 digest remain immutable across retries; no network input occurs under a lock.
@@ -3272,7 +3274,7 @@ and stale-policy refusal.
 SMTP receiving accesses storage through `smtp_storage`. The fixed worker
 admits a job from the trusted connection's session, account, configuration
 generation and observed peer/TLS facts, and performs preparation and
-publication. The network loop copies one decoded DATA line into admitted
+publication. The network loop copies one decoded DATA chunk into admitted
 memory per connection turn, under the same slot ownership and original
 deadline. `Job::write` is bounded and performs no database, filesystem or
 peer I/O; it does not wait on another slot's publication. Routing, TLS,
@@ -3324,7 +3326,9 @@ publication owner serialize preparation and publication. Four full-capacity
 incoming buffers plus that filtered body have a 160-MiB payload ceiling;
 allocator capacity and native protocol buffers are additional. This finite
 bound is not qualification of the provisional 128-MiB workload RSS goal.
-Each decoded line is at most 1000 bytes. The network loop performs its
+Each decoded chunk is at most 1000 bytes and may split a physical line or
+CRLF. Preparation revalidates framing across those boundaries without
+wrapping or truncating long lines. The network loop performs its
 bounded memory copy and refuses further copies after service failure. A
 failed write remains failed, and publication can be attempted only once.
 The trusted connection owner still supplies routing and observed peer/TLS

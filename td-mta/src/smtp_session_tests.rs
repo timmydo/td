@@ -9,6 +9,7 @@ use crate::{
     ids::StoreEpoch,
     ports::Commit,
 };
+use long_lines::receive_chunks;
 use std::num::NonZeroU32;
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 fn fixture(run: impl FnOnce(&Routing<'_>)) {
@@ -283,12 +284,7 @@ fn sizes_line_limits_and_recipient_exhaustion() {
             command(&mut s, "RCPT TO:<postmaster>\r\n", "250 ");
         }
         command(&mut s, "RCPT TO:<alias@example.test>\r\n", "452 ");
-        for (count, dot, valid) in [
-            (998, false, true),
-            (999, false, false),
-            (998, true, true),
-            (999, true, false),
-        ] {
+        for (count, dot) in [(998, false), (999, false), (998, true), (999, true)] {
             let mut s = session(routes);
             begin(&mut s, "");
             let mut line = Vec::new();
@@ -297,11 +293,11 @@ fn sizes_line_limits_and_recipient_exhaustion() {
             }
             line.extend(vec![b'x'; count]);
             line.extend(b"\r\n");
-            s.feed(&line).unwrap();
-            assert_eq!(matches!(s.pending(), Pending::Data(_)), valid);
-            if !valid {
-                assert_eq!(reply(&s), "554 5.6.0 Message line too long\r\n");
-            }
+            assert_eq!(
+                receive_chunks(&mut s, &line, line.len()),
+                &line[usize::from(dot)..]
+            );
+            assert_eq!(s.pending(), Pending::Input);
         }
         let mut s = session(routes);
         s.settings.message_bytes = s.settings.trace_bytes + 3;
@@ -313,6 +309,107 @@ fn sizes_line_limits_and_recipient_exhaustion() {
         assert!(matches!(s.pending(), Pending::Reply { close: true, .. }));
     });
 }
+#[cfg(test)]
+mod long_lines {
+    use super::*;
+    pub(super) fn receive_chunks(s: &mut Session<'_>, wire: &[u8], fragment: usize) -> Vec<u8> {
+        let mut stored = Vec::new();
+        for mut input in wire.chunks(fragment) {
+            while !input.is_empty() {
+                let n = s.feed(input).unwrap();
+                assert!(n > 0);
+                input = &input[n..];
+                match s.pending() {
+                    Pending::Data(bytes) => {
+                        assert!(!bytes.is_empty() && bytes.len() <= 1000);
+                        stored.extend_from_slice(bytes);
+                        assert_eq!(s.feed(b"ignored"), Err(Error::Conflict));
+                        s.data_written(Ok(())).unwrap();
+                    }
+                    Pending::Input | Pending::Commit => (),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        stored
+    }
+
+    #[test]
+    fn long_data_lines_preserve_bytes_across_chunk_and_crlf_boundaries() {
+        fixture(|routes| {
+            for length in [997, 998, 999, 1000, 1001, 1998, 1999, 2000, 65_537] {
+                for dot in [false, true] {
+                    let mut wire = Vec::new();
+                    if dot {
+                        wire.push(b'.');
+                    }
+                    wire.extend(vec![b'x'; length]);
+                    // Dots at internal chunk starts must neither unstuff nor terminate.
+                    wire.extend(b".\r\n..stuffed\r\n.dot\r\n.\r\n");
+                    let mut expected = vec![b'x'; length];
+                    expected.extend(b".\r\n.stuffed\r\ndot\r\n");
+                    for fragment in [1, 7, 999, 1000, 1001, wire.len()] {
+                        let mut s = session(routes);
+                        s.settings.message_bytes = s.settings.trace_bytes + expected.len();
+                        begin(&mut s, "");
+                        assert_eq!(receive_chunks(&mut s, &wire, fragment), expected);
+                        assert_eq!(s.pending(), Pending::Commit);
+                        s.committed(Ok(Commits::new([receipt()]).unwrap())).unwrap();
+                        assert!(reply(&s).starts_with("250 "));
+                        s.reply_sent().unwrap();
+                        begin(&mut s, "");
+                        assert_eq!(receive_chunks(&mut s, b"..\r\n.\r\n", 1), b".\r\n");
+                        assert_eq!(s.pending(), Pending::Commit);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn long_data_keeps_size_framing_and_storage_refusals_terminal() {
+        fixture(|routes| {
+            for prefix in [999, 1000, 1999, 2000] {
+                for tail in [b"\n".as_slice(), b"\rX", b"\0", b"\r\r\n"] {
+                    let mut s = session(routes);
+                    begin(&mut s, "");
+                    receive_chunks(&mut s, &vec![b'x'; prefix], 1);
+                    let mut input = tail;
+                    while !input.is_empty() {
+                        let used = s.feed(input).unwrap();
+                        input = &input[used..];
+                        if matches!(s.pending(), Pending::Data(_)) {
+                            s.data_written(Ok(())).unwrap();
+                        } else if matches!(s.pending(), Pending::Reply { .. }) {
+                            break;
+                        }
+                    }
+                    assert_eq!(reply(&s), "554 5.6.0 Invalid message framing\r\n");
+                    assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
+                    s.reply_sent().unwrap();
+                    assert_eq!(s.pending(), Pending::Closed);
+                }
+            }
+            let mut s = session(routes);
+            s.settings.message_bytes = s.settings.trace_bytes + 1500;
+            begin(&mut s, "");
+            receive_chunks(&mut s, &[b'x'; 1000], 1000);
+            s.feed(&[b'x'; 1000]).unwrap();
+            assert_eq!(reply(&s), "552 5.3.4 Message too large\r\n");
+            s.reply_sent().unwrap();
+            assert_eq!(s.pending(), Pending::Closed);
+
+            let mut s = session(routes);
+            begin(&mut s, "");
+            assert_eq!(s.feed(&[b'x'; 1000]).unwrap(), 1000);
+            s.data_written(Err(Error::Capacity)).unwrap();
+            assert_eq!(reply(&s), "451 4.3.0 Delivery temporarily unavailable\r\n");
+            s.reply_sent().unwrap();
+            assert_eq!(s.pending(), Pending::Closed);
+        });
+    }
+}
+
 #[test]
 fn commit_outcomes_and_begin_refusal() {
     fixture(|routes| {
@@ -658,7 +755,7 @@ fn data_refusals_have_content_free_diagnostics() {
         for (input, reason) in [
             (b"private\n".to_vec(), "invalid_data_framing"),
             (b"private\0\r\n".to_vec(), "invalid_data_framing"),
-            (vec![b'x'; 1002], "data_line_too_long"),
+            (vec![b'\n'; 1002], "invalid_data_framing"),
         ] {
             let mut s = session(routes);
             begin(&mut s, "");

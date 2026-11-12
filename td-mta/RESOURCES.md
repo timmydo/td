@@ -418,9 +418,9 @@ count (compiled maximum 32). Each mutex-protected slot owns its protocol,
 transport, optional ingress job and one phase: empty, network, queued,
 completed, retry or retiring. Worker scans replace separate work queues:
 each worker performs at most one operation per eligible slot per pass.
-Only the matching worker executes a queued operation. DATA line copies do
-not enter that queue: main copies at most one decoded line into the slot's
-admitted buffer per turn, under the slot mutex, with no storage or peer I/O.
+Only the matching worker executes a queued operation. DATA chunk copies do
+not enter that queue: main copies at most one 1000-byte decoded chunk into
+the slot's admitted buffer per turn, under the slot mutex, with no storage or peer I/O.
 Main acknowledges completed phases before further socket work or redispatch. Reuse requires
 worker retirement followed by main releasing the peer/listener count.
 There are no queued references that can outlive this phase, so these slots
@@ -4542,8 +4542,11 @@ trace allowance. A paused sender retains its buffer and permit but no database
 connection or storage-worker execution time. The singleton storage worker
 serializes preparation and publication, retaining at most one additional
 filtered body and one uncertain operation. Body preparation preserves the
-original per-line scan, record and output charges and validates CRLF plus the
-1000-byte line ceiling before copying. Its body-only loop samples the clock
+scan, record and output charges per at-most-1000-byte line fragment and
+validates CRLF and NUL rejection across fragments before copying. Physical
+lines need not fit a fragment. Header scanning borrows the admitted input,
+so a tentative field name that becomes body cannot grow a second buffer or
+spend the recognized-header allowance. Its body-only loop samples the clock
 once per bounded turn of at most 64 KiB plus 999 bytes, and again before
 returning; headers retain their existing parser checks. This avoids repeated
 clock reads for every short body line without replenishing the original meter

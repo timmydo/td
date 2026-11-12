@@ -12,9 +12,9 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-// SIZE adds 26 command octets; BODY adds 16. DATA includes one transparency dot.
+// SIZE adds 26 command octets; BODY adds 16. DATA streams in bounded chunks.
 const COMMAND_BYTES: usize = 512 + 26 + 16;
-const DATA_BYTES: usize = 1001;
+const DATA_BYTES: usize = 1000;
 
 /// Pinned routing and validated limits; the trusted driver supplies transport
 /// identity separately to delivery. Neither this context nor EHLO authenticates.
@@ -151,7 +151,7 @@ pub enum Pending<'a> {
     BeginData {
         maximum_bytes: usize,
     },
-    /// Decoded complete line, including CRLF; valid until data_written.
+    /// Decoded DATA chunk, possibly splitting a line or CRLF; valid until data_written.
     Data(&'a [u8]),
     /// All decoded bytes were written. Build trace fields and publish atomically.
     Commit,
@@ -207,6 +207,7 @@ pub struct Session<'a> {
     used: usize,
     cr: bool,
     data_start: usize,
+    data_continuation: bool,
     data_bytes: usize,
     hello: String,
     extended: bool,
@@ -237,6 +238,7 @@ impl<'a> Session<'a> {
             used: 0,
             cr: false,
             data_start: 0,
+            data_continuation: false,
             data_bytes: 0,
             hello: String::new(),
             extended: false,
@@ -309,7 +311,7 @@ impl<'a> Session<'a> {
     pub fn envelope(&self) -> Option<&Envelope> {
         self.envelope.as_ref()
     }
-    /// At most one command or DATA line, irrespective of input size. A framing
+    /// At most one command or bounded DATA chunk per call. A framing
     /// failure is terminal; its unread tail must never be submitted elsewhere.
     pub fn feed(&mut self, input: &[u8]) -> Result<usize, Error> {
         let result = self.feed_inner(input);
@@ -326,12 +328,7 @@ impl<'a> Session<'a> {
         for (offset, &byte) in input.iter().enumerate() {
             let cap = if data { DATA_BYTES } else { COMMAND_BYTES };
             if self.used == cap {
-                let reply = if data {
-                    "554 5.6.0 Message line too long\r\n"
-                } else {
-                    "500 5.5.2 Command too long\r\n"
-                };
-                self.respond(reply, Next::Closed);
+                self.respond("500 5.5.2 Command too long\r\n", Next::Closed);
                 return Ok(offset + 1);
             }
             if (self.cr && byte != b'\n')
@@ -356,7 +353,8 @@ impl<'a> Session<'a> {
             if self.cr {
                 let consumed = offset + 1;
                 if data {
-                    self.data_line()?;
+                    self.cr = false;
+                    self.data_chunk(true)?;
                 } else {
                     // Commands are tiny; copying frees the parser buffer for replies/state.
                     let mut command = [0; COMMAND_BYTES];
@@ -372,6 +370,10 @@ impl<'a> Session<'a> {
                 return Ok(consumed);
             }
             self.cr = byte == b'\r';
+            if data && self.used == DATA_BYTES {
+                self.data_chunk(false)?;
+                return Ok(offset + 1);
+            }
         }
         Ok(input.len())
     }
@@ -408,7 +410,9 @@ impl<'a> Session<'a> {
             return Err(Error::Conflict);
         }
         if result.is_ok() {
-            self.clear_line();
+            // Retain CRLF and physical-line state across chunk acknowledgements.
+            self.used = 0;
+            self.data_start = 0;
             self.state = State::Data;
         } else {
             self.respond(
@@ -490,6 +494,7 @@ impl<'a> Session<'a> {
         self.used = 0;
         self.cr = false;
         self.data_start = 0;
+        self.data_continuation = false;
     }
     fn reset(&mut self) {
         self.envelope = None;
@@ -504,17 +509,16 @@ impl<'a> Session<'a> {
             self.reset();
         }
     }
-    fn data_line(&mut self) -> Result<(), Error> {
+    fn data_chunk(&mut self, end_line: bool) -> Result<(), Error> {
         let line = self.line.get(..self.used).ok_or(Error::Invalid)?;
-        if line == b".\r\n" {
+        if !self.data_continuation && end_line && line == b".\r\n" {
             self.state = State::Commit;
             return Ok(());
         }
-        self.data_start = usize::from(line.first() == Some(&b'.'));
+        self.data_start = usize::from(!self.data_continuation && line.first() == Some(&b'.'));
+        self.data_continuation = !end_line;
         let size = self.used - self.data_start;
-        if size > 1000 {
-            self.respond("554 5.6.0 Message line too long\r\n", Next::Closed);
-        } else if self
+        if self
             .data_bytes
             .checked_add(size)
             .is_none_or(|n| n > self.incoming_limit())

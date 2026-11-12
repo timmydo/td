@@ -1722,8 +1722,8 @@ claim full power-loss, managed-provider or whole-service resource qualification.
 
 ## 9. SMTP receiving and message representation
 
-The current `smtp_session` engine consumes one command or DATA line per
-turn. Pending replies require an explicit flush acknowledgement; reservation,
+The current `smtp_session` engine consumes one command or at most 1000 DATA bytes
+per turn. Pending replies require an explicit flush acknowledgement; reservation,
 body writes and publication require separate trusted driver results before
 input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result closes without a final reply.
@@ -1758,7 +1758,7 @@ before filtering and after adding local trace fields. Header overflow yields
 552 5.3.4; work or storage refusal remains temporary. The shared raw scanner
 preserves malformed body boundaries, and MessageIds source extents retain
 only the bounded policy lookback.
-Framing, line-size, message-size and streaming-write failures during
+Framing, message-size and streaming-write failures during
 DATA close the connection, so the remaining stream cannot become
 commands. The runtime must flush a close reply and use bounded transport
 draining so unread DATA is discarded before closing where the shutdown
@@ -1808,7 +1808,7 @@ queued worker operation ends the visit; each turn retains its deadline
 checks. One
 fixed storage worker performs admission and publication; one fixed TLS
 worker constructs sessions and advances handshakes. The network loop copies
-one decoded DATA line of at most 1000 bytes per connection turn into its
+one decoded DATA chunk of at most 1000 bytes per connection turn into its
 admitted resident buffer. That copy performs no database, filesystem or peer
 I/O and cannot queue behind another connection's publication. Workers are
 woken only for their queued work or retirement, not for inline DATA copies.
@@ -1912,8 +1912,14 @@ DATA preserves non-NUL 8-bit octets even when a sender omits BODY=8BITMIME
 or declares BODY=7BIT. This is an explicit local-delivery interoperability
 tolerance; BODY syntax is still validated. Commands and envelope addresses
 remain ASCII, and outbound capability negotiation is unchanged. CRLF,
-NUL rejection, dot termination, line/total size bounds and durable publication
+NUL rejection, dot termination, total size bounds and durable publication
 before acceptance still apply to these messages.
+Incoming physical header and body lines may exceed the RFC 5321 998-byte
+content limit for local-delivery interoperability. The receiver streams them
+in fixed chunks, preserving CRLF and dot transparency state across chunk and
+transport boundaries. It inserts no wrapping or other content changes. The
+configured total-message and aggregate header limits, original deadlines and
+work budgets still apply; SMTP commands and outbound line limits are unchanged.
 
 Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable
 account IDs and deduplicate delivery to the same account within one transaction;

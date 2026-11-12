@@ -32,7 +32,8 @@ pub struct Completion {
     pub stop: bool,
 }
 pub trait Job: Send {
-    /// Copy one decoded line (at most 1000 bytes) into admitted memory.
+    /// Copy one decoded chunk (at most 1000 bytes) into admitted memory.
+    /// A chunk may split a physical line or its CRLF.
     /// Called on the network loop: no database, filesystem, peer I/O or waits.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Failure>;
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure>;

@@ -75,7 +75,7 @@ pub(super) fn prepare(
         meter,
         last: &mut last,
     };
-    let mut header = headers::Headers::new(message.header_bytes).map_err(header_error)?;
+    let mut header = headers::Headers::resident(message.bytes, message.header_bytes);
     let output_limit = message
         .bytes
         .len()
@@ -99,19 +99,16 @@ pub(super) fn prepare(
         Ok(())
     };
     let mut remaining = message.bytes;
+    let mut cr = false;
     while !remaining.is_empty() && !header.complete() {
         let window = remaining
-            .get(..remaining.len().min(1001))
+            .get(..remaining.len().min(1000))
             .ok_or(Error::Integrity)?;
         charge(clock, work.meter, window.len(), 0)?;
-        let length = window
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .and_then(|n| n.checked_add(1))
-            .ok_or(Error::Input(crate::ports::Error::Invalid))?;
+        let length = data_chunk(window, &mut cr)?;
         let line = remaining.get(..length).ok_or(Error::Integrity)?;
         remaining = remaining.get(length..).ok_or(Error::Integrity)?;
-        if line.len() > 1000 || !line.ends_with(b"\r\n") {
+        if remaining.is_empty() && !line.ends_with(b"\n") {
             return Err(Error::Input(crate::ports::Error::Invalid));
         }
         if header.push(line, false, &mut work).map_err(header_error)? {
@@ -128,14 +125,28 @@ pub(super) fn prepare(
             .write_filtered(trace.as_bytes(), &mut append, &mut work)
             .map_err(header_error)?;
     }
-    copy_body(remaining, &mut append, &mut work)?;
+    copy_body(remaining, cr, &mut append, &mut work)?;
     let (anchors, own) = header.thread_identifiers(&mut work).map_err(Error::Input)?;
     charge(clock, work.meter, 0, 0)?;
     Ok((bytes, anchors, own, provenance))
 }
-// Preserve per-line work charges, but sample deadlines once per bounded turn.
+// Validate only one bounded chunk, preserving CRLF state across chunks.
+fn data_chunk(window: &[u8], cr: &mut bool) -> Result<usize, Error> {
+    for (index, &byte) in window.iter().enumerate() {
+        if (*cr && byte != b'\n') || (!*cr && byte == b'\n') || byte == 0 {
+            return Err(Error::Input(crate::ports::Error::Invalid));
+        }
+        *cr = byte == b'\r';
+        if byte == b'\n' {
+            return Ok(index + 1);
+        }
+    }
+    Ok(window.len())
+}
+// Charge each line fragment, sampling deadlines once per bounded turn.
 fn copy_body(
     mut remaining: &[u8],
+    mut cr: bool,
     append: &mut impl FnMut(&[u8]) -> Result<(), crate::ports::Error>,
     work: &mut headers::Work<'_>,
 ) -> Result<(), Error> {
@@ -145,7 +156,7 @@ fn copy_body(
         let mut consumed = 0;
         while !remaining.is_empty() && consumed < TURN_BYTES {
             let window = remaining
-                .get(..remaining.len().min(1001))
+                .get(..remaining.len().min(1000))
                 .ok_or(Error::Integrity)?;
             work.meter
                 .charge(
@@ -157,13 +168,9 @@ fn copy_body(
                     },
                 )
                 .map_err(body_work_error)?;
-            let length = window
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .and_then(|n| n.checked_add(1))
-                .ok_or(Error::Input(crate::ports::Error::Invalid))?;
+            let length = data_chunk(window, &mut cr)?;
             let line = remaining.get(..length).ok_or(Error::Integrity)?;
-            if line.len() > 1000 || !line.ends_with(b"\r\n") {
+            if length == remaining.len() && !line.ends_with(b"\n") {
                 return Err(Error::Input(crate::ports::Error::Invalid));
             }
             work.meter
@@ -280,6 +287,7 @@ mod tests {
         let mut output = Vec::new();
         let result = copy_body(
             body,
+            false,
             &mut |part| {
                 output.extend_from_slice(part);
                 Ok(())
@@ -304,7 +312,7 @@ mod tests {
         let scan_bytes: usize = body
             .split_inclusive(|b| *b == b'\n')
             .map(|line| {
-                let scanned = remaining.min(1001);
+                let scanned = remaining.min(1000);
                 remaining -= line.len();
                 scanned
             })
@@ -321,11 +329,12 @@ mod tests {
         assert!(clock.0.load(Ordering::Relaxed) < 32);
     }
     #[test]
-    fn body_turns_keep_line_and_crlf_validation() {
+    fn body_turns_keep_crlf_validation() {
         for body in [
             b"bare\n".to_vec(),
             b"unfinished\r".to_vec(),
-            [vec![b'x'; 999], b"\r\n".to_vec()].concat(),
+            b"embedded\rCR\r\n".to_vec(),
+            b"nul\0\r\n".to_vec(),
         ] {
             assert_eq!(
                 run(&body, &CountingClock(AtomicU64::new(0)), 100, capacity()).0,
@@ -342,6 +351,25 @@ mod tests {
             run(&body, &CountingClock(AtomicU64::new(0)), 100, capacity()).0,
             Err(Error::Input(crate::ports::Error::Invalid))
         );
+    }
+    #[test]
+    fn long_body_lines_preserve_bytes_and_validate_chunk_edges() {
+        for length in [998, 999, 1000, 1001, 1999, 2000, 65535, 65536, 1_048_576] {
+            let mut body = vec![b'x'; length];
+            body.extend_from_slice(b".\r\n..dot\r\n");
+            let (result, output, _) =
+                run(&body, &CountingClock(AtomicU64::new(0)), 100, capacity());
+            assert_eq!(result, Ok(()));
+            assert_eq!(output, body);
+            for tail in [b"\r".as_slice(), b"\n", b"\rX", b"\0\r\n", b"unterminated"] {
+                let mut broken = vec![b'x'; length];
+                broken.extend_from_slice(tail);
+                assert_eq!(
+                    run(&broken, &CountingClock(AtomicU64::new(0)), 100, capacity()).0,
+                    Err(Error::Input(crate::ports::Error::Invalid))
+                );
+            }
+        }
     }
     #[test]
     fn body_turns_precharge_and_check_deadline_before_next_turn_and_return() {

@@ -9965,8 +9965,23 @@ fn exercise_receiving(
     assert!(consumed.remaining().output_bytes < capacity.output_bytes);
     assert!(consumed.remaining().records < capacity.records);
     receiving::prepare(binding, &message(b"\r\n", receipt), deadline()).unwrap();
+    // Tentative field names become body unless a colon establishes a header.
+    // They must not consume the aggregate header allowance while undecided.
+    for prefix in [b"".as_slice(), b"Subject: before malformed body\r\n"] {
+        let long_body = [prefix, &vec![b'x'; 300_000], b"\r\n"].concat();
+        let mut admitted = message(&long_body, receipt);
+        admitted.header_bytes = 256 * 1024;
+        receiving::prepare(binding, &admitted, deadline()).unwrap();
+        let long_header = [prefix, &vec![b'x'; 300_000], b": value\r\n"].concat();
+        let mut refused = message(&long_header, receipt);
+        refused.header_bytes = 256 * 1024;
+        assert!(matches!(
+            receiving::prepare(binding, &refused, deadline()),
+            Err(receiving::Error::HeaderLimit)
+        ));
+    }
     let mut bounded = td_mta::admission::work::Meter::new(cap(), capacity);
-    let long_line = vec![b'x'; 1024 * 1024];
+    let long_line = [b"\r\n".as_slice(), &vec![b'x'; 1024 * 1024]].concat();
     assert!(matches!(
         receiving::prepare_with_meter(
             binding,
@@ -9977,10 +9992,7 @@ fn exercise_receiving(
         ),
         Err(receiving::Error::Input(td_mta::ports::Error::Invalid))
     ));
-    assert_eq!(
-        capacity.io_bytes - bounded.remaining().io_bytes,
-        4 * td_mta::format::MAX_VALUE_BYTES as u64 + 1001
-    );
+    assert!(capacity.io_bytes - bounded.remaining().io_bytes >= long_line.len() as u64);
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
         "0"
@@ -13191,7 +13203,10 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             continue;
         }
         if case == 1 {
-            assert_eq!(job.write(b"invalid"), Err(Failure::Refused(Error::Invalid)));
+            assert_eq!(
+                job.write(&[b'x'; 1001]),
+                Err(Failure::Refused(Error::Invalid))
+            );
             assert_eq!(
                 job.write(b"valid\r\n"),
                 Err(Failure::Refused(Error::Invalid))

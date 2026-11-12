@@ -500,11 +500,18 @@ pub(super) fn exercise(
                 command(&mut client, b"RSET\r\n", "250");
             }
             envelope(&mut client);
-            client.get_mut().write_all(b"Subject: PostgreSQL worker\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nAuthentication-Results: example.test; auth=pass\r\n\r\nbody\r\n").unwrap();
+            client.get_mut().write_all(b"Subject: PostgreSQL worker\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nAuthentication-Results: example.test; auth=pass\r\n").unwrap();
+            let long_header = format!("X-Long: {}\r\n\r\n", "h".repeat(4096));
+            let long_body = format!("{}\r\n..dot\r\n", "b".repeat(8192));
+            client.get_mut().write_all(long_header.as_bytes()).unwrap();
+            client.get_mut().write_all(long_body.as_bytes()).unwrap();
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "0");
             command(&mut client, b".\r\n", "250");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+            let preserved = format!("{long_header}{}\r\n.dot\r\n", "b".repeat(8192));
+            let hex: String = preserved.bytes().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.blob_chunks WHERE position(decode('{hex}','hex') in bytes)>0")), "1");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"), "0");
             assert_eq!(pending.operation().unwrap(), None);

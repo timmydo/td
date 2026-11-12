@@ -8,7 +8,7 @@ use crate::{
     ids::EmailId,
     ports,
 };
-use std::{fmt::Write as _, net::IpAddr};
+use std::{borrow::Cow, fmt::Write as _, net::IpAddr};
 use td_mime::{header_message_ids as ids, headers};
 
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
@@ -217,15 +217,16 @@ pub(crate) fn extent(source: &[u8], start: u64, end: u64) -> Result<&[u8], Error
         .ok_or(Error::Invalid)
 }
 
-pub(crate) struct Headers {
-    pub source: Vec<u8>,
+pub(crate) struct Headers<'a> {
+    source: Cow<'a, [u8]>,
+    available: usize,
     pub identifiers: Identifiers,
     scanner: headers::Scanner,
     position: usize,
     limit: usize,
     end: Option<headers::End>,
 }
-impl Headers {
+impl<'a> Headers<'a> {
     pub fn new(limit: usize) -> Result<Self, HeaderError> {
         let capacity = limit.checked_add(1000).ok_or(Error::Capacity)?;
         let mut source = Vec::new();
@@ -233,13 +234,27 @@ impl Headers {
             .try_reserve_exact(capacity)
             .map_err(|_| Error::Capacity)?;
         Ok(Self {
-            source,
+            source: Cow::Owned(source),
+            available: 0,
             identifiers: Identifiers::default(),
             scanner: headers::Scanner::new(0, limit as u64),
             position: 0,
             limit,
             end: None,
         })
+    }
+    /// Borrow already admitted immutable DATA instead of retaining tentative
+    /// field-name bytes in the header arena. Only recognized fields spend its cap.
+    pub fn resident(source: &'a [u8], limit: usize) -> Self {
+        Self {
+            source: Cow::Borrowed(source),
+            available: 0,
+            identifiers: Identifiers::default(),
+            scanner: headers::Scanner::new(0, limit as u64),
+            position: 0,
+            limit,
+            end: None,
+        }
     }
     pub fn complete(&self) -> bool {
         self.end.is_some()
@@ -254,20 +269,36 @@ impl Headers {
             return Err(Error::Invalid.into());
         }
         let next = self
-            .source
-            .len()
+            .available
             .checked_add(input.len())
             .ok_or(Error::Capacity)?;
-        if next > self.limit.checked_add(1000).ok_or(Error::Capacity)? {
-            return Err(HeaderError::HeaderLimit);
+        match &mut self.source {
+            Cow::Owned(source) => {
+                if next > self.limit.checked_add(1000).ok_or(Error::Capacity)? {
+                    return Err(HeaderError::HeaderLimit);
+                }
+                source.extend_from_slice(input);
+            }
+            Cow::Borrowed(source) => {
+                let part = source.get(self.available..next).ok_or(Error::Invalid)?;
+                // The resident path advances only through that original source.
+                if !input.is_empty() && !std::ptr::eq(part, input) {
+                    return Err(Error::Invalid.into());
+                }
+            }
         }
-        self.source.extend_from_slice(input);
+        self.available = next;
+        self.scan(last, work)
+    }
+    fn scan(&mut self, last: bool, work: &mut Work<'_>) -> Result<bool, HeaderError> {
         loop {
             let now = work.tick()?;
             let progress = self
                 .scanner
                 .poll(
-                    self.source.get(self.position..).ok_or(Error::Invalid)?,
+                    self.source
+                        .get(self.position..self.available)
+                        .ok_or(Error::Invalid)?,
                     last,
                     now,
                     work.meter,
@@ -339,7 +370,9 @@ impl Headers {
             let now = work.tick()?;
             let progress = scanner
                 .poll(
-                    self.source.get(position..).ok_or(Error::Invalid)?,
+                    self.source
+                        .get(position..self.available)
+                        .ok_or(Error::Invalid)?,
                     true,
                     now,
                     work.meter,
@@ -372,7 +405,10 @@ impl Headers {
                     }
                     let tail = self
                         .source
-                        .get(usize::try_from(end.header_bytes).map_err(|_| Error::Invalid)?..)
+                        .get(
+                            usize::try_from(end.header_bytes).map_err(|_| Error::Invalid)?
+                                ..self.available,
+                        )
                         .ok_or(Error::Invalid)?;
                     // An orphan continuation was body in the received message.
                     // Keep it from continuing our newly prepended Received field.
