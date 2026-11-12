@@ -37,6 +37,7 @@ fn injected_clock_missing_time_and_shared_retirement() {
     assert!(backend_a.current_time().is_none());
     value.store(1_800_000_000, Ordering::SeqCst);
     assert_eq!(clock.now(), Err(TlsError::Crypto));
+    assert_eq!(clock.health(), Err(TlsError::Crypto));
     assert!(backend_b.current_time().is_none());
     assert!(clock.source.lock().unwrap().is_none());
     struct Maximum;
@@ -103,5 +104,46 @@ fn injected_clock_serializes_and_drops_panicking_source() {
         panic!("synthetic poisoned boundary")
     })
     .is_err());
+    assert_eq!(poisoned.health(), Err(TlsError::Crypto));
     assert_eq!(poisoned.now(), Err(TlsError::Crypto));
+    assert_eq!(poisoned.health(), Err(TlsError::Crypto));
+}
+
+/// A health check answers while another caller's callback runs, and sees the
+/// retirement that callback's unwind causes.
+#[test]
+fn health_does_not_wait_for_a_callback_in_progress() {
+    struct Held {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+    impl UtcClock for Held {
+        fn now(&self) -> Option<u64> {
+            self.entered.wait();
+            self.release.wait();
+            panic!("synthetic callback failure after the check")
+        }
+    }
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let clock = Arc::new(ClockHandle::new(Held {
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let caller = {
+        let clock = clock.clone();
+        std::thread::spawn(move || clock.now())
+    };
+    entered.wait();
+    let (answer, received) = std::sync::mpsc::channel();
+    let checker = {
+        let clock = clock.clone();
+        std::thread::spawn(move || answer.send(clock.health()).unwrap())
+    };
+    let during = received.recv_timeout(std::time::Duration::from_secs(10));
+    release.wait();
+    assert_eq!(caller.join().unwrap(), Err(TlsError::Crypto));
+    checker.join().unwrap();
+    assert_eq!(during, Ok(Ok(())));
+    assert_eq!(clock.health(), Err(TlsError::Crypto));
 }

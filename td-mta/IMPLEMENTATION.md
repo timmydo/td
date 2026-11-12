@@ -1948,9 +1948,10 @@ remain open. What remains of M07:
   evidence and `check_gateway_policy` exist, but `serve` refuses gateway
   listeners and receiving refuses a session carrying gateway evidence;
   M12 owns that listener;
-- selected-key lock contention measured across handshake and established
-  workers, with the shared clock callback, and qualified startup ordering
-  and supervision around the blocking entropy read (td-crypto/DESIGN.md);
+- contention across handshake and established workers in the integrated
+  service, per-operation sampling of the serialized clock included, and
+  qualified startup ordering and supervision around the blocking entropy
+  read (td-crypto/DESIGN.md);
 - M07e's accounting of retained peer state, decoded-message expansion and
   separate header/body polling, and the concurrent-session and
   simultaneous-traffic admission M07e4d and M07e4e leave pending;

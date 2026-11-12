@@ -221,7 +221,8 @@ No h2 engine or ACME TLS-ALPN-01 protocol is implied.
 A td-owned shared Send + Sync clock trait returns optional UTC seconds since
 Unix epoch. Its callback performs bounded, nonblocking work; configurations
 retain a shared clock handle and never retain a short-lived caller borrow.
-ClockHandle owns and serializes the source. Missing time returns Clock and
+ClockHandle owns and serializes the source; a health check reads its
+retirement without waiting for a callback. Missing time returns Clock and
 leaves the source available for other operations; callback unwind permanently
 retires the shared source and later calls return Crypto. A poisoned handle
 also refuses. Callbacks must not reenter the handle. DESIGN.md defines the

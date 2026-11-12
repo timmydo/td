@@ -100,10 +100,7 @@ impl ServerIdentity {
     }
 
     pub(super) fn check_health(&self) -> Result<(), TlsError> {
-        let mut point = [0; 65];
-        Provider
-            .p256_public(&self.key, &mut point)
-            .map_err(crypto_error)
+        self.key.healthy().map_err(crypto_error)
     }
 }
 

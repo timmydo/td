@@ -1537,9 +1537,10 @@ td-crypto/src/identity_tests.rs	unchecked-growth-or-clone	51
 td-crypto/src/pem_tests.rs	allocating-conversion	27
 td-crypto/src/pem_tests.rs	allocation-macro	9
 td-crypto/src/pem_tests.rs	unchecked-growth-or-clone	30
-td-crypto/src/provider_tests.rs	allocating-conversion	10
+td-crypto/src/provider_tests.rs	allocating-conversion	12
 td-crypto/src/provider_tests.rs	allocation-macro	17
-td-crypto/src/provider_tests.rs	unchecked-growth-or-clone	41
+td-crypto/src/provider_tests.rs	heap-owner	1
+td-crypto/src/provider_tests.rs	unchecked-growth-or-clone	43
 td-crypto/src/tls_client.rs	allocating-conversion	1
 td-crypto/src/tls_client.rs	allocation-macro	1
 td-crypto/src/tls_client.rs	heap-owner	8
@@ -1549,10 +1550,10 @@ td-crypto/src/tls_client_tests.rs	allocation-macro	7
 td-crypto/src/tls_client_tests.rs	heap-owner	11
 td-crypto/src/tls_client_tests.rs	unchecked-growth-or-clone	13
 td-crypto/src/tls_clock.rs	heap-owner	1
-td-crypto/src/tls_clock_tests.rs	allocating-conversion	2
+td-crypto/src/tls_clock_tests.rs	allocating-conversion	4
 td-crypto/src/tls_clock_tests.rs	allocation-macro	2
-td-crypto/src/tls_clock_tests.rs	heap-owner	9
-td-crypto/src/tls_clock_tests.rs	unchecked-growth-or-clone	9
+td-crypto/src/tls_clock_tests.rs	heap-owner	12
+td-crypto/src/tls_clock_tests.rs	unchecked-growth-or-clone	13
 td-crypto/src/tls_peer_tests.rs	allocating-conversion	8
 td-crypto/src/tls_peer_tests.rs	allocation-macro	2
 td-crypto/src/tls_peer_tests.rs	heap-owner	10

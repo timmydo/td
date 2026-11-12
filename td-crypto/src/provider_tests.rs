@@ -310,8 +310,9 @@ fn capacity_failure_and_retired_keys_preserve_caller_output() {
         let _held = key.key.lock().unwrap();
         panic!("fixture lock poison");
     });
-    assert_eq!(key.operate(|_| Ok(())), Err(Error::Crypto));
+    assert_eq!(key.healthy(), Err(Error::Crypto));
     assert!(matches!(key.key.lock(), Err(poisoned) if poisoned.get_ref().is_none()));
+    assert_eq!(key.operate(|_| Ok(())), Err(Error::Crypto));
 }
 
 #[test]
@@ -433,4 +434,44 @@ fn generated_documents_differ() {
         crate::pkcs8::parse(&first[..length]).unwrap().scalar,
         crate::pkcs8::parse(&second[..length]).unwrap().scalar
     );
+}
+
+/// A health check answers while another caller holds the key in a signature,
+/// and sees the retirement that signature's failure causes.
+#[test]
+fn health_does_not_wait_for_a_signature_in_progress() {
+    use std::{
+        panic::AssertUnwindSafe,
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+    };
+    let key = Arc::new(load_fixture());
+    let (entered, inside) = mpsc::channel();
+    let (release, held) = mpsc::channel::<()>();
+    let channels = AssertUnwindSafe((entered, held));
+    let signer = {
+        let key = key.clone();
+        thread::spawn(move || {
+            key.sign_es256_with(b"held", move |_| {
+                let channels = channels;
+                let (entered, held) = channels.0;
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+                Err::<(), _>(Error::Crypto)
+            })
+        })
+    };
+    inside.recv().unwrap();
+    let (answer, received) = mpsc::channel();
+    let checker = {
+        let key = key.clone();
+        thread::spawn(move || answer.send(key.healthy()).unwrap())
+    };
+    let during = received.recv_timeout(Duration::from_secs(10));
+    release.send(()).unwrap();
+    assert_eq!(signer.join().unwrap(), Err(Error::Crypto));
+    checker.join().unwrap();
+    assert_eq!(during, Ok(Ok(())));
+    assert_eq!(key.healthy(), Err(Error::Crypto));
 }

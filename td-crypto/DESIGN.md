@@ -294,8 +294,11 @@ from it once at load, behind a private mutex. Public-point extraction and
 signing serialize on that handle. Each operation borrows the key where it
 lies, inside the same narrow unwind boundary, so a signature moves no copy
 of the scalar. A returned
-operation error or Rust unwind drops the key and leaves the handle retired.
-Later operations fail Crypto; a poisoned mutex also refuses access. No clone,
+operation error or Rust unwind sets a retirement flag under the mutex,
+then drops the key; the TLS health check reads that flag and the mutex's
+poison state without taking it. Later operations fail Crypto; a poisoned
+mutex also refuses access, and retires the handle when an operation finds
+it. No clone,
 private-scalar export or backend handle is exposed. The mutex can block;
 these operations have no timeout/cancellation mechanism. M07 must fit actual
 usage into the control-worker lifecycle before enabling service.
@@ -900,8 +903,12 @@ M07e. Ordinary missing time is sticky only for that connection, even if a later
 query succeeds. Shared source retirement overrides that local failure with
 Crypto. No mutable transient error cell lives on the reusable configuration.
 The observer checks ClockHandle health without invoking its callback, so it
-cannot lose a transient failure by re-polling. Health waits for an in-flight
-serialized callback before inspecting the source slot.
+cannot lose a transient failure by re-polling. Health reads a retirement flag,
+which a callback unwind or a poisoned lock sets under the source lock, and
+the lock's poison state, so it does not wait for an in-flight callback: one
+still running that has not yet retired the source is ordered after the
+check, and its unwind is seen by every later check. Sampling time still
+takes the lock and runs the serialized callback.
 
 Every operational call samples supplied time even when the backend does not
 request it. Every mutable backend call checks the observer afterward, including
@@ -1017,8 +1024,10 @@ not block its healthy selected identity. Completed connections check selected
 key health on every operation, without re-expiring their established peer
 authentication when the certificate's date passes. Shared key retirement is
 checked after native calls and before publication; ordinary peer errors retire
-only the session. A private health helper performs the existing fenced public
-point operation, without adding a signing or secret-export path.
+only the session. A private health helper reads the key's retirement flag
+and its mutex's poison state, dropping a poisoned key's scalar when the lock
+is free, without adding a signing or secret-export path or waiting for
+another session's signature.
 
 Server configuration clones install their own sticky clock observer before
 configuration-dependent native work. Sample supplied time before operations
@@ -1277,15 +1286,34 @@ x86-64 host build. The reviewers ran no mutation testing of their own.
 The review holds for the code it read; a change to a reviewed path needs
 it again.
 
-Selected-key health currently uses the owned key's mutex-backed public-point
-operation. A server session checks it before work, after backend calls and at
-publication, so established record work can wait behind another session's
-signing operation. These repeated acquisitions preserve shared retirement
-semantics; they are not qualified as nonblocking or latency-bounded. M07e must
-measure contention across handshake and established workers, along with the
-shared clock callback. That measurement was to precede service admission,
-which came first; it remains open. Any later lock-free health optimization
-must independently preserve those retirement fences.
+Selected-key health and shared-clock health read a retirement flag and
+their mutex's poison state without taking the key's or the clock's mutex. A
+server session checks key health before work, after backend calls and at
+publication, and every backend call checks clock health; while those checks
+took the mutexes, established record work waited behind any other session's
+signature, and on each check behind any clock callback. Measured on the
+16-thread x86-64 development host in an optimized test build of td-crypto's
+own types: with two threads signing continuously on one key, at 0.4 to
+1.3 ms a signature, the mutex-backed key check waited p50 310 µs, p99 4.1 ms
+and at most 149 ms; with four threads calling a system-time clock
+continuously, the mutex-backed clock check waited p50 38 µs, p99 1.4 ms and
+at most 20 ms. Reading the flags, both checks measured p99 2.0 µs, timer
+overhead included, and at most 44 µs and 648 µs, beside the busy threads.
+Each flag is set under its lock before the failing call returns, so the
+session whose operation failed sees retirement at its next check, and a check overlapping another caller's
+operation is ordered before it unless that operation has already retired the
+handle.
+
+Established sessions no longer take the key's mutex. They still take the
+clock's: every operational call samples time through the shared
+serialized callback, and a server operation samples it again afterwards, so
+record work still waits behind other sessions' clock callbacks, as the clock
+figures above show under that load. Signing serializes too: concurrent
+handshakes on one identity take turns at its key, which bounds one key at
+roughly 770 to 2500 signatures a second on that host. These are component
+measurements on one machine, not a latency bound. Contention across complete
+handshake and established sessions in the integrated service, per-operation
+clock sampling included, is not measured and remains open.
 
 ### td-primitives backend qualification
 

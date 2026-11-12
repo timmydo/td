@@ -2,7 +2,10 @@
 use crate::{pkcs8, Crypto, Error, Sha256};
 use std::{
     panic::{catch_unwind, UnwindSafe},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, TryLockError,
+    },
 };
 use td_primitives::ec::p256;
 
@@ -21,6 +24,9 @@ const GENERATION_DRAWS: usize = 64;
 /// Signing allocates its DER signature; it is not hot-path qualified.
 pub struct P256Key {
     key: Mutex<Option<Owned>>,
+    // Set under the lock before a failing operation returns, so a health check
+    // need not wait behind another caller's signature.
+    retired: AtomicBool,
 }
 
 /// The scalar, and the public point derived from it once at load.
@@ -80,6 +86,7 @@ impl P256Key {
             Err(poisoned) => {
                 // Dropped where it lies, so no scalar stays in the slot.
                 *poisoned.into_inner() = None;
+                self.retired.store(true, Ordering::Release);
                 return Err(Error::Crypto);
             }
         };
@@ -88,10 +95,30 @@ impl P256Key {
         let key = slot.as_ref().ok_or(Error::Crypto)?;
         let result = provider(|| operation(key));
         if result.is_err() {
+            self.retired.store(true, Ordering::Release);
             // Retire: dropping the key zeroes its scalar.
             *slot = None;
         }
         result
+    }
+
+    /// Whether the key is unretired and unpoisoned, without waiting for a
+    /// caller's operation: one still running that has not yet retired the key
+    /// is ordered after this check.
+    pub(super) fn healthy(&self) -> Result<(), Error> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(Error::Crypto);
+        }
+        if self.key.is_poisoned() {
+            // Drop the scalar now unless a caller holds the lock; an operation
+            // that finds the poison drops it otherwise.
+            if let Err(TryLockError::Poisoned(poisoned)) = self.key.try_lock() {
+                *poisoned.into_inner() = None;
+                self.retired.store(true, Ordering::Release);
+            }
+            return Err(Error::Crypto);
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +230,7 @@ impl Crypto for Provider {
         })?;
         Ok(P256Key {
             key: Mutex::new(Some(key)),
+            retired: AtomicBool::new(false),
         })
     }
 

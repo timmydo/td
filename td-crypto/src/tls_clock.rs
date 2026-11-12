@@ -2,7 +2,10 @@
 use crate::TlsError;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 /// Caller-supplied UTC source. Callbacks must perform bounded, nonblocking work
@@ -16,6 +19,9 @@ pub trait UtcClock: Send + Sync {
 /// unwind retires the source for every holder; missing time alone does not.
 pub struct ClockHandle {
     source: Mutex<Option<Box<dyn UtcClock>>>,
+    // Set under the lock before a failing callback returns, so a health check
+    // need not wait behind another caller's callback.
+    retired: AtomicBool,
 }
 
 impl ClockHandle {
@@ -23,22 +29,29 @@ impl ClockHandle {
     pub fn new(source: impl UtcClock + 'static) -> Self {
         Self {
             source: Mutex::new(Some(Box::new(source))),
+            retired: AtomicBool::new(false),
         }
     }
 
+    /// Whether the source is unretired and unpoisoned, without waiting for a
+    /// callback in progress: one still running that has not yet retired the
+    /// source is ordered after this check.
     pub(super) fn health(&self) -> Result<(), TlsError> {
-        let slot = self.source.lock().map_err(|_| TlsError::Crypto)?;
-        if slot.is_some() {
-            Ok(())
-        } else {
+        if self.retired.load(Ordering::Acquire) || self.source.is_poisoned() {
             Err(TlsError::Crypto)
+        } else {
+            Ok(())
         }
     }
 
     /// Query the shared source. None maps to Clock; a caught unwind or poisoned
     /// source maps to Crypto and permanently refuses further callbacks.
     pub fn now(&self) -> Result<u64, TlsError> {
-        let mut slot = self.source.lock().map_err(|_| TlsError::Crypto)?;
+        let retire = || {
+            self.retired.store(true, Ordering::Release);
+            TlsError::Crypto
+        };
+        let mut slot = self.source.lock().map_err(|_| retire())?;
         let source = slot.take().ok_or(TlsError::Crypto)?;
         // This boundary consumes the source; an unwind cannot restore it or
         // expose its possibly changed state to another serialized callback.
@@ -46,7 +59,7 @@ impl ClockHandle {
             let now = source.now();
             (source, now)
         }))
-        .map_err(|_| TlsError::Crypto)?;
+        .map_err(|_| retire())?;
         *slot = Some(source);
         now.ok_or(TlsError::Clock)
     }
