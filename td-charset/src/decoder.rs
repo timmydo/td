@@ -80,6 +80,11 @@ impl Decoder {
         }
         Ok(out)
     }
+    /// Bytes pushed and not yet decoded: an unfinished sequence, at most three.
+    /// The bytes before them are all in batches already returned.
+    pub const fn pending(&self) -> usize {
+        self.len
+    }
     /// Flush an incomplete sequence as one replacement; subsequent calls are inert.
     pub fn finish(&mut self) -> Decoded {
         let mut out = Decoded::new();

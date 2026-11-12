@@ -31,7 +31,9 @@ in a fixed `Decoded` batch. The caller drains the batch before feeding more
 bytes. This makes chunk boundaries irrelevant and bounds each call to four
 pending-byte transitions, each using direct table access or a binary search
 of the 207 GB18030 ranges. State retains at most three unfinished bytes
-between calls. No decoder allocation, I/O, recursion or retained output occurs.
+between calls; `pending` says how many, so a caller that stops between
+batches knows which input bytes its output covers. No decoder
+allocation, I/O, recursion or retained output occurs.
 `finish` emits one replacement for an unfinished sequence and closes the
 stream; repeated finishes are inert and subsequent pushes return Finished.
 Decoders can be copied as pure checkpoints; callers own admission and output.
@@ -86,11 +88,25 @@ opt into HTML scanning merely because it contains a tag-like string.
 ## Consumer and build boundaries
 
 This library is independently consumable by td-web, td-mail and td-news.
-It currently changes no consumer and enters no distribution recipe.
+td-web is its one consumer: the td-web recipe stages it beside td-alloc,
+the one td-alloc instance td-web already shares (`td-alloc/DESIGN.md`),
+and td-web decodes pages and text with the streaming decoder and `sniff`
+(td-web/DESIGN.md §5). td-mail and td-news do not use it.
+
+The tables compiled into a consumer are WHATWG data under BSD-3-Clause
+(`data/LICENSE-WHATWG`), whose second clause asks a binary distribution
+to carry the notice. A consumer that ships, in an image or a package,
+must carry that file byte for byte beside what it ships. The
+`td-charset-notice` recipe writes it, its test holding it to this copy,
+at `share/licenses/td-charset/LICENSE-WHATWG`, and the `web` package
+copies it to `files/share/licenses/td-charset/LICENSE-WHATWG`. A build
+from the checkout, such as `./install-apps`, distributes nothing and
+has the file in the tree.
+
 Adoption must stage this crate and td-alloc in the consumer's recipe, as
-the one td-alloc instance the consumer already shares (`td-alloc/DESIGN.md`)
-so that one reservation scope covers both, and respect that consumer's
-deadlines, work budgets and charset policy. In particular
+the one td-alloc instance the consumer already shares, so that one
+reservation scope covers both, and respect that consumer's deadlines,
+work budgets and charset policy. In particular
 `td-mime`'s strict ASCII/Latin-1 semantics and admitted labels cannot be
 replaced by WHATWG aliases without an explicit policy change.
 The existing `td-encoding` crate continues to own hex/base64 byte encodings.

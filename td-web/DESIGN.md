@@ -34,13 +34,18 @@ td-web is a zone-one program (AGENTS.md "Trust zones"): the `td-web`
 crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
 and td's own crates by path: `td-ui` for the window, `td-html` for
-markup, `td-fetch-client` for the network, `td-url` for URLs, and the
-shared decoders (`td-png`, `td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. It adds no external
+markup, `td-charset` for text in other encodings, `td-fetch-client`
+for the network, `td-url` for URLs, and the shared decoders (`td-png`,
+`td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. td-charset's
+tables are WHATWG data under BSD-3-Clause, so the `web` package carries
+its notice, td-charset's `data/LICENSE-WHATWG` byte for byte, at
+`files/share/licenses/td-charset/LICENSE-WHATWG`, copied from the
+`td-charset-notice` recipe (td-charset/DESIGN.md). It adds no external
 dependency and no `unsafe`: it declares `#![forbid(unsafe_code)]`; the
 only raw syscall surface in its closure is td-ui's Wayland transport,
 already recorded in UNSAFE.md, and td-fetch-client forbids `unsafe` as
-td-web does. It follows AGENTS.md's production-code
-rules (no panicking calls or indexing; bounded inputs).
+td-web does. It follows AGENTS.md's production-code rules (no panicking
+calls or indexing; bounded inputs).
 
 Web content is hostile input. Every parser td-web feeds is bounded by
 the limits below and by its crate's own (td-html's depth and element
@@ -104,43 +109,52 @@ home, and no grant of the human's files. No bus
 names, no environment and no terminal.
 
 **Memory.** The bounds hold td-web's own memory; a body at
-`MAX_DOCUMENT` (16 MiB) for each fetch out, held at its own length;
-one rendering of markup within `HTML_LIMITS` (§5) or one decoding of a
+`MAX_DOCUMENT` (16 MiB) for each fetch out, held at its own length; one
+rendering of markup within `HTML_LIMITS` (§5) or one decoding of a
 picture; and what is shown, a page with the lines of it laid or a
-picture with its copy fitted to the pane. Renderings and decodings run on one render
-thread, for every fetch thread, one at a time; a navigation stopped or
-overtaken before its turn takes neither, and a document made for one
-stopped while it was made is dropped there before the next reply is
-taken, so it never stands beside that one's rendering. Measured on a
-development host, release build: td-web started under a headless
-td-compositor with the pinned faces and the blank page holds 23 MB
-resident at 1920x1200, 34 MB at 2880x1800 and 47 MB at 3840x2160,
-the largest output td supports, beside its window's shared-memory
-buffers, 9, 20 or 32 MB each, of which td-ui keeps up to three: 50,
-95 or 144 MB in all. The most it holds while a reply is made into a
-document beside the one shown is then those 144 MB; 67 MB of bodies
-(`MAX_WORKERS` of `MAX_DOCUMENT`); on the render thread the larger of
-td-html's rule for a rendering's peak, 100 bytes a byte of input read
-and 1.25 a byte of budget (td-html/DESIGN.md, "Resident rendering
-cost"), 252 MB at `HTML_LIMITS` (238 MB at most measured), and the
-costliest decoding, a 16-bit RGBA PNG of 16 Mi pixels inflated at 8
-bytes a pixel beside its 4-byte RGBA, 201 MB (201 measured; a JPEG
-of as many pixels some 112 MB); and the larger of what may be shown:
-a page, which holds no more than td-html's output for it, so no more
-than the budget's 34 MB (at most 19 MB measured), or a text page, whose
-tabs are expanded, at most 46 MB (eight bytes a byte of `MAX_TEXT` and
-120 a line; 43 MB measured, tabs 41 to a line), with the lines of it
-laid on the window's thread, only those near the ones shown however
-long the page, 19.3 MB at most measured and taken as 24 (§5), 70 MB;
-or a picture's 67 MB with its copy fitted to the pane, 33 MB at
-3840x2160, 100 MB, the larger: 564 MB. That is why `memory-high` is
-640 MiB (671 MB), 107 MB above the sum, so that pages as large as long
-Wikipedia articles render whole: under 512 MiB (537 MB) with the same
-room the sum fits only with markup cut at some 1.5 MiB, the wrap no
-longer weighing in it; `memory-max` stays 768 MiB (805 MB). A test
-(`the_html_limits_fit_the_jail`) holds the sum at least 20 MB under
-`memory-high`, the measured figures and the jail's copied by hand and
-reviewed when `web.rs` or the limits change.
+picture with its copy fitted to the pane. Renderings and decodings run
+on one render thread, for every fetch thread, one at a time; a
+navigation stopped or overtaken before its turn takes neither, and a
+document made for one stopped while it was made is dropped there before
+the next reply is taken, so it never stands beside that one's rendering.
+Measured on a development host, release build: td-web started under a
+headless td-compositor with the pinned faces and the blank page holds 23
+MB resident at 1920x1200, 34 MB at 2880x1800 and 47 MB at 3840x2160, the
+largest output td supports, beside its window's shared-memory buffers,
+9, 20 or 32 MB each, of which td-ui keeps up to three: 50, 95 or 144 MB
+in all. The most it holds while a reply is made into a document beside
+the one shown is then those 144 MB; 67 MB of bodies (`MAX_WORKERS` of
+`MAX_DOCUMENT`); on the render thread the larger of td-html's rule for a
+rendering's peak, 100 bytes a byte of input read and 1.25 a byte of
+budget (td-html/DESIGN.md, "Resident rendering cost"), 252 MB at
+`HTML_LIMITS` (238 MB at most measured), and the costliest decoding, a
+16-bit RGBA PNG of 16 Mi pixels inflated at 8 bytes a pixel beside its
+4-byte RGBA, 201 MB (201 measured; a JPEG of as many pixels some 112
+MB); and the larger of what may be shown: a page, which holds no more
+than td-html's output for it, so no more than the budget's 34 MB (at
+most 19 MB measured), or a text page, whose tabs are expanded, at most
+46 MB (eight bytes a byte of `MAX_TEXT` and 120 a line; 43 MB measured,
+tabs 41 to a line), with the lines of it laid on the window's thread,
+only those near the ones shown however long the page, 19.3 MB at most
+measured and taken as 24 (§5), 70 MB; or a picture's 67 MB with its copy
+fitted to the pane, 33 MB at 3840x2160, 100 MB, the larger: 564 MB. That
+is why `memory-high` is 640 MiB (671 MB), 107 MB above the sum, so that
+pages as large as long Wikipedia articles render whole: under 512 MiB
+(537 MB) with the same room the sum fits only with markup cut at some
+1.5 MiB, the wrap no longer weighing in it; `memory-max` stays 768 MiB
+(805 MB). A test (`the_html_limits_fit_the_jail`) holds the sum at least
+20 MB under `memory-high`, the measured figures and the jail's copied by
+hand and reviewed when `web.rs` or the limits change. A page's text is
+decoded (§5) on the render thread before it is rendered: sent in valid
+UTF-8 it is its body, cut in place; sent in another encoding, or in
+UTF-8 holding malformed bytes or ending unfinished, it is decoded into a
+string of at most `MAX_MARKUP` or `MAX_TEXT` bytes, had at once, and the
+body is dropped before td-html or the text's lines are given it. While
+it is decoded the body and the string are both alive, the string beside
+a body the bodies already count; that is within the sum because the
+render thread's term, a rendering or a picture's decoding, holds nothing
+then: the decoding is that thread's work before its rendering starts.
+After it, the text stands in its body's place and adds no term.
 
 The allocator (glibc's) gives a thread that allocates beside another an
 arena of its own and keeps much of a rendering's peak in it after, for
@@ -228,8 +242,8 @@ too; a larger body is refused by the service and shown as an error. A
 picture is shown within td-ui's bounds (8192 pixels an axis, 16 Mi
 pixels): a larger JPEG is decoded at the largest of td-jpeg's scales
 that fits, a larger PNG, GIF, WebP or AVIF is refused. Markup past `MAX_MARKUP` (2 MiB)
-and text past `MAX_TEXT` (4 MiB) are not rendered, and the page says
-so (§5). Requests carry
+and text past `MAX_TEXT` (4 MiB), both counted in the UTF-8 they
+decode to, are not rendered, and the page says so (§5). Requests carry
 `accept: text/html, application/xhtml+xml, text/plain;q=0.9,
 image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, image/webp;q=0.8, */*;q=0.1` and td-web's
 `user-agent`; the service sends `accept-encoding: identity` itself.
@@ -237,7 +251,11 @@ image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, image/webp;q=0.8, */*;q=0.1`
 ## 5. Documents
 
 A response is shown by its type, the `content-type` media type, else a
-sniff of its first bytes for `<!doctype html` or `<html`:
+sniff: `<!doctype html` or `<html` at its start, after spaces and a
+UTF-8 byte order mark, is HTML; a picture's signature a picture; a byte
+order mark, or no byte of binary data in its first 1445 bytes, the
+resource header (MIME Sniffing, "Rules for distinguishing if a resource
+is text or binary"), text:
 
 - `text/html` and `application/xhtml+xml` are rendered through td-html
   (`to_rich_within`, within `HTML_LIMITS`) once, unwrapped (width 0),
@@ -303,19 +321,55 @@ sniff of its first bytes for `<!doctype html` or `<html`:
 - Anything else is not shown: the page names the type and size and
   says that Firefox opens it. Downloads are a later increment (§10).
 
-Text is decoded as UTF-8, invalid sequences replaced and a byte order
-mark dropped; other charsets are a later increment. Control
-characters other than the tab (C0, DEL and C1), which prose would show
-as U+FFFD, are dropped before the page is wrapped, a CR before an LF
-among them. Markup past `MAX_MARKUP` (2 MiB) and text past `MAX_TEXT`
-(4 MiB) are not rendered, a page keeps at most `MAX_LINES` (100,000)
-logical lines, an unwrapped line at most `MAX_PRE_CHARS` characters,
-and the status row says when any of these, or td-html's output budget
-(below), cut the page short. The wrapped lines are not counted or cut:
-however many a page wraps to, only those near the ones shown are laid
-(below). A status other than `2xx`
-with a body is shown with its status in the status row; one without a
-body is an error page.
+**Encodings.** Markup and text are decoded to UTF-8 on the render thread
+before anything reads them, td-html and the title included, through
+td-charset (td-charset/DESIGN.md) by the WHATWG Encoding and HTML
+Standards' rules. A byte order mark decides first, whatever the label
+says, and is dropped. Then the `content-type`'s `charset` parameter, its
+first, when td-charset knows the label (ISO-8859-1 and ASCII meaning
+windows-1252, as WHATWG has them). Then, for HTML alone, a `<meta
+charset>` or a `<meta http-equiv=content-type>` complete in the first
+1024 bytes (HTML's prescan, a UTF-16 one meaning UTF-8). Then, as the
+HTML Standard's detection step allows, UTF-8 when every byte shown is
+UTF-8; else windows-1252, the standard's default for a browser with no
+locale. The detection is all or nothing, as validity detection such as
+chardetng's is: one byte that is not UTF-8 anywhere in what is shown of
+an unlabelled page makes the whole page windows-1252. A sequence the
+bound cuts counts as UTF-8 when the bytes past it finish it, and one the
+body ends in when UTF-8 beyond ASCII comes before it (a lead byte after
+ASCII alone is as likely windows-1252's last letter); decoding makes the
+latter one U+FFFD. Text takes the same order without the `<meta>`, as
+browsers read text: Firefox prescans no `text/plain`, and the HTML
+Standard's page-load model for text does not say.
+`application/xhtml+xml`, and XML shown as text (`text/xml`, a
+`text/*+xml` type), take XML's rules: the mark, the label, else UTF-8;
+the XML declaration is not read. A label td-charset does not know (Big5,
+EUC-JP, ISO-2022-JP) is passed over as if absent. Malformed bytes, and a
+sequence the body ends in, are each U+FFFD and the page renders on: only
+want of memory for its text fails a page, as an error page. `MAX_MARKUP`
+and `MAX_TEXT` bound the text decoded, in bytes of UTF-8, not the bytes
+sent, and the scalars a byte completes are left out whole when the bound
+would cut them: td-html is handed at most `MAX_MARKUP` bytes whatever
+the encoding, though a byte of windows-1252 or of halfwidth Shift_JIS
+decodes to three, and the note saying a page was cut gives how many of
+the bytes sent it shows: those before the first left out, none still
+unfinished among them. A page's text sent in valid UTF-8 is its body,
+cut in place; in another encoding, or UTF-8 holding malformed bytes or
+ending unfinished, it is decoded into a string of at most the bound, had
+at once, and the body dropped (§3). The status row names the encoding
+when it is not UTF-8 (§8). Find, the selection and copying see the
+decoded text alone. No encoding is chosen by hand (§10).
+
+Control characters other than the tab (C0, DEL and C1), which prose
+would show as U+FFFD, are dropped before the page is wrapped, a CR
+before an LF among them. Markup past `MAX_MARKUP` (2 MiB) and text past
+`MAX_TEXT` (4 MiB) are not rendered, a page keeps at most `MAX_LINES`
+(100,000) logical lines, an unwrapped line at most `MAX_PRE_CHARS`
+characters, and the status row says when any of these, or td-html's
+output budget (below), cut the page short. The wrapped lines are not
+counted or cut: however many a page wraps to, only those near the ones
+shown are laid (below). A status other than `2xx` with a body is shown
+with its status in the status row; one without a body is an error page.
 
 td-html builds a rendering whole before td-web cuts it, so
 `HTML_LIMITS` (td-html/DESIGN.md, "Resident rendering cost") bound that
@@ -474,9 +528,10 @@ One td-ui window: an address row on top, the page below, a status row
 at the bottom. The status row says, first that applies: what the last
 input made happen (a link not followed, a refusal, a copy), until the
 next key, click, wheel turn or paste; what is loading; where the link under the pointer, else the
-focused link, goes; the response's status, the place in the page and
-any cut. The place, said only of a page not shown whole, is `N of M
-lines`: the logical line the last line shown is part of, of the page's
+focused link, goes; the response's status, the place in the page, the
+encoding its text was decoded from when not UTF-8 (§5), and any cut.
+The place, said only of a page not shown whole, is `N of M lines`: the
+logical line the last line shown is part of, of the page's
 logical lines, which needs nothing laid but the lines shown (§5). Its
 app id is `td-web`; its title is the document's `<title>`, else its
 URL, then ` - td-web`.
@@ -659,7 +714,12 @@ order; each is its own design amendment when it starts:
 - **Foundations.** An HTML5 tree builder in td-html exposing a document
   tree (the consumer td-mail and td-news later move to); a cookie jar
   kept in the account's home; forms; gzip through the fetch service;
-  more concurrent fetches; legacy charsets.
+  more concurrent fetches.
+- **Encodings.** A key choosing the encoding a page is decoded with
+  (the HTML Standard's user override, kept with the page in the
+  history); the XML declaration for `application/xhtml+xml`; Big5,
+  EUC-JP and ISO-2022-JP in td-charset; and detection for unlabelled
+  pages in a legacy encoding, which windows-1252 misreads.
 - **More faces.** Kerning from `GPOS`, then Noto's CJK (CFF
   collections), colour emoji and variable fonts, each waiting for
   td-ui's reader to take that form (`td-ui/src/sfnt.rs`).

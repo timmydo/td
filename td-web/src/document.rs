@@ -12,7 +12,9 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
 use td_ui::picture::Picture;
 
+use crate::charset::{self, Rules};
 use crate::picture::{self, Format};
+use td_charset::Encoding;
 #[cfg(test)]
 use td_ui::picture::{MAX_PICTURE_AXIS, MAX_PICTURE_PIXELS};
 use td_ui::prose::{self, Metrics};
@@ -57,6 +59,9 @@ const FIRST_SLICE: usize = 4 << 10;
 const STRIDE: usize = 64;
 /// The logical lines whose walks' starts are remembered.
 const WALKED: usize = 2;
+/// The bytes of a body of no stated type MIME Sniffing reads, its
+/// resource header.
+const SNIFF_HEADER: usize = 1445;
 /// The most bytes searched for a title, from the start of the page.
 const TITLE_WINDOW: usize = 64 << 10;
 /// The longest title kept, in characters.
@@ -1373,11 +1378,12 @@ impl Document {
     }
 
     /// `body`, answered with `status` from `url` as `content_type`,
-    /// rendered into logical lines or decoded; none once `stopped` is set
-    /// before markup is rendered or a picture decoded. td-web calls this
-    /// only on its `Renderer`'s thread, which takes each reply when the
-    /// one before it is done, so a navigation stopped or overtaken while
-    /// it waited does no such work.
+    /// rendered into logical lines, markup and text decoded to UTF-8
+    /// first (`charset`), or decoded as a picture; none once `stopped` is
+    /// set before markup is decoded and rendered or a picture decoded.
+    /// td-web calls this only on its `Renderer`'s thread, which takes
+    /// each reply when the one before it is done, so a navigation stopped
+    /// or overtaken while it waited does no such work.
     pub fn from_reply_unless(
         url: Url,
         status: u16,
@@ -1404,35 +1410,43 @@ impl Document {
                 .map(Kind::Picture)
                 .unwrap_or(Kind::Other),
         };
-        // td-html would show a byte order mark as text.
-        let body = match body.strip_prefix(b"\xef\xbb\xbf") {
-            Some(rest) if matches!(kind, Kind::Html | Kind::Text) => rest,
-            _ => body.as_slice(),
-        };
         let heavy = matches!(kind, Kind::Html | Kind::Picture(_));
         if heavy && stopped.load(Ordering::SeqCst) {
             return None;
         }
         let size = body.len();
-        let cut = |most: usize| {
-            (size > most)
-                .then(|| format!("only the first {most} of the page's {size} bytes are shown"))
-        };
         let base = Some(url.clone());
         let (page, title, note) = match kind {
-            Kind::Html => {
-                // Cut here, not by td-html's input limit, so td-html's
-                // notice means only its budget: the note below says how
-                // much of the page was read.
-                let shown = body.get(..HTML_LIMITS.input).unwrap_or(body);
-                (html(shown, base), title(body), cut(MAX_MARKUP))
+            Kind::Html | Kind::Text => {
+                // Markup is cut here, not by td-html's input limit, so
+                // td-html's notice means only its budget: the note says
+                // how much of the page was read.
+                // XML, as markup or shown as text, takes XML's rules.
+                let xml = media == "text/xml" || media.ends_with("+xml");
+                let (rules, most) = match kind {
+                    Kind::Html if xml => (Rules::Xml, HTML_LIMITS.input),
+                    Kind::Html => (Rules::Html, HTML_LIMITS.input),
+                    _ if xml => (Rules::Xml, MAX_TEXT),
+                    _ => (Rules::Text, MAX_TEXT),
+                };
+                let declared = content_type.and_then(charset::label);
+                let declared = declared.as_ref().map(charset::Label::as_bytes);
+                let Ok(decoded) = charset::decode(body, declared, rules, most) else {
+                    let why = "td-web had no memory to decode this page.";
+                    return Some(Self {
+                        status,
+                        ..Self::error(Some(url), why)
+                    });
+                };
+                let note = noted(decoded.encoding, decoded.read, size);
+                let text = decoded.text;
+                if kind == Kind::Text {
+                    (plain(&text, true, base), None, note)
+                } else {
+                    (html(text.as_bytes(), base), title(text.as_bytes()), note)
+                }
             }
-            Kind::Text => {
-                let shown = body.get(..MAX_TEXT).unwrap_or(body);
-                let text = String::from_utf8_lossy(shown);
-                (plain(&text, true, base), None, cut(MAX_TEXT))
-            }
-            Kind::Picture(format) => match picture::decode(format, body) {
+            Kind::Picture(format) => match picture::decode(format, &body) {
                 Ok(picture) => {
                     return Some(Self {
                         url: Some(url),
@@ -1610,8 +1624,28 @@ enum Kind {
     Other,
 }
 
-/// What a body of no stated type is, by its first bytes.
+/// What the status row notes of a page's text (DESIGN.md §8): the
+/// encoding it was decoded from when that is not UTF-8, and how much of
+/// it is shown when not all of it. Only a note, so none when there is no
+/// memory for it.
+fn noted(encoding: Encoding, read: usize, size: usize) -> Option<String> {
+    let named = (encoding != Encoding::Utf8).then(|| encoding.name());
+    if read >= size {
+        return named.and_then(|name| td_alloc::string(name).ok());
+    }
+    let (name, between) = named.map_or(("", ""), |name| (name, " · "));
+    td_alloc::format(format_args!(
+        "{name}{between}only the first {read} of the page's {size} bytes are shown"
+    ))
+    .ok()
+}
+
+/// What a body of no stated type is: HTML by its start, a picture by its
+/// signature, and text by a byte order mark or no byte of binary data in
+/// its first `SNIFF_HEADER` bytes, the resource header (MIME Sniffing,
+/// "Rules for distinguishing if a resource is text or binary").
 fn sniff(body: &[u8]) -> Kind {
+    let header = body.get(..SNIFF_HEADER).unwrap_or(body);
     let unmarked = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
     let start: Vec<u8> = unmarked
         .iter()
@@ -1623,7 +1657,13 @@ fn sniff(body: &[u8]) -> Kind {
         Kind::Html
     } else if let Some(format) = Format::sniff(body) {
         Kind::Picture(format)
-    } else if !body.contains(&0) && std::str::from_utf8(body).is_ok() {
+    } else if [b"\xfe\xff".as_slice(), b"\xff\xfe", b"\xef\xbb\xbf"]
+        .iter()
+        .any(|mark| body.starts_with(mark))
+        || !header
+            .iter()
+            .any(|byte| matches!(byte, 0..=8 | 0x0b | 0x0e..=0x1a | 0x1c..=0x1f))
+    {
         Kind::Text
     } else {
         Kind::Other
@@ -2687,10 +2727,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// The most a text page holds: its text, a tab of it eight spaces and
-    /// any other byte at most three (a byte not UTF-8 is U+FFFD), and for
-    /// each of its lines its `Logical`, a one-run `Vec` and what a chunk
-    /// rounds its text up by, 120 bytes in all.
+    /// The most a text page holds: its text, at most `MAX_TEXT` bytes of
+    /// UTF-8 however it was sent, a tab of it eight spaces and any other
+    /// character its own bytes, and for each of its lines its `Logical`, a
+    /// one-run `Vec` and what a chunk rounds its text up by, 120 bytes in
+    /// all.
     const TEXT_PAGE: usize = 8 * MAX_TEXT + MAX_LINES * 120;
 
     /// A text page of `MAX_TEXT` keeps no more than `TEXT_PAGE`, however
@@ -2717,7 +2758,10 @@ pub(crate) mod tests {
     /// beside the one shown stays 20 MB under `memory-high`. That is its own
     /// resident memory on the largest output td supports, 3840x2160, with
     /// td-ui's three window buffers (`BASELINE`); a body for each fetch
-    /// out (`MAX_WORKERS` of `MAX_DOCUMENT`); on the render thread either
+    /// out (`MAX_WORKERS` of `MAX_DOCUMENT`), a page's text decoded from
+    /// another encoding taking its body's place (`charset::decode`, at
+    /// most `MAX_MARKUP` or `MAX_TEXT`, the body dropped before it is
+    /// rendered); on the render thread either
     /// a rendering at td-html's rule for its peak, 100 bytes a byte of
     /// input read and 1.25 a byte of budget (td-html/DESIGN.md, "Resident
     /// rendering cost"), or the costliest picture decoding, a 16-bit RGBA
@@ -2737,6 +2781,8 @@ pub(crate) mod tests {
         const FITTED: usize = 3840 * 2160 * 4;
         const MEMORY_HIGH: usize = 640 << 20;
         let bodies = crate::app::MAX_WORKERS * crate::fetch::MAX_DOCUMENT as usize;
+        // Decoded text in its body's place is no more than the body could be.
+        assert!(MAX_MARKUP.max(MAX_TEXT) <= crate::fetch::MAX_DOCUMENT as usize);
         let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
         let decoding = MAX_PICTURE_PIXELS * (8 + 4);
         let page = HTML_LIMITS.output.max(TEXT_PAGE) + WRAP;
@@ -2770,6 +2816,188 @@ pub(crate) mod tests {
         assert_eq!(text_of(&cells(&doc, 20)), ["plain   tab"]);
         let doc = Document::from_reply(base(), 200, None, vec![0, 1, 2]);
         assert!(text_of(&cells(&doc, 80))[0].contains("of no stated type, 3 bytes"));
+        // Text in another encoding has no byte of binary data; text in
+        // UTF-16 says so by its byte order mark.
+        let doc = Document::from_reply(base(), 200, None, b"caf\xe9\x1b".to_vec());
+        assert_eq!(text_of(&cells(&doc, 20)), ["café"]);
+        let doc = Document::from_reply(base(), 200, None, b"\xff\xfeo\x00k\x00".to_vec());
+        assert_eq!(text_of(&cells(&doc, 20)), ["ok"]);
+        let doc = Document::from_reply(base(), 200, None, b"a\x0bb".to_vec());
+        assert!(text_of(&cells(&doc, 80))[0].contains("of no stated type"));
+        // Only the resource header is read for binary data.
+        let mut late = vec![b'a'; SNIFF_HEADER];
+        late.push(0);
+        let doc = Document::from_reply(base(), 200, None, late.clone());
+        assert_eq!(text_of(&cells(&doc, 2000)), ["a".repeat(SNIFF_HEADER)]);
+        late[SNIFF_HEADER - 1] = 0;
+        let doc = Document::from_reply(base(), 200, None, late);
+        assert!(text_of(&cells(&doc, 80))[0].contains("of no stated type"));
+    }
+
+    /// XML shown as text takes XML's rules: UTF-8, not windows-1252,
+    /// when it has no label.
+    #[test]
+    fn xml_shown_as_text_defaults_to_utf8() {
+        for media in ["text/xml", "text/vnd.example+xml"] {
+            let (lines, note) = shown(media, b"<a>caf\xe9</a>");
+            assert_eq!(
+                (lines, note),
+                (vec!["<a>caf\u{fffd}</a>".into()], None),
+                "{media}"
+            );
+        }
+        assert_eq!(
+            shown("text/xml; charset=iso-8859-1", b"<a>caf\xe9</a>"),
+            (vec!["<a>café</a>".into()], Some("windows-1252".into()))
+        );
+    }
+
+    /// `body` answered as `content_type`: its lines' text and the note
+    /// the status row shows.
+    fn shown(content_type: &str, body: &[u8]) -> (Vec<String>, Option<String>) {
+        let doc = Document::from_reply(base(), 200, Some(content_type), body.to_vec());
+        (text_of(&cells(&doc, 80)), doc.note)
+    }
+
+    /// A page in another encoding is decoded by the Content-Type's
+    /// charset, else a `<meta>` naming one, its `<title>` too, and the
+    /// status row names the encoding.
+    #[test]
+    fn a_legacy_page_is_decoded_by_its_label_else_its_meta() {
+        let page = b"<title>Caf\xe9</title><p>\x80 5, caf\xe9";
+        let doc = Document::from_reply(
+            base(),
+            200,
+            Some("text/html; charset=windows-1252"),
+            page.to_vec(),
+        );
+        assert_eq!(doc.title.as_deref(), Some("Café"));
+        assert_eq!(text_of(&cells(&doc, 80)), ["€ 5, café"]);
+        assert_eq!(doc.note.as_deref(), Some("windows-1252"));
+        assert_eq!(
+            shown("text/html;charset=\"ISO-8859-1\"", page).0,
+            ["€ 5, café"],
+            "Latin-1 is windows-1252"
+        );
+        let (lines, note) = shown("text/html", b"<meta charset=windows-1252><p>caf\xe9 \x80");
+        assert_eq!(
+            (lines, note.as_deref()),
+            (vec!["café €".into()], Some("windows-1252"))
+        );
+        let page = b"<head><meta http-equiv=\"Content-Type\" \
+                     content=\"text/html; charset=iso-8859-15\">\
+                     <title>\xa4uro</title></head><p>\xa4";
+        let doc = Document::from_reply(base(), 200, Some("text/html"), page.to_vec());
+        assert_eq!(doc.title.as_deref(), Some("€uro"));
+        assert_eq!(text_of(&cells(&doc, 80)), ["€"]);
+        assert_eq!(doc.note.as_deref(), Some("ISO-8859-15"));
+    }
+
+    #[test]
+    fn shift_jis_and_gbk_pages_are_decoded() {
+        let (lines, note) = shown(
+            "text/html; charset=Shift_JIS",
+            b"<p>\x93\xfa\x96{\x8c\xea \xb1",
+        );
+        assert_eq!(lines, ["日本語 ｱ"]);
+        assert_eq!(note.as_deref(), Some("Shift_JIS"));
+        let (lines, note) = shown("text/html", b"<meta charset=gb2312><p>\xd6\xd0\xce\xc4");
+        assert_eq!(lines, ["中文"]);
+        assert_eq!(note.as_deref(), Some("GBK"));
+    }
+
+    /// A byte order mark decides, over the label, and is not shown.
+    #[test]
+    fn a_byte_order_mark_wins_over_the_label() {
+        let mut page = b"\xff\xfe".to_vec();
+        for unit in "<p>é€</p>".encode_utf16() {
+            page.extend(unit.to_le_bytes());
+        }
+        let (lines, note) = shown("text/html", &page);
+        assert_eq!(
+            (lines, note.as_deref()),
+            (vec!["é€".into()], Some("UTF-16LE"))
+        );
+        let (lines, note) = shown(
+            "text/html; charset=windows-1252",
+            b"\xef\xbb\xbf<p>caf\xc3\xa9",
+        );
+        assert_eq!((lines, note), (vec!["café".into()], None));
+    }
+
+    /// Text in another encoding by its label; with none, UTF-8 when it is
+    /// UTF-8, else windows-1252, as a page with no label or `<meta>`.
+    #[test]
+    fn text_is_decoded_by_its_label_else_falls_back() {
+        let (lines, note) = shown(
+            "text/plain; charset=iso-8859-2",
+            b"Za\xbf\xf3\xb3\xe6 g\xea\xb6l\xb1 ja\xbc\xf1",
+        );
+        assert_eq!(lines, ["Zażółć gęślą jaźń"]);
+        assert_eq!(note.as_deref(), Some("ISO-8859-2"));
+        assert_eq!(
+            shown("text/plain", b"caf\xc3\xa9"),
+            (vec!["café".into()], None)
+        );
+        let windows = (vec!["café".into()], Some("windows-1252".into()));
+        assert_eq!(shown("text/plain", b"caf\xe9"), windows);
+        assert_eq!(shown("text/html", b"<p>caf\xe9"), windows);
+        assert_eq!(shown("text/html", b"<p>caf\xc3\xa9").1, None);
+        // XML's default is UTF-8, not windows-1252.
+        assert_eq!(
+            shown("application/xhtml+xml", b"<p>caf\xe9"),
+            (vec!["caf\u{fffd}".into()], None)
+        );
+    }
+
+    /// Malformed bytes are replacements and the page renders on.
+    #[test]
+    fn malformed_bytes_are_replaced_and_the_page_renders() {
+        let (lines, _) = shown("text/html; charset=utf-8", b"<p>a\xffb</p><p>\xe2\x82 next");
+        assert_eq!(lines, ["a\u{fffd}b", "", "\u{fffd} next"]);
+        let (lines, note) = shown("text/html; charset=shift_jis", b"<p>x\x93\xff y\x93");
+        assert_eq!(lines, ["x\u{fffd} y\u{fffd}"]);
+        assert_eq!(note.as_deref(), Some("Shift_JIS"));
+        let (lines, _) = shown("text/plain; charset=utf-16le", b"o\x00k\x00!");
+        assert_eq!(lines, ["ok\u{fffd}"]);
+    }
+
+    /// The bounds are on the text decoded, in UTF-8: markup decoded three
+    /// bytes a byte reaches `MAX_MARKUP` from a third of as many bytes,
+    /// and td-html is handed no more, so its notice still means only its
+    /// budget; text likewise at `MAX_TEXT`.
+    #[test]
+    fn a_page_that_expands_is_cut_at_its_bound_in_utf8() {
+        let size = MAX_MARKUP / 2;
+        let mut page = b"<pre>".to_vec();
+        page.resize(size, 0x80);
+        let doc = Document::from_reply(base(), 200, Some("text/html; charset=windows-1252"), page);
+        let read = 5 + (MAX_MARKUP - 5) / 3;
+        assert_eq!(
+            doc.note.unwrap(),
+            format!("windows-1252 · only the first {read} of the page's {size} bytes are shown")
+        );
+        let Body::Page(page) = &doc.body else {
+            panic!("a page");
+        };
+        assert!(!page.unrendered, "td-html read it all");
+        // Lines of 99 halfwidth katakana, each three bytes of UTF-8.
+        let mut line = vec![0xb1; 99];
+        line.push(b'\n');
+        let text = line.repeat(MAX_TEXT / 100 + 1);
+        let size = text.len();
+        let doc = Document::from_reply(base(), 200, Some("text/plain; charset=shift_jis"), text);
+        let (whole, rest) = (MAX_TEXT / 298, MAX_TEXT % 298 / 3);
+        let read = whole * 100 + rest;
+        assert_eq!(
+            doc.note.unwrap(),
+            format!("Shift_JIS · only the first {read} of the page's {size} bytes are shown")
+        );
+        let Body::Page(page) = &doc.body else {
+            panic!("a page");
+        };
+        assert_eq!(page.lines.len(), whole + 1);
+        assert_eq!(page.lines[whole].runs[0].text.chars().count(), rest);
     }
 
     #[test]

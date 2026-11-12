@@ -675,6 +675,7 @@ mod tests {
                 "td-avif",
                 "td-btrfs",
                 "td-busd",
+                "td-charset",
                 "td-civil",
                 "td-compositor",
                 "td-disks",

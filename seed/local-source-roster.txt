@@ -31,4 +31,4 @@ td-ssh-source td-ssh td-primitives,td-encoding,td-login,td-fs,td-source-scan,eng
 td-taskmgr-source td-taskmgr td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
 td-term-source td-term td-fs,td-alloc,td-ui,td-compositor
 td-time-source td-time td-civil,td-fs,engine
-td-web-source td-web td-av1,td-avif,td-fetch-client,td-gif,td-html,td-jpeg,td-png,td-alloc,td-ui,td-url,td-webp,td-util,td-compositor,engine,td-inflate
+td-web-source td-web td-av1,td-avif,td-charset,td-fetch-client,td-gif,td-html,td-jpeg,td-png,td-alloc,td-ui,td-url,td-webp,td-util,td-compositor,engine,td-inflate

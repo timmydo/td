@@ -664,6 +664,7 @@ recipes/src/recipes/td-btrfs.rs	unchecked-growth-or-clone	9
 recipes/src/recipes/td-busd-test.rs	allocation-macro	4
 recipes/src/recipes/td-busd.rs	allocation-macro	3
 recipes/src/recipes/td-busd.rs	unchecked-growth-or-clone	6
+recipes/src/recipes/td-charset-notice.rs	allocation-macro	1
 recipes/src/recipes/td-compositor.rs	allocation-macro	4
 recipes/src/recipes/td-compositor.rs	unchecked-growth-or-clone	5
 recipes/src/recipes/td-dua-test.rs	allocation-macro	4
@@ -4386,7 +4387,7 @@ td-web/src/app.rs	heap-owner	3
 td-web/src/app.rs	unchecked-growth-or-clone	19
 td-web/src/document.rs	allocating-constructor	7
 td-web/src/document.rs	allocating-conversion	11
-td-web/src/document.rs	allocation-macro	7
+td-web/src/document.rs	allocation-macro	6
 td-web/src/document.rs	heap-owner	4
 td-web/src/document.rs	unchecked-growth-or-clone	40
 td-web/src/fetch.rs	allocating-conversion	1

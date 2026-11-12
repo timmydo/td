@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod charset;
 mod document;
 mod fetch;
 mod picture;

@@ -3681,7 +3681,10 @@ td-secret reach and td-news and td-open do not; mail and news add td-kv's
 no number td-news's does not: its render and fetch threads (`clone`, glibc having
 tried `clone3`), each thread's malloc arena (`mmap`, `mprotect`, `madvise`), its
 decoders and the unwinding that catches a rendering's panic reach only listed calls,
-and the spawn and resolver code it links is left out as above.
+and the spawn and resolver code it links is left out as above. td-charset, which
+decodes its pages' legacy encodings, is std-only and does no I/O: its decoders call
+nothing, and td-web's decoded strings come from the allocator its threads already
+use, so it adds no number.
 
 **What proves it.** The interpreter holds each program to exactly its list across
 the whole table, and to its argument rules. The realized C probe installs each
@@ -3706,7 +3709,7 @@ none, in a headless compositor through a fetch service.
 what the binaries can call changes: a change to the Rust toolchain or the Debian root's
 glibc, and more often an ordinary change to a program in those packages or a crate
 they link, such as td-mail, td-news, td-open, td-secret, td-web, td-ui, td-fs,
-td-kv, td-html, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
+td-kv, td-html, td-charset, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
 operating-system facility is a question for this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
 `UnixListener`, td-ui's PTY and its `Connection::waker` datagram pair are all off
 these lists today. Deriving them again is

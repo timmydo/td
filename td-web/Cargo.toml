@@ -29,10 +29,12 @@ indexing_slicing = "deny"
 
 # td's own crates, by the one sibling-dependency spelling the lock guard
 # admits (AGENTS.md 'Rust code'): the fetch service's client, HTML
-# rendering, the PNG, JPEG, GIF, WebP and AVIF decoders, the shared UI toolkit and URLs.
+# rendering, legacy text encodings, the PNG, JPEG, GIF, WebP and AVIF
+# decoders, the shared UI toolkit and URLs.
 [dependencies]
 td-alloc = { path = "../td-alloc" }
 td-avif = { path = "../td-avif" }
+td-charset = { path = "../td-charset" }
 td-fetch-client = { path = "../td-fetch-client" }
 td-gif = { path = "../td-gif" }
 td-html = { path = "../td-html" }

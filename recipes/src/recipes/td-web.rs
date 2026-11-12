@@ -13,6 +13,7 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&[
             "td-av1",
             "td-avif",
+            "td-charset",
             "td-fetch-client",
             "td-gif",
             "td-html",
@@ -50,6 +51,7 @@ mod tests {
             Some(vec![
                 "td-av1".into(),
                 "td-avif".into(),
+                "td-charset".into(),
                 "td-fetch-client".into(),
                 "td-gif".into(),
                 "td-html".into(),
@@ -92,6 +94,7 @@ mod tests {
                 "td-alloc",
                 "td-av1",
                 "td-avif",
+                "td-charset",
                 "td-fetch-client",
                 "td-gif",
                 "td-html",

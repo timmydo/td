@@ -17,6 +17,11 @@ const APPLICATION_SEARCH_TERMS: &[&str] = crate::shared::TD_WEB_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
 const PROGRAM: &str = "td-web";
 const PROGRAM_RECIPE: &str = "td-web";
+/// The notice of the WHATWG data td-charset compiles into td-web
+/// (BSD-3-Clause, whose second clause asks a binary distribution to carry
+/// it), copied from the `td-charset-notice` recipe into the package.
+const CHARSET_NOTICE: &str = "{in:td-charset-notice}/share/licenses/td-charset/LICENSE-WHATWG";
+const CHARSET_NOTICE_SHIPPED: &str = "{out}/files/share/licenses/td-charset/LICENSE-WHATWG";
 
 pub fn recipe() -> Recipe {
     // No environment: td-web is no other program's `BROWSER`, and opens
@@ -53,7 +58,7 @@ pub fn recipe() -> Recipe {
     };
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
-        .inputs(&[PROGRAM_RECIPE])
+        .inputs(&[PROGRAM_RECIPE, "td-charset-notice"])
         .payload_inputs(&["static-runtime"])
         .steps(vec![
             Step::MkDir {
@@ -81,6 +86,13 @@ pub fn recipe() -> Recipe {
                     "{{in:{PROGRAM_RECIPE}}}/lib/debug/.td-assembly-exception"
                 )],
                 dest: "{out}/lib/debug".into(),
+            },
+            // A copy, as the validator admits before it; it fails the build
+            // if the notice is not there.
+            Step::CopyFile {
+                file: CHARSET_NOTICE.into(),
+                to: CHARSET_NOTICE_SHIPPED.into(),
+                exec: false,
             },
             Step::validate_static_application(&declaration),
         ])
@@ -117,7 +129,10 @@ mod tests {
         assert_eq!(declaration.alias(), None);
         // Not BROWSER, and no opener shipped beside it.
         assert_eq!(declaration.environment().count(), 0);
-        assert_eq!(recipe.inputs, Some(vec![PROGRAM_RECIPE.into()]));
+        assert_eq!(
+            recipe.inputs,
+            Some(vec![PROGRAM_RECIPE.into(), "td-charset-notice".into()])
+        );
         assert_eq!(recipe.payload_inputs, Some(vec!["static-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
         assert_eq!(launcher.display_name(), APPLICATION_DISPLAY_NAME);
@@ -156,6 +171,15 @@ mod tests {
                 Step::CopyFiles { files, dest: to } if files == &[file.clone()] && to == dest
             )));
         }
+        // td-charset's notice ships in the package, copied from the recipe
+        // that writes td-charset's retained licence byte for byte (its own
+        // test holds that), into the package's shared licences.
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::CopyFile { file, to, exec: false }
+                if file == "{in:td-charset-notice}/share/licenses/td-charset/LICENSE-WHATWG"
+                    && to == "{out}/files/share/licenses/td-charset/LICENSE-WHATWG"
+        )));
         assert!(
             !steps
                 .iter()

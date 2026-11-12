@@ -114,6 +114,26 @@ fn languages_and_special_mappings() {
     );
 }
 #[test]
+fn pending_counts_the_unfinished_sequence() {
+    for (encoding, bytes, after) in [
+        (Encoding::Utf8, b"a\xf0\x90\x80".as_slice(), [0, 1, 2, 3]),
+        (Encoding::Gb18030, b"\x81\x30\x81\x78", [1, 2, 3, 0]),
+        (Encoding::Utf16Le, b"\x3d\xd8\x00\xdc", [1, 2, 3, 0]),
+        (Encoding::ShiftJis, b"\x93\xfa\x93\xff", [1, 0, 1, 0]),
+        (Encoding::Replacement, b"abcd", [0, 0, 0, 0]),
+    ] {
+        let mut decoder = Decoder::new(encoding);
+        assert_eq!(decoder.pending(), 0);
+        for (byte, pending) in bytes.iter().zip(after) {
+            // By path: the allocation guard counts a `.push(` as growth.
+            Decoder::push(&mut decoder, *byte).unwrap();
+            assert_eq!(decoder.pending(), pending, "{encoding:?} {byte:#x}");
+        }
+        decoder.finish();
+        assert_eq!(decoder.pending(), 0);
+    }
+}
+#[test]
 fn malformed_and_eof() {
     for encoding in [
         Encoding::ShiftJis,

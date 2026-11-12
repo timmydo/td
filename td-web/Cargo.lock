@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-charset"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
 name = "td-fetch-client"
 version = "0.1.0"
 
@@ -67,6 +74,7 @@ version = "0.1.0"
 dependencies = [
  "td-alloc",
  "td-avif",
+ "td-charset",
  "td-fetch-client",
  "td-gif",
  "td-html",

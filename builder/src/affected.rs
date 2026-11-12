@@ -1484,13 +1484,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-charset is a shared decoder with no recipe or consumer yet. Its
-    // standalone tests and reader closure are the whole affected surface.
-    if p.starts_with("td-charset/") && !p.contains("..") {
-        sel.add_preflight("cargo-test");
-        return;
-    }
-
     // td-source-scan is the confinement tests' shared source reader and only
     // ever a dev-dependency: no target artifact compiles it, as the recipes
     // compile its consumers' src/ with a direct rustc and no `--test` (td-svc's
@@ -1631,6 +1624,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // td-test-compositor, the native harness, is a dev-dependency only, but
     // cargo reads it to resolve the lock, so the same recipes stage it.
     const SHARED_LIBRARIES: &[&str] = &[
+        "td-charset/",
         "td-civil/",
         "td-encoding/",
         "td-fetch-client/",
@@ -2812,6 +2806,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-mail/README.md", "local-source-roster");
     assert_no_preflight!("td-mail/Cargo.lock", "local-source-roster");
     for path in [
+        "td-charset/src/lib.rs",
         "td-civil/src/lib.rs",
         "td-encoding/src/lib.rs",
         "td-fetch-client/src/lib.rs",
@@ -10875,7 +10870,7 @@ mod tests {
     }
 
     #[test]
-    fn charset_paths_run_standalone_without_distro_checks() {
+    fn charset_paths_run_their_crate_td_web_and_its_recipe_checks() {
         let root = repo_root();
         if !root.join("td-charset/Cargo.toml").is_file() {
             return;
@@ -10888,14 +10883,20 @@ mod tests {
         ] {
             let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
             for action in ["test", "clippy"] {
-                assert!(
-                    commands.iter().any(|command| command.contains(&format!(
-                        "cargo {action} --frozen --manifest-path td-charset/Cargo.toml"
-                    ))),
-                    "{commands:?}"
-                );
+                for manifest in ["td-charset", "td-web"] {
+                    assert!(
+                        commands.iter().any(|command| command.contains(&format!(
+                            "cargo {action} --frozen --manifest-path {manifest}/Cargo.toml"
+                        ))),
+                        "{commands:?}"
+                    );
+                }
             }
-            assert!(!path_output(&root, path).contains("td-builder check"));
+            // td-web's recipe stages td-charset, so its edits reach the
+            // target build.
+            let output = path_output(&root, path);
+            assert!(output.contains("td-builder check"), "{output}");
+            assert!(output.contains("recipe-checks"), "{output}");
         }
         for path in [
             "td-charset-extra/src/lib.rs",

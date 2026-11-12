@@ -1435,4 +1435,34 @@ mod tests {
         view.find("zeta", &mut rendered, metrics, 1);
         assert_eq!(view.selection, None);
     }
+
+    /// Find and the selection work on a page's decoded text: a query
+    /// matches a page sent in windows-1252, ignoring case, and its
+    /// selection copies the characters, not the bytes sent.
+    #[test]
+    fn find_and_selection_see_a_legacy_page_as_its_text() {
+        let url = td_url::Url::parse("https://example.org/").unwrap();
+        let doc = crate::document::Document::from_reply(
+            url,
+            200,
+            Some("text/html; charset=windows-1252"),
+            b"<p>Caf\xe9 cr\xe8me br\xfbl\xe9e, \x80 5</p>".to_vec(),
+        );
+        let (mut rendered, mut view) =
+            shown(doc.render(80 * CELL_WIDTH as u32, TextFamily::Sans), 1);
+        let metrics = &mut cell();
+        view.find("CRÈME BRÛLÉE", &mut rendered, metrics, 1);
+        let (start, end) = view.selection.and_then(Selection::range).unwrap();
+        assert_eq!(
+            rendered.page.text(start, end, 100).as_deref(),
+            Some("crème brûlée")
+        );
+        view.find("€", &mut rendered, metrics, 1);
+        assert_eq!(view.hits.len(), 1);
+        let all = rendered.page.line_end(0);
+        assert_eq!(
+            rendered.page.text(Place::default(), all, 100).as_deref(),
+            Some("Café crème brûlée, € 5")
+        );
+    }
 }
