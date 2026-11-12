@@ -607,7 +607,8 @@ message.
   in test targets of crates declaring `clippy-all-targets`. Keep a
   test-only helper inside its `#[cfg(test)]` module.
 - `unsafe` is confined to the syscall surfaces, `td-primitives`' calls into
-  CPU instructions a runtime check found, and the separately recorded
+  CPU instructions a runtime check found, `td-alloc`'s checked heap ownership,
+  and the separately recorded
   test-only allocation instrumentation in `UNSAFE.md`. A new
   surface, syscall, value-pinned request, or scoped allow requires an amendment
   there and in any component design/threat model in the same landing. Each

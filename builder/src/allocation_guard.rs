@@ -33,7 +33,12 @@ fn operations(source: &str) -> BTreeMap<String, usize> {
             .and_then(|n| tokens.get(n))
             .map(String::as_str);
         let next = tokens.get(i + 1).map(String::as_str);
-        let category = if next == Some("!") && ["vec", "format"].contains(&token.as_str()) {
+        let category = if ["alloc", "alloc_zeroed", "realloc", "dealloc"].contains(&token.as_str())
+            && next == Some("(")
+            && before != Some(".")
+        {
+            Some("raw-allocator")
+        } else if next == Some("!") && ["vec", "format"].contains(&token.as_str()) {
             Some("allocation-macro")
         } else if before == Some(".")
             && [
@@ -226,9 +231,80 @@ fn parse(text: &str) -> Result<Inventory, String> {
 }
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
+    check_owned_boundary(root)?;
     let recorded =
         fs::read_to_string(root.join(INVENTORY)).map_err(|e| format!("{INVENTORY}: {e}"))?;
     compare(&parse(&recorded)?, &inventory(root)?)
+}
+
+fn check_owned_boundary(root: &Path) -> Result<(), String> {
+    let source = root.join("td-alloc/src");
+    let expected = ["budget.rs", "lib.rs", "owned.rs", "raw.rs", "storage.rs"];
+    let mut seen = Vec::new();
+    for entry in fs::read_dir(&source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+            return Err("td-alloc: unexpected directory or symlink in allocation boundary".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "td-alloc: non-UTF-8 source")?;
+        if !expected.contains(&name.as_str()) {
+            return Err(format!("td-alloc: unreviewed source {name}"));
+        }
+        let text = fs::read_to_string(entry.path()).map_err(|e| e.to_string())?;
+        owned_source(&name, &text)?;
+        seen.push(name);
+    }
+    if seen.len() != expected.len() {
+        return Err("td-alloc: missing allocation source".into());
+    }
+    let manifest =
+        fs::read_to_string(root.join("td-alloc/Cargo.toml")).map_err(|e| e.to_string())?;
+    if !manifest.contains("path = \"src/owned.rs\"") || root.join("td-alloc/build.rs").exists() {
+        return Err("td-alloc: allocation root or build-script boundary changed".into());
+    }
+    Ok(())
+}
+
+fn owned_source(name: &str, source: &str) -> Result<(), String> {
+    let code =
+        td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
+    let compact: String = code.split_whitespace().collect();
+    let unsafe_words = code
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| *word == "unsafe")
+        .count();
+    let (words, blocks, allows) = if name == "raw.rs" {
+        (6, 4, 6)
+    } else {
+        (0, 0, 0)
+    };
+    if unsafe_words != words
+        || compact.matches("unsafe{").count() != blocks
+        || compact.matches("allow(unsafe_code)").count() != allows
+        || compact.contains("include!")
+        || compact.contains("include_bytes!")
+        || compact.contains("include_str!")
+        || compact.contains("cfg_attr")
+        || compact.contains("global_allocator")
+        || (name != "owned.rs" && compact.contains("#[path"))
+    {
+        return Err(format!(
+            "td-alloc/{name}: allocation confinement changed; review UNSAFE.md section 28"
+        ));
+    }
+    if name == "owned.rs" {
+        // The literal path is intentionally checked before blanking literals.
+        if !source.contains("#[path = \"lib.rs\"]")
+            || compact.matches("#[path").count() != 1
+            || !compact.contains("#![deny(unsafe_code)]")
+        {
+            return Err("td-alloc: owned root confinement changed".into());
+        }
+    }
+    Ok(())
 }
 
 fn compare(recorded: &Inventory, actual: &Inventory) -> Result<(), String> {
@@ -256,6 +332,25 @@ fn compare(recorded: &Inventory, actual: &Inventory) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn owned_allocation_boundary_rejects_new_unsafe_and_external_source() {
+        owned_source("budget.rs", "fn safe() {}").unwrap();
+        for source in [
+            "unsafe fn added() {}",
+            "include!(\"other.rs\");",
+            "#[allow(unsafe_code)] fn added() {}",
+            "#[path=\"other.rs\"] mod x;",
+            "#[global_allocator] static A: A = A;",
+        ] {
+            assert!(owned_source("budget.rs", source).is_err());
+        }
+        assert_eq!(
+            operations("std::alloc::alloc(layout); alloc_zeroed(layout); realloc(p, l, n);")
+                .get("raw-allocator"),
+            Some(&3)
+        );
+    }
 
     #[test]
     fn code_only_scan_covers_spacing_generics_and_macros() {
@@ -312,7 +407,21 @@ mod tests {
         let temp = crate::test_temp::TempDir::new("allocation-guard").unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("td-example/src")).unwrap();
-        fs::create_dir_all(root.join("td-alloc")).unwrap();
+        fs::create_dir_all(root.join("td-alloc/src")).unwrap();
+        fs::write(
+            root.join("td-alloc/Cargo.toml"),
+            include_str!("../../td-alloc/Cargo.toml"),
+        )
+        .unwrap();
+        for (name, text) in [
+            ("owned.rs", include_str!("../../td-alloc/src/owned.rs")),
+            ("lib.rs", include_str!("../../td-alloc/src/lib.rs")),
+            ("raw.rs", include_str!("../../td-alloc/src/raw.rs")),
+            ("budget.rs", include_str!("../../td-alloc/src/budget.rs")),
+            ("storage.rs", include_str!("../../td-alloc/src/storage.rs")),
+        ] {
+            fs::write(root.join("td-alloc/src").join(name), text).unwrap();
+        }
         fs::write(
             root.join("td-example/Cargo.toml"),
             "[package]\nname = \"td-example\"\n",

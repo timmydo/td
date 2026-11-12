@@ -1,0 +1,250 @@
+#![allow(clippy::unwrap_used, clippy::panic, clippy::non_canonical_clone_impl)]
+use td_alloc::{
+    with_reservation_limit, Arena, Budget, BudgetError, BudgetString, BudgetVec, Buffer,
+};
+
+#[test]
+fn ancestors_charge_live_owners_and_failed_admission_rolls_back() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(3 * meta + 100).unwrap();
+    let a = root.child(meta + 100).unwrap();
+    let b = root.child(meta + 100).unwrap();
+    let first = Buffer::filled(&a, 60, 1u8).unwrap();
+    assert_eq!(root.used(), 3 * meta + 60);
+    assert!(matches!(
+        Buffer::filled(&b, 41, 0u8),
+        Err(BudgetError::Limit)
+    ));
+    assert_eq!(b.used(), meta);
+    let second = Buffer::filled(&b, 40, 2u8).unwrap();
+    drop(a);
+    assert_eq!(root.used(), 3 * meta + 100);
+    drop(first);
+    assert_eq!(root.used(), 2 * meta + 40);
+    drop(second);
+    drop(b);
+    assert_eq!(root.used(), meta);
+}
+
+#[test]
+fn growth_admits_overlap_and_preserves_original_on_refusal() {
+    let meta = Budget::metadata_bytes();
+    let budget = Budget::new(meta + 20).unwrap();
+    let mut v = BudgetVec::filled(&budget, 8, 7u8).unwrap();
+    assert!(matches!(v.try_reserve_exact(5), Err(BudgetError::Limit)));
+    assert_eq!(&*v, &[7; 8]);
+    assert_eq!(v.capacity(), 8);
+    assert_eq!(budget.used(), meta + 8);
+    v.try_reserve_exact(4).unwrap();
+    assert_eq!(v.capacity(), 12);
+    assert_eq!(budget.used(), meta + 12);
+    v.clear();
+    assert_eq!(budget.used(), meta + 12);
+    drop(v);
+    assert_eq!(budget.used(), meta);
+}
+
+#[test]
+fn every_allocator_refusal_returns_admission() {
+    let meta = Budget::metadata_bytes();
+    assert!(matches!(
+        with_reservation_limit(0, || Budget::new(4096)),
+        Err(BudgetError::Allocation)
+    ));
+    let root = Budget::new(4096).unwrap();
+    assert!(matches!(
+        with_reservation_limit(0, || root.child(1024)),
+        Err(BudgetError::Allocation)
+    ));
+    assert_eq!(root.used(), meta);
+    let mut bytes = BudgetVec::filled(&root, 16, 4u8).unwrap();
+    assert!(matches!(
+        with_reservation_limit(0, || bytes.try_reserve_exact(16)),
+        Err(BudgetError::Allocation)
+    ));
+    assert_eq!(root.used(), meta + 16);
+    assert_eq!(&*bytes, &[4; 16]);
+    bytes.try_reserve_exact(16).unwrap();
+    assert_eq!(root.used(), meta + 32);
+}
+
+#[test]
+fn zero_sized_values_overalignment_and_overflow() {
+    #[derive(Clone, Copy)]
+    #[repr(align(256))]
+    struct Aligned(u8);
+    let root = Budget::new(4096).unwrap();
+    let zero = with_reservation_limit(0, || Buffer::filled(&root, 100, ())).unwrap();
+    assert_eq!(zero.len(), 100);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+    let data = Buffer::filled(&root, 3, Aligned(5)).unwrap();
+    assert_eq!(data.as_ptr() as usize % 256, 0);
+    assert!(data.iter().all(|v| v.0 == 5));
+    assert!(matches!(
+        BudgetVec::<u64>::with_capacity(&root, usize::MAX),
+        Err(BudgetError::Overflow)
+    ));
+}
+
+#[test]
+fn shared_budget_crosses_threads_and_survives_original_owner() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(meta + 64).unwrap();
+    let other = root.try_clone().unwrap();
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let bytes = Buffer::filled(&other, 64, 9u8).unwrap();
+        send.send(()).unwrap();
+        wait.recv().unwrap();
+        bytes
+    });
+    recv.recv().unwrap();
+    assert!(matches!(root.charge(1), Err(BudgetError::Limit)));
+    drop(root);
+    release.send(()).unwrap();
+    let bytes = worker.join().unwrap();
+    assert_eq!(&*bytes, &[9; 64]);
+    assert_eq!(bytes.budget().used(), meta + 64);
+}
+
+#[test]
+fn concurrent_siblings_never_exceed_ancestor() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(9 * meta + 128).unwrap();
+    let children: [_; 8] = std::array::from_fn(|_| root.child(meta + 128).unwrap());
+    std::thread::scope(|scope| {
+        for child in children {
+            let root = &root;
+            scope.spawn(move || {
+                for _ in 0..1000 {
+                    if let Ok(bytes) = Buffer::filled(&child, 48, 0u8) {
+                        assert!(root.used() <= root.limit());
+                        std::hint::black_box(bytes);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(root.used(), meta);
+}
+
+#[test]
+fn typed_arena_drops_values_and_indices_survive_growth() {
+    struct Count<'a>(&'a std::cell::Cell<usize>);
+    impl Drop for Count<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let drops = std::cell::Cell::new(0);
+    let root = Budget::new(8192).unwrap();
+    let mut arena = Arena::new(&root).unwrap();
+    for i in 0..100 {
+        assert_eq!(arena.try_insert(Count(&drops)).unwrap(), i);
+    }
+    assert_eq!(drops.get(), 0);
+    assert!(arena.get(99).is_some());
+    assert!(arena.get(100).is_none());
+    drop(arena);
+    assert_eq!(drops.get(), 100);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn utf8_and_copy_do_not_call_clone() {
+    #[derive(Copy)]
+    struct CopyOnly;
+    impl Clone for CopyOnly {
+        fn clone(&self) -> Self {
+            panic!("must copy");
+        }
+    }
+    let root = Budget::new(4096).unwrap();
+    let mut v = BudgetVec::filled(&root, 2, CopyOnly).unwrap();
+    v.try_extend_from_slice(&[CopyOnly; 4]).unwrap();
+    assert_eq!(v.len(), 6);
+    let mut text = BudgetString::new(&root).unwrap();
+    text.try_push_str("héllö 🌍").unwrap();
+    assert_eq!(text.as_str(), "héllö 🌍");
+}
+
+#[test]
+fn depth_limit_and_unwind_return_all_charges() {
+    let root = Budget::new(65536).unwrap();
+    let mut current = root.try_clone().unwrap();
+    for _ in 1..Budget::MAX_DEPTH {
+        current = current.child(65536).unwrap();
+    }
+    assert!(matches!(current.child(65536), Err(BudgetError::Limit)));
+    drop(current);
+    let result = std::panic::catch_unwind(|| {
+        let child = root.child(4096).unwrap();
+        let _bytes = Buffer::filled(&child, 128, 0u8).unwrap();
+        panic!("operation cancellation");
+    });
+    assert!(result.is_err());
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn tight_budget_vector_growth_uses_one_allocation_instead_of_exact_steps() {
+    let meta = Budget::metadata_bytes();
+    for ancestor_limited in [false, true] {
+        let root = Budget::new(2 * meta + if ancestor_limited { 5000 } else { 8000 }).unwrap();
+        let child = root
+            .child(meta + if ancestor_limited { 8000 } else { 5000 })
+            .unwrap();
+        let mut values = BudgetVec::filled(&child, 2048, 7u8).unwrap();
+        with_reservation_limit(1, || {
+            for _ in 2048..2500 {
+                values.try_push(7).unwrap();
+            }
+        });
+        assert_eq!(values.len(), 2500);
+        assert!(values.iter().all(|&value| value == 7));
+        assert_eq!(root.used(), 2 * meta + values.capacity());
+        assert!(root.used() <= root.limit());
+        assert!(child.used() <= child.limit());
+        drop(values);
+        assert_eq!(root.used(), 2 * meta);
+    }
+}
+
+#[test]
+fn tight_budget_string_growth_uses_one_allocation_instead_of_exact_steps() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(meta + 5000).unwrap();
+    let mut text = BudgetString::with_capacity(&root, 2048).unwrap();
+    for _ in 0..2048 {
+        text.try_push_str("x").unwrap();
+    }
+    with_reservation_limit(1, || {
+        for _ in 2048..2500 {
+            text.try_push_str("x").unwrap();
+        }
+    });
+    assert_eq!(text.as_str().len(), 2500);
+    assert!(text.as_str().bytes().all(|byte| byte == b'x'));
+    assert!(root.used() <= root.limit());
+    drop(text);
+    assert_eq!(root.used(), meta);
+}
+
+#[test]
+fn tight_budget_arena_growth_uses_one_allocation_instead_of_exact_steps() {
+    let root = Budget::new(Budget::metadata_bytes() + 5000).unwrap();
+    let mut arena = Arena::with_capacity(&root, 2048).unwrap();
+    for index in 0..2048 {
+        assert_eq!(arena.try_insert(7u8).unwrap(), index);
+    }
+    with_reservation_limit(1, || {
+        for index in 2048..2500 {
+            assert_eq!(arena.try_insert(7).unwrap(), index);
+        }
+    });
+    assert_eq!(arena.get(0), Some(&7));
+    assert_eq!(arena.get(2499), Some(&7));
+    drop(arena);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}

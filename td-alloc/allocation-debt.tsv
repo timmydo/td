@@ -10,10 +10,10 @@ builder/src/affected.rs	unchecked-growth-or-clone	127
 builder/src/affected/source_reads.rs	allocating-conversion	13
 builder/src/affected/source_reads.rs	allocation-macro	5
 builder/src/affected/source_reads.rs	unchecked-growth-or-clone	19
-builder/src/allocation_guard.rs	allocating-conversion	14
-builder/src/allocation_guard.rs	allocation-macro	6
+builder/src/allocation_guard.rs	allocating-conversion	23
+builder/src/allocation_guard.rs	allocation-macro	8
 builder/src/allocation_guard.rs	heap-owner	1
-builder/src/allocation_guard.rs	unchecked-growth-or-clone	9
+builder/src/allocation_guard.rs	unchecked-growth-or-clone	10
 builder/src/build.rs	allocating-constructor	8
 builder/src/build.rs	allocating-conversion	159
 builder/src/build.rs	allocation-macro	415
@@ -1067,6 +1067,10 @@ td-agent/src/workspace.rs	heap-owner	1
 td-agent/src/workspace.rs	unchecked-growth-or-clone	72
 td-alloc/src/lib.rs	direct-reservation	5
 td-alloc/src/lib.rs	unchecked-growth-or-clone	8
+td-alloc/src/raw.rs	raw-allocator	3
+td-alloc/src/storage.rs	allocating-constructor	8
+td-alloc/src/storage.rs	direct-reservation	4
+td-alloc/src/storage.rs	unchecked-growth-or-clone	6
 td-audio/src/alsa.rs	allocation-macro	22
 td-audio/src/device.rs	allocating-conversion	1
 td-audio/src/device.rs	allocation-macro	5

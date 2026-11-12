@@ -56,7 +56,7 @@ pub fn with_reservation_limit<T>(limit: usize, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-fn admit() -> Result<(), Error> {
+pub(crate) fn admit() -> Result<(), Error> {
     ADMISSION.with(|cell| {
         if let Some(mut a) = cell.get() {
             a.left = a.left.checked_sub(1).ok_or(Error)?;

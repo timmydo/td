@@ -1,9 +1,11 @@
 # td-alloc
 
-td-alloc owns fallible growth of td's std collections. It is std-only and
-forbids unsafe code. Cargo consumers depend on this sibling crate; the
-control plane and direct-rustc consumers mount the same source. A program
-must use one instance for code that shares a reservation scope.
+td-alloc owns fallible growth and budgeted storage. It depends only on std.
+Cargo consumers use `src/owned.rs`, whose private raw allocation boundary is
+recorded in UNSAFE.md section 28. The control plane and direct-rustc consumers
+mount the safe-only helpers in `src/lib.rs`; they do not compile the owned
+allocation boundary. A program uses one instance for code sharing a
+reservation scope.
 
 ## Allocation contract
 
@@ -103,3 +105,73 @@ requires a newly allocated Arc/Box cannot be made fallible by a Vec helper;
 transfer ownership or reserve reusable storage, or design and audit that
 surface separately under UNSAFE.md. The stable std allocator API does not
 currently provide a safe fallible replacement for every collection.
+
+
+## Owned byte budgets
+
+`Budget` is an explicitly passed, movable shared identity. Creating it and
+its children is fallible; `try_clone` shares the identity without allocating
+and refuses reference-count overflow. There is no implicit thread-local
+budget, reset operation or unlimited constructor. A chain has at most 16
+nodes, including the root, bounding admission, rollback and destruction.
+Each budget charges its own control block; a child also charges that block
+to every ancestor. Its limit includes this metadata. The control block
+stays charged while any handle, descendant or storage owner remains alive.
+
+`charge` admits bytes against every ancestor before storage is allocated.
+Concurrent partial admission can conservatively refuse another operation;
+it cannot permit oversubscription. A failed ancestor admission rolls back
+all descendant counters. `used` includes reservations currently in progress.
+The non-cloneable `Charge` returns its bytes on drop; consumers of external
+resources must release those resources before dropping their charge. Forgetting
+an owner leaks its admission too and cannot replenish a budget.
+
+The limit bounds the requested layouts of participating heap allocations,
+including spare capacity and budget metadata. It excludes allocator-internal
+metadata, fragmentation, stack storage, OS page commitment, mappings and
+allocations outside the API. It is not an RSS or cgroup guarantee. Shared
+library internals and user-supplied constructors/destructors remain outside
+this contract. A container of owned strings charges its element array;
+each string's storage needs its own budgeted owner. Service policy retains
+separate input, work, concurrency, descriptor and disk limits.
+
+## Owned storage and arenas
+
+`BudgetVec` admits an exact requested layout before allocating and retains
+its charge alongside the vector. A grow admits the whole replacement while
+the old capacity remains charged, moves initialized values, then frees the
+old allocation before returning its charge. Failed admission/allocation
+preserves the old values and capacity. Amortized growth clips spare capacity
+to currently available headroom
+across every ancestor and the layout limit. A stable tight cap therefore
+does not force repeated one-element reallocations and quadratic copying.
+Headroom is only a sizing hint: concurrent admission can change it, and
+the complete replacement charge remains authoritative. If that admission
+fails, growth may fall back to the exact requested size once. It does not
+retry an allocator refusal. Clear/truncate retain storage and therefore
+its charge.
+Zero-sized element storage costs no bytes or allocator attempt.
+
+Only borrowed slices escape. There is no mutable std collection access,
+infallible Clone, raw ownership extraction, or implicit budget transfer.
+`Buffer` freezes length/capacity for queued parser backing; moving or
+recovering its `BudgetVec` retains admission. `BudgetString` preserves UTF-8
+and offers fallible append and constant-time string borrowing. Copy/fill
+operations do not invoke a custom Clone implementation.
+
+`Arena<T>` owns typed values with stable, bounds-checked indices. It grows
+fallibly from the same budget and destroys values on drop. References borrow
+the arena and exclude simultaneous growth; addresses are not stable across
+growth. Indices are offsets local to one arena, not globally branded handles.
+No raw heterogeneous bump allocator or unrun-destructor policy is implied.
+
+Budget exhaustion, size/reference-count overflow and allocator refusal are
+separate allocation-free errors. Callers use existing/static refusal paths
+and reserve completion capacity before durable effects. The operation-count
+failure-injection scope also covers both raw allocations in this boundary;
+it remains thread-local test admission, not byte accounting.
+
+Every migrated application scenario needs before/after performance evidence
+under the same build profile and workload, covering representative latency,
+throughput and retained/peak memory. Primitive microbenchmarks supplement the
+scenario measurement; they do not establish whole-service performance.

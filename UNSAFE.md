@@ -13,11 +13,11 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-SEVEN
-numbered target-side exceptions, TWENTY-FIVE of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-EIGHT
+numbered target-side exceptions, TWENTY-SIX of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary, or in the twenty-sixth's case
-its CPU instructions (the crate itself
+its CPU instructions, or the twenty-eighth's checked heap ownership (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
@@ -52,7 +52,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-five live surfaces in twenty-seven numbered entries. The
+roster counts twenty-six live surfaces in twenty-eight numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -216,6 +216,7 @@ one.
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
 | 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
 | 27 | `td-ssh` | `setgroups(2)`, `setgid(2)`, `setuid(2)`, `prctl(2)` pinned to `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE`, `seccomp(2)` with one operation, `ioctl(2)` with seven value-pinned terminal requests, `setsid(2)`, `umask(2)` pinned to one floor operation; plus one scoped pre-exec hook — see [§27](#27-td-ssh--a-reduced-ssh-client-and-server) |
+| 28 | `td-alloc` | none: checked global allocation, Vec ownership adoption and strong reference counting; see §28 |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3873,6 +3874,41 @@ passing; and that the pre-auth worker names no key or socket type.
 `td-ssh/tests/server.rs` reads a running worker's and signer's `/proc` status to
 see the filter really installed. Any additional syscall, request, caller or
 allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
+
+## 28. `td-alloc` — fallible heap ownership
+
+The Cargo library root `src/owned.rs` denies unsafe code. `src/raw.rs` has
+six narrowly scoped allowances: four functions (`vector`, `Shared::new`,
+`Shared::inner`, `Shared::drop`) and the Send/Sync implementations for
+`Shared<T: Send + Sync>`. No other module has an allowance. The source-mounted
+`src/lib.rs` retains forbid and never imports this boundary, so the engine
+and direct-rustc helper consumers retain their existing safe-only contract.
+
+`vector` validates Layout::array, skips zero-sized layouts, admits the test
+reservation, calls std's global `alloc`, refuses null and transfers the exact
+pointer/layout once to Vec::from_raw_parts with zero initialized elements.
+Safe Vec operations and destruction then own initialization, moves and free.
+Budgeted growth never exposes the inner Vec and reserves before an operation
+could grow it. Both old and new layouts stay charged during replacement.
+
+The private Shared block contains an atomic strong count and initialized T.
+Creation admits the test reservation, allocates the nonzero exact layout,
+refuses null, and writes both fields before publishing. A live handle lends
+only shared references. Clone uses checked atomic increment capped at
+isize::MAX; there is no weak count, mutable access, or public raw conversion.
+Release decrements with release ordering; the last owner acquires a fence,
+moves the initialized block into a local, deallocates its exact original
+layout, then drops the local. No Pin or address guarantee escapes Shared.
+State returns its parent metadata charge only after the block is freed;
+a panicking T destructor cannot leak that block or expose freed memory.
+Shared is Send and Sync only when T is both. The only production T is the
+private budget State; its parent-chain depth is bounded at construction.
+
+Tests cover alignment, zero-sized values, layout overflow, null-equivalent
+injected refusal, rollback, replacement overlap, concurrent admission,
+worker handoff, owner lifetime, typed destruction and unwind. The source
+confinement test pins the allowances and keeps unsafe out of other modules.
+No allocator override, syscall or external dependency is introduced.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

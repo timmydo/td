@@ -7,6 +7,9 @@ description = "Fallible allocation helpers and scoped reservation admission"
 
 [workspace]
 
+[lib]
+path = "src/owned.rs"
+
 [package.metadata.td-gate]
 clippy-all-targets = true
 
