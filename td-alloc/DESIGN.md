@@ -141,6 +141,13 @@ The non-cloneable `Charge` returns its bytes on drop; consumers of external
 resources must release those resources before dropping their charge. Forgetting
 an owner leaks its admission too and cannot replenish a budget.
 
+`Charge::shrink_to` returns only the excess reservation to every ancestor,
+without releasing or reacquiring the retained bytes. It never allocates.
+Equal sizes and zero are allowed; a larger requested size returns `Limit`
+without changing the charge. Release the corresponding resources before
+shrinking: changing accounting does not resize or free storage. A zero-byte
+charge still retains its budget identity and metadata until dropped.
+
 The limit bounds the requested layouts of participating heap allocations,
 including spare capacity and budget metadata. It excludes allocator-internal
 metadata, fragmentation, stack storage, OS page commitment, mappings and
@@ -185,10 +192,6 @@ separate allocation-free errors. Callers use existing/static refusal paths
 and reserve completion capacity before durable effects. The operation-count
 failure-injection scope also covers both raw allocations in this boundary;
 it remains thread-local test admission, not byte accounting.
-td-web's page budgets (td-web/DESIGN.md §10, increment 6) need first
-`Charge::shrink_to`, which returns the difference between a charged
-ceiling and the actual, so a caller need not release the whole charge
-and charge the actual anew.
 
 Every migrated application scenario needs before/after performance evidence
 under the same build profile and workload, covering representative latency,

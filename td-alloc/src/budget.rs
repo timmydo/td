@@ -141,6 +141,20 @@ impl Charge {
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
+    /// Return excess reservation to every ancestor without reacquiring the
+    /// retained bytes. Release the corresponding resources before calling this;
+    /// changing a charge does not resize or free storage.
+    ///
+    /// A request to grow returns `BudgetError::Limit` and leaves the charge
+    /// unchanged. Equal sizes and zero are allowed; this never allocates.
+    pub fn shrink_to(&mut self, bytes: usize) -> Result<(), BudgetError> {
+        let released = self.bytes.checked_sub(bytes).ok_or(BudgetError::Limit)?;
+        self.bytes = bytes;
+        if released != 0 {
+            self.budget.release(released);
+        }
+        Ok(())
+    }
 }
 impl Drop for Charge {
     fn drop(&mut self) {

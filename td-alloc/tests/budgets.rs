@@ -4,6 +4,68 @@ use td_alloc::{
 };
 
 #[test]
+fn shrinking_returns_only_excess_to_all_ancestors_without_allocating() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(3 * meta + 100).unwrap();
+    let child = root.child(2 * meta + 100).unwrap();
+    let leaf = child.child(meta + 100).unwrap();
+    let mut charge = leaf.charge(100).unwrap();
+    with_reservation_limit(0, || {
+        charge.shrink_to(40).unwrap();
+        charge.shrink_to(40).unwrap();
+        assert_eq!(charge.shrink_to(41), Err(BudgetError::Limit));
+        assert_eq!(charge.shrink_to(usize::MAX), Err(BudgetError::Limit));
+    });
+    assert_eq!(charge.bytes(), 40);
+    assert_eq!(root.used(), 3 * meta + 40);
+    assert_eq!(child.used(), 2 * meta + 40);
+    assert_eq!(leaf.used(), meta + 40);
+    let spare = root.charge(60).unwrap();
+    assert!(matches!(root.charge(1), Err(BudgetError::Limit)));
+    drop(charge);
+    assert_eq!(root.used(), 3 * meta + 60);
+    assert_eq!(leaf.used(), meta);
+    drop(spare);
+    let mut charge = leaf.charge(100).unwrap();
+    charge.shrink_to(0).unwrap();
+    drop(leaf);
+    drop(child);
+    assert_eq!(root.used(), 3 * meta);
+    assert_eq!(charge.budget().used(), meta);
+    drop(charge);
+    assert_eq!(root.used(), meta);
+}
+
+#[test]
+fn shrinking_keeps_retained_bytes_admitted_while_a_sibling_uses_headroom() {
+    let meta = Budget::metadata_bytes();
+    let root = Budget::new(3 * meta + 100).unwrap();
+    let child = root.child(meta + 100).unwrap();
+    let sibling = root.child(meta + 100).unwrap();
+    let mut charge = child.charge(100).unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let start = std::time::Instant::now();
+            loop {
+                if let Ok(spare) = sibling.charge(60) {
+                    assert!(root.used() >= 3 * meta + 100);
+                    assert!(matches!(sibling.charge(1), Err(BudgetError::Limit)));
+                    return spare;
+                }
+                assert!(start.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::yield_now();
+            }
+        });
+        charge.shrink_to(40).unwrap();
+        let spare = worker.join().unwrap();
+        assert_eq!(root.used(), 3 * meta + 100);
+        drop(spare);
+    });
+    drop(charge);
+    assert_eq!(root.used(), 3 * meta);
+}
+
+#[test]
 fn ancestors_charge_live_owners_and_failed_admission_rolls_back() {
     let meta = Budget::metadata_bytes();
     let root = Budget::new(3 * meta + 100).unwrap();
