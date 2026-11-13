@@ -208,3 +208,54 @@ fn index_budget_edges_and_dense_documents() {
     );
     assert!(!subject(&tree, "p").has_text());
 }
+
+#[test]
+fn allocation_refusal_releases_partial_index() {
+    let document = td_html::document::parse("<main><p>one</p><p>two</p></main>").unwrap();
+    let budget = document.budget();
+    let baseline = budget.used();
+    for attempts in 0..2 {
+        let result = td_alloc::with_reservation_limit(attempts, || HtmlTree::new(&document));
+        assert!(matches!(
+            result,
+            Err(Error::Memory(BudgetError::Allocation))
+        ));
+        assert_eq!(budget.used(), baseline);
+    }
+    let tree = td_alloc::with_reservation_limit(2, || HtmlTree::new(&document)).unwrap();
+    assert_eq!(budget.used(), baseline + tree.index_bytes());
+    drop(tree);
+    assert_eq!(budget.used(), baseline);
+}
+
+#[test]
+fn page_budget_keeps_overlapping_indexes_admitted() {
+    let document = td_html::document::parse("<div><span>x</span><!--y--></div>").unwrap();
+    let payload = document.len() * (std::mem::size_of::<Links>() + std::mem::size_of::<NodeId>());
+    let metadata = Budget::metadata_bytes();
+    let root = Budget::new(3 * metadata + 2 * payload).unwrap();
+    let first_budget = root.child(metadata + payload).unwrap();
+    let second_budget = root.child(metadata + 2 * payload).unwrap();
+    let first = HtmlTree::with_budget(&document, &first_budget).unwrap();
+    drop(first_budget);
+    let second = HtmlTree::with_state_and_budget(&document, &NO_STATE, &second_budget).unwrap();
+    assert_eq!(root.used(), root.limit());
+    assert!(matches!(
+        HtmlTree::with_budget(&document, &second_budget),
+        Err(Error::Memory(BudgetError::Limit))
+    ));
+    drop(first);
+    let replacement = HtmlTree::with_budget(&document, &second_budget).unwrap();
+    assert_eq!(root.used(), 2 * metadata + 2 * payload);
+    assert_eq!(
+        replacement
+            .elements()
+            .map(|e| e.node_id())
+            .collect::<Vec<_>>(),
+        second.elements().map(|e| e.node_id()).collect::<Vec<_>>()
+    );
+    drop(second_budget);
+    drop(second);
+    drop(replacement);
+    assert_eq!(root.used(), metadata);
+}

@@ -184,6 +184,8 @@ recovering its `BudgetVec` retains admission. `BudgetString` preserves UTF-8
 and offers fallible append and constant-time string borrowing. Copy/fill
 operations do not invoke a custom Clone implementation. Borrowed iteration,
 Debug and equality preserve storage ownership. Checked removal cannot grow.
+`push_within_capacity` never allocates: it returns an unstored value when
+full, allowing fixed-size producers to use previously admitted capacity.
 BudgetString has fallible copy/clone and scalar append; immutable str
 borrowing exposes no unchecked mutation.
 

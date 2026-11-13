@@ -1,5 +1,6 @@
 //! HTML-only selector navigation over an immutable td-html document.
 #![forbid(unsafe_code)]
+use td_alloc::{Budget, BudgetError, BudgetVec};
 use td_css::selectors::{Element, State};
 use td_html::document::{Document, Namespace, NodeId, NodeKind};
 pub const MAX_INDEX_NODES: usize = td_html::html5::MAX_NODES;
@@ -12,6 +13,7 @@ pub enum Error {
     Nodes,
     Work,
     InvalidTree,
+    Memory(BudgetError),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,6 +21,11 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<BudgetError> for Error {
+    fn from(value: BudgetError) -> Self {
+        Self::Memory(value)
+    }
+}
 /// Stable for a matching operation. The caller owns focus, hover propagation
 /// and checked/selected semantics. Browsing history has no query.
 pub trait StateProvider {
@@ -62,8 +69,8 @@ fn check_size(nodes: usize) -> Result<(), Error> {
 /// Navigation is indexed once so comments/text never make CSS callbacks scan.
 pub struct HtmlTree<'d> {
     document: &'d Document,
-    links: Vec<Links>,
-    order: Vec<NodeId>,
+    links: BudgetVec<Links>,
+    order: BudgetVec<NodeId>,
     state: &'d dyn StateProvider,
 }
 impl<'d> HtmlTree<'d> {
@@ -71,11 +78,22 @@ impl<'d> HtmlTree<'d> {
         Self::with_state(document, &NO_STATE)
     }
     pub fn with_state(document: &'d Document, state: &'d dyn StateProvider) -> Result<Self, Error> {
+        Self::with_state_and_budget(document, state, document.budget())
+    }
+    /// Allocate the index from a caller-selected page budget.
+    pub fn with_budget(document: &'d Document, budget: &Budget) -> Result<Self, Error> {
+        Self::with_state_and_budget(document, &NO_STATE, budget)
+    }
+    pub fn with_state_and_budget(
+        document: &'d Document,
+        state: &'d dyn StateProvider,
+        budget: &Budget,
+    ) -> Result<Self, Error> {
         check_size(document.len())?;
         let mut tree = Self {
             document,
-            links: vec![Links::default(); document.len()],
-            order: Vec::with_capacity(document.len()),
+            links: BudgetVec::filled(budget, document.len(), Links::default())?,
+            order: td_alloc::BudgetVec::with_capacity(budget, document.len())?,
             state,
         };
         let mut work = Work {
@@ -116,7 +134,9 @@ impl<'d> HtmlTree<'d> {
                         }
                         link.last = Some(id);
                     }
-                    tree.order.push(id);
+                    tree.order
+                        .push_within_capacity(id)
+                        .map_err(|_| Error::InvalidTree)?;
                 }
                 NodeKind::Element(_) => descend = false,
                 NodeKind::Text(s) if !s.is_empty() => {

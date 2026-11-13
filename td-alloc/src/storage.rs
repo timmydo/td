@@ -77,7 +77,18 @@ impl<T> BudgetVec<T> {
     }
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), BudgetError> {
-        self.try_reserve(1)?;
+        if self.values.len() == self.values.capacity() {
+            self.try_reserve(1)?;
+        }
+        self.values.push(value);
+        Ok(())
+    }
+    /// Append without allocating, returning the value if capacity is full.
+    #[inline]
+    pub fn push_within_capacity(&mut self, value: T) -> Result<(), T> {
+        if self.values.len() == self.values.capacity() {
+            return Err(value);
+        }
         self.values.push(value);
         Ok(())
     }

@@ -1,8 +1,7 @@
 # HTML documents as CSS subjects
 
 td-dom connects td-html's immutable document tree to td-css's selector
-boundary. It is a standalone std-only library depending only on those two
-crates. No application consumes it yet. It fetches nothing, performs no
+boundary. It is a standalone library depending only on those two crates and td-alloc. No application consumes it yet. It fetches nothing, performs no
 layout or painting, and does not change the resident HTML renderer.
 td-html itself has no td-css dependency, so its existing users gain no CSS
 closure.
@@ -11,6 +10,13 @@ closure.
 
 `HtmlTree::new(&Document)` builds navigation for the HTML elements reachable
 from the document root. `with_state` additionally borrows a `StateProvider`.
+Both allocate through the document's shared budget. `with_budget` and
+`with_state_and_budget` instead use a caller-selected budget, allowing a
+page to put its tree and index under separate children of the same root.
+The document's cumulative parser charge is not charged again. Each index
+owns both array charges until it drops, including spare element capacity;
+multiple indexes overlap in their shared ancestors. Refusal returns no
+partial index and releases every partially acquired charge.
 `element(NodeId)` validates membership; `elements()` visits actual document
 order, parents first, which can differ from arena allocation order after
 formatting repair. Handles are cheap `Copy` values borrowing the index and
@@ -60,7 +66,8 @@ excluding allocator metadata, the index object and the borrowed document.
 
 Construction walks the ordinary document links once and charges each
 visited node and ancestor ascent to `MAX_INDEX_WORK`, twice
-`MAX_INDEX_NODES`. Refusal returns `Error::{Nodes, Work, InvalidTree}` and
+`MAX_INDEX_NODES`. Refusal returns `Error::{Nodes, Work, InvalidTree}` or `Error::Memory`
+with td-alloc's limit/overflow/allocator error and
 no partial index. The immutable Document API cannot construct invalid or
 cyclic links, but index lookups still validate IDs. No recursion, unsafe
 code, unchecked indexing or production panic is used.
@@ -82,6 +89,8 @@ font-relative lengths, custom properties and calc(). Navigation tests
 cover comment/text gaps, repaired parent order, templates and foreign
 isolation. State tests cover caller-reported interaction and visited
 privacy. Dense-document and counter-edge tests pin the index ceilings.
+Injected refusal covers both index allocations; shared-root tests hold
+two indexes together, deny the next, and verify complete release on drop.
 There are no filesystem test fixtures or external test dependencies.
 
 The resident renderer remains covered by the frozen pre-workstream

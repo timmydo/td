@@ -379,3 +379,33 @@ fn string_growth_and_copy_preserve_utf8_and_refused_owners() {
     drop(copy);
     assert_eq!(root.used(), Budget::metadata_bytes());
 }
+
+#[test]
+fn reserved_push_returns_unstored_values_without_allocation_or_early_drop() {
+    #[derive(Debug)]
+    struct Item<'a>(&'a std::cell::Cell<usize>);
+    impl Drop for Item<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let drops = std::cell::Cell::new(0);
+    let budget = Budget::new(4096).unwrap();
+    let mut values = BudgetVec::with_capacity(&budget, 1).unwrap();
+    let charged = budget.used();
+    with_reservation_limit(0, || {
+        values.push_within_capacity(Item(&drops)).unwrap();
+        let refused = values.push_within_capacity(Item(&drops)).unwrap_err();
+        assert_eq!(drops.get(), 0);
+        assert_eq!(values.len(), 1);
+        assert_eq!(budget.used(), charged);
+        drop(refused);
+        assert_eq!(drops.get(), 1);
+    });
+    drop(values);
+    assert_eq!(drops.get(), 2);
+    assert_eq!(budget.used(), Budget::metadata_bytes());
+    let mut zero = BudgetVec::<()>::new(&budget).unwrap();
+    with_reservation_limit(0, || zero.push_within_capacity(())).unwrap();
+    assert_eq!(zero.len(), 1);
+}

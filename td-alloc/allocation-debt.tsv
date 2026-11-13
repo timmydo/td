@@ -1072,7 +1072,7 @@ td-alloc/src/lib.rs	unchecked-growth-or-clone	8
 td-alloc/src/raw.rs	raw-allocator	4
 td-alloc/src/storage.rs	allocating-constructor	7
 td-alloc/src/storage.rs	direct-reservation	4
-td-alloc/src/storage.rs	unchecked-growth-or-clone	5
+td-alloc/src/storage.rs	unchecked-growth-or-clone	6
 td-audio/src/alsa.rs	allocation-macro	22
 td-audio/src/device.rs	allocating-conversion	1
 td-audio/src/device.rs	allocation-macro	5
@@ -1664,10 +1664,7 @@ td-disks/src/setting.rs	unchecked-growth-or-clone	2
 td-disks/src/table.rs	allocating-conversion	1
 td-disks/src/table.rs	allocation-macro	8
 td-disks/src/table.rs	unchecked-growth-or-clone	6
-td-dom/src/lib.rs	allocating-constructor	1
-td-dom/src/lib.rs	allocation-macro	1
-td-dom/src/lib.rs	unchecked-growth-or-clone	1
-td-dom/src/tests.rs	allocating-conversion	4
+td-dom/src/tests.rs	allocating-conversion	6
 td-dom/src/tests.rs	allocation-macro	2
 td-dua/src/app.rs	allocating-conversion	17
 td-dua/src/app.rs	allocation-macro	33

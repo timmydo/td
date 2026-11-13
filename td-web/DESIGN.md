@@ -987,7 +987,10 @@ budget to `parse_with_budget`, capped at `MAX_TREE_BYTES` plus its
 control block; it takes no second reservation for that storage. The
 parser's cumulative `charged_bytes` remains a separate complexity bound.
 
-td-dom, td-css and td-layout still allocate through std; each bounds
+td-dom indexes likewise use the supplied page budget through
+`HtmlTree::with_budget`; they keep both array charges until dropped.
+
+td-css and td-layout still allocate through std; each bounds
 what it keeps by its own admission model (td-css's compile ceiling and
 pool limits, td-layout's page charge). td-web joins
 them to the budget: before a step it takes a `Charge` of what that step
@@ -996,7 +999,14 @@ less its `used()`, and the root's), passes that as the step's limit,
 and once the step succeeds shrinks the charge to what the step reports
 it kept (`Charge::shrink_to`, increment 6), which returns only the
 difference, rather than returning the whole charge and charging the
-actual anew, which another thread could overtake. td-layout's
+actual anew, which another thread could overtake. Before that cutover,
+td-layout must expose a split between its declared model and storage
+already owned by the tree and DOM budgets. The external styled reservation
+excludes both owned terms, and leaves the index's full array capacity
+available until construction completes; reserving all remaining headroom
+for the declared term first would deny its owned allocations. The DOM
+index's charges return when its temporary index drops. Its bytes must not
+also survive inside the retained external reservation. td-layout's
 `Limits::bytes` bounds what td-layout itself counts, the tree's charge,
 its input, the styled document and any output retained beside the new,
 so it is given those as they stand plus the new step's charge. A
@@ -1008,7 +1018,8 @@ with the owned one; the terms do not change.
 | Term | Charged | Ceiling |
 |---|---|---:|
 | tree | td-html's owned allocation layouts, including parser scratch and growth overlap | 128 MiB, `MAX_TREE_BYTES`, plus budget metadata |
-| styled | td-layout's `StyledDocument::charged_bytes` beyond the tree's: the input, td-dom's arrays, the pool, the boxes; td-web's tree-order table | the page's |
+| styled | the input, pool, boxes and td-web tree-order table: the declared model excluding independently owned tree and DOM storage | the page's |
+| index | td-dom's owned arrays, only while its index lives | `MAX_INDEX_BYTES`, within the page's |
 | layout | a layout's `output_bytes` and td-web's indexes over it | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
 | sheets | their text, and a compiled set from compiling until the cascade is done, as td-css charges it | 48 MiB (estimate) |
@@ -1072,7 +1083,7 @@ td-html's rendering (252 MB), a page at its output budget, the wrap
 (24 MB) and the text page (46 MB), go with the renderer they measure.
 
 **What td-alloc does not bound**, and how it is kept: what those
-td-dom, td-css and td-layout allocate, since their charges are admission
+td-css and td-layout allocate, since their charges are admission
 models, not allocator bounds (td-layout's deliberately exceeds what is resident;
 td-css's allocation failure is the process's); glibc's arenas and
 fragmentation; td-ui's buffers, atlas pages, faces and measure caches;
@@ -1449,7 +1460,9 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      device-pixel size within a named bound, `OVERHANG` an em at each
      size, and atlas pages for sizes but its own capped at `ATLAS` in
      all, the eldest remade when another is needed.
-   - **td-layout**: a styled document holding its document by shared
+   - **td-layout**: a declared-charge split excluding independently
+     owned tree and DOM storage (above, "Memory"); a styled document
+     holding its document by shared
      ownership, so a page passes between threads, as td-web, which
      forbids `unsafe`, cannot hold a borrowed one beside its owner; a
      replaced element's intrinsic size from the caller, in place of its
@@ -1604,7 +1617,7 @@ order; each is its own design amendment when it starts:
 - **Environment changes**: td-css saying whether a changed width or
   scale alters which of a set's rules apply, so a resize that crosses
   no breakpoint lays a page out again without cascading it (§10).
-- **Owned budgets** in td-dom, td-css and td-layout, each replacing
+- **Owned budgets** in td-css and td-layout, each replacing
   its declared charge in §10's memory with storage held in a td-alloc
   budget.
 - **Toward replacing Firefox.** Script (an interpreter, §2),

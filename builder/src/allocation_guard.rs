@@ -256,6 +256,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
 }
 
 const TREE_STORAGE_SOURCES: &[&str] = &[
+    "td-dom/src/lib.rs",
     "td-html/src/html5/mod.rs",
     "td-html/src/html5/tokenizer.rs",
     "td-html/src/document/mod.rs",

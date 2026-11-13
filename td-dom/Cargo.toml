@@ -6,6 +6,7 @@ description = "td's immutable HTML document adapter for CSS matching"
 license = "MIT"
 [workspace]
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-html = { path = "../td-html" }
 td-css = { path = "../td-css" }
 [package.metadata.td-gate]
