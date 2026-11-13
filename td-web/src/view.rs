@@ -3,7 +3,6 @@
 //! over its pane in prose, each glyph at the pen its line was laid with.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use td_ui::prose::{self, LineBox, Metrics, OVERHANG, SIZE};
 use td_ui::raster::{
@@ -191,7 +190,9 @@ impl View {
         metrics: &mut Metrics,
         rows: usize,
     ) {
-        let page = Arc::clone(&rendered.page);
+        let Ok(page) = rendered.page.try_clone() else {
+            return;
+        };
         let count = page.links.len();
         self.selection = None;
         if count == 0 {
@@ -732,8 +733,8 @@ mod tests {
 
     /// `lines` to be laid on the cell, 100 cells wide.
     fn rendered(lines: &[Line]) -> Rendered {
-        let page = Arc::new(page(lines, Style::default()));
-        Rendered::new(&page, 800, TextFamily::Sans)
+        let page = crate::document::PageRef::for_test(page(lines, Style::default()));
+        Rendered::new(&page, 800, TextFamily::Sans).unwrap()
     }
 
     /// `rendered` shown from its first line on `rows` lines.
@@ -785,12 +786,17 @@ mod tests {
     fn a_long_logical_line_scrolls_a_line_at_a_time_both_ways() {
         let words: Vec<String> = (0..1000).map(|n| format!("w{n}")).collect();
         let text = words.join(" ");
-        let page = Arc::new(page(&[&[(&text, None)]], Style::default()));
+        let page = crate::document::PageRef::for_test(page(&[&[(&text, None)]], Style::default()));
         let width = 10 * CELL_WIDTH as u32;
-        let all = Laid::of(Rendered::new(&page, width, TextFamily::Sans), &mut cell()).lines;
+        let all = Laid::of(
+            Rendered::new(&page, width, TextFamily::Sans).unwrap(),
+            &mut cell(),
+        )
+        .lines;
         assert!(all.len() > 4 * STRIDE, "{}", all.len());
         let (rows, metrics) = (7, &mut cell());
-        let (mut rendered, mut view) = shown(Rendered::new(&page, width, TextFamily::Sans), rows);
+        let (mut rendered, mut view) =
+            shown(Rendered::new(&page, width, TextFamily::Sans).unwrap(), rows);
         let last = all.len() - rows;
         for k in 1..=last + 3 {
             view.scroll(1, &mut rendered, metrics, rows);
@@ -883,8 +889,11 @@ mod tests {
     /// end of one of its wrapped lines, and each line marks its part.
     #[test]
     fn a_match_across_a_wrapped_lines_end_is_marked_on_both() {
-        let page = Arc::new(page(&[&[("one two three", None)]], Style::default()));
-        let mut rendered = Rendered::new(&page, 5 * CELL_WIDTH as u32, TextFamily::Sans);
+        let page = crate::document::PageRef::for_test(page(
+            &[&[("one two three", None)]],
+            Style::default(),
+        ));
+        let mut rendered = Rendered::new(&page, 5 * CELL_WIDTH as u32, TextFamily::Sans).unwrap();
         let metrics = &mut cell();
         let mut view = View::default();
         view.find("ONE TWO", &mut rendered, metrics, 3);
@@ -905,9 +914,9 @@ mod tests {
     #[test]
     fn a_match_from_a_dropped_space_is_shown_where_it_is_drawn() {
         let text = "word ".repeat(200);
-        let page = Arc::new(page(&[&[(&text, None)]], Style::default()));
+        let page = crate::document::PageRef::for_test(page(&[&[(&text, None)]], Style::default()));
         // Nine cells: "word word" a line, the space after it dropped.
-        let mut rendered = Rendered::new(&page, 9 * CELL_WIDTH as u32, TextFamily::Sans);
+        let mut rendered = Rendered::new(&page, 9 * CELL_WIDTH as u32, TextFamily::Sans).unwrap();
         let (metrics, rows) = (&mut cell(), 3);
         let mut view = View::default();
         view.find(" w", &mut rendered, metrics, rows);
@@ -971,13 +980,13 @@ mod tests {
         let text = format!("{}needle", "x".repeat(200));
         let mut page = page(&[&[(&text, None)]], Style::default());
         page.lines[0].wrap = false;
-        let page = Arc::new(page);
+        let page = crate::document::PageRef::for_test(page);
         let metrics = &mut cell();
         let mut view = View::default();
-        let mut narrow = Rendered::new(&page, 800, TextFamily::Sans);
+        let mut narrow = Rendered::new(&page, 800, TextFamily::Sans).unwrap();
         view.find("needle", &mut narrow, metrics, 1);
         assert!(view.hits.is_empty());
-        let mut wide = Rendered::new(&page, 300 * CELL_WIDTH as u32, TextFamily::Sans);
+        let mut wide = Rendered::new(&page, 300 * CELL_WIDTH as u32, TextFamily::Sans).unwrap();
         view.find("needle", &mut wide, metrics, 1);
         assert_eq!(
             view.hits,
@@ -1100,8 +1109,8 @@ mod tests {
             strike: true,
             ..Style::default()
         };
-        let struck = Arc::new(page(&[&[("ab", None)]], struck));
-        let (rendered, view) = shown(Rendered::new(&struck, 800, TextFamily::Sans), 1);
+        let struck = crate::document::PageRef::for_test(page(&[&[("ab", None)]], struck));
+        let (rendered, view) = shown(Rendered::new(&struck, 800, TextFamily::Sans).unwrap(), 1);
         let (fills, _) = painted(&rendered, &view, None, &pane(1));
         let strokes: Vec<Rect> = fills
             .iter()
@@ -1114,8 +1123,8 @@ mod tests {
             code: true,
             ..Style::default()
         };
-        let code = Arc::new(page(&[&[("ab", None)]], code));
-        let (rendered, view) = shown(Rendered::new(&code, 800, TextFamily::Sans), 1);
+        let code = crate::document::PageRef::for_test(page(&[&[("ab", None)]], code));
+        let (rendered, view) = shown(Rendered::new(&code, 800, TextFamily::Sans).unwrap(), 1);
         let (fills, glyphs) = painted(&rendered, &view, None, &pane(1));
         assert_eq!(
             fills.iter().filter(|(_, color)| *color == CHROME).count(),
@@ -1129,7 +1138,15 @@ mod tests {
         let wide = "x".repeat(1000);
         let mut page = page(&[&[(&wide, None)]], Style::default());
         page.lines[0].wrap = false;
-        let (rendered, view) = shown(Rendered::new(&Arc::new(page), 800, TextFamily::Sans), 1);
+        let (rendered, view) = shown(
+            Rendered::new(
+                &crate::document::PageRef::for_test(page),
+                800,
+                TextFamily::Sans,
+            )
+            .unwrap(),
+            1,
+        );
         assert_eq!(rendered.shown(view.top, 5).count(), 1);
         let (_, glyphs) = painted(&rendered, &view, None, &pane(1));
         let last = glyphs.last().unwrap().0;
@@ -1142,7 +1159,15 @@ mod tests {
         let marks = "\u{301}".repeat(100);
         let mut page = page(&[&[(&marks, None)]], Style::default());
         page.lines[0].wrap = false;
-        let (mut rendered, view) = shown(Rendered::new(&Arc::new(page), 800, TextFamily::Sans), 1);
+        let (mut rendered, view) = shown(
+            Rendered::new(
+                &crate::document::PageRef::for_test(page),
+                800,
+                TextFamily::Sans,
+            )
+            .unwrap(),
+            1,
+        );
         // As Noto measures them: no advance.
         let line = &mut laid(&mut rendered)[0].line;
         for glyph in &mut line.glyphs {
@@ -1157,9 +1182,9 @@ mod tests {
     /// `lines` wrapped `columns` cells wide and shown from the first on
     /// `rows` lines.
     fn narrow(lines: &[Line], columns: u32, rows: usize) -> (Rendered, View) {
-        let page = Arc::new(page(lines, Style::default()));
+        let page = crate::document::PageRef::for_test(page(lines, Style::default()));
         shown(
-            Rendered::new(&page, columns * CELL_WIDTH as u32, TextFamily::Sans),
+            Rendered::new(&page, columns * CELL_WIDTH as u32, TextFamily::Sans).unwrap(),
             rows,
         )
     }
@@ -1226,7 +1251,12 @@ mod tests {
         let mut unwrapped = page(&[&[(&wide, None)]], Style::default());
         unwrapped.lines[0].wrap = false;
         let (rendered, view) = shown(
-            Rendered::new(&Arc::new(unwrapped), 800, TextFamily::Sans),
+            Rendered::new(
+                &crate::document::PageRef::for_test(unwrapped),
+                800,
+                TextFamily::Sans,
+            )
+            .unwrap(),
             1,
         );
         let one = pane(1);
@@ -1251,7 +1281,12 @@ mod tests {
     }
 
     fn rendered_empty() -> Rendered {
-        Rendered::new(&Arc::new(Page::default()), 800, TextFamily::Sans)
+        Rendered::new(
+            &crate::document::PageRef::for_test(Page::default()),
+            800,
+            TextFamily::Sans,
+        )
+        .unwrap()
     }
 
     /// The glyphs painted on the selection's ground.
@@ -1295,7 +1330,12 @@ mod tests {
         let mut unwrapped = page(&[&[(&wide, None)], &[("y", None)]], Style::default());
         unwrapped.lines[0].wrap = false;
         let (rendered, mut view) = shown(
-            Rendered::new(&Arc::new(unwrapped), 800, TextFamily::Sans),
+            Rendered::new(
+                &crate::document::PageRef::for_test(unwrapped),
+                800,
+                TextFamily::Sans,
+            )
+            .unwrap(),
             2,
         );
         view.select(Some(Selection {
@@ -1448,8 +1488,11 @@ mod tests {
             Some("text/html; charset=windows-1252"),
             b"<p>Caf\xe9 cr\xe8me br\xfbl\xe9e, \x80 5</p>".to_vec(),
         );
-        let (mut rendered, mut view) =
-            shown(doc.render(80 * CELL_WIDTH as u32, TextFamily::Sans), 1);
+        let (mut rendered, mut view) = shown(
+            doc.render(80 * CELL_WIDTH as u32, TextFamily::Sans)
+                .unwrap(),
+            1,
+        );
         let metrics = &mut cell();
         view.find("CRÈME BRÛLÉE", &mut rendered, metrics, 1);
         let (start, end) = view.selection.and_then(Selection::range).unwrap();

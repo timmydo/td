@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
+use crate::memory::{self, Resident};
+use td_alloc::{Budget, BudgetError, BudgetShared, Charge};
 use td_ui::picture::Picture;
 
 use crate::charset::{self, Rules};
@@ -162,7 +164,90 @@ pub struct Page {
     pub base: Option<Url>,
 }
 
+// Empty renderings need neither an allocation nor a budget control block.
+static EMPTY_PAGE: Page = Page {
+    lines: Vec::new(),
+    links: Vec::new(),
+    cut: false,
+    unrendered: false,
+    trimmed: false,
+    base: None,
+};
+#[derive(Default)]
+pub(crate) struct PageRef(Option<BudgetShared<Resident<Page>>>);
+impl PageRef {
+    fn new(page: Page, charge: Charge) -> Result<Self, BudgetError> {
+        let retained = page.storage_bytes()?;
+        let memory = charge.budget().try_clone()?;
+        let resident = Resident::new(page, charge, retained)?;
+        Ok(Self(Some(BudgetShared::new(&memory, resident)?)))
+    }
+    pub(crate) fn try_clone(&self) -> Result<Self, BudgetError> {
+        Ok(Self(
+            self.0.as_ref().map(BudgetShared::try_clone).transpose()?,
+        ))
+    }
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn for_test(page: Page) -> Self {
+        let memory = memory::root().unwrap();
+        Self::new(page, memory.charge(memory::PAGES).unwrap()).unwrap()
+    }
+    fn budget(&self) -> Option<&Budget> {
+        self.0.as_ref().map(|page| page.budget())
+    }
+}
+impl std::ops::Deref for PageRef {
+    type Target = Page;
+    fn deref(&self) -> &Page {
+        self.0.as_ref().map_or(&EMPTY_PAGE, |page| page)
+    }
+}
+impl std::fmt::Debug for PageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl PartialEq for PageRef {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for PageRef {}
+#[cfg(test)]
+impl Clone for PageRef {
+    #[allow(clippy::unwrap_used)]
+    fn clone(&self) -> Self {
+        self.try_clone().unwrap()
+    }
+}
+
 impl Page {
+    fn storage_bytes(&self) -> Result<usize, BudgetError> {
+        let mut total = 0usize;
+        let mut add = |capacity: usize, size: usize| -> Result<(), BudgetError> {
+            total = total
+                .checked_add(capacity.checked_mul(size).ok_or(BudgetError::Overflow)?)
+                .ok_or(BudgetError::Overflow)?;
+            Ok(())
+        };
+        add(self.lines.capacity(), std::mem::size_of::<Logical>())?;
+        add(self.links.capacity(), std::mem::size_of::<Link>())?;
+        for line in &self.lines {
+            add(line.runs.capacity(), std::mem::size_of::<Run>())?;
+            for run in &line.runs {
+                add(run.text.capacity(), 1)?;
+            }
+        }
+        for link in &self.links {
+            add(link.written.capacity(), 1)?;
+        }
+        // Url retains origin/path/host strings, each bounded by MAX_URL.
+        if self.base.is_some() {
+            add(3 * td_url::MAX_URL, 1)?;
+        }
+        Ok(total)
+    }
     /// What link `at` names.
     pub fn target(&self, at: usize) -> Option<Result<Reference, String>> {
         let link = self.links.get(at)?;
@@ -540,9 +625,9 @@ impl Wrapped {
 /// consecutive ones from wherever the reader is, made again from the
 /// logical lines when the reader moves past it (DESIGN.md §5). Every
 /// place it answers is where one of its wrapped lines starts.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct Rendered {
-    pub page: Arc<Page>,
+    pub page: PageRef,
     /// The width in pixels it is wrapped at.
     pub width: u32,
     body: TextFamily,
@@ -556,19 +641,61 @@ pub struct Rendered {
     /// walk along it found them: a walk back into it starts near where it
     /// is going, and one between two long lines walks neither again.
     stops: Vec<(usize, Vec<Place>)>,
+    memory: WrapCharge,
 }
 
+#[derive(Default)]
+struct WrapCharge(Option<Charge>);
+impl std::fmt::Debug for WrapCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WrapCharge")
+            .field(&self.0.as_ref().map(Charge::bytes))
+            .finish()
+    }
+}
+impl PartialEq for WrapCharge {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for WrapCharge {}
+#[cfg(test)]
+impl Clone for Rendered {
+    #[allow(clippy::unwrap_used)]
+    fn clone(&self) -> Self {
+        Self {
+            page: self.page.clone(),
+            width: self.width,
+            body: self.body,
+            laid: self.laid.clone(),
+            after: self.after,
+            stops: self.stops.clone(),
+            memory: WrapCharge(
+                self.memory
+                    .0
+                    .as_ref()
+                    .map(|c| c.budget().charge(memory::WRAP_WORK).unwrap()),
+            ),
+        }
+    }
+}
 impl Rendered {
     /// `page` to be laid into lines no wider than `width` pixels (at
     /// least one), its body text in `body`; a line that may not wrap is
     /// one line however wide. Nothing is laid yet.
-    pub fn new(page: &Arc<Page>, width: u32, body: TextFamily) -> Self {
-        Self {
-            page: Arc::clone(page),
+    pub fn new(page: &PageRef, width: u32, body: TextFamily) -> Result<Self, BudgetError> {
+        let memory = WrapCharge(
+            page.budget()
+                .map(|b| b.charge(memory::WRAP_WORK))
+                .transpose()?,
+        );
+        Ok(Self {
+            page: page.try_clone()?,
+            memory,
             width: width.max(1),
             body,
             ..Self::default()
-        }
+        })
     }
 
     /// The laid line starting at `place`, by its index.
@@ -1353,8 +1480,8 @@ pub fn visible(text: &str) -> String {
 
 /// What a document is shown as.
 enum Body {
-    Page(Arc<Page>),
-    Picture(Picture),
+    Page(PageRef),
+    Picture(Resident<Picture>),
     PictureResources,
 }
 
@@ -1372,7 +1499,7 @@ pub struct Document {
     /// A reply td-web does not show, kept as it arrived for a save
     /// (DESIGN.md §5, "Saving"): at most `MAX_DOCUMENT` beside a page of
     /// a few lines.
-    held: Option<Vec<u8>>,
+    held: Option<Resident<Vec<u8>>>,
 }
 
 impl Document {
@@ -1390,6 +1517,7 @@ impl Document {
     /// td-web calls this only on its `Renderer`'s thread, which takes
     /// each reply when the one before it is done, so a navigation stopped
     /// or overtaken while it waited does no such work.
+    #[cfg(test)]
     pub fn from_reply_unless(
         url: Url,
         status: u16,
@@ -1397,11 +1525,24 @@ impl Document {
         body: Vec<u8>,
         stopped: &AtomicBool,
     ) -> Option<Self> {
+        match memory::root() {
+            Ok(memory) => Self::from_reply_in(url, status, content_type, body, stopped, &memory),
+            Err(_) => Some(Self::resources(Some(url), status)),
+        }
+    }
+    fn from_reply_in(
+        url: Url,
+        status: u16,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+        stopped: &AtomicBool,
+        root: &Budget,
+    ) -> Option<Self> {
         if body.is_empty() && !(200..300).contains(&status) {
             let why = format!("The server answered {status} and sent nothing to show.");
             return Some(Self {
                 status,
-                ..Self::error(Some(url), &why)
+                ..Self::error_with_budget(Some(url), &why, root)
             });
         }
         let media = content_type
@@ -1420,6 +1561,20 @@ impl Document {
         if heavy && stopped.load(Ordering::SeqCst) {
             return None;
         }
+        let Ok(memory) = root.child(root.limit()) else {
+            return Some(Self::resources(Some(url), status));
+        };
+        let working = match kind {
+            Kind::Html => memory::HTML_WORK,
+            Kind::Text => memory::TEXT_WORK,
+            // The picture decoder owns its admission. A notice is
+            // admitted separately only if decoding fails.
+            Kind::Picture(_) => 0,
+            Kind::Other => body.capacity().checked_add(memory::SMALL_WORK)?,
+        };
+        let Ok(mut charge) = memory.charge(working) else {
+            return Some(Self::resources(Some(url), status));
+        };
         let size = body.len();
         let base = Some(url.clone());
         let (page, title, note, held) = match kind {
@@ -1438,16 +1593,23 @@ impl Document {
                 let declared = content_type.and_then(charset::label);
                 let declared = declared.as_ref().map(charset::Label::as_bytes);
                 let Ok(decoded) = charset::decode(body, declared, rules, most) else {
-                    let why = "td-web had no memory to decode this page.";
                     return Some(Self {
                         status,
-                        ..Self::error(Some(url), why)
+                        ..Self::resources(Some(url), status)
                     });
                 };
                 let note = noted(decoded.encoding, decoded.read, size);
                 let text = decoded.text;
                 if kind == Kind::Text {
-                    (plain(&text, true, base), None, note, None)
+                    (
+                        match plain_checked(&text, true, base) {
+                            Ok(page) => page,
+                            Err(_) => return Some(Self::resources(Some(url), status)),
+                        },
+                        None,
+                        note,
+                        None,
+                    )
                 } else {
                     (
                         html(text.as_bytes(), base),
@@ -1457,7 +1619,7 @@ impl Document {
                     )
                 }
             }
-            Kind::Picture(format) => match picture::decode(format, &body) {
+            Kind::Picture(format) => match picture::decode_with_budget(format, &body, &memory) {
                 Ok(picture) => {
                     return Some(Self {
                         url: Some(url),
@@ -1480,13 +1642,30 @@ impl Document {
                         held: None,
                     });
                 }
-                Err(why) => (plain(&why.to_string(), false, base), None, None, None),
+                Err(why) => {
+                    charge = match memory.charge(memory::SMALL_WORK) {
+                        Ok(charge) => charge,
+                        Err(_) => return Some(Self::resources(Some(url), status)),
+                    };
+                    let Ok(message) = td_alloc::format(format_args!("{why}")) else {
+                        return Some(Self::resources(Some(url), status));
+                    };
+                    (
+                        match plain_checked(&message, false, base) {
+                            Ok(page) => page,
+                            Err(_) => return Some(Self::resources(Some(url), status)),
+                        },
+                        None,
+                        None,
+                        None,
+                    )
+                }
             },
             Kind::Other => {
                 let named = if media.is_empty() {
                     "of no stated type".to_string()
                 } else {
-                    visible(&media)
+                    visible(media.get(..media.floor_char_boundary(4096)).unwrap_or(""))
                 };
                 // Only what the server answered with success is offered
                 // for saving, and kept for it.
@@ -1500,8 +1679,33 @@ impl Document {
                     "This is {named}, {size} bytes.\n\n{offer}td-web shows HTML, text, PNG, \
                      JPEG, GIF, WebP and AVIF; Firefox opens the rest."
                 );
-                (plain(&said, false, base), None, None, held)
+                (
+                    match plain_checked(&said, false, base) {
+                        Ok(page) => page,
+                        Err(_) => return Some(Self::resources(Some(url), status)),
+                    },
+                    None,
+                    None,
+                    held,
+                )
             }
+        };
+        let held = match held {
+            Some(body) => {
+                let bytes = body.capacity();
+                let owned = memory
+                    .charge(bytes)
+                    .and_then(|charge| Resident::new(body, charge, bytes));
+                match owned {
+                    Ok(body) => Some(body),
+                    Err(_) => return Some(Self::resources(Some(url), status)),
+                }
+            }
+            None => None,
+        };
+        let page = match PageRef::new(page, charge) {
+            Ok(page) => page,
+            Err(_) => return Some(Self::resources(Some(url), status)),
         };
         Some(Self {
             url: Some(url),
@@ -1509,33 +1713,81 @@ impl Document {
             title,
             note,
             disposition: None,
-            body: Body::Page(Arc::new(page)),
+            body: Body::Page(page),
             held,
         })
     }
 
-    /// A page saying why there is no document.
-    pub fn error(url: Option<Url>, why: &str) -> Self {
-        let page = plain(why, false, url.clone());
+    fn resources(url: Option<Url>, status: u16) -> Self {
         Self {
             url,
+            status,
+            title: None,
+            note: None,
+            disposition: None,
+            body: Body::PictureResources,
+            held: None,
+        }
+    }
+    /// A bounded error page, or an allocation-free resource notice.
+    pub fn error_with_budget(url: Option<Url>, why: &str, memory: &Budget) -> Self {
+        let made = (|| {
+            let charge = memory.charge(memory::SMALL_WORK)?;
+            let why = why.get(..why.floor_char_boundary(4096)).unwrap_or("");
+            let page = plain_checked(why, false, url.clone())?;
+            PageRef::new(page, charge)
+        })();
+        match made {
+            Ok(page) => Self {
+                url,
+                status: 0,
+                title: None,
+                note: None,
+                disposition: None,
+                body: Body::Page(page),
+                held: None,
+            },
+            Err(_) => Self::resources(url, 0),
+        }
+    }
+    #[cfg(test)]
+    pub fn error(url: Option<Url>, why: &str) -> Self {
+        match memory::root() {
+            Ok(memory) => Self::error_with_budget(url, why, &memory),
+            Err(_) => Self::resources(url, 0),
+        }
+    }
+    pub fn blank() -> Self {
+        Self {
+            url: None,
             status: 0,
             title: None,
             note: None,
             disposition: None,
-            body: Body::Page(Arc::new(page)),
+            body: Body::Page(PageRef::default()),
             held: None,
         }
     }
-
-    /// The start page.
-    pub fn blank() -> Self {
-        Self::error(None, "")
+    pub fn fit_picture(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<Resident<td_ui::picture::Fitted>> {
+        let Body::Picture(picture) = &self.body else {
+            return None;
+        };
+        let charge = picture
+            .budget()
+            .charge(td_ui::picture::MAX_PICTURE_PIXELS * 4)
+            .ok()?;
+        let fitted = picture.fit(width, height)?;
+        let bytes = fitted.bgra.capacity();
+        Resident::new(fitted, charge, bytes).ok()
     }
 
     /// The body of a reply td-web does not show, given up to be saved;
     /// a later save fetches it again.
-    pub fn take_held(&mut self) -> Option<Vec<u8>> {
+    pub fn take_held(&mut self) -> Option<Resident<Vec<u8>>> {
         self.held.take()
     }
 
@@ -1553,10 +1805,10 @@ impl Document {
     /// The document's lines to be wrapped at `width` pixels (at least
     /// one), its body text in `body`, as they are shown; none for a
     /// picture.
-    pub fn render(&self, width: u32, body: TextFamily) -> Rendered {
+    pub fn render(&self, width: u32, body: TextFamily) -> Result<Rendered, BudgetError> {
         match &self.body {
             Body::Page(page) => Rendered::new(page, width, body),
-            Body::Picture(_) | Body::PictureResources => Rendered::default(),
+            Body::Picture(_) | Body::PictureResources => Ok(Rendered::default()),
         }
     }
 }
@@ -1572,8 +1824,18 @@ type Job = Box<dyn FnOnce() + Send>;
 /// threads kept it once per thread. A job that panics answers nothing and
 /// the thread goes on, td-web's build unwinding; a thread found gone is
 /// started again for the next job.
-#[derive(Clone)]
-pub struct Renderer(Arc<Mutex<mpsc::Sender<Job>>>);
+pub struct Renderer(BudgetShared<RenderState>);
+struct RenderState {
+    thread: Mutex<mpsc::Sender<Job>>,
+    memory: Budget,
+}
+#[cfg(test)]
+impl Clone for Renderer {
+    #[allow(clippy::unwrap_used)]
+    fn clone(&self) -> Self {
+        self.try_clone().unwrap()
+    }
+}
 
 /// Starts a render thread, which runs what it is sent in turn until every
 /// sender is gone.
@@ -1593,19 +1855,44 @@ fn render_thread() -> Result<mpsc::Sender<Job>, String> {
 impl Renderer {
     /// A renderer and its thread, or why the thread could not start.
     pub fn start() -> Result<Self, String> {
-        Ok(Self(Arc::new(Mutex::new(render_thread()?))))
+        let memory = memory::root()
+            .map_err(|_| td_alloc::string("no memory for page budgets").unwrap_or_default())?;
+        Self::with_budget(&memory)
+    }
+    pub fn with_budget(memory: &Budget) -> Result<Self, String> {
+        let copied = memory
+            .try_clone()
+            .map_err(|_| td_alloc::string("no page budget handle").unwrap_or_default())?;
+        let state = RenderState {
+            thread: Mutex::new(render_thread()?),
+            memory: copied,
+        };
+        BudgetShared::new(memory, state)
+            .map(Self)
+            .map_err(|_| td_alloc::string("no memory for renderer ownership").unwrap_or_default())
+    }
+    pub fn try_clone(&self) -> Result<Self, BudgetError> {
+        Ok(Self(self.0.try_clone()?))
+    }
+    pub fn budget(&self) -> &Budget {
+        &self.0.memory
+    }
+    pub fn error(&self, url: Option<Url>, why: &str) -> Document {
+        Document::error_with_budget(url, why, self.budget())
     }
 
     /// `work`'s answer, made on the render thread behind the work handed
     /// over before it; none when it panicked or no thread would take it.
     fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (answer, done) = mpsc::channel();
+        // Each job returns once. A single slot avoids allocating an
+        // unbounded channel's multi-message block for the larger owner.
+        let (answer, done) = mpsc::sync_channel(1);
         let job: Job = Box::new(move || {
             let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
             let _ = answer.send(made.ok());
         });
         {
-            let mut thread = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut thread = self.0.thread.lock().unwrap_or_else(PoisonError::into_inner);
             if let Err(mpsc::SendError(job)) = thread.send(job) {
                 *thread = render_thread().ok()?;
                 thread.send(job).ok()?;
@@ -1629,16 +1916,15 @@ impl Renderer {
     ) -> Option<Document> {
         let (shown, kind) = (url.clone(), content_type.map(str::to_string));
         let stopped = Arc::clone(stopped);
+        let memory = match self.budget().try_clone() {
+            Ok(memory) => memory,
+            Err(_) => return Some(Document::resources(Some(url), status)),
+        };
         self.run(move || {
-            Document::from_reply_unless(url, status, kind.as_deref(), body, &stopped)
+            Document::from_reply_in(url, status, kind.as_deref(), body, &stopped, &memory)
                 .filter(|_| !stopped.load(Ordering::SeqCst))
         })
-        .unwrap_or_else(|| {
-            Some(Document::error(
-                Some(shown),
-                "the page could not be rendered",
-            ))
-        })
+        .unwrap_or_else(|| Some(self.error(Some(shown), "the page could not be rendered")))
     }
 }
 
@@ -1742,10 +2028,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// dropped (a CR before an LF among them, DEL and C1 too), which prose
 /// would show as U+FFFD, and td-html's stroke marks when td-web strikes
 /// the text itself.
-fn clean(text: &str, struck: bool) -> String {
-    text.chars()
-        .filter(|&c| (c == '\t' || !c.is_control()) && !(struck && c == STROKE))
-        .collect()
+fn clean(mut text: String, struck: bool) -> String {
+    text.retain(|c| (c == '\t' || !c.is_control()) && !(struck && c == STROKE));
+    text
 }
 
 /// Whether `text` is one of td-html's table rules or column bars: only
@@ -1812,15 +2097,14 @@ fn html(source: &[u8], base: Option<Url>) -> Page {
                     td_html::Tag::Colour(_) | td_html::Tag::BgColour(_) => {}
                 }
             }
-            let mut text = clean(&span.text, style.strike);
+            let has_text = !span.text.trim().is_empty();
+            let mut text = clean(span.text, style.strike);
             if unwrapped {
                 if left == 0 {
                     page.trimmed |= !text.is_empty();
                     // Text cut away still parts the links either side of it.
                     let target = href.or(image);
-                    if !span.text.trim().is_empty()
-                        && last.as_ref().map(|(previous, _)| previous.as_str()) != target
-                    {
+                    if has_text && last.as_ref().map(|(previous, _)| previous.as_str()) != target {
                         last = None;
                     }
                     continue;
@@ -1850,7 +2134,7 @@ fn html(source: &[u8], base: Option<Url>) -> Page {
                     }
                 },
                 None => {
-                    if !span.text.trim().is_empty() {
+                    if has_text {
                         last = None;
                     }
                     None
@@ -1894,7 +2178,12 @@ fn merged(runs: Vec<Run>, keep: usize) -> Vec<Run> {
 /// `text`'s lines, tabs expanded to every `TAB` characters and other
 /// control characters dropped, as logical lines in the monospace face
 /// when `mono`, else in the body's.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
+    plain_checked(text, mono, base).unwrap()
+}
+fn plain_checked(text: &str, mono: bool, base: Option<Url>) -> Result<Page, BudgetError> {
     let mut page = Page {
         base,
         ..Page::default()
@@ -1908,38 +2197,223 @@ fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
             page.cut = true;
             break;
         }
-        let mut line = String::new();
-        let mut columns = 0;
-        for c in raw.chars() {
-            if columns >= MAX_LINE_CHARS {
-                break;
+        // Unchanged text needs one validation scan and one copy, rather
+        // than measuring and encoding each scalar again.
+        let unchanged = if raw.is_ascii() {
+            (!raw.bytes().any(|b| b.is_ascii_control())).then_some(raw.len().min(MAX_LINE_CHARS))
+        } else {
+            raw.char_indices()
+                .take(MAX_LINE_CHARS)
+                .try_fold(0, |_, (at, c)| {
+                    (!c.is_control()).then_some(at + c.len_utf8())
+                })
+        };
+        let line = if let Some(end) = unchanged {
+            td_alloc::string(raw.get(..end).ok_or(BudgetError::Overflow)?)?
+        } else {
+            let mut bytes = 0usize;
+            let mut columns = 0;
+            for c in raw.chars() {
+                if columns >= MAX_LINE_CHARS {
+                    break;
+                }
+                let n = if c == '\t' {
+                    let n = TAB - columns % TAB;
+                    columns += n;
+                    n
+                } else if !c.is_control() {
+                    columns += 1;
+                    c.len_utf8()
+                } else {
+                    0
+                };
+                bytes = bytes.checked_add(n).ok_or(BudgetError::Overflow)?;
             }
-            if c == '\t' {
-                let pad = TAB - columns % TAB;
-                line.extend(std::iter::repeat_n(' ', pad));
-                columns += pad;
-            } else if !c.is_control() {
-                line.push(c);
-                columns += 1;
+            let mut line = String::new();
+            td_alloc::reserve_string(&mut line, bytes)?;
+            let mut columns = 0;
+            for c in raw.chars() {
+                if columns >= MAX_LINE_CHARS {
+                    break;
+                }
+                if c == '\t' {
+                    let pad = TAB - columns % TAB;
+                    for _ in 0..pad {
+                        line.push(' ');
+                    }
+                    columns += pad;
+                } else if !c.is_control() {
+                    line.push(c);
+                    columns += 1;
+                }
             }
-        }
-        line.shrink_to_fit();
-        page.lines.push(Logical {
-            runs: vec![Run {
+            line
+        };
+
+        let mut runs = td_alloc::with_capacity(1)?;
+        td_alloc::push(
+            &mut runs,
+            Run {
                 text: line,
                 style,
                 link: None,
-            }],
-            wrap: true,
-        });
+            },
+        )?;
+        td_alloc::push(&mut page.lines, Logical { runs, wrap: true })?;
     }
-    page.lines.shrink_to_fit();
-    page
+    Ok(page)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+
+    #[test]
+    fn page_and_wrap_owners_share_admission_until_the_last_drop() {
+        let root = memory::root().unwrap();
+        let base = root.used();
+        let doc = Document::from_reply_in(
+            base_url(),
+            200,
+            Some("text/plain"),
+            b"alpha beta gamma".to_vec(),
+            &AtomicBool::new(false),
+            &root,
+        )
+        .unwrap();
+        let page_bytes = root.used() - base;
+        assert!(page_bytes > 0 && page_bytes < memory::TEXT_WORK);
+        let first = doc.render(80, TextFamily::Sans).unwrap();
+        let second = doc.render(40, TextFamily::Sans).unwrap();
+        assert_eq!(root.used(), base + page_bytes + 2 * memory::WRAP_WORK);
+        drop(doc);
+        assert_eq!(root.used(), base + page_bytes + 2 * memory::WRAP_WORK);
+        drop(first);
+        assert_eq!(root.used(), base + page_bytes + memory::WRAP_WORK);
+        drop(second);
+        assert_eq!(root.used(), base);
+    }
+
+    #[test]
+    fn fitted_pixels_outlive_their_document_and_refusals_release_credit() {
+        // Decoding needs its working allowance and control blocks, not
+        // an extra allowance for an error notice that success never uses.
+        let root = Budget::new(memory::PICTURE_WORK + 2 * Budget::metadata_bytes()).unwrap();
+        let baseline = root.used();
+        let doc = Document::from_reply_in(
+            base_url(),
+            200,
+            Some("image/gif"),
+            picture::tests::GIF.to_vec(),
+            &AtomicBool::new(false),
+            &root,
+        )
+        .unwrap();
+        let pixels = root.used();
+        assert!(td_alloc::with_reservation_limit(0, || doc.fit_picture(4, 4)).is_none());
+        assert_eq!(root.used(), pixels);
+        let fit = doc.fit_picture(4, 4).unwrap();
+        let bytes = fit.bgra.capacity();
+        assert_eq!(root.used(), pixels + bytes);
+        drop(doc);
+        assert_eq!(root.used(), baseline + Budget::metadata_bytes() + bytes);
+        assert!(!fit.bgra.is_empty());
+        drop(fit);
+        assert_eq!(root.used(), baseline);
+    }
+
+    #[test]
+    fn page_root_refusal_preserves_the_displayed_page_and_held_save_charge() {
+        let root = memory::root().unwrap();
+        let baseline = root.used();
+        let old = Document::from_reply_in(
+            base_url(),
+            200,
+            Some("text/plain"),
+            b"old page".to_vec(),
+            &AtomicBool::new(false),
+            &root,
+        )
+        .unwrap();
+        let kept = root.used();
+        let blocker = root
+            .charge(root.limit() - root.used() - memory::SMALL_WORK)
+            .unwrap();
+        assert!(old.render(40, TextFamily::Sans).is_err());
+        let refused = Document::from_reply_in(
+            base_url(),
+            200,
+            Some("text/html"),
+            b"<p>new page".to_vec(),
+            &AtomicBool::new(false),
+            &root,
+        )
+        .unwrap();
+        assert!(refused.picture_resources());
+        drop((refused, blocker));
+        assert_eq!(root.used(), kept);
+        assert_eq!(
+            old.render(80, TextFamily::Sans).unwrap().page.lines[0].runs[0].text,
+            "old page"
+        );
+        drop(old);
+        assert_eq!(root.used(), baseline);
+        let mut held = Document::from_reply_in(
+            base_url(),
+            200,
+            Some("application/pdf"),
+            vec![9; 4096],
+            &AtomicBool::new(false),
+            &root,
+        )
+        .unwrap();
+        let body = held.take_held().unwrap();
+        drop(held);
+        assert_eq!(
+            root.used(),
+            baseline + Budget::metadata_bytes() + body.capacity()
+        );
+        drop(body);
+        assert_eq!(root.used(), baseline);
+    }
+
+    #[test]
+    fn cancelled_render_jobs_return_their_page_admission() {
+        let root = memory::root().unwrap();
+        let renderer = Renderer::with_budget(&root).unwrap();
+        let baseline = root.used();
+        let stopped = Arc::new(AtomicBool::new(true));
+        for kind in ["text/html", "text/plain", "image/gif"] {
+            assert!(renderer
+                .document(
+                    base_url(),
+                    200,
+                    Some(kind),
+                    b"<p>cancelled".to_vec(),
+                    &stopped
+                )
+                .is_none());
+            assert_eq!(root.used(), baseline);
+        }
+        stopped.store(false, Ordering::SeqCst);
+        let doc = renderer
+            .document(
+                base_url(),
+                200,
+                Some("text/plain"),
+                b"kept".to_vec(),
+                &stopped,
+            )
+            .unwrap();
+        drop(renderer);
+        assert!(root.used() > Budget::metadata_bytes());
+        drop(doc);
+        assert_eq!(root.used(), Budget::metadata_bytes());
+    }
+
+    fn base_url() -> Url {
+        base()
+    }
 
     #[test]
     fn resource_failure_document_needs_no_error_page() {
@@ -1974,7 +2448,7 @@ pub(crate) mod tests {
     /// A page's lines, every one laid, as reading down it a line at a
     /// time lays them.
     pub(crate) struct Laid {
-        pub page: Arc<Page>,
+        pub page: PageRef,
         pub width: u32,
         pub lines: Vec<Wrapped>,
     }
@@ -2029,7 +2503,8 @@ pub(crate) mod tests {
     /// `doc` wrapped `columns` cells wide in Sans, every line laid.
     fn cells(doc: &Document, columns: u32) -> Laid {
         Laid::of(
-            doc.render(columns * CELL_WIDTH as u32, TextFamily::Sans),
+            doc.render(columns * CELL_WIDTH as u32, TextFamily::Sans)
+                .unwrap(),
             &mut cell(),
         )
     }
@@ -2149,7 +2624,7 @@ pub(crate) mod tests {
         // by laying no more than its logical line.
         let wide = cells(&doc, 80);
         let line_at = |laid: &Laid, place| {
-            let mut rendered = Rendered::new(&laid.page, laid.width, TextFamily::Sans);
+            let mut rendered = Rendered::new(&laid.page, laid.width, TextFamily::Sans).unwrap();
             let start = rendered.snap(&mut cell(), place);
             assert!(rendered.laid.len() <= STRIDE);
             laid.lines.iter().position(|w| w.place() == start).unwrap()
@@ -2447,7 +2922,7 @@ pub(crate) mod tests {
         let rows = 40;
         let most = rows + 2 * STRIDE.max(rows) + STRIDE;
         let metrics = &mut cell();
-        let mut rendered = doc.render(1, TextFamily::Sans);
+        let mut rendered = doc.render(1, TextFamily::Sans).unwrap();
         rendered.settle(metrics, Place::default(), rows);
         assert!(rendered.laid.len() <= most);
         let last = rendered.last(metrics);
@@ -2468,7 +2943,7 @@ pub(crate) mod tests {
         let mut list = b"<ul>".to_vec();
         list.extend(b"<li>y".repeat(MAX_LINES + 1));
         let doc = html_doc(&list);
-        let mut rendered = doc.render(1, TextFamily::Sans);
+        let mut rendered = doc.render(1, TextFamily::Sans).unwrap();
         assert!(rendered.page.cut);
         let last = rendered.last(metrics);
         assert_eq!(last.logical, MAX_LINES - 1);
@@ -2486,7 +2961,7 @@ pub(crate) mod tests {
     #[test]
     fn a_line_that_never_fills_its_width_ends_at_its_bound() {
         let marks = "\u{301}".repeat(3 * MAX_ROW_BYTES / 2);
-        let page = Arc::new(Page {
+        let page = PageRef::for_test(Page {
             lines: vec![Logical {
                 runs: vec![Run {
                     text: format!("a{marks}b c"),
@@ -2499,7 +2974,7 @@ pub(crate) mod tests {
         });
         // On the cell a mark is as wide as any glyph, so a line wider
         // than all of them stands for one they never fill.
-        let rendered = Rendered::new(&page, u32::MAX / 2, TextFamily::Sans);
+        let rendered = Rendered::new(&page, u32::MAX / 2, TextFamily::Sans).unwrap();
         let laid = Laid::of(rendered.clone(), &mut cell());
         let bytes: Vec<usize> = laid
             .lines
@@ -2654,7 +3129,17 @@ pub(crate) mod tests {
     fn gone() -> Renderer {
         let (send, jobs) = mpsc::channel::<Job>();
         drop(jobs);
-        Renderer(Arc::new(Mutex::new(send)))
+        let memory = memory::root().unwrap();
+        Renderer(
+            BudgetShared::new(
+                &memory,
+                RenderState {
+                    thread: Mutex::new(send),
+                    memory: memory.try_clone().unwrap(),
+                },
+            )
+            .unwrap(),
+        )
     }
 
     /// A job that panics answers nothing, a reply's an error page, and the
@@ -2809,6 +3294,27 @@ pub(crate) mod tests {
     /// with its copy fitted to the pane, now the larger. `BASELINE`, `WRAP`
     /// and `MEMORY_HIGH`, the jail's in recipes/src/recipes/web.rs, are
     /// copied by hand and reviewed when any of them changes.
+    #[test]
+    fn page_admission_and_decoder_allowances_fit_the_jail() {
+        let root = memory::root().unwrap();
+        assert_eq!(root.limit(), memory::PAGES + 16 * Budget::metadata_bytes());
+        let bodies = crate::app::MAX_WORKERS * crate::fetch::MAX_DOCUMENT as usize;
+        assert!(145_000_000 + bodies + root.limit() + 20_000_000 < (640 << 20));
+        const {
+            assert!(memory::HTML_WORK >= 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4);
+            assert!(memory::TEXT_WORK >= TEXT_PAGE + MAX_TEXT + memory::SMALL_WORK);
+            assert!(memory::PICTURE_WORK >= (192 << 20) + (1 << 20));
+        }
+        let row_overhead = 16 * MAX_PICTURE_AXIS;
+        assert!(memory::PICTURE_WORK >= (16 << 20) + 4 * MAX_PICTURE_PIXELS + row_overhead);
+        assert!(memory::PICTURE_WORK >= 12 * MAX_PICTURE_PIXELS + row_overhead + (1 << 20));
+        assert!(
+            memory::PICTURE_WORK
+                >= 2 * crate::fetch::MAX_DOCUMENT as usize + 8 * MAX_PICTURE_PIXELS + row_overhead
+        );
+        assert!(memory::PICTURE_WORK >= 3 * crate::fetch::MAX_DOCUMENT as usize);
+    }
+
     #[test]
     fn the_html_limits_fit_the_jail() {
         const BASELINE: usize = 145_000_000;
@@ -3045,16 +3551,20 @@ pub(crate) mod tests {
         assert_eq!(lines[0], "This is application/pdf, 10 bytes.");
         assert_eq!(lines[2], "Ctrl+S saves it in Downloads.");
         assert!(lines[4].contains("Firefox opens the rest"));
-        assert_eq!(doc.take_held(), Some(vec![1; 10]), "kept for a save");
-        assert_eq!(doc.take_held(), None, "given up once");
+        assert_eq!(
+            doc.take_held().as_deref().map(Vec::as_slice),
+            Some(&[1u8; 10][..]),
+            "kept for a save"
+        );
+        assert!(doc.take_held().is_none(), "given up once");
         // What the server answered without success is neither offered nor
         // kept; nor is a page td-web shows.
         let mut doc = Document::from_reply(base(), 404, Some("application/pdf"), vec![1; 10]);
         let lines = text_of(&cells(&doc, 200));
         assert!(lines[2].contains("Firefox opens the rest"), "{lines:?}");
-        assert_eq!(doc.take_held(), None);
+        assert!(doc.take_held().is_none());
         let mut doc = Document::from_reply(base(), 200, Some("text/plain"), b"x".to_vec());
-        assert_eq!(doc.take_held(), None);
+        assert!(doc.take_held().is_none());
     }
 
     #[test]
@@ -3127,7 +3637,7 @@ pub(crate) mod tests {
             Some("text/plain"),
             "ab".repeat(MAX_LINES).into_bytes(),
         );
-        let mut rendered = doc.render(1, TextFamily::Sans);
+        let mut rendered = doc.render(1, TextFamily::Sans).unwrap();
         assert!(!rendered.page.cut);
         let last = rendered.last(&mut cell());
         assert_eq!(last.at, 2 * MAX_LINES - 1, "a glyph a line, all of them");

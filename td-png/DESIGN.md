@@ -91,8 +91,14 @@ What it does not do, so a consumer can say so: no colour management
 (`gAMA`, `cHRM`, `sRGB`, `iCCP` and every other ancillary chunk are
 skipped, the samples taken as sRGB); an animated PNG decodes to its
 default image; and the image data is gathered and inflated whole, so
-memory peaks at the inflated rows plus the RGBA frame (the compressed
-stream is dropped first). At the budgets that is about 512 MiB and a
+the inflater reserves once from the header's inflated byte count. Bounds
+up to 16 MiB round up to a power of two for reuse; larger bounds reserve
+exactly. It
+retains no geometrically grown spare capacity and needs no output-buffer
+replacement. Peak bulk storage is the larger of compressed IDAT capacity
+plus the reserved inflated buffer, and that buffer plus the RGBA frame
+and row scratch
+(the compressed stream is dropped before RGBA conversion). At the budgets that is about 512 MiB and a
 second for a frame 8192 pixels square, from a compressed stream a few
 hundred KiB long, so a consumer showing several images budgets each with
 `header` first. A 3840x2160 RGBA frame decodes in about 170 ms in a

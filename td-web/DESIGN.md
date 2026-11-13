@@ -181,6 +181,55 @@ render thread's term, a rendering or a picture's decoding, holds nothing
 then: the decoding is that thread's work before its rendering starts.
 After it, the text stands in its body's place and adds no term.
 
+**Page admission and ownership.** The window's Renderer owns one shared
+td-alloc root of 320 MiB plus sixteen budget control blocks. A reply takes
+a child when its render job begins. Displayed and incoming pages both
+count while both live; cancellation returns credit only when the worker
+actually drops its work or result. Shared page references use fallible
+BudgetShared ownership. Empty renderings need no allocation.
+
+The legacy path admits conservative working allowances before starting:
+256 MiB for HTML, 64 MiB for plain text, and 200 MiB for picture decoding.
+A small notice takes 1 MiB, and an unshown reply also admits its held body.
+After success Charge::shrink_to releases excess admission without a gap;
+a page retains the capacities of its line/run/link arrays and strings,
+plus a bounded allowance for its base URL. Decoded pictures retain their
+actual RGBA capacity. A held save body owns its capacity charge through
+the save worker, even after its Document is dropped. A wrapper frees its
+value before releasing its charge.
+
+Each Rendered instance admits 24 MiB for its legacy wrapping work and
+retains that reservation until dropped. A fitted picture admits at most
+64 MiB before fitting, then retains its actual buffer capacity. Overlapping
+owners keep both charges. The current resize path drops its old wrap or
+fit before asking for the replacement. A refused page, fit or wrap shows
+a static resource notice; cap refusal does not abort or panic. Error-page
+text is bounded to 4096 UTF-8 bytes before plain-text conversion.
+
+PNG reserves once from its validated inflated size before decoding.
+Bounds up to 16 MiB round up to a power of two for reuse; larger bounds
+reserve exactly. The smaller case fits below 81 MiB with RGBA and row
+scratch; the larger case avoids geometric spare capacity and old/new
+inflater-buffer overlap. At
+td-web's picture bounds, inflated rows plus RGBA and row scratch fit below
+200 MiB; compressed IDAT growth (at most three times the 16 MiB input
+while replacing a buffer) and IDAT capacity beside inflated rows are
+smaller. JPEG's coefficient/plane peak is at most 192 MiB plus bounded
+tables; WebP's working bound is below 145 MiB; AVIF's codec plus its at-most
+16 MiB coded copy is below 96 MiB, or 88 MiB for YUV plus RGBA. Thus the
+200 MiB allowance covers these decoder layouts, apart from allocator/RSS
+bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
+
+These legacy allowances are an admission model, distinct from exact
+ownership of the new parser, CSS and layout storage in §10. They do not
+instrument every std allocation inside the legacy rich renderer, window
+wrapping, IPC or URL/response metadata. Those source-inventory entries
+remain migration debt; this is not a whole-process allocation-failure
+guarantee. The root cap supplements the per-input/work limits and the
+jail's process-wide limit; it does not replace them. The memory ownership
+module has a strict guard against unchecked allocation operations and
+standard heap owners. No visual renderer cutover happens here.
+
 The allocator (glibc's) gives a thread that allocates beside another an
 arena of its own and keeps much of a rendering's peak in it after, for
 that arena's next rendering to reuse. Renderings on the fetch threads
@@ -1028,12 +1077,10 @@ including scratch and replacement overlap. Source-size limits alone do
 not guarantee admission: a sufficiently complex sheet can exhaust 48 MiB
 before compilation finishes, and the page follows "Cuts" below.
 
-A picture reached by navigation is a page of its own, charged its
-decoding's peak before it is decoded, from the dimensions td-web's
-shared picture dispatch reads first: 12 bytes a pixel for the
-costliest, a 16-bit PNG (192 MiB at td-ui's 16 Mi pixels), shrunk after
-to 4 bytes a pixel kept. Refused only because the page shown holds too
-much, it lets the shown page go, the pane showing paper, and tries once
+A picture reached by navigation is a page of its own, charged the shared
+decoder's conservative 200 MiB peak before decoding, including the bounded
+table/row overhead above its 192 MiB bulk ceiling, then shrunk to the
+retained RGBA capacity. Refused only because the page shown holds too much, it lets the shown page go, the pane showing paper, and tries once
 more. Its fitted copy is made on the window thread at its first paint
 at a size, as now, the one heavy step that runs there, and charged to
 the picture's budget there; a charge refused paints §5's static notice
@@ -1071,9 +1118,9 @@ and the jail's keyfile is unchanged. A test,
 `memory-high`, the term ceilings summing to `PAGES` and the root's
 limit at `PAGES` and its control blocks, its terms taken from the
 crates' constants (`MAX_TREE_BYTES`, `MAX_PAGE_BYTES`, `WORKING_BYTES`,
-the caller's sheets ceiling, the 192 MiB picture peak from td-ui's
-`MAX_PICTURE_PIXELS`), and the window's term and the jail's copied by
-hand and reviewed as §3's are. It replaces
+the caller's sheets ceiling, the 200 MiB picture working allowance checked
+against td-ui's `MAX_PICTURE_PIXELS` and the decoder bounds), and the
+window's term and the jail's copied by hand and reviewed as §3's are. It replaces
 `the_html_limits_fit_the_jail`: the terms that test sums,
 td-html's rendering (252 MB), a page at its output budget, the wrap
 (24 MB) and the text page (46 MB), go with the renderer they measure.

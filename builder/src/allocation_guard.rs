@@ -241,7 +241,11 @@ fn parse(text: &str) -> Result<Inventory, String> {
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     check_owned_boundary(root)?;
-    for path in ["td-mta/src/https_api_storage.rs", "td-mta/src/http_date.rs"] {
+    for path in [
+        "td-mta/src/https_api_storage.rs",
+        "td-mta/src/http_date.rs",
+        "td-web/src/memory.rs",
+    ] {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
     }
     for path in TREE_STORAGE_SOURCES.iter().chain(LAYOUT_STORAGE_SOURCES) {
@@ -609,6 +613,8 @@ mod tests {
             fs::write(root.join(path), "fn method() {}").unwrap();
         }
         fs::write(root.join("td-mta/src/http_date.rs"), "fn date() {}").unwrap();
+        fs::create_dir_all(root.join("td-web/src")).unwrap();
+        fs::write(root.join("td-web/src/memory.rs"), "fn memory() {}").unwrap();
         fs::write(
             root.join("td-mta/src/https_api_storage.rs"),
             "fn storage() {}",

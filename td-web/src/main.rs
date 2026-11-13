@@ -7,6 +7,7 @@ mod app;
 mod charset;
 mod document;
 mod fetch;
+mod memory;
 mod picture;
 mod save;
 mod view;

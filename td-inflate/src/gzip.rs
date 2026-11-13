@@ -226,10 +226,31 @@ pub fn decompress_raw_prefix_checked(
     Ok((output, consumed))
 }
 
+/// Reserve once before inflation for a caller with a validated output bound.
+/// Nonzero bounds up to 16 MiB round up to a power of two for buffer reuse;
+/// larger bounds reserve exactly. Output still cannot exceed the given bound,
+/// and inflation never needs an overlapping replacement output buffer.
+pub fn decompress_raw_prefix_preallocated_checked(
+    input: &[u8],
+    max_output_bytes: usize,
+) -> Result<(Vec<u8>, usize), RawError> {
+    let (output, consumed, _) =
+        decompress_raw_prefix_storage(input, max_output_bytes, MAX_DEFLATE_BLOCKS, true)?;
+    Ok((output, consumed))
+}
+
 fn decompress_raw_prefix_bounded(
     input: &[u8],
     max_output_bytes: usize,
     max_blocks: usize,
+) -> Result<(Vec<u8>, usize, usize), RawError> {
+    decompress_raw_prefix_storage(input, max_output_bytes, max_blocks, false)
+}
+fn decompress_raw_prefix_storage(
+    input: &[u8],
+    max_output_bytes: usize,
+    max_blocks: usize,
+    preallocate: bool,
 ) -> Result<(Vec<u8>, usize, usize), RawError> {
     if input.len() as u128 > u128::from(MAX_GZIP_INPUT_BYTES) {
         return Err(RawError::Message("raw DEFLATE input exceeds its limit"));
@@ -239,6 +260,13 @@ fn decompress_raw_prefix_bounded(
     }
     let mut bits = BitReader::new(input);
     let mut output = Vec::new();
+    if preallocate {
+        let capacity = max_output_bytes
+            .checked_next_power_of_two()
+            .filter(|&bytes| max_output_bytes != 0 && bytes <= 16 << 20)
+            .unwrap_or(max_output_bytes);
+        allocation::reserve_exact(&mut output, capacity).map_err(|_| RawError::Allocation)?;
+    }
     let blocks = inflate(&mut bits, &mut output, max_output_bytes, max_blocks)?;
     Ok((output, bits.byte_position(), blocks))
 }
@@ -880,6 +908,46 @@ fn skip_zero_terminated(input: &[u8], pos: usize, what: &str) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preallocated_raw_output_has_bounded_capacity_and_fallible_admission() {
+        let raw = [1, 3, 0, 252, 255, 1, 2, 3];
+        assert_eq!(
+            allocation::with_reservation_limit(0, || decompress_raw_prefix_preallocated_checked(
+                &raw, 3
+            )),
+            Err(RawError::Allocation)
+        );
+        // One output reservation and the two fixed Huffman symbol arrays.
+        let (out, consumed) = allocation::with_reservation_limit(3, || {
+            decompress_raw_prefix_preallocated_checked(&raw, 3)
+        })
+        .unwrap();
+        assert_eq!(out, [1, 2, 3]);
+        assert_eq!(out.capacity(), 4);
+        assert_eq!(consumed, raw.len());
+        assert!(matches!(
+            decompress_raw_prefix_preallocated_checked(&raw, 2),
+            Err(RawError::OutputLimit(2))
+        ));
+        assert_eq!(
+            decompress_raw_prefix_preallocated_checked(&raw, usize::MAX),
+            Err(RawError::Allocation)
+        );
+        for (bound, capacity) in [
+            ((16 << 20) - 1, 16 << 20),
+            (16 << 20, 16 << 20),
+            ((16 << 20) + 1, (16 << 20) + 1),
+        ] {
+            let (out, consumed) = decompress_raw_prefix_preallocated_checked(&raw, bound).unwrap();
+            assert_eq!(out, [1, 2, 3]);
+            assert_eq!(out.capacity(), capacity);
+            assert_eq!(consumed, raw.len());
+        }
+        let empty = [1, 0, 0, 255, 255];
+        let (out, consumed) = decompress_raw_prefix_preallocated_checked(&empty, 0).unwrap();
+        assert_eq!(out.capacity(), 0);
+        assert_eq!(consumed, empty.len());
+    }
 
     #[test]
     fn zlib_checks_framing_checksum_limits_and_every_truncated_prefix() {

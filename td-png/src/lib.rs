@@ -541,13 +541,14 @@ fn inflate(stream: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     let body = stream.get(2..).ok_or(Error::Truncated)?;
     // The inflater refuses output past its bound, so a stream that runs
     // long is refused there, by name.
-    let (raw, consumed) = gzip::decompress_raw_prefix_checked(body, expected).map_err(|why| {
-        if matches!(why, gzip::RawError::OutputLimit(_)) {
-            Error::Length
-        } else {
-            Error::Inflate(why)
-        }
-    })?;
+    let (raw, consumed) = gzip::decompress_raw_prefix_preallocated_checked(body, expected)
+        .map_err(|why| {
+            if matches!(why, gzip::RawError::OutputLimit(_)) {
+                Error::Length
+            } else {
+                Error::Inflate(why)
+            }
+        })?;
     if raw.len() != expected {
         return Err(Error::Length);
     }

@@ -201,6 +201,7 @@ struct Current {
     view: View,
     rendered: Rendered,
     rendered_for: Option<Layout>,
+    render_refused: bool,
     fitted: PictureFit,
 }
 
@@ -208,11 +209,14 @@ struct Current {
 enum PictureFit {
     #[default]
     Empty,
-    Ready(Fitted),
+    Ready(crate::memory::Resident<Fitted>),
     Failed,
 }
 impl PictureFit {
-    fn get_or_fit(&mut self, fit: impl FnOnce() -> Option<Fitted>) -> Option<&Fitted> {
+    fn get_or_fit(
+        &mut self,
+        fit: impl FnOnce() -> Option<crate::memory::Resident<Fitted>>,
+    ) -> Option<&Fitted> {
         if matches!(self, Self::Empty) {
             *self = fit().map_or(Self::Failed, Self::Ready);
         }
@@ -232,7 +236,7 @@ fn picture_notice(
     fill(page, PAPER, bounds, sink);
     td_ui::raster::text_run(
         surface.scale,
-        "Picture unavailable: memory or decode budget exhausted.".chars(),
+        "Page unavailable: memory or decode budget exhausted.".chars(),
         (page.x, page.y),
         page,
         td_ui::raster::GlyphStyle::regular(td_ui::raster::INK, PAPER),
@@ -321,7 +325,7 @@ fn arrive(
             doc.disposition = disposition;
             Some((doc, loaded.fragment.or(fragment)))
         }
-        Err(why) => Some((Document::error(Some(url), &why), fragment)),
+        Err(why) => Some((renderer.error(Some(url), &why), fragment)),
     }
 }
 
@@ -355,17 +359,18 @@ fn saved(
     fetcher: &dyn Fetcher,
     directory: &File,
     url: Url,
-    held: Option<(Vec<u8>, Option<String>)>,
+    held: Option<(crate::memory::Resident<Vec<u8>>, Option<String>)>,
     state: &AtomicU8,
 ) -> Option<String> {
-    let (name, body, from) = match held {
-        Some((body, disposition)) => (save::name(disposition.as_deref(), &url), body, url),
+    let fetched;
+    let (name, body, from) = match &held {
+        Some((body, disposition)) => (save::name(disposition.as_deref(), &url), &***body, url),
         None => match fetch::navigate(fetcher, url) {
-            Ok(loaded) if (200..300).contains(&loaded.reply.status) => (
-                save::name(loaded.reply.header("content-disposition"), &loaded.url),
-                loaded.reply.body,
-                loaded.url,
-            ),
+            Ok(loaded) if (200..300).contains(&loaded.reply.status) => {
+                let name = save::name(loaded.reply.header("content-disposition"), &loaded.url);
+                fetched = loaded.reply.body;
+                (name, fetched.as_slice(), loaded.url)
+            }
             Ok(loaded) => {
                 return said(format_args!(
                     "not saved: the server answered {}",
@@ -388,7 +393,7 @@ fn saved(
         return said(format_args!("{}", save::Refusal::Memory));
     };
     let from = short(&from).unwrap_or_default();
-    match save::store(directory, &name, &body) {
+    match save::store(directory, &name, body) {
         Ok(save::Stored {
             name,
             unsynced: None,
@@ -433,6 +438,7 @@ impl App {
                 view: View::default(),
                 rendered: Rendered::default(),
                 rendered_for: None,
+                render_refused: false,
                 fitted: PictureFit::Empty,
             },
             back: Vec::new(),
@@ -570,7 +576,12 @@ impl App {
         }
         let (send, answer) = mpsc::channel();
         let fetcher = Arc::clone(&self.fetcher);
-        let renderer = self.renderer.clone();
+        let Ok(renderer) = self.renderer.try_clone() else {
+            self.message = said(format_args!(
+                "the page could not be started: memory exhausted"
+            ));
+            return;
+        };
         let (target, named) = (url.clone(), fragment.clone());
         let stopped = Arc::new(AtomicBool::new(false));
         let told = Arc::clone(&stopped);
@@ -608,7 +619,7 @@ impl App {
             Ok(Some(arrival)) => arrival,
             Err(TryRecvError::Empty) => return,
             Ok(None) | Err(TryRecvError::Disconnected) => (
-                Document::error(
+                self.renderer.error(
                     Some(loading.url.clone()),
                     "the fetch ended without an answer",
                 ),
@@ -658,6 +669,7 @@ impl App {
             view: View::default(),
             rendered: Rendered::default(),
             rendered_for: None,
+            render_refused: false,
             fitted: PictureFit::Empty,
         };
         self.relayout();
@@ -859,7 +871,14 @@ impl App {
         if self.current.rendered_for != Some(layout) {
             let top = self.current.view.top;
             self.current.rendered = Rendered::default();
-            self.current.rendered = self.current.doc.render(layout.width, layout.body);
+            self.current.render_refused = false;
+            match self.current.doc.render(layout.width, layout.body) {
+                Ok(rendered) => self.current.rendered = rendered,
+                Err(_) => {
+                    self.current.render_refused = true;
+                    self.message = said(format_args!("Page unavailable: memory budget exhausted."));
+                }
+            }
             self.current.rendered_for = Some(layout);
             let rendered = &mut self.current.rendered;
             let view = &mut self.current.view;
@@ -989,7 +1008,9 @@ impl App {
     fn extend_by(&mut self, chord: &str) {
         let rows = self.rows();
         let Current { view, rendered, .. } = &mut self.current;
-        let page = Arc::clone(&rendered.page);
+        let Ok(page) = rendered.page.try_clone() else {
+            return;
+        };
         if page.lines.is_empty() {
             return;
         }
@@ -1559,7 +1580,7 @@ impl Handler for App {
                 let fitted = self.current.fitted.get_or_fit(|| {
                     let (width, height) =
                         picture.fit_size(page.width as usize, page.height as usize);
-                    picture.fit(width, height)
+                    self.current.doc.fit_picture(width, height)
                 });
                 if let Some(fitted) = fitted {
                     raster.image(page, page, fitted);
@@ -1567,7 +1588,7 @@ impl Handler for App {
                     picture_notice(surface, page, bounds, &mut sink);
                 }
             }
-            None if self.current.doc.picture_resources() => {
+            None if self.current.doc.picture_resources() || self.current.render_refused => {
                 picture_notice(surface, page, bounds, &mut sink);
             }
             None => {
@@ -1674,12 +1695,22 @@ mod tests {
         assert!(cache
             .get_or_fit(|| {
                 retried = true;
-                picture.fit(1, 1)
+                picture.fit(1, 1).and_then(|image| {
+                    let budget = crate::memory::root().ok()?;
+                    let bytes = image.bgra.capacity();
+                    crate::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
+                })
             })
             .is_none());
         assert!(!retried);
         cache = PictureFit::Empty;
-        assert!(cache.get_or_fit(|| picture.fit(1, 1)).is_some());
+        assert!(cache
+            .get_or_fit(|| picture.fit(1, 1).and_then(|image| {
+                let budget = crate::memory::root().ok()?;
+                let bytes = image.bgra.capacity();
+                crate::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
+            }))
+            .is_some());
     }
 
     use crate::document::tests::Laid;

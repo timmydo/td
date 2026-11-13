@@ -132,7 +132,24 @@ impl std::fmt::Display for Error {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, Error> {
+    decoded(format, body).map(|(picture, _)| picture)
+}
+
+pub(crate) fn decode_with_budget(
+    format: Format,
+    body: &[u8],
+    memory: &td_alloc::Budget,
+) -> Result<crate::memory::Resident<Picture>, Error> {
+    let charge = memory
+        .charge(crate::memory::PICTURE_WORK)
+        .map_err(|_| Error::Resources)?;
+    let (picture, capacity) = decoded(format, body)?;
+    crate::memory::Resident::new(picture, charge, capacity).map_err(|_| Error::Resources)
+}
+
+fn decoded(format: Format, body: &[u8]) -> Result<(Picture, usize), Error> {
     if body.len() as u64 > crate::fetch::MAX_DOCUMENT {
         return Err(Error::Input(format));
     }
@@ -202,7 +219,10 @@ pub(crate) fn decode(format: Format, body: &[u8]) -> Result<Picture, Error> {
             (image.width, image.height, rgba)
         }
     };
-    Picture::new(width, height, rgba).map_err(Error::Picture)
+    let capacity = rgba.capacity();
+    Picture::new(width, height, rgba)
+        .map(|picture| (picture, capacity))
+        .map_err(Error::Picture)
 }
 
 #[cfg(test)]
@@ -216,6 +236,52 @@ pub(crate) mod tests {
     pub(crate) const WEBP: &[u8] = include_bytes!("../../td-webp/tests/fixtures/palette.webp");
 
     pub(crate) const GIF: &[u8] = b"GIF89a\x02\0\x01\0\x80\0\0\0\0\0\xff\0\0\x21\xf9\x04\x01\0\0\0\0\x2c\0\0\0\0\x02\0\x01\0\0\x02\x02\x44\x0a\0\x3b";
+
+    #[test]
+    fn decoded_pixels_keep_credit_and_all_refusals_return_scratch() {
+        let root = crate::memory::root().unwrap();
+        let base = root.used();
+        for (format, bytes) in [
+            (
+                Format::Png,
+                include_bytes!("../../td-png/tests/fixtures/suite/rgb8.png").as_slice(),
+            ),
+            (
+                Format::Jpeg,
+                include_bytes!("../../td-jpeg/tests/fixtures/progressive/420-prog.jpg").as_slice(),
+            ),
+            (Format::Gif, GIF),
+            (Format::Webp, WEBP),
+            (Format::Avif, AVIF),
+        ] {
+            let mut succeeded = false;
+            for after in 0..1024 {
+                let result = td_alloc::with_reservation_limit(after, || {
+                    decode_with_budget(format, bytes, &root)
+                });
+                match result {
+                    Ok(image) => {
+                        assert!(root.used() >= base + image.bytes());
+                        assert!(root.used() < base + crate::memory::PICTURE_WORK);
+                        let blocked = root.charge(root.limit() - root.used()).unwrap();
+                        assert!(decode_with_budget(format, bytes, &root)
+                            .unwrap_err()
+                            .resources());
+                        drop(blocked);
+                        assert!(image.fit(11, 9).is_some());
+                        drop(image);
+                        succeeded = true;
+                    }
+                    Err(error) => assert!(error.resources()),
+                }
+                assert_eq!(root.used(), base, "{format:?}, reservation {after}");
+                if succeeded {
+                    break;
+                }
+            }
+            assert!(succeeded);
+        }
+    }
 
     #[test]
     fn every_picture_reservation_can_fail_without_losing_later_decodes() {

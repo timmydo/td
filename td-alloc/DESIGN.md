@@ -76,7 +76,10 @@ production sources reject recognized unchecked allocations and standard
 heap collection names. Layout outputs retain their own charges while
 overlapping replacements are constructed. CSS tokens may outlive their
 stylesheet through computed-style references; that lifetime retains the
-original budget charge. General UI, fetch, navigation and other existing subsystem
+original budget charge. td-web's displayed/incoming legacy pages, wrapping, decoded pictures,
+fitted copies and held save bodies retain shared admissions through their
+owners; its legacy rendering allowances remain conservative external
+models. General UI, fetch, IPC, URL metadata and other existing subsystem
 allocations remain migration debt.
 
 JMAP request byte and token backing uses owned child budgets under one

@@ -12,6 +12,12 @@ preset dictionaries are unsupported. Raw decoding reports its consumed
 prefix or requires an exact size and complete input.
 
 `decompress_raw_prefix_checked` uses allocation-free `RawError` values.
+`decompress_raw_prefix_preallocated_checked` first reserves the caller's
+validated output bound once, for formats such as PNG that know it. Nonzero
+bounds up to 16 MiB round up to a power of two so repeated decodes reuse
+common buffer sizes; larger bounds reserve exactly. It still refuses
+output past the original bound and returns the consumed input prefix.
+The ordinary raw entry point retains incremental growth.
 All raw-decoder buffers reserve fallibly before growth; fixed alphabets use
 stack arrays. The older String-returning entry points adapt these errors
 for existing callers and are outside the allocation-free error guarantee.

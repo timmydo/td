@@ -4327,11 +4327,11 @@ td-vm/src/vm_workspace.rs	unchecked-growth-or-clone	9
 td-web/src/app.rs	allocating-conversion	7
 td-web/src/app.rs	allocation-macro	19
 td-web/src/app.rs	heap-owner	4
-td-web/src/app.rs	unchecked-growth-or-clone	19
+td-web/src/app.rs	unchecked-growth-or-clone	18
 td-web/src/document.rs	allocating-constructor	7
-td-web/src/document.rs	allocating-conversion	11
-td-web/src/document.rs	allocation-macro	6
-td-web/src/document.rs	heap-owner	4
+td-web/src/document.rs	allocating-conversion	9
+td-web/src/document.rs	allocation-macro	5
+td-web/src/document.rs	heap-owner	1
 td-web/src/document.rs	unchecked-growth-or-clone	40
 td-web/src/fetch.rs	allocating-conversion	1
 td-web/src/fetch.rs	allocation-macro	3
