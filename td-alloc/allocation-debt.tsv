@@ -2048,16 +2048,6 @@ td-kv/src/lib.rs	allocating-conversion	10
 td-kv/src/lib.rs	allocation-macro	9
 td-kv/src/lib.rs	heap-owner	6
 td-kv/src/lib.rs	unchecked-growth-or-clone	22
-td-layout/src/block.rs	unchecked-growth-or-clone	7
-td-layout/src/inline.rs	direct-reservation	1
-td-layout/src/inline.rs	unchecked-growth-or-clone	12
-td-layout/src/lib.rs	allocating-constructor	1
-td-layout/src/lib.rs	allocation-macro	4
-td-layout/src/lib.rs	unchecked-growth-or-clone	1
-td-layout/src/validation.rs	allocating-conversion	7
-td-layout/src/validation.rs	allocation-macro	4
-td-layout/src/validation.rs	heap-owner	1
-td-layout/src/validation.rs	unchecked-growth-or-clone	5
 td-link/src/main.rs	allocating-conversion	1
 td-link/src/main.rs	allocation-macro	7
 td-link/src/main.rs	unchecked-growth-or-clone	3

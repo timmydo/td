@@ -6,6 +6,7 @@ license = "MIT"
 description = "Bounded document layout with shared styles and source identity"
 [workspace]
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-html = { path = "../td-html" }
 td-css = { path = "../td-css" }
 td-dom = { path = "../td-dom" }

@@ -998,30 +998,26 @@ original child's admission until their last owner drops, including a
 computed style that outlives its StyleSet. Dropping the set cannot return
 that still-owned charge or move it to the styled term.
 
-td-layout's remaining arrays still use std under its conservative admission
-model. Before that cutover, td-layout must expose a split excluding
-independently owned tree, DOM and CSS storage. The external styled
-reservation covers only the remaining arrays and leaves headroom for
-owned index, cascade scratch and pool allocations during construction.
-It must not reserve all remaining page bytes before those owners run.
-The temporary DOM index returns its actual admission when it drops; its
-bytes must not survive in the retained external reservation.
+td-layout owns its arrays and scratch through td-alloc. The cutover passes
+the page budget to StyledDocument::shared and a selected child to
+block::layout_with_budget. The shared styled document owns the immutable
+Document without a self-referential borrow. Its arrays and retained styles
+keep their charges until dropped; the temporary DOM index returns its
+actual admission when construction ends. Outputs retained across resize
+count against their common ancestor automatically.
 
-td-web admits the external step's ceiling before starting it, passes the
-corresponding model limit, and shrinks that reservation to reported retained
-storage with Charge::shrink_to after success. The retained bytes never leave
-the budget between those operations. Limits::bytes still applies to the
-complete layout admission model, including owned terms, input and outputs
-that remain beside replacements; it is independent of the external-only
-reservation. Any refusal follows "Cuts" below. Migrating a remaining array
-to a td-alloc owner removes its external reservation in the same change.
+No external reservation covers these owned arrays. Limits::bytes and
+Request::retained_output_bytes still govern the conservative layout
+admission model, independently of the actual shared budget. The consumer
+must own its input and its additional tree-order and viewport indexes
+through td-alloc as well. Any refusal follows "Cuts" below.
 
 | Term | Charged | Ceiling |
 |---|---|---:|
 | tree | td-html's owned allocation layouts, including parser scratch and growth overlap | 128 MiB, `MAX_TREE_BYTES`, plus budget metadata |
-| styled | the input, boxes and td-web tree-order table under the external model, plus owned CSS pool storage; excludes independently owned tree and DOM storage | the page's |
+| styled | owned input, boxes, CSS pool and td-web tree-order table; excludes independently owned tree and DOM storage | the page's |
 | index | td-dom's owned arrays, only while its index lives | `MAX_INDEX_BYTES`, within the page's |
-| layout | a layout's `output_bytes` and td-web's indexes over it | the page's |
+| layout | owned geometry, lines, fragments and td-web's indexes over them | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
 | sheets | their text, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB (estimate) |
 | pictures | inline pictures' pixels and fitted copies (increment 9) | 48 MiB (estimate) |

@@ -3,8 +3,8 @@
 ## 1. Boundary
 
 td-layout lays out td-html's immutable document with td-css computed values.
-It is a std-only library with path dependencies on td-html, td-css and
-td-dom. It does not fetch, decode images, paint, run scripts, handle input,
+It is a library with path dependencies on td-alloc, td-html, td-css and
+td-dom, with no external dependencies. It does not fetch, decode images, paint, run scripts, handle input,
 or depend on td-ui. Nothing in td-web consumes it yet. The existing HTML
 text and rich renderers remain independent and byte-identical.
 
@@ -19,9 +19,11 @@ bounded subset, not a claim to implement browser layout generally.
 
 ## 2. Page ownership and shared styles
 
-The caller owns the Document and compiled StyleSet. StyledDocument borrows
-the document, computes parents before children through td-dom's HTML
-projection, and owns a style pool and flat box/source records. Detached
+The caller supplies the Document and compiled StyleSet. StyledDocument
+can borrow the document or retain a BudgetShared<Document> through shared().
+The shared form has no self-referential borrow and can move to a worker.
+It computes parents before children through td-dom's HTML projection and
+owns a style pool and flat box/source records. Detached
 template contents and foreign subtrees have the same exclusion as td-dom.
 The caller supplies HTML_UA_CSS explicitly. Inline style attributes join
 the normal cascade. The root's computed font size supplies rem units.
@@ -58,11 +60,31 @@ and nested token/string allocations count. Shared allocations count once.
 Counts and byte limits both apply, and caller limits may only lower them.
 
 This charge is an admission model, not an exact allocator/RSS measurement.
-The tree, DOM index and CSS engine own fallible td-alloc storage; remaining
-layout arrays still use std. StylePool construction can return a CSS memory
-error, propagated by StyledDocument construction. A caller combining owned
-budgets with an external reservation must exclude owned allocations from
-that reservation; this library does not yet expose that split.
+The tree, DOM index, CSS engine and layout arrays own fallible td-alloc
+storage. Construction and layout can return memory errors. with_budget()
+and with_state_and_budget() use the caller's shared identity for navigation,
+computed candidates, style pooling and boxes. The default constructors
+create an independent budget of min(limits.bytes, MAX_PAGE_BYTES) plus
+WORKING_BYTES and budget metadata. That default does not impose an aggregate
+cap on separately owned documents or compiled sheets.
+
+layout() and wrap_text() use the styled document's budget. Their
+with_budget variants accept a selected child for output and scratch. Every
+retained array keeps its charge until storage is dropped, independently of
+retained_output_bytes. Overlapping results therefore count automatically
+against their common ancestor, even when that admission hint is zero.
+Dropping a launcher handle or cancelling a worker does not release storage
+still owned by the worker or its result. Output contains source IDs, not a
+document owner: its consumer must retain the corresponding StyledDocument
+for source lookup. Memory limits refuse work; they never return partial
+successful layout.
+
+The conservative charged_bytes/output_bytes admission model remains a
+separate bound. It is not an additional td-alloc reservation: doing so would
+double-charge owned storage. Original input bytes and caller font caches
+must be separately owned or reserved by the consumer. Shared stylesheet
+tokens remain charged to their original compilation budget until their last
+style owner is dropped.
 The separately owned compiled stylesheets, font caches, image pixels,
 framebuffer and concurrent network bodies still belong in the consumer's
 jail ledger. In particular, a stylesheet compilation peak is not hidden
@@ -85,7 +107,7 @@ measurement. The 2 MiB many-block case peaks at 93.3 MiB RSS and charges
 ## 3. Public data and source identity
 
 StyledDocument::new(document, sheets, input_bytes, limits) constructs shared styles and
-box records. NodeId always belongs to the borrowed document. StyleId is
+box records. NodeId always belongs to the retained or borrowed document. StyleId is
 local to this styled document; accessors return Option for invalid IDs.
 `block::layout` takes the styled document, mutable FontMetrics and a
 Request with viewport dimensions, an optional vertical window and the
@@ -162,8 +184,19 @@ prose-compatible break test; output positions retain subpixel precision.
 
 `inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
 StyleId for the line strut. It returns bounded lines and byte/work charges.
-The same internal flow can measure without retaining lines. Vec growth is
-charged before reserve, including doubled capacity and allocation overhead.
+The same internal flow can measure without retaining lines. BudgetVec growth
+is admitted before allocation, including the old and replacement buffers
+while they overlap. The byte model also counts conservative capacity and
+allocation overhead. Pending scalar scratch is reused across block flows;
+wrapping moves only the remaining word tail. Small event lists use four
+inline slots before falling back to budgeted storage. One text fragment
+and one replaced fragment can live directly in a line; additional
+fragments use budgeted arrays. These inline values count as part of the
+containing line allocation. Within one layout, the most recent ordinary
+block dimensions are cached by StyleId and containing width/height;
+replaced elements always read their own intrinsic attributes. Styling counts
+the geometry-producing boxes, allowing layout to admit and allocate its
+geometry array once at the exact required capacity.
 
 Line height uses participating text scalars, replaced elements and explicit
 breaks, with CSS line-height and half-leading around the baseline. Empty
@@ -396,8 +429,7 @@ siblings. Timing and RSS are deliberately not assertions in the gate.
 Tables, flexbox, float exclusion, advanced text, painting and td-web
 integration need subsequent designs. No existing consumer switches to this
 library as part of these increments. td-web's integration
-(td-web/DESIGN.md §10, increment 6) needs first a styled document that
-holds its document by shared ownership, intrinsic sizes for replaced
+(td-web/DESIGN.md §10, increment 6) needs intrinsic sizes for replaced
 elements supplied by the caller, list markers as a fragment kind, a
 basic automatic table layout (rows and cells, colspan and rowspan
 within bounds), an input limit the caller sets (up to 4 MiB for a text

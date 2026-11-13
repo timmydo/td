@@ -70,8 +70,11 @@ Picture decoding, raw DEFLATE decoding, picture fitting and td-charset's
 whole-input `decode` use the shared reservation path. Their codecs retain
 input/output/work bounds. The raw inflater's legacy String-returning
 wrappers and image encoders are outside the allocation-free error
-guarantee. The HTML document parser, DOM traversal index and CSS syntax/cascade/interner
-own their storage through shared budgets. CSS tokens may outlive their
+guarantee. The HTML document parser, DOM traversal index, CSS syntax/cascade/interner
+and layout storage own their allocations through shared budgets. Their
+production sources reject recognized unchecked allocations and standard
+heap collection names. Layout outputs retain their own charges while
+overlapping replacements are constructed. CSS tokens may outlive their
 stylesheet through computed-style references; that lifetime retains the
 original budget charge. General UI, fetch, navigation and other existing subsystem
 allocations remain migration debt.

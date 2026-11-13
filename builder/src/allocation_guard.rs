@@ -244,7 +244,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     for path in ["td-mta/src/https_api_storage.rs", "td-mta/src/http_date.rs"] {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
     }
-    for path in TREE_STORAGE_SOURCES {
+    for path in TREE_STORAGE_SOURCES.iter().chain(LAYOUT_STORAGE_SOURCES) {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
             .map_err(|error| format!("{path}: {error}"))?;
     }
@@ -271,6 +271,11 @@ const TREE_STORAGE_SOURCES: &[&str] = &[
     "td-html/src/document/tables.rs",
     "td-html/src/document/formatting.rs",
     "td-html/src/document/foreign.rs",
+];
+const LAYOUT_STORAGE_SOURCES: &[&str] = &[
+    "td-layout/src/lib.rs",
+    "td-layout/src/inline.rs",
+    "td-layout/src/block.rs",
 ];
 const CSS_STORAGE_SOURCES: &[&str] = &[
     "td-css/src/lib.rs",
@@ -591,7 +596,11 @@ mod tests {
         fs::create_dir_all(root.join("td-example/src")).unwrap();
         fs::create_dir_all(root.join("td-alloc/src")).unwrap();
         fs::create_dir_all(root.join("td-mta/src/jmap_request")).unwrap();
-        for path in TREE_STORAGE_SOURCES.iter().chain(CSS_STORAGE_SOURCES) {
+        for path in TREE_STORAGE_SOURCES
+            .iter()
+            .chain(CSS_STORAGE_SOURCES)
+            .chain(LAYOUT_STORAGE_SOURCES)
+        {
             let file = root.join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
             fs::write(file, "fn storage() {}").unwrap();

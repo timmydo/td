@@ -33,6 +33,7 @@ dependencies = [
 name = "td-layout"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-css",
  "td-dom",
  "td-html",

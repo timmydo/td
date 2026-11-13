@@ -2,6 +2,7 @@
 use crate::{keyword, Error, Limits, StyleId, StyledDocument, MAX_COORDINATE};
 use std::mem::size_of;
 use std::ops::Range;
+use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
 use td_html::document::NodeId;
@@ -47,18 +48,96 @@ pub struct ReplacedFragment {
     pub width: f64,
     pub height: f64,
 }
-#[derive(Clone, Debug, PartialEq)]
+/// A single fragment lives in its line; longer runs own budgeted storage.
+pub struct Fragments<T>(FragmentStorage<T>);
+#[derive(Debug)]
+enum FragmentStorage<T> {
+    One(Option<T>),
+    Many(BudgetVec<T>),
+}
+impl<T> Fragments<T> {
+    fn new() -> Self {
+        Self(FragmentStorage::One(None))
+    }
+    fn add(&mut self, value: T, memory: &Budget, counters: &mut Counters) -> Result<(), Error> {
+        match &mut self.0 {
+            FragmentStorage::One(first) if first.is_none() => *first = Some(value),
+            FragmentStorage::One(first) => {
+                let mut values = BudgetVec::new(memory)?;
+                // Reserve both before moving the first fragment out.
+                counters.charge(
+                    2usize
+                        .checked_mul(size_of::<T>())
+                        .and_then(|n| n.checked_mul(2))
+                        .and_then(|n| n.checked_add(32))
+                        .ok_or(Error::Limit("MAX_PAGE_BYTES"))?,
+                )?;
+                BudgetVec::try_reserve_exact(&mut values, 2)?;
+                values.try_push(first.take().ok_or(Error::Invalid)?)?;
+                values.try_push(value)?;
+                self.0 = FragmentStorage::Many(values);
+            }
+            FragmentStorage::Many(values) => {
+                counters.admit_growth(values)?;
+                values.try_push(value)?;
+            }
+        }
+        Ok(())
+    }
+}
+impl<T> std::ops::Deref for Fragments<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match &self.0 {
+            FragmentStorage::One(value) => value.as_slice(),
+            FragmentStorage::Many(values) => values,
+        }
+    }
+}
+impl<T> std::ops::DerefMut for Fragments<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match &mut self.0 {
+            FragmentStorage::One(value) => value.as_mut_slice(),
+            FragmentStorage::Many(values) => values,
+        }
+    }
+}
+impl<T: std::fmt::Debug> std::fmt::Debug for Fragments<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl<T: PartialEq> PartialEq for Fragments<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl<'a, T> IntoIterator for &'a Fragments<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a, T> IntoIterator for &'a mut Fragments<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+#[derive(Debug, PartialEq)]
 pub struct Line {
     pub y: f64,
     pub height: f64,
     pub baseline: f64,
     /// Content advance; negative replaced-element margins can make it signed.
     pub width: f64,
-    pub fragments: Vec<TextFragment>,
-    pub replaced: Vec<ReplacedFragment>,
+    pub fragments: Fragments<TextFragment>,
+    pub replaced: Fragments<ReplacedFragment>,
 }
 pub struct WrappedText {
-    pub lines: Vec<Line>,
+    pub lines: BudgetVec<Line>,
     pub charged_bytes: usize,
     pub work: usize,
 }
@@ -100,7 +179,7 @@ impl Counters {
             .ok_or(Error::Limit("MAX_LAYOUT_WORK"))?;
         Ok(())
     }
-    pub fn reserve<T>(&mut self, values: &mut Vec<T>) -> Result<(), Error> {
+    pub fn admit_growth<T>(&mut self, values: &mut BudgetVec<T>) -> Result<(), Error> {
         if values.len() == values.capacity() {
             let capacity = values
                 .capacity()
@@ -114,9 +193,7 @@ impl Counters {
                 .and_then(|n| n.checked_add(32))
                 .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
             self.charge(charge)?;
-            values
-                .try_reserve_exact(capacity - values.len())
-                .map_err(|_| Error::Limit("MAX_PAGE_BYTES"))?;
+            BudgetVec::try_reserve_exact(values, capacity - values.len())?;
         }
         Ok(())
     }
@@ -143,14 +220,14 @@ pub(crate) trait LineSink {
     fn wants(&self, y: f64, height: f64) -> bool;
     fn line(&mut self, line: Line, counters: &mut Counters) -> Result<(), Error>;
 }
-struct AllLines(Vec<Line>);
+struct AllLines(BudgetVec<Line>);
 impl LineSink for AllLines {
     fn wants(&self, _: f64, _: f64) -> bool {
         true
     }
     fn line(&mut self, line: Line, counters: &mut Counters) -> Result<(), Error> {
-        counters.reserve(&mut self.0)?;
-        self.0.push(line);
+        counters.admit_growth(&mut self.0)?;
+        self.0.try_push(line)?;
         Ok(())
     }
 }
@@ -162,10 +239,21 @@ pub fn wrap_text(
     width: u32,
     strut: StyleId,
 ) -> Result<WrappedText, Error> {
+    wrap_text_with_budget(styled, metrics, runs, width, strut, styled.budget())
+}
+pub fn wrap_text_with_budget(
+    styled: &StyledDocument<'_>,
+    metrics: &mut impl FontMetrics,
+    runs: &[TextRun],
+    width: u32,
+    strut: StyleId,
+    memory: &Budget,
+) -> Result<WrappedText, Error> {
     let mut counters = Counters::new(styled);
     counters.step(runs.len())?;
-    let mut sink = AllLines(Vec::new());
-    let mut flow = Flow::new(styled, metrics, width, strut, 0.0)?;
+    let mut sink = AllLines(BudgetVec::new(memory)?);
+    let mut pending = BudgetVec::new(memory)?;
+    let mut flow = Flow::new(styled, metrics, width, strut, 0.0, memory, &mut pending)?;
     for run in runs {
         flow.text(run, &mut counters, &mut sink)?;
     }
@@ -185,9 +273,10 @@ pub(crate) struct ImageRun {
 }
 pub(crate) struct Flow<'s, 'd, 'm, M> {
     styled: &'s StyledDocument<'d>,
+    memory: &'s Budget,
     metrics: &'m mut M,
     width: u32,
-    pending: Vec<Pending>,
+    pending: &'m mut BudgetVec<Pending>,
     pen: i64,
     after_space: Option<usize>,
     last_space: bool,
@@ -204,17 +293,21 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         width: u32,
         strut: StyleId,
         y: f64,
+        memory: &'s Budget,
+        pending: &'m mut BudgetVec<Pending>,
     ) -> Result<Self, Error> {
         if f64::from(width) > MAX_COORDINATE || !coordinate(y) {
             return Err(Error::Invalid);
         }
+        pending.clear();
         let style = styled.style(strut).ok_or(Error::Invalid)?;
         let (above, below) = vertical(metrics, style)?;
         Ok(Self {
             styled,
+            memory,
             metrics,
             width,
-            pending: Vec::new(),
+            pending,
             pen: 0,
             after_space: None,
             last_space: true,
@@ -236,7 +329,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             .document()
             .node(run.node)
             .and_then(|n| n.text())
-            .and_then(|s| s.get(run.range.clone()))
+            .and_then(|s| s.get(run.range.start..run.range.end))
             .ok_or(Error::Invalid)?;
         let style = self.styled.style(run.style).ok_or(Error::Invalid)?;
         let whitespace = keyword(style, Property::WhiteSpace);
@@ -292,7 +385,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 space: shown == ' ',
                 image: None,
             };
-            self.push(item, soft, counters, sink)?;
+            self.queue(item, soft, counters, sink)?;
         }
         Ok(())
     }
@@ -331,7 +424,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.after_space = None;
         }
         let above = ((height + top + bottom) * 64.0).round() as i64;
-        self.push(
+        self.queue(
             Pending {
                 node,
                 range: 0..0,
@@ -374,7 +467,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         self.previous_cr = false;
         Ok(())
     }
-    fn push(
+    fn queue(
         &mut self,
         mut item: Pending,
         soft: bool,
@@ -388,17 +481,30 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             && !self.pending.is_empty()
             && (soft || self.after_space.is_some())
         {
-            let rest = match self.after_space.take() {
-                Some(keep) => self.pending.split_off(keep.min(self.pending.len())),
-                None => Vec::new(),
-            };
-            if self.pending.iter().any(|p| !p.space) {
-                self.emit(counters, sink, None)?;
+            let keep = self
+                .after_space
+                .take()
+                .unwrap_or(self.pending.len())
+                .min(self.pending.len());
+            if self
+                .pending
+                .get(..keep)
+                .ok_or(Error::Invalid)?
+                .iter()
+                .any(|p| !p.space)
+            {
+                self.emit_prefix(counters, sink, None, keep)?;
             }
-            let shift = rest.first().map_or(self.pen, |p| p.pen);
-            self.pending = rest;
+            let shift = self.pending.get(keep).map_or(self.pen, |p| p.pen);
+            let remaining = self.pending.len() - keep;
+            // Both positions are below the original length: keep <= len,
+            // and at < len - keep. Move only the unbroken word's tail.
+            for at in 0..remaining {
+                self.pending.swap(at, keep + at);
+            }
+            self.pending.truncate(remaining);
             counters.step(self.pending.len())?;
-            for p in &mut self.pending {
+            for p in self.pending.iter_mut() {
                 p.pen = p.pen.checked_sub(shift).ok_or(Error::Invalid)?;
             }
             self.pen = self.pen.checked_sub(shift).ok_or(Error::Invalid)?;
@@ -417,7 +523,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
         let space = item.space;
-        self.pending.push(item);
+        self.pending.try_push(item)?;
         if space && soft {
             self.after_space = Some(self.pending.len());
         }
@@ -443,16 +549,22 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         sink: &mut impl LineSink,
         extra: Option<(i64, i64)>,
     ) -> Result<(), Error> {
-        counters.step(self.pending.len())?;
+        self.emit_prefix(counters, sink, extra, self.pending.len())
+    }
+    fn emit_prefix(
+        &mut self,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+        extra: Option<(i64, i64)>,
+        count: usize,
+    ) -> Result<(), Error> {
+        let prefix = self.pending.get(..count).ok_or(Error::Invalid)?;
+        counters.step(prefix.len())?;
         if counters.lines >= counters.limits.lines {
             return Err(Error::Limit("MAX_LINES"));
         }
         counters.lines += 1;
-        let end = self
-            .pending
-            .iter()
-            .rposition(|p| !p.space)
-            .map_or(0, |i| i + 1);
+        let end = prefix.iter().rposition(|p| !p.space).map_or(0, |i| i + 1);
         let pending = self.pending.get(..end).ok_or(Error::Invalid)?;
         let (above, below) = extra.map_or((self.above, self.below), |(above, below)| {
             (self.above.max(above), self.below.max(below))
@@ -504,24 +616,27 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         }
         sink.measure(bounds)?;
         if sink.wants(self.y, height) {
-            let mut fragments: Vec<TextFragment> = Vec::new();
-            let mut replaced = Vec::new();
+            let mut fragments: Fragments<TextFragment> = Fragments::new();
+            let mut replaced = Fragments::new();
             for p in pending {
                 if let Some((width, height, margin)) = p.image {
                     if counters.fragments >= counters.limits.fragments {
                         return Err(Error::Limit("MAX_FRAGMENTS"));
                     }
                     counters.fragments += 1;
-                    counters.reserve(&mut replaced)?;
                     let [_, _, bottom, left] = margin;
-                    replaced.push(ReplacedFragment {
-                        node: p.node,
-                        style: p.style,
-                        x: p.pen as f64 / 64.0 + left,
-                        y: above as f64 / 64.0 - height - bottom,
-                        width,
-                        height,
-                    });
+                    replaced.add(
+                        ReplacedFragment {
+                            node: p.node,
+                            style: p.style,
+                            x: p.pen as f64 / 64.0 + left,
+                            y: above as f64 / 64.0 - height - bottom,
+                            width,
+                            height,
+                        },
+                        self.memory,
+                        counters,
+                    )?;
                     continue;
                 }
                 if let Some(last) = fragments.last_mut().filter(|f| {
@@ -538,15 +653,18 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                         return Err(Error::Limit("MAX_FRAGMENTS"));
                     }
                     counters.fragments += 1;
-                    counters.reserve(&mut fragments)?;
-                    fragments.push(TextFragment {
-                        node: p.node,
-                        range: p.range.clone(),
-                        style: p.style,
-                        display: p.display,
-                        x: p.pen as f64 / 64.0,
-                        width: p.advance as f64 / 64.0,
-                    });
+                    fragments.add(
+                        TextFragment {
+                            node: p.node,
+                            range: p.range.start..p.range.end,
+                            style: p.style,
+                            display: p.display,
+                            x: p.pen as f64 / 64.0,
+                            width: p.advance as f64 / 64.0,
+                        },
+                        self.memory,
+                        counters,
+                    )?;
                 }
             }
             sink.line(

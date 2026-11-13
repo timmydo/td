@@ -1,9 +1,10 @@
 //! Normal-flow geometry and windowed line retention.
 use crate::inline::{
-    coordinate, Counters, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, TextRun,
+    coordinate, Counters, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Pending, TextRun,
 };
 use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument};
 use std::ops::Range;
+use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
 use td_html::document::NodeId;
@@ -69,8 +70,8 @@ pub struct BoxGeometry {
     pub replaced: bool,
 }
 pub struct Layout {
-    pub boxes: Vec<BoxGeometry>,
-    pub lines: Vec<Line>,
+    pub boxes: BudgetVec<BoxGeometry>,
+    pub lines: BudgetVec<Line>,
     pub height: f64,
     pub overflow: Rect,
     pub line_count: usize,
@@ -82,6 +83,15 @@ pub fn layout(
     styled: &StyledDocument<'_>,
     metrics: &mut impl FontMetrics,
     request: &Request,
+) -> Result<Layout, Error> {
+    layout_with_budget(styled, metrics, request, styled.budget())
+}
+/// Keep output and scratch under a caller-selected child of the page budget.
+pub fn layout_with_budget(
+    styled: &StyledDocument<'_>,
+    metrics: &mut impl FontMetrics,
+    request: &Request,
+    memory: &Budget,
 ) -> Result<Layout, Error> {
     for n in [request.width, request.height] {
         if !n.is_finite() || !(0.0..=MAX_VIEWPORT).contains(&n) {
@@ -98,13 +108,29 @@ pub fn layout(
     let mut counters = Counters::new(styled);
     counters.charge(request.retained_output_bytes)?;
     let initial = counters.bytes;
+    // Every ordinary block and block-level image emits one geometry record,
+    // independently of wrapping or the requested window.
+    let capacity = styled.geometry_count;
+    if capacity != 0 {
+        counters.charge(
+            capacity
+                .checked_mul(std::mem::size_of::<BoxGeometry>())
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(32))
+                .ok_or(Error::Limit("MAX_PAGE_BYTES"))?,
+        )?;
+    }
+    let boxes = td_alloc::BudgetVec::with_capacity(memory, capacity)?;
     let mut engine = Engine {
         styled,
+        memory,
         metrics,
         counters,
         request,
-        boxes: Vec::new(),
-        lines: Vec::new(),
+        boxes,
+        lines: BudgetVec::new(memory)?,
+        pending: BudgetVec::new(memory)?,
+        last_dimensions: None,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -146,11 +172,14 @@ pub fn layout(
 }
 struct Engine<'s, 'd, 'm, 'r, M> {
     styled: &'s StyledDocument<'d>,
+    memory: &'s Budget,
     metrics: &'m mut M,
     counters: Counters,
     request: &'r Request,
-    boxes: Vec<BoxGeometry>,
-    lines: Vec<Line>,
+    boxes: BudgetVec<BoxGeometry>,
+    lines: BudgetVec<Line>,
+    pending: BudgetVec<Pending>,
+    last_dimensions: Option<(StyleId, f64, Option<f64>, Dimensions)>,
     left: f64,
     top: f64,
     right: f64,
@@ -160,6 +189,34 @@ struct Engine<'s, 'd, 'm, 'r, M> {
 enum Event {
     Inline(BoxId),
     Block(BoxId),
+}
+struct Events {
+    inline: [Option<Event>; 4],
+    len: usize,
+    extra: Option<BudgetVec<Event>>,
+}
+impl Events {
+    fn get(&self, at: usize) -> Option<&Event> {
+        if at < self.inline.len() {
+            self.inline.get(at).and_then(Option::as_ref)
+        } else {
+            self.extra.as_ref()?.get(at - self.inline.len())
+        }
+    }
+    fn add(&mut self, event: Event, counters: &mut Counters, memory: &Budget) -> Result<(), Error> {
+        if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = Some(event);
+        } else {
+            if self.extra.is_none() {
+                self.extra = Some(BudgetVec::new(memory)?);
+            }
+            let extra = self.extra.as_mut().ok_or(Error::Invalid)?;
+            counters.admit_growth(extra)?;
+            extra.try_push(event)?;
+        }
+        self.len = self.len.checked_add(1).ok_or(Error::Invalid)?;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy)]
 struct Dimensions {
@@ -178,6 +235,28 @@ impl Dimensions {
     }
 }
 impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
+    fn block_dimensions(
+        &mut self,
+        b: &BoxNode,
+        width: f64,
+        height: Option<f64>,
+    ) -> Result<Dimensions, Error> {
+        // Ordinary block dimensions depend only on the shared style and
+        // containing dimensions. Replaced elements also read node attributes.
+        if b.kind == BoxKind::Block {
+            if let Some((style, w, h, value)) = self.last_dimensions {
+                if style == b.style && w == width && h == height {
+                    return Ok(value);
+                }
+            }
+        }
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let value = dimensions(self.styled, b, style, width, height)?;
+        if b.kind == BoxKind::Block {
+            self.last_dimensions = Some((b.style, width, height, value));
+        }
+        Ok(value)
+    }
     fn bounds(&mut self, rect: Rect) -> Result<(), Error> {
         include_bounds(
             &mut self.left,
@@ -187,9 +266,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             rect,
         )
     }
-    fn events(&mut self, first: Option<BoxId>) -> Result<Vec<Event>, Error> {
-        let mut events = Vec::new();
-        let mut stack = Vec::new();
+    fn events(&mut self, first: Option<BoxId>) -> Result<Events, Error> {
+        let mut events = Events {
+            inline: [None; 4],
+            len: 0,
+            extra: None,
+        };
+        let mut stack: Option<BudgetVec<BoxId>> = None;
         let mut next = first;
         while let Some(id) = next {
             self.counters.step(1)?;
@@ -197,24 +280,32 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             if b.kind == BoxKind::Inline {
                 if let Some(child) = b.first_child {
                     if let Some(sibling) = b.next_sibling {
-                        stack.push(sibling);
+                        if stack.is_none() {
+                            stack = Some(BudgetVec::new(self.memory)?);
+                        }
+                        stack.as_mut().ok_or(Error::Invalid)?.try_push(sibling)?;
                     }
                     next = Some(child);
                     continue;
                 }
             } else {
-                self.counters.reserve(&mut events)?;
                 let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
                 let block = b.kind == BoxKind::Block
                     || (b.kind == BoxKind::Image
                         && !matches!(keyword(style, Property::Display), "inline" | "inline-block"));
-                events.push(if block {
-                    Event::Block(id)
-                } else {
-                    Event::Inline(id)
-                });
+                events.add(
+                    if block {
+                        Event::Block(id)
+                    } else {
+                        Event::Inline(id)
+                    },
+                    &mut self.counters,
+                    self.memory,
+                )?;
             }
-            next = b.next_sibling.or_else(|| stack.pop());
+            next = b
+                .next_sibling
+                .or_else(|| stack.as_mut().and_then(BudgetVec::pop));
         }
         Ok(events)
     }
@@ -238,8 +329,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             match event {
                 Event::Block(id) => {
                     let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
-                    let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-                    let dims = dimensions(self.styled, &b, style, container.width, definite)?;
+                    let dims = self.block_dimensions(&b, container.width, definite)?;
                     let gap = previous_margin.map_or(dims.margin.top, |previous| {
                         collapse(previous, dims.margin.top)
                     });
@@ -275,8 +365,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         container.width.floor() as u32,
                         strut,
                         run_y,
+                        self.memory,
+                        &mut self.pending,
                     )?;
-                    for event in events.get(start..at).ok_or(Error::Invalid)? {
+                    for index in start..at {
+                        let event = events.get(index).ok_or(Error::Invalid)?;
                         let Event::Inline(id) = event else {
                             return Err(Error::Invalid);
                         };
@@ -406,13 +499,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             replaced: b.kind == BoxKind::Image,
         };
         self.bounds(geometry.border)?;
-        self.counters.reserve(&mut self.boxes)?;
-        self.boxes.push(geometry);
+        self.counters.admit_growth(&mut self.boxes)?;
+        self.boxes.try_push(geometry)?;
         Ok(height + decor.vertical())
     }
 }
 struct Positioned<'a> {
-    lines: &'a mut Vec<Line>,
+    lines: &'a mut BudgetVec<Line>,
     window: Option<&'a Range<f64>>,
     x: f64,
     dy: f64,
@@ -461,8 +554,8 @@ impl LineSink for Positioned<'_> {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
         }
-        counters.reserve(self.lines)?;
-        self.lines.push(line);
+        counters.admit_growth(self.lines)?;
+        self.lines.try_push(line)?;
         Ok(())
     }
 }
@@ -820,11 +913,10 @@ mod tests {
         window.window = Some(100.0..200.0);
         let subset = layout(&styled, &mut Metrics, &window).unwrap();
         assert_eq!(
-            subset.lines,
+            subset.lines.iter().collect::<Vec<_>>(),
             full.lines
                 .iter()
                 .filter(|l| l.y + l.height > 100.0 && l.y < 200.0)
-                .cloned()
                 .collect::<Vec<_>>()
         );
         assert_eq!(subset.height, full.height);
@@ -1065,11 +1157,10 @@ mod tests {
                         let window = layout(&styled, &mut Metrics, &request).unwrap();
                         assert_eq!(full.overflow, window.overflow);
                         assert_eq!(
-                            window.lines,
+                            window.lines.iter().collect::<Vec<_>>(),
                             full.lines
                                 .iter()
                                 .filter(|l| l.y + l.height > 20.0 && l.y < 40.0)
-                                .cloned()
                                 .collect::<Vec<_>>()
                         );
                     }

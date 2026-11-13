@@ -3,6 +3,7 @@
 pub mod block;
 pub mod inline;
 use std::mem::size_of;
+use td_alloc::{Budget, BudgetShared, BudgetVec};
 use td_css::selectors::Element;
 pub use td_css::sharing::StyleId;
 use td_css::sharing::{PoolLimits, StylePool};
@@ -26,6 +27,7 @@ pub enum Error {
     Css(td_css::Error),
     Tree(td_dom::Error),
     Invalid,
+    Memory(td_alloc::BudgetError),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +35,11 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<td_alloc::BudgetError> for Error {
+    fn from(value: td_alloc::BudgetError) -> Self {
+        Self::Memory(value)
+    }
+}
 impl From<td_css::Error> for Error {
     fn from(value: td_css::Error) -> Self {
         Self::Css(value)
@@ -104,14 +111,19 @@ pub struct BoxNode {
     pub first_child: Option<BoxId>,
     pub next_sibling: Option<BoxId>,
 }
-/// Borrowed immutable text; one style per equivalence class, never per node.
+/// Immutable text, borrowed or shared; one style per equivalence class.
 pub struct StyledDocument<'d> {
-    document: &'d Document,
+    document: DocumentOwner<'d>,
     styles: StylePool,
-    boxes: Vec<BoxNode>,
+    boxes: BudgetVec<BoxNode>,
     first: Option<BoxId>,
+    geometry_count: usize,
     charged: usize,
     limits: Limits,
+}
+enum DocumentOwner<'d> {
+    Borrowed(&'d Document),
+    Shared(BudgetShared<Document>),
 }
 impl<'d> StyledDocument<'d> {
     pub fn new(
@@ -120,7 +132,13 @@ impl<'d> StyledDocument<'d> {
         input_bytes: usize,
         limits: Limits,
     ) -> Result<Self, Error> {
-        Self::build(document, sheets, input_bytes, limits, None)
+        Self::with_budget(
+            document,
+            sheets,
+            input_bytes,
+            limits,
+            &default_budget(limits)?,
+        )
     }
     pub fn with_state(
         document: &'d Document,
@@ -129,14 +147,42 @@ impl<'d> StyledDocument<'d> {
         limits: Limits,
         state: &'d dyn StateProvider,
     ) -> Result<Self, Error> {
-        Self::build(document, sheets, input_bytes, limits, Some(state))
+        Self::with_state_and_budget(
+            document,
+            sheets,
+            input_bytes,
+            limits,
+            state,
+            &default_budget(limits)?,
+        )
+    }
+    /// Use the same identity for DOM navigation, candidate styles and boxes.
+    pub fn with_budget(
+        document: &'d Document,
+        sheets: &StyleSet,
+        input_bytes: usize,
+        limits: Limits,
+        memory: &Budget,
+    ) -> Result<Self, Error> {
+        Self::build(document, sheets, input_bytes, limits, None, memory)
+    }
+    pub fn with_state_and_budget(
+        document: &'d Document,
+        sheets: &StyleSet,
+        input_bytes: usize,
+        limits: Limits,
+        state: &dyn StateProvider,
+        memory: &Budget,
+    ) -> Result<Self, Error> {
+        Self::build(document, sheets, input_bytes, limits, Some(state), memory)
     }
     fn build(
         document: &'d Document,
         sheets: &StyleSet,
         input_bytes: usize,
         limits: Limits,
-        state: Option<&'d dyn StateProvider>,
+        state: Option<&dyn StateProvider>,
+        memory: &Budget,
     ) -> Result<Self, Error> {
         let limits = limits.clamped();
         if input_bytes > limits.input {
@@ -157,14 +203,17 @@ impl<'d> StyledDocument<'d> {
             .filter(|n| *n <= limits.bytes)
             .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
         let tree = match state {
-            Some(state) => HtmlTree::with_state(document, state)?,
-            None => HtmlTree::new(document)?,
+            Some(state) => HtmlTree::with_state_and_budget(document, state, memory)?,
+            None => HtmlTree::with_budget(document, memory)?,
         };
-        let mut styles = StylePool::new(PoolLimits {
-            bytes: limits.styles.bytes.min(limits.bytes - fixed),
-            ..limits.styles
-        })?;
-        let mut node_styles = vec![None; document.len()];
+        let mut styles = StylePool::with_budget(
+            PoolLimits {
+                bytes: limits.styles.bytes.min(limits.bytes - fixed),
+                ..limits.styles
+            },
+            memory,
+        )?;
+        let mut node_styles = BudgetVec::filled(memory, document.len(), None)?;
         let mut root_size = 16.0;
         for element in tree.elements() {
             let parent_id = element.parent().map(|p| p.node_id());
@@ -173,11 +222,12 @@ impl<'d> StyledDocument<'d> {
             if parent_id.is_some() && parent_style.is_none() {
                 continue;
             }
-            let computed = sheets.compute(
+            let computed = sheets.compute_with_budget(
                 &element,
                 parent_style.and_then(|id| styles.get(id)),
                 root_size,
                 element.attribute("style").unwrap_or(""),
+                memory,
             )?;
             if parent_id.is_none() {
                 root_size = computed.font_size();
@@ -191,16 +241,17 @@ impl<'d> StyledDocument<'d> {
                 .ok_or(Error::Invalid)? = Some(id);
         }
         let mut out = Self {
-            document,
+            document: DocumentOwner::Borrowed(document),
             charged: fixed + styles.charged_bytes(),
             styles,
-            boxes: Vec::with_capacity(document.len()),
+            boxes: td_alloc::BudgetVec::with_capacity(memory, document.len())?,
             first: None,
+            geometry_count: 0,
             limits,
         };
-        let mut last = vec![None; document.len()];
-        let mut parents = vec![None; document.len()];
-        let mut depths = vec![0usize; document.len()];
+        let mut last = BudgetVec::filled(memory, document.len(), None)?;
+        let mut parents = BudgetVec::filled(memory, document.len(), None)?;
+        let mut depths = BudgetVec::filled(memory, document.len(), 0usize)?;
         let mut previous_root: Option<BoxId> = None;
         // Walk actual links; repaired HTML need not follow allocation order.
         let mut next = document.node(document.root()).and_then(|n| n.first_child());
@@ -242,15 +293,24 @@ impl<'d> StyledDocument<'d> {
                         _ => BoxKind::Block,
                     }
                 };
+                if kind == BoxKind::Block
+                    || (kind == BoxKind::Image
+                        && !matches!(
+                            keyword(computed, Property::Display),
+                            "inline" | "inline-block"
+                        ))
+                {
+                    out.geometry_count = out.geometry_count.checked_add(1).ok_or(Error::Invalid)?;
+                }
                 let id = BoxId(out.boxes.len());
-                out.boxes.push(BoxNode {
+                out.boxes.try_push(BoxNode {
                     node: node_id,
                     style,
                     kind,
                     parent,
                     first_child: None,
                     next_sibling: None,
-                });
+                })?;
                 *parents.get_mut(node_id.index()).ok_or(Error::Invalid)? = Some(id);
                 *depths.get_mut(node_id.index()).ok_or(Error::Invalid)? = depth;
                 let previous = match parent {
@@ -295,8 +355,14 @@ impl<'d> StyledDocument<'d> {
         }
         Ok(out)
     }
-    pub fn document(&self) -> &'d Document {
-        self.document
+    pub fn document(&self) -> &Document {
+        match &self.document {
+            DocumentOwner::Borrowed(d) => d,
+            DocumentOwner::Shared(d) => d,
+        }
+    }
+    pub fn budget(&self) -> &Budget {
+        self.boxes.budget()
     }
     pub fn boxes(&self) -> &[BoxNode] {
         &self.boxes
@@ -322,6 +388,41 @@ impl<'d> StyledDocument<'d> {
     pub fn limits(&self) -> Limits {
         self.limits
     }
+}
+impl StyledDocument<'static> {
+    /// Own the immutable document without a self-referential borrow.
+    pub fn shared(
+        document: BudgetShared<Document>,
+        sheets: &StyleSet,
+        input_bytes: usize,
+        limits: Limits,
+        memory: &Budget,
+    ) -> Result<Self, Error> {
+        let built = StyledDocument::with_budget(&document, sheets, input_bytes, limits, memory)?;
+        let StyledDocument {
+            styles,
+            boxes,
+            first,
+            geometry_count,
+            charged,
+            limits,
+            ..
+        } = built;
+        Ok(Self {
+            document: DocumentOwner::Shared(document),
+            styles,
+            boxes,
+            first,
+            geometry_count,
+            charged,
+            limits,
+        })
+    }
+}
+fn default_budget(limits: Limits) -> Result<Budget, Error> {
+    Ok(Budget::new(
+        limits.bytes.min(MAX_PAGE_BYTES) + WORKING_BYTES + Budget::metadata_bytes(),
+    )?)
 }
 fn keyword(style: &ComputedStyle, property: Property) -> &str {
     match style.get(property) {
