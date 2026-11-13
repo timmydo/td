@@ -52,6 +52,7 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 # client, HTML as text, JSON, Markdown, TOML, the shared UI toolkit, the
 # shared framing, and for pictures base64, JPEG and PNG.
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-civil = { path = "../td-civil" }
 td-encoding = { path = "../td-encoding" }
 td-fetch-client = { path = "../td-fetch-client" }

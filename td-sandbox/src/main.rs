@@ -15,6 +15,8 @@ mod intake;
 mod relay;
 mod state;
 mod wire;
+#[path = "../../engine/src/workspace_intake.rs"]
+mod workspace_intake;
 // The workload account ledger's name grammar, which a sandbox's name
 // meets, its intake socket and its account homes.
 #[allow(dead_code, reason = "the ledger's root half is td-authd's")]

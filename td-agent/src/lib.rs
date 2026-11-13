@@ -74,6 +74,7 @@ pub mod history;
 pub mod host;
 #[path = "../../engine/src/host_path.rs"]
 pub mod host_path;
+pub mod intake;
 pub mod jail;
 pub mod key;
 pub mod keydialog;
@@ -137,6 +138,12 @@ pub mod window;
 pub mod window_wire;
 pub mod wire;
 pub mod workspace;
+#[allow(
+    dead_code,
+    reason = "sandbox transport operations shared with td-sandbox"
+)]
+#[path = "../../engine/src/workspace_intake.rs"]
+mod workspace_intake;
 // The grant table's format, for the sensitive trees of the home it and
 // td-agent's workspace admission share, and the ledger's account kinds it
 // keys rows by.

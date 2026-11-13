@@ -5,194 +5,19 @@
 
 use crate::{failure, owned, refused, text};
 use std::fmt::Write as _;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
 
-/// Where root's intake listens; the primary human alone may connect.
-pub const SOCKET: &str = crate::workload_accounts::WORKSPACE_INTAKE;
-/// Where root reports what happens after a launch's answer, and why one
-/// that ended before its relay began did not start.
-pub const LOG: &str = "/var/log/svc/workspace-intake.log";
-/// The intake's longest request, its newline included.
+use std::path::Path;
+#[cfg(test)]
+use std::time::Duration;
+
+pub use crate::workspace_intake::{lasting, shown, Answer, Intake, DELETED, EXISTS, LOG};
+pub type Root<'a> = crate::workspace_intake::Root<'a, MAX_REQUEST>;
 const MAX_REQUEST: usize = 8192;
-/// The longest answer read: a listing of an account's every directory row
-/// at the longest path.
-const MAX_ANSWER: usize = 64 * 1024;
-/// A launch's answer, `ok` or a refusal, read byte by byte so nothing of
-/// the relay after it is taken.
-const MAX_LINE: usize = 256;
-/// How long root may take to answer: a launch prepares the account and
-/// publishes its views; a deletion has the account empty its home.
-const LAUNCH_PATIENCE: Duration = Duration::from_secs(120);
-const ANSWER_PATIENCE: Duration = Duration::from_secs(600);
-/// Root's refusals by their words: a creation over a sandbox that holds
-/// files or grants, and a launch or grant change of a deleted one.
-pub const EXISTS: &str = "exists";
-pub const DELETED: &str = "deleted";
-/// Before a refusal asking again cannot change: root's or the writer's
-/// refusal of the request itself. Any other may pass.
-const FINAL: &str = "final: ";
-
-/// The reason of a refusal that asking again cannot change, none for one
-/// that may pass.
-pub fn lasting(reason: &str) -> Option<&str> {
-    reason.strip_prefix(FINAL)
-}
-
-/// A refusal's reason as the human reads it.
-pub fn shown(reason: &str) -> &str {
-    lasting(reason).unwrap_or(reason)
-}
-
-/// An answer: `ok` and what follows it, or the reason root refused.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Answer {
-    Ok(String),
-    Refused(String),
-}
-
-impl Answer {
-    /// What followed `ok`, or the refusal as an error.
-    pub fn accepted(self) -> io::Result<String> {
-        match self {
-            Self::Ok(rest) => Ok(rest),
-            Self::Refused(reason) => Err(io::Error::other(shown(&reason))),
-        }
-    }
-}
-
-/// Root's intake as td-sandbox asks it, or a stand-in in the tests.
-pub trait Intake {
-    /// One request that root answers whole and closes.
-    fn ask(&self, line: &str) -> io::Result<Answer>;
-}
-
-/// The intake at a socket path.
-pub struct Root {
-    pub socket: PathBuf,
-    /// How long a connection may wait for the socket to appear: at boot,
-    /// the intake's service may still be binding it.
-    pub patience: Duration,
-}
-
-impl Root {
-    pub fn new() -> Self {
-        Self {
-            socket: PathBuf::from(SOCKET),
-            patience: Duration::ZERO,
-        }
-    }
-
-    fn connect(&self) -> io::Result<UnixStream> {
-        let deadline = Instant::now() + self.patience;
-        loop {
-            match UnixStream::connect(&self.socket) {
-                Ok(stream) => return Ok(stream),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                Err(e) => {
-                    let message = text(format_args!(
-                        "root's workspace intake at {} cannot be reached ({e}); \
-                         sandboxes run only on td, through its workspace-intake service",
-                        self.socket.display()
-                    ))?;
-                    return Err(io::Error::new(e.kind(), message));
-                }
-            }
-        }
-    }
-
-    /// Sends a launch request and reads its one answer line: on `ok` the
-    /// connection, which is now the relay's.
-    pub fn launch(&self, line: &str) -> io::Result<UnixStream> {
-        let mut stream = self.connect()?;
-        send(&mut stream, line)?;
-        stream.set_read_timeout(Some(LAUNCH_PATIENCE))?;
-        let mut answer = td_alloc::with_capacity(MAX_LINE).map_err(refused)?;
-        let mut byte = [0u8; 1];
-        while answer.last() != Some(&b'\n') {
-            if answer.len() >= MAX_LINE {
-                return Err(io::Error::other("root's workspace intake answered amiss"));
-            }
-            match stream.read(&mut byte) {
-                Ok(0) => {
-                    return Err(failure(format_args!(
-                        "root's workspace intake closed without an answer; {LOG} says why"
-                    )))
-                }
-                Ok(_) => td_alloc::extend_from_slice(&mut answer, &byte).map_err(refused)?,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        stream.set_read_timeout(None)?;
-        match parse(&answer)? {
-            Answer::Ok(rest) if rest.is_empty() => Ok(stream),
-            Answer::Ok(_) => Err(io::Error::other("root's workspace intake answered amiss")),
-            Answer::Refused(reason) => Err(io::Error::other(shown(&reason))),
-        }
-    }
-}
-
-impl Intake for Root {
-    fn ask(&self, line: &str) -> io::Result<Answer> {
-        let mut stream = self.connect()?;
-        send(&mut stream, line)?;
-        stream.set_read_timeout(Some(ANSWER_PATIENCE))?;
-        // Reserved whole, so reading to the bound never grows it.
-        let mut answer = td_alloc::with_capacity(MAX_ANSWER + 1).map_err(refused)?;
-        stream
-            .take(MAX_ANSWER as u64 + 1)
-            .read_to_end(&mut answer)?;
-        if answer.len() > MAX_ANSWER {
-            return Err(io::Error::other(
-                "root's workspace intake answered too much",
-            ));
-        }
-        parse(&answer)
-    }
-}
-
-fn send(stream: &mut UnixStream, line: &str) -> io::Result<()> {
-    if line.len() > MAX_REQUEST || !line.ends_with('\n') {
-        return Err(io::Error::other(
-            "the request is too long for root's intake",
-        ));
-    }
-    stream.write_all(line.as_bytes())
-}
-
-/// `ok`, alone or with a space and more, or `refused` and a reason, one
-/// line or, for `ok`, more.
-pub fn parse(answer: &[u8]) -> io::Result<Answer> {
-    let amiss = || io::Error::other("root's workspace intake answered amiss");
-    let text = std::str::from_utf8(answer).map_err(|_| amiss())?;
-    if let Some(reason) = text
-        .strip_prefix("refused ")
-        .and_then(|rest| rest.strip_suffix('\n'))
-    {
-        if reason.is_empty() || reason.contains('\n') {
-            return Err(amiss());
-        }
-        return Ok(Answer::Refused(owned(reason)?));
-    }
-    match text.strip_prefix("ok") {
-        Some("\n") => Ok(Answer::Ok(String::new())),
-        Some(rest) => match rest.strip_prefix(' ').filter(|rest| rest.ends_with('\n')) {
-            Some(rest) => Ok(Answer::Ok(owned(rest)?)),
-            None => Err(amiss()),
-        },
-        None => Err(amiss()),
-    }
-}
+#[cfg(test)]
+use crate::workspace_intake::parse;
 
 /// `start NAME RUNTIME TERM`: td's shell on a PTY.
 pub fn start(name: &str, runtime: Option<&str>, term: &str) -> io::Result<String> {
@@ -507,7 +332,7 @@ mod tests {
         let socket = dir.join("workspace");
         let listener = std::os::unix::net::UnixListener::bind(&socket)?;
         let root = Root {
-            socket: socket.clone(),
+            socket: &socket,
             patience: Duration::ZERO,
         };
         let server = std::thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
@@ -547,7 +372,7 @@ mod tests {
         assert_eq!(seen.len(), 3);
         // No intake at all names what is missing.
         let missing = Root {
-            socket: dir.join("absent"),
+            socket: &dir.join("absent"),
             patience: Duration::ZERO,
         };
         let error = missing.ask("create x\n").err().map(|e| e.to_string());

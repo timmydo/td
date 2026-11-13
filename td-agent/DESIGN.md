@@ -4309,6 +4309,28 @@ commits as the identity the configuration names, cannot write
 and cannot name the sparse mode, which leaves the patterns as they
 were.
 
+**Root intake client.** `src/intake.rs` implements the workspace verbs of
+root's intake (td-authd/DESIGN.md, "Workspace instances"). Slot names
+use the ledger's fixed `agent-N` and `review-N` pools. Creation distinguishes
+`exists` from other refusals; status distinguishes absent, free and held,
+and accepts only canonical uids in the workload range. A launch encodes
+entry arguments as hex words and sends the policy's directories by role,
+relative to the human's canonical home. It refuses directories outside
+that home, roles the shared grant validator rejects, overlapping plans,
+more than 32 entries, invalid runtime/profile combinations, more than
+128 arguments, NUL arguments and requests exceeding 64 KiB. The account's
+home and scratch paths are root's to choose, never sent by the client.
+The client is not yet used by workspace or review launches.
+
+The socket transport is shared with td-sandbox in
+`engine/src/workspace_intake.rs`: bounded dialing, a two-second write
+wait, at most two minutes for a launch answer and ten for other requests,
+and bounded answer storage. A launch consumes exactly its `ok` line and
+returns the connection with no timeouts, preserving the tool host's first
+byte. This answer only accepts the launch; failure after it is reported
+in `/var/log/svc/workspace-intake.log`. No failure starts a local jail or
+an unconfined tool host.
+
 **The launch.** `./install-apps` installs
 td-jail and td-txt from the checkout beside td-agent, and td-net's
 launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them

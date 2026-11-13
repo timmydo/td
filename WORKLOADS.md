@@ -475,7 +475,9 @@ own account.
    or a failed instance; separate pools of 128 instances, 32 a slot; and
    a deletion, of a sandbox too, refused while a launch or instance of it
    runs, that first ends what they left in the account's delegation
-   through `cgroup.kill`, td-authd/DESIGN.md, "Workspace instances"); td-agent's intake client, unused; td-agent's cutover, with a
+   through `cgroup.kill`, td-authd/DESIGN.md, "Workspace instances"); td-agent's intake client (landed, unused: typed slot operations and
+   role-validated launch plans, with td-sandbox's socket transport shared
+   in engine); td-agent's cutover, with a
    VM oracle; reviews on the `review-N` pool through root; and the
    diagnose template.
 9. mail and news on their reserved rows, with fetch services of their

@@ -281,6 +281,8 @@ command runs. A connection that ends before that frame is a launch that
 never started, and one that ends before its exit frame a session that
 ended unreported: td-sandbox says so and names
 `/var/log/svc/workspace-intake.log`, where root reports both. td-sandbox
+shares its intake socket transport with td-agent
+(`engine/src/workspace_intake.rs`), with bounded dialing and writes, and
 waits at most two minutes for a launch's answer and ten for any other,
 a deletion's emptying among them. Root refuses a launch of a deleted
 sandbox `deleted`, which td-sandbox tells as such.
