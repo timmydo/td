@@ -86,6 +86,8 @@ pub const WORKLOAD_DELEGATION_PREFIX: &str = "td-workload-";
 /// the caller's class, a ledger account in the initial namespace, which
 /// only root's launch produces.
 pub const WORKSPACE_INTAKE: &str = "/run/td-authd/1000/workspace";
+/// Image oracle receipt for the conversation-account cutover.
+pub const WORKSPACE_ORACLE_MARKER: &str = "TD-AGENT-WORKSPACE-ACCOUNTS-OK";
 /// Root's directory of workspace launch specs, one root-owned directory of
 /// the account's group per account below it.
 pub const WORKSPACE_SPECS: &str = "/run/td-authd/workspaces";

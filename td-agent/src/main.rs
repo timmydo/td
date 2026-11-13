@@ -233,6 +233,13 @@ fn main() -> ExitCode {
         Some((first, rest)) if first == "review-log" => td_agent::review_metrics::run(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),
         Some((first, rest)) if first == "calibrate" => td_agent::calibrate::run(rest),
+        Some((first, [])) if first == "workspace-oracle" => td_agent::workspace_oracle::run(),
+        Some((first, rest)) if first == "workspace-import" => {
+            td_agent::workspace_upgrade::inside(rest)
+        }
+        Some((first, rest)) if first == "workspace-probe" => {
+            td_agent::workspace_oracle::inside(rest)
+        }
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
             .and_then(|config| {
                 td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)

@@ -188,8 +188,8 @@ an application's: the runtime's code runs under the workspace kind's
 seccomp filter (the development profile where that applies), with the
 workspace's grants (its writable worktrees and shares, its network and
 the host-local sockets that reaches), as the sandbox's own account for a
-td-sandbox sandbox and as the human (uid 1000) for a td-agent workspace
-until WORKLOADS.md step 8, and not behind the application kind's D-Bus,
+td-sandbox sandbox and as the conversation's ledger account for a
+confined td-agent workspace, and not behind the application kind's D-Bus,
 portal or Wayland boundaries. td's own
 glibc programs in such a workspace can load the runtime's code too: td's
 imported glibc keeps its compiled-in `/usr` paths, so its gconv modules,

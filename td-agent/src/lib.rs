@@ -144,6 +144,9 @@ pub mod workspace;
 )]
 #[path = "../../engine/src/workspace_intake.rs"]
 mod workspace_intake;
+pub mod workspace_oracle;
+pub mod workspace_slot;
+pub mod workspace_upgrade;
 // The grant table's format, for the sensitive trees of the home it and
 // td-agent's workspace admission share, and the ledger's account kinds it
 // keys rows by.

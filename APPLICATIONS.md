@@ -3804,8 +3804,9 @@ is installed, td's, two caller classes may, as the initial user
 namespace knows them, and every other identity is refused before its
 spec is read:
 
-- td's account, uid 1000, whose td-agent launches it as a program of
-  that account's (td-agent/DESIGN.md §8); td-sandbox no longer calls
+- td's account, uid 1000, retained for td-agent reviews until their
+  separate cutover (td-agent/DESIGN.md §8); confined conversations now
+  use their ledger accounts through root; td-sandbox no longer calls
   td-jail, and a spec of this caller's may not name
   `profile=development-offline`, which only a sandbox's names;
 - a ledger account, a uid in the sandbox and workspace range (98304
@@ -3916,9 +3917,10 @@ with the kind's own departures:
   runtime's, and stage 2 refuses them again. Its confinement is weaker
   than an application's: the runtime's code runs under the workspace
   kind's seccomp filter (the development profile where that applies),
-  as the caller, the sandbox's account for a td-sandbox sandbox or the
-  human (uid 1000) for a td-agent workspace until WORKLOADS.md step 8
-  moves it onto its account, with the workspace's grants (its writable
+  as the caller: the sandbox's account for td-sandbox or the
+  conversation's ledger account for a confined td-agent workspace on td,
+  and the human on a development host. Reviews retain their caller path
+  pending their separate account cutover. The runtime has the workspace's grants (its writable
   worktrees, shares or views, its network and the host-local sockets
   that reaches), and not behind the application kind's D-Bus, portal or
   Wayland boundaries. td's
@@ -3958,6 +3960,11 @@ with the kind's own departures:
   (td's maintenance mount of its whole volume at `/run/td-volume`) does
   not by itself refuse a directory whose identity lies strictly below
   that home's: the directory does not carry its reserved siblings.
+  For a ledger caller's root-validated private home and scratch alone,
+  the same exception admits that exact private root and descendants when
+  a reservation strictly contains it. Equal or nested reservations and
+  sibling aliases still refuse. This does not exempt a grant or a spec
+  supplied by the human caller class; their home-relative checks remain.
   Refused too is a directory that
   is or contains the caller's own home, as passwd
   spells it, as it resolves, or through a bind mount of it or of a
@@ -12551,8 +12558,8 @@ are unchanged.
 §C's `workspace` kind was built for a development host, and its
 divergences from §X.1 are availability ones, named here as the
 two-configuration rule requires. On td it is td's account's alone (§C):
-td-agent, a program of that account's, launches it there with td's own
-trees. A host's own `/td`, where a development host builds for td's
+root launches confined conversations as their ledger accounts with td's
+own trees; the human caller remains for reviews until their cutover. A host's own `/td`, where a development host builds for td's
 store, is bound read-only and reserved like the other trees, so a jailed
 tool reads td's store there and cannot write it.
 

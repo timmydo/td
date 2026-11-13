@@ -1562,6 +1562,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "sandbox-default",
     "workspace-intake",
     "sandbox-evidence",
+    "agent-workspace-evidence",
     "release-source",
     "rootcheck",
     "profiler",
@@ -2038,9 +2039,17 @@ fn build_desktop_td_svc_conf() -> String {
          [sandbox-evidence]\n\
          type=oneshot\n\
          unless-exists={applications_on_demand}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; old=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1); /bin/td-login exec-primary -- /bin/mkdir -p -m 0700 \"$home/sandbox-oracle\" || exit 1; /bin/td-login exec-primary -- /bin/touch \"$home/sandbox-oracle-public\" || exit 1; /bin/td-login exec-primary -- /bin/chmod 0644 \"$home/sandbox-oracle-public\" || exit 1; real=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle\") || exit 1; public=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle-public\") || exit 1; canon=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home\") || exit 1; seeded=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox\") || exit 1; /bin/td-login exec-primary -- /bin/rm -f \"$real/probe\" \"$seeded/sandbox-oracle-probe\" || exit 1; said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the create failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox share oracle \"$real\" --write 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the share failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle off 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network off failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"u=; while read -r k a b; do case \\\"\\$k\\\" in Uid:) u=\\$a;; esac; done </proc/self/status; [ \\\"\\$u\\\" -ge 98304 ] && [ \\\"\\$u\\\" -le 131071 ] || {{ echo \\\"the run is no sandbox account: uid \\$u\\\"; exit 1; }}; /bin/td-util printf \\\"#!/bin/sh\\\\necho sandbox-ran\\\\n\\\" > \\\"$real/probe\\\" && /bin/chmod 0755 \\\"$real/probe\\\" && r=\\$(\\\"$real/probe\\\") && [ \\\"\\$r\\\" = sandbox-ran ] || {{ echo \\\"the granted directory is not writable and executable\\\"; exit 1; }}; if /bin/cat \\\"$public\\\"; then echo \\\"the run read a world-readable file of the home it was not granted\\\"; exit 1; fi; l=\\$(/bin/ls -A \\\"$canon\\\") && [ \\\"\\$l\\\" = sandbox-oracle ] || {{ echo \\\"the home lists more than the grant, or nothing: \\$l\\\"; exit 1; }}; o=; while read -r l; do case \\\"\\$l\\\" in lo:*) :;; *:*) o=\\\"\\$o \\$l\\\";; esac; done </proc/net/dev; [ -z \\\"\\$o\\\" ] || {{ echo \\\"the run reaches a network beyond lo:\\$o\\\"; exit 1; }}; /bin/mkdir -p \\\"\\$HOME/a/b\\\" && /bin/td-util printf x > \\\"\\$HOME/a/b/f\\\" && /bin/chmod 000 \\\"\\$HOME/a\\\" || {{ echo \\\"the run cannot fill its own home\\\"; exit 1; }}; echo sandbox-inside-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-inside-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; owner=$(/bin/ls -ln \"$real/probe\" 2>&1); case \"$owner\" in *\" 1000 1000 \"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the probe the sandbox wrote is not owned by the human on disk: %s\\n\" \"$owner\"; exit 1; }};; esac; uid=$(/bin/rg -o -r \"\\$1\" \"^sandbox\\toracle\\t([0-9]+)$\" /var/lib/td/accounts.tsv) || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger holds no row of the oracle\"; exit 1; }}; /bin/td-login exec-primary -- /bin/rm -rf \"$home/.local/share/td-sandbox/.profiles/oracle\" || exit 1; if said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: a create went over the held sandbox: %s\\n\" \"$said\"; exit 1; }}; fi; case \"$said\" in *\"td-sandbox adopt oracle\"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the create over the held sandbox said: %s\\n\" \"$said\"; exit 1; }};; esac; [ -e \"/var/lib/td/workloads/$uid/a\" ] || {{ /bin/td-util printf \"sandbox-evidence: the refused create lost the home: %s\\n\" \"$uid\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox adopt oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the adopt failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle host 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network host failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"o=; while read -r l; do case \\\"\\$l\\\" in lo:*) :;; *:*) o=\\\"\\$o \\$l\\\";; esac; done </proc/net/dev; [ -n \\\"\\$o\\\" ] || {{ echo \\\"the host network shows no interface beyond lo\\\"; exit 1; }}; echo sandbox-host-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the host run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-host-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the host run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/rg -q \"^sandbox\\toracle\\tdirectory\\trw\\tsandbox-oracle$\" /var/lib/td/grants.tsv && /bin/rg -q \"^sandbox\\toracle\\tnetwork\\thost$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: the grant table lacks the rows of the oracle: %s\\n\" \"$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1)\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the delete failed: %s\\n\" \"$said\"; exit 1; }}; /bin/rg -q \"^td-grants-v1$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the grant table is unreadable\"; exit 1; }}; if left=$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: rows remain after the delete: %s\\n\" \"$left\"; exit 1; }}; fi; /bin/rg -q \"^sandbox\\toracle\\t$uid$\" /var/lib/td/accounts.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger lost the row of the oracle\"; exit 1; }}; left=$(/bin/ls -A \"/var/lib/td/workloads/$uid\" 2>&1); [ \"$left\" = .td-deleted ] || {{ /bin/td-util printf \"sandbox-evidence: the deleted home holds more than the deletion mark: %s\\n\" \"$left\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run default -- /bin/sh -c \"/bin/td-util printf \\\"#!/bin/sh\\\\necho default-ran\\\\n\\\" > \\\"$seeded/sandbox-oracle-probe\\\" && /bin/chmod 0755 \\\"$seeded/sandbox-oracle-probe\\\" && r=\\$(\\\"$seeded/sandbox-oracle-probe\\\") && [ \\\"\\$r\\\" = default-ran ] || {{ echo \\\"the default sandbox cannot write and run in ~/sandbox\\\"; exit 1; }}; echo sandbox-default-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the default run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-default-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the default run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/td-login exec-primary -- /bin/rm -f \"$seeded/sandbox-oracle-probe\" || exit 1; /bin/echo {sandbox_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; old=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1); /bin/td-login exec-primary -- /bin/mkdir -p -m 0700 \"$home/sandbox-oracle\" || exit 1; /bin/td-login exec-primary -- /bin/touch \"$home/sandbox-oracle-public\" || exit 1; /bin/td-login exec-primary -- /bin/chmod 0644 \"$home/sandbox-oracle-public\" || exit 1; real=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle\") || exit 1; public=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox-oracle-public\") || exit 1; canon=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home\") || exit 1; seeded=$(/bin/td-login exec-primary -- /bin/readlink -f \"$home/sandbox\") || exit 1; /bin/td-login exec-primary -- /bin/rm -f \"$real/probe\" \"$seeded/sandbox-oracle-probe\" || exit 1; said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the create failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox share oracle \"$real\" --write 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the share failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle off 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network off failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"u=; while read -r k a b; do case \\\"\\$k\\\" in Uid:) u=\\$a;; esac; done </proc/self/status; [ \\\"\\$u\\\" -ge 98304 ] && [ \\\"\\$u\\\" -le 131071 ] || {{ echo \\\"the run is no sandbox account: uid \\$u\\\"; exit 1; }}; /bin/td-util printf \\\"#!/bin/sh\\\\necho sandbox-ran\\\\n\\\" > \\\"$real/probe\\\" && /bin/chmod 0755 \\\"$real/probe\\\" && r=\\$(\\\"$real/probe\\\") && [ \\\"\\$r\\\" = sandbox-ran ] || {{ echo \\\"the granted directory is not writable and executable\\\"; exit 1; }}; if /bin/cat \\\"$public\\\"; then echo \\\"the run read a world-readable file of the home it was not granted\\\"; exit 1; fi; l=\\$(/bin/ls -A \\\"$canon\\\") && [ \\\"\\$l\\\" = sandbox-oracle ] || {{ echo \\\"the home lists more than the grant, or nothing: \\$l\\\"; exit 1; }}; /bin/td-agent workspace-probe offline-network || exit 1; /bin/mkdir -p \\\"\\$HOME/a/b\\\" && /bin/td-util printf x > \\\"\\$HOME/a/b/f\\\" && /bin/chmod 000 \\\"\\$HOME/a\\\" || {{ echo \\\"the run cannot fill its own home\\\"; exit 1; }}; echo sandbox-inside-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-inside-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; owner=$(/bin/ls -ln \"$real/probe\" 2>&1); case \"$owner\" in *\" 1000 1000 \"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the probe the sandbox wrote is not owned by the human on disk: %s\\n\" \"$owner\"; exit 1; }};; esac; uid=$(/bin/rg -o -r \"\\$1\" \"^sandbox\\toracle\\t([0-9]+)$\" /var/lib/td/accounts.tsv) || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger holds no row of the oracle\"; exit 1; }}; /bin/td-login exec-primary -- /bin/rm -rf \"$home/.local/share/td-sandbox/.profiles/oracle\" || exit 1; if said=$(/bin/td-login exec-primary -- /bin/td-sandbox create oracle 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: a create went over the held sandbox: %s\\n\" \"$said\"; exit 1; }}; fi; case \"$said\" in *\"td-sandbox adopt oracle\"*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the create over the held sandbox said: %s\\n\" \"$said\"; exit 1; }};; esac; [ -e \"/var/lib/td/workloads/$uid/a\" ] || {{ /bin/td-util printf \"sandbox-evidence: the refused create lost the home: %s\\n\" \"$uid\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox adopt oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the adopt failed: %s\\n\" \"$said\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox network oracle host 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the network host failed: %s\\n\" \"$said\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run oracle -- /bin/sh -c \"/bin/td-agent workspace-probe host-network || exit 1; echo sandbox-host-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the host run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-host-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the host run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/rg -q \"^sandbox\\toracle\\tdirectory\\trw\\tsandbox-oracle$\" /var/lib/td/grants.tsv && /bin/rg -q \"^sandbox\\toracle\\tnetwork\\thost$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: the grant table lacks the rows of the oracle: %s\\n\" \"$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1)\"; exit 1; }}; said=$(/bin/td-login exec-primary -- /bin/td-sandbox delete oracle 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the delete failed: %s\\n\" \"$said\"; exit 1; }}; /bin/rg -q \"^td-grants-v1$\" /var/lib/td/grants.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the grant table is unreadable\"; exit 1; }}; if left=$(/bin/rg \"^sandbox\\toracle\\t\" /var/lib/td/grants.tsv 2>&1); then {{ /bin/td-util printf \"sandbox-evidence: rows remain after the delete: %s\\n\" \"$left\"; exit 1; }}; fi; /bin/rg -q \"^sandbox\\toracle\\t$uid$\" /var/lib/td/accounts.tsv || {{ /bin/td-util printf \"sandbox-evidence: %s\\n\" \"the ledger lost the row of the oracle\"; exit 1; }}; left=$(/bin/ls -A \"/var/lib/td/workloads/$uid\" 2>&1); [ \"$left\" = .td-deleted ] || {{ /bin/td-util printf \"sandbox-evidence: the deleted home holds more than the deletion mark: %s\\n\" \"$left\"; exit 1; }}; ran=$(/bin/td-login exec-primary -- /bin/td-sandbox run default -- /bin/sh -c \"/bin/td-util printf \\\"#!/bin/sh\\\\necho default-ran\\\\n\\\" > \\\"$seeded/sandbox-oracle-probe\\\" && /bin/chmod 0755 \\\"$seeded/sandbox-oracle-probe\\\" && r=\\$(\\\"$seeded/sandbox-oracle-probe\\\") && [ \\\"\\$r\\\" = default-ran ] || {{ echo \\\"the default sandbox cannot write and run in ~/sandbox\\\"; exit 1; }}; echo sandbox-default-ok\" 2>&1) || {{ /bin/td-util printf \"sandbox-evidence: the default run failed: %s\\n\" \"$ran\"; exit 1; }}; case \"$ran\" in *sandbox-default-ok*) :;; *) {{ /bin/td-util printf \"sandbox-evidence: the default run proved nothing: %s\\n\" \"$ran\"; exit 1; }};; esac; /bin/td-login exec-primary -- /bin/rm -f \"$seeded/sandbox-oracle-probe\" || exit 1; /bin/echo {sandbox_marker}'\n\
          after=sandbox-default,workspace-intake\n\
          timeout={sandbox_evidence}\n\
+         \n\
+         [agent-workspace-evidence]\n\
+         type=oneshot\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/td-login exec-primary -- /bin/td-agent workspace-oracle\n\
+         cgroup=session\n\
+         after=workspace-intake\n\
+         timeout=600\n\
          \n\
          [release-source]\n\
          type=oneshot\n\
@@ -9684,6 +9693,7 @@ mod tests {
                                     | "grant-request"
                                     | "grant-evidence"
                                     | "sandbox-evidence"
+                                    | "agent-workspace-evidence"
                                     | "applications-workspace"
                                     | "mail"
                                     | "news"
@@ -9720,6 +9730,7 @@ mod tests {
             "grant-request",
             "grant-evidence",
             "sandbox-evidence",
+            "agent-workspace-evidence",
             "terminal",
             "web",
             "web-evidence",
@@ -9959,7 +9970,7 @@ mod tests {
         );
         // Inside: a sandbox account's uid, a script written and run in the
         // granted directory, a world-readable file of the home it was not
-        // granted unread, no interface but lo, and its own home filled,
+        // granted unread, no external interface or route, and its own home filled,
         // a directory of it mode 000.
         for inside in [
             r#"done </proc/self/status; [ \"\$u\" -ge 98304 ] && [ \"\$u\" -le 131071 ] ||"#,
@@ -9971,12 +9982,11 @@ mod tests {
             // can; bare, it would refuse the sandbox's uid.
             r#"canon=$(/bin/td-login exec-primary -- /bin/readlink -f "$home") || exit 1;"#,
             r#"l=\$(/bin/ls -A \"$canon\") && [ \"\$l\" = sandbox-oracle ] ||"#,
-            r#"case \"\$l\" in lo:*) :;; *:*) o="#,
-            r#"[ -z \"\$o\" ] ||"#,
+            r#"/bin/td-agent workspace-probe offline-network || exit 1"#,
             r#"/bin/mkdir -p \"\$HOME/a/b\" && /bin/td-util printf x > \"\$HOME/a/b/f\" && /bin/chmod 000 \"\$HOME/a\""#,
             r#"echo sandbox-inside-ok" 2>&1)"#,
-            // With network host, an interface beyond lo.
-            r#"[ -n \"\$o\" ] ||"#,
+            // Host mode needs an external link; the inert SIT placeholder cannot prove it.
+            r#"/bin/td-agent workspace-probe host-network || exit 1"#,
             r#"echo sandbox-host-ok" 2>&1)"#,
             // The seeded default writes and runs in ~/sandbox.
             r#"> \"$seeded/sandbox-oracle-probe\" && /bin/chmod 0755 \"$seeded/sandbox-oracle-probe\""#,
@@ -10043,6 +10053,24 @@ mod tests {
         // the account.
         assert!(30 * 6 + 3 * 5 + 60 * 3 + 20 * 2 <= svc_timeouts::SANDBOX_EVIDENCE);
         assert!(TD_SVC_UNITS.contains(&"sandbox-evidence"));
+    }
+
+    #[test]
+    fn the_agent_workspace_oracle_uses_the_real_human_launch_and_no_model() {
+        assert_eq!(
+            unit_key("agent-workspace-evidence", "exec").as_deref(),
+            Some("/bin/td-login exec-primary -- /bin/td-agent workspace-oracle")
+        );
+        assert_eq!(
+            unit_key("agent-workspace-evidence", "cgroup").as_deref(),
+            Some("session")
+        );
+        assert_eq!(unit_after("agent-workspace-evidence"), ["workspace-intake"]);
+        assert_eq!(
+            unit_key("agent-workspace-evidence", "unless-exists").as_deref(),
+            Some(APPLICATIONS_ON_DEMAND)
+        );
+        assert!(TD_SVC_UNITS.contains(&"agent-workspace-evidence"));
     }
 
     /// Root's workspace intake runs as root after firstboot seeds the
@@ -10162,6 +10190,7 @@ mod tests {
             ("wayland", vec!["seat", "sandbox-default"]),
             ("sandbox-default", vec!["td-firstboot", "workspace-intake"]),
             ("workspace-intake", vec!["td-firstboot"]),
+            ("agent-workspace-evidence", vec!["workspace-intake"]),
             (
                 "sandbox-evidence",
                 vec!["sandbox-default", "workspace-intake"],

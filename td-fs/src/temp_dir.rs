@@ -19,6 +19,12 @@ pub struct TempDir {
 
 impl TempDir {
     pub fn new(tag: &str) -> io::Result<Self> {
+        Self::new_in(&std::env::temp_dir(), tag)
+    }
+
+    /// An owned fixture beneath a caller-selected parent, for tests that
+    /// must exercise a real grantable filesystem rather than /tmp.
+    pub fn new_in(parent: &Path, tag: &str) -> io::Result<Self> {
         if tag.is_empty() || tag.contains('/') || tag.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -26,7 +32,7 @@ impl TempDir {
             ));
         }
         for _ in 0..1024 {
-            let path = std::env::temp_dir().join(format!(
+            let path = parent.join(format!(
                 "{tag}-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)

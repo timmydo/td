@@ -5,8 +5,9 @@
 //! leaves outlives its call; and the digest of each file the
 //! conversation last read or wrote, which a replacement must match.
 //!
-//! Every instance is started from the conversation's main thread, which
-//! td-jail ties its lifetime to (`jail::launch`).
+//! Host instances descend from the conversation's main thread. On td,
+//! root launches them as its slot account and observes the client channel
+//! for their lifetime (`jail::launch`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,9 @@ impl Bench {
             });
         if !current {
             let (mut policy, specs) = workspace::policy(workspace, state, id, shared, prepared)?;
+            if !self.unconfined {
+                policy.account = crate::workspace_slot::ensure(state, id)?;
+            }
             policy.runtime = runtime.map(str::to_string);
             self.files = None;
             self.policy = Some((shared.to_vec(), prepared.to_vec(), policy, specs));

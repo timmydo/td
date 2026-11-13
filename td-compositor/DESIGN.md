@@ -8201,3 +8201,7 @@ the ordinary fresh presented Enter approval; success says UPDATE PUBLISHER
 TRUST REPLACED. This does not install an image. I separately selects one exact
 deployment for `td-update trust-image`; its installation approval changes no
 publisher policy. `td-update/ADMIN.md` owns both recovery operations.
+
+The shared td-authd channel module also contains the root workspace
+intake's fixed `POLLRDHUP` lifetime check (UNSAFE.md §16). The compositor
+never calls it; its own authority-channel operations are unchanged.

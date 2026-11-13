@@ -1257,6 +1257,17 @@ pub fn maintenance(dir: &Path, entries: &[&Entry]) -> Option<crate::jail::Policy
     })
 }
 
+pub fn conversation_maintenance(
+    state: &StateDir,
+    id: &Id,
+    entries: &[&Entry],
+) -> Result<Policy, String> {
+    let mut policy = maintenance(&jail_dir(state, id), entries)
+        .ok_or_else(|| crate::workspace_slot::error("no worktree for maintenance"))?;
+    policy.account = crate::workspace_slot::ensure(state, id)?;
+    Ok(policy)
+}
+
 /// The state directory's directory of conversations' jail directories.
 pub const JAIL: &str = "jail";
 
@@ -1468,28 +1479,38 @@ pub fn policy(
         }
         _ => None,
     };
-    let runtime = made("runtime")?;
-    let scratch = ["tmp", "var-tmp", "shm", "run"]
-        .iter()
-        .map(|name| {
-            let path = runtime.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(format!("{} is not a runtime directory", path.display())),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&path).map_err(|e| e.to_string())?;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))
-                        .map_err(|e| e.to_string())?;
+    let product = crate::workspace_slot::product().map_err(crate::workspace_slot::error)?;
+    let scratch = if product {
+        Vec::new()
+    } else {
+        let runtime = made("runtime")?;
+        ["tmp", "var-tmp", "shm", "run"]
+            .iter()
+            .map(|name| {
+                let path = runtime.join(name);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => return Err(format!("{} is not a runtime directory", path.display())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        fs::create_dir(&path).map_err(|e| e.to_string())?;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(error) => return Err(error.to_string()),
-            }
-            Ok(path)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
     let policy = Policy {
+        account: None,
         development: true,
         scratch,
-        home: made("home")?,
+        home: if product {
+            PathBuf::new()
+        } else {
+            made("home")?
+        },
         worktrees,
         checkouts,
         repositories,

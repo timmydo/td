@@ -5883,12 +5883,7 @@ impl Session {
                 Ok(policy) => policy,
                 Err(why) => return Ok(Err(why)),
             };
-            let mut paths = policy.roots();
-            paths.extend(policy.repositories);
-            paths.extend(policy.objects);
-            paths.push(policy.home);
-            paths.extend(policy.scratch);
-            if let Err(why) = crate::access::disjoint(&grants, &paths) {
+            if let Err(why) = crate::access::disjoint(&grants, &policy) {
                 return Ok(Err(why));
             }
             let mut combined = client.shared_for(workspace).to_vec();
@@ -8405,8 +8400,9 @@ fn check_out(state: &Path, id: &Id, entries: &[&Entry], fetched: &Stored) -> Res
             },
         )?;
     }
-    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
-    let policy = crate::workspace::maintenance(&dir, entries).ok_or("no worktree to check out")?;
+    let state = StateDir::at(state.to_path_buf());
+    let dir = crate::workspace::jail_dir(&state, id);
+    let policy = crate::workspace::conversation_maintenance(&state, id, entries)?;
     for (entry, base) in entries.iter().zip(&fetched.ids) {
         let index = repository.join("worktrees").join(&entry.id).join("index");
         if std::fs::symlink_metadata(&index).is_ok() {
@@ -8494,9 +8490,9 @@ fn export_revision(
 ) -> Result<String, String> {
     let programs = crate::jail::Programs::from_env()?;
     let git = crate::repo::host_git()?;
-    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
-    let policy =
-        crate::workspace::maintenance(&dir, &[entry]).ok_or("no worktree to export from")?;
+    let state = StateDir::at(state.to_path_buf());
+    let dir = crate::workspace::jail_dir(&state, id);
+    let policy = crate::workspace::conversation_maintenance(&state, id, &[entry])?;
     let task = crate::repo::Task::ExportRevision {
         git,
         repository: entry.repository.clone(),
@@ -8527,8 +8523,9 @@ fn track(
     let first = entries.first().ok_or("no worktree to track in")?;
     let programs = crate::jail::Programs::from_env()?;
     let git = crate::repo::host_git()?;
-    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
-    let policy = crate::workspace::maintenance(&dir, entries).ok_or("no worktree to track in")?;
+    let state = StateDir::at(state.to_path_buf());
+    let dir = crate::workspace::jail_dir(&state, id);
+    let policy = crate::workspace::conversation_maintenance(&state, id, entries)?;
     let task = crate::repo::Task::Track {
         git,
         repository: first.repository.clone(),

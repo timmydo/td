@@ -1779,10 +1779,19 @@ impl Serve for Root<'_> {
         Ok(launched)
     }
 
-    /// Root keeps no copy of the channel, and this thread, td-jail's
-    /// launcher, lives until the jail ends. What td-jail last wrote on its
-    /// stderr comes back, bounded.
+    /// This thread lives until the jail ends. A workspace connection is
+    /// retained for the independent disconnect check; sandbox relays own
+    /// their lifetime. The last helper diagnostic comes back bounded.
     fn run(&self, stream: UnixStream, prepared: &Prepared) -> Result<(ExitStatus, String), String> {
+        let monitor = if prepared.held.is_some() {
+            Some(
+                stream
+                    .try_clone()
+                    .map_err(|e| message(format_args!("{e}")))?,
+            )
+        } else {
+            None
+        };
         let input = stream
             .try_clone()
             .map_err(|e| message(format_args!("{e}")))?;
@@ -1808,6 +1817,9 @@ impl Serve for Root<'_> {
         drop(command);
         let mut child =
             child.map_err(|e| message(format_args!("start the workspace helper: {e}")))?;
+        if let Some(monitor) = monitor {
+            return supervise_instance(&mut child, &monitor, &mut said);
+        }
         let mut tail = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
@@ -1903,6 +1915,52 @@ impl Serve for Root<'_> {
 
     fn grants(&self, request: &grant_requests::Request) -> Result<Written, Failed> {
         grant_requests::perform(primary_account::UID, request)
+    }
+}
+
+/// A retained socket observes the client's write-half closing even with
+/// unread bytes queued. No root reader consumes the tool-host protocol.
+fn supervise_instance(
+    child: &mut std::process::Child,
+    monitor: &UnixStream,
+    stderr: &mut UnixStream,
+) -> Result<(ExitStatus, String), String> {
+    struct Ending<'a>(&'a mut std::process::Child);
+    impl Drop for Ending<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let ending = Ending(child);
+    stderr
+        .set_nonblocking(true)
+        .map_err(|e| message(format_args!("{e}")))?;
+    let mut tail = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        // A diagnostic flood cannot starve the lifetime check.
+        for _ in 0..16 {
+            match stderr.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => stderr_tail::push(&mut tail, buffer.get(..n).unwrap_or_default()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if let Some(status) = ending
+            .0
+            .try_wait()
+            .map_err(|e| message(format_args!("{e}")))?
+        {
+            return Ok((status, stderr_tail::last_line(&tail).unwrap_or_default()));
+        }
+        if !crate::sys::channel_open(monitor).map_err(|e| message(format_args!("{e}")))? {
+            ending.0.kill().map_err(|e| message(format_args!("{e}")))?;
+            let status = ending.0.wait().map_err(|e| message(format_args!("{e}")))?;
+            return Ok((status, stderr_tail::last_line(&tail).unwrap_or_default()));
+        }
+        std::thread::sleep(STOP_POLL);
     }
 }
 
@@ -2318,6 +2376,24 @@ fn handle(mut stream: UnixStream, id: u64, active: &Active, serve: &impl Serve) 
         }
     };
     let (kind, name) = (request.kind, &request.name);
+    // Declared before the claim so it drops after both the prepared
+    // launch and the active claim. EOF then acknowledges their release,
+    // not merely the helper's exit. The monitor still sees a peer's
+    // write-half close through this retained endpoint.
+    let _completion = if matches!(&request.verb, Verb::Instance(_)) {
+        match stream.try_clone() {
+            Ok(channel) => Some(channel),
+            Err(error) => {
+                refuse(
+                    &mut stream,
+                    &message(format_args!("hold workspace completion: {error}")),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let _claim = match active.claim(kind, name, &request.verb) {
         Ok(claim) => claim,
         Err(why) => {

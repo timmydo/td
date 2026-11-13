@@ -1212,7 +1212,7 @@ mod confinement {
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
     const AUTHORITY_FINGERPRINT: u64 = 0x5135e135d85ca32a;
-    const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
+    const AUTH_SYS_FINGERPRINT: u64 = 0xb64878d738ec4031;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
     const AUTH_CHANNEL: &str = include_str!("../../td-authd/src/channel.rs");

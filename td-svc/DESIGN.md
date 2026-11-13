@@ -234,6 +234,10 @@ before it is placed, so a verified placement covers everything the
 instance starts. These are the only gated paths; ordinary services retain
 the placement contract above.
 
+`agent-workspace-evidence` is such a handoff: its leader is td-login,
+which runs the account oracle as the human; the oracle itself asks root
+for workspace instances, and declares no workload limits.
+
 A unit whose leader hands its processes to another cgroup declares
 `cgroup=session` and gets no leaf. Its limits are refused rather than written
 into a leaf its processes have already left — §3's accepted-and-ignored rule,

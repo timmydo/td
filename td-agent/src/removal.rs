@@ -67,7 +67,7 @@ pub fn survey(
                 "not asked: the survey took more than its {} minutes",
                 SURVEY_ALL.as_secs() / 60
             )),
-            Ok(_) => surveyed(entry, repositories, &bases, &tools, &dir, left),
+            Ok(_) => surveyed(entry, repositories, &bases, &tools, &dir, left, state, id),
         };
         found.push(Found {
             checkout: entry.checkout.clone(),
@@ -79,6 +79,7 @@ pub fn survey(
     found
 }
 
+#[allow(clippy::too_many_arguments)]
 fn surveyed(
     entry: &Entry,
     repositories: &Repositories,
@@ -86,6 +87,8 @@ fn surveyed(
     tools: &Result<(crate::jail::Programs, PathBuf), String>,
     dir: &Path,
     left: Duration,
+    state: &StateDir,
+    id: &Id,
 ) -> Result<Survey, String> {
     let (programs, git) = tools.as_ref().map_err(Clone::clone)?;
     let recorded = bases
@@ -117,8 +120,7 @@ fn surveyed(
         checkout: entry.checkout.clone(),
         bases: every,
     };
-    let policy =
-        crate::workspace::maintenance(dir, &together).ok_or("its repository has no worktree")?;
+    let policy = crate::workspace::conversation_maintenance(state, id, &together)?;
     let said = crate::jail::maintain(
         programs,
         &policy,

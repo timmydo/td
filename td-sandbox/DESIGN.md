@@ -347,6 +347,11 @@ human's home as the share alone (the home is 0700, so a listing proves
 the jail's view of it, not the discretionary bits, hides the rest), fail
 to read a world-readable file of the home it was not granted, find no
 network beyond loopback, and fill its own home with a directory of mode 000.
+The network checks call td-agent's `workspace-probe`: `offline-network`
+admits only loopback and the kernel's optional default `sit0` with all
+traffic counters zero, and requires both IPv4 and IPv6 routes to stay on
+loopback. `host-network` requires another interface; the inert tunnel
+cannot prove host access. The kernel tables are read with a size bound.
 Root checks the shared file's owner on disk. With the sandbox's record
 removed, a create over the held sandbox must be refused, naming `adopt`,
 its home kept, and `adopt` must record it; with network host a run must

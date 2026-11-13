@@ -136,6 +136,13 @@ pub fn system_path(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
 impl Programs {
     /// From the launch's variables, with this program as the entry.
     pub fn from_env() -> Result<Self, String> {
+        if crate::workspace_slot::product().map_err(crate::workspace_slot::error)? {
+            return Self::new(
+                "/bin/td-jail".into(),
+                "/bin/td-agent".into(),
+                "/bin/td-txt".into(),
+            );
+        }
         let named = |var: &str| {
             std::env::var_os(var)
                 .filter(|value| !value.is_empty())
@@ -213,6 +220,9 @@ impl Programs {
 /// directories, read-only or read-write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
+    /// A td conversation's persistent account. Reviews acquire theirs
+    /// separately; host-only launches retain their caller-owned spec.
+    pub account: Option<crate::workspace_slot::Account>,
     /// Host networking for ordinary development; reviews remain isolated.
     pub development: bool,
     pub scratch: Vec<PathBuf>,
@@ -411,6 +421,18 @@ pub fn launch_linked(
     if policy.development && linked.is_some() {
         return Err("development commands use host networking, not the egress proxy".into());
     }
+    if let Some(account) = &policy.account {
+        let arguments = host_arguments(policy, linked.is_some())?;
+        let stream = account
+            .launch(policy, &arguments)
+            .map_err(crate::workspace_slot::error)?;
+        let reader = stream.try_clone().map_err(crate::workspace_slot::error)?;
+        let shutdown = stream.try_clone().map_err(crate::workspace_slot::error)?;
+        stream
+            .set_write_timeout(Some(crate::egress::PIPE_STEP))
+            .map_err(crate::workspace_slot::error)?;
+        return Ok(Client::linked(reader, stream, linked).owning_root(shutdown));
+    }
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
@@ -421,6 +443,39 @@ pub fn launch_linked(
         let _ = fs::remove_file(&spec);
     }
     launched
+}
+
+fn host_arguments(policy: &Policy, linked: bool) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut add = |word: &str| -> Result<(), String> {
+        let word = td_alloc::string(word).map_err(crate::workspace_slot::error)?;
+        td_alloc::push(&mut words, word).map_err(crate::workspace_slot::error)
+    };
+    add("tool-host")?;
+    add("--txt")?;
+    add("/opt/workspace/bin/td-txt")?;
+    if linked {
+        add("--proxy")?;
+    }
+    if let Some(dir) = &policy.directory {
+        add("--directory")?;
+        add(dir
+            .to_str()
+            .ok_or_else(|| crate::workspace_slot::error("workspace path is not UTF-8"))?)?;
+    }
+    for path in policy
+        .worktrees
+        .iter()
+        .chain(&policy.checkouts)
+        .chain(&policy.read)
+        .chain(&policy.write)
+    {
+        add("--root")?;
+        add(path
+            .to_str()
+            .ok_or_else(|| crate::workspace_slot::error("workspace path is not UTF-8"))?)?;
+    }
+    Ok(words)
 }
 
 fn start(
@@ -557,6 +612,11 @@ pub fn maintain(
     task: &Task,
     time: Duration,
 ) -> Result<String, String> {
+    if let Some(account) = &policy.account {
+        return root_maintenance(account, policy, task, time, &mut |ours, deadline| {
+            raw_answer(ours, deadline, time)
+        });
+    }
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
@@ -582,6 +642,21 @@ pub fn export(
     time: Duration,
     pack: &Path,
 ) -> Result<String, String> {
+    if let Some(account) = &policy.account {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(pack)
+            .map_err(crate::workspace_slot::error)?;
+        let answer = root_maintenance(account, policy, task, time, &mut |ours, deadline| {
+            framed_answer(ours, deadline, time, &mut file, pack)
+        });
+        if answer.is_err() {
+            let _ = fs::remove_file(pack);
+        }
+        return answer;
+    }
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
@@ -808,6 +883,44 @@ fn framed_answer(
 /// deadline.
 type Reader<'a> = dyn FnMut(&mut UnixStream, Instant) -> Result<Vec<u8>, String> + 'a;
 
+fn root_maintenance(
+    account: &crate::workspace_slot::Account,
+    policy: &Policy,
+    task: &Task,
+    time: Duration,
+    read: &mut Reader,
+) -> Result<String, String> {
+    let mut args = Vec::new();
+    td_alloc::push(
+        &mut args,
+        td_alloc::string(repo::MAINTAIN).map_err(crate::workspace_slot::error)?,
+    )
+    .map_err(crate::workspace_slot::error)?;
+    for arg in task.args() {
+        td_alloc::push(
+            &mut args,
+            arg.into_string()
+                .map_err(|_| crate::workspace_slot::error("maintenance argument is not UTF-8"))?,
+        )
+        .map_err(crate::workspace_slot::error)?;
+    }
+    let mut stream = account
+        .launch(policy, &args)
+        .map_err(crate::workspace_slot::error)?;
+    let deadline = Instant::now()
+        .checked_add(time)
+        .ok_or_else(|| crate::workspace_slot::error("invalid maintenance deadline"))?;
+    let answered = read(&mut stream, deadline).and_then(|bytes| repo::read_answer(&bytes));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    answered.map_err(|why| {
+        td_alloc::format(format_args!(
+            "{why}; root's launch log: {}",
+            crate::intake::LOG
+        ))
+        .unwrap_or_default()
+    })
+}
+
 /// Runs `task` in a maintenance instance from `spec`, its answer what
 /// `read` makes of the channel by the deadline.
 fn run_maintenance(
@@ -1017,6 +1130,7 @@ mod tests {
     #[test]
     fn the_spec_is_td_jails_ordered_keyfile() {
         let policy = Policy {
+            account: None,
             development: false,
             scratch: Vec::new(),
             home: "/s/jail/a/home".into(),
@@ -1063,6 +1177,7 @@ mod tests {
     #[test]
     fn a_runtime_is_named_where_td_jail_reads_it_and_its_trees_are_not() {
         let policy = Policy {
+            account: None,
             development: true,
             home: "/s/jail/a/home".into(),
             worktrees: vec!["/w/a".into()],

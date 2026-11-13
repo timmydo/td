@@ -204,7 +204,7 @@ one.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies and the portable vault's logind sleep-delay inhibitor; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed file-grant values below; plus the separate named credential intake module below |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd or the workspace client stream; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
@@ -2909,6 +2909,12 @@ invalid fields or bounds drop all delivered owners. No received descriptor is
 exposed beyond the private channel implementation. Only the admitted peer
 pidfd remains open. Poll uses one borrowed pidfd, POLLIN(1), and timeout zero;
 any event or error refuses liveness, including when stream bytes remain.
+The workspace intake also borrows one UnixStream for `channel_open`,
+requesting only POLLRDHUP(0x2000), with timeout zero and unused arguments
+zero. Any returned event or syscall error ends its owned helper. The fixed
+repr(C) eight-byte pollfd remains alive through the synchronous call; no
+pointer escapes, no byte is read, and no descriptor is adopted. This wrapper
+is unused by the compositor which compiles the same module.
 
 Confinement tests inventory the complete production source, pin keyword counts
 without prose slack, function-only allowances, both bodies, ABI layouts, all
@@ -3040,16 +3046,19 @@ confinement tests. No instruction, syscall, option or allowance is added.
 
 ### Workspace launch intake
 
-`td-authd/src/workspace.rs` is a further safe consumer: it calls only the
+`td-authd/src/workspace.rs` is a further safe consumer: it calls the
 fixed peer-UID query, on each accepted connection to the workspace
 intake, and receives nothing through the credentials/pidfd or SCM_RIGHTS
 wrappers. It passes the accepted socket as the fixed credential helper's
 stdin and stdout, and one end of a socketpair it creates as its stderr,
-through safe std `Stdio` from `OwnedFd`, keeps no copy of the connection,
-and forwards no other descriptor; the helper execs `workspace-exec`,
+through safe std `Stdio` from `OwnedFd`, and forwards no other descriptor; the helper execs `workspace-exec`,
 which execs td-jail with those descriptors, so the connection becomes
 the jail's channel without a descriptor ever being sent. Root reads the
-helper's stderr through its own end. Its grant verbs and a deletion's
+helper's stderr through its own end. For a workspace instance it retains a
+clone of the connection for the fixed `sys::channel_open` poll above,
+checks every 20 ms while draining bounded stderr work nonblocking, and
+kills and reaps the owned helper on disconnect, poll failure or unwinding.
+Sandboxes retain their relay's existing lifetime protocol. Its grant verbs and a deletion's
 clear run the grant table's writer through `grant_requests.rs`'s one
 spawn path. A deletion's emptying of a sandbox's home runs as the
 account, through the same credential helper, as `workspace-empty`: safe

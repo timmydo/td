@@ -1092,6 +1092,11 @@ impl Client {
         self
     }
 
+    pub(crate) fn owning_root(mut self, channel: std::os::unix::net::UnixStream) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
     /// What td-jail, or an unjailed host, has said so far, when it said
     /// anything.
     pub fn diagnostic(&self) -> Option<String> {
@@ -1102,6 +1107,13 @@ impl Client {
     /// said and how it ended, the first failure giving it a moment to
     /// finish both.
     fn failed(&mut self, what: String) -> String {
+        if self.channel.is_some() && self.child.is_none() {
+            return td_alloc::format(format_args!(
+                "{what}; root's launch log: {}",
+                crate::intake::LOG
+            ))
+            .unwrap_or_default();
+        }
         let Some(tail) = &self.diagnostic else {
             return what;
         };
@@ -1280,6 +1292,19 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        if let (Some(channel), None) = (self.channel.as_ref(), self.child.as_ref()) {
+            // Root observes this independently of the entry's reader.
+            // Keep reading until root has reaped the helper and closed
+            // its copy, bounded as a local jail's teardown is.
+            let _ = channel.shutdown(std::net::Shutdown::Write);
+            let deadline = Instant::now() + DROP_WAIT;
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                if self.replies.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
+            let _ = channel.shutdown(std::net::Shutdown::Both);
+        }
         // An unjailed host has no instance to take its commands down: told
         // of the end by its channel, it cancels them itself, and is killed
         // only if it has not ended within the wait.

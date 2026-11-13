@@ -21,6 +21,7 @@ const SCM_PIDFD: i32 = 4;
 const MSG_CTRUNC: i32 = 8;
 const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
 const POLLIN: i16 = 1;
+const POLLRDHUP: i16 = 0x2000;
 const CONTROL: usize = 128;
 const HEADER: usize = 16;
 
@@ -151,6 +152,30 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<()> {
         return Err(io::Error::other("channel peer is no longer alive"));
     }
     Ok(())
+}
+
+/// The workspace intake's lifetime check, without consuming queued tool
+/// bytes. The borrowed connected stream stays live throughout the call.
+/// Any event (including HUP/ERR/NVAL), or a syscall error, ends the launch.
+#[allow(
+    dead_code,
+    reason = "root's workspace intake alone; the compositor shares this module"
+)]
+pub(super) fn channel_open(stream: &UnixStream) -> io::Result<bool> {
+    let mut poll = PollFd {
+        fd: stream.as_raw_fd(),
+        events: POLLRDHUP,
+        revents: 0,
+    };
+    let count = result(syscall5(
+        SYS_POLL,
+        (&mut poll as *mut PollFd) as usize,
+        1,
+        0,
+        0,
+        0,
+    ))?;
+    Ok(count == 0 && poll.revents == 0)
 }
 
 pub(super) struct Sender {

@@ -248,6 +248,11 @@ impl StateDir {
         let lock = lock_conversation(&dir, Duration::from_secs(2))?;
         let gone = self.conversations().join(format!("{DELETING}{id}"));
         std::fs::rename(&dir, &gone).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if let Err(why) = crate::workspace_slot::delete(self, id) {
+            // The tombstone and reservation remain together until root
+            // has ended and emptied the account. Startup retries it.
+            return Ok(Some(why));
+        }
         // Pictures staged for it and never taken go with it.
         let _ = std::fs::remove_dir_all(crate::picture::staging(self, id));
         let removed = File::open(self.conversations())
@@ -316,6 +321,12 @@ impl StateDir {
             };
             let path = entry.path();
             if let Ok(lock) = lock_conversation(&path, Duration::ZERO) {
+                if let Some(id) = gone.strip_prefix(DELETING).and_then(Id::parse) {
+                    if let Err(why) = crate::workspace_slot::delete(self, &id) {
+                        let _ = td_alloc::push(&mut problems, why);
+                        continue;
+                    }
+                }
                 match std::fs::remove_dir_all(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

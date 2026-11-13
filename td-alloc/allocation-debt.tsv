@@ -829,7 +829,7 @@ td-agent/src/conversation.rs	allocating-constructor	1
 td-agent/src/conversation.rs	allocating-conversion	161
 td-agent/src/conversation.rs	allocation-macro	233
 td-agent/src/conversation.rs	heap-owner	3
-td-agent/src/conversation.rs	unchecked-growth-or-clone	365
+td-agent/src/conversation.rs	unchecked-growth-or-clone	361
 td-agent/src/cost.rs	allocating-conversion	1
 td-agent/src/cost.rs	allocation-macro	2
 td-agent/src/diagnostics.rs	allocating-conversion	27

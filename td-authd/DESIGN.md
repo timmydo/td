@@ -2404,6 +2404,24 @@ refused `final: ` and the reason. For an admitted instance root:
    relay: the entry's arguments follow `--`, and td-agent's tool host
    speaks on the connection itself.
 
+For a workspace instance root retains a monitor clone of the accepted socket
+and a completion clone until its teardown finishes.
+Every 20 ms it uses the shared raw module's fixed `poll` wrapper with one
+borrowed Unix stream, `POLLRDHUP` and timeout zero. A write-half close,
+hangup, error or invalid descriptor ends the helper even if tool bytes
+remain unread; a poll error fails closed. Root consumes no protocol byte.
+It drains stderr nonblocking, at most sixteen 4096-byte reads per turn,
+retaining the same bounded tail, so flooding cannot starve the check.
+Normal exit is reaped; disconnect, setup failure and unwinding kill and
+reap the owned helper through std. The jail's parent-death chain takes
+its namespace down. Root finishes its view-release attempt, removes the
+spec and returns the active claim before dropping the completion clone.
+Remaining jail holders can delay the client's EOF until they too have
+exited; EOF never precedes that claim's return. Sandbox
+relays retain their own lifetime protocol and root keeps no clone there.
+This adds a value-pinned poll caller to the existing instruction, recorded
+in UNSAFE.md §16; it adds no instruction or descriptor adoption.
+
 When the instance ends, failed or not, root takes its plan from the
 account's and publishes the account's views again from the rest, so a
 view only it named is released and one another running instance names

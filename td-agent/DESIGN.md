@@ -3845,7 +3845,8 @@ Every instance has:
   below). No cgroupfs, no `/sys`.
 - **Home and runtime:** the conversation's private executable `HOME` and
   persistent `/tmp`, `/var/tmp`, `/dev/shm` and `/run`, backed by private
-  directories under its jail directory. Jobs mount the same backing paths;
+  directories in its ledger account on td, or under its jail directory
+  on a development host. Jobs mount the same backing paths;
   their exit reaps processes without deleting caches, sockets or logs.
   `/dev/shm` stays noexec. These are disk-backed, with no tmpfs size cap.
   Removing the conversation removes this state; reopening retains it. The caller's home is absent except through the
@@ -4111,20 +4112,21 @@ design is then additive:
   counterpart that throttles (`RLIMIT_CPU` kills). Setting it needs
   `unsafe` that td-agent does not carry, so it would be td-jail's to
   apply to an instance's entry.
-- **On td**, td-agent runs td-jail itself, as on a host ("On td"
-  below), so instances are the conversation process's descendants
-  there too.
+- **On td**, root launches confined instances under the conversation's
+  slot account, in that account's workload delegation. They are root's
+  descendants, and the client's channel binds their lifetime to the
+  conversation. A future aggregate limit must cover that delegation as
+  well as the conversation process; ancestry alone cannot impose it.
 
-To keep this open, the rule is placement: everything a conversation
-causes is placed under that conversation's node, and on a host and on td
-the means is ancestry. So there nothing may run a conversation's
-work in the broker or in any process not descended from that
-conversation's own; and nowhere may one conversation process serve two
-conversations, or anything depend on td-jail moving an instance out
-of its launcher's cgroup on a host. The git worker's imports and pushes
-are children of the broker, which would take a limit of their
-own (§9); a `/review`'s staging import and its review are the
-conversation process's own children (§15).
+The placement rule keeps one conversation process per conversation.
+Development-host instances, unconfined tools and the pending review path
+remain descendants of their conversation process; no host instance may
+move out of its launcher's cgroup. Confined td instances belong only to
+that conversation's slot delegation and end when their client closes.
+The broker runs no conversation tools. Its git worker's imports and
+pushes would take a limit of their own (§9); a `/review`'s staging import
+and its review remain the conversation process's children (§15) until
+the review account cutover.
 
 **Mechanism.** td has one confinement implementation, td-jail
 (APPLICATIONS.md §C), and td-agent does not grow a second one. The jail is
@@ -4166,15 +4168,15 @@ host. There is no silent unconfined fallback.
 APPLICATIONS.md §C's `td-jail --workspace LAUNCHER-PID SPEC [ARG...]`,
 with §X.8
 naming its host divergences, and it settles four things this section
-left open. The spec is td-agent's to write, per instance, not
-the launch's: an ordered keyfile of the entry and td-txt, the home, the
+left open. On a development host (and for reviews awaiting their cutover),
+the spec is td-agent's to write, per instance: an ordered keyfile of the entry and td-txt, the home, the
 worktrees and the shared directories, read-only or read-write, kept
 outside every directory it grants, since the instance runs as the
 caller and could otherwise rewrite the next instance's spec. The
 lifetime pipe is the channel itself: td-jail requires the instance's
 standard input and output to be one stream socket, the tool host's
 framed protocol runs over it, and the tool host ends when it closes;
-for an entry that is not reading, the outer process's parent-death
+on a development host, for an entry that is not reading, the outer process's parent-death
 signal, checked against its parent as stage 1's is, ends the instance
 with its launcher, so td-agent starts td-jail from the conversation
 process's main thread. `/tmp` and `/var/tmp` are fresh, private and
@@ -4320,7 +4322,76 @@ that home, roles the shared grant validator rejects, overlapping plans,
 more than 32 entries, invalid runtime/profile combinations, more than
 128 arguments, NUL arguments and requests exceeding 64 KiB. The account's
 home and scratch paths are root's to choose, never sent by the client.
-The client is not yet used by workspace or review launches.
+On td, confined conversations use it for every tool-host instance,
+background command, MCP server and repository maintenance operation.
+Reviews still use the caller-owned spec path pending their separate cutover.
+The product configuration's presence selects this path; an inspection error
+refuses. Its absence alone selects the documented development-host launch,
+never a refusal from root. Connecting waits up to ten seconds for a missing
+or not-yet-listening intake socket, including at boot.
+
+`workspace_slot.rs` reserves one `agent-N` per conversation, shared by all
+instances. Reservations are private files under the canonical human home's
+`.local/state/td-agent/workspace-slots`, named by slot, containing the
+canonical state directory's `conversations/ID` path. One private lock orders
+all state directories' reservations and deletions. Reads refuse linked,
+shared, nonregular, oversized or malformed records. An allocation first
+finds its existing reservation; otherwise it skips reserved slots and root's
+held slots, durably records ownership before creation, and keeps that record
+on failure so a retry resumes it. A restarted conversation reuses its own
+held account. Unclaimed held accounts are never inherited or emptied. Pool
+exhaustion refuses; no directory's absence silently frees a reservation.
+
+Before any tools start, initialization records `ready-agent-N` in the
+locked pool. A missing receipt means the account has never been exposed:
+root empties and recreates it before retrying a partial initialization.
+Existing conversations copy their old `jail/ID/home` and four `runtime/`
+trees into a private temporary directory below the human's home. One
+ordinary read grant lets a native development account instance import that snapshot
+into its own home and scratch. Each source directory is fd-pinned, and
+files are opened without following symlinks; symlinks retain their bytes.
+The copy retains file bytes and ordinary permission bits, not hard-link
+identity, timestamps or privileged mode bits. Absolute paths embedded in
+files or links are not rewritten. Dead sockets are omitted; other special
+files refuse with the originals retained. Each copy is bounded by 250000
+entries, 64 directory levels and 64 GiB, and the import has a ten-minute
+socket wait. Failure refuses launch and retains the originals for recovery.
+A successful copy is synced before the pool receipt, then the conversation's
+`jail/ID/account-imported` receipt is synced. A crash between receipts
+finishes the second without resetting the copied account. Later slot reuse
+never imports the old backups again. Originals remain until conversation
+deletion; the temporary grant tree is removed after the import ends.
+
+Deletion renames the conversation to its tombstone first, asks root to end
+and empty its slot, then removes the reservation. A refusal retains the
+reservation and tombstone; startup retries before removing the tombstone.
+Deleting the account's contents is idempotent across a crash. The human's
+granted directories remain the human's; normal conversation deletion owns
+its scratch worktree and repository trees as before.
+
+Root chooses the entry, td-txt, home, scratch and spec. No client-owned
+spec or private runtime is created for a product conversation. Its client
+shuts the channel's write half on drop and waits at most five seconds for
+it to close; root monitors that half-close independently of the entry's
+reader, kills and reaps its helper, and attempts to release the instance's
+views. Root returns its active claim before the channel reaches EOF.
+Maintenance accepts its bounded structured answer through EOF; an absent
+or malformed answer fails, with root's launch log named. Its entry's exit
+status is logged by root, not appended to the tool protocol.
+
+`workspace-probe` also supplies the sandbox oracle's bounded network-table
+checks (td-sandbox/DESIGN.md, "Validation"), with no added authority.
+
+The image's `agent-workspace-evidence` unit runs `workspace-oracle` as the
+human, only under `td.autotest=1`. With no model or API key it creates two
+real directory conversations and drives `Bench`'s MCP/program path. It
+checks distinct workload uids, idmapped writes owned by the human outside,
+ungranted directory and world-readable-file refusal, old-layout home and
+scratch import, persistent reservation,
+a nonreading entry ended on client disconnect, and reuse of an emptied
+home and all four scratch directories. It deletes its conversations and
+prints the shared workspace marker only after success; the system QEMU
+oracle requires that marker on each desktop oracle boot.
 
 The socket transport is shared with td-sandbox in
 `engine/src/workspace_intake.rs`: bounded dialing, a two-second write
@@ -4331,7 +4402,7 @@ byte. This answer only accepts the launch; failure after it is reported
 in `/var/log/svc/workspace-intake.log`. No failure starts a local jail or
 an unconfined tool host.
 
-**The launch.** `./install-apps` installs
+**The development-host launch.** `./install-apps` installs
 td-jail and td-txt from the checkout beside td-agent, and td-net's
 launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them
 every tool is refused with that reason. `jail::launch` writes an
@@ -4555,8 +4626,7 @@ unconfined workspace with one, and `jail::launch_unjailed` refuses a
 policy that names one, since nothing would bind it.
 
 The runtime runs as in any workspace jail (APPLICATIONS.md §C, Runtime),
-but as the human rather than a sandbox's account until WORKLOADS.md
-step 8: inside the workspace jail, as the human with the workspace's worktrees,
+as the workspace's own ledger account on td, with the workspace's worktrees,
 shared directories, network and the host-local sockets that reaches,
 outside the application kind's bus, portal and Wayland boundaries, and
 td's own glibc programs there can load its code. Its workspace is

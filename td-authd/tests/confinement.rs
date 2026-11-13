@@ -1496,6 +1496,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
     for constant in [
         "const SYS_POLL: usize = 7;",
+        "const POLLRDHUP: i16 = 0x2000;",
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_SETSOCKOPT: usize = 54;",
         "const SYS_GETSOCKOPT: usize = 55;",
@@ -1512,7 +1513,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         assert!(raw.contains(constant), "{constant}");
     }
     assert_eq!(raw.matches("const SYS_").count(), 4);
-    assert_eq!(raw.matches("syscall5(").count(), 5);
+    assert_eq!(raw.matches("syscall5(").count(), 6);
     assert_eq!(raw.matches("adopt(").count(), 2);
     let mounts = include_str!("../src/mount_sys.rs");
     assert_eq!(
@@ -1677,7 +1678,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("&application::PREPARE_WORKSPACE", 2),
         ("&application::ALLOCATE_WORKSPACE", 1),
         (".open(pinned(&directory, \"cgroup.kill\"))", 1),
-        ("std::thread::sleep(STOP_POLL)", 1),
+        ("std::thread::sleep(STOP_POLL)", 2),
+        ("crate::sys::channel_open(monitor)", 1),
         ("grant_requests::perform(", 1),
         ("application::require_process(", 2),
         ("Stdio::from(OwnedFd::from(", 3),
@@ -1817,10 +1819,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
     );
 }
 
-const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
+const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x8d1f61d7a37a8d2c;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0xea86f6e9834554d2;
-const WORKSPACE_FINGERPRINT: u64 = 0x7d94d5b3d4e0b810;
+const WORKSPACE_FINGERPRINT: u64 = 0x6b8b6d3339f5ebc1;
 const APPLICATION_FINGERPRINT: u64 = 0xc03468866b2802cb;
 
 fn fingerprint(source: &str) -> u64 {

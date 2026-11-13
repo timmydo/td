@@ -9,6 +9,51 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::os::unix::process::ExitStatusExt;
 
+#[test]
+fn channel_lifetime_does_not_consume_bytes_and_sees_a_half_close() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    assert!(crate::sys::channel_open(&server).unwrap());
+    client.write_all(b"unread tool bytes").unwrap();
+    assert!(crate::sys::channel_open(&server).unwrap());
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(!crate::sys::channel_open(&server).unwrap());
+    let mut bytes = [0; 17];
+    (&server).read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"unread tool bytes");
+}
+
+#[test]
+fn monitor_child() {
+    if std::env::var_os("TD_AUTHD_WORKSPACE_MONITOR_CHILD").is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+#[test]
+fn closing_the_client_reaps_an_entry_that_never_reads() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let (mut said, stderr) = UnixStream::pair().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "workspace::tests::monitor_child", "--nocapture"])
+        .env("TD_AUTHD_WORKSPACE_MONITOR_CHILD", "1")
+        .stdin(Stdio::from(OwnedFd::from(server.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(server.try_clone().unwrap())))
+        .stderr(Stdio::from(OwnedFd::from(stderr)))
+        .spawn()
+        .unwrap();
+    // There is unread input when the client disappears; EOF-only reads
+    // cannot detect that without stealing the entry's protocol bytes.
+    client.write_all(&[42; 8192]).unwrap();
+    drop(client);
+    let at = Instant::now();
+    let (status, _) = supervise_instance(&mut child, &server, &mut said).unwrap();
+    assert!(!status.success());
+    assert!(at.elapsed() < Duration::from_secs(3));
+    assert!(child.try_wait().unwrap().is_some());
+}
+
 fn words(command: &Command) -> Vec<String> {
     command
         .get_args()
@@ -606,6 +651,7 @@ fn the_spec_tree_is_the_owners_and_each_spec_is_new() {
 /// asked recorded.
 #[derive(Default)]
 struct Fake {
+    release_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     spec: PathBuf,
     prepare: Option<String>,
     run: Option<String>,
@@ -699,6 +745,10 @@ impl Serve for Fake {
     }
 
     fn release(&self, prepared: &Prepared, failed: bool) {
+        if let Some((entered, resume)) = &self.release_gate {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
         if let Some(id) = prepared.held {
             let how = if failed { "failed" } else { "ended" };
             self.asked(format!("release {id} {how}"));
@@ -2071,6 +2121,51 @@ fn workspace_instances_have_pools_of_their_own() {
 /// the connection as its channel and no relay, and gives back its plan's
 /// hold and its spec when it ends, failed or not; one refused before its
 /// answer holds nothing to give back.
+#[test]
+fn instance_eof_waits_for_view_release_and_the_active_claim() {
+    let temp = crate::test_temp::TempDir::new("td-workspace-completion").unwrap();
+    let spec = temp.path().join("spec");
+    fs::write(&spec, "format=1\n").unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let active = std::sync::Arc::new(Active::default());
+    let running = active.clone();
+    let saved = spec.clone();
+    let (root, mut peer) = UnixStream::pair().unwrap();
+    let worker = std::thread::spawn(move || {
+        let fake = Fake {
+            spec: saved,
+            release_gate: Some((entered_tx, resume_rx)),
+            ..Fake::default()
+        };
+        handle(root, 9, &running, &fake);
+    });
+    let mut request = instance_request(
+        &format!("agent-3 development native {}", word("tool-host")),
+        &[],
+    );
+    request.push(1);
+    peer.write_all(&request).unwrap();
+    let mut started = [0; STARTED.len()];
+    peer.read_exact(&mut started).unwrap();
+    assert_eq!(&started, STARTED);
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut byte = [0];
+    assert!(matches!(
+        peer.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    assert_eq!(active.busy().instances, 1);
+    resume_tx.send(()).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    assert_eq!(active.busy().instances, 0);
+    assert!(!spec.exists());
+    worker.join().unwrap();
+}
+
 #[test]
 fn an_instance_answers_once_runs_and_releases_its_plan() {
     let temp = crate::test_temp::TempDir::new("td-workspace-instance").unwrap();

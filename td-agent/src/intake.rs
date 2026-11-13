@@ -59,7 +59,10 @@ pub struct Root<'a> {
 impl Default for Root<'_> {
     fn default() -> Self {
         Self {
-            transport: crate::workspace_intake::Root::new(),
+            transport: crate::workspace_intake::Root {
+                patience: std::time::Duration::from_secs(10),
+                ..crate::workspace_intake::Root::new()
+            },
         }
     }
 }
@@ -237,6 +240,7 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
+            account: None,
             development: true,
             home: "/irrelevant/private-home".into(),
             scratch: vec!["/irrelevant/scratch".into()],

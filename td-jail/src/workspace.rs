@@ -323,6 +323,9 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 /// The spec as written, before admission.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
+    /// Set only after a ledger caller's root-owned spec has passed
+    /// `require_account_spec`; never parsed from a spec line.
+    account_private: bool,
     development: bool,
     shared_network: bool,
     runtime: Option<FlathubRuntime>,
@@ -540,6 +543,7 @@ where
     }
     if let Caller::Account(kind) = caller {
         require_account_spec(&spec, kind, uid)?;
+        spec.account_private = true;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         // A workspace binds, and examines, only the views its spec's lines
         // name: another running instance's may be released or published
@@ -1162,7 +1166,16 @@ fn admit(
         }
         // The home as it resolves, last of its spellings (`resolve`), as an
         // application grant's check takes it.
-        if aliases_reserved(&mounts, &reserved_mounts, homes.last()) {
+        let account_private = spec.account_private
+            && (grant.source == home.source
+                || scratch.iter().any(|ours| ours.source == grant.source));
+        let forbidden_alias = if account_private {
+            let private = authority::mount_identity_for_path(&mountinfo, &grant.source)?;
+            aliases_private(&mounts, &reserved_mounts, &private)
+        } else {
+            aliases_reserved(&mounts, &reserved_mounts, homes.last())
+        };
+        if forbidden_alias {
             return Err(invalid(format!(
                 "workspace directory {} aliases a reserved tree",
                 grant.source.display()
@@ -1555,6 +1568,29 @@ fn aliases_reserved(
     }
 }
 
+/// Root's validated account home or scratch can appear through td's
+/// maintenance mount too. Exempt only an ancestor reservation of this
+/// exact private root, and only identities within that root. An equal or
+/// nested reservation, or a bind of a sibling, remains forbidden.
+fn aliases_private(
+    mounts: &std::collections::BTreeSet<authority::MountIdentity>,
+    reserved: &std::collections::BTreeSet<authority::MountIdentity>,
+    private: &authority::MountIdentity,
+) -> bool {
+    mounts.iter().any(|mount| {
+        reserved.iter().any(|reserved| {
+            let overlaps =
+                contains_by_identity(mount, reserved) || contains_by_identity(reserved, mount);
+            let maintenance_ancestor = reserved.device == private.device
+                && reserved.root != private.root
+                && authority::root_within(&private.root, &reserved.root);
+            let inside_private = mount.device == private.device
+                && authority::root_within(&mount.root, &private.root);
+            overlaps && !(maintenance_ancestor && inside_private)
+        })
+    })
+}
+
 fn reserved_identities(
     mountinfo: &str,
     reserved: &[&str],
@@ -1650,6 +1686,49 @@ mod tests {
             "format=1\nprofile=development-offline\nprofile=development\nentry=/e\nhome=/h\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn only_the_validated_private_root_can_ignore_its_maintenance_ancestor() {
+        let identity =
+            |path: &str| authority::mount_identity_for_path(TD_MOUNTINFO, Path::new(path)).unwrap();
+        let tree =
+            |path: &str| authority::mount_tree_identities(TD_MOUNTINFO, Path::new(path)).unwrap();
+        let mut reserved = tree("/run");
+        reserved.extend(tree("/var/tmp"));
+        let human = identity("/var/home/tester");
+        for path in [
+            "/var/lib/td/workloads/98304",
+            "/var/lib/td/workload-scratch/98304/tmp",
+        ] {
+            let private = identity(path);
+            let own = tree(path);
+            // The pre-account home-relative rule rejects these roots on
+            // the real td layout; the private-root rule admits them.
+            assert!(aliases_reserved(&own, &reserved, Some(&human)));
+            assert!(!aliases_private(&own, &reserved, &private));
+            let child = tree(&format!("{path}/cache"));
+            assert!(!aliases_private(&child, &reserved, &private));
+            for elsewhere in [
+                "/var/lib/td/workloads/98305",
+                "/var/home/tester/secret",
+                "/var/tmp/x",
+                "/run/td-volume/@var",
+            ] {
+                let mut nested = own.clone();
+                nested.extend(tree(elsewhere));
+                assert!(aliases_private(&nested, &reserved, &private), "{elsewhere}");
+            }
+            let mut exact = reserved.clone();
+            exact.insert(private.clone());
+            assert!(aliases_private(&own, &exact, &private));
+            let mut below = reserved.clone();
+            below.extend(child);
+            assert!(aliases_private(&own, &below, &private));
+        }
+        let human_spec = parse_spec("format=1\nentry=/e\nhome=/h\n").unwrap();
+        assert!(!human_spec.account_private);
+        assert!(parse_spec("format=1\naccount-private=true\nentry=/e\nhome=/h\n").is_err());
     }
 
     #[test]

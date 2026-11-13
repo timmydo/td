@@ -46,9 +46,19 @@ pub fn admitted(state: &StateDir, requested: &[Shared]) -> Result<Vec<Shared>, S
     Ok(grants)
 }
 
-pub fn disjoint(grants: &[Shared], paths: &[PathBuf]) -> Result<(), String> {
+pub fn disjoint(grants: &[Shared], policy: &jail::Policy) -> Result<(), String> {
     for grant in grants {
-        if paths.iter().any(|path| overlap(&grant.path, path)) {
+        let paths = policy
+            .worktrees
+            .iter()
+            .chain(&policy.checkouts)
+            .chain(&policy.read)
+            .chain(&policy.write)
+            .chain(&policy.repositories)
+            .chain(&policy.objects)
+            .chain(&policy.scratch)
+            .chain(std::iter::once(&policy.home).filter(|path| !path.as_os_str().is_empty()));
+        if paths.into_iter().any(|path| overlap(&grant.path, path)) {
             return Err(format!(
                 "directory grant {} overlaps an existing workspace mount",
                 grant.path.display()
@@ -76,6 +86,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    #[test]
+    fn grants_compare_actual_mounts_with_root_owned_or_local_private_state() {
+        let mut policy = jail::Policy {
+            worktrees: vec!["/home/tester/project".into()],
+            ..Default::default()
+        };
+        let grants = [Shared {
+            path: "/home/tester/data".into(),
+            write: true,
+        }];
+        assert!(disjoint(&grants, &policy).is_ok());
+        policy.home = "/home/tester/data".into();
+        assert!(disjoint(&grants, &policy).is_err());
+        policy.home = PathBuf::new();
+        policy.read.push("/home/tester/data/subdir".into());
+        assert!(disjoint(&grants, &policy).is_err());
+    }
     #[test]
     fn revoke_matches_aliases_and_replaced_stored_paths() {
         let owned = td_fs::TempDir::new("revoke-path").unwrap();
