@@ -8,7 +8,9 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use crate::worker::{SubmitError, Worker};
 
 use crate::memory::{self, Resident};
 use td_alloc::{Budget, BudgetError, BudgetShared, Charge};
@@ -1813,20 +1815,61 @@ impl Document {
     }
 }
 
-/// Work for the render thread, which sends its own answer.
-type Job = Box<dyn FnOnce() + Send>;
+/// Common media types fit inside the charged request slot. Longer headers
+/// retain exact UTF-8 bytes in a separately charged owner.
+enum ContentType {
+    Inline(td_alloc::SmallText<128>),
+    Long(td_alloc::BudgetString),
+}
+impl ContentType {
+    fn copy(memory: &Budget, text: &str) -> Result<Self, BudgetError> {
+        match td_alloc::SmallText::copy(text) {
+            Some(text) => Ok(Self::Inline(text)),
+            None => td_alloc::BudgetString::copy(memory, text).map(Self::Long),
+        }
+    }
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(text) => text.as_str(),
+            Self::Long(text) => text,
+        }
+    }
+}
 
-/// The one thread every reply is made into a document on, one at a time,
-/// whichever fetch thread hands it over (DESIGN.md §3). A rendering
-/// within `HTML_LIMITS` can peak at some 240 MB, and the allocator keeps
-/// much of that in the arena of the thread that rendered it, which a
-/// thread alive beside it does not reuse: renderings on overlapping fetch
-/// threads kept it once per thread. A job that panics answers nothing and
-/// the thread goes on, td-web's build unwinding; a thread found gone is
-/// started again for the next job.
+/// A typed render request; its input body and URL retain their existing
+/// fetch/metadata limits. The content type is a budget-owned handoff copy.
+struct Reply {
+    url: Url,
+    status: u16,
+    kind: Option<ContentType>,
+    body: Vec<u8>,
+    stopped: Arc<AtomicBool>,
+}
+
+fn render_reply(reply: Reply, memory: &Budget) -> Option<Document> {
+    let Reply {
+        url,
+        status,
+        kind,
+        body,
+        stopped,
+    } = reply;
+    Document::from_reply_in(
+        url,
+        status,
+        kind.as_ref().map(ContentType::as_str),
+        body,
+        &stopped,
+        memory,
+    )
+    .filter(|_| !stopped.load(Ordering::SeqCst))
+}
+
+/// One worker serializes rendering, with a fixed queue for fetch workers.
+/// The reusable request/result slots are admitted on its page root at startup.
 pub struct Renderer(BudgetShared<RenderState>);
 struct RenderState {
-    thread: Mutex<mpsc::Sender<Job>>,
+    thread: Mutex<Worker<Reply, Option<Document>>>,
     memory: Budget,
 }
 #[cfg(test)]
@@ -1837,19 +1880,9 @@ impl Clone for Renderer {
     }
 }
 
-/// Starts a render thread, which runs what it is sent in turn until every
-/// sender is gone.
-fn render_thread() -> Result<mpsc::Sender<Job>, String> {
-    let (send, jobs) = mpsc::channel::<Job>();
-    std::thread::Builder::new()
-        .name("td-web render".into())
-        .spawn(move || {
-            for job in jobs {
-                job();
-            }
-        })
-        .map_err(|why| format!("the render thread could not start: {why}"))?;
-    Ok(send)
+fn render_thread(memory: &Budget) -> Result<Worker<Reply, Option<Document>>, String> {
+    Worker::start(memory, render_reply)
+        .map_err(|_| td_alloc::string("the render thread could not start").unwrap_or_default())
 }
 
 impl Renderer {
@@ -1864,7 +1897,7 @@ impl Renderer {
             .try_clone()
             .map_err(|_| td_alloc::string("no page budget handle").unwrap_or_default())?;
         let state = RenderState {
-            thread: Mutex::new(render_thread()?),
+            thread: Mutex::new(render_thread(memory)?),
             memory: copied,
         };
         BudgetShared::new(memory, state)
@@ -1881,24 +1914,28 @@ impl Renderer {
         Document::error_with_budget(url, why, self.budget())
     }
 
-    /// `work`'s answer, made on the render thread behind the work handed
-    /// over before it; none when it panicked or no thread would take it.
-    fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        // Each job returns once. A single slot avoids allocating an
-        // unbounded channel's multi-message block for the larger owner.
-        let (answer, done) = mpsc::sync_channel(1);
-        let job: Job = Box::new(move || {
-            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            let _ = answer.send(made.ok());
-        });
-        {
+    /// Claim a reusable slot, restarting a lost worker before retrying.
+    /// Waiting for its answer does not hold the submission lock.
+    fn run(&self, reply: Reply) -> Result<Option<Option<Document>>, BudgetError> {
+        let ticket = {
             let mut thread = self.0.thread.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Err(mpsc::SendError(job)) = thread.send(job) {
-                *thread = render_thread().ok()?;
-                thread.send(job).ok()?;
+            match thread.submit(reply) {
+                Ok(ticket) => ticket,
+                Err(SubmitError::Memory(error, _)) => return Err(error),
+                Err(SubmitError::Closed(reply)) => {
+                    let Ok(replacement) = Worker::start(self.budget(), render_reply) else {
+                        return Ok(None);
+                    };
+                    *thread = replacement;
+                    match thread.submit(reply) {
+                        Ok(ticket) => ticket,
+                        Err(SubmitError::Memory(error, _)) => return Err(error),
+                        Err(SubmitError::Closed(_)) => return Ok(None),
+                    }
+                }
             }
-        }
-        done.recv().ok().flatten()
+        };
+        Ok(ticket.wait())
     }
 
     /// `Document::from_reply_unless` on the render thread, waiting for it
@@ -1914,21 +1951,32 @@ impl Renderer {
         body: Vec<u8>,
         stopped: &Arc<AtomicBool>,
     ) -> Option<Document> {
-        let (shown, kind) = (url.clone(), content_type.map(str::to_string));
-        let stopped = Arc::clone(stopped);
-        let memory = match self.budget().try_clone() {
-            Ok(memory) => memory,
-            Err(_) => return Some(Document::resources(Some(url), status)),
-        };
-        self.run(move || {
-            Document::from_reply_in(url, status, kind.as_deref(), body, &stopped, &memory)
-                .filter(|_| !stopped.load(Ordering::SeqCst))
-        })
-        .unwrap_or_else(|| Some(self.error(Some(shown), "the page could not be rendered")))
+        if stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        let shown = url.clone();
+        let made = (|| {
+            let kind = content_type
+                .map(|kind| ContentType::copy(self.budget(), kind))
+                .transpose()?;
+            let reply = Reply {
+                url,
+                status,
+                kind,
+                body,
+                stopped: Arc::clone(stopped),
+            };
+            self.run(reply)
+        })();
+        match made {
+            Ok(Some(document)) => document,
+            Ok(None) => Some(self.error(Some(shown), "the page could not be rendered")),
+            Err(_) => Some(Document::resources(Some(shown), status)),
+        }
     }
 }
 
-// `Renderer::run` catches a rendering's panic, which only an unwinding
+// The worker catches a rendering's panic, which only an unwinding
 // build can: a build that aborts on panic (`panic = "abort"` in a profile,
 // `-C panic=abort` from a recipe) would end td-web on any rendering's
 // panic, so it does not build.
@@ -2393,6 +2441,7 @@ pub(crate) mod tests {
                     &stopped
                 )
                 .is_none());
+            renderer.0.thread.lock().unwrap().idle();
             assert_eq!(root.used(), baseline);
         }
         stopped.store(false, Ordering::SeqCst);
@@ -3095,74 +3144,83 @@ pub(crate) mod tests {
         let body = b"<p>x".to_vec();
         let doc = renderer.document(base(), 200, Some("text/html"), body, &stopped);
         assert!(doc.is_none());
-        // Text is made though its navigation stopped, then dropped there.
+        // Already stopped text is skipped before allocating a handoff too.
         let body = b"x".to_vec();
         let doc = renderer.document(base(), 200, Some("text/plain"), body, &stopped);
         assert!(doc.is_none());
     }
 
-    /// All of a renderer's work runs on its one thread, whichever thread
-    /// hands it over: not the caller's, and not a thread per job.
     #[test]
-    fn a_renderer_s_work_runs_on_its_one_thread() {
-        let renderer = Renderer::start().unwrap();
-        let here = std::thread::current().id();
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let renderer = renderer.clone();
-                std::thread::spawn(move || {
-                    (0..3)
-                        .map(|_| renderer.run(|| std::thread::current().id()).unwrap())
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        let ids: Vec<_> = threads
-            .into_iter()
-            .flat_map(|thread| thread.join().unwrap())
-            .collect();
-        assert_eq!(ids.len(), 12);
-        assert!(ids.iter().all(|&id| id == ids[0] && id != here));
-    }
-
-    /// A renderer whose thread is gone.
-    fn gone() -> Renderer {
-        let (send, jobs) = mpsc::channel::<Job>();
-        drop(jobs);
-        let memory = memory::root().unwrap();
-        Renderer(
-            BudgetShared::new(
-                &memory,
-                RenderState {
-                    thread: Mutex::new(send),
-                    memory: memory.try_clone().unwrap(),
-                },
-            )
-            .unwrap(),
-        )
-    }
-
-    /// A job that panics answers nothing, a reply's an error page, and the
-    /// same thread takes the next; a renderer whose thread is gone starts
-    /// another rather than failing every page after. A test build always
-    /// unwinds; what holds td-web's own build to it is the
-    /// `compile_error!` beside `Renderer`, which a build that aborts on
-    /// panic meets.
-    #[test]
-    fn a_renderer_outlives_a_panic_and_a_lost_thread() {
-        let renderer = Renderer::start().unwrap();
-        let before = renderer.run(|| std::thread::current().id()).unwrap();
-        assert_eq!(
-            renderer.run(|| -> u8 { panic!("a rendering panics") }),
-            None
-        );
-        assert_eq!(renderer.run(|| std::thread::current().id()), Some(before));
+    fn renderer_handoff_refusal_keeps_the_old_page_and_returns_credit() {
+        let root = memory::root().unwrap();
+        let renderer = Renderer::with_budget(&root).unwrap();
         let going = Arc::new(AtomicBool::new(false));
-        let gone = gone();
-        let body = b"<p>still here".to_vec();
-        let doc = gone.document(base(), 200, Some("text/html"), body, &going);
-        assert_eq!(text_of(&cells(&doc.unwrap(), 80)), ["still here"]);
-        assert!(gone.run(|| 1).is_some(), "the new thread stays");
+        let old = renderer
+            .document(base(), 200, Some("text/plain"), b"old".to_vec(), &going)
+            .unwrap();
+        renderer.0.thread.lock().unwrap().idle();
+        let baseline = root.used();
+        let long = format!("text/plain; x={}", "x".repeat(128));
+        for (kind, needed) in [("text/plain", 0), (long.as_str(), 1)] {
+            for allowance in 0..=needed {
+                let url = base();
+                let body = b"new".to_vec();
+                let doc = td_alloc::with_reservation_limit(allowance, || {
+                    renderer.document(url, 200, Some(kind), body, &going)
+                })
+                .unwrap();
+                assert_eq!(doc.picture_resources(), allowance < needed);
+                drop(doc);
+                renderer.0.thread.lock().unwrap().idle();
+                assert_eq!(root.used(), baseline);
+                assert_eq!(text_of(&cells(&old, 80)), ["old"]);
+            }
+        }
+        let blocker = root.charge(root.limit() - root.used()).unwrap();
+        let refused = renderer
+            .document(base(), 200, None, b"new".to_vec(), &going)
+            .unwrap();
+        assert!(refused.picture_resources());
+        going.store(true, Ordering::SeqCst);
+        assert!(renderer
+            .document(base(), 200, Some("text/plain"), b"stopped".to_vec(), &going)
+            .is_none());
+        drop((blocker, refused, old, renderer));
+        assert_eq!(root.used(), Budget::metadata_bytes());
+    }
+
+    #[test]
+    fn handoff_headers_keep_every_byte_across_inline_boundary() {
+        let root = memory::root().unwrap();
+        let baseline = root.used();
+        for len in [0, 127, 128, 129, 8192] {
+            let text = "x".repeat(len);
+            let kind = ContentType::copy(&root, &text).unwrap();
+            assert_eq!(kind.as_str(), text);
+            assert_eq!(root.used() == baseline, len <= 128);
+            drop(kind);
+            assert_eq!(root.used(), baseline);
+        }
+        let text = format!("{}é", "x".repeat(127));
+        assert_eq!(ContentType::copy(&root, &text).unwrap().as_str(), text);
+        assert_eq!(crate::worker::QUEUED, crate::app::MAX_WORKERS);
+    }
+
+    #[test]
+    fn a_renderer_restarts_a_lost_worker() {
+        let renderer = Renderer::start().unwrap();
+        renderer.0.thread.lock().unwrap().stop();
+        let going = Arc::new(AtomicBool::new(false));
+        for _ in 0..2 {
+            let doc = renderer.document(
+                base(),
+                200,
+                Some("text/html"),
+                b"<p>still here".to_vec(),
+                &going,
+            );
+            assert_eq!(text_of(&cells(&doc.unwrap(), 80)), ["still here"]);
+        }
     }
 
     /// `HTML_LIMITS` renders ordinary markup of `MAX_MARKUP` whole, here

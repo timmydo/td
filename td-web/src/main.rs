@@ -11,6 +11,7 @@ mod memory;
 mod picture;
 mod save;
 mod view;
+mod worker;
 
 use std::process::ExitCode;
 

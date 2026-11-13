@@ -79,7 +79,11 @@ stylesheet through computed-style references; that lifetime retains the
 original budget charge. td-web's displayed/incoming legacy pages, wrapping, decoded pictures,
 fitted copies and held save bodies retain shared admissions through their
 owners; its legacy rendering allowances remain conservative external
-models. General UI, fetch, IPC, URL metadata and other existing subsystem
+models. Its render-worker mailbox and typed request/result slots use
+one fallible shared owner on the page root, with four reusable request/result
+slots admitted at startup and a content-type copy held inline or in a
+BudgetString. Tickets keep the mailbox's charge through their lifetimes. Thread startup still uses std/OS machinery.
+General UI, fetch/window IPC, URL metadata and other existing subsystem
 allocations remain migration debt.
 
 JMAP request byte and token backing uses owned child budgets under one

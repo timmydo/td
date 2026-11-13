@@ -188,6 +188,29 @@ count while both live; cancellation returns credit only when the worker
 actually drops its work or result. Shared page references use fallible
 BudgetShared ownership. Empty renderings need no allocation.
 
+The renderer's typed handoff has four reusable request/result slots,
+matching `MAX_WORKERS`, in one BudgetShared mailbox admitted at startup.
+Those slots include active, queued and completed-but-unclaimed requests;
+further submitters wait for a free slot. A ticket retains that mailbox's
+budget ownership until it is consumed or dropped. Short content types
+(up to 128 UTF-8 bytes) fit inside a slot; longer ones use BudgetString
+without truncation. Nested bodies and URLs retain their existing
+fetch/metadata limits. Ordinary handoffs allocate no backing storage.
+Admission/refcount refusal returns the static resource notice, and an
+already cancelled reply allocates no handoff. The worker drops cancelled
+rendered output before taking another request.
+
+A dropped ticket abandons only its slot. Queued/running slots stay occupied
+until the worker releases them; a completed result is released by its
+caller. Ordinary rendering panics complete their ticket without a result
+and leave the worker running. An unexpected worker exit completes its
+active ticket and cancels queued tickets, wakes blocked submitters, and
+the next submission restarts it. Dropping the renderer closes and joins
+its worker; this can wait for its bounded active operation. Thread startup
+still uses std/OS allocation machinery outside the owned-allocation
+guarantee. The handoff module has a strict source guard against standard
+heap owners, recognized unchecked allocation operations and std channels.
+
 The legacy path admits conservative working allowances before starting:
 256 MiB for HTML, 64 MiB for plain text, and 200 MiB for picture decoding.
 A small notice takes 1 MiB, and an unshown reply also admits its held body.
@@ -223,7 +246,7 @@ bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
 These legacy allowances are an admission model, distinct from exact
 ownership of the new parser, CSS and layout storage in §10. They do not
 instrument every std allocation inside the legacy rich renderer, window
-wrapping, IPC or URL/response metadata. Those source-inventory entries
+wrapping, fetch/window IPC or URL/response metadata. Those source-inventory entries
 remain migration debt; this is not a whole-process allocation-failure
 guarantee. The root cap supplements the per-input/work limits and the
 jail's process-wide limit; it does not replace them. The memory ownership

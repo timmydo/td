@@ -245,8 +245,14 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
         "td-mta/src/https_api_storage.rs",
         "td-mta/src/http_date.rs",
         "td-web/src/memory.rs",
+        "td-web/src/worker.rs",
     ] {
-        budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
+        let source = fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?;
+        if path == "td-web/src/worker.rs" {
+            worker_source(&source)?;
+        } else {
+            budgeted_source(&source)?;
+        }
     }
     for path in TREE_STORAGE_SOURCES.iter().chain(LAYOUT_STORAGE_SOURCES) {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
@@ -343,6 +349,18 @@ fn budgeted_source(source: &str) -> Result<(), String> {
             "guarded paths require budgeted or fixed storage; unbudgeted allocation is forbidden"
                 .into(),
         );
+    }
+    Ok(())
+}
+fn worker_source(source: &str) -> Result<(), String> {
+    budgeted_source(source)?;
+    let code =
+        td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
+    if code
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|token| matches!(token, "mpsc" | "channel" | "sync_channel"))
+    {
+        return Err("render handoff requires its budget-owned mailbox, not std channels".into());
     }
     Ok(())
 }
@@ -513,6 +531,21 @@ mod tests {
     }
 
     #[test]
+    fn render_handoff_cannot_restore_boxes_or_std_channels() {
+        worker_source("fn f() { BudgetShared::new(&memory, call)?; }").unwrap();
+        worker_source("fn f() { JoinHandle::join(thread); }").unwrap();
+        for source in [
+            "fn f() { Box::new(job); }",
+            "fn f() { std::sync::mpsc::channel(); }",
+            "use std::sync::mpsc as queue;",
+            "fn f() { sync_channel(1); }",
+            "fn f() { String::new(); }",
+        ] {
+            assert!(worker_source(source).is_err());
+        }
+    }
+
+    #[test]
     fn code_only_scan_covers_spacing_generics_and_macros() {
         let counts = operations(
             r###"
@@ -615,6 +648,7 @@ mod tests {
         fs::write(root.join("td-mta/src/http_date.rs"), "fn date() {}").unwrap();
         fs::create_dir_all(root.join("td-web/src")).unwrap();
         fs::write(root.join("td-web/src/memory.rs"), "fn memory() {}").unwrap();
+        fs::write(root.join("td-web/src/worker.rs"), "fn worker() {}").unwrap();
         fs::write(
             root.join("td-mta/src/https_api_storage.rs"),
             "fn storage() {}",
