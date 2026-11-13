@@ -3,10 +3,10 @@ use crate::syntax::{Component, Token};
 use crate::values::{ComputedStyle, ComputedValue, Family, Length};
 use crate::variables::CustomProperties;
 use crate::Error;
-use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
-use std::sync::Arc;
+use td_alloc::{Budget, BudgetMap, BudgetVec};
 
 pub const MAX_STYLES: usize = 16_384;
 pub const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
@@ -34,24 +34,33 @@ impl Default for PoolLimits {
 /// Charges include doubled vector/string capacities and conservative map-node
 /// overhead. Pointer identities are only keys for allocations this pool owns.
 pub struct StylePool {
-    styles: Vec<ComputedStyle>,
-    buckets: BTreeMap<u64, Vec<StyleId>>,
-    custom: BTreeMap<u64, Vec<CustomProperties>>,
-    maps: BTreeSet<usize>,
-    tokens: BTreeSet<usize>,
+    styles: BudgetVec<ComputedStyle>,
+    buckets: BudgetMap<u64, BudgetVec<StyleId>>,
+    custom: BudgetMap<u64, BudgetVec<CustomProperties>>,
+    maps: BudgetMap<usize, ()>,
+    tokens: BudgetMap<usize, ()>,
     limits: PoolLimits,
     bytes: usize,
     work: usize,
     comparisons: usize,
 }
 impl StylePool {
-    pub fn new(limits: PoolLimits) -> Self {
-        Self {
-            styles: Vec::new(),
-            buckets: BTreeMap::new(),
-            custom: BTreeMap::new(),
-            maps: BTreeSet::new(),
-            tokens: BTreeSet::new(),
+    pub fn new(limits: PoolLimits) -> Result<Self, Error> {
+        let memory = Budget::new(
+            limits
+                .bytes
+                .min(MAX_POOL_BYTES)
+                .saturating_add(Budget::metadata_bytes()),
+        )?;
+        Self::with_budget(limits, &memory)
+    }
+    pub fn with_budget(limits: PoolLimits, memory: &Budget) -> Result<Self, Error> {
+        Ok(Self {
+            styles: BudgetVec::new(memory)?,
+            buckets: BudgetMap::new(memory)?,
+            custom: BudgetMap::new(memory)?,
+            maps: BudgetMap::new(memory)?,
+            tokens: BudgetMap::new(memory)?,
             limits: PoolLimits {
                 styles: limits.styles.min(MAX_STYLES),
                 bytes: limits.bytes.min(MAX_POOL_BYTES),
@@ -61,7 +70,7 @@ impl StylePool {
             bytes: 0,
             work: 0,
             comparisons: 0,
-        }
+        })
     }
     pub fn get(&self, id: StyleId) -> Option<&ComputedStyle> {
         self.styles.get(id.0)
@@ -82,7 +91,7 @@ impl StylePool {
         self.share_custom(&mut style.custom)?;
         let mut hash = DefaultHasher::new();
         // Canonical maps have a stable address while retained by this pool.
-        (Arc::as_ptr(&style.custom.entries) as usize).hash(&mut hash);
+        (std::ptr::from_ref(&*style.custom.entries).addr()).hash(&mut hash);
         let value_work = style.values.values().map(value_work).sum::<usize>();
         self.visit(value_work)?;
         for (property, value) in &style.values {
@@ -95,7 +104,7 @@ impl StylePool {
                 comparison(&mut self.comparisons, self.limits.comparisons)?;
                 visit_count(&mut self.work, value_work, self.limits.work)?;
                 if self.get(*id).is_some_and(|old| {
-                    Arc::ptr_eq(&old.custom.entries, &style.custom.entries)
+                    std::ptr::eq(&*old.custom.entries, &*style.custom.entries)
                         && old.values == style.values
                 }) {
                     return Ok(*id);
@@ -110,17 +119,24 @@ impl StylePool {
             charge += 128 + 2 * size_of::<ComputedValue>();
             if let ComputedValue::FontFamily(families) = value {
                 charge += 2 * families.capacity() * size_of::<Family>();
-                for family in families {
+                for family in families.iter() {
                     if let Family::Named(name) = family {
-                        charge += 2 * name.capacity() + 32;
+                        charge += 2 * name.heap_capacity() + 32;
                     }
                 }
             }
         }
         self.charge(charge)?;
         let id = StyleId(self.styles.len());
-        self.styles.push(style);
-        self.buckets.entry(key).or_default().push(id);
+        if !self.buckets.contains_key(&key) {
+            self.visit(self.buckets.len().saturating_add(1))?;
+        }
+        let bucket = self.buckets.try_get_or_insert_with(key, BudgetVec::new)?;
+        BudgetVec::try_reserve(bucket, 1)?;
+        self.styles.try_push(style)?;
+        bucket
+            .push_within_capacity(id)
+            .map_err(|_| Error::InvalidContext)?;
         Ok(id)
     }
     fn visit(&mut self, count: usize) -> Result<(), Error> {
@@ -140,22 +156,22 @@ impl StylePool {
         Ok(())
     }
     fn share_custom(&mut self, custom: &mut CustomProperties) -> Result<(), Error> {
-        let identity = Arc::as_ptr(&custom.entries) as usize;
-        if self.maps.contains(&identity) {
+        let identity = std::ptr::from_ref(&*custom.entries).addr();
+        if self.maps.contains_key(&identity) {
             return Ok(());
         }
-        // Even one entry owns a full BTreeMap leaf, Arc header, bucket
-        // Vec minimum allocation and both interning indexes.
+        // Keep the existing conservative admission model alongside exact
+        // owned layouts, including both interning indexes.
         let mut charge = 2048;
         let work_before = self.work;
         for (name, value) in custom.entries.iter() {
             self.visit(name.len() + 1)?;
-            charge += 160 + 2 * name.capacity();
+            charge += 160 + 2 * name.heap_capacity();
             if let Some(tokens) = value {
                 let token_id = tokens.as_ptr() as usize;
                 // Count traversal even for shared tokens: hashing sees them.
                 let token_charge = components_charge(tokens, &mut self.work, self.limits.work)?;
-                if !self.tokens.contains(&token_id) {
+                if !self.tokens.contains_key(&token_id) {
                     charge += token_charge + 128;
                 }
             }
@@ -169,7 +185,7 @@ impl StylePool {
                 comparison(&mut self.comparisons, self.limits.comparisons)?;
                 visit_count(&mut self.work, custom_work, self.limits.work)?;
                 if old == custom {
-                    *custom = old.clone();
+                    *custom = old.try_clone()?;
                     return Ok(());
                 }
             }
@@ -179,11 +195,23 @@ impl StylePool {
             return Err(Error::Limit("MAX_STYLES"));
         }
         self.charge(charge)?;
-        self.maps.insert(identity);
-        for tokens in custom.entries.values().flatten() {
-            self.tokens.insert(tokens.as_ptr() as usize);
+        if !self.custom.contains_key(&key) {
+            self.visit(self.custom.len().saturating_add(1))?;
         }
-        self.custom.entry(key).or_default().push(custom.clone());
+        // Retain ownership before publishing pointer identities. A later
+        // refusal may leave a valid interning entry, never a dangling key.
+        self.custom
+            .try_get_or_insert_with(key, BudgetVec::new)?
+            .try_push(custom.try_clone()?)?;
+        self.visit(self.maps.len().saturating_add(1))?;
+        self.maps.try_insert(identity, ())?;
+        for tokens in custom.entries.values().flatten() {
+            let identity = tokens.as_ptr() as usize;
+            if !self.tokens.contains_key(&identity) {
+                self.visit(self.tokens.len().saturating_add(1))?;
+            }
+            self.tokens.try_insert(identity, ())?;
+        }
         Ok(())
     }
 }
@@ -220,7 +248,7 @@ fn components_charge(values: &[Component], work: &mut usize, max: usize) -> Resu
             .checked_add(1)
             .filter(|n| *n <= max)
             .ok_or(Error::Limit("MAX_POOL_WORK"))?;
-        let string = |s: &String| 2 * s.capacity() + 32;
+        let string = |s: &crate::syntax::Text| 2 * s.heap_capacity() + 32;
         let payload = match value {
             Component::Function { name, .. } => name.len(),
             Component::Token(
@@ -288,7 +316,7 @@ fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
             }
         }
         ComputedValue::FontFamily(families) => {
-            for family in families {
+            for family in families.iter() {
                 std::mem::discriminant(family).hash(hash);
                 match family {
                     Family::Generic(s) => s.hash(hash),
@@ -306,14 +334,66 @@ fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
 mod tests {
     use super::*;
     #[test]
+    fn partial_interning_refusal_keeps_all_published_identities_owned() {
+        use td_alloc::{with_reservation_limit, BudgetError};
+        let source = crate::StyleSet::new(&[]).unwrap();
+        let nodes = crate::test_tree::tree();
+        let element = crate::test_tree::Handle {
+            nodes: &nodes,
+            index: 3,
+        };
+        let style = source
+            .compute(&element, None, 16.0, "--x: red; color: var(--x)")
+            .unwrap();
+        let memory = Budget::new(1024 * 1024).unwrap();
+        let mut completed = false;
+        for allowed in 0..128 {
+            let mut pool = StylePool::with_budget(PoolLimits::default(), &memory).unwrap();
+            let copy = style.try_clone().unwrap();
+            let result = with_reservation_limit(allowed, || pool.intern(copy));
+            for identity in pool.maps.keys() {
+                assert!(pool
+                    .custom
+                    .values()
+                    .flatten()
+                    .any(|v| std::ptr::from_ref(&*v.entries).addr() == *identity));
+            }
+            for identity in pool.tokens.keys() {
+                assert!(pool.custom.values().flatten().any(|v| v
+                    .entries
+                    .values()
+                    .flatten()
+                    .any(|t| t.as_ptr() as usize == *identity)));
+            }
+            for id in pool.buckets.values().flatten() {
+                assert!(pool.get(*id).is_some());
+            }
+            match result {
+                Ok(_) => completed = true,
+                Err(error) => assert_eq!(error, Error::Memory(BudgetError::Allocation)),
+            }
+            let id = pool.intern(style.try_clone().unwrap()).unwrap();
+            assert_eq!(pool.get(id).unwrap(), &style);
+            assert_eq!(pool.intern(style.try_clone().unwrap()).unwrap(), id);
+            drop(pool);
+            assert_eq!(memory.used(), Budget::metadata_bytes());
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+    }
+
+    #[test]
     fn identical_values_share_but_custom_values_distinguish() {
-        let mut pool = StylePool::new(PoolLimits::default());
-        let a = ComputedStyle::default();
-        let first = pool.intern(a.clone()).unwrap();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
+        let first = pool.intern(a.try_clone().unwrap()).unwrap();
         assert_eq!(first, pool.intern(a).unwrap());
-        let mut b = ComputedStyle::default();
+        let mut b = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
         b.values
-            .insert(crate::Property::Opacity, ComputedValue::Number(0.5));
+            .try_insert(crate::Property::Opacity, ComputedValue::Number(0.5))
+            .unwrap();
         assert_ne!(first, pool.intern(b).unwrap());
         assert_eq!(pool.len(), 2);
     }
@@ -324,8 +404,8 @@ mod tests {
             nodes: &nodes,
             index: 3,
         };
-        let sheets = crate::StyleSet::default();
-        let mut pool = StylePool::new(PoolLimits::default());
+        let sheets = crate::StyleSet::new(&[]).unwrap();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
         let first = sheets
             .compute(&element, None, 16.0, "--x: red; color: red")
             .unwrap();
@@ -340,11 +420,11 @@ mod tests {
         let c = pool.intern(different).unwrap();
         assert_ne!(a, b);
         assert_ne!(a, c);
-        assert!(Arc::ptr_eq(
+        assert!(td_alloc::BudgetShared::ptr_eq(
             &pool.get(a).unwrap().custom.entries,
             &pool.get(b).unwrap().custom.entries
         ));
-        assert!(!Arc::ptr_eq(
+        assert!(!td_alloc::BudgetShared::ptr_eq(
             &pool.get(a).unwrap().custom.entries,
             &pool.get(c).unwrap().custom.entries
         ));
@@ -360,11 +440,12 @@ mod tests {
             nodes: &nodes,
             index: 3,
         };
-        let sheets = crate::StyleSet::default();
+        let sheets = crate::StyleSet::new(&[]).unwrap();
         let mut pool = StylePool::new(PoolLimits {
             styles: 0,
             ..PoolLimits::default()
-        });
+        })
+        .unwrap();
         for index in 0..1000 {
             let style = sheets
                 .compute(&element, None, 16.0, &format!("--v{index}:initial"))
@@ -383,92 +464,110 @@ mod tests {
             nodes: &nodes,
             index: 3,
         };
-        let sheets = crate::StyleSet::default();
+        let sheets = crate::StyleSet::new(&[]).unwrap();
         let parent = sheets
             .compute(&element, None, 16.0, "--x: red; --unused: blue")
             .unwrap();
         let child = sheets
             .compute(&element, Some(&parent), 16.0, "--x: red")
             .unwrap();
-        assert!(Arc::ptr_eq(&parent.custom.entries, &child.custom.entries));
+        assert!(td_alloc::BudgetShared::ptr_eq(
+            &parent.custom.entries,
+            &child.custom.entries
+        ));
         let changed = sheets
             .compute(&element, Some(&parent), 16.0, "--x: blue")
             .unwrap();
-        assert!(!Arc::ptr_eq(
+        assert!(!td_alloc::BudgetShared::ptr_eq(
             &parent.custom.entries,
             &changed.custom.entries
         ));
     }
     #[test]
     fn signed_zero_and_collisions_use_equality() {
-        let mut pool = StylePool::new(PoolLimits::default());
-        let mut a = ComputedStyle::default();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let mut a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
         a.values
-            .insert(crate::Property::Opacity, ComputedValue::Number(-0.0));
-        let id = pool.intern(a.clone()).unwrap();
+            .try_insert(crate::Property::Opacity, ComputedValue::Number(-0.0))
+            .unwrap();
+        let id = pool.intern(a.try_clone().unwrap()).unwrap();
         a.values
-            .insert(crate::Property::Opacity, ComputedValue::Number(0.0));
-        assert_eq!(id, pool.intern(a.clone()).unwrap());
-        let mut other = a.clone();
+            .try_insert(crate::Property::Opacity, ComputedValue::Number(0.0))
+            .unwrap();
+        assert_eq!(id, pool.intern(a.try_clone().unwrap()).unwrap());
+        let mut other = a.try_clone().unwrap();
         other
             .values
-            .insert(crate::Property::Opacity, ComputedValue::Number(1.0));
+            .try_insert(crate::Property::Opacity, ComputedValue::Number(1.0))
+            .unwrap();
         let other_id = pool.intern(other).unwrap();
         // Force an unequal candidate into every bucket, including a's.
         for bucket in pool.buckets.values_mut() {
-            bucket.insert(0, other_id);
+            bucket.try_push(other_id).unwrap();
+            bucket.rotate_right(1);
         }
         assert_eq!(id, pool.intern(a).unwrap());
     }
     #[test]
     fn work_and_comparison_limits_include_exact_edge() {
-        let mut measure = StylePool::new(PoolLimits::default());
-        let a = ComputedStyle::default();
-        measure.intern(a.clone()).unwrap();
-        measure.intern(a.clone()).unwrap();
+        let mut measure = StylePool::new(PoolLimits::default()).unwrap();
+        let a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
+        measure.intern(a.try_clone().unwrap()).unwrap();
+        measure.intern(a.try_clone().unwrap()).unwrap();
         let work = measure.work();
         for (limit, ok) in [(work, true), (work - 1, false)] {
             let mut pool = StylePool::new(PoolLimits {
                 work: limit,
                 ..PoolLimits::default()
-            });
-            pool.intern(a.clone()).unwrap();
-            assert_eq!(pool.intern(a.clone()).is_ok(), ok);
+            })
+            .unwrap();
+            pool.intern(a.try_clone().unwrap()).unwrap();
+            assert_eq!(pool.intern(a.try_clone().unwrap()).is_ok(), ok);
         }
         let mut pool = StylePool::new(PoolLimits {
             comparisons: 1,
             ..PoolLimits::default()
-        });
-        pool.intern(a.clone()).unwrap();
-        pool.intern(a.clone()).unwrap();
+        })
+        .unwrap();
+        pool.intern(a.try_clone().unwrap()).unwrap();
+        pool.intern(a.try_clone().unwrap()).unwrap();
         assert_eq!(pool.intern(a), Err(Error::Limit("MAX_STYLE_COMPARISONS")));
     }
     #[test]
     fn budgets_admit_exact_charge_and_refuse_one_less() {
-        let mut measure = StylePool::new(PoolLimits::default());
-        measure.intern(ComputedStyle::default()).unwrap();
+        let mut measure = StylePool::new(PoolLimits::default()).unwrap();
+        measure
+            .intern(ComputedStyle::new(&crate::memory().unwrap()).unwrap())
+            .unwrap();
         let charge = measure.charged_bytes();
         for (bytes, accepted) in [(charge, true), (charge - 1, false)] {
             let mut pool = StylePool::new(PoolLimits {
                 bytes,
                 ..PoolLimits::default()
-            });
-            assert_eq!(pool.intern(ComputedStyle::default()).is_ok(), accepted);
+            })
+            .unwrap();
+            assert_eq!(
+                pool.intern(ComputedStyle::new(&crate::memory().unwrap()).unwrap())
+                    .is_ok(),
+                accepted
+            );
         }
         let mut pool = StylePool::new(PoolLimits {
             styles: 0,
             ..PoolLimits::default()
-        });
+        })
+        .unwrap();
         assert_eq!(
-            pool.intern(ComputedStyle::default()),
+            pool.intern(ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
             Err(Error::Limit("MAX_STYLES"))
         );
         let mut pool = StylePool::new(PoolLimits {
             comparisons: 0,
             ..PoolLimits::default()
-        });
-        let a = ComputedStyle::default();
-        pool.intern(a.clone()).unwrap();
+        })
+        .unwrap();
+        let a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
+        pool.intern(a.try_clone().unwrap()).unwrap();
         assert_eq!(pool.intern(a), Err(Error::Limit("MAX_STYLE_COMPARISONS")));
     }
 }

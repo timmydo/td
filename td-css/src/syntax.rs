@@ -3,8 +3,251 @@
 use crate::{
     Error, MAX_DECLARATIONS, MAX_INPUT_BYTES, MAX_NESTING, MAX_RULES, MAX_TOKENS, MAX_TOKEN_BYTES,
 };
+use td_alloc::{Budget, BudgetIntoIter, BudgetShared, BudgetString, BudgetVec};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Immutable token text. Short UTF-8 values live in their enclosing owner;
+/// longer values share fallibly allocated, budget-owned storage.
+pub struct Text(TextStorage);
+enum TextStorage {
+    Inline(td_alloc::SmallText<14>),
+    Medium(BudgetShared<td_alloc::SmallText<62>>),
+    Shared(BudgetShared<BudgetString>),
+}
+impl Text {
+    fn inline(value: &str) -> Option<Self> {
+        Some(Self(TextStorage::Inline(td_alloc::SmallText::copy(value)?)))
+    }
+    pub(crate) fn from_string(memory: &Budget, value: BudgetString) -> Result<Self, Error> {
+        if let Some(text) = Self::inline(&value) {
+            return Ok(text);
+        }
+        if let Some(fixed) = td_alloc::SmallText::<62>::copy(&value) {
+            return Ok(Self(TextStorage::Medium(BudgetShared::new(memory, fixed)?)));
+        }
+        Ok(Self(TextStorage::Shared(BudgetShared::new(memory, value)?)))
+    }
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match &self.0 {
+            TextStorage::Inline(value) => value.as_bytes(),
+            TextStorage::Medium(value) => value.as_bytes(),
+            TextStorage::Shared(value) => value.as_bytes(),
+        }
+    }
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            TextStorage::Inline(value) => value.as_str(),
+            TextStorage::Medium(value) => value.as_str(),
+            TextStorage::Shared(value) => value.as_str(),
+        }
+    }
+    pub(crate) fn heap_capacity(&self) -> usize {
+        match &self.0 {
+            TextStorage::Inline(_) => 0,
+            TextStorage::Medium(_) => 62,
+            TextStorage::Shared(value) => value.capacity(),
+        }
+    }
+    #[inline]
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self(match &self.0 {
+            TextStorage::Inline(value) => TextStorage::Inline(*value),
+            TextStorage::Medium(value) => TextStorage::Medium(value.try_clone()?),
+            TextStorage::Shared(value) => TextStorage::Shared(value.try_clone()?),
+        }))
+    }
+}
+impl std::ops::Deref for Text {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl AsRef<str> for Text {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl std::borrow::Borrow<str> for Text {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+impl std::fmt::Debug for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+impl PartialEq for Text {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+impl Eq for Text {}
+impl PartialOrd for Text {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Text {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bytes().cmp(other.bytes())
+    }
+}
+impl std::hash::Hash for Text {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.as_str().hash(h);
+    }
+}
+pub(crate) fn text(memory: &Budget, value: &str) -> Result<Text, Error> {
+    if let Some(text) = Text::inline(value) {
+        return Ok(text);
+    }
+    if let Some(fixed) = td_alloc::SmallText::<62>::copy(value) {
+        return Ok(Text(TextStorage::Medium(BudgetShared::new(memory, fixed)?)));
+    }
+    Text::from_string(memory, BudgetString::copy(memory, value)?)
+}
+pub(crate) fn lower_text(memory: &Budget, value: &str) -> Result<Text, Error> {
+    if let Some(mut text) = Text::inline(value) {
+        if let TextStorage::Inline(value) = &mut text.0 {
+            value.make_ascii_lowercase();
+        }
+        return Ok(text);
+    }
+    let mut value = BudgetString::copy(memory, value)?;
+    value.make_ascii_lowercase();
+    Text::from_string(memory, value)
+}
+struct TextBuilder<'a> {
+    memory: &'a Budget,
+    fixed: td_alloc::SmallText<62>,
+    heap: Option<BudgetString>,
+}
+impl<'a> TextBuilder<'a> {
+    fn new(memory: &'a Budget) -> Self {
+        Self {
+            memory,
+            fixed: td_alloc::SmallText::new(),
+            heap: None,
+        }
+    }
+    #[inline]
+    fn try_push(&mut self, ch: char) -> Result<(), Error> {
+        if let Some(heap) = &mut self.heap {
+            if heap.len().saturating_add(ch.len_utf8()) > MAX_TOKEN_BYTES {
+                return Err(Error::Limit("MAX_TOKEN_BYTES"));
+            }
+            heap.try_push(ch)?;
+            return Ok(());
+        }
+        let mut scratch = [0; 4];
+        let value = ch.encode_utf8(&mut scratch);
+        if self.fixed.try_push_str(value).is_ok() {
+            return Ok(());
+        }
+        let prefix = self.fixed.as_str();
+        let end = prefix.len() + value.len();
+        // The bounded fixed prefix and one scalar fit below MAX_TOKEN_BYTES.
+        let mut heap = match td_alloc::BudgetString::with_capacity(self.memory, 128) {
+            Err(td_alloc::BudgetError::Limit | td_alloc::BudgetError::Overflow) => {
+                td_alloc::BudgetString::with_capacity(self.memory, end)?
+            }
+            result => result?,
+        };
+        heap.try_push_str(prefix)?;
+        heap.try_push_str(value)?;
+        self.heap = Some(heap);
+        Ok(())
+    }
+    fn finish(self) -> Result<Text, Error> {
+        match self.heap {
+            Some(value) => Text::from_string(self.memory, value),
+            None => {
+                let fixed = self.fixed;
+                let value = fixed.as_str();
+                if let Some(text) = Text::inline(value) {
+                    Ok(text)
+                } else {
+                    Ok(Text(TextStorage::Medium(BudgetShared::new(
+                        self.memory,
+                        fixed,
+                    )?)))
+                }
+            }
+        }
+    }
+}
+pub(crate) fn keyword(value: &str, choices: &[&'static str]) -> Option<&'static str> {
+    choices
+        .iter()
+        .copied()
+        .find(|choice| value.eq_ignore_ascii_case(choice))
+}
+pub(crate) fn copy_components(
+    values: &[Component],
+    memory: &Budget,
+) -> Result<BudgetVec<Component>, Error> {
+    let mut result = td_alloc::BudgetVec::with_capacity(memory, values.len())?;
+    for value in values {
+        result
+            .push_within_capacity(value.try_clone()?)
+            .map_err(|_| Error::InvalidContext)?;
+    }
+    Ok(result)
+}
+impl Number {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            representation: self.representation.try_clone()?,
+            integer: self.integer,
+        })
+    }
+}
+impl Token {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Ident(s) => Self::Ident(s.try_clone()?),
+            Self::Function(s) => Self::Function(s.try_clone()?),
+            Self::AtKeyword(s) => Self::AtKeyword(s.try_clone()?),
+            Self::String(s) => Self::String(s.try_clone()?),
+            Self::Url(s) => Self::Url(s.try_clone()?),
+            Self::Hash { value, id } => Self::Hash {
+                value: value.try_clone()?,
+                id: *id,
+            },
+            Self::Number(n) => Self::Number(n.try_clone()?),
+            Self::Percentage(n) => Self::Percentage(n.try_clone()?),
+            Self::Dimension(n, s) => Self::Dimension(n.try_clone()?, s.try_clone()?),
+            Self::BadString => Self::BadString,
+            Self::BadUrl => Self::BadUrl,
+            Self::Whitespace => Self::Whitespace,
+            Self::Cdo => Self::Cdo,
+            Self::Cdc => Self::Cdc,
+            Self::Open(c) => Self::Open(*c),
+            Self::Close(c) => Self::Close(*c),
+            Self::Delim(c) => Self::Delim(*c),
+        })
+    }
+}
+impl Component {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Token(t) => Self::Token(t.try_clone()?),
+            Self::Block { kind, values } => Self::Block {
+                kind: *kind,
+                values: copy_components(values, values.budget())?,
+            },
+            Self::Function { name, values } => Self::Function {
+                name: name.try_clone()?,
+                values: copy_components(values, values.budget())?,
+            },
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct Parsed<T> {
     value: T,
     errors: usize,
@@ -24,28 +267,28 @@ impl<T> Parsed<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Number {
-    pub representation: String,
+    pub representation: Text,
     pub integer: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum Token {
-    Ident(String),
-    Function(String),
-    AtKeyword(String),
+    Ident(Text),
+    Function(Text),
+    AtKeyword(Text),
     Hash {
-        value: String,
+        value: Text,
         id: bool,
     },
-    String(String),
+    String(Text),
     BadString,
-    Url(String),
+    Url(Text),
     BadUrl,
     Number(Number),
     Percentage(Number),
-    Dimension(Number, String),
+    Dimension(Number, Text),
     Whitespace,
     Cdo,
     Cdc,
@@ -55,16 +298,16 @@ pub enum Token {
     Delim(char),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum Component {
     Token(Token),
     Block {
         kind: char,
-        values: Vec<Component>,
+        values: BudgetVec<Component>,
     },
     Function {
-        name: String,
-        values: Vec<Component>,
+        name: Text,
+        values: BudgetVec<Component>,
     },
 }
 
@@ -77,6 +320,12 @@ impl Component {
         matches!(self, Self::Token(Token::Delim(c)) if *c == ch)
     }
 
+    pub(crate) fn ident_owned(&self) -> Option<&Text> {
+        match self {
+            Self::Token(Token::Ident(name)) => Some(name),
+            _ => None,
+        }
+    }
     pub(crate) fn ident(&self) -> Option<&str> {
         match self {
             Self::Token(Token::Ident(name)) => Some(name),
@@ -85,17 +334,17 @@ impl Component {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Rule {
-    pub(crate) name: Option<String>,
-    pub(crate) prelude: Vec<Component>,
-    pub(crate) block: Option<Vec<Component>>,
+    pub(crate) name: Option<Text>,
+    pub(crate) prelude: BudgetVec<Component>,
+    pub(crate) block: Option<BudgetVec<Component>>,
 }
 
 impl Rule {
     /// None denotes a qualified rule; Some denotes an at-rule.
     pub fn at_name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.name.as_ref().map(|name| name.as_str())
     }
 
     pub fn prelude(&self) -> &[Component] {
@@ -103,18 +352,24 @@ impl Rule {
     }
 
     pub fn block(&self) -> Option<&[Component]> {
-        self.block.as_deref()
+        self.block.as_ref().map(|v| v.as_slice())
     }
 
-    pub fn declarations(&self) -> Result<Parsed<Vec<Declaration>>, Error> {
-        declarations(self.block.as_deref().unwrap_or_default())
+    pub fn declarations(&self) -> Result<Parsed<BudgetVec<Declaration>>, Error> {
+        declarations(
+            self.block
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or_default(),
+            self.prelude.budget(),
+        )
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Declaration {
-    name: String,
-    value: Vec<Component>,
+    name: Text,
+    value: BudgetVec<Component>,
     important: bool,
 }
 
@@ -168,23 +423,27 @@ fn starts_number(a: Option<char>, b: Option<char>, c: Option<char>) -> bool {
     }
 }
 
-fn push(text: &mut String, ch: char) -> Result<(), Error> {
-    if text.len() + ch.len_utf8() > MAX_TOKEN_BYTES {
-        return Err(Error::Limit("MAX_TOKEN_BYTES"));
-    }
-    text.push(ch);
-    Ok(())
+fn append_char(text: &mut TextBuilder<'_>, ch: char) -> Result<(), Error> {
+    text.try_push(ch)
 }
 
-struct Lexer {
-    chars: Vec<char>,
+enum Input<'a> {
+    Ascii(&'a [u8]),
+    Unicode(BudgetVec<char>),
+}
+struct Lexer<'a> {
+    chars: Input<'a>,
+    memory: &'a Budget,
     pos: usize,
     errors: usize,
 }
 
-impl Lexer {
+impl Lexer<'_> {
     fn peek(&self, offset: usize) -> Option<char> {
-        self.chars.get(self.pos + offset).copied()
+        match &self.chars {
+            Input::Ascii(bytes) => bytes.get(self.pos + offset).copied().map(char::from),
+            Input::Unicode(chars) => chars.get(self.pos + offset).copied(),
+        }
     }
 
     fn take(&mut self) -> Option<char> {
@@ -228,34 +487,36 @@ impl Lexer {
         }
     }
 
-    fn name(&mut self) -> Result<String, Error> {
-        let mut text = String::new();
+    fn name(&mut self) -> Result<Text, Error> {
+        let memory = self.memory;
+        let mut text = TextBuilder::new(memory);
         loop {
             match self.peek(0) {
                 Some(ch) if name_char(ch) => {
                     self.pos += 1;
-                    push(&mut text, ch)?;
+                    append_char(&mut text, ch)?;
                 }
                 Some('\\') if valid_escape(self.peek(0), self.peek(1)) => {
                     self.pos += 1;
-                    push(&mut text, self.escape())?;
+                    append_char(&mut text, self.escape())?;
                 }
-                _ => return Ok(text),
+                _ => return text.finish(),
             }
         }
     }
 
     fn string(&mut self, quote: char) -> Result<Token, Error> {
-        let mut text = String::new();
+        let memory = self.memory;
+        let mut text = TextBuilder::new(memory);
         loop {
             match self.peek(0) {
                 None => {
                     self.error();
-                    return Ok(Token::String(text));
+                    return Ok(Token::String(text.finish()?));
                 }
                 Some(ch) if ch == quote => {
                     self.pos += 1;
-                    return Ok(Token::String(text));
+                    return Ok(Token::String(text.finish()?));
                 }
                 Some('\n') => {
                     self.error();
@@ -266,12 +527,12 @@ impl Lexer {
                     match self.peek(0) {
                         Some('\n') => self.pos += 1,
                         None => {}
-                        Some(_) => push(&mut text, self.escape())?,
+                        Some(_) => append_char(&mut text, self.escape())?,
                     }
                 }
                 Some(ch) => {
                     self.pos += 1;
-                    push(&mut text, ch)?;
+                    append_char(&mut text, ch)?;
                 }
             }
         }
@@ -291,7 +552,8 @@ impl Lexer {
     }
 
     fn url(&mut self) -> Result<Token, Error> {
-        let mut text = String::new();
+        let memory = self.memory;
+        let mut text = TextBuilder::new(memory);
         while self.peek(0).is_some_and(space) {
             self.pos += 1;
         }
@@ -299,9 +561,9 @@ impl Lexer {
             match self.take() {
                 None => {
                     self.error();
-                    return Ok(Token::Url(text));
+                    return Ok(Token::Url(text.finish()?));
                 }
-                Some(')') => return Ok(Token::Url(text)),
+                Some(')') => return Ok(Token::Url(text.finish()?)),
                 Some(ch) if space(ch) => {
                     while self.peek(0).is_some_and(space) {
                         self.pos += 1;
@@ -309,11 +571,11 @@ impl Lexer {
                     match self.peek(0) {
                         Some(')') => {
                             self.pos += 1;
-                            return Ok(Token::Url(text));
+                            return Ok(Token::Url(text.finish()?));
                         }
                         None => {
                             self.error();
-                            return Ok(Token::Url(text));
+                            return Ok(Token::Url(text.finish()?));
                         }
                         _ => return Ok(self.bad_url()),
                     }
@@ -325,26 +587,27 @@ impl Lexer {
                     if self.peek(0) == Some('\n') {
                         return Ok(self.bad_url());
                     }
-                    push(&mut text, self.escape())?;
+                    append_char(&mut text, self.escape())?;
                 }
-                Some(ch) => push(&mut text, ch)?,
+                Some(ch) => append_char(&mut text, ch)?,
             }
         }
     }
 
     fn number(&mut self) -> Result<Token, Error> {
-        let mut representation = String::new();
+        let memory = self.memory;
+        let mut representation = TextBuilder::new(memory);
         let mut integer = true;
         if matches!(self.peek(0), Some('+' | '-')) {
             if let Some(ch) = self.take() {
-                push(&mut representation, ch)?;
+                append_char(&mut representation, ch)?;
             }
         }
         self.digits(&mut representation)?;
         if self.peek(0) == Some('.') && self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
             integer = false;
             self.pos += 1;
-            push(&mut representation, '.')?;
+            append_char(&mut representation, '.')?;
             self.digits(&mut representation)?;
         }
         if matches!(self.peek(0), Some('e' | 'E'))
@@ -354,17 +617,17 @@ impl Lexer {
         {
             integer = false;
             if let Some(ch) = self.take() {
-                push(&mut representation, ch)?;
+                append_char(&mut representation, ch)?;
             }
             if matches!(self.peek(0), Some('+' | '-')) {
                 if let Some(ch) = self.take() {
-                    push(&mut representation, ch)?;
+                    append_char(&mut representation, ch)?;
                 }
             }
             self.digits(&mut representation)?;
         }
         let number = Number {
-            representation,
+            representation: representation.finish()?,
             integer,
         };
         if self.ident_start() {
@@ -377,10 +640,10 @@ impl Lexer {
         }
     }
 
-    fn digits(&mut self, text: &mut String) -> Result<(), Error> {
+    fn digits(&mut self, text: &mut TextBuilder<'_>) -> Result<(), Error> {
         while let Some(ch) = self.peek(0).filter(|c| c.is_ascii_digit()) {
             self.pos += 1;
-            push(text, ch)?;
+            append_char(text, ch)?;
         }
         Ok(())
     }
@@ -470,40 +733,61 @@ impl Lexer {
     }
 }
 
-pub fn tokenize(input: &str) -> Result<Parsed<Vec<Token>>, Error> {
+fn lexer<'a>(input: &'a str, memory: &'a Budget) -> Result<Lexer<'a>, Error> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(Error::Limit("MAX_INPUT_BYTES"));
     }
-    let mut chars = Vec::with_capacity(input.len());
+    if input.is_ascii() && !input.bytes().any(|c| matches!(c, b'\r' | 0x0c | 0)) {
+        return Ok(Lexer {
+            chars: Input::Ascii(input.as_bytes()),
+            memory,
+            pos: 0,
+            errors: 0,
+        });
+    }
+    let mut chars = td_alloc::BudgetVec::with_capacity(memory, input.len())?;
     let mut source = input
         .strip_prefix('\u{feff}')
         .unwrap_or(input)
         .chars()
         .peekable();
     while let Some(ch) = source.next() {
-        chars.push(match ch {
-            '\r' => {
-                if source.peek() == Some(&'\n') {
-                    let _ = source.next();
+        chars
+            .push_within_capacity(match ch {
+                '\r' => {
+                    if source.peek() == Some(&'\n') {
+                        let _ = source.next();
+                    }
+                    '\n'
                 }
-                '\n'
-            }
-            '\x0c' => '\n',
-            '\0' => '\u{fffd}',
-            _ => ch,
-        });
+                '\x0c' => '\n',
+                '\0' => '\u{fffd}',
+                _ => ch,
+            })
+            .map_err(|_| Error::InvalidContext)?;
     }
-    let mut lexer = Lexer {
-        chars,
+    Ok(Lexer {
+        chars: Input::Unicode(chars),
+        memory,
         pos: 0,
         errors: 0,
-    };
-    let mut tokens = Vec::new();
+    })
+}
+
+pub fn tokenize(input: &str) -> Result<Parsed<BudgetVec<Token>>, Error> {
+    tokenize_with_budget(input, &crate::memory()?)
+}
+pub fn tokenize_with_budget(
+    input: &str,
+    memory: &Budget,
+) -> Result<Parsed<BudgetVec<Token>>, Error> {
+    let mut lexer = lexer(input, memory)?;
+    let mut tokens = BudgetVec::new(memory)?;
     while let Some(token) = lexer.token()? {
         if tokens.len() == MAX_TOKENS {
             return Err(Error::Limit("MAX_TOKENS"));
         }
-        tokens.push(token);
+        tokens.try_push(token)?;
     }
     Ok(Parsed {
         value: tokens,
@@ -511,14 +795,47 @@ pub fn tokenize(input: &str) -> Result<Parsed<Vec<Token>>, Error> {
     })
 }
 
-struct Components {
-    tokens: std::vec::IntoIter<Token>,
+struct Components<'a> {
+    memory: &'a Budget,
+    tokens: BudgetIntoIter<Token>,
     errors: usize,
 }
 
-impl Components {
-    fn list(&mut self, close: Option<char>, depth: usize) -> Result<Vec<Component>, Error> {
-        let mut values = Vec::new();
+// Count immediate children, skipping nested lists with a fixed bounded stack.
+// Exact reservation avoids repeated growth while building common rule bodies.
+fn component_capacity(tokens: &[Token], close: Option<char>) -> Result<usize, Error> {
+    let mut ends = ['\0'; MAX_NESTING];
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    for token in tokens {
+        if depth == 0 {
+            if matches!(token, Token::Close(ch) if Some(*ch) == close) {
+                break;
+            }
+            count += 1;
+        }
+        let end = match token {
+            Token::Open('(') | Token::Function(_) => Some(')'),
+            Token::Open('[') => Some(']'),
+            Token::Open('{') => Some('}'),
+            Token::Close(ch) if depth > 0 && ends.get(depth - 1) == Some(ch) => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        };
+        if let Some(end) = end {
+            *ends.get_mut(depth).ok_or(Error::Limit("MAX_NESTING"))? = end;
+            depth += 1;
+        }
+    }
+    Ok(count)
+}
+
+impl Components<'_> {
+    fn list(&mut self, close: Option<char>, depth: usize) -> Result<BudgetVec<Component>, Error> {
+        let capacity = component_capacity(self.tokens.as_slice(), close)?;
+        let mut values = td_alloc::BudgetVec::with_capacity(self.memory, capacity)?;
         while let Some(token) = self.tokens.next() {
             if matches!(token, Token::Close(ch) if Some(ch) == close) {
                 return Ok(values);
@@ -554,7 +871,9 @@ impl Components {
                     Component::Token(other)
                 }
             };
-            values.push(component);
+            values
+                .push_within_capacity(component)
+                .map_err(|_| Error::InvalidContext)?;
         }
         if close.is_some() {
             self.errors = self.errors.saturating_add(1);
@@ -563,9 +882,16 @@ impl Components {
     }
 }
 
-pub fn parse_components(input: &str) -> Result<Parsed<Vec<Component>>, Error> {
-    let tokens = tokenize(input)?;
+pub fn parse_components(input: &str) -> Result<Parsed<BudgetVec<Component>>, Error> {
+    parse_components_with_budget(input, &crate::memory()?)
+}
+pub fn parse_components_with_budget(
+    input: &str,
+    memory: &Budget,
+) -> Result<Parsed<BudgetVec<Component>>, Error> {
+    let tokens = tokenize_with_budget(input, memory)?;
     let mut parser = Components {
+        memory,
         tokens: tokens.value.into_iter(),
         errors: tokens.errors,
     };
@@ -576,18 +902,25 @@ pub fn parse_components(input: &str) -> Result<Parsed<Vec<Component>>, Error> {
     })
 }
 
-pub fn parse_stylesheet(input: &str) -> Result<Parsed<Vec<Rule>>, Error> {
-    let components = parse_components(input)?;
+pub fn parse_stylesheet(input: &str) -> Result<Parsed<BudgetVec<Rule>>, Error> {
+    parse_stylesheet_with_budget(input, &crate::memory()?)
+}
+pub fn parse_stylesheet_with_budget(
+    input: &str,
+    memory: &Budget,
+) -> Result<Parsed<BudgetVec<Rule>>, Error> {
+    let components = parse_components_with_budget(input, memory)?;
     rule_list(components.value, components.errors, true)
 }
 
 pub(crate) fn rule_list(
-    values: Vec<Component>,
+    values: BudgetVec<Component>,
     mut errors: usize,
     top: bool,
-) -> Result<Parsed<Vec<Rule>>, Error> {
+) -> Result<Parsed<BudgetVec<Rule>>, Error> {
+    let memory = values.budget().try_clone()?;
     let mut source = values.into_iter().peekable();
-    let mut rules = Vec::new();
+    let mut rules = BudgetVec::new(&memory)?;
     while let Some(first) = source.next() {
         if matches!(first, Component::Token(Token::Whitespace))
             || (top && matches!(first, Component::Token(Token::Cdo | Token::Cdc)))
@@ -595,9 +928,21 @@ pub(crate) fn rule_list(
             continue;
         }
         let (name, mut prelude, first_block) = match first {
-            Component::Token(Token::AtKeyword(name)) => (Some(name), Vec::new(), None),
-            Component::Block { kind: '{', values } => (None, Vec::new(), Some(values)),
-            other => (None, vec![other], None),
+            Component::Token(Token::AtKeyword(name)) => {
+                (Some(name), BudgetVec::new(&memory)?, None)
+            }
+            Component::Block { kind: '{', values } => {
+                (None, BudgetVec::new(&memory)?, Some(values))
+            }
+            other => (
+                None,
+                {
+                    let mut list = BudgetVec::new(&memory)?;
+                    list.try_push(other)?;
+                    list
+                },
+                None,
+            ),
         };
         let mut block = first_block;
         let mut terminated = block.is_some();
@@ -613,7 +958,7 @@ pub(crate) fn rule_list(
                         terminated = true;
                         break;
                     }
-                    other => prelude.push(other),
+                    other => prelude.try_push(other)?,
                 }
             }
         }
@@ -626,11 +971,11 @@ pub(crate) fn rule_list(
         if rules.len() == MAX_RULES {
             return Err(Error::Limit("MAX_RULES"));
         }
-        rules.push(Rule {
+        rules.try_push(Rule {
             name,
             prelude,
             block,
-        });
+        })?;
     }
     Ok(Parsed {
         value: rules,
@@ -648,17 +993,23 @@ pub(crate) fn trim(mut values: &[Component]) -> &[Component] {
     values
 }
 
-pub(crate) fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaration>>, Error> {
-    let mut source = values.iter().peekable();
-    let mut output = Vec::new();
+pub(crate) fn declarations(
+    values: &[Component],
+    memory: &Budget,
+) -> Result<Parsed<BudgetVec<Declaration>>, Error> {
+    let mut source = values;
+    let mut output = BudgetVec::new(memory)?;
     let mut errors = 0usize;
-    while let Some(first) = source.next() {
+    while let Some((first, rest)) = source.split_first() {
+        let current = source;
+        source = rest;
         if first.whitespace() || first.delim(';') {
             continue;
         }
         if matches!(first, Component::Token(Token::AtKeyword(_))) {
             let mut terminated = false;
-            for item in source.by_ref() {
+            while let Some((item, rest)) = source.split_first() {
+                source = rest;
                 if item.delim(';') || matches!(item, Component::Block { kind: '{', .. }) {
                     terminated = true;
                     break;
@@ -669,13 +1020,13 @@ pub(crate) fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaratio
             }
             continue;
         }
-        let mut candidate = vec![first.clone()];
-        while source.peek().is_some_and(|c| !c.delim(';')) {
-            if let Some(item) = source.next() {
-                candidate.push(item.clone());
-            }
-        }
-        let Some(name) = first.ident() else {
+        let end = source
+            .iter()
+            .position(|c| c.delim(';'))
+            .unwrap_or(source.len());
+        let candidate = current.get(..end + 1).ok_or(Error::InvalidContext)?;
+        source = source.get(end..).ok_or(Error::InvalidContext)?;
+        let Some(name) = first.ident_owned() else {
             errors = errors.saturating_add(1);
             continue;
         };
@@ -700,11 +1051,11 @@ pub(crate) fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaratio
         if output.len() == MAX_DECLARATIONS {
             return Err(Error::Limit("MAX_DECLARATIONS"));
         }
-        output.push(Declaration {
-            name: name.to_owned(),
-            value: value.to_vec(),
+        output.try_push(Declaration {
+            name: name.try_clone()?,
+            value: copy_components(value, memory)?,
             important,
-        });
+        })?;
     }
     Ok(Parsed {
         value: output,
@@ -712,9 +1063,15 @@ pub(crate) fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaratio
     })
 }
 
-pub fn parse_declarations(input: &str) -> Result<Parsed<Vec<Declaration>>, Error> {
-    let components = parse_components(input)?;
-    let mut parsed = declarations(&components.value)?;
+pub fn parse_declarations(input: &str) -> Result<Parsed<BudgetVec<Declaration>>, Error> {
+    parse_declarations_with_budget(input, &crate::memory()?)
+}
+pub fn parse_declarations_with_budget(
+    input: &str,
+    memory: &Budget,
+) -> Result<Parsed<BudgetVec<Declaration>>, Error> {
+    let components = parse_components_with_budget(input, memory)?;
+    let mut parsed = declarations(&components.value, memory)?;
     parsed.errors = parsed.errors.saturating_add(components.errors);
     Ok(parsed)
 }

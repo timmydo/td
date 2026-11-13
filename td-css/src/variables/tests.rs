@@ -7,7 +7,8 @@ use crate::{
 };
 fn style(inline: &str) -> ComputedStyle {
     let nodes = tree();
-    StyleSet::default()
+    StyleSet::new(&[])
+        .unwrap()
         .compute(
             &Handle {
                 nodes: &nodes,
@@ -69,7 +70,7 @@ fn every_cycle_member_is_invalid_including_unused_fallback_edges() {
 #[test]
 fn inherited_custom_values_are_substituted_once_but_lengths_use_current_font() {
     let nodes = tree();
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     let e = Handle {
         nodes: &nodes,
         index: 3,
@@ -96,7 +97,7 @@ fn inherited_custom_values_are_substituted_once_but_lengths_use_current_font() {
         Some(&ComputedValue::Length(Length::Px(20.0)))
     );
     let unchanged = set.compute(&e, Some(&parent), 20.0, "").unwrap();
-    assert!(Arc::ptr_eq(
+    assert!(td_alloc::BudgetShared::ptr_eq(
         &parent.custom.entries,
         &unchanged.custom.entries
     ));
@@ -198,11 +199,14 @@ fn custom_count_and_storage_have_exact_edges() {
     let definitions: String = (0..MAX_CUSTOM_PROPERTIES)
         .map(|i| format!("--x{i}:0;"))
         .collect();
-    assert!(StyleSet::default()
+    assert!(StyleSet::new(&[])
+        .unwrap()
         .compute(&e, None, 16.0, &definitions)
         .is_ok());
     assert_eq!(
-        StyleSet::default().compute(&e, None, 16.0, &format!("{definitions}--extra:0")),
+        StyleSet::new(&[])
+            .unwrap()
+            .compute(&e, None, 16.0, &format!("{definitions}--extra:0")),
         Err(Error::Limit("MAX_CUSTOM_PROPERTIES"))
     );
     let payload = "x".repeat(MAX_CUSTOM_BYTES / 64 - 7);
@@ -235,7 +239,7 @@ fn dependency_depth_and_expansion_work_refuse_before_unbounded_growth() {
         nodes: &nodes,
         index: 3,
     };
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     for count in [MAX_VARIABLE_DEPTH, MAX_VARIABLE_DEPTH + 1] {
         let text: String = (0..count)
             .map(|i| {
@@ -309,7 +313,7 @@ fn custom_values_apply_css_wide_defaulting_after_substitution() {
         nodes: &nodes,
         index: 3,
     };
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     let parent = style("--a:red;--b:blue");
     for (wide, want) in [("initial", "orange"), ("inherit", "red"), ("unset", "red")] {
         let source = format!("--a:var(--missing,{wide});color:var(--a,orange)");

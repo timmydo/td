@@ -1,5 +1,7 @@
 use crate::{raw, Budget, BudgetError, Charge};
+use std::borrow::Borrow;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 
 fn growth_capacity<T>(budget: &Budget, current: usize, needed: usize) -> usize {
@@ -37,6 +39,9 @@ impl<T> BudgetVec<T> {
         let values = raw::vector(capacity)?;
         Ok(Self { values, charge })
     }
+    pub fn as_slice(&self) -> &[T] {
+        &self.values
+    }
     pub fn capacity(&self) -> usize {
         self.values.capacity()
     }
@@ -54,10 +59,9 @@ impl<T> BudgetVec<T> {
         // Conservatively admit the full replacement even when realloc can
         // extend in place. On refusal the old allocation and charge survive.
         let layout = std::alloc::Layout::array::<T>(capacity).map_err(|_| BudgetError::Overflow)?;
-        let charge = self.budget().charge(layout.size())?;
-        raw::grow_vector(&mut self.values, capacity)?;
-        self.charge = charge;
-        Ok(())
+        self.charge.replace_layout(layout.size(), || {
+            raw::grow_vector(&mut self.values, capacity)
+        })
     }
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), BudgetError> {
         let needed = self
@@ -113,6 +117,11 @@ impl<T> BudgetVec<T> {
         Buffer(self)
     }
 }
+impl<T: PartialEq> BudgetVec<T> {
+    pub fn dedup(&mut self) {
+        self.values.dedup();
+    }
+}
 impl<T: Copy> BudgetVec<T> {
     pub fn filled(budget: &Budget, len: usize, value: T) -> Result<Self, BudgetError> {
         let mut out = Self::with_capacity(budget, len)?;
@@ -165,6 +174,191 @@ impl<'a, T> IntoIterator for &'a mut BudgetVec<T> {
     type IntoIter = std::slice::IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
+    }
+}
+
+/// Consuming iteration retains the backing allocation's charge until drop.
+pub struct BudgetIntoIter<T> {
+    values: std::vec::IntoIter<T>,
+    _charge: Charge,
+}
+impl<T> IntoIterator for BudgetVec<T> {
+    type Item = T;
+    type IntoIter = BudgetIntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        BudgetIntoIter {
+            values: self.values.into_iter(),
+            _charge: self.charge,
+        }
+    }
+}
+impl<T> BudgetIntoIter<T> {
+    pub fn as_slice(&self) -> &[T] {
+        self.values.as_slice()
+    }
+}
+impl<T> Iterator for BudgetIntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.values.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.values.size_hint()
+    }
+}
+impl<T> DoubleEndedIterator for BudgetIntoIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        self.values.next_back()
+    }
+}
+impl<T> ExactSizeIterator for BudgetIntoIter<T> {}
+impl<T> std::iter::FusedIterator for BudgetIntoIter<T> {}
+impl<T: Hash> Hash for BudgetVec<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.values.hash(state);
+    }
+}
+
+/// Sorted, compact owned map. Lookup is logarithmic; insertion shifts entries.
+/// Keys and values must own admission for any nested allocations.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BudgetMap<K, V> {
+    entries: BudgetVec<(K, V)>,
+}
+impl<K, V> BudgetMap<K, V> {
+    pub fn with_capacity(budget: &Budget, capacity: usize) -> Result<Self, BudgetError> {
+        Ok(Self {
+            entries: BudgetVec::with_capacity(budget, capacity)?,
+        })
+    }
+
+    pub fn new(budget: &Budget) -> Result<Self, BudgetError> {
+        Ok(Self {
+            entries: BudgetVec::new(budget)?,
+        })
+    }
+    pub fn budget(&self) -> &Budget {
+        self.entries.budget()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+    /// Borrow the entry at its sorted position, without exposing key mutation.
+    pub fn get_index(&self, index: usize) -> Option<(&K, &V)> {
+        self.entries.get(index).map(|(key, value)| (key, value))
+    }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> + ExactSizeIterator {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> + ExactSizeIterator {
+        self.entries.iter().map(|(key, _)| key)
+    }
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &V> + ExactSizeIterator {
+        self.entries.iter().map(|(_, value)| value)
+    }
+    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut V> + ExactSizeIterator {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
+}
+impl<K: Ord, V> BudgetMap<K, V> {
+    fn locate<Q: Ord + ?Sized>(&self, key: &Q) -> Result<usize, usize>
+    where
+        K: Borrow<Q>,
+    {
+        self.entries
+            .binary_search_by(|(stored, _)| stored.borrow().cmp(key))
+    }
+    pub fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.entries
+            .get(self.locate(key).ok()?)
+            .map(|(_, value)| value)
+    }
+    pub fn get_mut<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
+        let index = self.locate(key).ok()?;
+        self.entries.get_mut(index).map(|(_, value)| value)
+    }
+    pub fn contains_key<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
+        self.locate(key).is_ok()
+    }
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, BudgetError> {
+        match self.locate(&key) {
+            Ok(index) => {
+                let (_, stored) = self.entries.get_mut(index).ok_or(BudgetError::Overflow)?;
+                Ok(Some(std::mem::replace(stored, value)))
+            }
+            Err(index) => {
+                self.entries.try_push((key, value))?;
+                self.entries
+                    .get_mut(index..)
+                    .ok_or(BudgetError::Overflow)?
+                    .rotate_right(1);
+                Ok(None)
+            }
+        }
+    }
+    pub fn try_get_or_insert_with(
+        &mut self,
+        key: K,
+        make: impl FnOnce(&Budget) -> Result<V, BudgetError>,
+    ) -> Result<&mut V, BudgetError> {
+        let index = match self.locate(&key) {
+            Ok(index) => index,
+            Err(index) => {
+                let value = make(self.budget())?;
+                self.entries.try_push((key, value))?;
+                self.entries
+                    .get_mut(index..)
+                    .ok_or(BudgetError::Overflow)?
+                    .rotate_right(1);
+                index
+            }
+        };
+        self.entries
+            .get_mut(index)
+            .map(|(_, value)| value)
+            .ok_or(BudgetError::Overflow)
+    }
+    pub fn remove<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
+        self.entries
+            .remove(self.locate(key).ok()?)
+            .map(|(_, value)| value)
+    }
+}
+impl<K: Hash, V: Hash> Hash for BudgetMap<K, V> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entries.hash(state);
+    }
+}
+impl<K, V> IntoIterator for BudgetMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = BudgetIntoIter<(K, V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+impl<'a, K, V> IntoIterator for &'a BudgetMap<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, (K, V)>, fn(&'a (K, V)) -> (&'a K, &'a V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, v))
     }
 }
 
@@ -229,6 +423,9 @@ impl BudgetString {
     pub fn capacity(&self) -> usize {
         self.values.capacity()
     }
+    pub fn make_ascii_lowercase(&mut self) {
+        self.values.make_ascii_lowercase();
+    }
 
     pub fn new(budget: &Budget) -> Result<Self, BudgetError> {
         Self::with_capacity(budget, 0)
@@ -248,14 +445,16 @@ impl BudgetString {
             .ok_or(BudgetError::Overflow)?;
         if needed > self.values.capacity() {
             let preferred = growth_capacity::<u8>(self.budget(), self.values.capacity(), needed);
-            let capacity = match self.budget().charge(preferred) {
+            match self
+                .charge
+                .replace_layout(preferred, || raw::grow_string(&mut self.values, preferred))
+            {
                 Err(BudgetError::Limit | BudgetError::Overflow) if preferred != needed => {
-                    self.budget().charge(needed)?
+                    self.charge
+                        .replace_layout(needed, || raw::grow_string(&mut self.values, needed))?;
                 }
                 result => result?,
-            };
-            raw::grow_string(&mut self.values, capacity.bytes())?;
-            self.charge = capacity;
+            }
         }
         self.values.push_str(value);
         Ok(())
@@ -305,6 +504,26 @@ impl PartialEq<&str> for BudgetString {
     }
 }
 impl Eq for BudgetString {}
+impl PartialOrd for BudgetString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BudgetString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+impl Hash for BudgetString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+impl Borrow<str> for BudgetString {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
 
 /// Fallible immutable shared ownership. The control block and value stay
 /// charged until the final owner drops; nested allocations need owned storage.
@@ -314,6 +533,10 @@ struct SharedValue<T> {
     charge: Charge,
 }
 impl<T> BudgetShared<T> {
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        std::ptr::eq(left.deref(), right.deref())
+    }
+
     pub fn new(budget: &Budget, value: T) -> Result<Self, BudgetError> {
         let charge = budget.charge(raw::Shared::<SharedValue<T>>::bytes())?;
         Ok(Self(raw::Shared::new(SharedValue { value, charge })?))
@@ -342,6 +565,32 @@ impl<T: PartialEq> PartialEq for BudgetShared<T> {
     }
 }
 impl<T: Eq> Eq for BudgetShared<T> {}
+impl<T> AsRef<T> for BudgetShared<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+impl<T: Ord> PartialOrd for BudgetShared<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T: Ord> Ord for BudgetShared<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deref().cmp(other.deref())
+    }
+}
+impl<T: Hash> Hash for BudgetShared<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
+    }
+}
+impl Borrow<str> for BudgetShared<BudgetString> {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl PartialEq<&str> for BudgetShared<BudgetString> {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other

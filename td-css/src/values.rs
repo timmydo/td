@@ -1,8 +1,8 @@
 //! Property grammars and the computed-value model.
+use crate::syntax::{self, Text};
 use crate::syntax::{Component, Declaration, Token};
 use crate::{calc, variables, Error};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use td_alloc::{Budget, BudgetMap, BudgetShared, BudgetString, BudgetVec};
 mod layout;
 
 pub const MAX_FAMILIES: usize = 32;
@@ -246,12 +246,16 @@ impl Property {
     }
 
     /// Context-free seed; complete computation also applies dependent properties.
-    pub fn initial(self) -> ComputedValue {
-        match self {
+    pub fn initial(self, memory: &Budget) -> Result<ComputedValue, Error> {
+        Ok(match self {
             Self::Display => ComputedValue::Keyword("inline"),
             Self::Color => ComputedValue::Color(Color::BLACK),
             Self::BackgroundColor => ComputedValue::Color(Color::TRANSPARENT),
-            Self::FontFamily => ComputedValue::FontFamily(vec![Family::Generic("serif")]),
+            Self::FontFamily => ComputedValue::FontFamily({
+                let mut list = BudgetVec::new(memory)?;
+                list.try_push(Family::Generic("serif"))?;
+                BudgetShared::new(memory, list)?
+            }),
             Self::FontSize => ComputedValue::Length(Length::Px(16.0)),
             Self::FontWeight => ComputedValue::Weight(400),
             Self::FontStyle | Self::WhiteSpace => ComputedValue::Keyword("normal"),
@@ -284,7 +288,7 @@ impl Property {
             p if p.border_color() => ComputedValue::Color(Color::BLACK),
             property if property.border() => ComputedValue::Length(Length::Px(3.0)),
             _ => ComputedValue::Length(Length::Px(0.0)),
-        }
+        })
     }
 }
 
@@ -356,10 +360,10 @@ impl Length {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Family {
     Generic(&'static str),
-    Named(String),
+    Named(Text),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -369,41 +373,77 @@ pub struct Decoration {
     pub line_through: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ComputedValue {
     Number(f64),
     Keyword(&'static str),
     Color(Color),
     Length(Length),
-    FontFamily(Vec<Family>),
+    FontFamily(BudgetShared<BudgetVec<Family>>),
     Weight(u16),
     Decoration(Decoration),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ComputedStyle {
-    pub(crate) values: BTreeMap<Property, ComputedValue>,
+    pub(crate) values: BudgetMap<Property, ComputedValue>,
     pub(crate) custom: variables::CustomProperties,
 }
 
-impl Default for ComputedStyle {
-    fn default() -> Self {
-        Self {
-            values: Property::ALL
-                .iter()
-                .map(|p| {
-                    (
-                        *p,
-                        if p.border() {
-                            ComputedValue::Length(Length::Px(0.0))
-                        } else {
-                            p.initial()
-                        },
-                    )
-                })
-                .collect(),
-            custom: variables::CustomProperties::default(),
+impl ComputedStyle {
+    pub fn new(memory: &Budget) -> Result<Self, Error> {
+        let mut values = td_alloc::BudgetMap::with_capacity(memory, Property::ALL.len())?;
+        for property in Property::ALL {
+            let value = if property.border() {
+                ComputedValue::Length(Length::Px(0.0))
+            } else {
+                property.initial(memory)?
+            };
+            values.try_insert(*property, value)?;
         }
+        Ok(Self {
+            values,
+            custom: variables::CustomProperties::new(memory)?,
+        })
+    }
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let mut values =
+            td_alloc::BudgetMap::with_capacity(self.values.budget(), self.values.len())?;
+        for (key, value) in &self.values {
+            values.try_insert(*key, value.try_clone()?)?;
+        }
+        Ok(Self {
+            values,
+            custom: self.custom.try_clone()?,
+        })
+    }
+}
+impl ComputedValue {
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Number(v) => Self::Number(*v),
+            Self::Keyword(v) => Self::Keyword(v),
+            Self::Color(v) => Self::Color(*v),
+            Self::Length(v) => Self::Length(*v),
+            Self::FontFamily(v) => Self::FontFamily(v.try_clone()?),
+            Self::Weight(v) => Self::Weight(*v),
+            Self::Decoration(v) => Self::Decoration(*v),
+        })
+    }
+}
+impl Specified {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Pending(v) => Self::Pending(v.try_clone()?),
+            Self::Initial => Self::Initial,
+            Self::Inherit => Self::Inherit,
+            Self::Unset => Self::Unset,
+            Self::Ready(v) => Self::Ready(v.try_clone()?),
+            Self::CurrentColor => Self::CurrentColor,
+            Self::Length(n, u) => Self::Length(*n, *u),
+            Self::Calculated(v) => Self::Calculated(*v),
+            Self::RelativeWeight(v) => Self::RelativeWeight(*v),
+        })
     }
 }
 
@@ -414,7 +454,12 @@ impl ComputedStyle {
     }
 
     pub fn get(&self, property: Property) -> Option<&ComputedValue> {
-        self.values.get(&property)
+        // Completed styles contain the entire ordered property roster.
+        self.values
+            .get_index(property as usize)
+            .filter(|(key, _)| **key == property)
+            .map(|(_, value)| value)
+            .or_else(|| self.values.get(&property))
     }
 
     pub fn font_size(&self) -> f64 {
@@ -439,7 +484,7 @@ impl ComputedStyle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum Specified {
     Pending(variables::Pending),
     Initial,
@@ -467,7 +512,7 @@ pub(crate) enum Unit {
     Auto,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ValueDeclaration {
     pub property: Property,
     pub value: Specified,
@@ -513,7 +558,7 @@ fn single_ident(values: &[Component]) -> Option<&str> {
 }
 
 fn global(values: &[Component]) -> Option<Specified> {
-    match single_ident(values)?.to_ascii_lowercase().as_str() {
+    match syntax::keyword(single_ident(values)?, &["initial", "inherit", "unset"])? {
         "initial" => Some(Specified::Initial),
         "inherit" => Some(Specified::Inherit),
         "unset" => Some(Specified::Unset),
@@ -521,21 +566,61 @@ fn global(values: &[Component]) -> Option<Specified> {
     }
 }
 
-pub(crate) fn parse_declaration(declaration: &Declaration) -> Result<Vec<ValueDeclaration>, Error> {
+pub(crate) enum Declarations {
+    Single(Option<ValueDeclaration>),
+    Many(BudgetVec<ValueDeclaration>),
+}
+impl Declarations {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Single(value) => value.is_none(),
+            Self::Many(values) => values.is_empty(),
+        }
+    }
+}
+pub(crate) enum DeclarationIter {
+    Single(std::option::IntoIter<ValueDeclaration>),
+    Many(td_alloc::BudgetIntoIter<ValueDeclaration>),
+}
+impl Iterator for DeclarationIter {
+    type Item = ValueDeclaration;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(value) => value.next(),
+            Self::Many(values) => values.next(),
+        }
+    }
+}
+impl IntoIterator for Declarations {
+    type Item = ValueDeclaration;
+    type IntoIter = DeclarationIter;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Single(value) => DeclarationIter::Single(value.into_iter()),
+            Self::Many(values) => DeclarationIter::Many(values.into_iter()),
+        }
+    }
+}
+
+pub(crate) fn parse_declaration(
+    declaration: &Declaration,
+    memory: &Budget,
+) -> Result<Declarations, Error> {
     parse_named(
         declaration.name(),
         declaration.value(),
         declaration.important(),
+        memory,
     )
 }
-
 fn parse_named(
     name: &str,
     values: &[Component],
     important: bool,
-) -> Result<Vec<ValueDeclaration>, Error> {
-    let name = name.to_ascii_lowercase();
-    let values = crate::syntax::trim(values);
+    memory: &Budget,
+) -> Result<Declarations, Error> {
+    let name = syntax::lower_text(memory, name)?;
+    let values = syntax::trim(values);
     let sides = match name.as_str() {
         "margin" => Some(MARGINS),
         "padding" => Some(PADDINGS),
@@ -545,85 +630,86 @@ fn parse_named(
         _ => None,
     };
     let Some(has_var) = variables::inspect(values) else {
-        return Ok(Vec::new());
+        return Ok(Declarations::Single(None));
     };
     if has_var {
-        let targets: Vec<Property> = if let Some(sides) = sides.or_else(|| layout::targets(&name)) {
-            sides.to_vec()
-        } else {
-            Property::ALL
-                .iter()
-                .copied()
-                .filter(|p| p.name() == name)
-                .collect()
-        };
+        let mut out = BudgetVec::new(memory)?;
+        let targets = sides.or_else(|| layout::targets(&name));
         let pending = variables::Pending {
-            name,
-            tokens: Arc::from(values),
+            name: name.try_clone()?,
+            tokens: BudgetShared::new(memory, syntax::copy_components(values, memory)?)?,
         };
-        return Ok(targets
-            .into_iter()
-            .map(|property| ValueDeclaration {
+        for property in Property::ALL.iter().copied().filter(|p| {
+            targets.map_or_else(|| p.name() == name.as_str(), |sides| sides.contains(p))
+        }) {
+            out.try_push(ValueDeclaration {
                 property,
-                value: Specified::Pending(pending.clone()),
+                value: Specified::Pending(pending.try_clone()?),
                 important,
-            })
-            .collect());
+            })?;
+        }
+        return Ok(Declarations::Many(out));
     }
     if let Some(sides) = sides {
-        let parsed = if let Some(value) = global(values) {
-            vec![value]
+        let mut out = BudgetVec::new(memory)?;
+        let mut parsed = [None, None, None, None];
+        let mut count = 0usize;
+        if let Some(value) = global(values) {
+            *parsed.get_mut(count).ok_or(Error::InvalidContext)? = Some(value);
+            count += 1;
         } else {
-            let mut parsed = Vec::new();
             for component in values.iter().filter(|v| !v.whitespace()) {
-                if parsed.len() == 4 {
-                    return Ok(Vec::new());
+                if count == 4 || global(std::slice::from_ref(component)).is_some() {
+                    return Ok(Declarations::Single(None));
                 }
-                let Some(&property) = sides.first() else {
-                    return Ok(Vec::new());
+                let Some(property) = sides.first() else {
+                    return Ok(Declarations::Single(None));
                 };
-                if global(std::slice::from_ref(component)).is_some() {
-                    return Ok(Vec::new());
-                }
-                let Some(value) = parse_value(property, std::slice::from_ref(component))? else {
-                    return Ok(Vec::new());
+                let Some(value) = parse_value(*property, std::slice::from_ref(component), memory)?
+                else {
+                    return Ok(Declarations::Single(None));
                 };
-                parsed.push(value);
+                *parsed.get_mut(count).ok_or(Error::InvalidContext)? = Some(value);
+                count += 1;
             }
-            parsed
+        }
+        let indexes = match count {
+            1 => [0, 0, 0, 0],
+            2 => [0, 1, 0, 1],
+            3 => [0, 1, 2, 1],
+            4 => [0, 1, 2, 3],
+            _ => return Ok(Declarations::Single(None)),
         };
-        let expanded = match parsed.as_slice() {
-            [a] => vec![a.clone(), a.clone(), a.clone(), a.clone()],
-            [a, b] => vec![a.clone(), b.clone(), a.clone(), b.clone()],
-            [a, b, c] => vec![a.clone(), b.clone(), c.clone(), b.clone()],
-            [a, b, c, d] => vec![a.clone(), b.clone(), c.clone(), d.clone()],
-            _ => return Ok(Vec::new()),
-        };
-        return Ok(sides
-            .iter()
-            .copied()
-            .zip(expanded)
-            .map(|(property, value)| ValueDeclaration {
+        for (property, index) in sides.iter().copied().zip(indexes) {
+            out.try_push(ValueDeclaration {
                 property,
-                value,
+                value: parsed
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or(Error::InvalidContext)?
+                    .try_clone()?,
                 important,
-            })
-            .collect());
+            })?;
+        }
+        return Ok(Declarations::Many(out));
     }
     if layout::targets(&name).is_some() {
-        return layout::shorthand(&name, values, important);
+        return layout::shorthand(&name, values, important, memory).map(Declarations::Many);
     }
-    let Some(property) = Property::ALL.iter().copied().find(|p| p.name() == name) else {
-        return Ok(Vec::new());
+    let Some(property) = Property::ALL
+        .iter()
+        .copied()
+        .find(|p| p.name() == name.as_str())
+    else {
+        return Ok(Declarations::Single(None));
     };
-    Ok(parse_value(property, values)?
-        .map(|value| ValueDeclaration {
+    Ok(Declarations::Single(
+        parse_value(property, values, memory)?.map(|value| ValueDeclaration {
             property,
             value,
             important,
-        })
-        .into_iter()
-        .collect())
+        }),
+    ))
 }
 
 pub(crate) fn resolve_pending(
@@ -633,12 +719,12 @@ pub(crate) fn resolve_pending(
     budget: &mut variables::Budget,
 ) -> Result<Specified, Error> {
     let Specified::Pending(pending) = value else {
-        return Ok(value.clone());
+        return value.try_clone();
     };
     let Some(tokens) = variables::substitute(&pending.tokens, custom, budget)? else {
         return Ok(Specified::Unset);
     };
-    Ok(parse_named(&pending.name, &tokens, false)?
+    Ok(parse_named(&pending.name, &tokens, false, &budget.memory)?
         .into_iter()
         .find(|d| d.property == property)
         .map(|d| d.value)
@@ -664,7 +750,10 @@ pub(crate) fn length(value: &Component) -> Option<(f64, Unit)> {
         }
         Component::Token(Token::Percentage(n)) => Some((number(&n.representation)?, Unit::Percent)),
         Component::Token(Token::Dimension(n, unit)) => {
-            let unit = match unit.to_ascii_lowercase().as_str() {
+            let unit = match syntax::keyword(
+                unit,
+                &["px", "pt", "pc", "in", "cm", "mm", "q", "em", "rem"],
+            )? {
                 "px" => Unit::Px,
                 "pt" => Unit::Pt,
                 "pc" => Unit::Pc,
@@ -685,7 +774,11 @@ pub(crate) fn length(value: &Component) -> Option<(f64, Unit)> {
     }
 }
 
-fn parse_value(property: Property, values: &[Component]) -> Result<Option<Specified>, Error> {
+fn parse_value(
+    property: Property,
+    values: &[Component],
+    memory: &Budget,
+) -> Result<Option<Specified>, Error> {
     if let Some(value) = global(values) {
         return Ok(Some(value));
     }
@@ -716,7 +809,7 @@ fn parse_value(property: Property, values: &[Component]) -> Result<Option<Specif
         Color | BackgroundColor | BorderTopColor | BorderRightColor | BorderBottomColor
         | BorderLeftColor => parse_color(values),
         FontFamily => {
-            parse_families(values)?.map(|v| Specified::Ready(ComputedValue::FontFamily(v)))
+            parse_families(values, memory)?.map(|v| Specified::Ready(ComputedValue::FontFamily(v)))
         }
         FontStyle => keyword(values, &["normal", "italic", "oblique"]),
         WhiteSpace => keyword(
@@ -777,7 +870,13 @@ fn parse_length_property(property: Property, values: &[Component]) -> Option<Spe
     };
     if let Some(name) = value.ident() {
         if property == Property::FontSize {
-            let (size, unit) = match name.to_ascii_lowercase().as_str() {
+            let (size, unit) = match syntax::keyword(
+                name,
+                &[
+                    "xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large",
+                    "smaller", "larger",
+                ],
+            )? {
                 "xx-small" => (9.0, Unit::Px),
                 "x-small" => (10.0, Unit::Px),
                 "small" => (13.0, Unit::Px),
@@ -792,7 +891,7 @@ fn parse_length_property(property: Property, values: &[Component]) -> Option<Spe
             return Some(Specified::Length(size, unit));
         }
         if property.border() {
-            let width = match name.to_ascii_lowercase().as_str() {
+            let width = match syntax::keyword(name, &["thin", "medium", "thick"])? {
                 "thin" => 1.0,
                 "medium" => 3.0,
                 "thick" => 5.0,
@@ -831,13 +930,15 @@ fn length_property(property: Property, value: &Component) -> Option<Specified> {
 
 fn weight(values: &[Component]) -> Option<Specified> {
     if let Some(name) = single_ident(values) {
-        return Some(match name.to_ascii_lowercase().as_str() {
-            "normal" => Specified::Ready(ComputedValue::Weight(400)),
-            "bold" => Specified::Ready(ComputedValue::Weight(700)),
-            "bolder" => Specified::RelativeWeight(true),
-            "lighter" => Specified::RelativeWeight(false),
-            _ => return None,
-        });
+        return Some(
+            match syntax::keyword(name, &["normal", "bold", "bolder", "lighter"])? {
+                "normal" => Specified::Ready(ComputedValue::Weight(400)),
+                "bold" => Specified::Ready(ComputedValue::Weight(700)),
+                "bolder" => Specified::RelativeWeight(true),
+                "lighter" => Specified::RelativeWeight(false),
+                _ => return None,
+            },
+        );
     }
     let [Component::Token(Token::Number(number))] = values else {
         return None;
@@ -857,12 +958,13 @@ fn decoration(values: &[Component]) -> Option<Decoration> {
     let mut result = Decoration::default();
     let mut any = false;
     for value in values.iter().filter(|v| !v.whitespace()) {
-        let target = match value.ident()?.to_ascii_lowercase().as_str() {
-            "underline" => &mut result.underline,
-            "overline" => &mut result.overline,
-            "line-through" => &mut result.line_through,
-            _ => return None,
-        };
+        let target =
+            match syntax::keyword(value.ident()?, &["underline", "overline", "line-through"])? {
+                "underline" => &mut result.underline,
+                "overline" => &mut result.overline,
+                "line-through" => &mut result.line_through,
+                _ => return None,
+            };
         if *target {
             return None;
         }
@@ -872,59 +974,80 @@ fn decoration(values: &[Component]) -> Option<Decoration> {
     any.then_some(result)
 }
 
-fn parse_families(values: &[Component]) -> Result<Option<Vec<Family>>, Error> {
-    let mut families = Vec::new();
+fn parse_families(
+    values: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetShared<BudgetVec<Family>>>, Error> {
+    let mut families = BudgetVec::new(memory)?;
     for part in values.split(|v| v.delim(',')) {
         if families.len() == MAX_FAMILIES {
             return Err(Error::Limit("MAX_FAMILIES"));
         }
-        let part = crate::syntax::trim(part);
+        let part = syntax::trim(part);
         if let [Component::Token(Token::String(name))] = part {
-            families.push(Family::Named(name.clone()));
+            families.try_push(Family::Named(name.try_clone()?))?;
             continue;
         }
-        let mut words = Vec::new();
+        if let [value] = part {
+            if let Some(generic) = value
+                .ident()
+                .and_then(|name| syntax::keyword(name, FAMILIES))
+            {
+                families.try_push(Family::Generic(generic))?;
+                continue;
+            }
+        }
+        if let [Component::Token(Token::Ident(name))] = part {
+            if syntax::keyword(
+                name,
+                &[
+                    "initial",
+                    "inherit",
+                    "unset",
+                    "revert",
+                    "revert-layer",
+                    "default",
+                ],
+            )
+            .is_some()
+            {
+                return Ok(None);
+            }
+            families.try_push(Family::Named(name.try_clone()?))?;
+            continue;
+        }
+        let mut joined = BudgetString::new(memory)?;
         for value in part.iter().filter(|v| !v.whitespace()) {
             let Some(name) = value.ident() else {
                 return Ok(None);
             };
-            if [
-                "initial",
-                "inherit",
-                "unset",
-                "revert",
-                "revert-layer",
-                "default",
-            ]
-            .iter()
-            .any(|n| name.eq_ignore_ascii_case(n))
+            if syntax::keyword(
+                name,
+                &[
+                    "initial",
+                    "inherit",
+                    "unset",
+                    "revert",
+                    "revert-layer",
+                    "default",
+                ],
+            )
+            .is_some()
+                || syntax::keyword(name, FAMILIES).is_some()
             {
                 return Ok(None);
             }
-            words.push(name);
-        }
-        if words.is_empty() {
-            return Ok(None);
-        }
-        if let [name] = words.as_slice() {
-            if let Some(generic) = FAMILIES
-                .iter()
-                .find(|family| name.eq_ignore_ascii_case(family))
-            {
-                families.push(Family::Generic(generic));
-                continue;
+            if !joined.is_empty() {
+                joined.try_push(' ')?;
             }
+            joined.try_push_str(name)?;
         }
-        if words.iter().any(|name| {
-            FAMILIES
-                .iter()
-                .any(|family| name.eq_ignore_ascii_case(family))
-        }) {
+        if joined.is_empty() {
             return Ok(None);
         }
-        families.push(Family::Named(words.join(" ")));
+        families.try_push(Family::Named(Text::from_string(memory, joined)?))?;
     }
-    Ok(Some(families))
+    Ok(Some(BudgetShared::new(memory, families)?))
 }
 
 fn parse_color(values: &[Component]) -> Option<Specified> {
@@ -936,7 +1059,30 @@ fn parse_color(values: &[Component]) -> Option<Specified> {
             if name.eq_ignore_ascii_case("currentcolor") {
                 return Some(Specified::CurrentColor);
             }
-            let (red, green, blue, alpha) = match name.to_ascii_lowercase().as_str() {
+            let (red, green, blue, alpha) = match syntax::keyword(
+                name,
+                &[
+                    "black",
+                    "silver",
+                    "gray",
+                    "white",
+                    "maroon",
+                    "red",
+                    "purple",
+                    "fuchsia",
+                    "green",
+                    "lime",
+                    "olive",
+                    "yellow",
+                    "navy",
+                    "blue",
+                    "teal",
+                    "aqua",
+                    "orange",
+                    "rebeccapurple",
+                    "transparent",
+                ],
+            )? {
                 "black" => (0, 0, 0, 255),
                 "silver" => (192, 192, 192, 255),
                 "gray" => (128, 128, 128, 255),
@@ -969,35 +1115,25 @@ fn parse_color(values: &[Component]) -> Option<Specified> {
             if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return None;
             }
-            let mut bytes = Vec::new();
-            match value.len() {
-                3 | 4 => {
-                    for ch in value.chars() {
-                        bytes.push(u8::try_from(ch.to_digit(16)?).ok()? * 17);
-                    }
-                }
-                6 | 8 => {
-                    for pair in value.as_bytes().as_chunks::<2>().0 {
-                        let text = std::str::from_utf8(pair).ok()?;
-                        bytes.push(u8::from_str_radix(text, 16).ok()?);
-                    }
-                }
+            let channels = match value.len() {
+                3 | 4 => value.len(),
+                6 | 8 => value.len() / 2,
                 _ => return None,
+            };
+            let mut bytes = [0u8, 0, 0, 255];
+            for (index, byte) in bytes.iter_mut().take(channels).enumerate() {
+                *byte = if value.len() <= 4 {
+                    u8::from_str_radix(value.get(index..index + 1)?, 16).ok()? * 17
+                } else {
+                    u8::from_str_radix(value.get(index * 2..index * 2 + 2)?, 16).ok()?
+                };
             }
-            match bytes.as_slice() {
-                [red, green, blue] => Color {
-                    red: *red,
-                    green: *green,
-                    blue: *blue,
-                    alpha: 255,
-                },
-                [red, green, blue, alpha] => Color {
-                    red: *red,
-                    green: *green,
-                    blue: *blue,
-                    alpha: *alpha,
-                },
-                _ => return None,
+            let [red, green, blue, alpha] = bytes;
+            Color {
+                red,
+                green,
+                blue,
+                alpha,
             }
         }
         _ => return None,
@@ -1012,32 +1148,31 @@ pub(crate) fn compute_value(
     font_size: f64,
     color: Color,
     root_font_size: f64,
+    memory: &Budget,
 ) -> Result<ComputedValue, Error> {
     let initial = || {
         if property.border_color() {
-            ComputedValue::Color(color)
+            Ok(ComputedValue::Color(color))
         } else {
-            property.initial()
+            property.initial(memory)
         }
     };
-    let inherited = || {
-        parent
-            .and_then(|style| style.get(property))
-            .cloned()
-            .unwrap_or_else(&initial)
+    let inherited = || match parent.and_then(|style| style.get(property)) {
+        Some(value) => value.try_clone(),
+        None => initial(),
     };
     let result = match value {
         Specified::Pending(_) => return Err(Error::InvalidContext),
-        Specified::Initial => initial(),
-        Specified::Inherit => inherited(),
+        Specified::Initial => initial()?,
+        Specified::Inherit => inherited()?,
         Specified::Unset => {
             if property.inherited() {
-                inherited()
+                inherited()?
             } else {
-                initial()
+                initial()?
             }
         }
-        Specified::Ready(value) => value.clone(),
+        Specified::Ready(value) => value.try_clone()?,
         Specified::CurrentColor => ComputedValue::Color(if property == Property::Color {
             parent.map(ComputedStyle::color).unwrap_or(Color::BLACK)
         } else {
@@ -1108,6 +1243,6 @@ pub(crate) fn compute_value(
     Ok(result)
 }
 
-pub(crate) fn finish(style: &mut ComputedStyle, root: bool) {
-    layout::finish(style, root);
+pub(crate) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error> {
+    layout::finish(style, root)
 }

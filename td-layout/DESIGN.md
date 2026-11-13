@@ -58,6 +58,11 @@ and nested token/string allocations count. Shared allocations count once.
 Counts and byte limits both apply, and caller limits may only lower them.
 
 This charge is an admission model, not an exact allocator/RSS measurement.
+The tree, DOM index and CSS engine own fallible td-alloc storage; remaining
+layout arrays still use std. StylePool construction can return a CSS memory
+error, propagated by StyledDocument construction. A caller combining owned
+budgets with an external reservation must exclude owned allocations from
+that reservation; this library does not yet expose that split.
 The separately owned compiled stylesheets, font caches, image pixels,
 framebuffer and concurrent network bodies still belong in the consumer's
 jail ledger. In particular, a stylesheet compilation peak is not hidden

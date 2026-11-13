@@ -67,7 +67,9 @@ fn parse_and_cascade_ua_author_inline_and_inheritance() {
     let document=td_html::document::parse("<!doctype html><html><body><main id=main><p class=lead id=first style='margin-left:2em'>a <a href=/ id=link>link</a></p><!--gap--><p id=second>b</p><ul><li id=item>c</li></ul></main></body></html>").unwrap();
     let tree = HtmlTree::new(&document).unwrap();
     let styles=StyleSet::new(&[(Origin::UserAgent,HTML_UA_CSS),(Origin::Author,"html{font-size:20px} main {color: red;--gap:3px} p.lead {font-size:150%;padding-left:calc(1em + var(--gap))} p + p {color:blue} a:link{color:inherit} a:visited {color:green}")]).unwrap();
-    let mut computed = vec![None::<ComputedStyle>; document.len()];
+    let mut computed = (0..document.len())
+        .map(|_| None::<ComputedStyle>)
+        .collect::<Vec<_>>();
     let mut root_size = 16.;
     for e in tree.elements() {
         let parent = e
@@ -87,7 +89,7 @@ fn parse_and_cascade_ua_author_inline_and_inheritance() {
             .as_ref()
             .unwrap()
             .get(p)
-            .cloned()
+            .map(|value| value.try_clone().unwrap())
     };
     assert_eq!(value("first", Property::Display), Some(V::Keyword("block")));
     assert_eq!(

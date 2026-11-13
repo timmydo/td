@@ -7,7 +7,7 @@
 //! use td_css::selectors::Element;
 //! use td_css::values::{ComputedValue, Length, Property};
 //!
-//! #[derive(Clone)]
+//! #[derive(Clone, Copy)]
 //! struct Paragraph;
 //! impl Element for Paragraph {
 //!     fn tag_name(&self) -> &str { "p" }
@@ -60,6 +60,7 @@ pub enum Error {
     Limit(&'static str),
     InvalidSelector,
     InvalidContext,
+    Memory(td_alloc::BudgetError),
 }
 
 impl std::fmt::Display for Error {
@@ -67,23 +68,36 @@ impl std::fmt::Display for Error {
         match self {
             Self::Limit(name) => write!(f, "CSS limit exceeded: {name}"),
             Self::InvalidSelector => f.write_str("unsupported or invalid CSS selector"),
+            Self::Memory(error) => write!(f, "CSS allocation refused: {error:?}"),
             Self::InvalidContext => f.write_str("invalid CSS computation context"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+impl From<td_alloc::BudgetError> for Error {
+    fn from(error: td_alloc::BudgetError) -> Self {
+        Self::Memory(error)
+    }
+}
+/// Standalone storage ceiling; page callers supply a shared budget instead.
+pub const MAX_ALLOCATION_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) fn memory() -> Result<td_alloc::Budget, Error> {
+    Ok(td_alloc::Budget::new(
+        MAX_ALLOCATION_BYTES + td_alloc::Budget::metadata_bytes(),
+    )?)
+}
 
 #[cfg(test)]
 mod confinement {
     #[test]
-    fn standalone_without_dependencies() {
+    fn standalone_uses_only_owned_allocation_dependency() {
         let manifest = include_str!("../Cargo.toml");
-        assert!(!manifest.contains("[dependencies]"));
+        assert!(manifest.contains(r#"td-alloc = { path = "../td-alloc" }"#));
         assert!(!manifest.contains("[dev-dependencies]"));
         assert_eq!(
             include_str!("../Cargo.lock").matches("[[package]]").count(),
-            1
+            2
         );
     }
 }

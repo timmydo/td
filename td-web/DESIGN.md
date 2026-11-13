@@ -990,47 +990,47 @@ parser's cumulative `charged_bytes` remains a separate complexity bound.
 td-dom indexes likewise use the supplied page budget through
 `HtmlTree::with_budget`; they keep both array charges until dropped.
 
-td-css and td-layout still allocate through std; each bounds
-what it keeps by its own admission model (td-css's compile ceiling and
-pool limits, td-layout's page charge). td-web joins
-them to the budget: before a step it takes a `Charge` of what that step
-may keep, its ceiling or the headroom if less (the budget's `limit()`
-less its `used()`, and the root's), passes that as the step's limit,
-and once the step succeeds shrinks the charge to what the step reports
-it kept (`Charge::shrink_to`, increment 6), which returns only the
-difference, rather than returning the whole charge and charging the
-actual anew, which another thread could overtake. Before that cutover,
-td-layout must expose a split between its declared model and storage
-already owned by the tree and DOM budgets. The external styled reservation
-excludes both owned terms, and leaves the index's full array capacity
-available until construction completes; reserving all remaining headroom
-for the declared term first would deny its owned allocations. The DOM
-index's charges return when its temporary index drops. Its bytes must not
-also survive inside the retained external reservation. td-layout's
-`Limits::bytes` bounds what td-layout itself counts, the tree's charge,
-its input, the styled document and any output retained beside the new,
-so it is given those as they stand plus the new step's charge. A
-charge refused is a step
-refused (below, "Cuts"). A crate that later keeps its storage in a
-td-alloc budget (`BudgetVec`, `Arena`) replaces its declared charge
-with the owned one; the terms do not change.
+td-css owns syntax, compiled rules, compute scratch and retained styles
+through td-alloc. The cutover passes the sheets child to
+StyleSet::new_with_budget and the page child to compute_with_budget and
+StylePool::with_budget. Shared strings and custom tokens retain their
+original child's admission until their last owner drops, including a
+computed style that outlives its StyleSet. Dropping the set cannot return
+that still-owned charge or move it to the styled term.
+
+td-layout's remaining arrays still use std under its conservative admission
+model. Before that cutover, td-layout must expose a split excluding
+independently owned tree, DOM and CSS storage. The external styled
+reservation covers only the remaining arrays and leaves headroom for
+owned index, cascade scratch and pool allocations during construction.
+It must not reserve all remaining page bytes before those owners run.
+The temporary DOM index returns its actual admission when it drops; its
+bytes must not survive in the retained external reservation.
+
+td-web admits the external step's ceiling before starting it, passes the
+corresponding model limit, and shrinks that reservation to reported retained
+storage with Charge::shrink_to after success. The retained bytes never leave
+the budget between those operations. Limits::bytes still applies to the
+complete layout admission model, including owned terms, input and outputs
+that remain beside replacements; it is independent of the external-only
+reservation. Any refusal follows "Cuts" below. Migrating a remaining array
+to a td-alloc owner removes its external reservation in the same change.
 
 | Term | Charged | Ceiling |
 |---|---|---:|
 | tree | td-html's owned allocation layouts, including parser scratch and growth overlap | 128 MiB, `MAX_TREE_BYTES`, plus budget metadata |
-| styled | the input, pool, boxes and td-web tree-order table: the declared model excluding independently owned tree and DOM storage | the page's |
+| styled | the input, boxes and td-web tree-order table under the external model, plus owned CSS pool storage; excludes independently owned tree and DOM storage | the page's |
 | index | td-dom's owned arrays, only while its index lives | `MAX_INDEX_BYTES`, within the page's |
 | layout | a layout's `output_bytes` and td-web's indexes over it | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
-| sheets | their text, and a compiled set from compiling until the cascade is done, as td-css charges it | 48 MiB (estimate) |
+| sheets | their text, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB (estimate) |
 | pictures | inline pictures' pixels and fitted copies (increment 9) | 48 MiB (estimate) |
 
 The ceilings of page, sheets and pictures sum to `PAGES`, so a page
-alone is refused only by its own terms. The sheets term matters: td-css
-keeps some 74 bytes resident a byte of a sheet's source where custom
-properties fill it (measured in review), so 2 MiB of such sheets would
-hold 150 MB; at 48 MiB a page's sheets past some 650 KiB of that shape
-are refused at compiling, and the page steps down (below, "Cuts").
+alone is refused only by its own terms. The sheets child bounds simultaneously live compilation layouts,
+including scratch and replacement overlap. Source-size limits alone do
+not guarantee admission: a sufficiently complex sheet can exhaust 48 MiB
+before compilation finishes, and the page follows "Cuts" below.
 
 A picture reached by navigation is a page of its own, charged its
 decoding's peak before it is decoded, from the dimensions td-web's
@@ -1075,17 +1075,16 @@ and the jail's keyfile is unchanged. A test,
 `memory-high`, the term ceilings summing to `PAGES` and the root's
 limit at `PAGES` and its control blocks, its terms taken from the
 crates' constants (`MAX_TREE_BYTES`, `MAX_PAGE_BYTES`, `WORKING_BYTES`,
-td-css's compile ceiling, the 192 MiB picture peak from td-ui's
+the caller's sheets ceiling, the 192 MiB picture peak from td-ui's
 `MAX_PICTURE_PIXELS`), and the window's term and the jail's copied by
 hand and reviewed as §3's are. It replaces
 `the_html_limits_fit_the_jail`: the terms that test sums,
 td-html's rendering (252 MB), a page at its output budget, the wrap
 (24 MB) and the text page (46 MB), go with the renderer they measure.
 
-**What td-alloc does not bound**, and how it is kept: what those
-td-css and td-layout allocate, since their charges are admission
-models, not allocator bounds (td-layout's deliberately exceeds what is resident;
-td-css's allocation failure is the process's); glibc's arenas and
+**What td-alloc does not bound**, and how it is kept: td-layout's
+remaining std storage, whose external charge is a conservative admission
+model; glibc's arenas and
 fragmentation; td-ui's buffers, atlas pages, faces and measure caches;
 and the fetch client's bodies. Every heavy step but a navigated
 picture's fit runs on the one render thread, and a page's last drop
@@ -1461,7 +1460,7 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      size, and atlas pages for sizes but its own capped at `ATLAS` in
      all, the eldest remade when another is needed.
    - **td-layout**: a declared-charge split excluding independently
-     owned tree and DOM storage (above, "Memory"); a styled document
+     owned tree, DOM and CSS storage (above, "Memory"); a styled document
      holding its document by shared
      ownership, so a page passes between threads, as td-web, which
      forbids `unsafe`, cannot hold a borrowed one beside its owner; a
@@ -1481,10 +1480,8 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      space is preserved; a cascade without `style` attributes; and a
      byte limit for each layout request, where today it is fixed when
      the page is cascaded.
-   - **td-css**: an admission ceiling the caller sets, charged while a
-     set compiles as td-html's and td-layout's limits are, and the
-     compiled set's charge reported; a refusal that names the sheet it
-     arose in; a media condition for each sheet given to a set; the
+   - **td-css**: the owned-budget API supplies compilation admission;
+     remaining prerequisites are a refusal that names the sheet it arose in; a media condition for each sheet given to a set; the
      `background` shorthand's colour; and `rgb()`, `hsl()` and CSS
      Color 4's extended named colours.
    - **td-alloc** (available): `Charge::shrink_to`, which returns the difference

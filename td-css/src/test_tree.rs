@@ -1,4 +1,4 @@
-#![allow(clippy::indexing_slicing)]
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 use crate::selectors::Element;
 
 pub(crate) struct Node {
@@ -121,4 +121,18 @@ impl Element for Handle<'_> {
     fn is_link(&self) -> bool {
         self.tag_name() == "a" && self.attribute("href").is_some()
     }
+}
+
+pub(crate) fn owned_text(value: &str) -> crate::syntax::Text {
+    crate::syntax::text(&crate::memory().unwrap(), value).unwrap()
+}
+pub(crate) fn families(
+    values: Vec<crate::values::Family>,
+) -> td_alloc::BudgetShared<td_alloc::BudgetVec<crate::values::Family>> {
+    let memory = crate::memory().unwrap();
+    let mut output = td_alloc::BudgetVec::new(&memory).unwrap();
+    for value in values {
+        output.try_push(value).unwrap();
+    }
+    td_alloc::BudgetShared::new(&memory, output).unwrap()
 }

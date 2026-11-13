@@ -12,7 +12,7 @@ fn compute(css: &str, inline: &str) -> ComputedStyle {
                 nodes: &nodes,
                 index: 3,
             },
-            Some(&ComputedStyle::default()),
+            Some(&ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
             16.0,
             inline,
         )
@@ -150,7 +150,7 @@ fn inline_specificity_and_source_order_are_independent_tiers() {
 #[test]
 fn inherited_values_are_computed_once_and_font_dependencies_are_ordered() {
     let nodes = tree();
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     let parent = set.compute(&Handle { nodes:&nodes,index:2 }, None,16.0,
         "font-size:20px; margin:2em; color:blue; background-color:currentcolor; font-weight:500; width:50%").unwrap();
     let child = set.compute(&Handle { nodes:&nodes,index:3 },Some(&parent),20.0,
@@ -215,7 +215,7 @@ fn root_rem_uses_initial_size_only_for_its_font_size() {
         nodes: &nodes,
         index: 0,
     };
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     for (source, size) in [
         ("font-size:2rem;margin:1rem", 32.0),
         ("font-size:20px;margin:1rem", 20.0),
@@ -234,7 +234,7 @@ fn root_rem_uses_initial_size_only_for_its_font_size() {
 #[test]
 fn every_property_has_initial_inherit_and_unset() {
     let nodes = tree();
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     let parent = compute("", "display:block;color:red;background-color:blue;font-family:monospace;font-size:30px;font-weight:700;font-style:italic;text-decoration:underline;white-space:pre;margin:5px;padding:6px;border-width:7px;width:25%;height:2em;list-style-type:square;text-align:right");
     for property in Property::ALL {
         assert!(parent.get(*property).is_some(), "{property:?}");
@@ -267,9 +267,9 @@ fn every_property_has_initial_inherit_and_unset() {
             ) {
                 V::Color(parent.color())
             } else if keyword == "inherit" || (keyword == "unset" && property.inherited()) {
-                parent.get(*property).unwrap().clone()
+                parent.get(*property).unwrap().try_clone().unwrap()
             } else {
-                property.initial()
+                property.initial(&crate::memory().unwrap()).unwrap()
             };
             assert_eq!(
                 style.get(*property),
@@ -315,11 +315,11 @@ fn all_first_properties_compute_typed_values() {
             "font-family",
             "\"serif\", Times New Roman, sans-serif",
             Property::FontFamily,
-            V::FontFamily(vec![
-                Family::Named("serif".into()),
-                Family::Named("Times New Roman".into()),
+            V::FontFamily(crate::test_tree::families(vec![
+                Family::Named(crate::test_tree::owned_text("serif")),
+                Family::Named(crate::test_tree::owned_text("Times New Roman")),
                 Family::Generic("sans-serif"),
-            ]),
+            ])),
         ),
         (
             "font-size",
@@ -541,7 +541,9 @@ fn unsupported_or_invalid_values_do_not_erase_valid_ones() {
     }
     assert_eq!(
         compute("", "font-family:monospace;font-family:serif foo").get(Property::FontFamily),
-        Some(&V::FontFamily(vec![Family::Generic("monospace")]))
+        Some(&V::FontFamily(crate::test_tree::families(vec![
+            Family::Generic("monospace")
+        ])))
     );
     assert_eq!(
         compute(
@@ -616,7 +618,7 @@ fn lengths_resolve_absolute_units_and_clamp_finite_overflow() {
 #[test]
 fn relative_font_weights_and_keyword_sizes_follow_ua_tables() {
     let nodes = tree();
-    let set = StyleSet::default();
+    let set = StyleSet::new(&[]).unwrap();
     for (weight, bolder, lighter) in [
         (100, 400, 100),
         (200, 400, 100),
@@ -683,15 +685,26 @@ fn ua_sheet_uses_the_same_pipeline_and_has_no_hidden_injection() {
         index: 1,
     };
     assert_eq!(
-        StyleSet::default()
-            .compute(&body, Some(&ComputedStyle::default()), 16.0, "")
+        StyleSet::new(&[])
+            .unwrap()
+            .compute(
+                &body,
+                Some(&ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
+                16.0,
+                ""
+            )
             .unwrap()
             .get(Property::Display),
         Some(&V::Keyword("inline"))
     );
     let set = StyleSet::new(&[(Origin::UserAgent, HTML_UA_CSS)]).unwrap();
     let body_style = set
-        .compute(&body, Some(&ComputedStyle::default()), 16.0, "")
+        .compute(
+            &body,
+            Some(&ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
+            16.0,
+            "",
+        )
         .unwrap();
     assert_eq!(
         body_style.get(Property::Display),
@@ -820,7 +833,7 @@ fn aggregate_admission_limits_and_context_are_enforced() {
     let nodes = tree();
     for bad in [f64::NAN, f64::INFINITY, -1.0, MAX_ABSOLUTE_VALUE + 1.0] {
         assert_eq!(
-            StyleSet::default().compute(
+            StyleSet::new(&[]).unwrap().compute(
                 &Handle {
                     nodes: &nodes,
                     index: 3
@@ -833,7 +846,8 @@ fn aggregate_admission_limits_and_context_are_enforced() {
         );
     }
     let families = vec!["Arial"; values::MAX_FAMILIES].join(",");
-    assert!(StyleSet::default()
+    assert!(StyleSet::new(&[])
+        .unwrap()
         .compute(
             &Handle {
                 nodes: &nodes,
@@ -845,7 +859,7 @@ fn aggregate_admission_limits_and_context_are_enforced() {
         )
         .is_ok());
     assert!(matches!(
-        StyleSet::default().compute(
+        StyleSet::new(&[]).unwrap().compute(
             &Handle {
                 nodes: &nodes,
                 index: 3
@@ -895,7 +909,7 @@ fn realistic_class_rule_fanout_avoids_unrelated_work() {
     assert!(stats.match_steps < 100);
     let mut reference = Work {
         unindexed: true,
-        ..Work::default()
+        ..Work::new(&crate::memory().unwrap()).unwrap()
     };
     assert_eq!(
         set.compute_inner(&element, None, 16.0, "", &mut reference),
@@ -990,7 +1004,7 @@ fn indexed_and_reference_cascade_agree_on_lists_logic_and_order() {
             for inline in ["", "color:rebeccapurple;margin:2px!important"] {
                 let mut reference = Work {
                     unindexed: true,
-                    ..Work::default()
+                    ..Work::new(&crate::memory().unwrap()).unwrap()
                 };
                 assert_eq!(
                     set.compute(&e, None, 16.0, inline),
@@ -1033,7 +1047,7 @@ fn generated_index_matches_unindexed_values() {
             };
             let mut work = Work {
                 unindexed: true,
-                ..Work::default()
+                ..Work::new(&crate::memory().unwrap()).unwrap()
             };
             assert_eq!(
                 set.compute(&e, None, 16.0, ""),
@@ -1235,4 +1249,108 @@ fn inactive_conditional_trees_still_have_global_bounds() {
         StyleSet::new(&[(Origin::Author, &huge)]),
         Err(Error::Limit("MAX_CONDITION_PARTS"))
     ));
+}
+
+#[test]
+fn every_compile_and_compute_allocation_refusal_releases_owned_storage() {
+    use td_alloc::{with_reservation_limit, Budget, BudgetError};
+    let memory = Budget::new(16 * 1024 * 1024).unwrap();
+    let source = "@media (min-width: 1px) { p.hot[data-x*='BETA' i] { --a-very-long-custom-name: 2px; --b: var(--a-very-long-custom-name); margin: var(--b); color: red; font-family: 'Test Face é語🌍 with a long name that crosses the fixed token storage boundary and spills to a heap string', serif } }";
+    let mut complete = false;
+    for allowed in 0..2048 {
+        let result = with_reservation_limit(allowed, || {
+            StyleSet::new_with_budget(&[(Origin::Author, source)], &memory)
+        });
+        match result {
+            Ok(value) => {
+                drop(value);
+                complete = true;
+            }
+            Err(error) => assert_eq!(error, Error::Memory(BudgetError::Allocation)),
+        }
+        assert_eq!(memory.used(), Budget::metadata_bytes());
+        if complete {
+            break;
+        }
+    }
+    assert!(complete);
+    let sheets = StyleSet::new_with_budget(&[(Origin::Author, source)], &memory).unwrap();
+    let retained = memory.used();
+    let nodes = crate::test_tree::tree();
+    let element = crate::test_tree::Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let output = Budget::new(16 * 1024 * 1024).unwrap();
+    complete = false;
+    for allowed in 0..2048 {
+        let result = with_reservation_limit(allowed, || {
+            sheets.compute_with_budget(
+                &element,
+                None,
+                16.0,
+                "padding: calc(1px + 2px); --c: blue",
+                &output,
+            )
+        });
+        match result {
+            Ok(value) => {
+                drop(value);
+                complete = true;
+            }
+            Err(error) => assert_eq!(error, Error::Memory(BudgetError::Allocation)),
+        }
+        assert_eq!(output.used(), Budget::metadata_bytes());
+        assert_eq!(memory.used(), retained);
+        if complete {
+            break;
+        }
+    }
+    assert!(complete);
+    let style = sheets
+        .compute_with_budget(&element, None, 16.0, "", &output)
+        .unwrap();
+    drop(sheets);
+    assert!(
+        memory.used() > Budget::metadata_bytes(),
+        "shared custom tokens retain their original budget"
+    );
+    drop(style);
+    assert_eq!(memory.used(), Budget::metadata_bytes());
+    assert_eq!(output.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn shared_root_exhaustion_refuses_scratch_without_disturbing_retained_styles() {
+    use td_alloc::{Budget, BudgetError};
+    let root = Budget::new(2 * 1024 * 1024).unwrap();
+    let compilation = root.child(1024 * 1024).unwrap();
+    let computation = root.child(1024 * 1024).unwrap();
+    let source = "p { --a-very-long-custom-name: 'é語🌍a very long token'; font-family: 'a long family name'; color: red }";
+    let sheets = StyleSet::new_with_budget(&[(Origin::Author, source)], &compilation).unwrap();
+    let nodes = crate::test_tree::tree();
+    let element = crate::test_tree::Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let style = sheets
+        .compute_with_budget(&element, None, 16.0, "", &computation)
+        .unwrap();
+    let before = root.used();
+    let full = root.charge(root.limit() - root.used()).unwrap();
+    assert!(matches!(
+        sheets.compute_with_budget(&element, Some(&style), 16.0, "margin: 2px", &computation),
+        Err(Error::Memory(BudgetError::Limit))
+    ));
+    drop(full);
+    assert_eq!(root.used(), before);
+    let replacement = sheets
+        .compute_with_budget(&element, Some(&style), 16.0, "margin: 2px", &computation)
+        .unwrap();
+    drop(replacement);
+    drop(style);
+    drop(sheets);
+    drop(compilation);
+    drop(computation);
+    assert_eq!(root.used(), Budget::metadata_bytes());
 }

@@ -17,7 +17,7 @@ engine crate (the shared `engine` lib and
 numbered target-side exceptions, TWENTY-SIX of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary, or in the twenty-sixth's case
-its CPU instructions, or the twenty-eighth's checked heap ownership (the crate itself
+its CPU instructions, or the twenty-eighth's checked storage (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
@@ -216,7 +216,7 @@ one.
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
 | 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
 | 27 | `td-ssh` | `setgroups(2)`, `setgid(2)`, `setuid(2)`, `prctl(2)` pinned to `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE`, `seccomp(2)` with one operation, `ioctl(2)` with seven value-pinned terminal requests, `setsid(2)`, `umask(2)` pinned to one floor operation; plus one scoped pre-exec hook — see [§27](#27-td-ssh--a-reduced-ssh-client-and-server) |
-| 28 | `td-alloc` | none: checked global allocation, Vec ownership adoption and strong reference counting; see §28 |
+| 28 | `td-alloc` | none: checked global allocation, Vec ownership adoption, strong reference counting and fixed UTF-8 views; see §28 |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3933,8 +3933,9 @@ allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
 ## 28. `td-alloc` — fallible heap ownership
 
 The Cargo library root `src/owned.rs` denies unsafe code. `src/raw.rs` has
-eight narrowly scoped allowances: six functions (`vector`, `grow_vector`,
-`grow_string`, `Shared::new`, `Shared::inner`, `Shared::drop`) and the Send/Sync implementations for
+nine narrowly scoped allowances: seven functions (`vector`, `grow_vector`,
+`grow_string`, `Shared::new`, `Shared::inner`, `Shared::drop`,
+`SmallText::as_str`) and the Send/Sync implementations for
 `Shared<T: Send + Sync>`. No other module has an allowance. The source-mounted
 `src/lib.rs` retains forbid and never imports this boundary, so the engine
 and direct-rustc helper consumers retain their existing safe-only contract.
@@ -3974,6 +3975,16 @@ safe BudgetShared wrapper admits the complete SharedValue control-block
 layout before construction; after the last reference frees that block,
 field order drops the nested value before returning this admission. Any
 nested allocation requires its own budgeted owner. No Pin guarantee escapes.
+
+SmallText<N> has private fixed bytes and a u8 length, limiting its content
+to min(N, 255) bytes. Empty construction and Copy preserve validity;
+copy/append accept only complete str values, check the length and slice
+before copying, then update length. Refusal leaves the value unchanged.
+ASCII lowercasing preserves UTF-8. The sole additional conversion,
+SmallText::as_str, lends from_utf8_unchecked over that initialized prefix.
+No mutable byte view or raw constructor escapes, and the returned borrow
+excludes mutation. The fixed storage itself allocates nothing and belongs
+to its enclosing owner's accounting; it is not independently charged.
 
 Tests cover alignment, zero-sized values, layout overflow, null-equivalent
 injected refusal, rollback, replacement overlap, concurrent admission,

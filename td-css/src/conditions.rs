@@ -1,6 +1,7 @@
 //! Bounded media and supports conditions, evaluated without document state.
 use crate::syntax::{self, Component, Token};
 use crate::{values, Error};
+use td_alloc::{Budget, BudgetVec};
 
 pub const MAX_CONDITION_PARTS: usize = 2048;
 pub const MAX_CONDITION_DEPTH: usize = 16;
@@ -93,11 +94,20 @@ impl Truth {
 
 /// Parse a complete media query list. Unknown queries do not match.
 pub fn media_matches(input: &str, environment: &Environment) -> Result<bool, Error> {
-    media(syntax::parse_components(input)?.value(), environment)
+    let memory = crate::memory()?;
+    media(
+        syntax::parse_components_with_budget(input, &memory)?.value(),
+        environment,
+        &memory,
+    )
 }
 /// Query the property/value grammar this crate implements, not layout support.
 pub fn supports_matches(input: &str) -> Result<bool, Error> {
-    supports(syntax::parse_components(input)?.value())
+    let memory = crate::memory()?;
+    supports(
+        syntax::parse_components_with_budget(input, &memory)?.value(),
+        &memory,
+    )
 }
 
 fn validate(values: &[Component], depth: usize, count: &mut usize) -> Result<bool, Error> {
@@ -120,8 +130,15 @@ fn validate(values: &[Component], depth: usize, count: &mut usize) -> Result<boo
     }
     Ok(valid)
 }
-fn compact(values: &[Component]) -> Vec<&Component> {
-    values.iter().filter(|v| !v.whitespace()).collect()
+fn compact<'a>(
+    values: &'a [Component],
+    memory: &Budget,
+) -> Result<BudgetVec<&'a Component>, Error> {
+    let mut out = td_alloc::BudgetVec::with_capacity(memory, values.len())?;
+    for value in values.iter().filter(|v| !v.whitespace()) {
+        out.try_push(value)?;
+    }
+    Ok(out)
 }
 fn ident(value: Option<&&Component>, name: &str) -> bool {
     value
@@ -134,7 +151,11 @@ fn reserved(name: &str) -> bool {
         .any(|n| name.eq_ignore_ascii_case(n))
 }
 
-pub(crate) fn media(values: &[Component], env: &Environment) -> Result<bool, Error> {
+pub(crate) fn media(
+    values: &[Component],
+    env: &Environment,
+    memory: &Budget,
+) -> Result<bool, Error> {
     env.validate()?;
     // Validate each comma member separately for recoverable grammar errors,
     // but share admission accounting across all members.
@@ -154,12 +175,16 @@ pub(crate) fn media(values: &[Component], env: &Environment) -> Result<bool, Err
             count += 1;
         }
         if validate(member, 0, &mut count)? {
-            answer |= media_query(&compact(member), env)? == Some(Truth::True);
+            answer |= media_query(&compact(member, memory)?, env, memory)? == Some(Truth::True);
         }
     }
     Ok(answer)
 }
-fn media_query(v: &[&Component], env: &Environment) -> Result<Option<Truth>, Error> {
+fn media_query(
+    v: &[&Component],
+    env: &Environment,
+    memory: &Budget,
+) -> Result<Option<Truth>, Error> {
     let mut pos = 0;
     let negate = ident(v.first(), "not");
     if negate || ident(v.first(), "only") {
@@ -178,37 +203,39 @@ fn media_query(v: &[&Component], env: &Environment) -> Result<Option<Truth>, Err
             if !ident(rest.first(), "and") {
                 return Ok(None);
             }
-            let Some(t) = condition(rest.get(1..).unwrap_or_default(), Some(env), false)? else {
+            let Some(t) = condition(rest.get(1..).unwrap_or_default(), Some(env), false, memory)?
+            else {
                 return Ok(None);
             };
             result = result.and(t);
         }
         return Ok(Some(if negate { result.not() } else { result }));
     }
-    condition(v, Some(env), true)
+    condition(v, Some(env), true, memory)
 }
 
-pub(crate) fn supports(values: &[Component]) -> Result<bool, Error> {
+pub(crate) fn supports(values: &[Component], memory: &Budget) -> Result<bool, Error> {
     if !validate(values, 0, &mut 0)? {
         return Ok(false);
     }
-    Ok(condition(&compact(values), None, true)? == Some(Truth::True))
+    Ok(condition(&compact(values, memory)?, None, true, memory)? == Some(Truth::True))
 }
 fn condition(
     v: &[&Component],
     env: Option<&Environment>,
     allow_or: bool,
+    memory: &Budget,
 ) -> Result<Option<Truth>, Error> {
     if ident(v.first(), "not") {
         let [_, value] = v else {
             return Ok(None);
         };
-        return Ok(atom(value, env)?.map(Truth::not));
+        return Ok(atom(value, env, memory)?.map(Truth::not));
     }
     let Some(first) = v.first() else {
         return Ok(None);
     };
-    let Some(mut result) = atom(first, env)? else {
+    let Some(mut result) = atom(first, env, memory)? else {
         return Ok(None);
     };
     let mut mode = None;
@@ -224,7 +251,7 @@ fn condition(
             return Ok(None);
         }
         mode = Some(or);
-        let Some(next) = atom(value, env)? else {
+        let Some(next) = atom(value, env, memory)? else {
             return Ok(None);
         };
         result = if or {
@@ -238,7 +265,7 @@ fn condition(
     }
     Ok(Some(result))
 }
-fn atom(v: &Component, env: Option<&Environment>) -> Result<Option<Truth>, Error> {
+fn atom(v: &Component, env: Option<&Environment>, memory: &Budget) -> Result<Option<Truth>, Error> {
     let unknown = if env.is_some() {
         Truth::Unknown
     } else {
@@ -251,12 +278,12 @@ fn atom(v: &Component, env: Option<&Environment>) -> Result<Option<Truth>, Error
             None
         });
     };
-    let parts = compact(values);
-    if let Some(t) = condition(&parts, env, true)? {
+    let parts = compact(values, memory)?;
+    if let Some(t) = condition(&parts, env, true, memory)? {
         return Ok(Some(t));
     }
     if let Some(env) = env {
-        return Ok(Some(feature(values, env)));
+        return Ok(Some(feature(values, &parts, env)));
     }
     // A supports declaration is exactly one declaration, not a list.
     if values.iter().any(|v| v.delim(';'))
@@ -265,16 +292,17 @@ fn atom(v: &Component, env: Option<&Environment>) -> Result<Option<Truth>, Error
     {
         return Ok(Some(Truth::False));
     }
-    let parsed = syntax::declarations(values)?;
+    let parsed = syntax::declarations(values, memory)?;
     let [d] = parsed.value().as_slice() else {
         return Ok(Some(Truth::False));
     };
     Ok(Some(Truth::from(
-        crate::variables::parse(d).is_some() || !values::parse_declaration(d)?.is_empty(),
+        crate::variables::parse(d, memory)?.is_some()
+            || !values::parse_declaration(d, memory)?.is_empty(),
     )))
 }
 
-fn feature(values: &[Component], env: &Environment) -> Truth {
+fn feature(values: &[Component], p: &[&Component], env: &Environment) -> Truth {
     // Whitespace may surround a comparison, never split <= or >=.
     for (i, c) in values.iter().enumerate() {
         if c.delim('<') || c.delim('>') {
@@ -286,9 +314,20 @@ fn feature(values: &[Component], env: &Environment) -> Truth {
             }
         }
     }
-    let p = compact(values);
-    if let [name] = p.as_slice() {
-        return match name.ident().map(str::to_ascii_lowercase).as_deref() {
+    if let [name] = p {
+        return match name.ident().and_then(|name| {
+            syntax::keyword(
+                name,
+                &[
+                    "width",
+                    "height",
+                    "resolution",
+                    "orientation",
+                    "prefers-color-scheme",
+                    "prefers-reduced-motion",
+                ],
+            )
+        }) {
             Some("width") => Truth::from(env.width != 0.0),
             Some("height") => Truth::from(env.height != 0.0),
             Some("resolution") => Truth::from(env.resolution_dppx != 0.0),
@@ -297,18 +336,36 @@ fn feature(values: &[Component], env: &Environment) -> Truth {
             _ => Truth::Unknown,
         };
     }
-    if let [name, colon, value] = p.as_slice() {
+    if let [name, colon, value] = p {
         if colon.delim(':') {
             let Some(name) = name.ident() else {
                 return Truth::Unknown;
             };
-            let name = name.to_ascii_lowercase();
+            let Some(name) = syntax::keyword(
+                name,
+                &[
+                    "width",
+                    "height",
+                    "resolution",
+                    "min-width",
+                    "max-width",
+                    "min-height",
+                    "max-height",
+                    "min-resolution",
+                    "max-resolution",
+                    "orientation",
+                    "prefers-color-scheme",
+                    "prefers-reduced-motion",
+                ],
+            ) else {
+                return Truth::Unknown;
+            };
             let (base, op) = if let Some(n) = name.strip_prefix("min-") {
                 (n, Compare::Ge)
             } else if let Some(n) = name.strip_prefix("max-") {
                 (n, Compare::Le)
             } else {
-                (name.as_str(), Compare::Eq)
+                (name, Compare::Eq)
             };
             if let Some(actual) = metric(base, env) {
                 return number(value, base)
@@ -321,8 +378,19 @@ fn feature(values: &[Component], env: &Environment) -> Truth {
             let Some(value) = value.ident() else {
                 return Truth::Unknown;
             };
-            let value = value.to_ascii_lowercase();
-            return match (base, value.as_str()) {
+            let value = syntax::keyword(
+                value,
+                &[
+                    "portrait",
+                    "landscape",
+                    "light",
+                    "dark",
+                    "reduce",
+                    "no-preference",
+                ],
+            )
+            .unwrap_or("");
+            return match (base, value) {
                 ("orientation", "portrait") => Truth::from(env.height >= env.width),
                 ("orientation", "landscape") => Truth::from(env.width > env.height),
                 ("prefers-color-scheme", "light") => {
@@ -337,7 +405,7 @@ fn feature(values: &[Component], env: &Environment) -> Truth {
             };
         }
     }
-    range(&p, env).unwrap_or(Truth::Unknown)
+    range(p, env).unwrap_or(Truth::Unknown)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Compare {
@@ -366,7 +434,7 @@ impl Compare {
     }
 }
 fn metric(name: &str, env: &Environment) -> Option<f64> {
-    match name.to_ascii_lowercase().as_str() {
+    match syntax::keyword(name, &["width", "height", "resolution"])? {
         "width" => Some(env.width),
         "height" => Some(env.height),
         "resolution" => Some(env.resolution_dppx),
@@ -384,16 +452,21 @@ fn number(value: &Component, name: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|n| n.is_finite())?;
-    let unit = unit.to_ascii_lowercase();
+    let unit = syntax::keyword(
+        unit,
+        &[
+            "dppx", "x", "dpi", "dpcm", "px", "em", "rem", "pt", "pc", "in", "cm", "mm", "q", "",
+        ],
+    )?;
     let factor = if name.eq_ignore_ascii_case("resolution") {
-        match unit.as_str() {
+        match unit {
             "dppx" | "x" => 1.0,
             "dpi" => 1.0 / 96.0,
             "dpcm" => 2.54 / 96.0,
             _ => return None,
         }
     } else {
-        match unit.as_str() {
+        match unit {
             "px" => 1.0,
             "em" | "rem" => 16.0,
             "pt" => 96.0 / 72.0,

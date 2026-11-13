@@ -1,7 +1,8 @@
 //! HTML selector parsing, specificity and budgeted matching.
+use crate::syntax::Text;
 use crate::syntax::{self, Component, Number, Token};
 use crate::Error;
-use std::collections::BTreeSet;
+use td_alloc::{Budget, BudgetVec};
 
 pub const MAX_SELECTORS: usize = 256;
 pub const MAX_SELECTOR_PARTS: usize = 1024;
@@ -21,7 +22,7 @@ pub enum State {
 
 /// A cheap handle into a stable HTML tree. Siblings and children are elements
 /// only. Attribute names supplied by the matcher are ASCII lowercase.
-pub trait Element: Clone {
+pub trait Element: Copy {
     fn tag_name(&self) -> &str;
     fn attribute(&self, name: &str) -> Option<&str>;
     fn parent(&self) -> Option<Self>;
@@ -55,20 +56,20 @@ impl Specificity {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SelectorList {
-    selectors: Vec<Complex>,
+    selectors: BudgetVec<Complex>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Complex {
-    parts: Vec<Part>,
+    parts: BudgetVec<Part>,
     specificity: Specificity,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Part {
-    simples: Vec<Simple>,
+    simples: BudgetVec<Simple>,
     relation: Option<Combinator>,
 }
 
@@ -80,12 +81,12 @@ enum Combinator {
     Subsequent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum Simple {
     Universal,
-    Type(String),
-    Id(String),
-    Class(String),
+    Type(Text),
+    Id(Text),
+    Class(Text),
     Attribute(Attribute),
     Root,
     Empty,
@@ -114,12 +115,13 @@ enum Logical {
     Not,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Attribute {
-    name: String,
+    name: Text,
     operator: Operator,
-    value: String,
+    value: Text,
     insensitive: bool,
+    prefix: Option<BudgetVec<u16>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,8 +160,8 @@ impl Simple {
     }
 }
 
-#[derive(Default)]
 struct CompileBudget {
+    memory: Budget,
     members: usize,
     parts: usize,
 }
@@ -210,24 +212,24 @@ impl MatchBudget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum IndexKey {
-    Id(String),
-    Class(String),
-    Tag(String),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum IndexKey<'a> {
+    Id(&'a Text),
+    Class(&'a Text),
+    Tag(&'a Text),
     Universal,
 }
-
-fn compound_keys(part: &Part) -> BTreeSet<IndexKey> {
+fn compound_keys<'a>(part: &'a Part, keys: &mut BudgetVec<IndexKey<'a>>) -> Result<bool, Error> {
     for kind in 0..3 {
         for simple in &part.simples {
             let key = match (kind, simple) {
-                (0, Simple::Id(s)) => IndexKey::Id(s.clone()),
-                (1, Simple::Class(s)) => IndexKey::Class(s.clone()),
-                (2, Simple::Type(s)) => IndexKey::Tag(s.clone()),
+                (0, Simple::Id(s)) => IndexKey::Id(s),
+                (1, Simple::Class(s)) => IndexKey::Class(s),
+                (2, Simple::Type(s)) => IndexKey::Tag(s),
                 _ => continue,
             };
-            return [key].into_iter().collect();
+            keys.try_push(key)?;
+            return Ok(false);
         }
     }
     for simple in &part.simples {
@@ -236,33 +238,50 @@ fn compound_keys(part: &Part) -> BTreeSet<IndexKey> {
             list,
         } = simple
         {
-            return list.index_keys();
+            return list.append_index_keys(keys);
         }
     }
-    [IndexKey::Universal].into_iter().collect()
+    Ok(true)
 }
-
 impl SelectorList {
-    /// Each matching complex selector must satisfy one of these keys.
-    pub(crate) fn index_keys(&self) -> BTreeSet<IndexKey> {
-        let mut keys = BTreeSet::new();
+    fn append_index_keys<'a>(&'a self, keys: &mut BudgetVec<IndexKey<'a>>) -> Result<bool, Error> {
         for selector in &self.selectors {
             if let Some(part) = selector.parts.last() {
-                keys.extend(compound_keys(part));
+                if compound_keys(part, keys)? {
+                    return Ok(true);
+                }
             }
         }
-        if keys.contains(&IndexKey::Universal) {
-            return [IndexKey::Universal].into_iter().collect();
+        Ok(false)
+    }
+    pub(crate) fn index_keys(&self) -> Result<BudgetVec<IndexKey<'_>>, Error> {
+        let mut keys = BudgetVec::new(self.selectors.budget())?;
+        if self.append_index_keys(&mut keys)? {
+            keys.clear();
+            keys.try_push(IndexKey::Universal)?;
         }
-        keys
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
     }
     pub fn parse(input: &str) -> Result<Self, Error> {
-        let components = syntax::parse_components(input)?;
-        Self::from_components(components.value())
+        Self::parse_with_budget(input, &crate::memory()?)
     }
-
-    pub(crate) fn from_components(values: &[Component]) -> Result<Self, Error> {
-        parse_list(values, false, 0, &mut CompileBudget::default())
+    pub fn parse_with_budget(input: &str, memory: &Budget) -> Result<Self, Error> {
+        let components = syntax::parse_components_with_budget(input, memory)?;
+        Self::from_components(components.value(), memory)
+    }
+    pub(crate) fn from_components(values: &[Component], memory: &Budget) -> Result<Self, Error> {
+        parse_list(
+            values,
+            false,
+            0,
+            &mut CompileBudget {
+                members: 0,
+                parts: 0,
+                memory: memory.try_clone()?,
+            },
+        )
     }
 
     pub fn specificities(&self) -> impl Iterator<Item = Specificity> + '_ {
@@ -302,11 +321,11 @@ fn parse_list(
     if forgiving && !any_value(values) {
         return Err(Error::InvalidSelector);
     }
-    let mut selectors = Vec::new();
+    let mut selectors = BudgetVec::new(&budget.memory)?;
     for member in values.split(|v| v.delim(',')) {
         budget.member()?;
         match parse_complex(syntax::trim(member), depth, budget) {
-            Ok(selector) => selectors.push(selector),
+            Ok(selector) => selectors.try_push(selector)?,
             Err(Error::InvalidSelector) if forgiving => {}
             Err(error) => return Err(error),
         }
@@ -357,23 +376,23 @@ fn parse_complex(
     budget: &mut CompileBudget,
 ) -> Result<Complex, Error> {
     let mut cursor = Cursor::new(values);
-    let mut parts = Vec::new();
+    let mut parts = BudgetVec::new(&budget.memory)?;
     let mut specificity = Specificity::default();
     let mut relation = None;
     loop {
         if parts.len() == MAX_COMPOUNDS {
             return Err(Error::Limit("MAX_COMPOUNDS"));
         }
-        let mut simples = Vec::new();
+        let mut simples = BudgetVec::new(&budget.memory)?;
         match cursor.peek() {
             Some(Component::Token(Token::Ident(name))) => {
                 budget.part()?;
-                simples.push(Simple::Type(name.to_ascii_lowercase()));
+                simples.try_push(Simple::Type(syntax::lower_text(&budget.memory, name)?))?;
                 let _ = cursor.take();
             }
             Some(value) if value.delim('*') => {
                 budget.part()?;
-                simples.push(Simple::Universal);
+                simples.try_push(Simple::Universal)?;
                 let _ = cursor.take();
             }
             _ => {}
@@ -383,7 +402,7 @@ fn parse_complex(
                 Some(Component::Token(Token::Hash { value, id: true })) => {
                     budget.part()?;
                     let _ = cursor.take();
-                    Simple::Id(value.clone())
+                    Simple::Id(value.try_clone()?)
                 }
                 Some(value) if value.delim('.') => {
                     budget.part()?;
@@ -392,12 +411,12 @@ fn parse_complex(
                         .take()
                         .and_then(Component::ident)
                         .ok_or(Error::InvalidSelector)?;
-                    Simple::Class(name.to_owned())
+                    Simple::Class(syntax::text(&budget.memory, name)?)
                 }
                 Some(Component::Block { kind: '[', values }) => {
                     budget.part()?;
                     let _ = cursor.take();
-                    Simple::Attribute(parse_attribute(values)?)
+                    Simple::Attribute(parse_attribute(values, &budget.memory)?)
                 }
                 Some(value) if value.delim(':') => {
                     budget.part()?;
@@ -406,7 +425,7 @@ fn parse_complex(
                 }
                 _ => break,
             };
-            simples.push(simple);
+            simples.try_push(simple)?;
         }
         if simples.is_empty() {
             return Err(Error::InvalidSelector);
@@ -414,7 +433,7 @@ fn parse_complex(
         for simple in &simples {
             specificity = specificity.add(simple.specificity());
         }
-        parts.push(Part { simples, relation });
+        parts.try_push(Part { simples, relation })?;
         let spaced = cursor.space();
         if cursor.end() {
             break;
@@ -435,20 +454,21 @@ fn parse_complex(
     Ok(Complex { parts, specificity })
 }
 
-fn parse_attribute(values: &[Component]) -> Result<Attribute, Error> {
+fn parse_attribute(values: &[Component], memory: &Budget) -> Result<Attribute, Error> {
     let mut cursor = Cursor::new(syntax::trim(values));
     let name = cursor
         .take()
         .and_then(Component::ident)
-        .ok_or(Error::InvalidSelector)?
-        .to_ascii_lowercase();
+        .ok_or(Error::InvalidSelector)?;
+    let name = syntax::lower_text(memory, name)?;
     cursor.space();
     if cursor.end() {
         return Ok(Attribute {
             name,
             operator: Operator::Present,
-            value: String::new(),
+            value: syntax::text(memory, "")?,
             insensitive: false,
+            prefix: None,
         });
     }
     let operator = match cursor.take() {
@@ -471,7 +491,7 @@ fn parse_attribute(values: &[Component]) -> Result<Attribute, Error> {
     };
     cursor.space();
     let value = match cursor.take() {
-        Some(Component::Token(Token::Ident(value) | Token::String(value))) => value.clone(),
+        Some(Component::Token(Token::Ident(value) | Token::String(value))) => value.try_clone()?,
         _ => return Err(Error::InvalidSelector),
     };
     cursor.space();
@@ -485,11 +505,17 @@ fn parse_attribute(values: &[Component]) -> Result<Attribute, Error> {
     if !cursor.end() {
         return Err(Error::InvalidSelector);
     }
+    let prefix = if insensitive && matches!(operator, Operator::Substring) && !value.is_empty() {
+        Some(substring_prefix(value.as_bytes(), memory)?)
+    } else {
+        None
+    };
     Ok(Attribute {
         name,
         operator,
         value,
         insensitive,
+        prefix,
     })
 }
 
@@ -500,8 +526,26 @@ fn pseudo(
 ) -> Result<Simple, Error> {
     match cursor.take() {
         Some(Component::Token(Token::Ident(name))) => {
-            let name = name.to_ascii_lowercase();
-            Ok(match name.as_str() {
+            let name = syntax::keyword(
+                name,
+                &[
+                    "root",
+                    "empty",
+                    "link",
+                    "visited",
+                    "hover",
+                    "focus",
+                    "checked",
+                    "first-child",
+                    "last-child",
+                    "first-of-type",
+                    "last-of-type",
+                    "only-child",
+                    "only-of-type",
+                ],
+            )
+            .ok_or(Error::InvalidSelector)?;
+            Ok(match name {
                 "root" => Simple::Root,
                 "empty" => Simple::Empty,
                 "link" => Simple::Link,
@@ -522,13 +566,25 @@ fn pseudo(
             })
         }
         Some(Component::Function { name, values }) => {
-            let name = name.to_ascii_lowercase();
-            match name.as_str() {
+            let name = syntax::keyword(
+                name,
+                &[
+                    "is",
+                    "where",
+                    "not",
+                    "nth-child",
+                    "nth-last-child",
+                    "nth-of-type",
+                    "nth-last-of-type",
+                ],
+            )
+            .ok_or(Error::InvalidSelector)?;
+            match name {
                 "is" | "where" | "not" => {
                     if depth == MAX_SELECTOR_DEPTH {
                         return Err(Error::Limit("MAX_SELECTOR_DEPTH"));
                     }
-                    let kind = match name.as_str() {
+                    let kind = match name {
                         "is" => Logical::Is,
                         "where" => Logical::Where,
                         _ => Logical::Not,
@@ -585,25 +641,37 @@ fn nth(values: &[Component]) -> Result<(i64, i64), Error> {
     let first = cursor.take().ok_or(Error::InvalidSelector)?;
     let (a, unit) = match first {
         Component::Token(Token::Ident(name)) => {
-            let name = name.to_ascii_lowercase();
-            if !plus && (name == "odd" || name == "even") {
+            let name = name.as_str();
+            if !plus && (name.eq_ignore_ascii_case("odd") || name.eq_ignore_ascii_case("even")) {
                 if !cursor.end() {
                     return Err(Error::InvalidSelector);
                 }
-                return Ok((2, i64::from(name == "odd")));
+                return Ok((2, i64::from(name.eq_ignore_ascii_case("odd"))));
             }
-            if let Some(unit) = name.strip_prefix("-n").filter(|_| !plus) {
-                (-1, unit.to_owned())
-            } else if let Some(unit) = name.strip_prefix('n') {
-                (1, unit.to_owned())
+            if let Some(unit) = name
+                .get(..2)
+                .filter(|s| !plus && s.eq_ignore_ascii_case("-n"))
+                .and_then(|_| name.get(2..))
+            {
+                (-1, unit)
+            } else if let Some(unit) = name
+                .get(..1)
+                .filter(|s| s.eq_ignore_ascii_case("n"))
+                .and_then(|_| name.get(1..))
+            {
+                (1, unit)
             } else {
                 return Err(Error::InvalidSelector);
             }
         }
         Component::Token(Token::Dimension(number, name)) if !plus && number.integer => {
-            let name = name.to_ascii_lowercase();
-            let unit = name.strip_prefix('n').ok_or(Error::InvalidSelector)?;
-            (coefficient(&number.representation)?, unit.to_owned())
+            let name = name.as_str();
+            let unit = name
+                .get(..1)
+                .filter(|s| s.eq_ignore_ascii_case("n"))
+                .and_then(|_| name.get(1..))
+                .ok_or(Error::InvalidSelector)?;
+            (coefficient(&number.representation)?, unit)
         }
         _ if !plus && cursor.end() => return Ok((0, integer(first, false)?)),
         _ => return Err(Error::InvalidSelector),
@@ -671,6 +739,55 @@ pub(crate) fn html_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')
 }
 
+// Compile a linear-time ASCII-insensitive substring search once per selector.
+fn substring_prefix(value: &[u8], memory: &Budget) -> Result<BudgetVec<u16>, Error> {
+    let mut prefix = BudgetVec::filled(memory, value.len(), 0u16)?;
+    let mut matched = 0usize;
+    for (index, byte) in value.iter().enumerate().skip(1) {
+        while matched > 0
+            && !value
+                .get(matched)
+                .is_some_and(|old| old.eq_ignore_ascii_case(byte))
+        {
+            matched = usize::from(*prefix.get(matched - 1).ok_or(Error::InvalidSelector)?);
+        }
+        if value
+            .get(matched)
+            .is_some_and(|old| old.eq_ignore_ascii_case(byte))
+        {
+            matched += 1;
+        }
+        *prefix.get_mut(index).ok_or(Error::InvalidSelector)? =
+            u16::try_from(matched).map_err(|_| Error::InvalidSelector)?;
+    }
+    Ok(prefix)
+}
+fn insensitive_contains(actual: &[u8], value: &[u8], prefix: &[u16]) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let mut matched = 0usize;
+    for byte in actual {
+        while matched > 0
+            && !value
+                .get(matched)
+                .is_some_and(|old| old.eq_ignore_ascii_case(byte))
+        {
+            matched = prefix.get(matched - 1).map_or(0, |n| usize::from(*n));
+        }
+        if value
+            .get(matched)
+            .is_some_and(|old| old.eq_ignore_ascii_case(byte))
+        {
+            matched += 1;
+        }
+        if matched == value.len() {
+            return true;
+        }
+    }
+    false
+}
+
 impl Attribute {
     fn matches(&self, actual: &str) -> bool {
         let equals = |a: &str, b: &str| {
@@ -706,9 +823,9 @@ impl Attribute {
             Operator::Substring => {
                 !value.is_empty()
                     && if self.insensitive {
-                        actual
-                            .to_ascii_lowercase()
-                            .contains(&value.to_ascii_lowercase())
+                        self.prefix.as_ref().is_some_and(|prefix| {
+                            insensitive_contains(actual.as_bytes(), value.as_bytes(), prefix)
+                        })
                     } else {
                         actual.contains(value)
                     }
@@ -734,7 +851,7 @@ fn matches_complex<E: Element>(
     let Some(relation) = part.relation else {
         return Ok(true);
     };
-    let mut current = element.clone();
+    let mut current = *element;
     loop {
         budget.step()?;
         let next = match relation {
@@ -765,7 +882,7 @@ fn position<E: Element>(
     } else {
         None
     };
-    let mut current = element.clone();
+    let mut current = *element;
     let mut count = 1i64;
     loop {
         budget.step()?;
@@ -798,7 +915,7 @@ fn matches_simple<E: Element>(
         Simple::Type(name) => checked(element.tag_name(), budget)?.eq_ignore_ascii_case(name),
         Simple::Id(name) => attribute(element, "id", budget)? == Some(name.as_str()),
         Simple::Class(name) => attribute(element, "class", budget)?
-            .is_some_and(|s| s.split(html_space).any(|c| c == name)),
+            .is_some_and(|s| s.split(html_space).any(|c| c == name.as_str())),
         Simple::Attribute(test) => {
             budget.charge(test.value.len())?;
             attribute(element, &test.name, budget)?.is_some_and(|value| test.matches(value))

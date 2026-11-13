@@ -7,6 +7,9 @@ pub use helpers::*;
 
 mod budget;
 mod raw;
+pub use raw::SmallText;
 mod storage;
 pub use budget::{Budget, BudgetError, Charge};
-pub use storage::{Arena, BudgetShared, BudgetString, BudgetVec, Buffer};
+pub use storage::{
+    Arena, BudgetIntoIter, BudgetMap, BudgetShared, BudgetString, BudgetVec, Buffer,
+};

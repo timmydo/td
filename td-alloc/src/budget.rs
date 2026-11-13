@@ -140,6 +140,33 @@ pub struct Charge {
     bytes: usize,
 }
 impl Charge {
+    // Replace one owned layout while admitting both old and new. Borrow the
+    // existing identity instead of cloning it for each reallocation.
+    pub(crate) fn replace_layout<T>(
+        &mut self,
+        bytes: usize,
+        replace: impl FnOnce() -> Result<T, BudgetError>,
+    ) -> Result<T, BudgetError> {
+        struct Pending<'a> {
+            budget: &'a Budget,
+            bytes: usize,
+        }
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.budget.release(self.bytes);
+            }
+        }
+        self.budget.acquire(bytes)?;
+        let mut pending = Pending {
+            budget: &self.budget,
+            bytes,
+        };
+        let result = replace()?;
+        self.budget.release(self.bytes);
+        self.bytes = bytes;
+        pending.bytes = 0;
+        Ok(result)
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -164,5 +191,38 @@ impl Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         self.budget.release(self.bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    #[test]
+    fn replacement_admission_survives_refusal_and_unwind() {
+        let root = Budget::new(4096).unwrap();
+        let mut charge = root.charge(8).unwrap();
+        let refused = charge.replace_layout(16, || {
+            assert_eq!(root.used(), Budget::metadata_bytes() + 24);
+            Err::<(), _>(BudgetError::Allocation)
+        });
+        assert_eq!(refused, Err(BudgetError::Allocation));
+        assert_eq!(charge.bytes(), 8);
+        assert_eq!(root.used(), Budget::metadata_bytes() + 8);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = charge.replace_layout::<()>(16, || panic!("replacement interrupted"));
+        }))
+        .is_err());
+        assert_eq!(charge.bytes(), 8);
+        assert_eq!(root.used(), Budget::metadata_bytes() + 8);
+        charge
+            .replace_layout(16, || {
+                assert_eq!(root.used(), Budget::metadata_bytes() + 24);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(root.used(), Budget::metadata_bytes() + 16);
+        drop(charge);
+        assert_eq!(root.used(), Budget::metadata_bytes());
     }
 }

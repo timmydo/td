@@ -57,6 +57,61 @@ pub(super) fn grow_string(values: &mut String, capacity: usize) -> Result<(), Bu
     unsafe { grow_vector(values.as_mut_vec(), capacity) }
 }
 
+/// Fixed UTF-8 storage, at most 255 bytes, with no heap allocation.
+/// Fields stay private so all bytes below len came from complete str values.
+#[derive(Clone, Copy)]
+pub struct SmallText<const N: usize> {
+    bytes: [u8; N],
+    len: u8,
+}
+impl<const N: usize> SmallText<N> {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+    pub fn copy(value: &str) -> Option<Self> {
+        let mut out = Self::new();
+        out.try_push_str(value).ok()?;
+        Some(out)
+    }
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
+    }
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: new starts empty; copy and try_push_str copy complete valid
+        // str values and advance len only after a checked in-bounds copy.
+        // ASCII folding preserves UTF-8, and Copy preserves the representation.
+        // No mutable bytes or unchecked constructor escape. The view borrows
+        // self, excluding mutation for its entire lifetime.
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+    #[inline]
+    pub fn try_push_str(&mut self, value: &str) -> Result<(), BudgetError> {
+        let start = usize::from(self.len);
+        let end = start
+            .checked_add(value.len())
+            .ok_or(BudgetError::Overflow)?;
+        let target = self.bytes.get_mut(start..end).ok_or(BudgetError::Limit)?;
+        let len = u8::try_from(end).map_err(|_| BudgetError::Limit)?;
+        target.copy_from_slice(value.as_bytes());
+        self.len = len;
+        Ok(())
+    }
+    pub fn make_ascii_lowercase(&mut self) {
+        self.bytes.make_ascii_lowercase();
+    }
+}
+impl<const N: usize> Default for SmallText<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Inner<T> {
     references: AtomicUsize,
     value: T,

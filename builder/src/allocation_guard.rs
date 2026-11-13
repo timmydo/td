@@ -104,7 +104,9 @@ fn operations(source: &str) -> BTreeMap<String, usize> {
                 .is_some_and(|owner| owner == "td_alloc")
                 && i.checked_sub(3)
                     .and_then(|n| tokens.get(n))
-                    .is_some_and(|owner| ["BudgetVec", "BudgetString"].contains(&owner.as_str())))
+                    .is_some_and(|owner| {
+                        ["BudgetVec", "BudgetString", "BudgetMap"].contains(&owner.as_str())
+                    }))
             && ["with_capacity", "from_iter"].contains(&token.as_str())
         {
             Some("allocating-constructor")
@@ -246,6 +248,10 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
             .map_err(|error| format!("{path}: {error}"))?;
     }
+    for path in CSS_STORAGE_SOURCES {
+        css_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
+            .map_err(|error| format!("{path}: {error}"))?;
+    }
     for path in METHOD_STORAGE_SOURCES {
         method_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
             .map_err(|error| format!("{path}: {error}"))?;
@@ -265,6 +271,19 @@ const TREE_STORAGE_SOURCES: &[&str] = &[
     "td-html/src/document/tables.rs",
     "td-html/src/document/formatting.rs",
     "td-html/src/document/foreign.rs",
+];
+const CSS_STORAGE_SOURCES: &[&str] = &[
+    "td-css/src/lib.rs",
+    "td-css/src/syntax.rs",
+    "td-css/src/selectors.rs",
+    "td-css/src/cascade.rs",
+    "td-css/src/cascade/index.rs",
+    "td-css/src/conditions.rs",
+    "td-css/src/values.rs",
+    "td-css/src/values/layout.rs",
+    "td-css/src/variables.rs",
+    "td-css/src/sharing.rs",
+    "td-css/src/calc.rs",
 ];
 const METHOD_STORAGE_SOURCES: &[&str] = &[
     "td-mta/src/jmap_request/creation_ids.rs",
@@ -289,7 +308,17 @@ fn standard_owners(code: &str, enum_variants: bool) -> bool {
         .filter(|word| !word.is_empty())
         .any(|word| {
             let forbidden = [
-                "Vec", "String", "Box", "Arc", "Rc", "HashMap", "BTreeMap", "VecDeque",
+                "Vec",
+                "String",
+                "Box",
+                "Arc",
+                "Rc",
+                "HashMap",
+                "BTreeMap",
+                "VecDeque",
+                "HashSet",
+                "BTreeSet",
+                "BinaryHeap",
             ]
             .contains(&word)
                 && !(enum_variants && word == "String" && previous == "Kind");
@@ -305,6 +334,24 @@ fn budgeted_source(source: &str) -> Result<(), String> {
             "guarded paths require budgeted or fixed storage; unbudgeted allocation is forbidden"
                 .into(),
         );
+    }
+    Ok(())
+}
+fn css_source(source: &str) -> Result<(), String> {
+    let code =
+        td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
+    // CSS quoted tokens use a String enum variant backed by owned Text.
+    // Normalize only those exact spellings, never the std owner or an alias.
+    let compact = code
+        .replace(" :: ", "::")
+        .replace(":: ", "::")
+        .replace(" ::", "::");
+    let owners = compact
+        .replace("Token::String", "Token::Quoted")
+        .replace("Self::String", "Self::Quoted")
+        .replace("String(Text)", "Quoted(Text)");
+    if !operations(source).is_empty() || standard_owners(&owners, false) {
+        return Err("guarded CSS storage requires fallible td-alloc owners".into());
     }
     Ok(())
 }
@@ -366,7 +413,7 @@ fn owned_source(name: &str, source: &str) -> Result<(), String> {
         .filter(|word| *word == "unsafe")
         .count();
     let (words, blocks, allows) = if name == "raw.rs" {
-        (8, 6, 8)
+        (9, 7, 9)
     } else {
         (0, 0, 0)
     };
@@ -521,13 +568,30 @@ mod tests {
     }
 
     #[test]
+    fn css_storage_allows_only_the_quoted_token_variant() {
+        assert!(css_source(
+            "enum Token { String(Text) } fn f() { Token::String(value); Self::String(value); }"
+        )
+        .is_ok());
+        for source in [
+            "use std::string::String as Text;",
+            "fn f() { String::new(); }",
+            "fn f() { values.clone(); }",
+            "fn f() { let v: Vec<u8> = Default::default(); }",
+            "use std::collections::BTreeSet as Set;",
+        ] {
+            assert!(css_source(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn discovery_checks_untracked_sources_and_refuses_missing_inventory() {
         let temp = crate::test_temp::TempDir::new("allocation-guard").unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("td-example/src")).unwrap();
         fs::create_dir_all(root.join("td-alloc/src")).unwrap();
         fs::create_dir_all(root.join("td-mta/src/jmap_request")).unwrap();
-        for path in TREE_STORAGE_SOURCES {
+        for path in TREE_STORAGE_SOURCES.iter().chain(CSS_STORAGE_SOURCES) {
             let file = root.join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
             fs::write(file, "fn storage() {}").unwrap();

@@ -163,7 +163,7 @@ impl<'d> StyledDocument<'d> {
         let mut styles = StylePool::new(PoolLimits {
             bytes: limits.styles.bytes.min(limits.bytes - fixed),
             ..limits.styles
-        });
+        })?;
         let mut node_styles = vec![None; document.len()];
         let mut root_size = 16.0;
         for element in tree.elements() {

@@ -139,48 +139,67 @@ pub(super) fn shorthand(
     name: &str,
     v: &[Component],
     important: bool,
-) -> Result<Vec<ValueDeclaration>, Error> {
+    memory: &Budget,
+) -> Result<BudgetVec<ValueDeclaration>, Error> {
+    let mut output = BudgetVec::new(memory)?;
     let Some(targets) = targets(name) else {
-        return Ok(Vec::new());
+        return Ok(output);
     };
-    let values = if let Some(global) = global(v) {
-        targets.iter().map(|p| (*p, global.clone())).collect()
-    } else {
-        let parsed = match name {
-            "font" => font(v)?,
-            "overflow" => overflow(v),
-            _ => border(v, targets)?,
-        };
-        let Some(parsed) = parsed else {
-            return Ok(Vec::new());
-        };
-        parsed
+    if let Some(global) = global(v) {
+        for property in targets {
+            output.try_push(ValueDeclaration {
+                property: *property,
+                value: global.try_clone()?,
+                important,
+            })?;
+        }
+        return Ok(output);
+    }
+    let parsed = match name {
+        "font" => font(v, memory)?,
+        "overflow" => overflow(v, memory)?,
+        _ => border(v, targets, memory)?,
     };
-    Ok(values
-        .into_iter()
-        .map(|(property, value)| ValueDeclaration {
-            property,
-            value,
-            important,
-        })
-        .collect())
+    if let Some(parsed) = parsed {
+        for (property, value) in parsed {
+            output.try_push(ValueDeclaration {
+                property,
+                value,
+                important,
+            })?;
+        }
+    }
+    Ok(output)
 }
-fn overflow(v: &[Component]) -> Option<Vec<(Property, Specified)>> {
-    let values: Vec<_> = v.iter().filter(|v| !v.whitespace()).collect();
-    let (a, b) = match values.as_slice() {
-        [a] => (*a, *a),
-        [a, b] => (*a, *b),
-        _ => return None,
+fn overflow(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let mut values = v.iter().filter(|v| !v.whitespace());
+    let Some(a) = values.next() else {
+        return Ok(None);
     };
-    Some(vec![
-        (OverflowX, keyword(std::slice::from_ref(a), OVERFLOW)?),
-        (OverflowY, keyword(std::slice::from_ref(b), OVERFLOW)?),
-    ])
+    let b = values.next().unwrap_or(a);
+    if values.next().is_some() {
+        return Ok(None);
+    }
+    let Some(a) = keyword(std::slice::from_ref(a), OVERFLOW) else {
+        return Ok(None);
+    };
+    let Some(b) = keyword(std::slice::from_ref(b), OVERFLOW) else {
+        return Ok(None);
+    };
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, 2)?;
+    output.try_push((OverflowX, a))?;
+    output.try_push((OverflowY, b))?;
+    Ok(Some(output))
 }
+
 fn border(
     v: &[Component],
     targets: &[Property],
-) -> Result<Option<Vec<(Property, Specified)>>, Error> {
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
     let mut width = None;
     let mut style = None;
     let mut color = None;
@@ -192,15 +211,15 @@ fn border(
         }
         let one = std::slice::from_ref(c);
         if let Some(v) = keyword(one, STYLES) {
-            if style.replace(v).is_some() {
+            if Option::replace(&mut style, v).is_some() {
                 return Ok(None);
             }
         } else if let Some(v) = parse_color(one) {
-            if color.replace(v).is_some() {
+            if Option::replace(&mut color, v).is_some() {
                 return Ok(None);
             }
         } else if let Some(v) = parse_length(BorderTopWidth, one)? {
-            if width.replace(v).is_some() {
+            if Option::replace(&mut width, v).is_some() {
                 return Ok(None);
             }
         } else {
@@ -210,38 +229,42 @@ fn border(
     if count == 0 {
         return Ok(None);
     }
-    Ok(Some(
-        targets
-            .iter()
-            .map(|p| {
-                let value = if p.border() {
-                    &width
-                } else if p.border_color() {
-                    &color
-                } else {
-                    &style
-                };
-                (*p, value.clone().unwrap_or(Specified::Initial))
-            })
-            .collect(),
-    ))
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, targets.len())?;
+    for property in targets {
+        let value = if property.border() {
+            &width
+        } else if property.border_color() {
+            &color
+        } else {
+            &style
+        };
+        output.try_push((
+            *property,
+            match value {
+                Some(value) => value.try_clone()?,
+                None => Specified::Initial,
+            },
+        ))?;
+    }
+    Ok(Some(output))
 }
-fn font(v: &[Component]) -> Result<Option<Vec<(Property, Specified)>>, Error> {
-    let tokens: Vec<_> = v
+fn font(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let mut tokens = v
         .iter()
         .enumerate()
         .filter(|(_, c)| !c.whitespace())
-        .collect();
-    let mut pos = 0;
+        .peekable();
     let mut normals = 0;
-    let mut prefix = BTreeMap::new();
+    let mut prefix = td_alloc::BudgetMap::with_capacity(memory, FONT.len())?;
     let size = loop {
-        let Some((_, c)) = tokens.get(pos) else {
+        let Some((_, c)) = tokens.next() else {
             return Ok(None);
         };
-        let one = std::slice::from_ref(*c);
+        let one = std::slice::from_ref(c);
         if let Some(size) = parse_length(FontSize, one)? {
-            pos += 1;
             break size;
         }
         if normals + prefix.len() == 3 {
@@ -260,52 +283,54 @@ fn font(v: &[Component]) -> Result<Option<Vec<(Property, Specified)>>, Error> {
             let Some((p, value)) = found else {
                 return Ok(None);
             };
-            if prefix.insert(p, value).is_some() {
+            if prefix.try_insert(p, value)?.is_some() {
                 return Ok(None);
             }
         }
-        pos += 1;
     };
-    prefix.insert(FontSize, size);
-    if tokens.get(pos).is_some_and(|(_, c)| c.delim('/')) {
-        pos += 1;
-        let Some((_, c)) = tokens.get(pos) else {
+    prefix.try_insert(FontSize, size)?;
+    if tokens.peek().is_some_and(|(_, c)| c.delim('/')) {
+        let _ = tokens.next();
+        let Some((_, c)) = tokens.next() else {
             return Ok(None);
         };
-        let Some(height) = parse(LineHeight, std::slice::from_ref(*c))? else {
+        let Some(height) = parse(LineHeight, std::slice::from_ref(c))? else {
             return Ok(None);
         };
-        prefix.insert(LineHeight, height);
-        pos += 1;
+        prefix.try_insert(LineHeight, height)?;
     }
-    let Some((start, _)) = tokens.get(pos) else {
+    let Some((start, _)) = tokens.next() else {
         return Ok(None);
     };
-    let Some(family) = parse_families(v.get(*start..).unwrap_or_default())? else {
+    let Some(family) = parse_families(v.get(start..).unwrap_or_default(), memory)? else {
         return Ok(None);
     };
-    prefix.insert(
+    prefix.try_insert(
         FontFamily,
         Specified::Ready(ComputedValue::FontFamily(family)),
-    );
-    Ok(Some(
-        FONT.iter()
-            .map(|p| (*p, prefix.remove(p).unwrap_or(Specified::Initial)))
-            .collect(),
-    ))
+    )?;
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, FONT.len())?;
+    for property in FONT {
+        output.try_push((
+            *property,
+            prefix.remove(property).unwrap_or(Specified::Initial),
+        ))?;
+    }
+    Ok(Some(output))
 }
+
 fn word(style: &ComputedStyle, p: Property) -> Option<&'static str> {
     match style.get(p) {
         Some(ComputedValue::Keyword(v)) => Some(*v),
         _ => None,
     }
 }
-pub(super) fn finish(style: &mut ComputedStyle, root: bool) {
+pub(super) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error> {
     for (width, kind) in BORDERS.iter().zip(BORDER_STYLES) {
         if matches!(word(style, *kind), Some("none" | "hidden")) {
             style
                 .values
-                .insert(*width, ComputedValue::Length(Length::Px(0.0)));
+                .try_insert(*width, ComputedValue::Length(Length::Px(0.0)))?;
         }
     }
     let x = word(style, OverflowX);
@@ -318,7 +343,7 @@ pub(super) fn finish(style: &mut ComputedStyle, root: bool) {
                 _ => None,
             };
             if let Some(next) = next {
-                style.values.insert(p, ComputedValue::Keyword(next));
+                style.values.try_insert(p, ComputedValue::Keyword(next))?;
             }
         }
     }
@@ -334,9 +359,12 @@ pub(super) fn finish(style: &mut ComputedStyle, root: bool) {
             _ => None,
         };
         if let Some(next) = next {
-            style.values.insert(Display, ComputedValue::Keyword(next));
+            style
+                .values
+                .try_insert(Display, ComputedValue::Keyword(next))?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

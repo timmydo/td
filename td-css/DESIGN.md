@@ -2,7 +2,8 @@
 
 td-css is td's CSS engine: owned syntax, selector matching and computed
 styles, without layout, painting, fetching or a document tree. It is a
-standalone, std-only library, with no dependencies, no unsafe code and no
+standalone library using std and td-alloc, with no external dependencies,
+no unsafe code and no
 production panics or unchecked indexing. The standalone
 [td-dom adapter](../td-dom/DESIGN.md) connects its Element boundary to
 td-html documents; no application consumes it yet. td-css itself has no
@@ -24,7 +25,10 @@ rules are not interpreted as nested selectors.
 Input is already decoded UTF-8 (`&str`). Encoding sniffing and decoding
 bytes belong to the caller. Preprocessing folds CRLF, CR and form feed to
 LF, and replaces NUL with U+FFFD. Rust strings cannot contain surrogates.
-An initial BOM is removed. Comments disappear without adding whitespace.
+An initial BOM is removed. ASCII input with no CR, form feed or NUL is
+borrowed during lexing; other input uses an owned normalized character
+array. Both paths produce the same owned tokens. Comments disappear without
+adding whitespace.
 Tokens retain decoded names, strings and URLs, number representations and
 integer flags, and the ID/unrestricted distinction on hash tokens.
 Escapes, bad strings, bad URLs, CDO/CDC and EOF recovery follow Syntax §4.
@@ -34,7 +38,8 @@ meaning.
 
 The syntax layer implements the stylesheet, declaration-list and
 component-value-list entry points of Syntax §5. Functions and simple
-blocks own their component values. Unclosed blocks/functions end at EOF;
+blocks own their component values. Rule bodies take ownership of their parsed arrays, and declaration validation
+borrows candidate spans before copying only retained values. Unclosed blocks/functions end at EOF;
 an incomplete qualified rule without a block is discarded. A declaration
 without a name/colon is discarded through its next top-level semicolon.
 Its terminal, ASCII-insensitive `!important` is removed into a flag.
@@ -91,7 +96,7 @@ members. `:link` matches any link; `:visited` always fails. The interface
 has no visited-history query, so history cannot change any computed value,
 including through negation or logical functions.
 
-`Element: Clone` is a cheap handle into the caller's stable tree. It
+`Element: Copy` is a cheap handle into the caller's stable tree. It
 exposes `tag_name`, `attribute`, `parent`, `previous_sibling`,
 `next_sibling`, `first_child`, `has_text`, and `is_link`. Attributes are
 queried by ASCII-lowercase name, including `id` and `class`. The caller
@@ -123,6 +128,9 @@ with any universal branch is wholly universal. An empty forgiving list
 contributes no key because it cannot match. Keys only select candidates:
 the complete selector list still determines matching and specificity.
 Candidate rule numbers are deduplicated and visited in original order.
+Index construction appends shared key/rule pairs, then sorts each key class
+once. Binary lookup finds its contiguous matching range. Construction is
+O(entries log entries), without quadratic sorted-map insertion.
 
 Ordinary invalid property values are discarded before the cascade. A
 syntactically valid var() value instead defers property grammar until
@@ -367,7 +375,8 @@ the complete HTML rendering stylesheet.
 
 ## 5. Bounds and failure
 
-All limits are compiled constants, not caller-adjustable. They apply
+Syntax and work limits are compiled constants. Caller-supplied memory
+budgets and PoolLimits may impose lower storage bounds. Limits apply
 before the allocation or recursive step they guard. A fatal `Error`
 names the exhausted bound; callers must report refusal rather than treat
 it as a stylesheet matching nothing.
@@ -414,18 +423,44 @@ backtrack over ancestors or siblings, but shares one work counter across
 logical functions and every candidate rule of a compute call. Index
 lookups charge observed tag/id/class bytes before scanning or folding,
 one step per lookup and one per bucket entry before deduplication.
-BTree lookups and candidate sorting have an additional logarithmic factor
+Binary index lookups and candidate sorting have an additional logarithmic factor
 bounded by MAX_INDEX_ENTRIES and MAX_COMPILED_RULES; the work counter is an
 admission metric, not a CPU instruction count. Duplicate class words
 still charge repeated bucket visits. Only indexed fields are observed. Recursive matching
 depth is bounded by compounds and logical depth, not document depth.
 Attribute scans are bounded by MAX_ELEMENT_BYTES per observed string and
 charged by byte length to the same work budget. Substring matching uses
-linear string search, ASCII-folding bounded strings for an `i` test.
+linear string search; an `i` selector compiles a bounded KMP prefix array
+and folds ASCII bytes while scanning, without allocating in the match.
 Numeric input may be larger than a supported value; finite values beyond
 the computed bound are clamped, without wrapping or creating NaN.
-Memory allocation failure remains the Rust allocator's process-level
-failure; this is an admission contract, not fallible global allocation.
+All td-css-owned heap storage uses td-alloc. Token text up to 14 UTF-8
+bytes lives inline in its enclosing owner.
+Text from 15 through 62 bytes uses one shared fixed SmallText allocation;
+longer text uses a shared BudgetString. Custom maps, retained custom-token
+arrays and font families use immutable BudgetShared owners; nested component arrays use BudgetVec.
+Component construction counts immediate children with a fixed bounded
+delimiter stack before reserving exact capacity.
+Mutable arrays and small ordered maps use BudgetVec and BudgetMap.
+Error::Memory distinguishes budget exhaustion, overflow and allocator
+refusal with no heap-backed diagnostic. Failure drops temporary storage;
+no partial stylesheet or computed style escapes. Element callbacks and
+caller-provided formatting/hashing remain outside this storage contract.
+The source guard rejects standard owners and recognized unchecked growth
+throughout production td-css, apart from the CSS token's String variant.
+
+Standalone syntax, selector and stylesheet constructors create a 256 MiB
+root plus its budget metadata. Their with_budget variants instead share
+an explicit caller budget; all scratch and returned storage keep that
+identity. StyleSet::compute uses the stylesheet's budget by default;
+compute_with_budget and compute_with_stats_and_budget let a page choose a
+separate child. These are simultaneous owned-layout limits, independent
+of the cumulative syntax/substitution admission counters. Shared strings
+and tokens retain their original admission while a computed style or
+interner still references them, even after the StyleSet drops. Callers
+must not release or subtract an estimated stylesheet charge at that point.
+Small ordered maps have logarithmic lookup and linear shifting insertion;
+custom-property counts and pool work bounds limit their construction.
 
 ## 6. Public API and tests
 
@@ -444,9 +479,7 @@ completion; consumed steps exclude the charge that refused. `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
 td-web's styled pages (td-web/DESIGN.md §10, increment 6) need first a
-caller-set admission ceiling charged while a StyleSet compiles, with
-the compiled set's charge reported, a refusal naming the sheet it arose
-in, a media condition per sheet, the `background` shorthand's colour,
+refusal naming the sheet it arose in, a media condition per sheet, the `background` shorthand's colour,
 and rgb()/hsl() and CSS Color 4's extended named colours, and will use
 an answer to whether a changed environment changes which of its rules
 apply.
@@ -456,7 +489,9 @@ apply.
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
 the fixed 55-longhand roster. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
-computation above. `ComputedStyle::default` has initial invisible borders. `ComputedStyle::get` yields immutable typed
+computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
+borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`
+is fallible for owning values. `ComputedStyle::get` yields immutable typed
 values (keywords, RGBA colors, px/percentage/auto and unresolved calc() lengths, family lists,
 weights, scalar numbers and decoration flags); `font_size` and `color` are convenient
 typed accessors. `custom_property(name)` exposes an immutable computed
@@ -758,7 +793,7 @@ and sizing values account for substantial remaining discarded CSS.
 computed styles. `intern` returns an opaque StyleId; `get` borrows the
 canonical value. Equal values with equal custom properties share an ID,
 including separately computed siblings. Custom maps are canonicalized
-independently, and inherited token allocations retain their Arc sharing.
+independently, and inherited token allocations retain their BudgetShared sharing.
 A fingerprint only selects an equality bucket. Signed zero hashes alike.
 No global cache or tree dependency is introduced.
 
@@ -772,3 +807,13 @@ Canonical custom maps and shared token allocations count once. Pool
 metadata stays charged even when a failed insertion retained only a new
 custom map. A refusal never returns an ID for an incomplete style.
 The newly computed candidate and cascade scratch remain caller costs.
+
+StylePool::new is fallible; with_budget shares a page's chosen owner.
+Exact owned allocations and the conservative PoolLimits admission model
+are separate constraints. A refused insertion may retain valid custom-map
+or empty-bucket cache entries, and consumes work/admission units already
+used. Published pointer identities always have a retained owner; style IDs
+are published only after their style is stored. Dropping the pool releases
+its allocations, while shared owners elsewhere retain their own charges.
+Failure tests inject refusal at every allocation in compilation, computation
+and interning, check release or valid partial cache ownership, and retry.

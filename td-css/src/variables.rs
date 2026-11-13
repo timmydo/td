@@ -1,8 +1,8 @@
 //! Computed custom properties and bounded token substitution.
+use crate::syntax::Text;
 use crate::syntax::{self, Component, Declaration, Token};
 use crate::{Error, MAX_NESTING};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use td_alloc::{BudgetMap, BudgetShared, BudgetVec};
 
 pub const MAX_CUSTOM_PROPERTIES: usize = 8192;
 pub const MAX_CUSTOM_BYTES: usize = 1024 * 1024;
@@ -10,41 +10,62 @@ pub const MAX_VARIABLE_DEPTH: usize = 64;
 pub const MAX_SUBSTITUTION_COMPONENTS: usize = 262_144;
 pub const MAX_SUBSTITUTION_BYTES: usize = 4 * 1024 * 1024;
 
-type Tokens = Arc<[Component]>;
+pub(crate) type Tokens = BudgetShared<BudgetVec<Component>>;
 type CustomValue = Option<Tokens>;
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CustomProperties {
-    pub(crate) entries: Arc<BTreeMap<String, CustomValue>>,
+    pub(crate) entries: BudgetShared<BudgetMap<Text, CustomValue>>,
     bytes: usize,
 }
 impl CustomProperties {
+    pub(crate) fn new(memory: &td_alloc::Budget) -> Result<Self, Error> {
+        Ok(Self {
+            entries: BudgetShared::new(memory, BudgetMap::new(memory)?)?,
+            bytes: 0,
+        })
+    }
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            entries: self.entries.try_clone()?,
+            bytes: self.bytes,
+        })
+    }
     pub(crate) fn get(&self, name: &str) -> Option<&[Component]> {
-        self.entries.get(name).and_then(Option::as_deref)
+        self.entries
+            .get(name)
+            .and_then(|value| value.as_ref().map(|tokens| &***tokens))
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum CustomSpecified {
     Inherit,
     Invalid,
     Tokens(Tokens),
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct CustomDeclaration {
-    pub name: String,
+    pub name: Text,
     pub value: CustomSpecified,
     pub important: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Pending {
-    pub name: String,
+    pub name: Text,
     pub tokens: Tokens,
 }
-#[derive(Default)]
 pub(crate) struct Budget {
+    pub(crate) memory: td_alloc::Budget,
     pub components: usize,
     pub bytes: usize,
 }
 impl Budget {
+    pub(crate) fn new(memory: &td_alloc::Budget) -> Result<Self, Error> {
+        Ok(Self {
+            memory: memory.try_clone()?,
+            components: 0,
+            bytes: 0,
+        })
+    }
     fn charge(&mut self, bytes: usize) -> Result<(), Error> {
         if self.components == MAX_SUBSTITUTION_COMPONENTS {
             return Err(Error::Limit("MAX_SUBSTITUTION_COMPONENTS"));
@@ -98,27 +119,60 @@ fn inspect_inner(values: &[Component], top: bool) -> Option<bool> {
     }
     Some(found)
 }
-pub(crate) fn parse(declaration: &Declaration) -> Option<CustomDeclaration> {
-    if !is_name(declaration.name()) {
-        return None;
+pub(crate) fn parse(
+    declaration: &Declaration,
+    memory: &td_alloc::Budget,
+) -> Result<Option<CustomDeclaration>, Error> {
+    if !is_name(declaration.name()) || inspect(declaration.value()).is_none() {
+        return Ok(None);
     }
     let values = declaration.value();
-    let _ = inspect(values)?;
     let wide = match values {
         [v] => v.ident(),
         _ => None,
     };
-    let value = match wide.map(str::to_ascii_lowercase).as_deref() {
+    let value = match wide.and_then(|v| {
+        syntax::keyword(
+            v,
+            &["initial", "inherit", "unset", "revert", "revert-layer"],
+        )
+    }) {
         Some("initial") => CustomSpecified::Invalid,
         Some("inherit" | "unset") => CustomSpecified::Inherit,
-        Some("revert" | "revert-layer") => return None,
-        _ => CustomSpecified::Tokens(Arc::from(values)),
+        Some("revert" | "revert-layer") => return Ok(None),
+        _ => CustomSpecified::Tokens(BudgetShared::new(
+            memory,
+            syntax::copy_components(values, memory)?,
+        )?),
     };
-    Some(CustomDeclaration {
-        name: declaration.name().to_owned(),
+    Ok(Some(CustomDeclaration {
+        name: syntax::text(memory, declaration.name())?,
         value,
         important: declaration.important(),
-    })
+    }))
+}
+impl CustomSpecified {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(match self {
+            Self::Inherit => Self::Inherit,
+            Self::Invalid => Self::Invalid,
+            Self::Tokens(tokens) => Self::Tokens(tokens.try_clone()?),
+        })
+    }
+}
+impl Pending {
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            name: self.name.try_clone()?,
+            tokens: self.tokens.try_clone()?,
+        })
+    }
+}
+fn copy_value(value: Option<&CustomValue>) -> Result<CustomValue, Error> {
+    value
+        .and_then(Option::as_ref)
+        .map(|tokens| Ok(tokens.try_clone()?))
+        .transpose()
 }
 
 fn own_bytes(c: &Component) -> usize {
@@ -154,7 +208,7 @@ fn stored_bytes(values: &[Component]) -> usize {
 }
 fn dependencies(
     values: &[Component],
-    out: &mut BTreeSet<String>,
+    out: &mut BudgetMap<Text, ()>,
     budget: &mut Budget,
 ) -> Result<(), Error> {
     for c in values {
@@ -163,7 +217,7 @@ fn dependencies(
             Component::Function { name, values } => {
                 if name.eq_ignore_ascii_case("var") {
                     if let Some((name, _)) = args(values) {
-                        out.insert(name.to_owned());
+                        out.try_insert(syntax::text(&budget.memory, name)?, ())?;
                     }
                 }
                 dependencies(values, out, budget)?;
@@ -176,38 +230,41 @@ fn dependencies(
 }
 
 pub(crate) fn compute(
-    local: BTreeMap<String, CustomSpecified>,
+    local: BudgetMap<Text, CustomSpecified>,
     parent: Option<&CustomProperties>,
     budget: &mut Budget,
 ) -> Result<CustomProperties, Error> {
-    let inherited = parent.cloned().unwrap_or_default();
+    let memory = budget.memory.try_clone()?;
+    let inherited = match parent {
+        Some(parent) => parent.try_clone()?,
+        None => CustomProperties::new(&memory)?,
+    };
     if local.is_empty() {
         return Ok(inherited);
     }
-    let mut count = inherited.entries.len();
-    for name in local.keys() {
-        if !inherited.entries.contains_key(name) {
-            count += 1;
-        }
-    }
+    let count = inherited.entries.len()
+        + local
+            .keys()
+            .filter(|name| !inherited.entries.contains_key(*name))
+            .count();
     if count > MAX_CUSTOM_PROPERTIES {
         return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
     }
-    let mut graph = BTreeMap::new();
+    let mut graph = BudgetMap::new(&memory)?;
     for (name, value) in &local {
-        let mut edges = BTreeSet::new();
+        let mut edges = BudgetMap::new(&memory)?;
         if let CustomSpecified::Tokens(tokens) = value {
             dependencies(tokens, &mut edges, budget)?;
         }
-        graph.insert(name.clone(), edges);
+        graph.try_insert(name.try_clone()?, edges)?;
     }
     let cycles = cycles(&graph, budget)?;
     let mut resolver = Resolver {
         local: &local,
         graph: &graph,
         inherited: &inherited,
-        resolved: BTreeMap::new(),
-        stack: Vec::new(),
+        resolved: BudgetMap::new(&memory)?,
+        stack: BudgetVec::new(&memory)?,
         cycles,
         budget,
     };
@@ -218,95 +275,111 @@ pub(crate) fn compute(
     for name in resolver.resolved.keys() {
         if let Some(old) = inherited.entries.get(name) {
             bytes = bytes
-                .checked_sub(name.len() + old.as_deref().map(stored_bytes).unwrap_or(0))
+                .checked_sub(
+                    name.len() + old.as_ref().map(|tokens| stored_bytes(tokens)).unwrap_or(0),
+                )
                 .ok_or(Error::InvalidContext)?;
         }
     }
-    let mut changes = Vec::new();
-    for (name, value) in resolver.resolved {
+    for (name, value) in &resolver.resolved {
         bytes = bytes
-            .checked_add(name.len() + value.as_deref().map(stored_bytes).unwrap_or(0))
+            .checked_add(
+                name.len()
+                    + value
+                        .as_ref()
+                        .map(|tokens| stored_bytes(tokens))
+                        .unwrap_or(0),
+            )
             .filter(|n| *n <= MAX_CUSTOM_BYTES)
             .ok_or(Error::Limit("MAX_CUSTOM_BYTES"))?;
-        changes.push((name, value));
     }
-    if changes
+    if resolver
+        .resolved
         .iter()
         .all(|(name, value)| inherited.entries.get(name) == Some(value))
     {
         return Ok(inherited);
     }
-    let mut entries = (*inherited.entries).clone();
-    for (name, value) in changes {
-        entries.insert(name, value);
+    let mut entries = BudgetMap::new(&memory)?;
+    for (name, value) in inherited.entries.iter() {
+        entries.try_insert(name.try_clone()?, copy_value(Some(value))?)?;
+    }
+    for (name, value) in resolver.resolved {
+        entries.try_insert(name, value)?;
     }
     Ok(CustomProperties {
-        entries: Arc::new(entries),
+        entries: BudgetShared::new(&memory, entries)?,
         bytes,
     })
 }
 struct Resolver<'a> {
-    local: &'a BTreeMap<String, CustomSpecified>,
-    graph: &'a BTreeMap<String, BTreeSet<String>>,
+    local: &'a BudgetMap<Text, CustomSpecified>,
+    graph: &'a BudgetMap<Text, BudgetMap<Text, ()>>,
     inherited: &'a CustomProperties,
-    resolved: BTreeMap<String, CustomValue>,
-    stack: Vec<String>,
-    cycles: BTreeSet<String>,
+    resolved: BudgetMap<Text, CustomValue>,
+    stack: BudgetVec<Text>,
+    cycles: BudgetMap<Text, ()>,
     budget: &'a mut Budget,
 }
 impl Resolver<'_> {
-    fn resolve(&mut self, name: &str) -> Result<CustomValue, Error> {
+    fn resolve(&mut self, name: &Text) -> Result<CustomValue, Error> {
         self.budget.charge(name.len())?;
         if let Some(value) = self.resolved.get(name) {
-            return Ok(value.clone());
+            return copy_value(Some(value));
         }
-        if self.cycles.contains(name) {
-            self.resolved.insert(name.to_owned(), None);
+        if self.cycles.contains_key(name) {
+            self.resolved.try_insert(name.try_clone()?, None)?;
             return Ok(None);
         }
         let Some(raw) = self.local.get(name) else {
-            return Ok(self.inherited.entries.get(name).cloned().flatten());
+            return copy_value(self.inherited.entries.get(name));
         };
         let value = match raw {
             CustomSpecified::Invalid => None,
-            CustomSpecified::Inherit => self.inherited.entries.get(name).cloned().flatten(),
+            CustomSpecified::Inherit => copy_value(self.inherited.entries.get(name))?,
             CustomSpecified::Tokens(tokens) => {
                 if self.stack.len() == MAX_VARIABLE_DEPTH {
                     return Err(Error::Limit("MAX_VARIABLE_DEPTH"));
                 }
-                self.stack.push(name.to_owned());
+                self.stack.try_push(name.try_clone()?)?;
                 if let Some(deps) = self.graph.get(name) {
-                    for dep in deps {
+                    for dep in deps.keys() {
                         let _ = self.resolve(dep)?;
                     }
                 }
-                let result = {
-                    let resolved = &self.resolved;
-                    let inherited = &self.inherited.entries;
-                    expand(tokens, 0, self.budget, &|key| {
-                        resolved
-                            .get(key)
-                            .or_else(|| inherited.get(key))
-                            .cloned()
-                            .flatten()
-                    })?
-                    .and_then(|tokens| {
+                let resolved = &self.resolved;
+                let inherited = &self.inherited.entries;
+                let expanded = expand(tokens, 0, self.budget, &|key| {
+                    resolved
+                        .get(key)
+                        .or_else(|| inherited.get(key))
+                        .and_then(|value| value.as_ref().map(|tokens| &***tokens))
+                })?;
+                let result = match expanded {
+                    None => None,
+                    Some(tokens) => {
                         let wide = match syntax::trim(&tokens) {
                             [c] => c.ident(),
                             _ => None,
                         };
-                        match wide.map(str::to_ascii_lowercase).as_deref() {
+                        match wide.and_then(|v| {
+                            syntax::keyword(
+                                v,
+                                &["initial", "revert", "revert-layer", "inherit", "unset"],
+                            )
+                        }) {
                             Some("initial" | "revert" | "revert-layer") => None,
-                            Some("inherit" | "unset") => inherited.get(name).cloned().flatten(),
-                            _ => Some(Arc::from(tokens)),
+                            Some("inherit" | "unset") => copy_value(inherited.get(name))?,
+                            _ => Some(BudgetShared::new(&self.budget.memory, tokens)?),
                         }
-                    })
+                    }
                 };
                 let _ = self.stack.pop();
                 result
             }
         };
-        self.resolved.insert(name.to_owned(), value.clone());
+        self.resolved
+            .try_insert(name.try_clone()?, copy_value(Some(&value))?)?;
         Ok(value)
     }
 }
@@ -315,17 +388,20 @@ pub(crate) fn substitute(
     values: &[Component],
     custom: &CustomProperties,
     budget: &mut Budget,
-) -> Result<Option<Vec<Component>>, Error> {
+) -> Result<Option<BudgetVec<Component>>, Error> {
     expand(values, 0, budget, &|key| {
-        custom.entries.get(key).cloned().flatten()
+        custom
+            .entries
+            .get(key)
+            .and_then(|value| value.as_ref().map(|tokens| &***tokens))
     })
 }
 fn copy_values(
     values: &[Component],
     depth: usize,
     budget: &mut Budget,
-) -> Result<Vec<Component>, Error> {
-    let mut out = Vec::new();
+) -> Result<BudgetVec<Component>, Error> {
+    let mut out = BudgetVec::new(&budget.memory)?;
     for c in values {
         budget.charge(own_bytes(c))?;
         let value = match c {
@@ -343,23 +419,23 @@ fn copy_values(
                     return Err(Error::Limit("MAX_NESTING"));
                 }
                 Component::Function {
-                    name: name.clone(),
+                    name: name.try_clone()?,
                     values: copy_values(values, depth + 1, budget)?,
                 }
             }
-            _ => c.clone(),
+            _ => c.try_clone()?,
         };
-        out.push(value);
+        out.try_push(value)?;
     }
     Ok(out)
 }
-fn expand<F: Fn(&str) -> CustomValue>(
+fn expand<'a, F: Fn(&str) -> Option<&'a [Component]>>(
     values: &[Component],
     depth: usize,
     budget: &mut Budget,
     lookup: &F,
-) -> Result<Option<Vec<Component>>, Error> {
-    let mut out = Vec::new();
+) -> Result<Option<BudgetVec<Component>>, Error> {
+    let mut out = BudgetVec::new(&budget.memory)?;
     for c in values {
         budget.charge(own_bytes(c))?;
         match c {
@@ -369,7 +445,9 @@ fn expand<F: Fn(&str) -> CustomValue>(
                 };
                 budget.charge(name.len())?;
                 if let Some(tokens) = lookup(name) {
-                    out.extend(copy_values(&tokens, depth, budget)?);
+                    for value in copy_values(tokens, depth, budget)? {
+                        out.try_push(value)?;
+                    }
                 } else if let Some(fallback) = fallback {
                     if depth == MAX_NESTING {
                         return Err(Error::Limit("MAX_NESTING"));
@@ -377,7 +455,9 @@ fn expand<F: Fn(&str) -> CustomValue>(
                     let Some(expanded) = expand(fallback, depth + 1, budget, lookup)? else {
                         return Ok(None);
                     };
-                    out.extend(expanded);
+                    for value in expanded {
+                        out.try_push(value)?;
+                    }
                 } else {
                     return Ok(None);
                 }
@@ -389,10 +469,10 @@ fn expand<F: Fn(&str) -> CustomValue>(
                 let Some(values) = expand(values, depth + 1, budget, lookup)? else {
                     return Ok(None);
                 };
-                out.push(Component::Function {
-                    name: name.clone(),
+                out.try_push(Component::Function {
+                    name: name.try_clone()?,
                     values,
-                });
+                })?;
             }
             Component::Block { kind, values } => {
                 if depth == MAX_NESTING {
@@ -401,30 +481,35 @@ fn expand<F: Fn(&str) -> CustomValue>(
                 let Some(values) = expand(values, depth + 1, budget, lookup)? else {
                     return Ok(None);
                 };
-                out.push(Component::Block {
+                out.try_push(Component::Block {
                     kind: *kind,
                     values,
-                });
+                })?;
             }
-            _ => out.push(c.clone()),
+            _ => out.try_push(c.try_clone()?)?,
         }
     }
     Ok(Some(out))
 }
 
-#[derive(Default)]
 struct Scc {
-    indices: BTreeMap<String, usize>,
-    low: BTreeMap<String, usize>,
-    stack: Vec<String>,
-    on_stack: BTreeSet<String>,
-    cyclic: BTreeSet<String>,
+    indices: BudgetMap<Text, usize>,
+    low: BudgetMap<Text, usize>,
+    stack: BudgetVec<Text>,
+    on_stack: BudgetMap<Text, ()>,
+    cyclic: BudgetMap<Text, ()>,
 }
 fn cycles(
-    graph: &BTreeMap<String, BTreeSet<String>>,
+    graph: &BudgetMap<Text, BudgetMap<Text, ()>>,
     budget: &mut Budget,
-) -> Result<BTreeSet<String>, Error> {
-    let mut state = Scc::default();
+) -> Result<BudgetMap<Text, ()>, Error> {
+    let mut state = Scc {
+        indices: BudgetMap::new(&budget.memory)?,
+        low: BudgetMap::new(&budget.memory)?,
+        stack: BudgetVec::new(&budget.memory)?,
+        on_stack: BudgetMap::new(&budget.memory)?,
+        cyclic: BudgetMap::new(&budget.memory)?,
+    };
     for name in graph.keys() {
         if !state.indices.contains_key(name) {
             visit(name, graph, &mut state, budget, 0)?;
@@ -433,8 +518,8 @@ fn cycles(
     Ok(state.cyclic)
 }
 fn visit(
-    name: &str,
-    graph: &BTreeMap<String, BTreeSet<String>>,
+    name: &Text,
+    graph: &BudgetMap<Text, BudgetMap<Text, ()>>,
     state: &mut Scc,
     budget: &mut Budget,
     depth: usize,
@@ -445,11 +530,11 @@ fn visit(
     budget.charge(name.len())?;
     let index = state.indices.len();
     let mut low = index;
-    state.indices.insert(name.to_owned(), index);
-    state.stack.push(name.to_owned());
-    state.on_stack.insert(name.to_owned());
+    state.indices.try_insert(name.try_clone()?, index)?;
+    state.stack.try_push(name.try_clone()?)?;
+    state.on_stack.try_insert(name.try_clone()?, ())?;
     if let Some(edges) = graph.get(name) {
-        for dep in edges {
+        for dep in edges.keys() {
             budget.charge(dep.len())?;
             if !graph.contains_key(dep) {
                 continue;
@@ -457,7 +542,7 @@ fn visit(
             if !state.indices.contains_key(dep) {
                 visit(dep, graph, state, budget, depth + 1)?;
                 low = low.min(state.low.get(dep).copied().ok_or(Error::InvalidContext)?);
-            } else if state.on_stack.contains(dep) {
+            } else if state.on_stack.contains_key(dep) {
                 low = low.min(
                     state
                         .indices
@@ -468,19 +553,25 @@ fn visit(
             }
         }
     }
-    state.low.insert(name.to_owned(), low);
+    state.low.try_insert(name.try_clone()?, low)?;
     if low == index {
-        let mut members = Vec::new();
+        let mut members = BudgetVec::new(&budget.memory)?;
         while let Some(member) = state.stack.pop() {
             state.on_stack.remove(&member);
-            let done = member == name;
-            members.push(member);
+            let done = member == *name;
+            members.try_push(member)?;
             if done {
                 break;
             }
         }
-        if members.len() > 1 || graph.get(name).is_some_and(|edges| edges.contains(name)) {
-            state.cyclic.extend(members);
+        if members.len() > 1
+            || graph
+                .get(name)
+                .is_some_and(|edges| edges.contains_key(name))
+        {
+            for member in members {
+                state.cyclic.try_insert(member, ())?;
+            }
         }
     }
     Ok(())

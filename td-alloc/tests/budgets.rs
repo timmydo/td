@@ -409,3 +409,106 @@ fn reserved_push_returns_unstored_values_without_allocation_or_early_drop() {
     with_reservation_limit(0, || zero.push_within_capacity(())).unwrap();
     assert_eq!(zero.len(), 1);
 }
+
+#[test]
+fn sorted_map_refusal_preserves_entries_and_borrowed_lookup() {
+    use td_alloc::BudgetMap;
+    let root = Budget::new(65536).unwrap();
+    let mut map = BudgetMap::with_capacity(&root, 3).unwrap();
+    for (key, value) in [("z", 1), ("a", 2), ("m", 3)] {
+        map.try_insert(BudgetString::copy(&root, key).unwrap(), value)
+            .unwrap();
+    }
+    assert_eq!(
+        map.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        ["a", "m", "z"]
+    );
+    assert_eq!(map.get("m"), Some(&3));
+    assert_eq!(
+        map.get_index(0).map(|(k, v)| (k.as_str(), *v)),
+        Some(("a", 2))
+    );
+    assert!(map.get_index(map.len()).is_none());
+    let replacement = BudgetString::copy(&root, "m").unwrap();
+    assert_eq!(
+        with_reservation_limit(0, || map.try_insert(replacement, 4)).unwrap(),
+        Some(3)
+    );
+    let key = BudgetString::copy(&root, "b").unwrap();
+    let charged = root.used() - key.capacity();
+    assert_eq!(
+        with_reservation_limit(0, || map.try_insert(key, 5)),
+        Err(BudgetError::Allocation)
+    );
+    assert_eq!(map.len(), 3);
+    assert_eq!(root.used(), charged);
+    assert_eq!(map.remove("m"), Some(4));
+    assert_eq!(map.remove("m"), None);
+    let key = BudgetString::copy(&root, "b").unwrap();
+    *map.try_get_or_insert_with(key, |_| Ok(6)).unwrap() += 1;
+    assert_eq!(map.get("b"), Some(&7));
+    drop(map);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn consuming_iterator_keeps_backing_charge_and_drops_unconsumed_values() {
+    struct Item<'a>(&'a std::cell::Cell<usize>);
+    impl Drop for Item<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let drops = std::cell::Cell::new(0);
+    let root = Budget::new(4096).unwrap();
+    for consume_all in [false, true] {
+        let before = drops.get();
+        let mut values = BudgetVec::with_capacity(&root, 4).unwrap();
+        for _ in 0..4 {
+            values.try_push(Item(&drops)).unwrap();
+        }
+        let charged = root.used();
+        let mut iter = with_reservation_limit(0, || values.into_iter());
+        drop(iter.next());
+        drop(iter.next_back());
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.as_slice().len(), 2);
+        assert_eq!(drops.get(), before + 2);
+        if consume_all {
+            for item in iter.by_ref() {
+                drop(item);
+            }
+        }
+        assert_eq!(root.used(), charged);
+        drop(iter);
+        assert_eq!(drops.get(), before + 4);
+        assert_eq!(root.used(), Budget::metadata_bytes());
+    }
+}
+
+#[test]
+fn fixed_text_keeps_utf8_and_never_allocates_or_partially_appends() {
+    use td_alloc::SmallText;
+    with_reservation_limit(0, || {
+        for value in ["", "é語🌍", "ABCDEFGHIJKLMN", "a\0b", "ééééééé"] {
+            let mut text = SmallText::<14>::copy(value).unwrap();
+            assert_eq!(text.as_str(), value);
+            assert_eq!(text.as_bytes(), value.as_bytes());
+            let before = text;
+            assert_eq!(text.try_push_str("🌍🌍🌍🌍"), Err(BudgetError::Limit));
+            assert_eq!(text.as_str(), before.as_str());
+            text.make_ascii_lowercase();
+            assert_eq!(text.as_str(), value.to_ascii_lowercase());
+        }
+        let mut text = SmallText::<8>::new();
+        for value in ["é", "語", "a", "é"] {
+            text.try_push_str(value).unwrap();
+        }
+        assert_eq!(text.as_str(), "é語aé");
+        assert!(SmallText::<0>::copy("").is_some());
+        assert!(SmallText::<0>::copy("x").is_none());
+        let text = "x".repeat(255);
+        assert_eq!(SmallText::<256>::copy(&text).unwrap().as_str(), text);
+        assert!(SmallText::<256>::copy(&"x".repeat(256)).is_none());
+    });
+}

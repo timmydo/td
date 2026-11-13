@@ -12,7 +12,8 @@ fn parsed(input: &str, percent: bool) -> Result<Option<Linear>, Error> {
 }
 fn style(input: &str) -> ComputedStyle {
     let nodes = tree();
-    StyleSet::default()
+    StyleSet::new(&[])
+        .unwrap()
         .compute(
             &Handle {
                 nodes: &nodes,

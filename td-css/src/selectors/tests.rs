@@ -445,3 +445,39 @@ fn interaction_states_are_caller_reported_and_history_stays_absent() {
         })
     );
 }
+
+#[test]
+fn insensitive_substring_matches_ascii_folding_for_repetitive_and_unicode_inputs() {
+    let memory = crate::memory().unwrap();
+    let mut seed = 0x134ab33fu64;
+    for _ in 0..4000 {
+        let mut strings = Vec::new();
+        for max in [80, 15] {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let count = seed as usize % max;
+            let mut text = String::new();
+            for _ in 0..count {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push(['a', 'A', 'b', 'B', 'é', 'É', '語'][seed as usize % 7]);
+            }
+            strings.push(text);
+        }
+        let actual = &strings[0];
+        let needle = &strings[1];
+        let prefix = super::substring_prefix(needle.as_bytes(), &memory).unwrap();
+        assert_eq!(
+            super::insensitive_contains(actual.as_bytes(), needle.as_bytes(), &prefix),
+            actual
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        );
+    }
+    let needle = format!("{}b", "a".repeat(8000));
+    let actual = format!("{}B", "A".repeat(32000));
+    let prefix = super::substring_prefix(needle.as_bytes(), &memory).unwrap();
+    assert!(super::insensitive_contains(
+        actual.as_bytes(),
+        needle.as_bytes(),
+        &prefix
+    ));
+}

@@ -7,7 +7,8 @@ use crate::{
 };
 fn style(input: &str, parent: Option<&ComputedStyle>) -> ComputedStyle {
     let nodes = tree();
-    StyleSet::default()
+    StyleSet::new(&[])
+        .unwrap()
         .compute(
             &Handle {
                 nodes: &nodes,
@@ -20,7 +21,10 @@ fn style(input: &str, parent: Option<&ComputedStyle>) -> ComputedStyle {
         .unwrap()
 }
 fn child(input: &str) -> ComputedStyle {
-    style(input, Some(&ComputedStyle::default()))
+    style(
+        input,
+        Some(&ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
+    )
 }
 #[test]
 fn each_added_longhand_has_a_typed_value() {
@@ -200,10 +204,12 @@ fn font_shorthand_resets_optional_parts_and_handles_pending_tokens() {
     );
     assert_eq!(
         s.get(FontFamily),
-        Some(&ComputedValue::FontFamily(vec![
-            Family::Named("Example Face".into()),
-            Family::Generic("sans-serif")
-        ]))
+        Some(&ComputedValue::FontFamily(crate::test_tree::families(
+            vec![
+                Family::Named(crate::test_tree::owned_text("Example Face")),
+                Family::Generic("sans-serif")
+            ]
+        )))
     );
     let s = child("font:italic bold 20px/2 serif;font:12px monospace");
     assert_eq!(s.get(FontStyle), Some(&ComputedValue::Keyword("normal")));
@@ -279,7 +285,8 @@ fn extra_grammars_reject_unsupported_values_and_clamp_numeric_ranges() {
                     .unwrap()
                     .value()
                     .first()
-                    .unwrap()
+                    .unwrap(),
+                &crate::memory().unwrap()
             )
             .unwrap()
             .is_empty(),

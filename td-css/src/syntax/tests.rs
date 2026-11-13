@@ -3,11 +3,11 @@
 use super::*;
 
 fn tokens(input: &str) -> Vec<Token> {
-    tokenize(input).unwrap().into_inner()
+    tokenize(input).unwrap().into_inner().into_iter().collect()
 }
 
 fn ident(input: &str) -> Token {
-    Token::Ident(input.to_owned())
+    Token::Ident(crate::test_tree::owned_text(input))
 }
 
 #[test]
@@ -67,17 +67,17 @@ fn escapes_names_hash_types_and_preprocessing() {
         tokens("#a #123 #\\31 23"),
         vec![
             Token::Hash {
-                value: "a".into(),
+                value: crate::test_tree::owned_text("a"),
                 id: true
             },
             Token::Whitespace,
             Token::Hash {
-                value: "123".into(),
+                value: crate::test_tree::owned_text("123"),
                 id: false
             },
             Token::Whitespace,
             Token::Hash {
-                value: "123".into(),
+                value: crate::test_tree::owned_text("123"),
                 id: true
             },
         ]
@@ -104,7 +104,7 @@ fn comments_do_not_merge_tokens_or_introduce_whitespace() {
         vec![ident("a"), Token::Whitespace, ident("b")]
     );
     let parsed = tokenize("a/*unterminated").unwrap();
-    assert_eq!(parsed.value(), &vec![ident("a")]);
+    assert_eq!(parsed.value().as_slice(), &vec![ident("a")]);
     assert_eq!(parsed.errors(), 1);
 }
 
@@ -120,13 +120,13 @@ fn numbers_dimensions_and_exponents_keep_integer_type() {
     ];
     for (input, representation, integer, unit) in cases {
         let number = Number {
-            representation: representation.into(),
+            representation: crate::test_tree::owned_text(representation),
             integer,
         };
         let expected = match unit {
             "number" => Token::Number(number),
             "%" => Token::Percentage(number),
-            _ => Token::Dimension(number, unit.into()),
+            _ => Token::Dimension(number, crate::test_tree::owned_text(unit)),
         };
         assert_eq!(tokens(input), vec![expected], "{input}");
     }
@@ -134,7 +134,7 @@ fn numbers_dimensions_and_exponents_keep_integer_type() {
         tokens("1."),
         vec![
             Token::Number(Number {
-                representation: "1".into(),
+                representation: crate::test_tree::owned_text("1"),
                 integer: true
             }),
             Token::Delim('.')
@@ -144,26 +144,35 @@ fn numbers_dimensions_and_exponents_keep_integer_type() {
 
 #[test]
 fn strings_newlines_and_eof_recover() {
-    assert_eq!(tokens("'ab\\\ncd'"), vec![Token::String("abcd".into())]);
+    assert_eq!(
+        tokens("'ab\\\ncd'"),
+        vec![Token::String(crate::test_tree::owned_text("abcd"))]
+    );
     assert_eq!(
         tokens("'a\nb"),
         vec![Token::BadString, Token::Whitespace, ident("b")]
     );
     let parsed = tokenize("\"abc\\").unwrap();
-    assert_eq!(parsed.value(), &vec![Token::String("abc".into())]);
+    assert_eq!(
+        parsed.value().as_slice(),
+        &vec![Token::String(crate::test_tree::owned_text("abc"))]
+    );
     assert_eq!(parsed.errors(), 1);
     assert_eq!(tokens("\\\n"), vec![Token::Delim('\\'), Token::Whitespace]);
 }
 
 #[test]
 fn urls_quoted_unquoted_bad_and_eof() {
-    assert_eq!(tokens("URL(  a\\ b )"), vec![Token::Url("a b".into())]);
+    assert_eq!(
+        tokens("URL(  a\\ b )"),
+        vec![Token::Url(crate::test_tree::owned_text("a b"))]
+    );
     assert_eq!(
         tokens("url( 'a')"),
         vec![
-            Token::Function("url".into()),
+            Token::Function(crate::test_tree::owned_text("url")),
             Token::Whitespace,
-            Token::String("a".into()),
+            Token::String(crate::test_tree::owned_text("a")),
             Token::Close(')')
         ]
     );
@@ -172,7 +181,10 @@ fn urls_quoted_unquoted_bad_and_eof() {
     assert_eq!(tokens("url(a\x7f)z"), vec![Token::BadUrl, ident("z")]);
     assert_eq!(tokens("url(a\\\n)z"), vec![Token::BadUrl, ident("z")]);
     let parsed = tokenize("url(a").unwrap();
-    assert_eq!(parsed.value(), &vec![Token::Url("a".into())]);
+    assert_eq!(
+        parsed.value().as_slice(),
+        &vec![Token::Url(crate::test_tree::owned_text("a"))]
+    );
     assert_eq!(parsed.errors(), 1);
 }
 
@@ -206,7 +218,7 @@ fn balanced_components_hide_separators_and_recover_at_eof() {
         .block()
         .is_none());
     assert_eq!(
-        parse_components(")").unwrap().value(),
+        parse_components(")").unwrap().value().as_slice(),
         &vec![Component::Token(Token::Close(')'))]
     );
 }
@@ -352,5 +364,66 @@ fn deterministic_hostile_strings_terminate_without_panics() {
         }
         let _ = parse_stylesheet(&input);
         let _ = parse_declarations(&input);
+    }
+}
+
+#[test]
+fn inline_and_shared_text_keep_utf8_order_and_hash_across_the_boundary() {
+    use std::hash::{Hash, Hasher};
+    let memory = crate::memory().unwrap();
+    for value in [
+        "",
+        "ABCDEFGHIJKLMN",
+        "ABCDEFGHIJKLMNO",
+        "ééééééé",
+        "éééééééé",
+        "語🌍aé",
+        "é語🌍abcdef",
+    ] {
+        let text = super::text(&memory, value).unwrap();
+        assert_eq!(text.as_str(), value);
+        let copy = td_alloc::with_reservation_limit(0, || text.try_clone()).unwrap();
+        assert_eq!(copy, text);
+        let heap = td_alloc::BudgetString::copy(&memory, value).unwrap();
+        let shared = super::Text(super::TextStorage::Shared(
+            td_alloc::BudgetShared::new(&memory, heap).unwrap(),
+        ));
+        assert_eq!(text, shared);
+        assert_eq!(text.cmp(&shared), std::cmp::Ordering::Equal);
+        let mut a = std::collections::hash_map::DefaultHasher::new();
+        let mut b = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut a);
+        shared.hash(&mut b);
+        assert_eq!(a.finish(), b.finish());
+        let folded = super::lower_text(&memory, value).unwrap();
+        assert_eq!(folded.as_str(), value.to_ascii_lowercase());
+        let mut builder = super::TextBuilder::new(&memory);
+        for ch in value.chars() {
+            builder.try_push(ch).unwrap();
+        }
+        assert_eq!(builder.finish().unwrap(), text);
+    }
+    for len in [61, 62, 63, 64, 128] {
+        let value = format!("{}é", "x".repeat(len - 2));
+        let text = super::text(&memory, &value).unwrap();
+        let mut builder = super::TextBuilder::new(&memory);
+        for ch in value.chars() {
+            builder.try_push(ch).unwrap();
+        }
+        assert_eq!(text, builder.finish().unwrap());
+        assert_eq!(text.as_str(), value);
+        let copy = td_alloc::with_reservation_limit(0, || text.try_clone()).unwrap();
+        assert_eq!(text, copy);
+    }
+    assert_eq!(memory.used(), td_alloc::Budget::metadata_bytes());
+}
+
+#[test]
+fn borrowed_ascii_and_normalized_character_storage_produce_identical_trees() {
+    for source in ["", "p { color: red; font-family: LongNamedFamilyForThePage; --a: 1px }", "@media (min-width:1px) { [data-x*=abc i] { content: 'escaped\\1f30d'; padding:calc(1px + 2em) } }"] {
+        let normalized = format!("\u{feff}{source}");
+        assert_eq!(tokenize(source).unwrap(), tokenize(&normalized).unwrap());
+        assert_eq!(parse_components(source).unwrap(), parse_components(&normalized).unwrap());
+        assert_eq!(parse_stylesheet(source).unwrap(), parse_stylesheet(&normalized).unwrap());
     }
 }

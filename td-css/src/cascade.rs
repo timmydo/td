@@ -2,12 +2,13 @@
 use crate::conditions::{self, Environment};
 use crate::selectors::{Element, MatchBudget, SelectorList, Specificity};
 use crate::syntax;
+use crate::syntax::Text;
 use crate::values::{
     self, ComputedStyle, Property, Specified, ValueDeclaration, MAX_ABSOLUTE_VALUE,
 };
 use crate::variables::{self, CustomDeclaration, CustomSpecified};
 use crate::{Error, MAX_DECLARATIONS};
-use std::collections::BTreeMap;
+use td_alloc::{Budget, BudgetMap, BudgetVec};
 
 mod index;
 pub use index::MAX_INDEX_ENTRIES;
@@ -40,17 +41,17 @@ impl Origin {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Rule {
     selectors: SelectorList,
-    declarations: Vec<ValueDeclaration>,
-    custom: Vec<CustomDeclaration>,
+    declarations: BudgetVec<ValueDeclaration>,
+    custom: BudgetVec<CustomDeclaration>,
     origin: Origin,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct StyleSet {
-    rules: Vec<Rule>,
+    rules: BudgetVec<Rule>,
     index: index::RuleIndex,
 }
 
@@ -72,15 +73,15 @@ struct Work {
     unindexed: bool,
 }
 
-impl Default for Work {
-    fn default() -> Self {
-        Self {
+impl Work {
+    fn new(memory: &Budget) -> Result<Self, Error> {
+        Ok(Self {
             budget: MatchBudget::new(),
-            substitution: variables::Budget::default(),
+            substitution: variables::Budget::new(memory)?,
             stats: ComputeStats::default(),
             #[cfg(test)]
             unindexed: false,
-        }
+        })
     }
 }
 
@@ -93,6 +94,16 @@ impl StyleSet {
     pub fn new_with_environment(
         sheets: &[(Origin, &str)],
         environment: &Environment,
+    ) -> Result<Self, Error> {
+        Self::new_with_environment_and_budget(sheets, environment, &crate::memory()?)
+    }
+    pub fn new_with_budget(sheets: &[(Origin, &str)], memory: &Budget) -> Result<Self, Error> {
+        Self::new_with_environment_and_budget(sheets, &Environment::default(), memory)
+    }
+    pub fn new_with_environment_and_budget(
+        sheets: &[(Origin, &str)],
+        environment: &Environment,
+        memory: &Budget,
     ) -> Result<Self, Error> {
         environment.validate()?;
         if sheets.len() > MAX_SHEETS {
@@ -108,19 +119,23 @@ impl StyleSet {
             }
         }
         let mut compiler = Compiler {
-            output: Self::default(),
+            output: Self {
+                rules: BudgetVec::new(memory)?,
+                index: index::RuleIndex::new(memory)?,
+            },
             declarations: 0,
             walked: 0,
             environment,
         };
         for (origin, source) in sheets {
             compiler.add(
-                syntax::parse_stylesheet(source)?.into_inner(),
+                syntax::parse_stylesheet_with_budget(source, memory)?.into_inner(),
                 *origin,
                 0,
                 true,
             )?;
         }
+        compiler.output.index.finish();
         Ok(compiler.output)
     }
 
@@ -151,7 +166,42 @@ impl StyleSet {
         inline: &str,
         stats: &mut ComputeStats,
     ) -> Result<ComputedStyle, Error> {
-        let mut work = Work::default();
+        self.compute_with_stats_and_budget(
+            element,
+            parent,
+            root_font_size,
+            inline,
+            stats,
+            self.rules.budget(),
+        )
+    }
+    pub fn compute_with_budget<E: Element>(
+        &self,
+        element: &E,
+        parent: Option<&ComputedStyle>,
+        root_font_size: f64,
+        inline: &str,
+        memory: &Budget,
+    ) -> Result<ComputedStyle, Error> {
+        self.compute_with_stats_and_budget(
+            element,
+            parent,
+            root_font_size,
+            inline,
+            &mut ComputeStats::default(),
+            memory,
+        )
+    }
+    pub fn compute_with_stats_and_budget<E: Element>(
+        &self,
+        element: &E,
+        parent: Option<&ComputedStyle>,
+        root_font_size: f64,
+        inline: &str,
+        stats: &mut ComputeStats,
+        memory: &Budget,
+    ) -> Result<ComputedStyle, Error> {
+        let mut work = Work::new(memory)?;
         let result = self.compute_inner(element, parent, root_font_size, inline, &mut work);
         work.stats.match_steps = work.budget.used();
         work.stats.substitution_components = work.substitution.components;
@@ -171,15 +221,22 @@ impl StyleSet {
         if !root_font_size.is_finite() || !(0.0..=MAX_ABSOLUTE_VALUE).contains(&root_font_size) {
             return Err(Error::InvalidContext);
         }
-        let mut winners = BTreeMap::new();
-        let mut custom_winners = BTreeMap::new();
+        let memory = work.substitution.memory.try_clone()?;
+        let mut winners = BudgetMap::new(&memory)?;
+        let mut custom_winners = BudgetMap::new(&memory)?;
         #[cfg(not(test))]
-        let candidates = self.index.candidates(element, &mut work.budget)?;
+        let candidates = self.index.candidates(element, &mut work.budget, &memory)?;
         #[cfg(test)]
         let candidates = if work.unindexed {
-            (0..self.rules.len()).collect()
+            {
+                let mut all = td_alloc::BudgetVec::with_capacity(&memory, self.rules.len())?;
+                for index in 0..self.rules.len() {
+                    all.try_push(index)?;
+                }
+                all
+            }
         } else {
-            self.index.candidates(element, &mut work.budget)?
+            self.index.candidates(element, &mut work.budget, &memory)?
         };
         work.stats.candidate_rules = candidates.len();
         let mut order = 0usize;
@@ -200,7 +257,7 @@ impl StyleSet {
                             specificity,
                             order,
                         },
-                    );
+                    )?;
                     order += 1;
                 }
                 for declaration in &rule.custom {
@@ -218,10 +275,10 @@ impl StyleSet {
                 }
             }
         }
-        let inline = syntax::parse_declarations(inline)?;
+        let inline = syntax::parse_declarations_with_budget(inline, &memory)?;
         let mut count = 0usize;
         for declaration in inline.value() {
-            if let Some(custom) = variables::parse(declaration) {
+            if let Some(custom) = variables::parse(declaration, &memory)? {
                 if count == MAX_DECLARATIONS {
                     return Err(Error::Limit("MAX_DECLARATIONS"));
                 }
@@ -239,7 +296,7 @@ impl StyleSet {
                 order += 1;
                 continue;
             }
-            for value in values::parse_declaration(declaration)? {
+            for value in values::parse_declaration(declaration, &memory)? {
                 if count == MAX_DECLARATIONS {
                     return Err(Error::Limit("MAX_DECLARATIONS"));
                 }
@@ -253,21 +310,22 @@ impl StyleSet {
                         specificity: Specificity::default(),
                         order,
                     },
-                );
+                )?;
                 order += 1;
             }
         }
+        let mut custom_local = BudgetMap::new(&memory)?;
+        for (name, winner) in custom_winners {
+            custom_local.try_insert(name, winner.value)?;
+        }
         let custom = variables::compute(
-            custom_winners
-                .into_iter()
-                .map(|(name, winner)| (name, winner.value))
-                .collect(),
+            custom_local,
             parent.map(|p| &p.custom),
             &mut work.substitution,
         )?;
         let mut style = ComputedStyle {
             custom,
-            ..ComputedStyle::default()
+            values: td_alloc::BudgetMap::with_capacity(&memory, Property::ALL.len())?,
         };
         // Dependency order: font size, then color, then all remaining values.
         let properties = [Property::FontSize, Property::Color].into_iter().chain(
@@ -302,10 +360,11 @@ impl StyleSet {
                 } else {
                     root_font_size
                 },
+                &memory,
             )?;
-            style.values.insert(property, value);
+            style.values.try_insert(property, value)?;
         }
-        values::finish(&mut style, parent.is_none());
+        values::finish(&mut style, parent.is_none())?;
         Ok(style)
     }
 }
@@ -319,11 +378,12 @@ struct Compiler<'a> {
 impl Compiler<'_> {
     fn add(
         &mut self,
-        rules: Vec<syntax::Rule>,
+        rules: BudgetVec<syntax::Rule>,
         origin: Origin,
         depth: usize,
         active: bool,
     ) -> Result<(), Error> {
+        let memory = self.output.rules.budget().try_clone()?;
         for rule in rules {
             if self.walked == MAX_GROUP_RULES {
                 return Err(Error::Limit("MAX_GROUP_RULES"));
@@ -331,9 +391,9 @@ impl Compiler<'_> {
             self.walked += 1;
             if let Some(name) = &rule.name {
                 let condition = if name.eq_ignore_ascii_case("media") {
-                    conditions::media(&rule.prelude, self.environment)?
+                    conditions::media(&rule.prelude, self.environment, &memory)?
                 } else if name.eq_ignore_ascii_case("supports") {
-                    conditions::supports(&rule.prelude)?
+                    conditions::supports(&rule.prelude, &memory)?
                 } else {
                     continue;
                 };
@@ -353,28 +413,28 @@ impl Compiler<'_> {
             if !active {
                 continue;
             }
-            let selectors = match SelectorList::from_components(&rule.prelude) {
+            let selectors = match SelectorList::from_components(&rule.prelude, &memory) {
                 Ok(s) => s,
                 Err(Error::InvalidSelector) => continue,
                 Err(e) => return Err(e),
             };
-            let mut declarations = Vec::new();
-            let mut custom = Vec::new();
+            let mut declarations = BudgetVec::new(&memory)?;
+            let mut custom = BudgetVec::new(&memory)?;
             for declaration in rule.declarations()?.value() {
-                if let Some(value) = variables::parse(declaration) {
+                if let Some(value) = variables::parse(declaration, &memory)? {
                     if self.declarations == MAX_DECLARATIONS {
                         return Err(Error::Limit("MAX_DECLARATIONS"));
                     }
                     self.declarations += 1;
-                    custom.push(value);
+                    custom.try_push(value)?;
                     continue;
                 }
-                for value in values::parse_declaration(declaration)? {
+                for value in values::parse_declaration(declaration, &memory)? {
                     if self.declarations == MAX_DECLARATIONS {
                         return Err(Error::Limit("MAX_DECLARATIONS"));
                     }
                     self.declarations += 1;
-                    declarations.push(value);
+                    declarations.try_push(value)?;
                 }
             }
             if self.output.rules.len() == MAX_COMPILED_RULES {
@@ -382,13 +442,13 @@ impl Compiler<'_> {
             }
             self.output
                 .index
-                .insert(self.output.rules.len(), &selectors)?;
-            self.output.rules.push(Rule {
+                .admit_rule(self.output.rules.len(), &selectors)?;
+            self.output.rules.try_push(Rule {
                 selectors,
                 declarations,
                 custom,
                 origin,
-            });
+            })?;
         }
         Ok(())
     }
@@ -408,22 +468,23 @@ struct Winner {
 }
 
 fn choose(
-    winners: &mut BTreeMap<Property, Winner>,
+    winners: &mut BudgetMap<Property, Winner>,
     declaration: &ValueDeclaration,
     priority: Priority,
-) {
+) -> Result<(), Error> {
     if winners
         .get(&declaration.property)
         .is_none_or(|winner| priority >= winner.priority)
     {
-        winners.insert(
+        winners.try_insert(
             declaration.property,
             Winner {
                 priority,
-                value: declaration.value.clone(),
+                value: declaration.value.try_clone()?,
             },
-        );
+        )?;
     }
+    Ok(())
 }
 
 struct CustomWinner {
@@ -431,7 +492,7 @@ struct CustomWinner {
     value: CustomSpecified,
 }
 fn choose_custom(
-    winners: &mut BTreeMap<String, CustomWinner>,
+    winners: &mut BudgetMap<Text, CustomWinner>,
     declaration: &CustomDeclaration,
     priority: Priority,
 ) -> Result<(), Error> {
@@ -440,13 +501,13 @@ fn choose_custom(
         return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
     }
     if old.is_none_or(|winner| priority >= winner.priority) {
-        winners.insert(
-            declaration.name.clone(),
+        winners.try_insert(
+            declaration.name.try_clone()?,
             CustomWinner {
                 priority,
-                value: declaration.value.clone(),
+                value: declaration.value.try_clone()?,
             },
-        );
+        )?;
     }
     Ok(())
 }

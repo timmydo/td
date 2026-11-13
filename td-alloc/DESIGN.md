@@ -70,7 +70,10 @@ Picture decoding, raw DEFLATE decoding, picture fitting and td-charset's
 whole-input `decode` use the shared reservation path. Their codecs retain
 input/output/work bounds. The raw inflater's legacy String-returning
 wrappers and image encoders are outside the allocation-free error
-guarantee. General UI, fetch, navigation and other existing subsystem
+guarantee. The HTML document parser, DOM traversal index and CSS syntax/cascade/interner
+own their storage through shared budgets. CSS tokens may outlive their
+stylesheet through computed-style references; that lifetime retains the
+original budget charge. General UI, fetch, navigation and other existing subsystem
 allocations remain migration debt.
 
 JMAP request byte and token backing uses owned child budgets under one
@@ -164,7 +167,9 @@ separate input, work, concurrency, descriptor and disk limits.
 its charge alongside the vector. A grow admits the whole replacement while
 the old capacity remains charged, then requests fallible reallocation.
 The allocator may extend in place; admission still conservatively covers
-both layouts until success consumes the old allocation. Refusal preserves
+both layouts until success consumes the old allocation. Replacement
+borrows the existing budget identity instead of cloning its reference count;
+a scoped pending reservation rolls back on failure or unwinding. Refusal preserves
 the original storage. Failed admission/allocation
 preserves the old values and capacity. Amortized growth clips spare capacity
 to currently available headroom
@@ -177,7 +182,10 @@ retry an allocator refusal. Clear/truncate retain storage and therefore
 its charge.
 Zero-sized element storage costs no bytes or allocator attempt.
 
-Only borrowed slices escape. There is no mutable std collection access,
+Borrowed slices and consuming BudgetIntoIter iteration preserve admission.
+The consuming iterator holds the original backing charge until it drops,
+even after yielding its last element; unconsumed elements are destroyed
+before that charge returns. There is no mutable std collection access,
 infallible Clone, raw ownership extraction, or implicit budget transfer.
 `Buffer` freezes length/capacity for queued parser backing; moving or
 recovering its `BudgetVec` retains admission. `BudgetString` preserves UTF-8
@@ -186,8 +194,16 @@ operations do not invoke a custom Clone implementation. Borrowed iteration,
 Debug and equality preserve storage ownership. Checked removal cannot grow.
 `push_within_capacity` never allocates: it returns an unstored value when
 full, allowing fixed-size producers to use previously admitted capacity.
+SmallText<N> keeps at most min(N, 255) UTF-8 bytes in fixed storage. Copy
+and append reject overflow without changing existing text, ASCII folding
+preserves validity, and constant-time str views expose no mutable bytes.
+It never allocates; an enclosing budgeted owner accounts for its storage.
+Its one private unchecked UTF-8 conversion is recorded in UNSAFE.md §28.
+
 BudgetString has fallible copy/clone and scalar append; immutable str
-borrowing exposes no unchecked mutation.
+borrowing exposes no unchecked mutation. ASCII lowercasing preserves size
+and UTF-8. Ordering, hashing and Borrow<str> expose existing values without
+allocating; user-defined comparison/hash implementations remain caller code.
 
 `BudgetShared<T>` provides immutable strong ownership with fallible
 construction and checked, allocation-free `try_clone`. Its control block
@@ -195,6 +211,14 @@ and inline value are charged before allocation; nested storage must retain
 its own admission. Final destruction frees the control block before dropping
 the value and returning its charge. There is no weak pointer, mutable access,
 infallible Clone, or raw ownership conversion. Send/Sync require T: Send + Sync.
+ptr_eq compares retained shared values without exposing ownership.
+
+BudgetMap stores ordered key/value pairs in one BudgetVec. Lookup is binary;
+insertion shifts a suffix, so bulk untrusted indexes should append and sort
+instead. New insertion reserves before mutation; refusal preserves entries.
+Replacing an existing value needs no allocation and retains its old key.
+Nested keys and values own their own admission. Consuming iteration retains
+the backing charge like BudgetVec, and removal cannot allocate.
 
 `Arena<T>` owns typed values with stable, bounds-checked indices. It grows
 fallibly from the same budget and destroys values on drop. References borrow
