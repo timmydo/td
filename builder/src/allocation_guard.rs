@@ -242,6 +242,10 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     for path in ["td-mta/src/https_api_storage.rs", "td-mta/src/http_date.rs"] {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)?;
     }
+    for path in TREE_STORAGE_SOURCES {
+        budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
+            .map_err(|error| format!("{path}: {error}"))?;
+    }
     for path in METHOD_STORAGE_SOURCES {
         method_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
             .map_err(|error| format!("{path}: {error}"))?;
@@ -251,6 +255,16 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     compare(&parse(&recorded)?, &inventory(root)?)
 }
 
+const TREE_STORAGE_SOURCES: &[&str] = &[
+    "td-html/src/html5/mod.rs",
+    "td-html/src/html5/tokenizer.rs",
+    "td-html/src/document/mod.rs",
+    "td-html/src/document/builder.rs",
+    "td-html/src/document/modes.rs",
+    "td-html/src/document/tables.rs",
+    "td-html/src/document/formatting.rs",
+    "td-html/src/document/foreign.rs",
+];
 const METHOD_STORAGE_SOURCES: &[&str] = &[
     "td-mta/src/jmap_request/creation_ids.rs",
     "td-mta/src/jmap_request/email_create.rs",
@@ -286,7 +300,10 @@ fn budgeted_source(source: &str) -> Result<(), String> {
     let code =
         td_engine::embed_scan::blank_literals(&td_engine::embed_scan::production_code(source));
     if !operations(source).is_empty() || standard_owners(&code, false) {
-        return Err("guarded request paths require budgeted or fixed storage; unbudgeted allocation is forbidden".into());
+        return Err(
+            "guarded paths require budgeted or fixed storage; unbudgeted allocation is forbidden"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -348,7 +365,7 @@ fn owned_source(name: &str, source: &str) -> Result<(), String> {
         .filter(|word| *word == "unsafe")
         .count();
     let (words, blocks, allows) = if name == "raw.rs" {
-        (6, 4, 6)
+        (8, 6, 8)
     } else {
         (0, 0, 0)
     };
@@ -509,6 +526,11 @@ mod tests {
         fs::create_dir_all(root.join("td-example/src")).unwrap();
         fs::create_dir_all(root.join("td-alloc/src")).unwrap();
         fs::create_dir_all(root.join("td-mta/src/jmap_request")).unwrap();
+        for path in TREE_STORAGE_SOURCES {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fn storage() {}").unwrap();
+        }
         for path in METHOD_STORAGE_SOURCES {
             fs::write(root.join(path), "fn method() {}").unwrap();
         }
@@ -545,6 +567,13 @@ mod tests {
         assert!(check(root).is_err());
         fs::write(root.join(INVENTORY), render(root).unwrap()).unwrap();
         assert!(check(root).is_ok());
+        let html = root.join("td-html/src/html5/tokenizer.rs");
+        fs::write(&html, "fn leaked() { let x = Vec::<u8>::new(); }").unwrap();
+        assert!(check(root)
+            .unwrap_err()
+            .contains("td-html/src/html5/tokenizer.rs"));
+        fs::write(html, "fn storage() {}").unwrap();
+
         fs::write(
             root.join("td-example/src/new.rs"),
             "fn g() { let s = format!(\"x\"); }",

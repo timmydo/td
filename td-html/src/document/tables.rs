@@ -70,7 +70,7 @@ impl Builder<'_> {
                     }
                     Token::Tag(t) if !t.end && t.name == "html" => return self.body(t),
                     Token::Tag(t) if !t.end && t.name == "col" => {
-                        self.insert(t, Namespace::Html, false)?;
+                        self.insert_element(t, Namespace::Html, false)?;
                         return Ok(());
                     }
                     Token::Tag(t) if t.end && t.name == "colgroup" => {
@@ -104,7 +104,7 @@ impl Builder<'_> {
                         match (t.end, t.name.as_str()) {
                             (false, "tr") => {
                                 self.clear_to(&["tbody", "tfoot", "thead", "template", "html"])?;
-                                self.insert(t, Namespace::Html, true)?;
+                                self.insert_element(t, Namespace::Html, true)?;
                                 self.mode = Mode::Row;
                                 return Ok(());
                             }
@@ -159,9 +159,9 @@ impl Builder<'_> {
                         match (t.end, t.name.as_str()) {
                             (false, "td" | "th") => {
                                 self.clear_to(&["tr", "template", "html"])?;
-                                self.insert(t, Namespace::Html, true)?;
+                                self.insert_element(t, Namespace::Html, true)?;
                                 self.mode = Mode::Cell;
-                                self.active.push(None);
+                                self.active.try_push(None)?;
                                 return Ok(());
                             }
                             (true, "tr") => {
@@ -293,14 +293,14 @@ impl Builder<'_> {
             match (t.end, t.name.as_str()) {
                 (false, "caption") => {
                     self.clear_to(&["table", "template", "html"])?;
-                    self.active.push(None);
-                    self.insert(t, Namespace::Html, true)?;
+                    self.active.try_push(None)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                     self.mode = Mode::Caption;
                     return Ok(());
                 }
                 (false, "colgroup") => {
                     self.clear_to(&["table", "template", "html"])?;
-                    self.insert(t, Namespace::Html, true)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                     self.mode = Mode::ColumnGroup;
                     return Ok(());
                 }
@@ -312,7 +312,7 @@ impl Builder<'_> {
                 }
                 (false, "tbody" | "tfoot" | "thead") => {
                     self.clear_to(&["table", "template", "html"])?;
-                    self.insert(t, Namespace::Html, true)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                     self.mode = Mode::TableBody;
                     return Ok(());
                 }
@@ -357,12 +357,12 @@ impl Builder<'_> {
                         .iter()
                         .any(|a| a.name == "type" && a.value.eq_ignore_ascii_case("hidden")) =>
                 {
-                    self.insert(t, Namespace::Html, false)?;
+                    self.insert_element(t, Namespace::Html, false)?;
                     return Ok(());
                 }
                 (false, "form") => {
                     if self.form.is_none() && self.templates.is_empty() {
-                        self.form = Some(self.insert(t, Namespace::Html, false)?);
+                        self.form = Some(self.insert_element(t, Namespace::Html, false)?);
                     } else {
                         self.error();
                     }
@@ -403,7 +403,7 @@ impl Builder<'_> {
                     if self.current_is("option") {
                         self.open.pop();
                     }
-                    self.insert(t, Namespace::Html, true)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                 }
                 (false, "optgroup") => {
                     if self.current_is("option") {
@@ -412,7 +412,7 @@ impl Builder<'_> {
                     if self.current_is("optgroup") {
                         self.open.pop();
                     }
-                    self.insert(t, Namespace::Html, true)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                 }
                 (false, "hr") => {
                     if self.current_is("option") {
@@ -421,7 +421,7 @@ impl Builder<'_> {
                     if self.current_is("optgroup") {
                         self.open.pop();
                     }
-                    self.insert(t, Namespace::Html, false)?;
+                    self.insert_element(t, Namespace::Html, false)?;
                 }
                 (true, "optgroup") => {
                     if self.current_is("option")

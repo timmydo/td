@@ -1,4 +1,5 @@
-//! Immutable arena-indexed HTML documents. Parsing never invokes scripts or I/O.
+use td_alloc::{BudgetShared, BudgetString, BudgetVec};
+// Immutable arena-indexed HTML documents. Parsing never invokes scripts or I/O.
 use crate::html5::{self, ParseError, ParseLimits, Token, Tokenizer};
 use std::num::NonZeroU32;
 mod builder;
@@ -51,18 +52,18 @@ impl AttributePrefix {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Attribute {
-    pub name: String,
+    pub name: BudgetShared<BudgetString>,
     pub prefix: Option<AttributePrefix>,
     pub namespace: AttributeNamespace,
-    pub value: String,
+    pub value: BudgetString,
 }
 #[derive(Debug)]
 pub struct Element {
-    pub name: String,
+    pub name: BudgetShared<BudgetString>,
     pub namespace: Namespace,
-    pub attributes: Vec<Attribute>,
+    pub attributes: BudgetVec<Attribute>,
     pub template_contents: Option<NodeId>,
     html_integration: bool,
 }
@@ -83,9 +84,9 @@ pub enum NodeKind {
     Document,
     DocumentFragment,
     Element(Element),
-    Text(String),
-    Comment(String),
-    Doctype(html5::Doctype),
+    Text(BudgetString),
+    Comment(BudgetString),
+    Doctype(BudgetShared<html5::Doctype>),
 }
 #[derive(Debug)]
 pub struct Node {
@@ -138,7 +139,7 @@ pub enum QuirksMode {
 }
 #[derive(Debug)]
 pub struct Document {
-    nodes: Vec<Node>,
+    nodes: BudgetVec<Node>,
     root: NodeId,
     quirks: QuirksMode,
     errors: usize,
@@ -146,6 +147,9 @@ pub struct Document {
     charged_bytes: usize,
 }
 impl Document {
+    pub fn budget(&self) -> &td_alloc::Budget {
+        self.nodes.budget()
+    }
     pub fn root(&self) -> NodeId {
         self.root
     }
@@ -200,7 +204,20 @@ pub fn parse(input: &str) -> Result<Document, ParseError> {
     parse_with_limits(input, ParseLimits::default())
 }
 pub fn parse_with_limits(input: &str, limits: ParseLimits) -> Result<Document, ParseError> {
-    builder::Builder::new(input, limits)?.parse()
+    if input.len() > limits.clamped().input {
+        return Err(ParseError::Input);
+    }
+    let memory =
+        td_alloc::Budget::new(crate::html5::MAX_TREE_BYTES + td_alloc::Budget::metadata_bytes())?;
+    parse_with_budget(input, limits, &memory)
+}
+/// Parse with a shared budget retained by every owned tree allocation.
+pub fn parse_with_budget(
+    input: &str,
+    limits: ParseLimits,
+    memory: &td_alloc::Budget,
+) -> Result<Document, ParseError> {
+    builder::Builder::new(input, limits, memory)?.parse()
 }
 #[cfg(test)]
 mod tests;

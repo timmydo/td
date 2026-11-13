@@ -26,39 +26,49 @@ pub(super) enum Mode {
 pub(super) struct Builder<'a> {
     pub tok: Tokenizer<'a>,
     pub doc: Document,
-    pub open: Vec<NodeId>,
-    pub active: Vec<Option<NodeId>>,
-    pub templates: Vec<Mode>,
+    pub open: BudgetVec<NodeId>,
+    pub active: BudgetVec<Option<NodeId>>,
+    pub templates: BudgetVec<Mode>,
     pub mode: Mode,
     pub original: Mode,
     pub table_original: Mode,
-    pub pending_table: String,
+    pub pending_table: BudgetString,
+    names: BudgetVec<BudgetShared<BudgetString>>,
+    #[cfg(test)]
+    pub scalar_text: bool,
     pub foster: bool,
     pub head: Option<NodeId>,
     pub form: Option<NodeId>,
     pub ignore_lf: bool,
 }
 impl<'a> Builder<'a> {
-    pub fn new(input: &'a str, limits: ParseLimits) -> Result<Self, ParseError> {
-        let tok = Tokenizer::new(input, limits)?;
+    pub fn new(
+        input: &'a str,
+        limits: ParseLimits,
+        memory: &td_alloc::Budget,
+    ) -> Result<Self, ParseError> {
+        let tok = Tokenizer::with_budget(input, limits, memory)?;
         let root = NodeId::new(0)?;
         let mut b = Self {
             tok,
             doc: Document {
-                nodes: Vec::new(),
+                nodes: BudgetVec::new(memory)?,
                 root,
                 quirks: QuirksMode::NoQuirks,
                 errors: 0,
                 work: 0,
                 charged_bytes: 0,
             },
-            open: Vec::new(),
-            active: Vec::new(),
-            templates: Vec::new(),
+            open: BudgetVec::new(memory)?,
+            active: BudgetVec::new(memory)?,
+            templates: BudgetVec::new(memory)?,
             mode: Mode::Initial,
             original: Mode::Body,
             table_original: Mode::Table,
-            pending_table: String::new(),
+            pending_table: BudgetString::new(memory)?,
+            names: BudgetVec::new(memory)?,
+            #[cfg(test)]
+            scalar_text: false,
             foster: false,
             head: None,
             form: None,
@@ -70,6 +80,10 @@ impl<'a> Builder<'a> {
     pub fn parse(mut self) -> Result<Document, ParseError> {
         while let Some(token) = self.tok.next_token()? {
             if let Token::Text(s) = token {
+                if self.bulk_text(&s) {
+                    self.text_token(s)?;
+                    continue;
+                }
                 for c in s.chars() {
                     if self.ignore_lf {
                         self.ignore_lf = false;
@@ -83,6 +97,7 @@ impl<'a> Builder<'a> {
                 self.ignore_lf = false;
                 self.flush_table()?;
                 self.process(&token)?;
+                self.tok.recycle(token);
             }
             self.tok.set_foreign(
                 self.current_element()
@@ -133,6 +148,41 @@ impl<'a> Builder<'a> {
         self.doc.charged_bytes = self.tok.charged_bytes();
         Ok(self.doc)
     }
+    fn bulk_text(&self, text: &str) -> bool {
+        #[cfg(test)]
+        if self.scalar_text {
+            return false;
+        }
+        !text.is_empty()
+            && self.mode == Mode::Body
+            && !self.ignore_lf
+            && !self.foster
+            && self.active.is_empty()
+            && !self.foreign_text()
+            && !text.contains('\0')
+    }
+    // In this state every scalar has the same insertion point and no repair,
+    // preprocessing or formatting effect. Preserve its work/admission charges
+    // while transferring a new token's owned backing directly into the arena.
+    fn text_token(&mut self, text: BudgetString) -> Result<(), ParseError> {
+        self.tok.budget.steps(text.chars().count())?;
+        self.tok
+            .budget
+            .charge(text.len().saturating_mul(BYTE_CHARGE))?;
+        let (parent, before) = self.location(None)?;
+        let previous = match before {
+            Some(id) => self.node(id)?.previous,
+            None => self.node(parent)?.last,
+        };
+        if let Some(previous) = previous {
+            if let NodeKind::Text(existing) = &mut self.node_mut(previous)?.kind {
+                existing.try_push_str(&text)?;
+                return Ok(());
+            }
+        }
+        let id = self.allocate(NodeKind::Text(text))?;
+        self.attach(id, parent, before)
+    }
     pub fn step(&mut self) -> Result<(), ParseError> {
         self.tok.budget.step()
     }
@@ -166,21 +216,51 @@ impl<'a> Builder<'a> {
         }
         self.tok.budget.charge(NODE_CHARGE)?;
         let id = NodeId::new(self.doc.nodes.len())?;
-        self.doc.nodes.push(Node {
+        self.doc.nodes.try_push(Node {
             kind,
             parent: None,
             first: None,
             last: None,
             previous: None,
             next: None,
-        });
+        })?;
         Ok(id)
     }
-    pub fn owned(&mut self, s: &str) -> Result<String, ParseError> {
+    pub fn intern(&mut self, text: &str) -> Result<BudgetShared<BudgetString>, ParseError> {
+        self.tok
+            .budget
+            .charge(text.len().saturating_mul(BYTE_CHARGE))?;
+        let mut low = 0;
+        let mut high = self.names.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let name = self.names.get(mid).ok_or(ParseError::State)?;
+            self.tok
+                .budget
+                .steps(name.len().min(text.len()).saturating_add(1))?;
+            match name.as_str().cmp(text) {
+                std::cmp::Ordering::Equal => return Ok(name.try_clone()?),
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        self.tok.budget.steps(self.names.len() - low)?;
+        let name = BudgetShared::new(
+            &self.tok.budget.memory,
+            BudgetString::copy(&self.tok.budget.memory, text)?,
+        )?;
+        self.names.try_push(name.try_clone()?)?;
+        self.names
+            .get_mut(low..)
+            .ok_or(ParseError::State)?
+            .rotate_right(1);
+        Ok(name)
+    }
+    pub fn owned(&mut self, s: &str) -> Result<BudgetString, ParseError> {
         self.tok
             .budget
             .charge(s.len().saturating_mul(BYTE_CHARGE))?;
-        Ok(s.to_owned())
+        Ok(BudgetString::copy(&self.tok.budget.memory, s)?)
     }
     pub fn depth(&mut self, id: NodeId) -> Result<usize, ParseError> {
         let mut n = 0;
@@ -342,21 +422,22 @@ impl<'a> Builder<'a> {
         if self.open.len() >= self.tok.budget.limits.depth {
             return Err(ParseError::Depth);
         }
-        self.open.push(id);
+        self.open.try_push(id)?;
         Ok(())
     }
     pub fn new_element(&mut self, tag: &Tag, namespace: Namespace) -> Result<NodeId, ParseError> {
-        let name = self.owned(super::foreign::element_name(&tag.name, namespace))?;
+        let name = self.intern(super::foreign::element_name(&tag.name, namespace))?;
         let mut html_integration = namespace == Namespace::Svg
             && matches!(name.as_str(), "foreignObject" | "desc" | "title");
-        let mut attributes = Vec::new();
+        let mut attributes =
+            td_alloc::BudgetVec::with_capacity(&self.tok.budget.memory, tag.attributes.len())?;
         for a in &tag.attributes {
             self.step()?;
             if namespace == Namespace::MathMl && name == "annotation-xml" && a.name == "encoding" {
                 html_integration = a.value.eq_ignore_ascii_case("text/html")
                     || a.value.eq_ignore_ascii_case("application/xhtml+xml");
             }
-            attributes.push(self.convert_attribute(a, namespace)?);
+            attributes.try_push(self.convert_attribute(a, namespace)?)?;
         }
         self.allocate(NodeKind::Element(Element {
             name,
@@ -366,7 +447,7 @@ impl<'a> Builder<'a> {
             html_integration,
         }))
     }
-    pub fn insert(
+    pub fn insert_element(
         &mut self,
         tag: &Tag,
         namespace: Namespace,
@@ -382,12 +463,12 @@ impl<'a> Builder<'a> {
     }
     pub fn insert_named(&mut self, name: &str) -> Result<NodeId, ParseError> {
         let tag = self.synthetic(name, false)?;
-        self.insert(&tag, Namespace::Html, true)
+        self.insert_element(&tag, Namespace::Html, true)
     }
     pub fn synthetic(&mut self, name: &str, end: bool) -> Result<Tag, ParseError> {
         Ok(Tag {
             name: self.owned(name)?,
-            attributes: Vec::new(),
+            attributes: BudgetVec::new(&self.tok.budget.memory)?,
             self_closing: false,
             end,
         })
@@ -408,7 +489,8 @@ impl<'a> Builder<'a> {
                     .element()
                     .and_then(|e| e.attributes.get(i))
                     .is_some_and(|old| {
-                        old.namespace == AttributeNamespace::None && old.name == a.name
+                        old.namespace == AttributeNamespace::None
+                            && old.name.as_str() == a.name.as_str()
                     })
                 {
                     found = true;
@@ -423,7 +505,7 @@ impl<'a> Builder<'a> {
             }
             let attr = self.convert_attribute(a, Namespace::Html)?;
             if let NodeKind::Element(e) = &mut self.node_mut(id)?.kind {
-                e.attributes.push(attr);
+                e.attributes.try_push(attr)?;
             }
         }
         Ok(())
@@ -438,12 +520,12 @@ impl<'a> Builder<'a> {
         self.tok.budget.charge(c.len_utf8() * BYTE_CHARGE)?;
         if let Some(previous) = previous {
             if let NodeKind::Text(s) = &mut self.node_mut(previous)?.kind {
-                s.push(c);
+                s.try_push(c)?;
                 return Ok(());
             }
         }
-        let mut s = String::new();
-        s.push(c);
+        let mut s = BudgetString::new(&self.tok.budget.memory)?;
+        s.try_push(c)?;
         let id = self.allocate(NodeKind::Text(s))?;
         self.attach(id, parent, before)
     }
@@ -639,7 +721,7 @@ impl<'a> Builder<'a> {
         self.reset_mode()
     }
     pub fn start_text(&mut self, tag: &Tag, mode: TextMode) -> Result<(), ParseError> {
-        self.insert(tag, Namespace::Html, true)?;
+        self.insert_element(tag, Namespace::Html, true)?;
         self.tok.set_text_mode(mode);
         self.original = self.mode;
         self.mode = Mode::Text;
@@ -649,7 +731,10 @@ impl<'a> Builder<'a> {
         if self.mode != Mode::TableText {
             return Ok(());
         }
-        let pending = std::mem::take(&mut self.pending_table);
+        let pending = std::mem::replace(
+            &mut self.pending_table,
+            BudgetString::new(&self.tok.budget.memory)?,
+        );
         self.mode = self.table_original;
         if pending.chars().all(super::ws) {
             for c in pending.chars() {

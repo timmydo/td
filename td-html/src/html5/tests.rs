@@ -1,3 +1,4 @@
+#![cfg(test)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -13,22 +14,30 @@ fn tokens(s: &str) -> Vec<Token> {
     }
     out
 }
+fn owned(s: &str) -> td_alloc::BudgetString {
+    let budget = td_alloc::Budget::new(MAX_TREE_BYTES).unwrap();
+    td_alloc::BudgetString::copy(&budget, s).unwrap()
+}
 fn text(s: &str) -> Token {
-    Token::Text(s.into())
+    Token::Text(owned(s))
 }
 fn comment(s: &str) -> Token {
-    Token::Comment(s.into())
+    Token::Comment(owned(s))
 }
 fn tag(name: &str, attrs: &[(&str, &str)], end: bool, close: bool) -> Token {
-    Token::Tag(Tag {
-        name: name.into(),
-        attributes: attrs
-            .iter()
-            .map(|(k, v)| Attribute {
-                name: (*k).into(),
-                value: (*v).into(),
+    let budget = td_alloc::Budget::new(MAX_TREE_BYTES).unwrap();
+    let mut attributes = td_alloc::BudgetVec::new(&budget).unwrap();
+    for (k, v) in attrs {
+        attributes
+            .try_push(Attribute {
+                name: owned(k),
+                value: owned(v),
             })
-            .collect(),
+            .unwrap();
+    }
+    Token::Tag(Tag {
+        name: owned(name),
+        attributes,
         end,
         self_closing: close,
     })
@@ -120,9 +129,9 @@ fn doctypes_and_abrupt_identifiers() {
         assert_eq!(
             tokens(input),
             vec![Token::Doctype(Doctype {
-                name: name.into(),
-                public_id: public.map(str::to_owned),
-                system_id: system.map(str::to_owned),
+                name: owned(name),
+                public_id: public.map(owned),
+                system_id: system.map(owned),
                 force_quirks: quirks
             })],
             "{input}"
@@ -132,8 +141,8 @@ fn doctypes_and_abrupt_identifiers() {
         tokens("<!doctype html PUBLIC 'x><p>"),
         vec![
             Token::Doctype(Doctype {
-                name: "html".into(),
-                public_id: Some("x".into()),
+                name: owned("html"),
+                public_id: Some(owned("x")),
                 system_id: None,
                 force_quirks: true
             }),

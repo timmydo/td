@@ -315,7 +315,31 @@ are arena-indexed by opaque `NodeId`; no Rc, recursive node ownership or
 mutation API escapes parsing. `Document::node` validates an id and returns
 an immutable node. IDs are local to their document, not global identity.
 The document owns all names, attributes and text and does not borrow the
-input. Iteration in document order follows links, not allocation order:
+input. `parse_with_budget(input, limits, &Budget)` shares the caller's
+byte budget; every node array, attribute array, string, parser stack and
+name-pool entry retains admission. `Document::budget` borrows that same
+identity. The convenience entry points create a root capped at
+MAX_TREE_BYTES plus budget metadata. ParseLimits.bytes remains the
+separate cumulative work/storage admission below, even when lowered.
+The tree builder reuses one consumed tag's buffers and at most eight small
+attribute scratch pairs (each buffer at most 1024 bytes); cached capacity
+stays charged until released. External tokenizer clients retain their own
+tokens. Ordinary in-body text without formatting repair transfers its token
+backing directly into the node arena; scalar work and cumulative byte
+charges remain unchanged. Normalized ASCII runs in names and attribute
+values batch the same scalar transitions and admission, with special bytes
+and non-ASCII input retaining the scalar path.
+Allocation refusal returns `Allocation`; byte-budget or layout overflow
+returns `Bytes`, with no partial document. Dropping failed parsing returns
+all its live storage admission.
+
+Element and attribute names are immutable budgeted shared strings,
+interned within one parse. Lookup comparisons and sorted-pool insertions
+charge work. Names retain their control blocks after the parser pool drops;
+shared names charge once. The rare doctype record lives in one budgeted
+shared allocation, so its optional strings do not enlarge every arena node. Other nested strings use BudgetString, arrays
+use BudgetVec, and no infallible Clone or uncharged mutable collection
+escapes. Public borrowed string and slice access remains available. Iteration in document order follows links, not allocation order:
 repair may move a node or allocate an ancestor after its descendants.
 
 Node kinds are Document, DocumentFragment, Element, Text, Comment and
@@ -331,7 +355,8 @@ Text nodes coalesce with the adjacent text at the insertion location.
 
 `html5::Tokenizer` is an incremental token iterator over a bounded `&str`,
 with explicit text-mode and foreign-CDATA controls for the tree builder.
-It emits owned tags, text, comments and doctypes. It does not guess a
+It emits owned tags, text, comments and doctypes. `Tokenizer::with_budget`
+accepts a shared byte budget; retained tokens keep their own admission. It does not guess a
 context from a start tag: only the builder knows whether that start tag
 was accepted. EOF and terminal refusal remain terminal on repeated calls.
 Callers retaining every token must budget that retained storage themselves.
@@ -360,14 +385,17 @@ refunded after a node is moved or parsing drops a temporary token.
 | `MAX_ADOPTION_PASSES` | 8 | Adoption-agency outer iterations per end tag |
 | `MAX_FORMATTING_DUPLICATES` | 3 | Identical active formatting entries after the last marker |
 
-The allocation charge is `NODE_CHARGE` (256 bytes) per arena node,
-`ATTRIBUTE_CHARGE` (128 bytes) per token or copied attribute, and
+The cumulative allocation charge is `NODE_CHARGE` (twice the node
+record size) per arena node, `ATTRIBUTE_CHARGE` (twice the document
+attribute record size) per token or copied attribute, and
 `BYTE_CHARGE` (2 bytes) per byte appended to owned strings. Token text,
 comments, names and doctype identifiers use that same string charge;
 moving a token's string into a node costs no second string charge.
 Attribute prefixes use a fixed enum rather than separately allocated strings.
-Attribute and node vector growth is covered by their fixed charges,
-parser stacks by the depth/node ceilings. The byte charge allows ordinary
+Attribute and node capacity estimates use their fixed charges,
+parser stacks the depth/node ceilings. Separately, td-alloc admits exact
+requested layouts, including capacity, shared control blocks, parser
+scratch and overlapping growth, against the supplied live byte budget. The byte charge allows ordinary
 geometric string capacity growth; it is an admission model, not a promise
 about the allocator's metadata or the caller's retained source. Text and
 comment lengths need no independent ceiling beyond input, work and bytes.

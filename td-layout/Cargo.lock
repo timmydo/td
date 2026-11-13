@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "td-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "td-css"
 version = "0.1.0"
 
@@ -17,6 +21,9 @@ dependencies = [
 [[package]]
 name = "td-html"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-layout"

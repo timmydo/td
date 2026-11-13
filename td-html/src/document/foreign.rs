@@ -29,7 +29,7 @@ impl Builder<'_> {
             (None, a.name.as_str(), AttributeNamespace::None)
         };
         Ok(Attribute {
-            name: self.owned(name)?,
+            name: self.intern(name)?,
             prefix: prefix.map(|p| match p {
                 "xml" => AttributePrefix::Xml,
                 "xmlns" => AttributePrefix::Xmlns,
@@ -83,7 +83,7 @@ impl Builder<'_> {
                     .current_element()
                     .map(|e| e.namespace)
                     .unwrap_or(Namespace::Html);
-                self.insert(t, ns, !t.self_closing)?;
+                self.insert_element(t, ns, !t.self_closing)?;
             }
             Token::Tag(t) => {
                 for i in (0..self.open.len()).rev() {

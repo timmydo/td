@@ -14,10 +14,20 @@ impl Builder<'_> {
             self.tok.budget.attribute()?;
         }
         let e = self.node(id)?.element().ok_or(ParseError::State)?;
+        let mut attributes =
+            td_alloc::BudgetVec::with_capacity(&self.tok.budget.memory, e.attributes.len())?;
+        for a in &e.attributes {
+            attributes.try_push(Attribute {
+                name: a.name.try_clone()?,
+                value: a.value.try_clone()?,
+                prefix: a.prefix,
+                namespace: a.namespace,
+            })?;
+        }
         let e = Element {
-            name: e.name.clone(),
+            name: e.name.try_clone()?,
             namespace: e.namespace,
-            attributes: e.attributes.clone(),
+            attributes,
             template_contents: None,
             html_integration: e.html_integration,
         };
@@ -96,7 +106,7 @@ impl Builder<'_> {
                 self.active.remove(i);
             }
         }
-        self.active.push(Some(id));
+        self.active.try_push(Some(id))?;
         Ok(())
     }
     pub(super) fn reconstruct(&mut self) -> Result<(), ParseError> {
@@ -237,7 +247,11 @@ impl Builder<'_> {
             if bookmark > self.active.len() {
                 return Err(ParseError::State);
             }
-            self.active.insert(bookmark, Some(replacement));
+            self.active.try_push(Some(replacement))?;
+            self.active
+                .get_mut(bookmark..)
+                .ok_or(ParseError::State)?
+                .rotate_right(1);
             if let Some(i) = self.open_position(format)? {
                 self.open.remove(i);
             }
@@ -245,7 +259,11 @@ impl Builder<'_> {
             if self.open.len() >= self.tok.budget.limits.depth {
                 return Err(ParseError::Depth);
             }
-            self.open.insert(at, replacement);
+            self.open.try_push(replacement)?;
+            self.open
+                .get_mut(at..)
+                .ok_or(ParseError::State)?
+                .rotate_right(1);
         }
         Ok(())
     }

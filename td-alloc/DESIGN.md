@@ -117,8 +117,9 @@ Migration proceeds at operation boundaries: parsers and decoded buffers,
 then rendering, networking and storage. Replace an operation's diagnostics
 and fallback paths along with its main allocations. Shared ownership that
 requires a newly allocated Arc/Box cannot be made fallible by a Vec helper;
-transfer ownership or reserve reusable storage, or design and audit that
-surface separately under UNSAFE.md. The stable std allocator API does not
+use `BudgetShared` for immutable shared ownership, transfer ownership or
+reserve reusable storage. Other owning surfaces need their own audit under
+UNSAFE.md. The stable std allocator API does not
 currently provide a safe fallible replacement for every collection.
 
 
@@ -161,8 +162,10 @@ separate input, work, concurrency, descriptor and disk limits.
 
 `BudgetVec` admits an exact requested layout before allocating and retains
 its charge alongside the vector. A grow admits the whole replacement while
-the old capacity remains charged, moves initialized values, then frees the
-old allocation before returning its charge. Failed admission/allocation
+the old capacity remains charged, then requests fallible reallocation.
+The allocator may extend in place; admission still conservatively covers
+both layouts until success consumes the old allocation. Refusal preserves
+the original storage. Failed admission/allocation
 preserves the old values and capacity. Amortized growth clips spare capacity
 to currently available headroom
 across every ancestor and the layout limit. A stable tight cap therefore
@@ -179,7 +182,17 @@ infallible Clone, raw ownership extraction, or implicit budget transfer.
 `Buffer` freezes length/capacity for queued parser backing; moving or
 recovering its `BudgetVec` retains admission. `BudgetString` preserves UTF-8
 and offers fallible append and constant-time string borrowing. Copy/fill
-operations do not invoke a custom Clone implementation.
+operations do not invoke a custom Clone implementation. Borrowed iteration,
+Debug and equality preserve storage ownership. Checked removal cannot grow.
+BudgetString has fallible copy/clone and scalar append; immutable str
+borrowing exposes no unchecked mutation.
+
+`BudgetShared<T>` provides immutable strong ownership with fallible
+construction and checked, allocation-free `try_clone`. Its control block
+and inline value are charged before allocation; nested storage must retain
+its own admission. Final destruction frees the control block before dropping
+the value and returning its charge. There is no weak pointer, mutable access,
+infallible Clone, or raw ownership conversion. Send/Sync require T: Send + Sync.
 
 `Arena<T>` owns typed values with stable, bounds-checked indices. It grows
 fallibly from the same budget and destroys values on drop. References borrow
@@ -190,7 +203,7 @@ No raw heterogeneous bump allocator or unrun-destructor policy is implied.
 Budget exhaustion, size/reference-count overflow and allocator refusal are
 separate allocation-free errors. Callers use existing/static refusal paths
 and reserve completion capacity before durable effects. The operation-count
-failure-injection scope also covers both raw allocations in this boundary;
+failure-injection scope also covers raw allocations and reallocations in this boundary;
 it remains thread-local test admission, not byte accounting.
 
 Every migrated application scenario needs before/after performance evidence

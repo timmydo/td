@@ -14,8 +14,8 @@ pub const MAX_ATTRIBUTE_BYTES: usize = 1024 * 1024;
 pub const MAX_WORK: usize = 64_000_000;
 pub const MAX_ADOPTION_PASSES: usize = 8;
 pub const MAX_FORMATTING_DUPLICATES: usize = 3;
-pub const NODE_CHARGE: usize = 256;
-pub const ATTRIBUTE_CHARGE: usize = 128;
+pub const NODE_CHARGE: usize = 2 * std::mem::size_of::<crate::document::Node>();
+pub const ATTRIBUTE_CHARGE: usize = 2 * std::mem::size_of::<crate::document::Attribute>();
 pub const BYTE_CHARGE: usize = 2;
 
 /// Caller ceilings, clamped to the constants above; zero refuses that resource.
@@ -73,6 +73,7 @@ pub enum ParseError {
     AttributeBytes,
     Work,
     State,
+    Allocation,
 }
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,21 +81,31 @@ impl std::fmt::Display for ParseError {
     }
 }
 impl std::error::Error for ParseError {}
+impl From<td_alloc::BudgetError> for ParseError {
+    fn from(error: td_alloc::BudgetError) -> Self {
+        match error {
+            td_alloc::BudgetError::Limit | td_alloc::BudgetError::Overflow => Self::Bytes,
+            td_alloc::BudgetError::Allocation => Self::Allocation,
+        }
+    }
+}
 
 pub(crate) struct Budget {
+    pub memory: td_alloc::Budget,
     pub limits: ParseLimits,
     pub bytes: usize,
     pub work: usize,
     pub attributes: usize,
 }
 impl Budget {
-    pub fn new(limits: ParseLimits) -> Self {
-        Self {
+    pub fn new(limits: ParseLimits, memory: &td_alloc::Budget) -> Result<Self, ParseError> {
+        Ok(Self {
+            memory: memory.try_clone()?,
             limits: limits.clamped(),
             bytes: 0,
             work: 0,
             attributes: 0,
-        }
+        })
     }
     pub fn charge(&mut self, bytes: usize) -> Result<(), ParseError> {
         self.bytes = self
@@ -105,9 +116,12 @@ impl Budget {
         Ok(())
     }
     pub fn step(&mut self) -> Result<(), ParseError> {
+        self.steps(1)
+    }
+    pub fn steps(&mut self, count: usize) -> Result<(), ParseError> {
         self.work = self
             .work
-            .checked_add(1)
+            .checked_add(count)
             .filter(|n| *n <= self.limits.work)
             .ok_or(ParseError::Work)?;
         Ok(())
@@ -120,9 +134,9 @@ impl Budget {
             .ok_or(ParseError::Attributes)?;
         self.charge(ATTRIBUTE_CHARGE)
     }
-    pub fn push(
+    pub fn append_char(
         &mut self,
-        out: &mut String,
+        out: &mut td_alloc::BudgetString,
         c: char,
         limit: usize,
         error: ParseError,
@@ -131,12 +145,16 @@ impl Budget {
             return Err(error);
         }
         self.charge(c.len_utf8() * BYTE_CHARGE)?;
-        out.push(c);
+        out.try_push(c)?;
         Ok(())
     }
-    pub fn append(&mut self, out: &mut String, text: &str) -> Result<(), ParseError> {
+    pub fn append_text(
+        &mut self,
+        out: &mut td_alloc::BudgetString,
+        text: &str,
+    ) -> Result<(), ParseError> {
         self.charge(text.len().saturating_mul(BYTE_CHARGE))?;
-        out.push_str(text);
+        out.try_push_str(text)?;
         Ok(())
     }
 }

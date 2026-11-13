@@ -100,7 +100,9 @@ impl Budget {
     }
     pub fn charge(&self, bytes: usize) -> Result<Charge, BudgetError> {
         let budget = self.try_clone()?;
-        budget.acquire(bytes)?;
+        if bytes != 0 {
+            budget.acquire(bytes)?;
+        }
         Ok(Charge { budget, bytes })
     }
     fn acquire(&self, bytes: usize) -> Result<(), BudgetError> {
@@ -121,6 +123,9 @@ impl Budget {
         Ok(())
     }
     fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
         self.0.get().used.fetch_sub(bytes, Ordering::Relaxed);
         if let Some(parent) = &self.0.get().parent {
             parent.release(bytes);

@@ -46,6 +46,9 @@ dependencies = [
 [[package]]
 name = "td-html"
 version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
 
 [[package]]
 name = "td-jpeg"

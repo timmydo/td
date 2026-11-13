@@ -80,7 +80,7 @@ impl Builder<'_> {
                         return Ok(());
                     }
                     self.tok.budget.charge(c.len_utf8() * BYTE_CHARGE)?;
-                    self.pending_table.push(c);
+                    self.pending_table.try_push(c)?;
                     return Ok(());
                 }
                 Mode::ColumnGroup => {
@@ -143,7 +143,10 @@ impl Builder<'_> {
                             force_quirks: d.force_quirks,
                         };
                         self.doc.quirks = quirks(&d);
-                        let id = self.allocate(NodeKind::Doctype(d))?;
+                        let id = self.allocate(NodeKind::Doctype(BudgetShared::new(
+                            &self.tok.budget.memory,
+                            d,
+                        )?))?;
                         self.attach(id, self.doc.root, None)?;
                         self.mode = Mode::BeforeHtml;
                         return Ok(());
@@ -160,7 +163,7 @@ impl Builder<'_> {
                         return Ok(());
                     }
                     Token::Tag(t) if !t.end && t.name == "html" => {
-                        self.insert(t, Namespace::Html, true)?;
+                        self.insert_element(t, Namespace::Html, true)?;
                         self.mode = Mode::BeforeHead;
                         return Ok(());
                     }
@@ -183,7 +186,7 @@ impl Builder<'_> {
                     }
                     Token::Tag(t) if !t.end && t.name == "html" => return self.body(t),
                     Token::Tag(t) if !t.end && t.name == "head" => {
-                        self.head = Some(self.insert(t, Namespace::Html, true)?);
+                        self.head = Some(self.insert_element(t, Namespace::Html, true)?);
                         self.mode = Mode::Head;
                         return Ok(());
                     }
@@ -251,7 +254,7 @@ impl Builder<'_> {
                     }
                     Token::Tag(t) if !t.end && t.name == "html" => return self.body(t),
                     Token::Tag(t) if !t.end && t.name == "body" => {
-                        self.insert(t, Namespace::Html, true)?;
+                        self.insert_element(t, Namespace::Html, true)?;
                         self.mode = Mode::Body;
                         return Ok(());
                     }
@@ -398,23 +401,23 @@ impl Builder<'_> {
             Token::Tag(t) => match (t.end, t.name.as_str()) {
                 (false, "html") => self.body(t)?,
                 (false, "base" | "basefont" | "bgsound" | "link" | "meta") => {
-                    self.insert(t, Namespace::Html, false)?;
+                    self.insert_element(t, Namespace::Html, false)?;
                 }
                 (false, "title") => self.start_text(t, TextMode::Rcdata)?,
                 (false, "style" | "noframes") => self.start_text(t, TextMode::Rawtext)?,
                 (false, "script") => self.start_text(t, TextMode::Script)?,
                 (false, "noscript") => {
-                    self.insert(t, Namespace::Html, true)?;
+                    self.insert_element(t, Namespace::Html, true)?;
                     self.mode = Mode::HeadNoscript;
                 }
                 (false, "template") => {
-                    let id = self.insert(t, Namespace::Html, true)?;
+                    let id = self.insert_element(t, Namespace::Html, true)?;
                     let fragment = self.allocate(NodeKind::DocumentFragment)?;
                     if let NodeKind::Element(e) = &mut self.node_mut(id)?.kind {
                         e.template_contents = Some(fragment);
                     }
-                    self.active.push(None);
-                    self.templates.push(Mode::Template);
+                    self.active.try_push(None)?;
+                    self.templates.try_push(Mode::Template)?;
                     self.mode = Mode::Template;
                 }
                 (true, "template") => self.close_template()?,
@@ -474,7 +477,7 @@ impl Builder<'_> {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 if self.scoped("p", "button")? {
@@ -483,13 +486,13 @@ impl Builder<'_> {
                 if self.current_element().is_some_and(|e| heading(&e.name)) {
                     self.open.pop();
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "pre" | "listing" => {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
                 self.ignore_lf = true;
             }
             "form" => {
@@ -500,7 +503,7 @@ impl Builder<'_> {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                let id = self.insert(t, Namespace::Html, true)?;
+                let id = self.insert_element(t, Namespace::Html, true)?;
                 if self.templates.is_empty() {
                     self.form = Some(id);
                 }
@@ -535,13 +538,13 @@ impl Builder<'_> {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "plaintext" => {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
                 self.tok.set_text_mode(TextMode::Plaintext);
             }
             "button" => {
@@ -550,7 +553,7 @@ impl Builder<'_> {
                     self.pop_through("button")?;
                 }
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small"
             | "strike" | "strong" | "tt" | "u" => {
@@ -570,33 +573,33 @@ impl Builder<'_> {
                     self.adoption("nobr")?;
                     self.reconstruct()?;
                 }
-                let id = self.insert(t, Namespace::Html, true)?;
+                let id = self.insert_element(t, Namespace::Html, true)?;
                 self.add_active(id)?;
             }
             "applet" | "marquee" | "object" => {
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, true)?;
-                self.active.push(None);
+                self.insert_element(t, Namespace::Html, true)?;
+                self.active.try_push(None)?;
             }
             "table" => {
                 if self.doc.quirks != QuirksMode::Quirks && self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
                 self.mode = Mode::Table;
             }
             "area" | "br" | "embed" | "img" | "input" | "keygen" | "wbr" => {
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, false)?;
+                self.insert_element(t, Namespace::Html, false)?;
             }
             "param" | "source" | "track" => {
-                self.insert(t, Namespace::Html, false)?;
+                self.insert_element(t, Namespace::Html, false)?;
             }
             "hr" => {
                 if self.scoped("p", "button")? {
                     self.close_p()?;
                 }
-                self.insert(t, Namespace::Html, false)?;
+                self.insert_element(t, Namespace::Html, false)?;
             }
             "image" => {
                 let mut replacement = self.copy_tag(t)?;
@@ -617,7 +620,7 @@ impl Builder<'_> {
             "iframe" | "noembed" => self.start_text(t, TextMode::Rawtext)?,
             "select" => {
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
                 self.mode = if matches!(
                     self.mode,
                     Mode::Table | Mode::Caption | Mode::TableBody | Mode::Row | Mode::Cell
@@ -632,23 +635,23 @@ impl Builder<'_> {
                     self.open.pop();
                 }
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "rb" | "rtc" => {
                 if self.scoped("ruby", "")? {
                     self.implied("", false)?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "rp" | "rt" => {
                 if self.scoped("ruby", "")? {
                     self.implied("rtc", false)?;
                 }
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
             "math" | "svg" => {
                 self.reconstruct()?;
-                self.insert(
+                self.insert_element(
                     t,
                     if name == "math" {
                         Namespace::MathMl
@@ -662,7 +665,7 @@ impl Builder<'_> {
             | "thead" | "tr" | "frameset" => self.error(),
             _ => {
                 self.reconstruct()?;
-                self.insert(t, Namespace::Html, true)?;
+                self.insert_element(t, Namespace::Html, true)?;
             }
         }
         Ok(())
@@ -760,13 +763,14 @@ impl Builder<'_> {
     }
     pub(super) fn copy_tag(&mut self, t: &Tag) -> Result<Tag, ParseError> {
         let name = self.owned(&t.name)?;
-        let mut attributes = Vec::new();
+        let mut attributes =
+            td_alloc::BudgetVec::with_capacity(&self.tok.budget.memory, t.attributes.len())?;
         for a in &t.attributes {
             self.tok.budget.attribute()?;
-            attributes.push(html5::Attribute {
+            attributes.try_push(html5::Attribute {
                 name: self.owned(&a.name)?,
                 value: self.owned(&a.value)?,
-            });
+            })?;
         }
         Ok(Tag {
             name,

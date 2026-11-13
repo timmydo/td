@@ -310,3 +310,72 @@ fn tight_budget_arena_growth_uses_one_allocation_instead_of_exact_steps() {
     drop(arena);
     assert_eq!(root.used(), Budget::metadata_bytes());
 }
+
+#[test]
+fn shared_values_charge_once_and_release_nested_storage_after_the_last_owner() {
+    use td_alloc::BudgetShared;
+    let root = Budget::new(4096).unwrap();
+    let nested = Buffer::filled(&root, 128, 9u8).unwrap();
+    let value = BudgetShared::new(&root, nested).unwrap();
+    let charged = root.used();
+    assert!(charged > Budget::metadata_bytes() + 128);
+    let other = with_reservation_limit(0, || value.try_clone()).unwrap();
+    assert_eq!(root.used(), charged);
+    drop(value);
+    assert_eq!(&**other, &[9; 128]);
+    assert_eq!(root.used(), charged);
+    std::thread::spawn(move || drop(other)).join().unwrap();
+    assert_eq!(root.used(), Budget::metadata_bytes());
+    let nested = Buffer::filled(&root, 128, 9u8).unwrap();
+    assert!(matches!(
+        with_reservation_limit(0, || BudgetShared::new(&root, nested)),
+        Err(BudgetError::Allocation)
+    ));
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn growing_preserves_overaligned_values_and_drops_each_once() {
+    #[repr(align(256))]
+    struct Item<'a>(&'a std::cell::Cell<usize>, usize);
+    impl Drop for Item<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let drops = std::cell::Cell::new(0);
+    let root = Budget::new(65536).unwrap();
+    let mut values = BudgetVec::new(&root).unwrap();
+    for i in 0..65 {
+        values.try_push(Item(&drops, i)).unwrap();
+        assert_eq!(values.as_ptr() as usize % 256, 0);
+        assert_eq!(drops.get(), 0);
+        assert!(values.iter().enumerate().all(|(at, v)| at == v.1));
+    }
+    assert!(values.remove(65).is_none());
+    drop(values.remove(0).unwrap());
+    assert_eq!(drops.get(), 1);
+    drop(values);
+    assert_eq!(drops.get(), 65);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn string_growth_and_copy_preserve_utf8_and_refused_owners() {
+    let root = Budget::new(4096).unwrap();
+    let mut text = BudgetString::copy(&root, "é🌎").unwrap();
+    let before = root.used();
+    assert!(matches!(
+        with_reservation_limit(0, || text.try_push('語')),
+        Err(BudgetError::Allocation)
+    ));
+    assert_eq!(text.as_str(), "é🌎");
+    assert_eq!(root.used(), before);
+    text.try_push('語').unwrap();
+    let copy = text.try_clone().unwrap();
+    assert_eq!(text, copy);
+    assert_eq!(text.as_str(), "é🌎語");
+    drop(text);
+    drop(copy);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}

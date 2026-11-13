@@ -1,6 +1,6 @@
 //! The allocation boundary recorded in UNSAFE.md. No public raw pointers.
 use crate::BudgetError;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, realloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicUsize, Ordering};
 
@@ -19,6 +19,42 @@ pub(super) fn vector<T>(capacity: usize) -> Result<Vec<T>, BudgetError> {
         let ptr = NonNull::new(alloc(layout).cast::<T>()).ok_or(BudgetError::Allocation)?;
         Ok(Vec::from_raw_parts(ptr.as_ptr(), 0, capacity))
     }
+}
+
+/// Grow an exclusively owned Vec without moving its initialized values twice.
+#[allow(unsafe_code)]
+pub(super) fn grow_vector<T>(values: &mut Vec<T>, capacity: usize) -> Result<(), BudgetError> {
+    if capacity <= values.capacity() {
+        return Ok(());
+    }
+    let next = Layout::array::<T>(capacity).map_err(|_| BudgetError::Overflow)?;
+    if values.capacity() == 0 {
+        *values = vector(capacity)?;
+        return Ok(());
+    }
+    let old = Layout::array::<T>(values.capacity()).map_err(|_| BudgetError::Overflow)?;
+    let len = values.len();
+    crate::helpers::admit()?;
+    // SAFETY: ZST Vec capacity is usize::MAX and returned above. Both layouts
+    // are nonzero, validated arrays with identical alignment. The exclusive
+    // Vec owns exactly the old global allocation. On null it remains valid.
+    // On success realloc preserves all initialized bytes and consumes the old
+    // allocation. Replace only its stack descriptor, without dropping the old
+    // descriptor or invoking any user code, then resume normal Vec ownership.
+    unsafe {
+        let pointer =
+            NonNull::new(realloc(values.as_mut_ptr().cast(), old, next.size()).cast::<T>())
+                .ok_or(BudgetError::Allocation)?;
+        std::ptr::write(values, Vec::from_raw_parts(pointer.as_ptr(), len, capacity));
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+pub(super) fn grow_string(values: &mut String, capacity: usize) -> Result<(), BudgetError> {
+    // SAFETY: grow_vector preserves the length and all initialized bytes on
+    // success and failure. It cannot invalidate the String's UTF-8 invariant.
+    unsafe { grow_vector(values.as_mut_vec(), capacity) }
 }
 
 struct Inner<T> {

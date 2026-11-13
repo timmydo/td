@@ -9,4 +9,4 @@ mod budget;
 mod raw;
 mod storage;
 pub use budget::{Budget, BudgetError, Charge};
-pub use storage::{Arena, BudgetString, BudgetVec, Buffer};
+pub use storage::{Arena, BudgetShared, BudgetString, BudgetVec, Buffer};

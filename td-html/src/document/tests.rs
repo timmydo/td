@@ -1,3 +1,4 @@
+#![cfg(test)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -463,6 +464,7 @@ fn tree_moves_check_descendants_and_cycles_before_link_changes() {
             depth: 3,
             ..Default::default()
         },
+        &td_alloc::Budget::new(html5::MAX_TREE_BYTES).unwrap(),
     )
     .unwrap();
     let root = b.doc.root;
@@ -595,7 +597,11 @@ fn global_budget_ceiling_edges_and_clamping() {
             html5::MAX_WORK
         )
     );
-    let mut budget = html5::Budget::new(limits);
+    let mut budget = html5::Budget::new(
+        limits,
+        &td_alloc::Budget::new(html5::MAX_TREE_BYTES).unwrap(),
+    )
+    .unwrap();
     budget.attributes = html5::MAX_ATTRIBUTES - 1;
     assert_eq!(budget.attribute(), Ok(()));
     assert_eq!(budget.attribute(), Err(ParseError::Attributes));
@@ -641,5 +647,121 @@ fn integration_point_detection_does_not_rescan_attributes_per_character() {
             d.work()
         );
         invariants(&d);
+    }
+}
+
+#[test]
+fn allocation_refusals_reclaim_the_whole_shared_parse_budget() {
+    use td_alloc::{with_reservation_limit, Budget};
+    let input = "<!doctype html PUBLIC 'a' 'b'><body x=y><table>foster<tr><td><b a=b>one<i>two</b>three</i></table><template><svg><foreignObject><p title='&amp;'>four</p></foreignObject></svg></template><!--tail-->";
+    let root = Budget::new(1 << 20).unwrap();
+    let child = root.child(1 << 20).unwrap();
+    let baseline = root.used();
+    let mut completed = false;
+    for allowance in 0..512 {
+        let result = with_reservation_limit(allowance, || {
+            parse_with_budget(input, ParseLimits::default(), &child)
+        });
+        match result {
+            Err(ParseError::Allocation) => {}
+            Ok(document) => {
+                invariants(&document);
+                assert!(root.used() > baseline);
+                drop(document);
+                completed = true;
+            }
+            other => panic!("unexpected parse result at {allowance}: {other:?}"),
+        }
+        assert_eq!(root.used(), baseline, "allowance {allowance}");
+        if completed {
+            break;
+        }
+    }
+    assert!(completed);
+    let document = parse_with_budget(input, ParseLimits::default(), &child).unwrap();
+    invariants(&document);
+    drop(document);
+    assert_eq!(root.used(), baseline);
+}
+
+#[test]
+fn a_document_keeps_its_page_admission_after_the_original_handles_drop() {
+    use td_alloc::Budget;
+    let root = Budget::new(1 << 20).unwrap();
+    let child = root.child(1 << 20).unwrap();
+    let document =
+        parse_with_budget("<p a=b>retained text", ParseLimits::default(), &child).unwrap();
+    let retained = root.used();
+    drop(child);
+    assert_eq!(root.used(), retained);
+    assert!(matches!(
+        root.charge(root.limit() - retained + 1),
+        Err(td_alloc::BudgetError::Limit)
+    ));
+    let spare = root.charge(root.limit() - retained).unwrap();
+    assert!(matches!(
+        parse_with_budget("<p>second", ParseLimits::default(), &root),
+        Err(ParseError::Bytes)
+    ));
+    assert_eq!(root.used(), root.limit());
+    drop(spare);
+    invariants(&document);
+    drop(document);
+    assert_eq!(root.used(), Budget::metadata_bytes());
+}
+
+#[test]
+fn batched_text_and_ascii_tokens_match_scalar_recovery_and_work() {
+    let pieces = [
+        "<body><p>ordinary words &amp; more</p>",
+        "<p a='one two' data-FOO=x:y.z>é語\r\ntext</p>",
+        "<pre>\nfirst\nsecond</pre>",
+        "<b>one<i>two</b>three</i>",
+        "<table>foster<tr><td>cell</td></tr>outside</table>",
+        "<svg><foreignObject><p>integration</p></foreignObject></svg>",
+        "<template><p>content</template>",
+        "<svg><foreignObject><![CDATA[]]></foreignObject></svg>",
+        "<svg><title><![CDATA[]]></title></svg>",
+        "<math><mi><![CDATA[]]></mi></math>",
+        "<textarea>raw &amp; text</textarea>",
+        "<p a=b c=\"bad\x7fvalue\" a='duplicate'>\0tail</p>",
+        "<head>stray</head><body><span>x</span>tail",
+    ];
+    let root = td_alloc::Budget::new(1 << 20).unwrap();
+    for (i, first) in pieces.iter().enumerate() {
+        for second in pieces {
+            let input = format!("{first}{second}{first}");
+            let fast = parse_with_budget(&input, ParseLimits::default(), &root).unwrap();
+            let mut builder = builder::Builder::new(&input, ParseLimits::default(), &root).unwrap();
+            builder.scalar_text = true;
+            builder.tok.scalar_runs = true;
+            let scalar = builder.parse().unwrap();
+            assert_eq!(
+                format!("{fast:?}"),
+                format!("{scalar:?}"),
+                "case {i}: {input:?}"
+            );
+            invariants(&fast);
+        }
+    }
+    assert_eq!(root.used(), td_alloc::Budget::metadata_bytes());
+}
+
+#[test]
+fn empty_cdata_at_integration_points_keeps_node_admission_unchanged() {
+    for input in [
+        "<svg><foreignObject><![CDATA[]]></foreignObject></svg>",
+        "<svg><title><![CDATA[]]></title></svg>",
+        "<math><mi><![CDATA[]]></mi></math>",
+    ] {
+        let limits = ParseLimits {
+            nodes: 6,
+            ..ParseLimits::default()
+        };
+        let document = parse_with_limits(input, limits).unwrap();
+        assert_eq!(document.len(), 6);
+        assert!(!document
+            .nodes()
+            .any(|(_, node)| matches!(node.kind(), NodeKind::Text(text) if text.is_empty())));
     }
 }

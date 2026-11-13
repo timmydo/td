@@ -3933,8 +3933,8 @@ allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
 ## 28. `td-alloc` — fallible heap ownership
 
 The Cargo library root `src/owned.rs` denies unsafe code. `src/raw.rs` has
-six narrowly scoped allowances: four functions (`vector`, `Shared::new`,
-`Shared::inner`, `Shared::drop`) and the Send/Sync implementations for
+eight narrowly scoped allowances: six functions (`vector`, `grow_vector`,
+`grow_string`, `Shared::new`, `Shared::inner`, `Shared::drop`) and the Send/Sync implementations for
 `Shared<T: Send + Sync>`. No other module has an allowance. The source-mounted
 `src/lib.rs` retains forbid and never imports this boundary, so the engine
 and direct-rustc helper consumers retain their existing safe-only contract.
@@ -3945,6 +3945,17 @@ pointer/layout once to Vec::from_raw_parts with zero initialized elements.
 Safe Vec operations and destruction then own initialization, moves and free.
 Budgeted growth never exposes the inner Vec and reserves before an operation
 could grow it. Both old and new layouts stay charged during replacement.
+`grow_vector` validates the new array layout before calling global realloc
+with the old Vec's exact nonzero layout and unchanged alignment. It keeps
+the original Vec intact on null. Success consumes that allocation and
+preserves every initialized element; an immediate pointer write replaces
+the Vec descriptor without dropping the consumed descriptor. No callback
+or fallible step occurs between realloc success and descriptor replacement.
+An empty Vec uses vector; zero-sized elements never need growth.
+`grow_string` lends its private byte Vec only to grow_vector, which leaves
+length and initialized bytes unchanged on success and failure, preserving
+UTF-8. The allocator may extend in place; accounting still admits the full
+replacement beside the old layout before calling it.
 
 The private Shared block contains an atomic strong count and initialized T.
 Creation admits the test reservation, allocates the nonzero exact layout,
@@ -3956,8 +3967,13 @@ moves the initialized block into a local, deallocates its exact original
 layout, then drops the local. No Pin or address guarantee escapes Shared.
 State returns its parent metadata charge only after the block is freed;
 a panicking T destructor cannot leak that block or expose freed memory.
-Shared is Send and Sync only when T is both. The only production T is the
-private budget State; its parent-chain depth is bounded at construction.
+Shared is Send and Sync only when T is both. Production T is the private
+budget State or a private SharedValue<T> containing a value followed by its
+Charge. State's parent-chain depth is bounded at construction. The public
+safe BudgetShared wrapper admits the complete SharedValue control-block
+layout before construction; after the last reference frees that block,
+field order drops the nested value before returning this admission. Any
+nested allocation requires its own budgeted owner. No Pin guarantee escapes.
 
 Tests cover alignment, zero-sized values, layout overflow, null-equivalent
 injected refusal, rollback, replacement overlap, concurrent admission,

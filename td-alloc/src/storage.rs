@@ -1,8 +1,14 @@
 use crate::{raw, Budget, BudgetError, Charge};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 fn growth_capacity<T>(budget: &Budget, current: usize, needed: usize) -> usize {
-    let preferred = current.saturating_mul(2).max(8).max(needed);
+    let minimum = match std::mem::size_of::<T>() {
+        1 => 8,
+        2..=1024 => 4,
+        _ => 1,
+    };
+    let preferred = current.saturating_mul(2).max(minimum).max(needed);
     let available = budget
         .remaining()
         .min(isize::MAX as usize)
@@ -45,11 +51,12 @@ impl<T> BudgetVec<T> {
         if capacity <= self.capacity() {
             return Ok(());
         }
-        // Both buffers are charged during the copy, even if the allocator could
-        // have extended in place. Refusal leaves contents and capacity unchanged.
-        let mut next = Self::with_capacity(self.budget(), capacity)?;
-        next.values.append(&mut self.values);
-        *self = next;
+        // Conservatively admit the full replacement even when realloc can
+        // extend in place. On refusal the old allocation and charge survive.
+        let layout = std::alloc::Layout::array::<T>(capacity).map_err(|_| BudgetError::Overflow)?;
+        let charge = self.budget().charge(layout.size())?;
+        raw::grow_vector(&mut self.values, capacity)?;
+        self.charge = charge;
         Ok(())
     }
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), BudgetError> {
@@ -68,10 +75,19 @@ impl<T> BudgetVec<T> {
             result => result,
         }
     }
+    #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), BudgetError> {
         self.try_reserve(1)?;
         self.values.push(value);
         Ok(())
+    }
+    /// Remove an element without allocating; an invalid index changes nothing.
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        if index < self.len() {
+            Some(self.values.remove(index))
+        } else {
+            None
+        }
     }
     pub fn pop(&mut self) -> Option<T> {
         self.values.pop()
@@ -103,13 +119,41 @@ impl<T: Copy> BudgetVec<T> {
 }
 impl<T> Deref for BudgetVec<T> {
     type Target = [T];
+    #[inline]
     fn deref(&self) -> &[T] {
         &self.values
     }
 }
 impl<T> DerefMut for BudgetVec<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.values
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for BudgetVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.values.fmt(f)
+    }
+}
+impl<T: PartialEq> PartialEq for BudgetVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+impl<T: Eq> Eq for BudgetVec<T> {}
+impl<'a, T> IntoIterator for &'a BudgetVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a, T> IntoIterator for &'a mut BudgetVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
     }
 }
 
@@ -136,11 +180,13 @@ impl<T> Buffer<T> {
 }
 impl<T> Deref for Buffer<T> {
     type Target = [T];
+    #[inline]
     fn deref(&self) -> &[T] {
         &self.0
     }
 }
 impl<T> DerefMut for Buffer<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.0
     }
@@ -152,6 +198,27 @@ pub struct BudgetString {
     charge: Charge,
 }
 impl BudgetString {
+    pub fn copy(budget: &Budget, text: &str) -> Result<Self, BudgetError> {
+        let mut out = Self::with_capacity(budget, text.len())?;
+        out.try_push_str(text)?;
+        Ok(out)
+    }
+    pub fn try_clone(&self) -> Result<Self, BudgetError> {
+        Self::copy(self.budget(), self.as_str())
+    }
+    #[inline]
+    pub fn try_push(&mut self, value: char) -> Result<(), BudgetError> {
+        if self.values.capacity() - self.values.len() >= value.len_utf8() {
+            self.values.push(value);
+            Ok(())
+        } else {
+            self.try_push_str(value.encode_utf8(&mut [0; 4]))
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
     pub fn new(budget: &Budget) -> Result<Self, BudgetError> {
         Self::with_capacity(budget, 0)
     }
@@ -161,6 +228,7 @@ impl BudgetString {
         let values = String::from_utf8(values).map_err(|_| BudgetError::Overflow)?;
         Ok(Self { values, charge })
     }
+    #[inline]
     pub fn try_push_str(&mut self, value: &str) -> Result<(), BudgetError> {
         let needed = self
             .values
@@ -169,18 +237,19 @@ impl BudgetString {
             .ok_or(BudgetError::Overflow)?;
         if needed > self.values.capacity() {
             let preferred = growth_capacity::<u8>(self.budget(), self.values.capacity(), needed);
-            let mut next = match Self::with_capacity(self.budget(), preferred) {
+            let capacity = match self.budget().charge(preferred) {
                 Err(BudgetError::Limit | BudgetError::Overflow) if preferred != needed => {
-                    Self::with_capacity(self.budget(), needed)?
+                    self.budget().charge(needed)?
                 }
                 result => result?,
             };
-            next.values.push_str(&self.values);
-            *self = next;
+            raw::grow_string(&mut self.values, capacity.bytes())?;
+            self.charge = capacity;
         }
         self.values.push_str(value);
         Ok(())
     }
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.values
     }
@@ -189,6 +258,82 @@ impl BudgetString {
     }
     pub fn budget(&self) -> &Budget {
         self.charge.budget()
+    }
+}
+
+impl Deref for BudgetString {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl fmt::Debug for BudgetString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.values.fmt(f)
+    }
+}
+impl fmt::Display for BudgetString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.values.fmt(f)
+    }
+}
+impl PartialEq for BudgetString {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+impl PartialEq<str> for BudgetString {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<&str> for BudgetString {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl Eq for BudgetString {}
+
+/// Fallible immutable shared ownership. The control block and value stay
+/// charged until the final owner drops; nested allocations need owned storage.
+pub struct BudgetShared<T>(raw::Shared<SharedValue<T>>);
+struct SharedValue<T> {
+    value: T,
+    charge: Charge,
+}
+impl<T> BudgetShared<T> {
+    pub fn new(budget: &Budget, value: T) -> Result<Self, BudgetError> {
+        let charge = budget.charge(raw::Shared::<SharedValue<T>>::bytes())?;
+        Ok(Self(raw::Shared::new(SharedValue { value, charge })?))
+    }
+    pub fn try_clone(&self) -> Result<Self, BudgetError> {
+        Ok(Self(self.0.try_clone()?))
+    }
+    pub fn budget(&self) -> &Budget {
+        self.0.get().charge.budget()
+    }
+}
+impl<T> Deref for BudgetShared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0.get().value
+    }
+}
+impl<T: fmt::Debug> fmt::Debug for BudgetShared<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+impl<T: PartialEq> PartialEq for BudgetShared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
+impl<T: Eq> Eq for BudgetShared<T> {}
+impl PartialEq<&str> for BudgetShared<BudgetString> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
     }
 }
 
