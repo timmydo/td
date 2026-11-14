@@ -24,6 +24,7 @@ pub struct Producer {
     generation: u64,
     minimum: Severity,
     next: [AtomicU64; KINDS],
+    next_smtp_diagnostic: AtomicU64,
     dropped: AtomicU64,
     failures: AtomicU64,
     degraded: AtomicBool,
@@ -60,6 +61,7 @@ impl Producer {
                 generation,
                 minimum,
                 next: std::array::from_fn(|_| AtomicU64::new(0)),
+                next_smtp_diagnostic: AtomicU64::new(1),
                 dropped: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
                 degraded: AtomicBool::new(false),
@@ -96,16 +98,22 @@ impl Producer {
         submission: Option<SubmissionId>,
         transaction: Option<crate::format::Sequence>,
     ) {
-        if rank(kind.severity()) < rank(self.minimum) {
+        if !self.admit(kind) {
             return;
+        }
+        self.send(self.event(kind, submission, transaction));
+    }
+    fn admit(&self, kind: Kind) -> bool {
+        if rank(kind.severity()) < rank(self.minimum) {
+            return false;
         }
         let Some(now) = self.clock.sample().ok().map(|v| v.monotonic.0) else {
             add(&self.dropped, 1);
-            return;
+            return false;
         };
         let Some(bucket) = self.next.get(bucket(kind)) else {
             add(&self.dropped, 1);
-            return;
+            return false;
         };
         let prior = bucket.load(Ordering::Relaxed);
         if now < prior
@@ -119,14 +127,58 @@ impl Producer {
                 .is_err()
         {
             add(&self.dropped, 1);
+            return false;
+        }
+        true
+    }
+    fn send(&self, event: Event) {
+        if self.sender.try_send(event).is_err() {
+            add(&self.dropped, 1);
+        }
+    }
+    /// One sampled rejection and at most five envelope companions share one ID.
+    /// The group spends one rejection bucket; each queue loss is still counted.
+    pub(crate) fn smtp_rejection(
+        &self,
+        reply: crate::smtp_session::Rejection,
+        peer: std::net::IpAddr,
+        envelope: Option<&crate::smtp_session::Envelope>,
+    ) {
+        let kind = Kind::SmtpRejected { reply, peer };
+        if !self.admit(kind) {
             return;
         }
-        if self
-            .sender
-            .try_send(self.event(kind, submission, transaction))
-            .is_err()
-        {
+        let mut event = self.event(kind, None, None);
+        let Some(envelope) = envelope else {
+            self.send(event);
+            return;
+        };
+        let Ok(id) =
+            self.next_smtp_diagnostic
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+        else {
+            // Never reuse a correlation identifier or suppress the refusal itself.
             add(&self.dropped, 1);
+            self.send(event);
+            return;
+        };
+        event.context.request = std::num::NonZeroU64::new(id);
+        self.send(event);
+        for index in std::iter::once(None).chain(
+            (0..envelope
+                .recipients
+                .len()
+                .min(crate::smtp_session::EnvelopeAddress::RECIPIENT_LIMIT))
+                .map(Some),
+        ) {
+            if let Some(address) = crate::smtp_session::EnvelopeAddress::new(envelope, index) {
+                event.kind = Kind::SmtpEnvelopeAddress { peer, address };
+                self.send(event);
+            } else {
+                add(&self.dropped, 1);
+            }
         }
     }
     pub fn performance_status(
@@ -154,7 +206,7 @@ impl Producer {
 }
 fn bucket(kind: Kind) -> usize {
     match kind {
-        Kind::SmtpRejected { .. } => 27,
+        Kind::SmtpRejected { .. } | Kind::SmtpEnvelopeAddress { .. } => 27,
         Kind::SmtpDataInterrupted { .. } => 28,
         Kind::Performance { phase, .. } => 29 + phase as usize,
         Kind::DeliveryNoticeDeferred { .. } => 25,
@@ -358,8 +410,95 @@ fn rank(value: Severity) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+    fn diagnostic_envelope() -> crate::smtp_session::Envelope {
+        crate::smtp_session::Envelope {
+            ehlo: "unlogged.example".into(),
+            reverse_path: "".into(),
+            recipients: (0..8)
+                .map(|i| crate::smtp_session::Recipient {
+                    account: crate::ids::AccountId::from_bytes([1; 16]),
+                    address: format!("r{i}@example.test"),
+                })
+                .collect(),
+            eight_bit: false,
+            declared_bytes: None,
+        }
+    }
+    #[test]
+    fn data_envelope_group_is_correlated_bounded_and_sampled_together() {
+        let (producer, writer) =
+            Producer::new(Arc::new(RuntimeClock::new()), 7, Severity::Info).unwrap();
+        let envelope = diagnostic_envelope();
+        let reply =
+            crate::smtp_session::Rejection::from_reply(b"554 5.6.0 Invalid message framing\r\n")
+                .unwrap();
+        let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        for _ in 0..100 {
+            producer.smtp_rejection(reply, peer, Some(&envelope));
+        }
+        let events: Vec<_> = writer.receiver.try_iter().collect();
+        assert_eq!(events.len(), 6);
+        assert_eq!(producer.status().dropped, 99);
+        assert_eq!(events[0].kind, Kind::SmtpRejected { reply, peer });
+        assert!(events[0].context.request.is_some());
+        for (i, event) in events.iter().enumerate().skip(1) {
+            assert_eq!(event.context, events[0].context);
+            let Kind::SmtpEnvelopeAddress {
+                address,
+                peer: found,
+            } = event.kind
+            else {
+                panic!("missing envelope");
+            };
+            assert_eq!(found, peer);
+            assert_eq!(address.recipients(), 8);
+            assert_eq!(address.index(), i.checked_sub(2).map(|n| n as u16));
+            assert_eq!(
+                address.text(),
+                if i == 1 {
+                    String::new()
+                } else {
+                    format!("r{}@example.test", i - 2)
+                }
+            );
+        }
+        producer.next[27].store(0, Ordering::Relaxed);
+        producer.smtp_rejection(reply, peer, Some(&envelope));
+        let second: Vec<_> = writer.receiver.try_iter().collect();
+        assert_eq!(second.len(), 6);
+        assert_ne!(second[0].context.request, events[0].context.request);
+    }
+    #[test]
+    fn data_envelope_queue_loss_severity_and_id_exhaustion_remain_observable() {
+        let reply =
+            crate::smtp_session::Rejection::from_reply(b"554 5.6.0 Invalid message framing\r\n")
+                .unwrap();
+        let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let envelope = diagnostic_envelope();
+        let (producer, writer) =
+            Producer::new(Arc::new(RuntimeClock::new()), 1, Severity::Error).unwrap();
+        producer.smtp_rejection(reply, peer, Some(&envelope));
+        assert_eq!(writer.receiver.try_iter().count(), 0);
+        let (producer, writer) =
+            Producer::new(Arc::new(RuntimeClock::new()), 1, Severity::Info).unwrap();
+        for _ in 0..QUEUE - 2 {
+            producer.send(producer.event(Kind::BootStarted, None, None));
+        }
+        producer.smtp_rejection(reply, peer, Some(&envelope));
+        assert_eq!(writer.receiver.try_iter().count(), QUEUE);
+        assert_eq!(producer.status().dropped, 4);
+        producer.next[27].store(0, Ordering::Relaxed);
+        producer
+            .next_smtp_diagnostic
+            .store(u64::MAX, Ordering::Relaxed);
+        producer.smtp_rejection(reply, peer, Some(&envelope));
+        let remaining: Vec<_> = writer.receiver.try_iter().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].context.request, None);
+        assert_eq!(producer.status().dropped, 5);
+    }
     #[test]
     fn performance_history_has_one_initial_snapshot_then_an_hourly_budget() {
         let now = Instant::now();

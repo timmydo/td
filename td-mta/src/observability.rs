@@ -207,9 +207,13 @@ fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
         Error::Indeterminate => "indeterminate",
     }
 }
-/// Only SMTP refusal diagnostics admit a bounded, validated recipient spelling.
+/// SMTP refusal diagnostics admit bounded, validated envelope spellings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
+    SmtpEnvelopeAddress {
+        peer: std::net::IpAddr,
+        address: crate::smtp_session::EnvelopeAddress,
+    },
     SmtpDataInterrupted {
         peer: std::net::IpAddr,
         error: Option<crate::ports::Error>,
@@ -280,6 +284,7 @@ pub enum Kind {
 impl Kind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::SmtpEnvelopeAddress { .. } => "smtp_envelope_address",
             Self::SmtpDataInterrupted { .. } => "smtp_data_interrupted",
             Self::SmtpRejected { .. } => "smtp_rejected",
             Self::RelayPollDeferred => "relay_poll_deferred",
@@ -309,7 +314,8 @@ impl Kind {
     }
     pub const fn severity(self) -> Severity {
         match self {
-            Self::SmtpDataInterrupted { .. }
+            Self::SmtpEnvelopeAddress { .. }
+            | Self::SmtpDataInterrupted { .. }
             | Self::SmtpRejected { .. }
             | Self::DeliveryNoticeDeferred { .. }
             | Self::RelayConnectionFailed { .. }
@@ -343,9 +349,9 @@ impl Kind {
     }
     fn action(self) -> Option<&'static str> {
         match self {
-            Self::SmtpRejected { .. } | Self::SmtpDataInterrupted { .. } => {
-                Some("inspect_smtp_rejections")
-            }
+            Self::SmtpEnvelopeAddress { .. }
+            | Self::SmtpRejected { .. }
+            | Self::SmtpDataInterrupted { .. } => Some("inspect_smtp_rejections"),
             Self::DeliveryNoticeDeferred { .. }
             | Self::RelayConnectionFailed { .. }
             | Self::RelayStepFailed { .. } => Some("inspect_relay"),
@@ -405,6 +411,13 @@ impl fmt::Display for EventJson<'_> {
             e.kind.severity().code()
         )?;
         match e.kind {
+            Kind::SmtpEnvelopeAddress { peer, address } => {
+                write!(f, ",\"peer_ip\":\"{}\",\"recipient_count\":{},\"recipient_limit\":{},\"recipient_index\":", peer, address.recipients(), crate::smtp_session::EnvelopeAddress::RECIPIENT_LIMIT)?;
+                match address.index() {
+                    Some(index) => write!(f, "{index}")?,
+                    None => f.write_str("null")?,
+                }
+            }
             Kind::SmtpDataInterrupted { peer, error } => write!(f, ",\"peer_ip\":\"{}\",\"error\":\"{}\"", peer, error.map_or("none", |error| connect_error(Some(error))))?,
             Kind::SmtpRejected { reply, peer } => write!(f, ",\"smtp_status\":{},\"reason\":\"{}\",\"peer_ip\":\"{}\",\"reply_queued\":true", reply.status(), reply.reason(), peer)?,
             Kind::RelayPollDeferred => f.write_str(",\"reason\":\"storage_busy\"")?,
@@ -480,6 +493,16 @@ impl fmt::Display for EventJson<'_> {
                 quoted(f, address)?;
                 f.write_str("}")?;
             }
+        }
+        if let Kind::SmtpEnvelopeAddress { address, .. } = &e.kind {
+            write!(
+                f,
+                "{{\"source\":\"{}\",\"truncated\":{},\"text\":",
+                address.source(),
+                address.truncated()
+            )?;
+            quoted(f, address.text())?;
+            f.write_str("}")?;
         }
         f.write_str("]}\n")
     }
@@ -639,7 +662,18 @@ mod tests {
     }
     #[allow(clippy::unwrap_used)]
     fn kinds() -> Vec<Kind> {
+        let envelope = crate::smtp_session::Envelope {
+            ehlo: "".into(),
+            reverse_path: format!("\"{}\"@{}.test", "\\\"".repeat(30), "a".repeat(63)),
+            recipients: vec![],
+            eight_bit: false,
+            declared_bytes: None,
+        };
         let mut result = vec![
+            Kind::SmtpEnvelopeAddress {
+                peer: std::net::IpAddr::V6(std::net::Ipv6Addr::from([u16::MAX; 8])),
+                address: crate::smtp_session::EnvelopeAddress::new(&envelope, None).unwrap(),
+            },
             Kind::SmtpRejected {
                 reply: crate::smtp_session::Rejection::from_reply(
                     b"550 5.1.1 Unknown local recipient\r\n",
@@ -938,6 +972,11 @@ mod tests {
     // Independent v1 contract oracle; a new variant requires an explicit policy.
     fn policy(kind: Kind) -> (&'static str, &'static str, &'static str) {
         match kind {
+            Kind::SmtpEnvelopeAddress { .. } => (
+                "smtp_envelope_address",
+                "warning",
+                "[\"inspect_smtp_rejections\"]",
+            ),
             Kind::SmtpRejected { .. } => {
                 ("smtp_rejected", "warning", "[\"inspect_smtp_rejections\"]")
             }
@@ -1015,6 +1054,9 @@ mod tests {
                 "\"facts\":{{\"code\":\"{code}\",\"severity\":\"{severity}\""
             )));
             let untrusted = match kind {
+                Kind::SmtpEnvelopeAddress { .. } => {
+                    "[{\"source\":\"smtp_mail_from\",\"truncated\":true,\"text\":"
+                }
                 Kind::SmtpRejected { reply, .. } if reply.recipient().is_some() => {
                     "[{\"source\":\"smtp_recipient\",\"truncated\":true,\"text\":"
                 }

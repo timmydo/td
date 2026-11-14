@@ -602,16 +602,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 let turn = (|| {
                                     let peer = slot.peer;
                                     let connection = slot.connection()?;
-                                    if let Some(reply) = connection.network_mut()?.take_rejection()
-                                    {
-                                        control.log(
-                                            crate::observability::Kind::SmtpRejected {
+                                    let network = connection.network_mut()?;
+                                    if let Some(reply) = network.take_rejection() {
+                                        if let Some(logger) = control.logging() {
+                                            logger.smtp_rejection(
                                                 reply,
                                                 peer,
-                                            },
-                                            None,
-                                            None,
-                                        );
+                                                network.session().rejected_envelope(),
+                                            );
+                                        }
                                     }
                                     if stopping.is_some() {
                                         let _ = connection

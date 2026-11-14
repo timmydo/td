@@ -52,12 +52,14 @@ that operation, including an old retained snapshot during reload.
 free-form strings, credential/AUTH/Authorization contents, subject or message
 body fields. SMTP refusal diagnostics admit a typed numeric peer address and,
 for eligible RCPT rejections, a bounded validated recipient spelling as
-untrusted text. Other events have empty `untrusted`. Redaction is enforced by
+untrusted text. DATA rejection companions carry bounded validated envelope
+addresses. Other events have empty `untrusted`. Redaction is enforced by
 the input shape, not a substring filter. The `facts` object begins with `code`
 and `severity`.
 
 | Code | Additional facts | Severity | Recommended action |
 | --- | --- | --- | --- |
+| `smtp_envelope_address` | `peer_ip`, `recipient_count`, `recipient_limit`, zero-based `recipient_index` (null for sender) | warning | inspect_smtp_rejections |
 | `performance` | fixed `phase`, unsigned `calls`, `failures`, `busy`, `unavailable`, `total_us`, `max_us`, `lost` | info | none |
 | `boot_started` | none | info | none |
 | `config_activated` | none | info | none |
@@ -355,8 +357,8 @@ transaction sequence), JMAP authentication/capacity refusals, and relay
 connection/attempt failures (with submission ID and fixed stage/error codes),
 and deferred local delivery notices (fixed error class, without a submission
 ID when the notice producer has not returned one).
-Connection/request correlation is not yet emitted by these producers; the
-broader protocol/TLS/outcome event vocabulary above remains available to future
+DATA rejection groups use `request_id` as described below; other producers
+do not yet emit connection/request correlation. The broader protocol/TLS/outcome event vocabulary above remains available to future
 instrumentation. No arbitrary peer SMTP text, credentials, subjects or message
 bodies enter these default records. SMTP refusal diagnostics additionally
 record the numeric socket peer IP and eligible refused recipient below, for
@@ -377,10 +379,44 @@ Its recipient spelling (without brackets or obsolete source routes) appears
 in `untrusted` as `{"source":"smtp_recipient","truncated":false,"text":"..."}`.
 Only the first 96 ASCII bytes are retained; a longer address sets `truncated`
 to true. JSON escaping preserves one-line records. Invalid paths, parameters,
-other commands and DATA refusals emit no recipient text. This bounded copy
+other commands and DATA refusals emit no recipient text in that event. This bounded copy
 fits the existing 256-byte event cell, 96 KiB queue and 1,024-byte encoded
 event ceilings, including maximal context and escaped quoted local parts.
 It adds no allocation, per-address bucket or complete delivery ledger.
+
+For a close reply queued during DATA parsing, body writing or final header
+validation, the session moves its current envelope into diagnostic custody
+before clearing delivery authority. It retains no additional body bytes and
+releases that envelope after reply acknowledgement, abort or session drop.
+The sampled `smtp_rejected` event and up to five `smtp_envelope_address`
+companions share the same `boot_id`, nonzero `request_id`, timestamp and peer.
+This request ID identifies a diagnostic group, not an authenticated session,
+durable mail record or delivery receipt; it never wraps within a producer.
+
+One companion records MAIL FROM and up to four record the first accepted RCPT
+TO addresses in envelope order. Each address is revalidated and limited to
+96 ASCII bytes with `truncated` reporting any omission, escaped under
+`untrusted` with source `smtp_mail_from` or `smtp_rcpt_to`. An empty sender
+text means the actual null reverse path (`MAIL FROM:<>`), not an unknown sender.
+The facts include the total accepted `recipient_count`, `recipient_limit:4`,
+and zero-based `recipient_index` (null for sender). A count above four means
+additional recipients were deliberately omitted. These are claimed envelope
+addresses, not the message's From/To headers or verified sender identities.
+Rejected RCPT addresses are not accepted recipients. No subject, message
+header, DATA excerpt, AUTH content or credential is collected.
+
+The entire group spends one existing rejection-rate bucket, so malformed DATA
+can add at most five companion records per minute per producer, independent
+of recipient count. Each event stays within the existing cell and encoded
+size ceilings. Queue and database limits still apply per record: companions
+may be missing or separated by other events or inspection pages. Correlate
+by boot and request ID, never adjacency. Loss counters cover queue failure,
+invalid diagnostic addresses and exhausted IDs; a refusal still logs without
+companions if its ID cannot be issued. The group is not atomic or a complete
+delivery ledger. Transport-only interruptions without a queued DATA refusal,
+pre-DATA admission failures and indeterminate publication retain their existing
+metadata-only diagnostics. The daily digest continues to count refusals; these
+private address companions are available through `postgres logs`.
 `smtp_data_interrupted` records network-reported closure/error during admitted
 DATA with a numeric
 peer and fixed error class; `error:none` means the transport owner closed
@@ -388,7 +424,7 @@ without returning an error, not successful delivery. A refused DATA exchange
 can emit both records. No final SMTP status is invented for an interruption or
 uncertain COMMIT. Transport closure before DATA admission, forced shutdown retirement and
 worker failures that bypass network progress are outside this event.
-Both event kinds use separate fixed one-per-minute producer buckets and the
+Refusal groups and interruption events use separate fixed one-per-minute producer buckets and the
 existing bounded queue/database retention. Suppression counts remain visible;
 these sampled events are not a complete per-message delivery ledger.
 

@@ -774,3 +774,94 @@ fn data_refusals_have_content_free_diagnostics() {
         );
     });
 }
+
+#[cfg(test)]
+mod data_envelope_diagnostics {
+    use super::*;
+    #[test]
+    fn malformed_data_retains_only_its_current_envelope_for_diagnostics() {
+        fixture(|routes| {
+            for malformed in [b"private\n".as_slice(), b"private\rX", b"private\0"] {
+                for sender in ["", "sender@remote.test"] {
+                    let mut s = session(routes);
+                    command(&mut s, "EHLO remote.test\r\n", "250-");
+                    command(&mut s, "MAIL FROM:<old@remote.test>\r\n", "250 ");
+                    command(&mut s, "RCPT TO:<alias@example.test>\r\n", "250 ");
+                    command(&mut s, "RSET\r\n", "250 ");
+                    command(&mut s, &format!("MAIL FROM:<{sender}>\r\n"), "250 ");
+                    command(&mut s, "RCPT TO:<Alice@example.test>\r\n", "250 ");
+                    command(&mut s, "RCPT TO:<\"a>b\"@example.test>\r\n", "250 ");
+                    assert!(s.rejected_envelope().is_none());
+                    s.feed(b"DATA\r\n").unwrap();
+                    s.data_ready(Ok(())).unwrap();
+                    s.reply_sent().unwrap();
+                    for byte in malformed {
+                        s.feed(std::slice::from_ref(byte)).unwrap();
+                    }
+                    assert_eq!(s.rejection().unwrap().reason(), "invalid_data_framing");
+                    assert!(s.envelope().is_none());
+                    let diagnostic = s.rejected_envelope().unwrap();
+                    assert_eq!(diagnostic.reverse_path, sender);
+                    assert_eq!(diagnostic.recipients.len(), 2);
+                    assert_eq!(diagnostic.recipients[0].address, "Alice@example.test");
+                    assert_eq!(diagnostic.recipients[1].address, "\"a>b\"@example.test");
+                    assert_eq!(
+                        EnvelopeAddress::new(diagnostic, None).unwrap().text(),
+                        sender
+                    );
+                    assert_eq!(
+                        s.feed(b"RCPT TO:<leak@example.test>\r\n"),
+                        Err(Error::Conflict)
+                    );
+                    s.abort();
+                    assert!(s.rejected_envelope().is_none());
+                }
+            }
+            let mut s = session(routes);
+            begin(&mut s, "BODY=8BITMIME");
+            s.feed(b"private body\r\n").unwrap();
+            s.message_too_large().unwrap();
+            assert_eq!(s.rejection().unwrap().reason(), "headers_too_large");
+            assert!(s.rejected_envelope().is_some());
+            assert!(s.envelope().is_none());
+        });
+    }
+
+    #[test]
+    fn envelope_address_diagnostics_validate_and_bound_public_fields() {
+        let mut envelope = Envelope {
+            ehlo: "not logged".into(),
+            reverse_path: "".into(),
+            recipients: vec![],
+            eight_bit: false,
+            declared_bytes: None,
+        };
+        let null = EnvelopeAddress::new(&envelope, None).unwrap();
+        assert_eq!(null.text(), "");
+        assert!(!null.truncated());
+        envelope.reverse_path = format!("{}@{}.test", "a".repeat(64), "b".repeat(63));
+        let long = EnvelopeAddress::new(&envelope, None).unwrap();
+        assert_eq!(long.text(), &envelope.reverse_path[..96]);
+        assert!(long.truncated());
+        assert!(!format!("{long:?}").contains(&"a".repeat(64)));
+        for invalid in [
+            "bad\naddress@example.test",
+            "bad address@example.test",
+            "x@example.test> AUTH secret",
+            "é@example.test",
+        ] {
+            envelope.reverse_path = invalid.into();
+            assert!(EnvelopeAddress::new(&envelope, None).is_none());
+        }
+        for _ in 0..5 {
+            envelope.recipients.push(Recipient {
+                account: ACCOUNT,
+                address: "alias@example.test".into(),
+            });
+        }
+        let last = EnvelopeAddress::new(&envelope, Some(3)).unwrap();
+        assert_eq!(last.recipients(), 5);
+        assert_eq!(last.index(), Some(3));
+        assert!(EnvelopeAddress::new(&envelope, Some(4)).is_none());
+    }
+}

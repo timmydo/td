@@ -129,6 +129,85 @@ impl Rejection {
     }
 }
 
+/// One bounded address from an admitted DATA envelope, never a message header.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct EnvelopeAddress {
+    bytes: [u8; 96],
+    len: u8,
+    truncated: bool,
+    index: Option<u16>,
+    recipients: u16,
+}
+impl std::fmt::Debug for EnvelopeAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvelopeAddress")
+            .field("index", &self.index)
+            .field("recipients", &self.recipients)
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+impl EnvelopeAddress {
+    pub(crate) const RECIPIENT_LIMIT: usize = 4;
+
+    pub(crate) fn new(envelope: &Envelope, index: Option<usize>) -> Option<Self> {
+        let address = match index {
+            None => envelope.reverse_path.as_str(),
+            Some(index) if index < Self::RECIPIENT_LIMIT => {
+                envelope.recipients.get(index)?.address.as_str()
+            }
+            Some(_) => return None,
+        };
+        // Revalidate public Envelope fields before admitting text to the log.
+        let mut wire = [0; MAX_ADDRESS + 2];
+        let end = address.len().checked_add(1)?;
+        *wire.first_mut()? = b'<';
+        wire.get_mut(1..end)?.copy_from_slice(address.as_bytes());
+        *wire.get_mut(end)? = b'>';
+        let wire = std::str::from_utf8(wire.get(..end + 1)?).ok()?;
+        let (validated, "") = path(wire, "", index.is_none())? else {
+            return None;
+        };
+        let len = validated.len().min(96);
+        let mut bytes = [0; 96];
+        bytes
+            .get_mut(..len)?
+            .copy_from_slice(validated.as_bytes().get(..len)?);
+        Some(Self {
+            bytes,
+            len: u8::try_from(len).ok()?,
+            truncated: len < validated.len(),
+            index: match index {
+                Some(index) => Some(u16::try_from(index).ok()?),
+                None => None,
+            },
+            recipients: u16::try_from(envelope.recipients.len()).ok()?,
+        })
+    }
+    pub(crate) fn text(&self) -> &str {
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("")
+    }
+    pub(crate) fn truncated(self) -> bool {
+        self.truncated
+    }
+    pub(crate) fn index(self) -> Option<u16> {
+        self.index
+    }
+    pub(crate) fn recipients(self) -> u16 {
+        self.recipients
+    }
+    pub(crate) fn source(self) -> &'static str {
+        if self.index.is_none() {
+            "smtp_mail_from"
+        } else {
+            "smtp_rcpt_to"
+        }
+    }
+}
+
 pub struct Recipient {
     pub account: AccountId,
     pub address: String,
@@ -213,6 +292,7 @@ pub struct Session<'a> {
     extended: bool,
     tls: bool,
     envelope: Option<Envelope>,
+    rejected_envelope: Option<Envelope>,
     recipient_bytes: usize,
     transactions: u64,
 }
@@ -244,6 +324,7 @@ impl<'a> Session<'a> {
             extended: false,
             tls: false,
             envelope: None,
+            rejected_envelope: None,
             recipient_bytes: 0,
             transactions: 0,
         })
@@ -272,6 +353,10 @@ impl<'a> Session<'a> {
             Some(command) => rejection.with_command(command),
             None => rejection,
         })
+    }
+    /// Diagnostic custody only; ordinary delivery authority is already cleared.
+    pub(crate) fn rejected_envelope(&self) -> Option<&Envelope> {
+        self.rejected_envelope.as_ref()
     }
     /// Native root-header admission can discover a permanent size refusal
     /// while writing the final line or finishing an EOF-terminated header block.
@@ -382,6 +467,7 @@ impl<'a> Session<'a> {
             return Err(Error::Conflict);
         };
         self.reply.clear();
+        self.rejected_envelope = None;
         self.clear_line();
         self.state = match next {
             Next::Command => State::Command,
@@ -485,6 +571,7 @@ impl<'a> Session<'a> {
     /// Disconnect, timeout, failed upgrade or driver failure. The driver must
     /// separately retire its uncommitted spool/reservation; no retry is implied.
     pub fn abort(&mut self) {
+        self.rejected_envelope = None;
         self.reset();
         self.clear_line();
         self.reply.clear();
@@ -502,6 +589,10 @@ impl<'a> Session<'a> {
         self.data_bytes = 0;
     }
     fn respond(&mut self, reply: &str, next: Next) {
+        if next == Next::Closed && matches!(self.state, State::Data | State::Write | State::Commit)
+        {
+            self.rejected_envelope = self.envelope.take();
+        }
         self.reply.clear();
         self.reply.push_str(reply);
         self.state = State::Reply(next);

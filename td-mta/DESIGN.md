@@ -2452,8 +2452,13 @@ peer strings. Structured fields have documented meaning and stable enum values.
 Default logs omit credentials, Authorization/AUTH contents, message bodies
 and subjects. RCPT rejections for unknown recipients, unavailable routing or
 recipient limits include up to 96 bytes of the validated recipient spelling,
-explicitly labeled as untrusted with truncation reported. Other recipient
-details remain available through authorized inspection.
+explicitly labeled as untrusted with truncation reported. A queued DATA close
+refusal may also retain its existing envelope until reply acknowledgement,
+abort or session drop, solely for diagnostics after delivery authority is
+cleared. Correlated companion records carry the claimed MAIL FROM and first
+four accepted RCPT TO addresses, each bounded to 96 bytes, with total recipient
+count and explicit truncation. OBSERVABILITY.md owns correlation, sampling,
+loss and privacy limits. No message header or body is logged.
 
 Service writers retain up to 30 days in PostgreSQL, bounded by a 65,536-row
 ring, 1,024-byte events, a shared ingestion rate and a 96 MiB relation-size

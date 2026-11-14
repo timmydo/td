@@ -676,3 +676,41 @@ mod recipient_diagnostics {
         });
     }
 }
+
+#[cfg(test)]
+mod data_envelope_diagnostics {
+    use super::*;
+    #[test]
+    fn malformed_data_envelope_survives_until_refusal_observation() {
+        fixture(|routes, plan, timer| {
+            let mut n = network(routes, plan, timer);
+            let mut w = Wire::default();
+            begin(&mut n, &mut w, timer);
+            n.data_ready(Ok(()), timer).unwrap();
+            turns(&mut n, &mut w, timer, 4);
+            w.input
+                .extend(b"private body\nRCPT TO:<not-the-envelope@example.test>\r\n");
+            for _ in 0..50 {
+                let progress = n.advance(&mut w, timer).unwrap();
+                if let Some(reply) = n.take_rejection() {
+                    assert_eq!(reply.reason(), "invalid_data_framing");
+                    assert!(n.session().envelope().is_none());
+                    let envelope = n.session().rejected_envelope().unwrap();
+                    assert_eq!(envelope.reverse_path, "");
+                    assert_eq!(envelope.recipients.len(), 1);
+                    assert_eq!(envelope.recipients[0].address, "a@example.test");
+                    assert!(n.take_rejection().is_none());
+                    w.write_max = Some(0);
+                    assert_eq!(n.advance(&mut w, timer), Ok(Progress::Pending));
+                    assert!(n.session().rejected_envelope().is_some());
+                    w.write_max = None;
+                    turns(&mut n, &mut w, timer, 8);
+                    assert!(n.session().rejected_envelope().is_none());
+                    return;
+                }
+                assert_ne!(progress, Progress::Closed);
+            }
+            panic!("missing malformed DATA refusal");
+        });
+    }
+}
