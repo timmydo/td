@@ -152,7 +152,7 @@ fn writer(owner: u32, request: &Request) -> Result<Command, String> {
         }
     };
     if let Verb::Grant(_, path) = &request.verb {
-        workload_grants::validate_path(path)?;
+        workload_grants::validate_directory(request.kind, &request.name, path)?;
     }
     let path = match path {
         Some(path) => Some(std::str::from_utf8(path).map_err(|_| "the path is not UTF-8")?),

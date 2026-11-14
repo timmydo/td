@@ -298,6 +298,7 @@ impl ResolvedResourceLimits {
 
 #[derive(Debug)]
 pub(crate) struct StatePlan {
+    view_policy: crate::workload_grants::ViewPolicy,
     pub(crate) real_home: PathBuf,
     pub(crate) state_root: PathBuf,
     pub(crate) home: PathBuf,
@@ -433,11 +434,10 @@ where
     require_application_account(name)?;
     let identity = effective_identity()?;
     let mut config = target_config()?;
-    config.real_home = Some(if identity.0 == APPLICATION_UID {
-        crate::primary_account::load()?.home()
-    } else {
-        PathBuf::from(format!("/var/lib/td/applications/{}", identity.0))
-    });
+    config.real_home = Some(PathBuf::from(format!(
+        "/var/lib/td/applications/{}",
+        identity.0
+    )));
     resolve_with_config(
         name,
         arguments,
@@ -1995,6 +1995,7 @@ struct AdmittedView {
 /// reservation, and only one the manifest names. Another home, or an
 /// account with no manifest, has none.
 fn granted_views(
+    policy: crate::workload_grants::ViewPolicy,
     mountinfo: &str,
     home: &Path,
     reserved: &BTreeSet<MountIdentity>,
@@ -2010,7 +2011,7 @@ fn granted_views(
     manifest_views(
         mountinfo,
         uid,
-        ViewPlacement::Application,
+        ViewPlacement::Application(policy),
         require_grant_target,
         reserved,
         &|_| true,
@@ -2060,14 +2061,14 @@ pub(crate) fn workspace_views(
 /// manifest may list td-agent's own trees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewPlacement {
-    Application,
+    Application(crate::workload_grants::ViewPolicy),
     Workspace(crate::workload_accounts::Kind),
 }
 
 impl ViewPlacement {
     fn target(self, account: &crate::primary_account::PrimaryAccount, path: &str) -> PathBuf {
         match self {
-            Self::Application => Path::new("/home/td").join(path),
+            Self::Application(_) => Path::new("/home/td").join(path),
             Self::Workspace(_) => account.persistent_home().join(path),
         }
     }
@@ -2079,10 +2080,10 @@ impl ViewPlacement {
     }
 
     /// The kind whose manifest it reads.
-    fn kind(self) -> crate::workload_accounts::Kind {
+    fn policy(self) -> crate::workload_grants::ViewPolicy {
         match self {
-            Self::Application => crate::workload_accounts::Kind::Application,
-            Self::Workspace(kind) => kind,
+            Self::Application(policy) => policy,
+            Self::Workspace(kind) => crate::workload_grants::ViewPolicy::for_kind(kind),
         }
     }
 }
@@ -2098,7 +2099,7 @@ fn manifest_views(
     reserved: &BTreeSet<MountIdentity>,
     wanted: &dyn Fn(&Path) -> bool,
 ) -> io::Result<Vec<AdmittedView>> {
-    let Some(manifest) = read_view_manifest(uid, placement.kind())? else {
+    let Some(manifest) = read_view_manifest(uid, placement.policy())? else {
         return Ok(Vec::new());
     };
     let account = crate::primary_account::load()?;
@@ -2217,7 +2218,7 @@ fn admit_view(
         view,
         account,
         Path::new(&entry.path),
-        (placement.kind(), entry.access),
+        (placement.policy(), entry.access),
     )?;
     let identities = mount_tree_identities(mountinfo, view)?;
     require_projection_mounts(&identities, &identity, reserved)?;
@@ -2232,14 +2233,14 @@ fn admit_view(
 /// absent: nothing was published for the account.
 fn read_view_manifest(
     uid: u32,
-    kind: crate::workload_accounts::Kind,
+    policy: crate::workload_grants::ViewPolicy,
 ) -> io::Result<Option<crate::workload_grants::Manifest>> {
     read_view_manifest_at(
         Path::new("/var/lib/td"),
         uid,
         ((0, 0), uid),
         crate::workload_grants::VIEWS_MODE,
-        kind,
+        policy,
     )
 }
 
@@ -2258,7 +2259,7 @@ fn read_view_manifest_at(
     uid: u32,
     owners: ((u32, u32), u32),
     views_mode: u32,
-    kind: crate::workload_accounts::Kind,
+    policy: crate::workload_grants::ViewPolicy,
 ) -> io::Result<Option<crate::workload_grants::Manifest>> {
     let ((owner, group), account_group) = owners;
     use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
@@ -2308,7 +2309,7 @@ fn read_view_manifest_at(
     let mut text = String::new();
     file.take(grants::MAX_MANIFEST_BYTES as u64 + 1)
         .read_to_string(&mut text)?;
-    grants::Manifest::parse_for(kind, &text)
+    grants::Manifest::parse_scoped(policy, &text)
         .map(Some)
         .map_err(invalid)
 }
@@ -2338,7 +2339,7 @@ fn projection_identity(
     account: &crate::primary_account::PrimaryAccount,
     relative: &Path,
     policy: (
-        crate::workload_accounts::Kind,
+        crate::workload_grants::ViewPolicy,
         crate::workload_grants::Access,
     ),
 ) -> io::Result<MountIdentity> {
@@ -2372,11 +2373,13 @@ fn human_source_identity(
     home: &Path,
     relative: &Path,
     policy: (
-        crate::workload_accounts::Kind,
+        crate::workload_grants::ViewPolicy,
         crate::workload_grants::Access,
     ),
 ) -> io::Result<MountIdentity> {
-    crate::workload_grants::validate_view(policy.0, policy.1, relative.as_os_str().as_bytes())
+    policy
+        .0
+        .validate(policy.1, relative.as_os_str().as_bytes())
         .map_err(invalid)?;
     crate::mount_identity::human_source_identity(mountinfo, home, relative)
 }
@@ -2464,7 +2467,12 @@ impl GrantBoundary {
         let other_home_mounts =
             mount_identities_outside_allowed_home(mountinfo, &home_roots, &state.real_home)?;
         Ok(Self {
-            views: granted_views(mountinfo, &state.real_home, &reserved_mounts)?,
+            views: granted_views(
+                state.view_policy,
+                mountinfo,
+                &state.real_home,
+                &reserved_mounts,
+            )?,
             reserved,
             home_roots,
             allowed_home: state.real_home.clone(),
@@ -3714,6 +3722,10 @@ fn prepare_state(
         ensure_state_component(runtime_root, RUNTIME_ROOT_NAME, identity, true)?;
     let runtime = ensure_state_component(&runtime_applications, name, identity, true)?;
     Ok(StatePlan {
+        view_policy: crate::workload_grants::ViewPolicy::for_account(
+            crate::workload_accounts::Kind::Application,
+            name,
+        ),
         real_home: home,
         state_root: applications,
         home: private_home,
@@ -4110,8 +4122,13 @@ mod tests {
     use super::*;
     use crate::permissions::PermissionSocket;
     use crate::workload_accounts::Kind;
-    const APPLICATION_VIEW: (Kind, crate::workload_grants::Access) =
-        (Kind::Application, crate::workload_grants::Access::ReadWrite);
+    const APPLICATION_VIEW: (
+        crate::workload_grants::ViewPolicy,
+        crate::workload_grants::Access,
+    ) = (
+        crate::workload_grants::ViewPolicy::for_kind(Kind::Application),
+        crate::workload_grants::Access::ReadWrite,
+    );
     use std::ops::Deref;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4349,7 +4366,13 @@ mod tests {
         let owner = ((shown.uid(), shown.gid()), shown.gid());
         let read = |mode: u32| {
             fs::set_permissions(&account, fs::Permissions::from_mode(mode)).unwrap();
-            let result = read_view_manifest_at(&state, 65536, owner, mode, Kind::Application);
+            let result = read_view_manifest_at(
+                &state,
+                65536,
+                owner,
+                mode,
+                crate::workload_grants::ViewPolicy::for_kind(Kind::Application),
+            );
             fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
             result
         };
@@ -4369,20 +4392,31 @@ mod tests {
         // A mode other than the one required, another owner, and no
         // manifest or no account directory.
         fs::set_permissions(&account, fs::Permissions::from_mode(0o710)).unwrap();
-        assert!(read_view_manifest_at(&state, 65536, owner, 0o750, Kind::Application).is_err());
+        assert!(read_view_manifest_at(
+            &state,
+            65536,
+            owner,
+            0o750,
+            crate::workload_grants::ViewPolicy::for_kind(Kind::Application)
+        )
+        .is_err());
         assert!(read_view_manifest_at(
             &state,
             65536,
             (owner.0, owner.1.wrapping_add(1)),
             0o710,
-            Kind::Application
+            crate::workload_grants::ViewPolicy::for_kind(Kind::Application)
         )
         .is_err());
-        assert!(
-            read_view_manifest_at(&state, 65537, owner, 0o710, Kind::Application)
-                .unwrap()
-                .is_none()
-        );
+        assert!(read_view_manifest_at(
+            &state,
+            65537,
+            owner,
+            0o710,
+            crate::workload_grants::ViewPolicy::for_kind(Kind::Application)
+        )
+        .unwrap()
+        .is_none());
         // td-agent's own trees: a workspace's manifest lists them, no other
         // kind's does.
         fs::write(
@@ -4391,11 +4425,24 @@ mod tests {
         )
         .unwrap();
         for kind in [Kind::Application, Kind::Sandbox] {
-            assert!(read_view_manifest_at(&state, 65536, owner, 0o710, kind).is_err());
+            assert!(read_view_manifest_at(
+                &state,
+                65536,
+                owner,
+                0o710,
+                crate::workload_grants::ViewPolicy::for_kind(kind)
+            )
+            .is_err());
         }
-        let listed = read_view_manifest_at(&state, 65536, owner, 0o710, Kind::Workspace)
-            .unwrap()
-            .unwrap();
+        let listed = read_view_manifest_at(
+            &state,
+            65536,
+            owner,
+            0o710,
+            crate::workload_grants::ViewPolicy::for_kind(Kind::Workspace),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(listed.views().len(), 1);
         fs::remove_file(&manifest).unwrap();
         assert!(read(0o100).unwrap().is_none());
@@ -4488,7 +4535,7 @@ mod tests {
                 &downloads,
                 &account,
                 &none,
-                ViewPlacement::Application
+                ViewPlacement::Application(APPLICATION_VIEW.0)
             )
             .unwrap(),
             BTreeSet::from([shown.clone()])
@@ -4499,7 +4546,7 @@ mod tests {
             &documents,
             &account,
             &none,
-            ViewPlacement::Application,
+            ViewPlacement::Application(APPLICATION_VIEW.0),
         )
         .unwrap();
         // The access must be the entry's, both ways.
@@ -4509,7 +4556,7 @@ mod tests {
             &documents,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         assert!(admit_view(
@@ -4518,7 +4565,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         for missing in ["nosuid", "nodev", "noexec", "idmapped"] {
@@ -4534,7 +4581,7 @@ mod tests {
                     &downloads,
                     &account,
                     &none,
-                    ViewPlacement::Application
+                    ViewPlacement::Application(APPLICATION_VIEW.0)
                 )
                 .is_err(),
                 "{missing}"
@@ -4547,7 +4594,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         let stacked = format!(
@@ -4560,7 +4607,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         assert!(admit_view(
@@ -4569,7 +4616,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         assert!(admit_view(
@@ -4578,7 +4625,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         // A mount below the view that is not the human's directory, and a
@@ -4593,7 +4640,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         assert!(admit_view(
@@ -4602,7 +4649,7 @@ mod tests {
             &downloads,
             &account,
             &BTreeSet::from([shown]),
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         // A sandbox's or workspace's view is executable: admitted without
@@ -4618,7 +4665,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
         assert!(admit_view(
@@ -4658,12 +4705,12 @@ mod tests {
                 "{missing}"
             );
         }
-        assert!(!ViewPlacement::Application.executable());
+        assert!(!ViewPlacement::Application(APPLICATION_VIEW.0).executable());
         assert!(ViewPlacement::Workspace(crate::workload_accounts::Kind::Sandbox).executable());
         // An application's view lies below its private home, a workspace's
         // at the human's own path.
         assert_eq!(
-            ViewPlacement::Application.target(&account, "src/x"),
+            ViewPlacement::Application(APPLICATION_VIEW.0).target(&account, "src/x"),
             Path::new("/home/td/src/x")
         );
         assert_eq!(
@@ -4711,9 +4758,58 @@ mod tests {
             &entry(Access::ReadWrite, ".cache/x"),
             &account,
             &none,
-            ViewPlacement::Application
+            ViewPlacement::Application(APPLICATION_VIEW.0)
         )
         .is_err());
+    }
+
+    #[test]
+    fn configuration_views_require_the_named_application_and_the_human_source() {
+        use crate::workload_grants::{Access, View, ViewPolicy};
+        let account =
+            crate::primary_account::parse("alice:x:1000:1000:human:/home/alice:/bin/sh\n").unwrap();
+        let view = Path::new("/var/lib/td/grant-views/65537/0");
+        for (name, path) in [("mail", ".config/td-mail"), ("news", ".config/td-news")] {
+            let entry = View {
+                index: 0,
+                access: Access::ReadWrite,
+                path: path.into(),
+            };
+            let mounts = format!("22 2 7:0 / / ro,relatime - erofs /dev/loop0 ro\n25 22 0:19 /@var /var rw,nosuid,nodev,relatime - btrfs none rw\n35 25 0:19 /@var/home/alice/{path} {} rw,nosuid,nodev,noexec,idmapped - btrfs none rw\n", view.display());
+            let placement =
+                ViewPlacement::Application(ViewPolicy::for_account(Kind::Application, name));
+            require_grant_target(&placement.target(&account, path)).unwrap();
+            admit_view(&mounts, view, &entry, &account, &BTreeSet::new(), placement).unwrap();
+            for other in ["firefox", if name == "mail" { "news" } else { "mail" }] {
+                assert!(admit_view(
+                    &mounts,
+                    view,
+                    &entry,
+                    &account,
+                    &BTreeSet::new(),
+                    ViewPlacement::Application(ViewPolicy::for_account(Kind::Application, other))
+                )
+                .is_err());
+            }
+            assert!(admit_view(
+                &mounts.replace("/home/alice/", "/home/other/"),
+                view,
+                &entry,
+                &account,
+                &BTreeSet::new(),
+                placement
+            )
+            .is_err());
+            assert!(admit_view(
+                &mounts.replace(",noexec", ""),
+                view,
+                &entry,
+                &account,
+                &BTreeSet::new(),
+                placement
+            )
+            .is_err());
+        }
     }
 
     /// Identity validation must use the same kind/access policy as the
@@ -4737,7 +4833,7 @@ mod tests {
                 view.display(), access.as_str(),
             );
             let placement = if kind == Kind::Application {
-                ViewPlacement::Application
+                ViewPlacement::Application(APPLICATION_VIEW.0)
             } else {
                 ViewPlacement::Workspace(kind)
             };
@@ -5096,20 +5192,23 @@ mod tests {
     }
 
     #[test]
-    fn personal_names_share_only_the_assigned_human_identity_and_runtime() {
+    fn mail_and_news_have_distinct_account_runtimes_and_refuse_the_human() {
         let policy = crate::app_policy::Policy::from_tables(
-            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tpersonal\t\nnews\tpersonal\t\n",
+            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tservice\t\nnews\tservice\t\n",
             LEDGER,
         )
         .unwrap();
-        for name in ["mail", "news"] {
-            application_account(1000, name, &policy).unwrap();
+        for (name, assigned) in [("mail", 65537), ("news", 65538)] {
+            application_account(assigned, name, &policy).unwrap();
             assert_eq!(
-                application_session(1000, name, &policy).unwrap().2,
-                Path::new("/run/user/1000")
+                application_session(assigned, name, &policy).unwrap().2,
+                PathBuf::from(format!("/run/user/{assigned}"))
             );
-            for uid in [0, 991, 1001, 65536, 65537, 65538] {
-                assert!(application_account(uid, name, &policy).is_err());
+            for uid in [0, 991, 1000, 1001, 65536, 65537, 65538] {
+                if uid != assigned {
+                    assert!(application_account(uid, name, &policy).is_err());
+                    assert!(application_session(uid, name, &policy).is_err());
+                }
             }
         }
         assert!(application_account(1000, "firefox", &policy).is_err());
@@ -6046,6 +6145,9 @@ mod tests {
         let state_root = fs::canonicalize(root.join("home/state-root")).unwrap();
         let state = StatePlan {
             real_home: real_home.clone(),
+            view_policy: crate::workload_grants::ViewPolicy::for_kind(
+                crate::workload_accounts::Kind::Application,
+            ),
             state_root: state_root.clone(),
             home: fs::canonicalize(root.join("private-home")).unwrap(),
             config: fs::canonicalize(root.join("config")).unwrap(),

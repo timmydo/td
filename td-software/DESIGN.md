@@ -300,9 +300,9 @@ request is out at a time. A change applies from the application's next
 launch: a running window keeps what it was launched with. Only a
 Flathub application has the panel. Root admits a grant for any
 application with an account of its own (td-authd/DESIGN.md, "Grant
-requests"), so an image-shipped one that has one, as td-web does, takes
-grants through `td-ctl` alone; mail and news run as the human and take
-none.
+requests"), so image-shipped mail, news and td-web take grants through
+`td-ctl` alone. Mail and news retain human-editable configuration through
+their own exact configuration-directory grants.
 
 td-software writes no table here either: root's writer validates and
 writes, and td-software reads the answers as untrusted bounded text (a

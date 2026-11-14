@@ -236,9 +236,8 @@ struct Grant {
     access: Access,
     path: String,
     identity: MountIdentity,
-    /// The account's, which decides what its manifest may list
-    /// (`workload_grants::validate_view`).
-    kind: Kind,
+    /// The account's kind and admitted name decide what its manifest may list.
+    policy: grants::ViewPolicy,
     /// By the account's kind (`executable_views`).
     executable: bool,
 }
@@ -271,7 +270,7 @@ fn shows(view: &Present, grant: &Grant) -> bool {
 /// mountpoint, and the directory's path.
 fn grants_for(
     directories: Vec<Directory>,
-    kind: Kind,
+    policy: grants::ViewPolicy,
     mountinfo: &str,
     home: &Path,
 ) -> Result<Vec<Grant>, String> {
@@ -284,8 +283,8 @@ fn grants_for(
             access: directory.access,
             path: directory.path,
             identity,
-            kind,
-            executable: executable_views(kind),
+            policy,
+            executable: executable_views(policy.kind()),
         });
     }
     Ok(grants)
@@ -316,7 +315,7 @@ trait Host {
 }
 
 fn manifest_of(
-    kind: Kind,
+    policy: grants::ViewPolicy,
     listed: &[(usize, usize)],
     grants: &[Grant],
 ) -> Result<Manifest, String> {
@@ -329,7 +328,7 @@ fn manifest_of(
             path: grant.path.clone(),
         });
     }
-    Manifest::new_for(kind, views)
+    Manifest::new_scoped(policy, views)
 }
 
 /// One launch's publication of `uid`'s views of `grants`, in an order that
@@ -350,7 +349,7 @@ fn manifest_of(
 /// Returns the manifest published: what a launch may bind.
 fn reconcile<H: Host>(
     host: &mut H,
-    kind: Kind,
+    policy: grants::ViewPolicy,
     uid: u32,
     grants: &[Grant],
 ) -> Result<Manifest, String> {
@@ -364,7 +363,7 @@ fn reconcile<H: Host>(
             candidates.push((view.index, at));
         }
     }
-    host.write_manifest(&manifest_of(kind, &candidates, grants)?)?;
+    host.write_manifest(&manifest_of(policy, &candidates, grants)?)?;
     for view in &present {
         if !candidates.iter().any(|(index, _)| *index == view.index) {
             host.release(view.index)?;
@@ -414,7 +413,7 @@ fn reconcile<H: Host>(
             }
         }
     }
-    let manifest = manifest_of(kind, &listed, grants)?;
+    let manifest = manifest_of(policy, &listed, grants)?;
     host.write_manifest(&manifest)?;
     for (index, _) in &candidates {
         if !listed.iter().any(|(listing, _)| listing == index) {
@@ -440,7 +439,7 @@ impl Host for Live<'_> {
     }
 
     fn source(&mut self, grant: &Grant) -> Result<Found<File>, String> {
-        grants::validate_view(grant.kind, grant.access, grant.path.as_bytes())?;
+        grant.policy.validate(grant.access, grant.path.as_bytes())?;
         let Some(source) = open_human_directory(self.home, &grant.path, (HUMAN, HUMAN))? else {
             return Ok(None);
         };
@@ -507,14 +506,15 @@ pub(crate) fn publish(kind: Kind, name: &str, uid: u32) -> Result<Table, String>
         return Err("a workspace's views come from its launch's plan, not the grant table".into());
     }
     let table = read_table()?;
+    let policy = grants::ViewPolicy::for_account(kind, name);
     with_account(kind, uid, |live, td, mountinfo, home| {
-        let grants = grants_for(table.directories(kind, name), kind, mountinfo, home)?;
+        let grants = grants_for(table.directories(kind, name), policy, mountinfo, home)?;
         // A row this deployment's validator refuses is held, never
         // published.
         for (directory, why) in &table.refused(kind, name) {
             live.warn(&format!("row {:?} is not published: {why}", directory.path));
         }
-        reconcile(live, kind, uid, &grants)?;
+        reconcile(live, policy, uid, &grants)?;
         if kind == Kind::Application {
             remove_retired_mountpoint(td, uid, &mount_rows(mountinfo)?, live);
             if name == portal_files::FILE_CHOOSER_APPLICATION {
@@ -539,9 +539,10 @@ pub(crate) fn publish_plan(
     uid: u32,
     held: impl FnOnce() -> Result<Vec<Directory>, String>,
 ) -> Result<Manifest, String> {
+    let policy = grants::ViewPolicy::for_kind(Kind::Workspace);
     with_account(Kind::Workspace, uid, |live, _, mountinfo, home| {
-        let grants = grants_for(held()?, Kind::Workspace, mountinfo, home)?;
-        reconcile(live, Kind::Workspace, uid, &grants)
+        let grants = grants_for(held()?, policy, mountinfo, home)?;
+        reconcile(live, policy, uid, &grants)
     })
 }
 

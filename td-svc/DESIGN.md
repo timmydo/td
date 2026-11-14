@@ -438,15 +438,14 @@ ordering alone does not establish either result.
 
 Application units require successful firstboot and invoke the root typed
 launcher, with `cgroup=session` because the leader moves into its
-application's session leaf (`td-app-UID/session`, or the human's
-`td-user-1000/session` for the personal mail and news). Like Firefox's,
+application's session leaf (`td-app-UID/session`). Like Firefox's,
 the mail, news and web units run at boot only on an oracle's (§3's
-`unless-exists=`); an ordinary session starts mail and news from its own
-shell (APPLICATIONS.md §W.7), and Firefox and web from their launcher
-cards. No unit prepares an application's grants: its root launch
+`unless-exists=`); an ordinary session starts every application from its
+launcher card (APPLICATIONS.md §W.7). No unit prepares an application's grants: its root launch
 publishes them (td-authd/DESIGN.md, "Application filesystem grants").
-Mail and news require the human's `fetchd`, and web its own `web-fetch`,
-td-fetchd run as web's account on every boot (td-web/DESIGN.md §3),
+Mail, news and web require `mail-fetch`, `news-fetch` and `web-fetch`,
+respectively, each td-fetchd running as that application's account on
+every boot after firstboot (td-web/DESIGN.md §3),
 since a skipped unit would satisfy `requires=` with no socket. Shutdown
 releases every grant view after services stop and before releasing the
 portal view and `/var`.

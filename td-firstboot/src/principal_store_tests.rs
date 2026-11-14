@@ -412,7 +412,7 @@ fn boot_enrollment_seeds_a_public_account_ledger_idempotently() {
     temp.cleanup().unwrap();
 }
 
-const GRANTS_SEED: &str = "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\n";
+const GRANTS_SEED: &str = "td-grants-v1\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tmail\tdirectory\trw\t.config/td-mail\napplication\tmail\tdirectory\trw\tDownloads\napplication\tnews\tdirectory\trw\t.config/td-news\n";
 
 fn grant_table(directory: &Directory) -> Option<String> {
     directory
@@ -420,7 +420,7 @@ fn grant_table(directory: &Directory) -> Option<String> {
         .unwrap()
 }
 
-/// The first boot seeds Firefox's `Downloads` grant, private to root, and
+/// The first boot seeds Downloads and configuration grants, private to root, and
 /// no later boot rewrites the table.
 #[test]
 fn boot_enrollment_seeds_a_private_grant_table_once() {
@@ -458,6 +458,7 @@ fn a_present_grant_table_is_never_reseeded_or_rewritten() {
         let temp = notebook_temp::TempDir::new("td-grant-table").unwrap();
         let directory = account_directory(&temp);
         public_file(&directory.path(workload_grants::FILE_NAME), text, 0o600);
+        public_file(&directory.path(MAIL_NEWS_GRANTS), "complete\n", 0o600);
         directory
             .enroll_checked(&app("mail", 65537), |_| Ok(()))
             .unwrap();
@@ -465,6 +466,70 @@ fn a_present_grant_table_is_never_reseeded_or_rewritten() {
         // The rest of the boot's enrollment went ahead.
         assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
         temp.cleanup().unwrap();
+    }
+}
+
+#[test]
+fn mail_news_grants_upgrade_once_preserving_existing_rows_and_revocations() {
+    let temp = notebook_temp::TempDir::new("td-mail-news-grants").unwrap();
+    let directory = account_directory(&temp);
+    // Firefox was revoked; mail already has a read-only Downloads grant.
+    let prior = "td-grants-v1\napplication\tmail\tdirectory\tro\tDownloads\nsandbox\ttools\tnetwork\thost\n";
+    public_file(&directory.path(workload_grants::FILE_NAME), prior, 0o600);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    let upgraded = grant_table(&directory).unwrap();
+    let table = Table::parse(&upgraded).unwrap();
+    assert!(table.held(Kind::Application, "firefox").is_empty());
+    assert_eq!(table.network(Kind::Sandbox, "tools"), Network::Host);
+    assert_eq!(
+        table.held(Kind::Application, "mail"),
+        [
+            workload_grants::Directory {
+                access: Access::ReadOnly,
+                path: "Downloads".into()
+            },
+            workload_grants::Directory {
+                access: Access::ReadWrite,
+                path: ".config/td-mail".into()
+            },
+        ]
+    );
+    assert_eq!(table.held(Kind::Application, "news").len(), 1);
+    // Retry after table publication but before the receipt is durable.
+    fs::remove_file(directory.path(MAIL_NEWS_GRANTS)).unwrap();
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    assert_eq!(grant_table(&directory).unwrap(), upgraded);
+    let revoked = table
+        .revoke(Kind::Application, "mail", ".config/td-mail")
+        .unwrap()
+        .revoke(Kind::Application, "news", ".config/td-news")
+        .unwrap();
+    fs::write(directory.path(workload_grants::FILE_NAME), revoked.encode()).unwrap();
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    assert_eq!(grant_table(&directory).unwrap(), revoked.encode());
+}
+
+#[test]
+fn a_bad_mail_news_receipt_or_missing_completed_table_refuses() {
+    for (text, mode) in [
+        ("bad\n", 0o600),
+        ("complete\n", 0o644),
+        ("complete\n", 0o600),
+    ] {
+        let temp = notebook_temp::TempDir::new("td-mail-news-receipt").unwrap();
+        let directory = account_directory(&temp);
+        public_file(&directory.path(MAIL_NEWS_GRANTS), text, mode);
+        assert!(directory
+            .enroll_checked(&app("mail", 65537), |_| Ok(()))
+            .is_err());
+        assert!(grant_table(&directory).is_none());
+        assert!(account_ledger(&directory).is_none());
     }
 }
 
@@ -560,6 +625,7 @@ fn interrupted_grant_staging_is_removed_but_other_writers_are_refused() {
         assert!(!staged.exists());
         assert_eq!(grant_table(&directory).as_deref(), Some(GRANTS_SEED));
         fs::remove_file(directory.path(workload_grants::FILE_NAME)).unwrap();
+        fs::remove_file(directory.path(MAIL_NEWS_GRANTS)).unwrap();
     }
     public_file(&staged, "td-gra", 0o640);
     assert!(directory
@@ -687,12 +753,12 @@ fn the_image_check_wants_declarations_the_carried_rows_cover() {
     let declared =
         |rows: &str| Declarations::parse(&format!("td-bus-applications-v2\t1000\n{rows}")).unwrap();
     let carried = declared(
-        "firefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nnews\tservice\t\nweb\tservice\t\n",
+        "firefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\nweb\tservice\t\n",
     );
     check_accounts(&image, None).unwrap();
     check_accounts(&image, Some(&carried)).unwrap();
     // claude's row is imported from a retained reservation, never carried.
-    for uncarried in ["claude\tservice\t\n", "photo\tpersonal\t\n"] {
+    for uncarried in ["claude\tservice\t\n", "photo\tservice\t\n"] {
         assert!(check_accounts(&image, Some(&declared(uncarried))).is_err());
     }
     // A Flathub declaration needs no carried row: an install allocates it.
@@ -820,18 +886,17 @@ fn interrupted_account_staging_is_removed_but_other_writers_are_refused() {
     temp.cleanup().unwrap();
 }
 
-/// The launcher's uid is the ledger's account for a service application
-/// and the session owner for a personal one, and a retained reservation
+/// The launcher's uid is the ledger's account, and a retained reservation
 /// that disagrees with the ledger refuses.
 #[test]
 fn the_launch_uid_comes_from_the_ledger() {
     use crate::app_policy::Policy;
-    const DECLARED: &str = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nnews\tservice\t\n";
+    const DECLARED: &str = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\n";
     const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n";
     let policy = Policy::from_tables(DECLARED, LEDGER).unwrap();
     let none = Registry::parse(SESSION).unwrap();
     assert_eq!(launch_uid(&none, &policy, 1000, "firefox").unwrap(), 65536);
-    assert_eq!(launch_uid(&none, &policy, 1000, "mail").unwrap(), 1000);
+    assert_eq!(launch_uid(&none, &policy, 1000, "mail").unwrap(), 65537);
     // Declared without a ledger row, undeclared, or another session's.
     assert!(launch_uid(&none, &policy, 1000, "news").is_err());
     assert!(launch_uid(&none, &policy, 1000, "web").is_err());
@@ -875,7 +940,7 @@ fn no_ids() -> Result<BTreeSet<u32>, String> {
 /// The session owner's declarations the allocation tests install against.
 fn installable() -> crate::app_policy::Declarations {
     crate::app_policy::Declarations::parse(
-        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nnotes\tservice\t\nphoto\tservice\t\nweb\tservice\t\nwriter\tservice\t\n",
+        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnotes\tservice\t\nphoto\tservice\t\nweb\tservice\t\nwriter\tservice\t\n",
     )
     .unwrap()
 }
@@ -1110,16 +1175,16 @@ fn seeding_keeps_an_installed_row_the_policy_does_not_declare() {
 }
 
 /// Only the session owner's declared Flathub service applications are
-/// allocated: not an undeclared name, a personal application or one the
+/// allocated: not an undeclared name or one the
 /// image ships.
 #[test]
 fn only_a_declared_flathub_service_application_is_allocatable() {
     use crate::app_policy::Declarations;
     let declarations = Declarations::parse(
-        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nphoto\tservice\t\nweb\tservice\t\n",
+        "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nphoto\tservice\t\nweb\tservice\t\n",
     )
     .unwrap();
-    let flathub: fn(&str) -> bool = |name| ["firefox", "mail", "photo", "other"].contains(&name);
+    let flathub: fn(&str) -> bool = |name| ["firefox", "photo", "other"].contains(&name);
     allocatable(&declarations, 1000, "firefox", flathub).unwrap();
     allocatable(&declarations, 1000, "photo", flathub).unwrap();
     for (owner, name) in [
@@ -1649,7 +1714,7 @@ fn grant_requests_list_add_replace_and_revoke_rows() {
     assert!(!directory.path(GRANTS_STAGED).exists());
     assert_eq!(
         grant_table(&directory).unwrap(),
-        "td-grants-v1\napplication\tfirefox\tdirectory\tro\tPictures\napplication\tfirefox\tdirectory\trw\tDownloads\n"
+        "td-grants-v1\napplication\tfirefox\tdirectory\tro\tPictures\napplication\tfirefox\tdirectory\trw\tDownloads\napplication\tmail\tdirectory\trw\t.config/td-mail\napplication\tmail\tdirectory\trw\tDownloads\napplication\tnews\tdirectory\trw\t.config/td-news\n"
     );
     assert_eq!(listed(&directory), ["ro\tPictures", "rw\tDownloads"]);
     // Idempotent: the same row again writes nothing.
@@ -1677,7 +1742,7 @@ fn grant_requests_list_add_replace_and_revoke_rows() {
         grant(&directory, &GrantVerb::Revoke("Downloads".into())).unwrap(),
         GrantReply::Revoked
     );
-    assert_eq!(grant_table(&directory).as_deref(), Some("td-grants-v1\n"));
+    assert_eq!(grant_table(&directory).as_deref(), Some("td-grants-v1\napplication\tmail\tdirectory\trw\t.config/td-mail\napplication\tmail\tdirectory\trw\tDownloads\napplication\tnews\tdirectory\trw\t.config/td-news\n"));
     assert!(listed(&directory).is_empty());
     let error = grant(&directory, &GrantVerb::Revoke("Downloads".into())).unwrap_err();
     assert!(error.contains("holds no grant"), "{error}");
@@ -2103,16 +2168,17 @@ fn a_grant_request_waits_for_the_lock_only_briefly() {
 }
 
 /// Only a declared service application of the session's owner takes a
-/// grant: not an undeclared name, a personal application or another
-/// session's.
+/// grant: not an undeclared name or another session's.
 #[test]
 fn only_a_declared_service_application_is_grantable() {
     let declarations = installable();
-    for name in ["firefox", "web", "photo"] {
+    for name in ["firefox", "web", "photo", "mail"] {
         grantable(&declarations, 1000, name).unwrap();
     }
-    let error = grantable(&declarations, 1000, "mail").unwrap_err();
-    assert!(error.contains("runs as you"), "{error}");
+    assert!(crate::app_policy::Declarations::parse(
+        "td-bus-applications-v2\t1000\nmail\tpersonal\t\n"
+    )
+    .is_err());
     assert!(grantable(&declarations, 1000, "other").is_err());
     assert!(grantable(&declarations, 1001, "firefox").is_err());
 }

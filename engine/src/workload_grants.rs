@@ -10,7 +10,8 @@
 //! account's views from
 //! it and lists them in that account's manifest, and td-jail admits the
 //! views the manifest lists. Every directory a row or a manifest names is
-//! checked by `validate_path`, the one byte validator all three share.
+//! checked by the shared `ViewPolicy`: the reserved-path validator plus
+//! the exact application configuration exceptions and workspace roles.
 
 use crate::workload_accounts::{valid_name, Kind};
 
@@ -308,7 +309,7 @@ impl Table {
         access: Access,
         path: &str,
     ) -> Result<(Self, Change), String> {
-        validate_path(path.as_bytes())?;
+        validate_directory(kind, name, path.as_bytes())?;
         if !valid_name(name) {
             return Err("invalid grant account name".into());
         }
@@ -492,21 +493,21 @@ impl Table {
     }
 
     /// The directory grants of the `kind` account `name` a launch
-    /// publishes: those `validate_path` admits.
+    /// publishes: those `validate_directory` admits.
     pub fn directories(&self, kind: Kind, name: &str) -> Vec<Directory> {
         self.held(kind, name)
             .into_iter()
-            .filter(|directory| validate_path(directory.path.as_bytes()).is_ok())
+            .filter(|directory| validate_directory(kind, name, directory.path.as_bytes()).is_ok())
             .collect()
     }
 
-    /// The account's rows this deployment's `validate_path` refuses, each
+    /// The account's rows this deployment's `validate_directory` refuses, each
     /// with why: kept, listed and revocable, never published.
     pub fn refused(&self, kind: Kind, name: &str) -> Vec<(Directory, String)> {
         self.held(kind, name)
             .into_iter()
             .filter_map(|directory| {
-                validate_path(directory.path.as_bytes())
+                validate_directory(kind, name, directory.path.as_bytes())
                     .err()
                     .map(|why| (directory, why))
             })
@@ -531,7 +532,9 @@ fn require_account_rows(admitted: &[Row], row: &Row) -> Result<(), String> {
                     count += 1;
                     // Only publishable rows can overlap: an inert one is
                     // never a view.
-                    let publishable = |path: &str| validate_path(path.as_bytes()).is_ok();
+                    let publishable = |path: &str| {
+                        validate_directory(row.kind, &row.name, path.as_bytes()).is_ok()
+                    };
                     if publishable(path) && publishable(other) && nested(path, other) {
                         return Err(format!(
                             "grant directories {other:?} and {path:?} of one account overlap"
@@ -861,6 +864,57 @@ pub fn validate_view(kind: Kind, access: Access, relative: &[u8]) -> Result<(), 
     }
 }
 
+/// The policy of an account's views. Configuration exceptions are bound to
+/// the admitted application name; neither a generic application view nor a
+/// sandbox or workspace can request them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewPolicy {
+    kind: Kind,
+    configuration: Option<&'static [u8]>,
+}
+
+impl ViewPolicy {
+    pub const fn for_kind(kind: Kind) -> Self {
+        Self {
+            kind,
+            configuration: None,
+        }
+    }
+
+    pub fn for_account(kind: Kind, name: &str) -> Self {
+        let configuration = match (kind, name) {
+            (Kind::Application, "mail") => Some(b".config/td-mail".as_slice()),
+            (Kind::Application, "news") => Some(b".config/td-news".as_slice()),
+            _ => None,
+        };
+        Self {
+            kind,
+            configuration,
+        }
+    }
+
+    pub fn kind(self) -> Kind {
+        self.kind
+    }
+
+    pub fn validate(self, access: Access, relative: &[u8]) -> Result<(), String> {
+        if self.configuration == Some(relative) {
+            return Ok(());
+        }
+        validate_view(self.kind, access, relative)
+    }
+}
+
+/// A persistent grant may name an application's own exact configuration
+/// directory. Every other path still passes the general reserved-tree rule.
+pub fn validate_directory(kind: Kind, name: &str, relative: &[u8]) -> Result<(), String> {
+    if ViewPolicy::for_account(kind, name).configuration == Some(relative) {
+        Ok(())
+    } else {
+        validate_path(relative)
+    }
+}
+
 /// Whether two directories below the home, as views name them, are one or
 /// nest: what keeps one account's views apart.
 pub fn overlapping(left: &str, right: &str) -> bool {
@@ -892,17 +946,21 @@ impl Manifest {
     }
 
     /// A `kind` account's manifest, each view admitted by `validate_view`.
-    pub fn new_for(kind: Kind, mut views: Vec<View>) -> Result<Self, String> {
+    pub fn new_for(kind: Kind, views: Vec<View>) -> Result<Self, String> {
+        Self::new_scoped(ViewPolicy::for_kind(kind), views)
+    }
+
+    pub fn new_scoped(policy: ViewPolicy, mut views: Vec<View>) -> Result<Self, String> {
         views.sort_by_key(|view| view.index);
         let mut manifest = Self::default();
         for view in views {
-            manifest.admit(kind, view)?;
+            manifest.admit(policy, view)?;
         }
         Ok(manifest)
     }
 
-    fn admit(&mut self, kind: Kind, view: View) -> Result<(), String> {
-        validate_view(kind, view.access, view.path.as_bytes())?;
+    fn admit(&mut self, policy: ViewPolicy, view: View) -> Result<(), String> {
+        policy.validate(view.access, view.path.as_bytes())?;
         if view.index >= MAX_VIEWS
             || self.views.len() >= MAX_DIRECTORIES
             || self
@@ -933,6 +991,10 @@ impl Manifest {
 
     /// A `kind` account's manifest, each view admitted by `validate_view`.
     pub fn parse_for(kind: Kind, text: &str) -> Result<Self, String> {
+        Self::parse_scoped(ViewPolicy::for_kind(kind), text)
+    }
+
+    pub fn parse_scoped(policy: ViewPolicy, text: &str) -> Result<Self, String> {
         if text.len() > MAX_MANIFEST_BYTES || !text.ends_with('\n') {
             return Err("grant view manifest is oversized or not newline-terminated".into());
         }
@@ -951,7 +1013,7 @@ impl Manifest {
                 .filter(|number| number.to_string() == *index)
                 .ok_or("noncanonical grant view index")?;
             manifest.admit(
-                kind,
+                policy,
                 View {
                     index: number,
                     access: Access::parse(access).ok_or("unknown grant view access")?,
@@ -1870,5 +1932,61 @@ mod tests {
         assert!(Manifest::parse_for(Kind::Workspace, &nested).is_err());
         assert!(overlapping("src", "src/td") && overlapping("src", "src"));
         assert!(!overlapping("src", "srcs"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn configuration_grants_are_exact_and_bound_to_the_application() {
+        for (application, path) in [("mail", ".config/td-mail"), ("news", ".config/td-news")] {
+            for kind in [Kind::Application, Kind::Sandbox, Kind::Workspace] {
+                for name in ["mail", "news", "firefox", "agent-1"] {
+                    let policy = ViewPolicy::for_account(kind, name);
+                    let admitted = kind == Kind::Application && name == application;
+                    for access in [Access::ReadOnly, Access::ReadWrite] {
+                        assert_eq!(policy.validate(access, path.as_bytes()).is_ok(), admitted);
+                        let table = Table::seeded().grant(kind, name, access, path);
+                        assert_eq!(table.is_ok(), admitted);
+                        if let Ok((table, _)) = table {
+                            assert!(table
+                                .directories(kind, name)
+                                .iter()
+                                .any(|row| row.path == path));
+                            let view = View {
+                                index: 0,
+                                access,
+                                path: path.into(),
+                            };
+                            let manifest = Manifest::new_scoped(policy, vec![view]).unwrap();
+                            assert!(Manifest::parse_scoped(policy, &manifest.encode()).is_ok());
+                            assert!(Manifest::parse_for(kind, &manifest.encode()).is_err());
+                            assert!(table
+                                .revoke(kind, name, path)
+                                .unwrap()
+                                .directories(kind, name)
+                                .is_empty());
+                        }
+                    }
+                    for refused in [
+                        ".config",
+                        ".config/td-mail/child",
+                        ".config/td-news/child",
+                        ".config/td-mailx",
+                        ".config/td-newsx",
+                        ".config/../.ssh",
+                        ".config//td-mail",
+                    ] {
+                        assert!(policy
+                            .validate(Access::ReadWrite, refused.as_bytes())
+                            .is_err());
+                        assert!(validate_directory(kind, name, refused.as_bytes()).is_err());
+                    }
+                }
+            }
+        }
     }
 }

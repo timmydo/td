@@ -466,17 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn templates_match_the_personal_configuration_grants() {
+    fn templates_match_the_application_scoped_configuration_grants() {
         let root = source_const(MAIN_RS, "APPLICATION_CONFIG_ROOT").unwrap();
         for name in ["mail", "news"] {
             let permissions = crate::catalog::lookup(name)
                 .unwrap()
                 .application_permissions
                 .unwrap();
-            assert!(permissions
-                .to_keyfile()
-                .lines()
-                .any(|line| line == format!("~/{root}/td-{name}=rw:create")));
+            assert!(permissions.filesystems().next().is_none());
+            let path = format!("{root}/td-{name}");
+            td_engine::workload_grants::validate_directory(
+                td_engine::workload_accounts::Kind::Application,
+                name,
+                path.as_bytes(),
+            )
+            .unwrap();
+            assert!(td_engine::workload_grants::validate_path(path.as_bytes()).is_err());
+            assert!(include_str!("../../../td-firstboot/src/principal_store.rs")
+                .contains(&format!("(\"{name}\", \"{path}\")")));
         }
     }
 

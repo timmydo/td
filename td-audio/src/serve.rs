@@ -2111,7 +2111,7 @@ mod tests {
         const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\n";
         let installed = || {
             crate::app_policy::Policy::from_tables(
-                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tpersonal\t\n",
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\n",
                 LEDGER,
             )
             .map_err(io::Error::other)

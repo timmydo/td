@@ -640,10 +640,10 @@ recipes/src/recipes/system-secret-vm-test.rs	allocating-conversion	2
 recipes/src/recipes/system-secret-vm-test.rs	allocation-macro	7
 recipes/src/recipes/system-secret-vm-test.rs	unchecked-growth-or-clone	5
 recipes/src/recipes/system-x86-64.rs	allocating-constructor	1
-recipes/src/recipes/system-x86-64.rs	allocating-conversion	99
-recipes/src/recipes/system-x86-64.rs	allocation-macro	167
+recipes/src/recipes/system-x86-64.rs	allocating-conversion	95
+recipes/src/recipes/system-x86-64.rs	allocation-macro	166
 recipes/src/recipes/system-x86-64.rs	heap-owner	6
-recipes/src/recipes/system-x86-64.rs	unchecked-growth-or-clone	280
+recipes/src/recipes/system-x86-64.rs	unchecked-growth-or-clone	279
 recipes/src/recipes/td-agent-test.rs	allocation-macro	4
 recipes/src/recipes/td-audio.rs	allocating-conversion	5
 recipes/src/recipes/td-audio.rs	allocation-macro	3
@@ -1109,7 +1109,7 @@ td-audio/src/wire.rs	allocating-constructor	1
 td-audio/src/wire.rs	allocating-conversion	2
 td-audio/src/wire.rs	unchecked-growth-or-clone	3
 td-authd/src/application.rs	allocating-constructor	1
-td-authd/src/application.rs	allocating-conversion	15
+td-authd/src/application.rs	allocating-conversion	13
 td-authd/src/application.rs	allocation-macro	11
 td-authd/src/application.rs	unchecked-growth-or-clone	2
 td-authd/src/application_cache.rs	allocating-conversion	5
@@ -1831,7 +1831,7 @@ td-firstboot/src/primary_profile.rs	allocating-conversion	14
 td-firstboot/src/primary_profile.rs	allocation-macro	17
 td-firstboot/src/primary_profile.rs	unchecked-growth-or-clone	3
 td-firstboot/src/principal_store.rs	allocating-conversion	15
-td-firstboot/src/principal_store.rs	allocation-macro	46
+td-firstboot/src/principal_store.rs	allocation-macro	44
 td-firstboot/src/principal_store.rs	heap-owner	1
 td-firstboot/src/principal_store.rs	unchecked-growth-or-clone	10
 td-firstboot/src/principal_store_tests.rs	allocating-conversion	48

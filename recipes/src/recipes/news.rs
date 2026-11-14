@@ -1,13 +1,13 @@
 //! The `news` application: td-news, td's feed reader, as a static package
 //! on the data-only static runtime. It opens a td-ui window of its own when
-//! the session runs `/bin/news` (at boot only on an oracle's, through
+//! its launcher card starts it (at boot only on an oracle's, through
 //! `system-x86-64`'s `[news]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-news/config.toml`, which
-//! td-firstboot provisions once under the login user's jail state.
+//! td-firstboot provisions once in the login user's own configuration directory.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
-use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
+use td_engine::permissions::{PermissionPolicy, PermissionSocket};
 
 const APPLICATION_NAME: &str = crate::shared::TD_NEWS_NAME;
 const APPLICATION_ENTRY: &str = crate::shared::TD_NEWS_ENTRY;
@@ -43,9 +43,6 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
-        .and_then(|permissions| {
-            permissions.with_filesystem("~/.config/td-news", FilesystemAccess::ReadWrite, true)
-        })
         .and_then(|permissions| permissions.with_memory_high(128 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(192 * 1024 * 1024))
         // Tasks, threads included: the client keeps a backend thread beside
@@ -153,7 +150,7 @@ mod tests {
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Filesystem]\n~/.config/td-news=rw:create\n\n[Resources]\nmemory-high=134217728\nmemory-max=201326592\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=134217728\nmemory-max=201326592\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(

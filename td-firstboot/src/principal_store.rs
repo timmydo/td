@@ -28,6 +28,8 @@ const ACCOUNTS_MODE: u32 = workload_accounts::MODE;
 const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
 /// The workload grant table (td-authd/DESIGN.md, "Workload grant table"):
 /// what each account may reach of the human's, root's alone to read.
+const MAIL_NEWS_GRANTS: &str = "mail-news-grants-v1";
+const MAIL_NEWS_GRANTS_STAGED: &str = ".mail-news-grants.next";
 const GRANTS_STAGED: &str = ".grants.next";
 const GRANTS_MODE: u32 = workload_grants::MODE;
 const GRANTS_LIMIT: u64 = workload_grants::MAX_BYTES as u64;
@@ -523,7 +525,7 @@ impl Directory {
                 return Ok(listing(&read(self, true)?));
             }
             GrantVerb::Grant(_, path) => {
-                workload_grants::validate_path(path.as_bytes())?;
+                workload_grants::validate_directory(kind, name, path.as_bytes())?;
                 admit()?;
             }
             GrantVerb::Network(Network::Host) => admit()?,
@@ -652,18 +654,51 @@ impl Directory {
                 GRANTS_LIMIT,
             )?;
         }
+        self.publish_as(
+            MAIL_NEWS_GRANTS,
+            MAIL_NEWS_GRANTS_STAGED,
+            "complete\n",
+            PRIVATE_MODE,
+            64,
+        )?;
         Ok(ledger)
     }
 
-    /// The grant table to publish: the seed (Firefox's `Downloads`) when
-    /// none exists, else none, once the present one has been read at its
-    /// exact shape and parsed. The seed is written once, so a row the human
-    /// revoked stays revoked; a malformed table refuses and is never reset.
+    /// Validate the table and one-time mail/news grant upgrade before any
+    /// publication. A durable receipt prevents resurrecting later revocations;
+    /// malformed or missing completed state refuses rather than resetting it.
     fn seeded_grants(&self) -> Result<Option<Table>, String> {
-        match self.read_as(workload_grants::FILE_NAME, GRANTS_MODE, GRANTS_LIMIT)? {
-            Some(text) => Table::parse(&text).map(|_| None),
-            None => Ok(Some(Table::seeded())),
+        let receipt = self.read_as(MAIL_NEWS_GRANTS, PRIVATE_MODE, 64)?;
+        if receipt.as_deref().is_some_and(|text| text != "complete\n") {
+            return Err("invalid mail/news grant transition receipt".into());
         }
+        let present = self.read_as(workload_grants::FILE_NAME, GRANTS_MODE, GRANTS_LIMIT)?;
+        if receipt.is_some() && present.is_none() {
+            return Err("the grant table is absent after its transition".into());
+        }
+        let mut table = match present {
+            Some(text) => Table::parse(&text)?,
+            None => Table::seeded(),
+        };
+        if receipt.is_some() {
+            return Ok(None);
+        }
+        for (name, path) in [
+            ("mail", ".config/td-mail"),
+            ("news", ".config/td-news"),
+            ("mail", "Downloads"),
+        ] {
+            if !table
+                .held(Kind::Application, name)
+                .iter()
+                .any(|row| row.path == path)
+            {
+                table = table
+                    .grant(Kind::Application, name, Access::ReadWrite, path)?
+                    .0;
+            }
+        }
+        Ok(Some(table))
     }
 
     /// The retained reservations joined with the deployment's. The caller
@@ -977,8 +1012,8 @@ fn check_accounts_with(
 
 /// What an install may allocate: an account for `name`, which the session
 /// `owner`'s deployment declares as a service application among its
-/// `flathub` declarations. A personal application runs as its owner, and an
-/// application the image ships has its carried row or none.
+/// `flathub` declarations. An application the image ships has its carried
+/// row or none.
 fn allocatable(
     declarations: &Declarations,
     owner: u32,
@@ -988,16 +1023,11 @@ fn allocatable(
     if declarations.owner() != owner {
         return Err("application allocation names another session".into());
     }
-    let row = declarations
+    declarations
         .rows()
         .iter()
         .find(|row| row.application == name)
         .ok_or_else(|| format!("the deployment does not declare application {name:?}"))?;
-    if row.class != crate::app_policy::Class::Service {
-        return Err(format!(
-            "application {name:?} runs as its owner and has no account of its own"
-        ));
-    }
     if !flathub(name) {
         return Err(format!(
             "application {name:?} ships in the image; only a Flathub application is allocated at install"
@@ -1125,9 +1155,7 @@ fn outside_ids(
 }
 
 /// What a grant may name: an application the session `owner`'s deployment
-/// declares as a service application, which runs as an account of its
-/// own. A personal application runs as the human and reaches the human's
-/// files by its policy; a row for one would be ignored at its launch.
+/// declares, running as its own ledger account.
 fn grantable(
     declarations: &crate::app_policy::Declarations,
     owner: u32,
@@ -1136,17 +1164,11 @@ fn grantable(
     if declarations.owner() != owner {
         return Err("the grant request names another session".into());
     }
-    let row = declarations
+    declarations
         .rows()
         .iter()
         .find(|row| row.application == name)
         .ok_or_else(|| format!("the deployment does not declare application {name:?}"))?;
-    if row.class != crate::app_policy::Class::Service {
-        return Err(format!(
-            "application {name:?} runs as you and reaches your files by its own policy; \
-             only an application with an account of its own takes grants"
-        ));
-    }
     Ok(())
 }
 
@@ -1262,8 +1284,7 @@ pub(crate) fn check_launch_application(owner: u32, name: &str) -> Result<u32, St
     launch_uid(&prior, &crate::app_policy::load()?, owner, name)
 }
 
-/// The uid `name` launches as: the session owner for a personal
-/// application, else its ledger account. Either way the image declares it
+/// The uid `name` launches as: its ledger account. The image declares it
 /// and the ledger holds its account, at the uid any retained reservation of
 /// it names.
 fn launch_uid(
@@ -1281,8 +1302,7 @@ fn launch_uid(
     let rule = policy
         .for_name(name)
         .ok_or("application has no bus assignment")?;
-    // `for_name` gives the owner or this account; only a retained
-    // reservation can disagree.
+    // The execution assignment and retained reservation must agree.
     if retained
         .applications()
         .any(|application| application.name == name && application.uid != account)

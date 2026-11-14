@@ -449,9 +449,9 @@ Firstboot then prepares root-owned mode-0755 `/run/user` and app-owned
 mode-0700 `/run/user/APP_UID` using the existing pinned runtime provisioner.
 An existing published runtime with wrong ownership or permissions refuses;
 only interrupted root-owned creation is completed. No socket is created.
-Only installed applications assigned service UIDs consume this preparation.
-Personal mail/news retain their old UID reservations but execute under the
-human account and share its runtime and fetch daemon.
+Every declared application consumes this preparation, including mail and
+news on their carried accounts 65537 and 65538. Each has its own runtime
+and fetch daemon.
 
 On the desktop, before any application's, firstboot prepares the Flathub
 runtime account's delegation the same way: `/sys/fs/cgroup/td-runtimes`,
@@ -480,17 +480,36 @@ An activated application account's home must be exactly
 `/var/lib/td/applications/APP_UID`. The shared account validator checks this
 for retained as well as current application reservations. An absent account
 remains a reservation; its row alone creates no application state or runtime.
-The stock bus policy also permits an installed source-built personal application
-to execute as its human owner. Mail and news use this class. Their old account
-rows remain reservations but get no state migration or runtime preparation.
-Launch admission requires an active reservation and a matching immutable bus
-policy row whose UID is either the reserved service UID or the session owner.
-Personal launches use `exec-primary`, require `/td-user-1000/session`, and
-resolve the actual human home through the shared account validator. The jail
-mounts only each program's `.config/td-PROGRAM` subtree read/write and its own
-private state; mail also mounts Downloads directly. Firstboot templates use
-those real configuration paths, preserve existing files, and never read or
-migrate the old private configuration or plaintext password files.
+Every declared application runs as its ledger account. Mail and news use
+65537 and 65538, with private homes and runtimes. Firstboot provisions
+missing configuration templates in the human's `.config/td-mail` and
+`.config/td-news`, preserving existing files. Explicit grants expose
+only the matching application's directory read/write; mail also receives
+Downloads. Old private configuration and plaintext password files are
+never used as a fallback for those human configuration files.
+
+Mail and news may already have an older private home beside their active
+human-owned `.td/app/NAME`. Before either account or the human starts,
+under `.migration.lock`, firstboot validates the active tree, then moves
+any previous private home whole to
+`applications/.mail-news-transition/NAME/previous-home`. The transition
+parent and each NAME directory are root-only mode 0700; no archive is
+merged or overwritten. Active human state is then migrated by the bounded
+walk below. Without active human state the existing private home is kept.
+Root-owned, single-link, empty mode-0600 `prepared` and `done` receipts
+are synced before creating the replacement home and after publishing it,
+respectively. An archive without `prepared` resumes after its rename;
+`prepared` without `done` resumes home preparation. After `done`, even a
+missing private home is recreated without importing a later human tree.
+Before `done`, firstboot also moves the selected home's private `config`
+directory, if present, to `previous-config` beside the receipts. This
+preserves old settings and plaintext passwords without exposing them under
+an absent, refused or revoked human configuration view. It never overwrites
+an archive; a crash after this rename resumes with no source. The jail
+creates an empty private config directory on its next launch. After `done`,
+subsequent private configuration is left alone.
+These receipts are validated on every preparation. Rolling back to a
+human-account deployment does not export the new private state back.
 Firstboot separately creates a missing portal credential store, owned by
 the portal account, so secure-attention enrollment has an empty store to
 open. It inserts no placeholder mail credential and releases no key.
@@ -727,8 +746,8 @@ an error, never an empty ledger:
 - The application policy (`td-busd/src/app_policy.rs`) joins the image's
   declarations, `/etc/td-bus-applications.tsv` at
   `td-bus-applications-v2`, a `NAME CLASS OWNED` row per application with
-  class `personal` (runs as the session's human) or `service` (runs as
-  its own account) and no uid, with the ledger's application rows. An
+  class `service` (runs as its own account) and no uid; `personal`
+  declarations are refused. The join uses the ledger's application rows. An
   application is active when the image declares it and the ledger holds
   its row. The broker, td-portal, td-jail, td-compositor, td-audio,
   td-authd, td-secret and td-firstboot include it. A loaded policy reads
@@ -772,9 +791,8 @@ before publication nothing changed, and after it the row stands and the
 next install, not new, completes the root-owned remainder. td-firstboot requires root credentials, the deployment enrolled
 and its accounts verified as `check-launch-application` does, and admits
 only an application the session OWNER's deployment declares as a
-service application among its Flathub declarations: an undeclared name,
-a personal application, which runs as the human, and an application the
-image ships, which has its carried row or none, all refuse. Then, under
+service application among its Flathub declarations: an undeclared name
+and an application the image ships, which has its carried row or none, all refuse. Then, under
 `.principals.lock`, it reads the published ledger (an absent one
 refuses: boot seeds it first) and returns an existing row unchanged, or
 adds the lowest uid of 66560 through 98303 that no row of any kind holds
@@ -1000,8 +1018,13 @@ is not UTF-8. It may not be, lie below or contain:
 So `.local`, `.cargo` and `.var` are refused as ancestors. Two directory
 rows of one account may not be equal or nest, since two views of one
 tree would let the account reach one name through two grants of
-different access. `validate_path` is the one byte validator: td-authd
-applies it before opening a source and td-jail to every source it
+different access. The shared validator admits one configuration exception:
+application `mail` may receive exactly `.config/td-mail`, and `news`
+exactly `.config/td-news`, at either access. No other account, parent,
+neighbor or descendant receives that exception. `ViewPolicy` carries the
+admitted application name through the manifest and source identity checks;
+the generic `validate_path` keeps refusing both directories. td-authd
+validates before opening a source and td-jail validates every source it
 admits, so a table and a jail cannot disagree on what is reserved. Every
 path it admits is a grant target td-jail accepts, apart from one meeting
 the application's own policy grants (Firefox's `Opened`, say): td-jail
@@ -1035,18 +1058,19 @@ root's, of mode 0600 and within the bound, was the whole earlier table,
 and these readers take it; a locked reader, and every other state file,
 still require exactly one link.
 
-td-firstboot writes the table once, under the same state lock and in the
-same staged, synced and renamed form as the ledger, when boot enrollment
-finds none: its seed is Firefox's `rw` `Downloads`. A present table is read
-at its exact owner, mode and single link and parsed, never rewritten, so a
-row the human revoked stays revoked and a table a later deployment wrote
-is kept; a malformed or misshapen table refuses the boot and changes
-nothing, as the ledger's does. After boot the table changes only through
-"Grant requests" below, or root editing the file, and a change takes
-effect at the account's next launch. Rows naming an application that runs
-as the human (mail and news today) are ignored: such an application
-reaches the human's files by its policy, as the human, and no view is
-published for it.
+td-firstboot seeds a missing table with Firefox's writable Downloads.
+Under the same principal lock, one upgrade adds mail's writable Downloads
+and the two application-scoped configuration grants. Existing exact rows
+retain their access; unrelated rows and revoked Firefox grants remain
+unchanged. The updated table is staged, synced and renamed before the
+root-owned mode-0600 `mail-news-grants-v1` receipt, containing `complete`
+and a newline, is published. A crash between the two publications retries
+idempotently before sessions start. A receipt prevents later boots from
+restoring revoked grants. A malformed receipt or table, or a missing table
+after completion, refuses without resetting it. Every launch uses the
+account's current rows. After this transition, changes come only from
+"Grant requests" below or root editing the file, and take effect at the
+account's next launch.
 
 Rolling back to a deployment from before this table (WORKLOADS.md step 6's
 first landing) re-grants Firefox's `Downloads` by that deployment's own
@@ -1131,8 +1155,7 @@ itself, then:
   clear freeing it for the next conversation;
 - for a grant, and for a sandbox's network set to `host`, first admits
   the request: an application must be one the image declares, owned by
-  OWNER, with an account of its own (one that runs as the human is
-  refused by name); a sandbox's OWNER must be the primary human, uid
+  OWNER; a sandbox's OWNER must be the primary human, uid
   1000, whose session the deployment's principal table names, since a
   grant's source is always that human's home and a row names no owner,
   so another session owner is refused. A grant's source
@@ -1648,10 +1671,9 @@ the validator. Trusted root must not change the account database, deployment
 or mount hierarchy during launch. The check creates no state and does not
 substitute for successful firstboot dependency ordering.
 
-After validation the authority execs the fixed td-login helper: `exec-primary`
-for a personal application assigned to the human, or `exec-service-as tdaUID`
-for an application assigned a service account, which td-login resolves
-from the workload account ledger. Both then execute the authority's
+After validation the authority execs the fixed td-login helper,
+`exec-service-as tdaUID`, which resolves the account from the workload
+account ledger and then executes the authority's
 own `application-exec` wrapper. All
 standard descriptors become null, the environment is cleared and cwd is `/`.
 The supervisor PID is retained across execs. No inherited root endpoint or
@@ -1661,9 +1683,8 @@ firstboot check can be run directly for detailed admission diagnostics.
 
 The unprivileged wrapper requires all four UID/GID columns to equal the
 selected execution UID and empty inheritable/permitted/effective/ambient
-capabilities. A service-account launch requires exactly its primary
-supplementary group and membership in `td-app-UID/session`; a personal
-launch retains the human's groups and requires `td-user-1000/session`. A diagnostic-only td-login placement failure thus
+capabilities. Every application launch requires exactly its primary
+supplementary group and membership in `td-app-UID/session`. A diagnostic-only td-login placement failure thus
 cannot execute application code. This wrapper gains no privilege and is not
 an alternative application-identity authority: an app UID invoking it directly
 still has only that UID. Broker and jail activation must independently bind
@@ -2100,9 +2121,8 @@ reading, through that descriptor; the views it reaches by path, for
 Application activation uses the same application policy reader, the
 image's declarations joined with the workload account ledger, in the
 broker, jail, portal, compositor and audio daemon. Broker registration
-requires the assigned execution UID. The human UID may register the
-personal names explicitly assigned to it, but confined peers cannot
-register another instance.
+requires the assigned application UID. The human UID cannot register
+an application, and confined peers cannot register another instance.
 The portal validates broker-reported UID plus app name against its loaded
 policy for both credential retrieval and FileChooser. Public Wayland admits
 the human, the live installer wizard's UID 990 and assigned application
@@ -2110,14 +2130,13 @@ UIDs; audio admits the human, its own
 service and the assigned Firefox UID. Compositor control and
 readiness remain human-only, and the private portal channel remains UID 991.
 
-Mail and news share the human fetch daemon at
-`/run/user/1000/td-fetch/socket`. Its runtime directory is mode 0700 and the
-socket mode 0600. Their jails mount only this service directory. Fetch
-requests share the human UID domain; there is no per-application host-UID
-isolation from the daemon. A service-account application's jail takes the
-fetch socket only from its own runtime directory: web (td-web/DESIGN.md §3)
-has its own daemon, run as its account, at
-`/run/user/65540/td-fetch/socket`.
+Mail, news and web each have a fetch daemon running as their own account,
+at `/run/user/65537/td-fetch/socket`, `/run/user/65538/td-fetch/socket` and
+`/run/user/65540/td-fetch/socket`, respectively (td-web/DESIGN.md §3).
+Each runtime directory is mode 0700 and its socket mode 0600; a jail takes
+only its own account's service directory. These daemons share neither
+connections nor credentials with one another or the human's fetch daemon.
+A daemon shares its own application's UID domain, outside that jail.
 Production application units use the typed root launcher with null
 application stdio.
 Bus evidence connects as the human observer and independently checks the

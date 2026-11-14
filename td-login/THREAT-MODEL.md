@@ -285,28 +285,14 @@ view's nosuid keeps a setuid or setgid bit from taking effect within
 the view, not when the human runs the file from its own path. Only the
 grant decides this; the human's later runs are not confined.
 
-The same intake makes one more socket that admits the human's kernel
-credentials and acts on them. Every workload that still runs as UID
-1000 (mail and news and jailed td-agent workspaces, WORKLOADS.md steps
-8 and 9) passes its peer check, so what
-keeps them from it is only that no jail binds `/run/td-authd`, its
-`1000` directory or the intake: the next paragraph's `/run`
-reservation, which a td-jail test pins for these paths as it does for
-the compositor's control socket. An unconfined td-agent workspace can
-reach it, as it can the control socket.
-
-Which workloads can ask is narrower than "anything but the human", and
-not yet by account. Firefox and td-web run as accounts of their own,
-which the control socket refuses, as do sandboxes, each its own
-account. Mail and news and jailed td-agent workspaces still run as UID
-1000 (WORKLOADS.md steps 8 and 9); what keeps them from asking today is
-only that no jail
-binds `/run/td-compositor/1000/td-control` or its directory: td-jail
-reserves `/run` from every workspace, by path and by alias, and binds an
-application nothing of the compositor's but its Wayland socket, which a
-td-jail test pins. An unconfined td-agent workspace runs as the human
-with no jail and can ask. Root's writer refuses a source that is not the
-human's alone or is reached through a link, whoever asks.
+The intake admits the human's kernel credentials. Applications, sandboxes
+and confined td-agent workspaces and reviews run as separate accounts,
+which fail that peer check. Their jails also exclude `/run/td-authd` and
+the compositor control socket: td-jail reserves `/run` from workspaces by
+path and alias, and applications receive only the public Wayland socket.
+An unconfined td-agent workspace deliberately runs as the human with no
+jail and can reach both authorities. Root's grant writer still refuses a
+source not owned by the human or reached through a link.
 
 ## 2. The core invariant: ordering, and then proof
 
@@ -716,19 +702,15 @@ succeeds; file and TPM-only stores cannot serve application credentials.
 That is a rule of td-secret's stores: td-mail's `password_file`
 (`APPLICATIONS.md` §W.4) is a file the application reads itself, outside
 them by its owner's choice, and nothing in this document protects it.
-Foreign application assignments are active service accounts.
-The broker loads an immutable deployment table binding each installed name
-to its execution UID and exact bus grants. Personal mail and news share the
-human UID, but each requires registered jail lineage before its name is
-exposed to the portal. An unconfined human connection has no application
-identity. Only names explicitly assigned to the human UID may be registered
-by that UID. Foreign applications retain their private homes under
-`/var/lib/td/applications/APP_UID`, runtimes and cgroups. Personal
-applications use the human home only through the jail's per-application
-state and explicit configuration grants; an escape from that jail would
-have human-UID authority. The root launcher checks both the retained UID
-reservation and the immutable execution assignment, then uses `exec-primary`
-for personal applications or the service-only class for foreign ones.
+Every application runs as its ledger account, including mail and news.
+The broker joins the immutable deployment declarations with that ledger,
+binding each installed name to its UID and exact bus grants. Registered
+jail lineage is required before a name is exposed to the portal. The human
+UID cannot register an application. Applications have private homes under
+`/var/lib/td/applications/APP_UID`, runtimes and cgroups. Mail and news
+receive only their own human configuration directories through explicit,
+noexec grants. The root launcher checks the retained reservation and the
+execution assignment, then uses `exec-service-as` for every application.
 `td-authd/DESIGN.md` specifies this reservation and launch contract. The
 image's paired td-authd terminal launcher uses ordinary `exec-as` after
 a read-only reservation check and private-channel authentication. It
@@ -1002,8 +984,8 @@ followed by digits, is an application account's reserved form, and
   `/var/lib/td/workloads/<uid>` by kind, shell `/bin/false`, the service
   class, and no supplementary group. A missing, hostile or malformed
   ledger, or a uid it does not hold, refuses. Any application row
-  resolves, a retired application's (a former install's `tda65539`) or a
-  personal one's included, and any sandbox or workspace row: td-login
+  resolves, a retired application's (a former install's `tda65539`)
+  included, and any sandbox or workspace row: td-login
   reads no declarations or grants, and `exec-service-as`'s caller is root,
   which could run as any uid anyway. Such an account may have no home,
   runtime or cgroup delegation prepared, since firstboot prepares only the

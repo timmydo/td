@@ -105,7 +105,7 @@ mod policy_files {
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
-    const DECLARED: &str = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tpersonal\t\nweb\tservice\t\n";
+    const DECLARED: &str = "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nweb\tservice\t\n";
     const LEDGER: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\n";
     const GROWN: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tweb\t65540\n";
 
@@ -191,7 +191,7 @@ mod policy_files {
         fs::remove_dir(&path).unwrap();
         for content in [
             DECLARED.replace("1000", "01000"),
-            DECLARED.replace("mail\tpersonal", "mail\t1000"),
+            DECLARED.replace("mail\tservice", "mail\t1000"),
             "x".repeat(MAX_BYTES + 1),
         ] {
             fixture.declare(&content, 0o444);
@@ -218,7 +218,7 @@ mod policy_files {
         let fixture = Fixture::new();
         let policy = fixture.load(Admission::Strict).unwrap();
         assert_eq!(policy.for_name("firefox").unwrap().uid, 65536);
-        assert_eq!(policy.for_name("mail").unwrap().uid, 1000);
+        assert_eq!(policy.for_name("mail").unwrap().uid, 65537);
         assert_eq!(policy.account("mail"), Some(65537));
         for mode in [0o600, 0o664, 0o444] {
             fixture.publish(LEDGER, mode);
@@ -231,8 +231,8 @@ mod policy_files {
     }
 
     /// A session service starts on a ledger it cannot read with no
-    /// application rows: the human and personal applications keep working,
-    /// every service application is refused, and the repaired ledger is
+    /// application rows: the human's session keeps working,
+    /// every application is refused, and the repaired ledger is
     /// read on the next miss once it changes.
     #[test]
     fn a_session_policy_starts_without_a_readable_ledger() {
@@ -241,7 +241,7 @@ mod policy_files {
         fs::remove_file(&ledger).unwrap();
         let missing = fixture.load(Admission::Session).unwrap();
         assert!(missing.admits(1000));
-        assert_eq!(missing.for_name("mail").unwrap().uid, 1000);
+        assert!(missing.for_name("mail").is_none());
         assert!(missing.for_name("firefox").is_none());
         assert!(missing.for_uid(65536).is_none());
         assert!(!missing.admits(65536));

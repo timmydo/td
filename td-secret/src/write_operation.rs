@@ -129,7 +129,7 @@ mod tests {
         )
         .unwrap()
     }
-    const DECLARED: &str = "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tservice\t\n";
+    const DECLARED: &str = "td-bus-applications-v2\t1000\nmail\tservice\t\nnews\tservice\t\n";
     const LEDGER: &str = "td-accounts-v1\napplication\tmail\t65537\napplication\tnews\t65538\n";
     fn policy() -> Policy {
         Policy::from_tables(DECLARED, LEDGER).unwrap()

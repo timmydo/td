@@ -3907,29 +3907,28 @@ mod tests {
     }
 
     #[test]
-    fn personal_credential_identity_still_requires_the_broker_application_name() {
+    fn mail_and_news_credential_identities_require_their_own_accounts() {
         let policy = app_policy::Policy::from_tables(
-            "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tpersonal\t\n",
+            "td-bus-applications-v2\t1000\nmail\tservice\t\nnews\tservice\t\n",
             "td-accounts-v1\napplication\tmail\t65537\napplication\tnews\t65538\n",
         )
         .unwrap();
-        for (uid, name, expected) in [
-            (1000, Some("mail"), Some("mail")),
-            (1000, Some("news"), Some("news")),
-            (1000, None, None),
-        ] {
-            let bytes = credentials_reply(41, uid, name);
+        for (uid, name) in [(65537, "mail"), (65538, "news")] {
+            let bytes = credentials_reply(41, uid, Some(name));
             let (reply, _) = message::decode(&bytes, 0).unwrap();
             assert_eq!(
                 credentials_app_id(&reply, Some(&policy))
                     .unwrap()
                     .as_deref(),
-                expected
+                Some(name)
             );
+            let bytes = credentials_reply(41, 1000, Some(name));
+            let (reply, _) = message::decode(&bytes, 0).unwrap();
+            assert!(credentials_app_id(&reply, Some(&policy)).is_err());
         }
-        let bytes = credentials_reply(41, 65537, Some("mail"));
+        let bytes = credentials_reply(41, 1000, None);
         let (reply, _) = message::decode(&bytes, 0).unwrap();
-        assert!(credentials_app_id(&reply, Some(&policy)).is_err());
+        assert_eq!(credentials_app_id(&reply, Some(&policy)).unwrap(), None);
     }
 
     #[test]

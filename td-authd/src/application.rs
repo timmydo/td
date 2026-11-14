@@ -28,15 +28,14 @@ pub(crate) struct Check {
     uid: fn(&str) -> Result<u32, String>,
 }
 
-/// The read-only launch admission: the account an active application runs
-/// as, the human's for a personal one.
+/// The read-only launch admission: an active application's ledger account.
 const LAUNCH: Check = Check {
     what: "application",
     verb: "check-launch-application",
     words: &[],
     reply: "TD-LAUNCH-APPLICATION-CHECK-OK\t",
     deadline: Duration::from_secs(2),
-    uid: launch_uid,
+    uid: service_uid,
 };
 
 /// An install's allocation (td-authd/DESIGN.md, "Application cache
@@ -156,11 +155,7 @@ impl Request {
 
     fn helper(&self, uid: u32) -> Command {
         let mut command = Command::new("/bin/td-login");
-        if uid == self.owner {
-            command.args(["exec-primary", "--"]);
-        } else {
-            command.args(["exec-service-as", &format!("tda{uid}"), "--"]);
-        }
+        command.args(["exec-service-as", &format!("tda{uid}"), "--"]);
         command
             .args([
                 "/bin/td-authd",
@@ -178,15 +173,8 @@ impl Request {
     /// td-jail selects the application by its argv[0], so the launch needs
     /// no `/bin/APP` link.
     fn application(&self, uid: u32) -> Result<Command, String> {
-        let (home, user) = if uid == self.owner {
-            let account = crate::primary_account::load().map_err(|error| error.to_string())?;
-            (account.home(), account.name().to_owned())
-        } else {
-            (
-                format!("/var/lib/td/applications/{uid}").into(),
-                format!("tda{uid}"),
-            )
-        };
+        let home = format!("/var/lib/td/applications/{uid}");
+        let user = format!("tda{uid}");
         let mut command = Command::new("/bin/td-jail");
         command
             .arg0(&self.name)
@@ -208,14 +196,6 @@ impl Drop for CheckedChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-fn launch_uid(text: &str) -> Result<u32, String> {
-    if text == "1000" {
-        Ok(1000)
-    } else {
-        decimal(text, APPLICATION_UIDS, "application")
     }
 }
 
@@ -342,11 +322,8 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
     let uid = admit(&LAUNCH, request.owner, &request.name)?;
-    // An application's own account gets the views its grants name, before
-    // its first process; one running as the human needs none.
-    if uid != request.owner {
-        crate::grant_views::publish(Kind::Application, &request.name, uid)?;
-    }
+    // Publish only this application's explicit grants before its first process.
+    crate::grant_views::publish(Kind::Application, &request.name, uid)?;
     // No root log or inherited descriptor reaches the credential helper or
     // application.
     let error = request
@@ -375,8 +352,7 @@ pub(crate) fn bounded(path: &str) -> Result<String, String> {
 
 /// The process about to exec a workload's jail: `uid` in every column with
 /// no other group, no capability, and in its account's session leaf, the
-/// human's `td-user-1000` or the ledger account's own delegation, which
-/// td-login placed it in.
+/// ledger account's delegation, which td-login placed it in.
 pub(crate) fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
     let what = if WORKLOAD_UIDS.contains(&uid) {
         "workload"
@@ -399,7 +375,7 @@ pub(crate) fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<()
         .lines()
         .find_map(|line| line.strip_prefix("Groups:"))
         .ok_or_else(|| message(format_args!("{what} process lacks its group set")))?;
-    if uid != 1000 && groups.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str()] {
+    if groups.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str()] {
         return Err(message(format_args!(
             "{what} process has extra or missing groups"
         )));
@@ -420,13 +396,9 @@ pub(crate) fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<()
     let leaf = cgroup
         .strip_prefix("0::/")
         .and_then(|rest| rest.strip_suffix("/session\n"));
-    let inside = if uid == 1000 {
-        leaf == Some("td-user-1000")
-    } else {
-        let delegation = crate::workload_accounts::delegation(uid)
-            .ok_or("the process has no session delegation")?;
-        leaf == Some(text(format_args!("{delegation}"))?.as_str())
-    };
+    let delegation =
+        crate::workload_accounts::delegation(uid).ok_or("the process has no session delegation")?;
+    let inside = leaf == Some(text(format_args!("{delegation}"))?.as_str());
     if !inside {
         return Err(message(format_args!(
             "{what} process is outside its assigned session cgroup"
@@ -439,7 +411,7 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
     let (uid, rest) = arguments
         .split_first()
         .ok_or("application-exec requires UID and request")?;
-    let uid = launch_uid(uid)?;
+    let uid = service_uid(uid)?;
     let request = Request::parse(rest)?;
     require_process(
         uid,
@@ -462,10 +434,10 @@ mod tests {
     #[test]
     fn every_application_uid_check_is_the_ledgers_range() {
         assert_eq!(crate::consent::APPLICATION_UIDS, APPLICATION_UIDS);
-        assert_eq!(launch_uid("65536"), Ok(65536));
-        assert_eq!(launch_uid("98303"), Ok(98303));
+        assert_eq!(service_uid("65536"), Ok(65536));
+        assert_eq!(service_uid("98303"), Ok(98303));
         for text in ["65535", "98304", "131071", "2147483647"] {
-            assert!(launch_uid(text).is_err(), "{text}");
+            assert!(service_uid(text).is_err(), "{text}");
         }
     }
 
@@ -640,27 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn personal_launch_uses_the_human_helper_and_session_delegation() {
-        let request = Request::parse(&request()).unwrap();
-        let helper = request.helper(1000);
-        let args: Vec<_> = helper.get_args().map(|arg| arg.to_str().unwrap()).collect();
-        assert_eq!(
-            args.get(..3),
-            Some(["exec-primary", "--", "/bin/td-authd"].as_slice())
-        );
-        assert_eq!(
-            reply_uid(&LAUNCH, "TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n").unwrap(),
-            1000
-        );
+    fn a_human_uid_is_never_an_application_launch_identity() {
+        assert!(reply_uid(&LAUNCH, "TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n").is_err());
         let status = "Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nGroups: 1000\nCapInh: 0000000000000000\nCapPrm: 0000000000000000\nCapEff: 0000000000000000\nCapAmb: 0000000000000000\n";
-        require_process(1000, status, "0::/td-user-1000/session\n").unwrap();
-        assert!(require_process(1000, status, "0::/td-app-1000/session\n").is_err());
-        assert!(require_process(
-            1000,
-            &status.replace("Gid: 1000", "Gid: 0"),
-            "0::/td-user-1000/session\n"
-        )
-        .is_err());
+        for cgroup in ["0::/td-user-1000/session\n", "0::/td-app-1000/session\n"] {
+            assert!(require_process(1000, status, cgroup).is_err());
+            assert!(require_process(1000, &status.replace("Gid: 1000", "Gid: 0"), cgroup).is_err());
+        }
+        let mut args = vec!["1000".to_owned()];
+        args.extend(request());
+        assert!(exec(&args).is_err());
     }
 
     #[test]

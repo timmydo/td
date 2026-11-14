@@ -765,7 +765,7 @@ pub(crate) mod vm_tests {
             ("/etc/group", "tester:x:1000:\n", 0o644),
             (
                 "/etc/td-bus-applications.tsv",
-                "td-bus-applications-v2\t1000\nmail\tpersonal\t\n",
+                "td-bus-applications-v2\t1000\nmail\tservice\t\n",
                 0o444,
             ),
             (

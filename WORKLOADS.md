@@ -53,16 +53,12 @@ from the human apart from one from an escaped workload.
 prerequisite for elevation ("`td-compositor` must NOT share a uid with
 anything an application can become").
 
-The decision reverses one placement: mail and news, which now run as the
-login user (`APPLICATIONS.md` §L, "Firefox runs under external service UID
-65536"), return to their reserved accounts.
-
 ## Where things stand
 
 | Workload | Account today | Started by |
 | --- | --- | --- |
 | Firefox | `tda65536` | td-authd `application-start` |
-| mail, news | the human (1000); 65537 and 65538 stay reserved | `application-start` or the human's shell |
+| mail, news | `tda65537`, `tda65538`, each with its own fetch service | td-authd `application-start` from the launcher card |
 | td-web | `tda65540`, with a fetch service of its own; on a host, the human | `application-start` from its launcher card; on a host, `./install-apps`, unjailed |
 | td-sandbox | `tdw<uid>`, the sandbox's own, from 98304 up | `td-sandbox` → root's workspace intake → `td-jail --workspace` as the account |
 | td-agent conversation tool jails | a per-conversation `agent-N` ledger account on td; the caller on a development host | td-agent → root intake → td-login → td-jail |
@@ -82,7 +78,8 @@ Already built and reused by this design:
 - the workload grant table `/var/lib/td/grants.tsv`, root's alone,
   whose directory rows keyed by account td-authd publishes as idmapped
   views at each application launch and lists in the account's manifest,
-  seeded once with Firefox's writable Downloads (td-authd/DESIGN.md,
+  seeded once with Firefox's and mail's writable Downloads and each of
+  mail and news's own human-editable configuration directory (td-authd/DESIGN.md,
   "Workload grant table" and "Application filesystem grants";
   `UNSAFE.md` §16); td-jail binds only the views a manifest lists, each
   compared with the identity td-authd published it by, one derivation
@@ -213,8 +210,7 @@ guarantees. An application is allocated when td-software installs it, not
 when the image declares it.
 
 The uids the image reserves today carry over as rows already present:
-Firefox 65536 and td-web 65540, and mail 65537 and news 65538, which
-return to use. A
+Firefox 65536 and td-web 65540, and mail 65537 and news 65538, in active use. A
 workload's kind and name join the ledger to its policy: an application's
 reviewed declaration in the image, or the grants the human made for a
 sandbox or workspace. So the bus broker and td-portal take an
@@ -275,7 +271,10 @@ Everything a workload reaches outside its runtime and home is a grant:
   format's, which td-agent reads. One account's directories do not nest,
   and a path holds no control or bidirectional format character. A row a
   later deployment's rules refuse is kept inert, listed and revocable but
-  never published, rather than failing the whole table;
+  never published, rather than failing the whole table. The exact
+  `.config/td-mail` and `.config/td-news` directories are exceptions only
+  for application `mail` and `news`, respectively. Parents, descendants
+  and other accounts receive no exception; these views remain noexec;
 - **a socket**: Wayland, the fetch service, and others named per grant;
 - **network**: `off` or `host`: one
   row per sandbox or workspace account, which the human sets as a
@@ -488,7 +487,11 @@ own account.
    a scratch workspace on the existing unconfined path, as the human
    with no jail or ledger slot, after its explicit confirmation).
 9. mail and news on their reserved rows, with fetch services of their
-   own as td-web has (td-web/DESIGN.md §3).
+   own (landed). Human-editable configuration stays under `.config/td-mail`
+   and `.config/td-news`, through explicit application-scoped grants.
+   Firstboot imports active human state once, retaining any older private
+   home in a root-only archive (td-authd/DESIGN.md, "Application state
+   preparation").
 10. td-software's runtime view (its folders panel landed with step 6).
 
 ## Open questions

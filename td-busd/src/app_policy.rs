@@ -44,8 +44,6 @@ pub struct Rule {
 /// The account a declared application runs as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
-    /// The session's human (td's mail and news).
-    Personal,
     /// Its own account: the ledger's application row of its name.
     Service,
 }
@@ -53,7 +51,6 @@ pub enum Class {
 impl Class {
     fn parse(text: &str) -> Option<Self> {
         match text {
-            "personal" => Some(Self::Personal),
             "service" => Some(Self::Service),
             _ => None,
         }
@@ -61,7 +58,6 @@ impl Class {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Personal => "personal",
             Self::Service => "service",
         }
     }
@@ -197,7 +193,7 @@ struct Source {
 }
 
 /// The declarations joined with the ledger's application rows. A uid comes
-/// only from the ledger; a personal application runs as the session owner.
+/// only from the ledger; the session owner is never an application uid.
 ///
 /// Ledger rows are appended and never reassigned, so a copy read earlier is
 /// a correct subset of the published ledger. A loaded policy therefore keeps
@@ -297,10 +293,7 @@ impl Policy {
             |ledger| ledger.name(Kind::Application, uid).map(str::to_string),
             workload_accounts::APPLICATION_UIDS.contains(&uid),
         )?;
-        let row = self
-            .declarations
-            .row(&name)
-            .filter(|row| row.class == Class::Service)?;
+        let row = self.declarations.row(&name)?;
         Some(Rule {
             uid,
             application: name,
@@ -311,10 +304,7 @@ impl Policy {
     /// The declared application `name` at the uid it runs as.
     pub fn for_name(&self, name: &str) -> Option<Rule> {
         let row = self.declarations.row(name)?;
-        let uid = match row.class {
-            Class::Personal => self.owner(),
-            Class::Service => self.account(name)?,
-        };
+        let uid = self.account(name)?;
         Some(Rule {
             uid,
             application: name.into(),
@@ -593,22 +583,21 @@ mod tests {
     }
 
     #[test]
-    fn personal_applications_share_the_human_uid_but_keep_distinct_registered_names() {
-        let policy = policy(
-            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tpersonal\t\nnews\tpersonal\t\n",
-        );
+    fn mail_and_news_never_register_as_the_human() {
+        let declared =
+            "td-bus-applications-v2\t1000\nfirefox\tservice\t\nmail\tservice\t\nnews\tservice\t\n";
+        let policy = policy(declared);
+        assert!(Declarations::parse(&declared.replace("mail\tservice", "mail\tpersonal")).is_err());
+        assert!(Declarations::parse(&declared.replace("news\tservice", "news\tpersonal")).is_err());
         assert!(policy.for_uid(1000).is_none());
-        // A personal application's ledger row is its account, not the uid
-        // it runs as.
-        assert!(policy.for_uid(65537).is_none());
+        assert_eq!(policy.for_uid(65537).unwrap().application, "mail");
         assert_eq!(policy.account("mail"), Some(65537));
         assert_eq!(policy.account("news"), None);
-        for app in ["mail", "news"] {
-            policy.registration(1000, app, &[], &[]).unwrap();
-            assert!(policy.registration(65537, app, &[], &[]).is_err());
+        policy.registration(65537, "mail", &[], &[]).unwrap();
+        for app in ["mail", "news", "firefox", "absent"] {
+            assert!(policy.registration(1000, app, &[], &[]).is_err());
         }
-        assert!(policy.registration(1000, "firefox", &[], &[]).is_err());
-        assert!(policy.registration(1000, "absent", &[], &[]).is_err());
+        assert!(policy.registration(65537, "news", &[], &[]).is_err());
     }
 
     #[test]

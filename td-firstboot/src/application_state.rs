@@ -404,6 +404,156 @@ fn validate(application: &str, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// A root-only receipt for the mail/news return from human-owned state.
+/// The old private home may predate the active human tree. Preserve it whole
+/// under a root-only archive and prefer the active tree, never merge them.
+/// `prepared` is durable before home creation; `done` is durable after it.
+/// A crash after the archive rename is recognized by the archive itself.
+fn personal_transition(
+    place: &Place,
+    base: &File,
+    name: &str,
+    purpose: Purpose,
+    account: Owner,
+) -> io::Result<Option<File>> {
+    let Purpose::Application {
+        application: application @ ("mail" | "news"),
+        former: Some(former),
+    } = purpose
+    else {
+        return Ok(None);
+    };
+    let (ids, root) = (place.ids, place.root);
+    let transitions = root_child(ids, base, ".mail-news-transition", 0o700, root)?;
+    let receipt = root_child(ids, &transitions, application, 0o700, root)?;
+    if receipt_exists(ids, &receipt, "done", root)? {
+        return Ok(Some(receipt));
+    }
+    if !receipt_exists(ids, &receipt, "prepared", root)? {
+        if !exists(&at(&receipt, "previous-home"))? {
+            let source = legacy_parent(ids, former)?;
+            if let Some(source) = source {
+                match directory(&at(&source, application)) {
+                    Ok(old) => {
+                        let owner = (former.uid, former.gid);
+                        if !matches_owner(ids, &old.metadata()?, owner) {
+                            return Err(invalid("legacy application root has another owner"));
+                        }
+                        walk(
+                            ids,
+                            &old,
+                            owner,
+                            account,
+                            base.metadata()?.dev(),
+                            0,
+                            &mut { MAX_ENTRIES },
+                            false,
+                        )?;
+                        match directory(&at(base, name)) {
+                            Ok(previous) => {
+                                let metadata = previous.metadata()?;
+                                if !matches_owner(ids, &metadata, account)
+                                    && !matches_owner(ids, &metadata, root)
+                                {
+                                    return Err(invalid(
+                                        "previous application home has another owner",
+                                    ));
+                                }
+                                fs::rename(at(base, name), at(&receipt, "previous-home"))?;
+                                receipt.sync_all()?;
+                                base.sync_all()?;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        write_receipt(ids, &receipt, "prepared", root)?;
+    }
+    Ok(Some(receipt))
+}
+
+fn receipt_exists(ids: &dyn Ownership, parent: &File, name: &str, root: Owner) -> io::Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | NONBLOCK)
+        .open(at(parent, name))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || !matches_owner(ids, &metadata, root)
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(invalid("invalid application transition receipt"));
+    }
+    Ok(true)
+}
+
+fn write_receipt(ids: &dyn Ownership, parent: &File, name: &str, root: Owner) -> io::Result<()> {
+    if !receipt_exists(ids, parent, name, root)? {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW)
+            .open(at(parent, name))?;
+        file.sync_all()?;
+        parent.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Before completing the transition, take pre-cutover private configuration
+/// out of the jail's fallback config mount. Missing/revoked human grants must
+/// not reveal old settings or plaintext passwords. Preserve the directory
+/// whole under the root-only receipt; a crash after rename resumes with no
+/// source, and never overwrites an archive.
+fn finish_transition(
+    place: &Place,
+    private: &File,
+    purpose: Purpose,
+    receipt: &File,
+) -> io::Result<()> {
+    if receipt_exists(place.ids, receipt, "done", place.root)? {
+        return Ok(());
+    }
+    let Purpose::Application { application, .. } = purpose else {
+        return Err(invalid("only an application has a state transition"));
+    };
+    let mut parent = private.try_clone()?;
+    for name in [".td", "app", application] {
+        parent = match directory(&at(&parent, name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return write_receipt(place.ids, receipt, "done", place.root);
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    if exists(&at(&parent, "config"))? {
+        // A symlink, file or other malformed config is refused as the jail's
+        // state preparation would refuse it. No path below it is followed.
+        let _config = directory(&at(&parent, "config"))?;
+        if exists(&at(receipt, "previous-config"))? {
+            return Err(invalid("both private configuration and its archive exist"));
+        }
+        fs::rename(at(&parent, "config"), at(receipt, "previous-config"))?;
+        receipt.sync_all()?;
+        parent.sync_all()?;
+    }
+    write_receipt(place.ids, receipt, "done", place.root)
+}
+
 /// The private home of `place` that `purpose` names, published to `account`
 /// once complete: an application's with its `.td/app/APP`, and `former`'s
 /// state moved into it when there is one; a workload's empty. Only
@@ -418,6 +568,18 @@ fn home(place: &Place, purpose: Purpose, account: Owner, fresh: bool) -> Result<
             Purpose::Workload => None,
         };
         let name = account.0.to_string();
+        let transition = personal_transition(place, &base, &name, purpose, account)?;
+        let purpose = match (purpose, &transition) {
+            (Purpose::Application { application, .. }, Some(receipt))
+                if receipt_exists(ids, receipt, "done", root)? =>
+            {
+                Purpose::Application {
+                    application,
+                    former: None,
+                }
+            }
+            _ => purpose,
+        };
         match directory(&at(&base, &name)) {
             Ok(_) if fresh => {
                 return Err(invalid("a new account's home already exists"));
@@ -432,6 +594,9 @@ fn home(place: &Place, purpose: Purpose, account: Owner, fresh: bool) -> Result<
                     if metadata.mode() & 0o7777 != 0o700 {
                         existing.set_permissions(Permissions::from_mode(0o700))?;
                         existing.sync_all()?;
+                    }
+                    if let Some(receipt) = &transition {
+                        finish_transition(place, &existing, purpose, receipt)?;
                     }
                     return Ok(());
                 }
@@ -464,7 +629,11 @@ fn home(place: &Place, purpose: Purpose, account: Owner, fresh: bool) -> Result<
         // root-owned barrier. Interrupted conversion stays inaccessible.
         ids.give(&private, account)?;
         private.sync_all()?;
-        base.sync_all()
+        base.sync_all()?;
+        if let Some(receipt) = &transition {
+            finish_transition(place, &private, purpose, receipt)?;
+        }
+        Ok(())
     })();
     result.map_err(|error| match purpose {
         Purpose::Application { application, .. } => {
@@ -881,6 +1050,183 @@ mod tests {
         fn owner(&self, path: &Path) -> Owner {
             self.ids.of(&fs::symlink_metadata(path).unwrap())
         }
+    }
+
+    #[test]
+    fn mail_and_news_prefer_active_human_state_and_archive_the_old_home_once() {
+        for application in ["mail", "news"] {
+            let homes = Homes::new();
+            homes.create(false).unwrap();
+            let old = homes.home().join("old-record");
+            homes.record(&old, homes.account);
+            let current = homes.legacy(application);
+            fs::write(&current, b"current").unwrap();
+            homes.boot(application, 65537).unwrap();
+            let active = homes
+                .home()
+                .join(".td/app")
+                .join(application)
+                .join("record");
+            assert_eq!(fs::read(&active).unwrap(), b"current");
+            assert_eq!(homes.ids.of(&fs::metadata(&active).unwrap()), homes.account);
+            assert!(!current.exists());
+            let transition = homes
+                .temp
+                .path()
+                .join("applications/.mail-news-transition")
+                .join(application);
+            assert_eq!(
+                fs::read(transition.join("previous-home/old-record")).unwrap(),
+                b"the human's"
+            );
+            assert_eq!(fs::metadata(&transition).unwrap().mode() & 0o7777, 0o700);
+            assert!(transition.join("prepared").is_file());
+            assert!(transition.join("done").is_file());
+            // A later human recreation cannot replace the application's state.
+            homes.left(current.parent().unwrap(), HUMAN);
+            homes.record(&current, HUMAN);
+            homes.boot(application, 65537).unwrap();
+            assert_eq!(fs::read(&active).unwrap(), b"current");
+            assert!(current.exists());
+            // Even losing the private home after completion does not import it again.
+            fs::remove_dir_all(homes.home()).unwrap();
+            homes.boot(application, 65537).unwrap();
+            assert!(!active.exists());
+            assert!(current.exists());
+        }
+    }
+
+    #[test]
+    fn mail_transition_resumes_after_archive_and_after_preparation() {
+        for prepared in [false, true] {
+            let homes = Homes::new();
+            homes.create(false).unwrap();
+            let current = homes.legacy("mail");
+            let base = root_chain(&homes.place(), "applications").unwrap();
+            let transitions =
+                root_child(&homes.ids, &base, ".mail-news-transition", 0o700, ROOT).unwrap();
+            let receipt = root_child(&homes.ids, &transitions, "mail", 0o700, ROOT).unwrap();
+            fs::rename(homes.home(), at(&receipt, "previous-home")).unwrap();
+            if prepared {
+                write_receipt(&homes.ids, &receipt, "prepared", ROOT).unwrap();
+                homes.left(&homes.home(), ROOT);
+            }
+            homes.boot("mail", 65537).unwrap();
+            assert!(!current.exists());
+            assert!(homes.home().join(".td/app/mail/record").is_file());
+            assert!(at(&receipt, "previous-home/.td/app/photo").is_dir());
+            assert!(receipt_exists(&homes.ids, &receipt, "done", ROOT).unwrap());
+        }
+    }
+
+    #[test]
+    fn malformed_active_state_is_refused_before_archiving_the_old_home() {
+        let homes = Homes::new();
+        homes.create(false).unwrap();
+        let current = homes.legacy("mail");
+        fs::hard_link(&current, current.with_file_name("linked")).unwrap();
+        assert!(homes.boot("mail", 65537).is_err());
+        assert!(homes.home().join(".td/app/photo").is_dir());
+        assert!(current.exists());
+        assert!(!homes
+            .temp
+            .path()
+            .join("applications/.mail-news-transition/mail/previous-home")
+            .exists());
+    }
+
+    #[test]
+    fn old_private_configuration_never_becomes_a_fallback_for_a_missing_grant() {
+        for migrated in [false, true] {
+            let homes = Homes::new();
+            home(
+                &homes.place(),
+                Purpose::Application {
+                    application: "mail",
+                    former: None,
+                },
+                homes.account,
+                false,
+            )
+            .unwrap();
+            let (application, owner) = if migrated {
+                let record = homes.legacy("mail");
+                (record.parent().unwrap().to_path_buf(), HUMAN)
+            } else {
+                (homes.home().join(".td/app/mail"), homes.account)
+            };
+            let config = application.join("config");
+            homes.left(&config, owner);
+            homes.left(&config.join("td-mail"), owner);
+            homes.record(&config.join("td-mail/config.toml"), owner);
+            homes.record(&config.join("td-mail/mail.password"), owner);
+            homes.boot("mail", 65537).unwrap();
+            let config = homes.home().join(".td/app/mail/config");
+            assert!(
+                !config.exists(),
+                "private fallback survived, migrated={migrated}"
+            );
+            let archive = homes
+                .temp
+                .path()
+                .join("applications/.mail-news-transition/mail/previous-config/td-mail");
+            assert_eq!(
+                fs::read(archive.join("mail.password")).unwrap(),
+                b"the human's"
+            );
+            assert_eq!(
+                fs::read(archive.join("config.toml")).unwrap(),
+                b"the human's"
+            );
+            homes.boot("mail", 65537).unwrap();
+            assert!(!config.exists());
+            // A post-cutover private config belongs to the application: boot
+            // must not repeatedly archive or overwrite it.
+            homes.left(&config, homes.account);
+            homes.record(&config.join("new"), homes.account);
+            homes.boot("mail", 65537).unwrap();
+            assert!(config.join("new").is_file());
+            assert!(archive.join("mail.password").is_file());
+        }
+    }
+
+    #[test]
+    fn configuration_archive_resumes_before_the_completion_receipt() {
+        let homes = Homes::new();
+        home(
+            &homes.place(),
+            Purpose::Application {
+                application: "news",
+                former: None,
+            },
+            homes.account,
+            false,
+        )
+        .unwrap();
+        let config = homes.home().join(".td/app/news/config");
+        homes.left(&config, homes.account);
+        homes.record(&config.join("old"), homes.account);
+        let base = root_chain(&homes.place(), "applications").unwrap();
+        let receipt = personal_transition(
+            &homes.place(),
+            &base,
+            &homes.account.0.to_string(),
+            Purpose::Application {
+                application: "news",
+                former: Some(&homes.human),
+            },
+            homes.account,
+        )
+        .unwrap()
+        .unwrap();
+        fs::rename(&config, at(&receipt, "previous-config")).unwrap();
+        homes.boot("news", 65538).unwrap();
+        assert!(!config.exists());
+        assert_eq!(
+            fs::read(at(&receipt, "previous-config/old")).unwrap(),
+            b"the human's"
+        );
+        assert!(receipt_exists(&homes.ids, &receipt, "done", ROOT).unwrap());
     }
 
     /// An install's home is empty and the account's alone; a reinstall finds

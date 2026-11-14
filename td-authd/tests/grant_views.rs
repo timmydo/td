@@ -13,7 +13,12 @@ fn table_grants(
     mountinfo: &str,
     home: &Path,
 ) -> Result<Vec<Grant>, String> {
-    grants_for(table.directories(kind, name), kind, mountinfo, home)
+    grants_for(
+        table.directories(kind, name),
+        grants::ViewPolicy::for_account(kind, name),
+        mountinfo,
+        home,
+    )
 }
 
 fn owner(path: &Path) -> (u32, u32) {
@@ -348,7 +353,7 @@ fn grant(access: Access, path: &str) -> Grant {
         access,
         path: path.into(),
         identity: identity("0:19", &format!("/@var/home/alice/{path}")),
-        kind: Kind::Application,
+        policy: grants::ViewPolicy::for_kind(Kind::Application),
         executable: false,
     }
 }
@@ -429,7 +434,7 @@ impl Host for Fake {
     fn source(&mut self, grant: &Grant) -> Result<Found<(String, u64)>, String> {
         let path = grant.path.as_str();
         self.calls.push(format!("source {path}"));
-        grants::validate_view(grant.kind, grant.access, path.as_bytes())?;
+        grant.policy.validate(grant.access, path.as_bytes())?;
         if grant.executable && self.noexec.iter().any(|name| name == path) {
             return Err("its mount is noexec".into());
         }
@@ -503,8 +508,30 @@ impl Host for Fake {
 
 fn run(host: &mut Fake, grants: &[Grant]) -> Result<(), String> {
     host.grants = grants.to_vec();
-    let kind = grants.first().map_or(Kind::Application, |grant| grant.kind);
-    reconcile(host, kind, UID, grants).map(drop)
+    let policy = grants
+        .first()
+        .map_or(grants::ViewPolicy::for_kind(Kind::Application), |grant| {
+            grant.policy
+        });
+    reconcile(host, policy, UID, grants).map(drop)
+}
+
+#[test]
+fn configuration_publication_keeps_the_application_identity_through_reconciliation() {
+    for (name, path) in [("mail", ".config/td-mail"), ("news", ".config/td-news")] {
+        let table = Table::seeded()
+            .grant(Kind::Application, name, Access::ReadWrite, path)
+            .unwrap()
+            .0;
+        let grants = table_grants(&table, Kind::Application, name, STOCK, Path::new(HOME)).unwrap();
+        assert_eq!(grants.len(), 1);
+        let mut host = Fake::new(&[(path, 11)]);
+        run(&mut host, &grants).unwrap();
+        let wrong = if name == "mail" { "news" } else { "mail" };
+        let mut wrong_grants = grants.clone();
+        wrong_grants[0].policy = grants::ViewPolicy::for_account(Kind::Application, wrong);
+        assert!(run(&mut host, &wrong_grants).is_err());
+    }
 }
 
 /// A first launch publishes every present source from index 0 and lists
@@ -694,7 +721,7 @@ fn a_workspaces_plan_publishes_td_agents_own_trees_only_for_it() {
     let repository = ".local/share/td-agent/ws/w-01234567/td.git";
     let objects = ".local/share/td-agent/store/local-x-0123456789abcdef.git/objects";
     let workspace = |access, path: &str| Grant {
-        kind: Kind::Workspace,
+        policy: grants::ViewPolicy::for_kind(Kind::Workspace),
         executable: true,
         ..grant(access, path)
     };
@@ -715,7 +742,7 @@ fn a_workspaces_plan_publishes_td_agents_own_trees_only_for_it() {
         workspace(Access::ReadOnly, repository),
         grant(Access::ReadWrite, repository),
         Grant {
-            kind: Kind::Sandbox,
+            policy: grants::ViewPolicy::for_kind(Kind::Sandbox),
             executable: true,
             ..grant(Access::ReadWrite, repository)
         },
@@ -771,7 +798,7 @@ fn a_published_view_that_shows_something_else_refuses() {
     host.0.grants = vec![downloads.clone()];
     assert!(reconcile(
         &mut host,
-        Kind::Application,
+        grants::ViewPolicy::for_kind(Kind::Application),
         UID,
         std::slice::from_ref(&downloads)
     )

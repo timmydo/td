@@ -67,15 +67,15 @@ and an amendment to this section; it is out of scope.
 td-web runs under its own external service account, not as the login
 user: the browsing it does, and the state a later cookie jar keeps, stay
 outside the human's UID domain, as Firefox's do. Its registry name is
-`web`, its account `tda65540`, its external UID 65540 (the first not
-reserved; 65537-65539 stay reserved, APPLICATIONS.md §L), the workload
+`web`, its account `tda65540`, its external UID 65540 (mail uses 65537, news 65538, and 65539 remains
+reserved, APPLICATIONS.md §L), the workload
 account ledger's carried row (td-authd/DESIGN.md, "Workload account
 ledger"), its home `/var/lib/td/applications/65540`. Inside its jail it is UID 1000, as
 every application is.
 
 It is a `ShippedApplication` on `static-runtime`, packaged by the `web`
 recipe from the `td-web` recipe's static binary with its debug
-companion, like mail and news, but not run as the login user: it has no
+companion, like mail and news: it has no
 `/bin` name and no terminal starts it. Its launcher card ("Web"; found
 by web, browser, www or td-web; app id `td-web`) asks root to start
 td-svc's `[web]` unit, which runs `td-authd application-start 1000 web
@@ -317,8 +317,8 @@ which would want `renameat2` or `linkat`.
 socket only from its own runtime directory, owned by its own UID
 (td-jail `sockets=fetch`). td-web therefore has its own `td-fetchd`,
 td-svc's `[web-fetch]`, run as `tda65540` with its socket at
-`/run/user/65540/td-fetch/socket`, as mail's and news's were before
-they joined the login user; `[web]` requires it. It runs on every boot,
+`/run/user/65540/td-fetch/socket`, as mail and news each have their own
+under 65537 and 65538; `[web]` requires it. It runs on every boot,
 not on demand: a unit skipped by `unless-exists=` settles ready, which
 would satisfy `[web]`'s requirement with no socket behind it.
 td-firstboot prepares the account's home and its `/run/user/65540`, as

@@ -449,6 +449,8 @@ const TERMINAL_APPLICATION_WORKSPACE: u8 = 2;
 /// td-web's service account (td-web/DESIGN.md §3), which its fetch
 /// service's unit names as well as its registry row.
 const WEB_UID: u32 = 65540;
+const MAIL_UID: u32 = 65537;
+const NEWS_UID: u32 = 65538;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     ShippedApplication {
@@ -461,14 +463,13 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     },
     // The source-built applications: td-owned static programs on the
     // data-only runtime, each a td-ui window of its own. None holds a bus
-    // name; the tripwire below counts the applications that do. Mail and
-    // news run as the login user (`Class::Personal`); web, td's own browser,
-    // under its own service account, as Firefox does (td-web/DESIGN.md §3).
+    // name; the tripwire below counts the applications that do. Each runs
+    // under its own ledger account with a private fetch service.
     ShippedApplication {
         name: TD_MAIL_NAME,
         package: TD_MAIL_NAME,
         package_recipe: super::mail::recipe,
-        class: Class::Personal,
+        class: Class::Service,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -476,7 +477,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: TD_NEWS_NAME,
         package: TD_NEWS_NAME,
         package_recipe: super::news::recipe,
-        class: Class::Personal,
+        class: Class::Service,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -1577,6 +1578,8 @@ const TD_SVC_UNITS: &[&str] = &[
     "busd",
     "fetchd",
     "egressd",
+    "mail-fetch",
+    "news-fetch",
     "web-fetch",
     "fetch-evidence",
     "portal-files",
@@ -2208,6 +2211,26 @@ fn build_desktop_td_svc_conf() -> String {
          # runs as that account and shares nothing with the human's fetchd.\n\
          # Every boot, not on demand: the launcher's start of [web] requires\n\
          # it running, and a skipped unit would satisfy that with no socket.\n\
+         [mail-fetch]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-service-as tda{mail_uid} -- /bin/td-fetchd run --socket /run/user/{mail_uid}/td-fetch/socket\n\
+         after=td-firstboot,netup\n\
+         requires=td-firstboot\n\
+         ready=/bin/td-login exec-service-as tda{mail_uid} -- /bin/td-fetchd probe /run/user/{mail_uid}/td-fetch/socket\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
+         [news-fetch]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-service-as tda{news_uid} -- /bin/td-fetchd run --socket /run/user/{news_uid}/td-fetch/socket\n\
+         after=td-firstboot,netup\n\
+         requires=td-firstboot\n\
+         ready=/bin/td-login exec-service-as tda{news_uid} -- /bin/td-fetchd probe /run/user/{news_uid}/td-fetch/socket\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
          [web-fetch]\n\
          type=daemon\n\
          cgroup=session\n\
@@ -2384,8 +2407,8 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/td-authd application-start {ui_uid} {mail_name} direct --\n\
-         after=busd,portal,fetchd,applications-workspace,firefox-tls-setup\n\
-         requires=wayland,busd,fetchd,td-firstboot\n\
+         after=busd,portal,mail-fetch,applications-workspace,firefox-tls-setup\n\
+         requires=wayland,busd,mail-fetch,td-firstboot\n\
          ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{mail_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -2402,7 +2425,7 @@ fn build_desktop_td_svc_conf() -> String {
          [mail-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {mail_name} {mail_name} && /bin/echo {mail_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda{mail_uid} -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/td-login exec-service-as tda{mail_uid} -- /bin/td-jail --probe-application-filter {mail_name} {mail_name} && /bin/echo {mail_marker}'\n\
          after=mail,firefox-tls-setup\n\
          requires=mail\n\
          timeout={application_evidence}\n\
@@ -2417,8 +2440,8 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/td-authd application-start {ui_uid} {news_name} direct --\n\
-         after=busd,fetchd,applications-workspace\n\
-         requires=wayland,busd,fetchd,td-firstboot\n\
+         after=busd,news-fetch,applications-workspace\n\
+         requires=wayland,busd,news-fetch,td-firstboot\n\
          ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{news_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -2427,7 +2450,7 @@ fn build_desktop_td_svc_conf() -> String {
          [news-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {news_name} {news_name} && /bin/echo {news_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda{news_uid} -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/td-login exec-service-as tda{news_uid} -- /bin/td-jail --probe-application-filter {news_name} {news_name} && /bin/echo {news_marker}'\n\
          after=news,firefox-tls-setup\n\
          requires=news\n\
          timeout={application_evidence}\n\
@@ -2817,6 +2840,8 @@ fn build_desktop_td_svc_conf() -> String {
         news_program = entry_program(TD_NEWS_ENTRY),
         web_name = TD_WEB_NAME,
         web_program = entry_program(TD_WEB_ENTRY),
+        mail_uid = MAIL_UID,
+        news_uid = NEWS_UID,
         web_uid = WEB_UID,
         window_record = WINDOW_RECORD,
         focused_record = FOCUSED_WINDOW_RECORD,
@@ -4809,36 +4834,6 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
         .collect()
 }
 
-/// td's own source-built mail and news clients run as the login user, not
-/// a service account (APPLICATIONS.md §D); every other application, td's
-/// own web browser among them (td-web/DESIGN.md §3), runs as its own
-/// ledger account.
-fn runs_as_human(application: &ShippedApplication) -> bool {
-    application.class == Class::Personal
-}
-
-/// The applications with a `/bin/NAME` link to td-jail: those the
-/// deployment runs as the login user, whose shell is then the account
-/// td-jail requires, so the session starts them from its terminal
-/// (APPLICATIONS.md §A.0). A service-account application gets none; a
-/// shell could only reach td-jail's refusal.
-fn application_bin_links(sys: &SystemDef) -> Vec<&'static str> {
-    sys.applications
-        .iter()
-        .filter(|application| runs_as_human(application))
-        .map(|application| application.name)
-        .collect()
-}
-
-/// The applications that must have no `/bin` entry at all.
-fn unlinked_application_names(sys: &SystemDef) -> Vec<&'static str> {
-    let links = application_bin_links(sys);
-    application_names(sys)
-        .into_iter()
-        .filter(|name| !links.contains(name))
-        .collect()
-}
-
 fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
     let mut inputs: Vec<&str> = sys
         .applications
@@ -5867,16 +5862,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    // td-authd's supervised launch execs /bin/td-jail with the application's
-    // name as argv[0]; only an application the login user runs has a /bin
-    // name, since for any other a shell would only reach td-jail's refusal
-    // (APPLICATIONS.md §A.0).
-    for name in application_bin_links(sys) {
-        steps.push(Step::Symlink {
-            target: "/bin/td-jail".into(),
-            link: format!("{{root}}/real-root/bin/{name}"),
-        });
-    }
+    // Application launches go through root; a human shell has no direct
+    // /bin/APP route to td-jail.
+
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
     // OPERAND's name (`/init`), so argv[0]'s basename is `init` and the multicall dispatches
     // to the init applet exactly as a /bin/<applet> symlink would — the symlink's TARGET
@@ -6397,9 +6385,6 @@ fn shape_check(sys: &SystemDef) -> String {
      @DESKTOP{@\
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
-     for a in @APPLICATION_LINKS@; do \
-         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
-     done; \
      for a in @UNLINKED_APPLICATIONS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but td-authd starts $a by argv[0] and a shell launch would only be refused\" >&2; exit 1; fi; \
      done; \
@@ -6511,10 +6496,9 @@ fn shape_check(sys: &SystemDef) -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
-        .replace("@APPLICATION_LINKS@", &application_bin_links(sys).join(" "))
         .replace(
             "@UNLINKED_APPLICATIONS@",
-            &unlinked_application_names(sys).join(" "),
+            &application_names(sys).join(" "),
         )
         .replace("@TD_SVC_UNITS@", &td_svc_units(sys).join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
@@ -8642,9 +8626,9 @@ mod tests {
             assert_eq!(
                 unit_key(unit, "requires").as_deref(),
                 Some(if name == "mail" {
-                    "wayland,busd,fetchd,td-firstboot"
+                    "wayland,busd,mail-fetch,td-firstboot"
                 } else {
-                    "wayland,busd,fetchd,td-firstboot"
+                    "wayland,busd,news-fetch,td-firstboot"
                 }),
                 "{unit}"
             );
@@ -8658,21 +8642,22 @@ mod tests {
                     vec![
                         "busd",
                         "portal",
-                        "fetchd",
+                        "mail-fetch",
                         "applications-workspace",
                         "firefox-tls-setup",
                     ]
                 } else {
-                    vec!["busd", "fetchd", "applications-workspace"]
+                    vec!["busd", "news-fetch", "applications-workspace"]
                 },
                 "{unit}"
             );
+            let uid = if name == "mail" { MAIL_UID } else { NEWS_UID };
             let evidence = format!("{unit}-evidence");
             let exec = unit_key(&evidence, "exec").unwrap_or_default();
             assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
             assert!(
                 exec.contains(&format!(
-                    "/bin/td-jail --probe-process-token {name} {program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {name} {name} && /bin/echo {marker}'"
+                    "/bin/td-jail --probe-process-token {name} {program} && /bin/td-login exec-service-as tda{uid} -- /bin/td-jail --probe-application-filter {name} {name} && /bin/echo {marker}'"
                 )),
                 "{exec}"
             );
@@ -8773,17 +8758,19 @@ mod tests {
             unit_after("web-evidence"),
             vec![TD_WEB_NAME, "firefox-tls-setup"]
         );
-        for (key, value) in [
+        for (name, uid) in [("mail", MAIL_UID), ("news", NEWS_UID), ("web", WEB_UID)] {
+            let fetch = format!("{name}-fetch");
+            for (key, value) in [
             (
                 "exec",
                 format!(
-                    "/bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-fetchd run --socket /run/user/{WEB_UID}/td-fetch/socket"
+                    "/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket"
                 ),
             ),
             (
                 "ready",
                 format!(
-                    "/bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-fetchd probe /run/user/{WEB_UID}/td-fetch/socket"
+                    "/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd probe /run/user/{uid}/td-fetch/socket"
                 ),
             ),
             ("type", "daemon".into()),
@@ -8792,14 +8779,15 @@ mod tests {
             ("requires", "td-firstboot".into()),
         ] {
             assert_eq!(
-                unit_key("web-fetch", key).as_deref(),
+                unit_key(&fetch, key).as_deref(),
                 Some(value.as_str()),
                 "{key}"
             );
         }
-        // Not on demand: a skipped service would satisfy [web]'s requires=
-        // with no socket behind it.
-        assert_eq!(unit_key("web-fetch", "unless-exists"), None);
+            // Not on demand: a skipped service would satisfy [web]'s requires=
+            // with no socket behind it.
+            assert_eq!(unit_key(&fetch, "unless-exists"), None);
+        }
         let exec = unit_key("placement-evidence", "exec").unwrap_or_default();
         assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
         assert!(
@@ -8996,7 +8984,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            jail.contains("views: granted_views(mountinfo, &state.real_home, &reserved_mounts)?,")
+            jail.contains("views: granted_views(\n                state.view_policy,\n                mountinfo,\n                &state.real_home,\n                &reserved_mounts,\n            )?,")
         );
         assert!(!jail.contains("Some(\"firefox\") => \"Downloads\""));
     }
@@ -10204,14 +10192,16 @@ mod tests {
                 vec![
                     "busd",
                     "portal",
-                    "fetchd",
+                    "mail-fetch",
                     "applications-workspace",
                     "firefox-tls-setup",
                 ],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
-            ("news", vec!["busd", "fetchd", "applications-workspace"]),
+            ("news", vec!["busd", "news-fetch", "applications-workspace"]),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
+            ("mail-fetch", vec!["td-firstboot", "netup"]),
+            ("news-fetch", vec!["td-firstboot", "netup"]),
             ("web-fetch", vec!["td-firstboot", "netup"]),
             ("web", vec!["busd", "web-fetch", "applications-workspace"]),
             ("web-evidence", vec!["web", "firefox-tls-setup"]),
@@ -10619,11 +10609,8 @@ mod tests {
         for application in SYSTEM.applications {
             let rule = policy.for_name(application.name).unwrap();
             let account = policy.account(application.name).unwrap();
-            let expected_uid = match application.class {
-                Class::Personal => UI_UID,
-                Class::Service => account,
-            };
-            assert_eq!(rule.uid, expected_uid);
+            assert_eq!(rule.uid, account);
+            assert_ne!(rule.uid, UI_UID);
             assert_eq!(rule.application, application.name);
             let permissions = (application.package_recipe)()
                 .application_permissions
@@ -11802,11 +11789,8 @@ mod tests {
             .collect();
         assert_eq!(
             shipped_links,
-            vec![
-                format!("{{root}}/real-root/bin/{TD_MAIL_NAME}"),
-                format!("{{root}}/real-root/bin/{TD_NEWS_NAME}"),
-            ],
-            "only the applications the login user runs have a /bin name"
+            Vec::<String>::new(),
+            "all applications launch under their own accounts through root"
         );
 
         assert_eq!(SYSTEM.applications.len(), 4);
@@ -12476,19 +12460,11 @@ mod tests {
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
         let shape = shape_check(&SYSTEM);
         assert_eq!(
-            application_bin_links(&SYSTEM),
-            vec![TD_MAIL_NAME, TD_NEWS_NAME]
-        );
-        assert_eq!(
-            unlinked_application_names(&SYSTEM),
-            vec![FIREFOX_NAME, TD_WEB_NAME]
+            application_names(&SYSTEM),
+            vec![FIREFOX_NAME, TD_MAIL_NAME, TD_NEWS_NAME, TD_WEB_NAME]
         );
         assert!(shape.contains(&format!(
-            "for a in {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
-             [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"
-        )));
-        assert!(shape.contains(&format!(
-            "for a in {FIREFOX_NAME} {TD_WEB_NAME}; do \
+            "for a in {FIREFOX_NAME} {TD_MAIL_NAME} {TD_NEWS_NAME} {TD_WEB_NAME}; do \
              if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then"
         )));
     }
@@ -18336,7 +18312,7 @@ mod principal_tests {
                 name: "news",
                 package: "news",
                 package_recipe: super::super::news::recipe,
-                class: Class::Personal,
+                class: Class::Service,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -18344,7 +18320,7 @@ mod principal_tests {
                 name: "mail",
                 package: "mail",
                 package_recipe: super::super::mail::recipe,
-                class: Class::Personal,
+                class: Class::Service,
                 runtime: "empty-runtime",
                 runtime_recipe: Some(super::super::empty_runtime::recipe),
             },
@@ -18355,7 +18331,7 @@ mod principal_tests {
         };
         assert_eq!(
             build_bus_application_policy(&sys).unwrap(),
-            "td-bus-applications-v2\t1000\nmail\tpersonal\t\nnews\tpersonal\t\n"
+            "td-bus-applications-v2\t1000\nmail\tservice\t\nnews\tservice\t\n"
         );
         assert!(!build_principals(&sys).contains("application\t"));
     }

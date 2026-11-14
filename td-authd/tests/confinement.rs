@@ -1379,10 +1379,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(grants.contains("    command.args(path);\n"));
     assert_eq!(grants.matches("command.args(").count(), 3);
     // The path reaches the writer only once the table's validator took it:
-    // a grant's by `validate_path`, a revoke's by `table_path`, which still
+    // a grant's by `validate_directory`, a revoke's by `table_path`, which still
     // reaches an inert row.
     for check in [
-        "workload_grants::validate_path(path)?;",
+        "workload_grants::validate_directory(request.kind, &request.name, path)?;",
         "workload_grants::table_path(path)?;",
     ] {
         assert_eq!(grants.matches(check).count(), 1, "{check}");
@@ -1624,24 +1624,28 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // admitted for its account's kind, td-agent's own trees for a
     // workspace's alone.
     assert!(views.contains(
-        "    with_account(Kind::Workspace, uid, |live, _, mountinfo, home| {\n        let grants = grants_for(held()?, Kind::Workspace, mountinfo, home)?;\n"
+        "    with_account(Kind::Workspace, uid, |live, _, mountinfo, home| {\n        let grants = grants_for(held()?, policy, mountinfo, home)?;\n"
     ));
     assert!(views.contains(
         "    require_kind_uid(kind, uid)?;\n    if kind == Kind::Workspace {\n        return Err("
     ));
-    assert!(views.contains(
-        "        grants::validate_view(grant.kind, grant.access, grant.path.as_bytes())?;\n"
-    ));
+    assert!(
+        views.contains("        grant.policy.validate(grant.access, grant.path.as_bytes())?;\n")
+    );
     assert!(views.contains("view_access(grant.access, grant.executable)"));
     // The account's kind alone selects executable views; no row, request
     // or caller does.
     assert_eq!(
-        views.matches("executable: executable_views(kind),").count(),
+        views
+            .matches("executable: executable_views(policy.kind()),")
+            .count(),
         1
     );
     assert!(views.contains(
         "fn executable_views(kind: Kind) -> bool {\n    match kind {\n        Kind::Application => false,\n        Kind::Sandbox | Kind::Workspace => true,\n    }\n}"
     ));
+    assert!(views.contains("let policy = grants::ViewPolicy::for_account(kind, name);"));
+    assert!(views.contains("let policy = grants::ViewPolicy::for_kind(Kind::Workspace);"));
     // The workspace intake: the primary human's peers alone, one fixed
     // helper argv for the ledger account, one fixed jail argv and one
     // fixed emptier argv, the accepted connection a launch's only
@@ -1820,10 +1824,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
 }
 
 const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
-const GRANT_REQUESTS_FINGERPRINT: u64 = 0x8d1f61d7a37a8d2c;
-const GRANT_VIEWS_FINGERPRINT: u64 = 0xea86f6e9834554d2;
+const GRANT_REQUESTS_FINGERPRINT: u64 = 0x5f7221258ec5d3d1;
+const GRANT_VIEWS_FINGERPRINT: u64 = 0x48b5bc7296ae3585;
 const WORKSPACE_FINGERPRINT: u64 = 0x6b8b6d3339f5ebc1;
-const APPLICATION_FINGERPRINT: u64 = 0xc03468866b2802cb;
+const APPLICATION_FINGERPRINT: u64 = 0xd216cde5d8075fd7;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {

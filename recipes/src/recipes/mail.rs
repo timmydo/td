@@ -1,17 +1,17 @@
 //! The `mail` application: td-mail, td's JMAP mail client, as a static
 //! package on the data-only static runtime. It opens a td-ui window of its own
-//! when the session runs `/bin/mail` (at boot only on an oracle's, through
+//! when its launcher card starts it (at boot only on an oracle's, through
 //! `system-x86-64`'s `[mail]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once in the login user's own configuration directory. Saved
-//! attachments land in the `xdg-download` grant, the directory Firefox shares.
+//! attachments land in the writable `Downloads` grant, the directory Firefox shares.
 //! Composing is in td-mail's own window, in td-ui's editor pane the
 //! crate embeds (APPLICATIONS.md §W.8, "Composing in place"), so the
 //! package ships no editor and its manifest names none.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
-use td_engine::permissions::{FilesystemAccess, PermissionPolicy, PermissionSocket};
+use td_engine::permissions::{PermissionPolicy, PermissionSocket};
 
 const APPLICATION_NAME: &str = crate::shared::TD_MAIL_NAME;
 const APPLICATION_ENTRY: &str = crate::shared::TD_MAIL_ENTRY;
@@ -48,12 +48,6 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
-        .and_then(|permissions| {
-            permissions.with_filesystem("~/.config/td-mail", FilesystemAccess::ReadWrite, true)
-        })
-        .and_then(|permissions| {
-            permissions.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true)
-        })
         .and_then(|permissions| permissions.with_memory_high(192 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(256 * 1024 * 1024))
         // Tasks, threads included: the client keeps a backend thread per
@@ -177,7 +171,7 @@ mod tests {
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Filesystem]\nxdg-download=rw:create\n~/.config/td-mail=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(

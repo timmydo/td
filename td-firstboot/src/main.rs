@@ -170,7 +170,7 @@ const HOST_KEY: &str = "ssh/ssh_host_ed25519_key";
 const HOST_KEY_PUB: &str = "ssh/ssh_host_ed25519_key.pub";
 const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
 
-/// The real human configuration directory. Each personal application's
+/// The real human configuration directory. Each application's
 /// jail grants only its own child here, never the whole directory.
 const APPLICATION_CONFIG_ROOT: &str = ".config";
 
@@ -542,9 +542,7 @@ fn run_with_primary(
         application_runtime::prepare_runtime_account().map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
         // The active applications: each the image declares whose account the
-        // ledger, published above, holds. A personal one runs as the human
-        // and gets no home, cgroup or runtime of its account's. Only one of
-        // the carried block gets the human's legacy state; an installed one
+        // ledger, published above, holds. Only one of the carried block gets the human's legacy state; an installed one
         // gets the install's home (application_state::prepare).
         let policy = app_policy::load().map_err(Failure::Failed)?;
         let owner = policy.owner();
@@ -561,9 +559,6 @@ fn run_with_primary(
                         "active application lacks its configured human migration home".into(),
                     )
                 })?;
-            if declaration.class == app_policy::Class::Personal {
-                continue;
-            }
             application_state::prepare(former, name, uid).map_err(Failure::Failed)?;
             application_runtime::prepare(uid).map_err(Failure::Failed)?;
             emit(&format!(
@@ -3391,7 +3386,7 @@ mod principal_arguments {
             .is_none());
         assert!(deployment_declarations(guard.path(), true).is_err());
         let file = etc.join("td-bus-applications.tsv");
-        std::fs::write(&file, "td-bus-applications-v2\t1000\nmail\tpersonal\t\n").unwrap();
+        std::fs::write(&file, "td-bus-applications-v2\t1000\nmail\tservice\t\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
         let declared = deployment_declarations(guard.path(), true)
             .unwrap()
