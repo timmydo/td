@@ -31,6 +31,8 @@ because its old DNS name now points here.
 | Root-owned deployment receipts and diagnostics | `/var/lib/td-mta-operator/` |
 | Native notification configuration and bounded state | `/var/lib/td-mta/mail/.operations/notifications/` |
 | Scheduled database backups | `/var/lib/td-mta/backups/scheduled/` |
+| Managed data disk | 64 GiB, Azure data LUN 0, ext4 mounted at `/data` |
+| Backup and recovery archive storage | `/data/td-mta/backups/` and `/data/td-mta/migration/`, bind-mounted at their existing `/var/lib/td-mta/` paths |
 | Whole-body integrity progress | `/var/lib/td-mta/integrity/` |
 
 Keep connection files and credentials private; no password belongs in a
@@ -187,6 +189,51 @@ after checking every file against the retained copy under
 `/var/lib/td-mta-operator/duplicate-archive-cleanup-20261104.json`. Other
 migration copies differ and remain retained. Do not treat migration data as
 build cache.
+
+## Backup and recovery data disk
+
+The 64 GiB managed data disk uses ext4 UUID
+`8fb95fa6-d31b-466f-ba0c-f9174ed941c7`. `/etc/fstab` mounts it at `/data`
+with `nodev,nosuid,nofail`; device names such as `/dev/sdc1` are not boot
+identities. `/data/td-mta` is owned by `td-mta` with mode 0700. Its
+`backups` and `migration` directories retain the original owners, modes,
+modification times, extended attributes and file contents. Bind mounts expose them
+at `/var/lib/td-mta/backups` and `/var/lib/td-mta/migration`, so backup and
+recovery commands retain their existing paths. PostgreSQL, live mail state,
+runtime directories and build trees remain on the OS disk.
+
+Both bind mounts explicitly require `data.mount`. Their underlying OS-disk
+mountpoint directories are root-owned mode 000, preventing service-user
+writes into a fallback directory when a mount is absent. The current and
+retired backup services, backup-status service, aggregate health service
+and notification digest carry `data-disk.conf` drop-ins with
+`RequiresMountsFor` and `AssertPathIsMountPoint` for the backup mount. The
+retired Stalwart catch-up service has the equivalent migration-mount
+dependency; it remains disabled. Preserve these drop-ins when updating
+generated operations units. `nofail` permits host recovery when the data
+disk is unavailable; it does not permit dependent maintenance jobs to
+proceed without their storage.
+
+The notification configuration includes a `disk-data` inspection of `/data`
+alongside the existing OS-disk inspection. Monitor both filesystems. Backup
+retention remains seven scheduled archives within 4 GiB, and the data disk
+does not replace off-host backups.
+
+Inspect the mounts and existing backup health with:
+
+```text
+findmnt --mountpoint /data
+findmnt --mountpoint /var/lib/td-mta/backups
+findmnt --mountpoint /var/lib/td-mta/migration
+df -h / /data
+systemctl status td-mta-maint-backup-status.service
+```
+
+The private migration receipt and SHA-256 verification manifest are retained
+under `/var/lib/td-mta-operator/data-disk-migration-20261114/`. Removing the
+old OS-disk copies requires verified content and metadata equality and
+working persistent mounts; mounting over an old directory alone reclaims
+no space. Recovery archives remain retained data, not disposable cache.
 
 ## Retired Stalwart source and recovery copies
 
