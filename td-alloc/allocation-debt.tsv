@@ -1113,7 +1113,7 @@ td-authd/src/application.rs	allocating-conversion	13
 td-authd/src/application.rs	allocation-macro	11
 td-authd/src/application.rs	unchecked-growth-or-clone	2
 td-authd/src/application_cache.rs	allocating-conversion	5
-td-authd/src/application_cache.rs	allocation-macro	22
+td-authd/src/application_cache.rs	allocation-macro	20
 td-authd/src/application_cache.rs	unchecked-growth-or-clone	6
 td-authd/src/backoff.rs	allocating-conversion	6
 td-authd/src/backoff.rs	allocation-macro	10
@@ -2019,8 +2019,8 @@ td-jail/src/firefox.rs	allocating-constructor	2
 td-jail/src/firefox.rs	allocating-conversion	17
 td-jail/src/firefox.rs	allocation-macro	34
 td-jail/src/firefox.rs	unchecked-growth-or-clone	14
-td-jail/src/flathub.rs	allocating-conversion	18
-td-jail/src/flathub.rs	allocation-macro	27
+td-jail/src/flathub.rs	allocating-conversion	16
+td-jail/src/flathub.rs	allocation-macro	26
 td-jail/src/flathub.rs	unchecked-growth-or-clone	1
 td-jail/src/main.rs	allocating-conversion	1
 td-jail/src/main.rs	allocation-macro	2
@@ -3734,10 +3734,9 @@ td-sh/src/regex.rs	heap-owner	2
 td-sh/src/regex.rs	unchecked-growth-or-clone	29
 td-sh/src/sys.rs	allocation-macro	9
 td-sh/src/term.rs	allocating-conversion	3
-td-software/src/app.rs	allocating-constructor	1
-td-software/src/app.rs	allocating-conversion	22
-td-software/src/app.rs	allocation-macro	68
-td-software/src/app.rs	unchecked-growth-or-clone	44
+td-software/src/app.rs	allocating-conversion	19
+td-software/src/app.rs	allocation-macro	49
+td-software/src/app.rs	unchecked-growth-or-clone	41
 td-software/src/grants.rs	allocating-conversion	2
 td-software/src/grants.rs	heap-owner	1
 td-software/src/grants.rs	unchecked-growth-or-clone	2

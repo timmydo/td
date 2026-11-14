@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use crate::flathub_app::{
     self, FlathubRuntime, FlathubSource, RuntimeSelection, Selection, CACHE_DIR, CURRENT, DEPLOY,
-    FILES, FLATHUB_SOURCES, GENERATIONS, MAX_STATE_BYTES, RUNTIME_STORE, RUNTIME_UID, SELECTION,
+    FILES, GENERATIONS, MAX_STATE_BYTES, RUNTIME_STORE, RUNTIME_UID, SELECTION,
 };
 
 /// td-net's applet, linked beside td-jail in the image.
@@ -297,22 +297,9 @@ fn application_runtime_absent(name: &str, runtime: FlathubRuntime) -> io::Error 
 /// workspace installs nothing, and an application that names the runtime
 /// installs and keeps it.
 fn workspace_runtime_absent(runtime: FlathubRuntime) -> io::Error {
-    let installers: Vec<&str> = FLATHUB_SOURCES
-        .iter()
-        .filter(|source| source.runtime == runtime)
-        .map(|source| source.name)
-        .collect();
-    if installers.is_empty() {
-        return refused(format!(
-            "the runtime {} is not installed, and no application installs it yet",
-            runtime.name
-        ));
-    }
     refused(format!(
-        "the runtime {} is not installed; install an application that uses it ({}) in \
-         td-software",
-        runtime.name,
-        installers.join(", ")
+        "the runtime {} is not installed; install it in td-software",
+        runtime.name
     ))
 }
 
@@ -561,13 +548,12 @@ mod tests {
         let store = runtime_store(root.path());
         assert_eq!(
             hold_store_current(&store).err().unwrap().to_string(),
-            "the runtime freedesktop-platform-25-08 is not installed; install an application \
-             that uses it (firefox) in td-software"
+            "the runtime freedesktop-platform-25-08 is not installed; install it in td-software"
         );
         let sdk = flathub_app::flathub_runtime("freedesktop-sdk-25-08").unwrap();
         assert_eq!(
             workspace_runtime_absent(sdk).to_string(),
-            "the runtime freedesktop-sdk-25-08 is not installed, and no application installs it yet"
+            "the runtime freedesktop-sdk-25-08 is not installed; install it in td-software"
         );
 
         let files = runtime_generation(&store.root, 1, COMMIT);

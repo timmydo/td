@@ -62,7 +62,7 @@ These are fixed by the deployment, and this proposal keeps them fixed:
 account's cache has a `current` generation. Install, update and remove
 change only that cache, which the account owns, and the runtime store
 of the runtime it declares, which the runtime account owns and which
-holds only what an installed application asked for (td-authd/DESIGN.md,
+also holds runtimes installed explicitly for workspaces (td-authd/DESIGN.md,
 "Application cache operation"). The registry and
 principal table still list every declaration the image ships, so the set
 an owner can install is the reviewed set in git. It changes through `td
@@ -251,10 +251,8 @@ revalidation, which fetches nothing, for up to two minutes.
 - **Install** runs `td-app runtime update RUNTIME --force` as the
   runtime account, then `td-app update APP --force` on an account with
   no `current`. Every admission rule of §W.9 applies unchanged,
-  including the feed transport under the autotest token. *As built:*
-  while the runtime half runs, the record shows the operation running
-  and no progress; the runtime store's progress reaches td-software
-  with its runtime views (WORKLOADS.md, "Landing order", step 10).
+  including the feed transport under the autotest token. The runtime's
+  separately polled status supplies progress during this first half.
 - **Update** is the same command on an installed account, and the only
   way an installed application updates. It replaced the launcher's
   per-application UPDATE row and the daily check beside a launch, and
@@ -266,9 +264,8 @@ revalidation, which fetches nothing, for up to two minutes.
   and collects every generation, deploy and object graph that no launch
   holds. Held generations follow §W.9's lease: they outlive their last
   launch until the store's next write collects them, a later update,
-  revalidation or removal. When no other installed application names
-  its runtime, root then runs `td-app runtime remove RUNTIME` as the
-  runtime account, which empties that runtime's store the same way.
+  revalidation or removal. Removing an application keeps its shared
+  runtime; that is removed explicitly from its runtime entry.
 
   It keeps `admitted`, so a reinstall cannot admit a commit older than
   one already admitted. It also keeps the jail state under
@@ -282,6 +279,41 @@ revalidation, which fetches nothing, for up to two minutes.
   holds its generation's selection, so once `remove` has run and a
   collection under the cache lock leaves a generation, an instance runs.
   It also refuses while `current` or `previous` exists.
+
+### Runtimes and download progress
+
+Runtime catalog strings and list growth use td-alloc's fallible helpers;
+a refusal leaves the receiving catalog unchanged and the window offers no
+partial runtime list. Progress text and detail-line growth use the same
+helpers, with an empty presentation on refusal. Runtime action and
+confirmation allocation refusal offers no action. The rest of the window
+retains its recorded allocation debt.
+
+The list includes every compiled `FLATHUB_RUNTIMES` declaration as a
+`Runtime: NAME` entry, even when no application names it. A runtime uses
+the same status and operation requests with its reserved td name; root
+selects the runtime operation and the UI parses `kind=runtime` separately
+from application records. The runtime shows its exact ref, current and
+previous commits, size and check time, and the command to select it in
+td-sandbox. Its actions are Install, Check now and Remove. It has no
+Launch, Delete data or folder grants. Remove asks first and explains that
+future sandbox launches need a reinstall; root refuses while an installed
+application needs the runtime. Running sessions retain their generation.
+
+Runtimes are retained until explicitly removed, including those Firefox
+installed. No application removal discards a runtime a workspace may need.
+Installing or updating a runtime grants no new authority to the human;
+only td-app running as the runtime account writes its store, under the
+same admission rules as the runtime half of a Firefox install.
+
+During an application's install or update, its runtime is polled at the
+active interval as well. Its details show the application's current writer
+when present, otherwise the runtime's current writer, with the runtime
+name. A failed read clears that entry's progress; an older record is never
+shown as a live download. Status polls do not block a download. Mutations
+of a runtime and every application naming it are serialized by root's
+request dispatcher; status reads remain independent. The catalog and
+runtime names are immutable deployment declarations, never arbitrary refs.
 
 ### 4.3 Folders it can reach
 
@@ -387,7 +419,7 @@ can be installed at every commit.
    same cache, so they cannot disagree.
 
    *As built (the program):* `td-software/` is a td-ui window, std plus
-   td-civil, td-fs and td-ui, with td-app's status record compiled in
+   td-alloc, td-civil, td-fs and td-ui, with td-app's status record compiled in
    from `engine/src/flathub_app.rs`. It reads the image's registry and
    launcher table (bounded to the builder's 1 MiB each) and lists every
    application: the Flathub declarations first, then those the image
@@ -398,9 +430,13 @@ can be installed at every commit.
    a writer's progress, root's operation and the last one's outcome),
    then the current version's commits, dates and sizes, the previous
    version kept, when it was last checked and the last refusal.
-   Progress is the stage, then objects done of those found so far and
-   of their bound and bytes of the transfer bound, saying that Flathub
-   names no total in advance.
+   Progress names the stage and the runtime or application being fetched,
+   downloaded bytes and completed objects of those discovered so far,
+   elapsed stage time and the observed rate between changed status samples.
+   Totals remain unknown; safety ceilings are not presented as totals.
+   After five seconds without a changed sample the rate is replaced with
+   waiting for progress. A new stage, part or decreased counter resets
+   measurement; a failed or older record clears it.
 
    Its buttons are Install for one not installed, with Delete data once
    a check has run or been refused and no previous version is kept (a

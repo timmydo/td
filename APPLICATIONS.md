@@ -11808,8 +11808,9 @@ itself from the workload account ledger, where an install first
 allocates it and a removal keeps it; an application with no row there
 was never installed, so its status is an empty cache's and its other
 verbs refuse. Its install and update run the runtime's `runtime update`
-first, as the runtime account, and its remove runs `runtime remove` once
-no other installed application names the runtime (td-authd/DESIGN.md,
+first, as the runtime account; removing an application keeps its runtime.
+An explicit runtime removal refuses while an installed application needs
+it (td-authd/DESIGN.md,
 "Application cache operation"). Its `runtime-cache` operation is the
 root path to the runtime verbs alone ("Runtime cache operation"). td-software's
 requests reach it from the compositor's control socket as private request
@@ -11862,14 +11863,13 @@ collected finds it unlinked and asks again (three times at most). A
 workspace launch that names a runtime (§C, "The `workspace` kind") holds
 that runtime store's `current` the same way, with the same checks on the
 store, selection and tree, and keeps it in stage 1 until the instance
-ends; it asks td-app nothing, and with no `current` it is refused, since
-only an application's install brings a runtime into the store. The
-declared `freedesktop-sdk-25-08` (`runtime/org.freedesktop.Sdk/x86_64/25.08`)
-is named by no application, so it is refused as not installed until a
-runtime install path exists; root's `runtime-cache` operation accepts it
-by name. Removing the last application that names a runtime removes it
-under a running workspace as under a running application: the held
-generation stays, and the next launch is refused. The
+ends; it asks td-app nothing, and with no `current` it is refused and
+names td-software as the place to install the runtime. td-software offers
+every declared runtime, including `freedesktop-sdk-25-08`
+(`runtime/org.freedesktop.Sdk/x86_64/25.08`), through root's `runtime-cache`
+operation. Runtimes remain after application removal until explicitly
+removed. A running workspace keeps its held generation after that removal;
+its next launch requires a reinstall. The
 held runtime generation must be the one the application generation's
 `runtime=` row names; when the runtime moved between td-app's answer and
 the hold, td-jail asks again, and that `ready` answers `absent`, so the

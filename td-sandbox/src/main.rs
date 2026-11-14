@@ -44,6 +44,7 @@ const HELP: &str = "td-sandbox COMMAND\n\
                               or grants, which adopt or delete settle\n\
   adopt NAME                  record a sandbox root holds that has no record\n\
   list                        list sandboxes with their accounts and networks\n\
+  runtimes                    list supported runtimes to install in td-software\n\
   inspect NAME                show account, home, network, runtime and grants\n\
   share NAME PATH --read|--write  share a directory below your home\n\
   unshare NAME PATH\n\
@@ -54,7 +55,7 @@ const HELP: &str = "td-sandbox COMMAND\n\
   stop NAME                   terminate the active session\n\
   delete NAME                 delete an inactive sandbox, its grants and\n\
                               its home's contents; its account is kept\n\
-  Sandboxes run only on td: every command but help, runtime and stop asks\n\
+  Sandboxes run only on td: every command but help, runtimes, runtime and stop asks\n\
   root's workspace intake.\n";
 
 /// How long `init-default` waits for root's intake at boot.
@@ -302,6 +303,18 @@ fn session(profile: &state::Profile, name: &str, line: &str, terminal: bool) -> 
     result
 }
 
+/// The compiled choices, not a claim that their payloads are installed.
+fn runtime_catalog(output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "NAME\tSOURCE\nnative\ttd (no download)")?;
+    for runtime in flathub_app::FLATHUB_RUNTIMES {
+        writeln!(output, "{}\t{}", runtime.name, runtime.exact_ref)?;
+    }
+    writeln!(
+        output,
+        "Install Flathub runtimes in td-software before using them (td only)."
+    )
+}
+
 fn run() -> io::Result<u8> {
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|v| v == "--inside") {
@@ -311,6 +324,11 @@ fn run() -> io::Result<u8> {
     let command = word(args.next())?;
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         print!("{HELP}");
+        return Ok(0);
+    }
+    if command == "runtimes" {
+        end(&mut args)?;
+        runtime_catalog(&mut io::stdout().lock())?;
         return Ok(0);
     }
     let (home, canonical) = homes()?;
@@ -488,6 +506,19 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn runtimes_lists_the_compiled_choices_without_an_intake_or_home() -> io::Result<()> {
+        let mut output = Vec::new();
+        runtime_catalog(&mut output)?;
+        let listing = String::from_utf8(output).map_err(error)?;
+        assert!(listing.contains("native\ttd (no download)\n"));
+        for runtime in flathub_app::FLATHUB_RUNTIMES {
+            assert!(listing.contains(&format!("{}\t{}\n", runtime.name, runtime.exact_ref)));
+        }
+        assert!(listing.contains("Install Flathub runtimes in td-software"));
+        Ok(())
+    }
 
     /// Root as the commands see it: each request recorded, its answer
     /// chosen by its verb.

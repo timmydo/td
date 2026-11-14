@@ -105,7 +105,11 @@ fn verb_byte(verb: Verb) -> u8 {
 /// peer chose, and the operation admits it against the deployment.
 fn operation(owner: u32, name: &str, verb: Verb) -> Command {
     let mut command = Command::new("/bin/td-authd");
-    command.args(["application-cache", &owner.to_string(), name, verb.word()]);
+    if flathub_app::flathub_runtime(name).is_some() {
+        command.args(["runtime-cache", name, verb.word()]);
+    } else {
+        command.args(["application-cache", &owner.to_string(), name, verb.word()]);
+    }
     command
 }
 
@@ -441,19 +445,33 @@ impl Entry {
 /// whether it shows a writer at work and a `current` generation.
 fn checked(name: &str, bytes: &[u8]) -> Option<(Vec<u8>, Found)> {
     let text = std::str::from_utf8(bytes).ok()?;
-    let status = Status::parse(text).ok()?;
-    let header = 6 + REASON_BYTES;
-    let found = Found {
-        writer: status
-            .cache
-            .as_ref()
-            .is_some_and(|cache| cache.progress.is_some()),
-        installed: status
-            .cache
-            .as_ref()
-            .is_some_and(|cache| cache.current.is_some()),
+    let (record_name, found) = if flathub_app::flathub_runtime(name).is_some() {
+        let status = flathub_app::RuntimeStatus::parse(text).ok()?;
+        (
+            status.name,
+            Found {
+                writer: status.progress.is_some(),
+                installed: status.current.is_some(),
+            },
+        )
+    } else {
+        let status = Status::parse(text).ok()?;
+        (
+            status.name,
+            Found {
+                writer: status
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.progress.is_some()),
+                installed: status
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.current.is_some()),
+            },
+        )
     };
-    (status.name == name && bytes.len() <= FRAME_BYTES.saturating_sub(header))
+    let header = 6 + REASON_BYTES;
+    (record_name == name && bytes.len() <= FRAME_BYTES.saturating_sub(header))
         .then(|| (bytes.to_vec(), found))
 }
 
@@ -480,6 +498,11 @@ pub(crate) fn registry_names(text: &str) -> Result<Vec<String>, String> {
             || !seen.insert(name)
         {
             return Err(invalid());
+        }
+        if flathub_app::flathub_runtime(name).is_some() {
+            return Err(crate::message(format_args!(
+                "an application name conflicts with a runtime"
+            )));
         }
         if crate::consent::application_name(name) {
             names.push(name.to_string());
@@ -647,6 +670,28 @@ impl Requests {
         // The live medium's session runs only the installer.
         if std::fs::symlink_metadata(crate::launch::LIVE_MEDIUM).is_ok() {
             return vec![0xff, 3];
+        }
+        if flathub_app::flathub_runtime(&request.name).is_some() && request.verb == Verb::DeleteData
+        {
+            return crate::allocation::copy(&[0xff, 3]).unwrap_or_default();
+        }
+        // A runtime and every application using it share one mutation lane.
+        // Status reads stay independent, including throughout the runtime
+        // half of an application install.
+        let runtime = |name: &str| {
+            flathub_app::flathub_runtime(name)
+                .or_else(|| flathub_app::flathub_source(name).map(|source| source.runtime))
+        };
+        if request.verb != Verb::Status {
+            if let Some(wanted) = runtime(&request.name) {
+                if self
+                    .entries
+                    .iter()
+                    .any(|(name, entry)| entry.operation.is_some() && runtime(name) == Some(wanted))
+                {
+                    return crate::allocation::copy(&[0xff, 1]).unwrap_or_default();
+                }
+            }
         }
         let start = self.start;
         let Some(entry) = self.entry(&request.name) else {

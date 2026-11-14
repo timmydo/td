@@ -4635,8 +4635,8 @@ first.
 td-jail is the authority, as for td-sandbox (td-sandbox/DESIGN.md,
 "Runtime"): it refuses a name `FLATHUB_RUNTIMES` does not declare, any
 runtime on a development host, where it would replace the host's `/usr`,
-and one with no `current`, naming the applications that install it
-(the SDK, `freedesktop-sdk-25-08`, has none yet); otherwise it binds
+and one with no `current`, directing the human to install the runtime
+in td-software (including `freedesktop-sdk-25-08`); otherwise it binds
 that generation read-only at `/usr` with `/lib` and `/lib64` links into
 it, ends the entry's `PATH` with `/bin:/usr/bin`, takes the
 runtime's loader files into `/etc`, and holds the runtime's `current`

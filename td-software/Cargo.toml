@@ -13,6 +13,7 @@ license = "MIT"
 [workspace]
 
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-civil = { path = "../td-civil" }
 td-fs = { path = "../td-fs" }
 td-ui = { path = "../td-ui" }

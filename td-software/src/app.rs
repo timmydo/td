@@ -17,8 +17,8 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 use crate::grants::{self, Access, Grant};
 use crate::registry::Application;
 use crate::snapshot::{
-    CacheStatus, Failure, GenerationStatus, Operation, Part, Progress, Record, Snapshot, Stage,
-    Status,
+    Failure, Operation, Part, Progress, Record, Snapshot, Stage, ViewCache as CacheStatus,
+    ViewGeneration as GenerationStatus, ViewStatus as Status,
 };
 use crate::worker::{Job, Reply};
 
@@ -216,6 +216,70 @@ pub enum Standing {
     },
 }
 
+/// Presentation growth refuses to an empty line, without allocating an error.
+fn display_text(args: std::fmt::Arguments<'_>) -> String {
+    td_alloc::format(args).unwrap_or_default()
+}
+
+fn runtime_removal_details(lines: [String; 2]) -> Vec<String> {
+    let mut details = Vec::new();
+    if td_alloc::reserve(&mut details, lines.len()).is_err() {
+        return details;
+    }
+    for line in lines {
+        if td_alloc::push(&mut details, line).is_err() {
+            return Vec::new();
+        }
+    }
+    details
+}
+
+/// Observations from bounded status polls, not a guessed download total.
+#[derive(Clone, Copy)]
+struct Transfer {
+    progress: Progress,
+    began: u64,
+    changed: u64,
+    rate: Option<u64>,
+}
+
+impl Transfer {
+    fn observe(previous: Option<Self>, progress: Progress, now: u64) -> Self {
+        let Some(old) = previous.filter(|old| {
+            old.progress.stage == progress.stage
+                && old.progress.part == progress.part
+                && old.progress.bytes <= progress.bytes
+                && old.progress.objects <= progress.objects
+        }) else {
+            return Self {
+                progress,
+                began: now,
+                changed: now,
+                rate: None,
+            };
+        };
+        let elapsed = now.saturating_sub(old.changed);
+        let changed =
+            old.progress.bytes != progress.bytes || old.progress.objects != progress.objects;
+        Self {
+            progress,
+            began: old.began,
+            changed: if changed { now } else { old.changed },
+            rate: if changed && elapsed > 0 {
+                Some(
+                    progress
+                        .bytes
+                        .saturating_sub(old.progress.bytes)
+                        .saturating_mul(1000)
+                        / elapsed,
+                )
+            } else {
+                old.rate
+            },
+        }
+    }
+}
+
 struct Entry {
     application: Application,
     snapshot: Option<Snapshot>,
@@ -227,6 +291,8 @@ struct Entry {
     /// A status request is out.
     asking: bool,
     next_poll: u64,
+    last_poll: u64,
+    transfer: Option<Transfer>,
     /// An operation asked for whose start no status has shown yet.
     pending: Option<Operation>,
     /// Root started `pending`, or may have; the next status shows it.
@@ -300,6 +366,7 @@ impl Entry {
 
     fn actions(&self) -> Vec<(Action, bool)> {
         let busy = self.busy();
+        let runtime = self.application.is_runtime();
         match self.standing() {
             Standing::Unknown if self.unreadable() => vec![(Action::Remove, !busy)],
             Standing::Unknown | Standing::BuiltIn => Vec::new(),
@@ -312,18 +379,24 @@ impl Entry {
                     cache.previous.is_none() && (cache.checked.is_some() || cache.refused.is_some())
                 });
                 let mut actions = vec![(Action::Install, !busy)];
-                if removed {
+                if removed && !runtime {
                     actions.push((Action::DeleteData, !busy));
                 }
                 actions
             }
             Standing::Installed { .. } => {
                 let removing = matches!(self.running(), Some(Some(Operation::Remove)));
-                vec![
+                let choices = [
                     (Action::Launch, !removing),
                     (Action::Update, !busy),
                     (Action::Remove, !busy),
-                ]
+                ];
+                let choices = if runtime {
+                    choices.get(1..).unwrap_or_default()
+                } else {
+                    &choices
+                };
+                td_alloc::copy(choices).unwrap_or_default()
             }
         }
     }
@@ -421,6 +494,8 @@ impl App {
                 error: None,
                 asking: false,
                 next_poll: 0,
+                last_poll: 0,
+                transfer: None,
                 pending: None,
                 started: false,
                 uncertain: false,
@@ -569,11 +644,37 @@ impl App {
     /// Asks every status that is due.
     pub fn tick(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        let mut runtimes = [false; crate::flathub_app::FLATHUB_RUNTIMES.len()];
+        for entry in &self.entries {
+            if matches!(
+                entry.running(),
+                Some(Some(Operation::Install | Operation::Update))
+            ) {
+                if let Some(source) = crate::flathub_app::flathub_source(&entry.application.name) {
+                    for (needed, runtime) in runtimes
+                        .iter_mut()
+                        .zip(crate::flathub_app::FLATHUB_RUNTIMES)
+                    {
+                        *needed |= *runtime == source.runtime;
+                    }
+                }
+            }
+        }
         for entry in &mut self.entries {
+            if runtimes
+                .iter()
+                .zip(crate::flathub_app::FLATHUB_RUNTIMES)
+                .any(|(needed, runtime)| *needed && runtime.name == entry.application.name)
+            {
+                entry.next_poll = entry
+                    .next_poll
+                    .min(entry.last_poll.saturating_add(POLL_ACTIVE_MS));
+            }
             // An application the image ships has no cache to read.
             let flathub = entry.application.flathub.is_some();
             if flathub && !entry.asking && now_ms >= entry.next_poll {
                 entry.asking = true;
+                entry.last_poll = now_ms;
                 self.jobs.push(Job::Status(entry.application.name.clone()));
             }
         }
@@ -672,11 +773,20 @@ impl App {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 entry.error = Some(error);
+                entry.transfer = None;
                 entry.next_poll = now.saturating_add(POLL_RETRY_MS);
                 return;
             }
         };
         entry.error = None;
+        entry.transfer = match &snapshot.record {
+            Record::Current(status) => status
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.progress)
+                .map(|progress| Transfer::observe(entry.transfer, progress, now)),
+            _ => None,
+        };
         // The first status after root started an operation, or may have,
         // shows it running, already ended, or never started.
         let mut ended = None;
@@ -756,6 +866,11 @@ impl App {
             return;
         };
         let display = entry.application.display.clone();
+        if entry.application.is_runtime() {
+            return self.say(display_text(format_args!(
+                "Runtimes have no folder grants; share folders with the sandbox or application."
+            )));
+        }
         if entry.application.flathub.is_none() {
             return self.say(format!(
                 "{display} ships with the system: this panel is for Flathub applications; \
@@ -1056,6 +1171,14 @@ impl App {
 
     fn ask(&mut self, act: Act, display: &str) {
         let (title, label, details) = match act {
+            Act::Remove(index) if self.entries.get(index).is_some_and(|entry| entry.application.is_runtime()) => (
+                display_text(format_args!("Remove {display}?")),
+                "Remove",
+                runtime_removal_details([
+                    display_text(format_args!("Sandboxes using it cannot start again until it is reinstalled; running sessions keep their files.")),
+                    display_text(format_args!("Removal is refused while an installed application needs this runtime.")),
+                ]),
+            ),
             Act::Remove(_) => (
                 format!("Remove {display}?"),
                 "Remove",
@@ -1073,6 +1196,9 @@ impl App {
                 ],
             ),
         };
+        if title.is_empty() || details.is_empty() || details.iter().any(String::is_empty) {
+            return self.say(String::new());
+        }
         let details: Vec<&str> = details.iter().map(String::as_str).collect();
         let Some(rect) = dialog_rect(self.surface) else {
             return self.say("The window is too small for the question");
@@ -1372,14 +1498,29 @@ impl App {
         };
         let display = &entry.application.display;
         let mut lines = Vec::new();
-        let mut line = |text: String, ink: u32| lines.push((text, ink));
+        let mut line = |text: String, ink: u32| {
+            // Missing presentation is preferable to aborting on allocation refusal.
+            let _ = td_alloc::push(&mut lines, (text, ink));
+        };
         match entry.application.flathub {
-            Some(source) => line(format!("{display}, from Flathub ({source})"), INK),
+            Some(source) => line(
+                display_text(format_args!("{display}, from Flathub ({source})")),
+                INK,
+            ),
             None => line(display.clone(), INK),
+        }
+        if entry.application.is_runtime() {
+            line(
+                display_text(format_args!(
+                    "Use with: td-sandbox runtime NAME {}",
+                    entry.application.name
+                )),
+                LINE_NUMBER,
+            );
         }
         match entry.standing() {
             Standing::Unknown => match &entry.error {
-                Some(error) => line(format!("Its status cannot be read: {error}"), WARNING),
+                Some(error) => line(display_text(format_args!("Its status cannot be read: {error}")), WARNING),
                 None if entry.unreadable() => line(
                     "Root cannot read its status, which a damaged download can cause: \
                      Remove deletes the download and keeps its data."
@@ -1391,11 +1532,12 @@ impl App {
             },
             Standing::BuiltIn => {
                 line(
-                    format!("Built in: {display} ships with the system and updates with it."),
+                    display_text(format_args!("Built in: {display} ships with the system and updates with it.")),
                     INK,
                 );
                 line("It cannot be removed here.".into(), LINE_NUMBER);
             }
+            Standing::NotInstalled if entry.running().is_some() => line(display_text(format_args!("Not installed yet.")), INK),
             Standing::NotInstalled => line(
                 "Not installed. Install downloads it from Flathub; nothing is fetched until you ask."
                     .into(),
@@ -1412,32 +1554,85 @@ impl App {
         // What is changing comes first, so a short window keeps it.
         if let Some(error) = entry.error.as_ref().filter(|_| entry.snapshot.is_some()) {
             line(
-                format!("Its status cannot be read now, so what follows may be old: {error}"),
+                display_text(format_args!(
+                    "Its status cannot be read now, so what follows may be old: {error}"
+                )),
                 WARNING,
             );
         }
         // Progress only as just read: a writer killed mid-download can
         // leave the cache unreadable, and Remove must then stay on.
-        let fresh = entry.snapshot.as_ref().and_then(Snapshot::cache);
-        if let Some(progress) = fresh.and_then(|cache| cache.progress.as_ref()) {
-            progressing(&mut line, progress);
+        let runtime_entry =
+            crate::flathub_app::flathub_source(&entry.application.name).and_then(|source| {
+                self.entries
+                    .iter()
+                    .find(|other| other.application.name == source.runtime.name)
+            });
+        let installing = matches!(
+            entry.running(),
+            Some(Some(Operation::Install | Operation::Update))
+        );
+        let progress_entry = if entry.transfer.is_some() {
+            Some(entry)
+        } else if installing {
+            runtime_entry.filter(|other| other.transfer.is_some())
+        } else {
+            None
+        };
+        if let Some(progress_entry) = progress_entry.filter(|other| other.error.is_none()) {
+            if let Some(transfer) = &progress_entry.transfer {
+                if progress_entry.application.is_runtime() {
+                    line(
+                        display_text(format_args!("Runtime: {}", progress_entry.application.name)),
+                        INK,
+                    );
+                }
+                progressing(&mut line, &transfer.progress);
+                let elapsed = self.now_ms.saturating_sub(transfer.began) / 1000;
+                if transfer.progress.stage == Stage::Fetch {
+                    let rate = if self.now_ms.saturating_sub(transfer.changed) > 5000 {
+                        display_text(format_args!("waiting for download progress"))
+                    } else {
+                        transfer.rate.map_or_else(
+                            || display_text(format_args!("measuring download speed")),
+                            |rate| display_text(format_args!("{}/s observed", size(rate))),
+                        )
+                    };
+                    line(
+                        display_text(format_args!("{rate}; {elapsed}s in this stage.")),
+                        INK,
+                    );
+                } else {
+                    line(
+                        display_text(format_args!("{elapsed}s in this stage.")),
+                        LINE_NUMBER,
+                    );
+                }
+            }
+        } else if installing {
+            line(
+                display_text(format_args!(
+                    "Preparing the download or waiting for the next progress report."
+                )),
+                INK,
+            );
         }
         let cache = entry.cache();
         if let Some(snapshot) = &entry.snapshot {
             match (snapshot.operation, &snapshot.last) {
                 (Some(operation), _) => line(
-                    format!(
-                        "Root is running the {} as the application's account.",
-                        operation.noun()
-                    ),
+                    display_text(format_args!("{} {display}.", operation.doing())),
                     INK,
                 ),
                 (None, Some((operation, None))) => line(
-                    format!("The last {} finished.", operation.noun()),
+                    display_text(format_args!("The last {} finished.", operation.noun())),
                     LINE_NUMBER,
                 ),
                 (None, Some((operation, Some(reason)))) => line(
-                    format!("The last {} failed: {reason}", operation.noun()),
+                    display_text(format_args!(
+                        "The last {} failed: {reason}",
+                        operation.noun()
+                    )),
                     WARNING,
                 ),
                 (None, None) => {}
@@ -1451,24 +1646,35 @@ impl App {
                 generation(&mut line, "Version", current);
             }
             if let Some(previous) = &cache.previous {
-                let commit = short(&previous.application.row.commit);
+                let commit = short(
+                    &previous
+                        .application
+                        .as_ref()
+                        .unwrap_or(&previous.runtime)
+                        .row
+                        .commit,
+                );
                 line(
-                    format!(
-                        "The previous version, application commit {commit}, is kept beside it."
-                    ),
+                    display_text(format_args!(
+                        "The previous version, commit {commit}, is kept beside it."
+                    )),
                     LINE_NUMBER,
                 );
             }
             line(
                 match cache.checked {
-                    Some(time) => format!("Last checked: {}", when(time)),
+                    Some(time) => display_text(format_args!("Last checked: {}", when(time))),
                     None => "Last checked: never".into(),
                 },
                 INK,
             );
             if let Some(refused) = &cache.refused {
                 line(
-                    format!("Last refusal, {}: {}", when(refused.time), refused.reason),
+                    display_text(format_args!(
+                        "Last refusal, {}: {}",
+                        when(refused.time),
+                        refused.reason
+                    )),
                     WARNING,
                 );
             }
@@ -1514,8 +1720,8 @@ fn when(seconds: u64) -> String {
         .ok()
         .and_then(td_civil::unix_to_civil_utc_checked)
         .map_or_else(
-            || "an unreadable time".into(),
-            |civil| format!("{} UTC", td_civil::format_ymd_hms(&civil)),
+            || display_text(format_args!("an unreadable time")),
+            |civil| display_text(format_args!("{} UTC", td_civil::format_ymd_hms(&civil))),
         )
 }
 
@@ -1523,7 +1729,7 @@ fn when(seconds: u64) -> String {
 pub fn size(bytes: u64) -> String {
     const UNITS: &[&str] = &["kB", "MB", "GB", "TB"];
     if bytes < 1000 {
-        return format!("{bytes} bytes");
+        return display_text(format_args!("{bytes} bytes"));
     }
     let mut value = bytes as f64 / 1000.0;
     let mut unit = 0;
@@ -1531,51 +1737,80 @@ pub fn size(bytes: u64) -> String {
         value /= 1000.0;
         unit += 1;
     }
-    format!("{value:.1} {}", UNITS.get(unit).copied().unwrap_or("TB"))
+    display_text(format_args!(
+        "{value:.1} {}",
+        UNITS.get(unit).copied().unwrap_or("TB")
+    ))
 }
 
 /// A count with its thousands apart.
 pub fn count(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
+    let digits = display_text(format_args!("{value}"));
+    let mut out = String::new();
+    for (index, digit) in digits.char_indices() {
+        if index > 0
+            && (digits.len() - index).is_multiple_of(3)
+            && td_alloc::push_str(&mut out, ",").is_err()
+        {
+            return String::new();
         }
-        out.push(digit);
+        let mut buffer = [0; 4];
+        if td_alloc::push_str(&mut out, digit.encode_utf8(&mut buffer)).is_err() {
+            return String::new();
+        }
     }
     out
 }
 
 /// A ref's last two parts, `org.freedesktop.Platform 25.08`.
 fn named(exact_ref: &str) -> String {
-    let parts: Vec<&str> = exact_ref.split('/').collect();
-    match (parts.get(1), parts.get(3)) {
-        (Some(id), Some(branch)) => format!("{id} {branch}"),
-        _ => exact_ref.to_string(),
+    let mut parts = exact_ref.split('/');
+    match (parts.nth(1), parts.nth(1)) {
+        (Some(id), Some(branch)) => display_text(format_args!("{id} {branch}")),
+        _ => display_text(format_args!("{exact_ref}")),
     }
 }
 
 fn generation(line: &mut impl FnMut(String, u32), label: &str, current: &GenerationStatus) {
-    let application = &current.application;
     let runtime = &current.runtime;
+    let Some(application) = &current.application else {
+        line(
+            display_text(format_args!(
+                "{label}: {} commit {} of {}",
+                named(&runtime.row.exact_ref),
+                short(&runtime.row.commit),
+                when(runtime.row.timestamp)
+            )),
+            INK,
+        );
+        line(
+            display_text(format_args!(
+                "Size on disk: {}",
+                runtime
+                    .bytes
+                    .map_or_else(|| display_text(format_args!("unmeasured")), size)
+            )),
+            INK,
+        );
+        return;
+    };
     line(
-        format!(
+        display_text(format_args!(
             "{label}: application commit {} of {}, on {} commit {}",
             short(&application.row.commit),
             when(application.row.timestamp),
             named(&runtime.row.exact_ref),
             short(&runtime.row.commit),
-        ),
+        )),
         INK,
     );
     let measured = |bytes: Option<u64>| bytes.map_or_else(|| "unmeasured".to_string(), size);
     line(
-        format!(
+        display_text(format_args!(
             "Size on disk: {} for the application, {} for its runtime",
             measured(application.bytes),
             measured(runtime.bytes)
-        ),
+        )),
         INK,
     );
 }
@@ -1598,24 +1833,23 @@ fn progressing(line: &mut impl FnMut(String, u32), progress: &Progress) {
         Some(Part::Runtime) => " the runtime",
         None => "",
     };
-    line(format!("Working: {doing}{part}."), INK);
+    line(display_text(format_args!("Working: {doing}{part}.")), INK);
     if progress.objects_known > 0 || progress.bytes > 0 {
         line(
-            format!(
-                "{} of the {} objects found so far (never more than {}), {} downloaded (never more than {}).",
+            display_text(format_args!(
+                "{} downloaded; {} of {} objects found so far completed.",
+                size(progress.bytes),
                 count(progress.objects),
                 count(progress.objects_known),
-                count(progress.objects_bound),
-                size(progress.bytes),
-                size(progress.bytes_bound),
-            ),
+            )),
             INK,
         );
     }
     if progress.stage == Stage::Fetch {
         line(
-            "Flathub names no total in advance: the objects found grow as each tree is read."
-                .into(),
+            display_text(format_args!(
+                "Total download size is unknown; more objects may be discovered."
+            )),
             LINE_NUMBER,
         );
     }

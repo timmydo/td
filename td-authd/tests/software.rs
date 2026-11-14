@@ -706,3 +706,65 @@ fn more_declarations_than_root_follows_answers_no_set() {
     assert_eq!(requests.installed(1000), [0xff, 2]);
     assert!(requests.entries.is_empty());
 }
+
+#[test]
+fn runtime_requests_use_the_fixed_runtime_operation_and_typed_status() {
+    let name = "freedesktop-sdk-25-08";
+    for verb in [Verb::Install, Verb::Update, Verb::Remove, Verb::Status] {
+        let command = operation(1000, name, verb);
+        assert_eq!(command.get_program(), "/bin/td-authd");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["runtime-cache", name, verb.word()]
+        );
+    }
+    let record = flathub_app::RuntimeStatus {
+        name: name.into(),
+        current: None,
+        previous: None,
+        checked: None,
+        refused: None,
+        progress: Some(flathub_app::Progress::idle(flathub_app::Stage::Fetch)),
+    }
+    .render();
+    let (_, found) = checked(name, record.as_bytes()).unwrap();
+    assert!(found.writer);
+    assert!(!found.installed);
+    assert!(checked("firefox", record.as_bytes()).is_none());
+    assert!(checked("freedesktop-platform-25-08", record.as_bytes()).is_none());
+    assert!(checked(name, RECORD).is_none());
+    let mut requests = Requests::with_starter(fixture);
+    assert_eq!(
+        requests.answer(
+            1000,
+            Request {
+                name: name.into(),
+                verb: Verb::DeleteData
+            }
+        ),
+        [0xff, 3]
+    );
+    assert!(requests.entries.is_empty());
+    assert!(registry_names(&format!("{name}\t/td/store/app\n")).is_err());
+    assert!(flathub_app::FLATHUB_SOURCES.len() + flathub_app::FLATHUB_RUNTIMES.len() <= NAMES / 2);
+}
+
+#[test]
+fn runtime_and_application_mutations_exclude_each_other_but_status_does_not() {
+    let runtime = "freedesktop-platform-25-08";
+    for (first, second) in [("firefox", runtime), (runtime, "firefox")] {
+        let mut requests = Requests::with_starter(fixture);
+        fresh(&mut requests, first);
+        fresh(&mut requests, second);
+        assert_eq!(requests.answer(1000, install(first)), [0x86]);
+        assert_eq!(requests.answer(1000, install(second)), [0xff, 1]);
+        assert_eq!(requests.answer(1000, status(second))[0], 0x87);
+        // The SDK has another store, so it need not wait on Firefox.
+        fresh(&mut requests, "freedesktop-sdk-25-08");
+        assert_eq!(
+            requests.answer(1000, install("freedesktop-sdk-25-08")),
+            [0x86]
+        );
+        stop(&mut requests);
+    }
+}

@@ -5759,6 +5759,11 @@ letter:
   already pending joined; an `0d` the worker's queue could not take is
   an `unavailable`.
 
+`status`, `install`, `update` and `remove` also accept a declared runtime's
+td name. Root selects `runtime-cache` for those names, which are reserved
+against application registry names; `delete-data` refuses for runtimes,
+and runtimes have no launcher entry. The wire framing is unchanged.
+
 The compositor validates the name and names nothing else; root, not the
 compositor, holds the account, the program and the deployment check. An
 operation is answered `ok` once root has started it: it runs on as root's

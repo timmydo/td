@@ -909,48 +909,10 @@ fn require_runtime(store: &Path, runtime: Option<&str>) -> Result<(), String> {
     )?;
     match fs::symlink_metadata(current) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let installers = Installers(runtime);
-            Err(if installers.none() {
-                message(format_args!(
-                    "the runtime {runtime} is not installed, and no application installs it yet"
-                ))
-            } else {
-                message(format_args!(
-                    "the runtime {runtime} is not installed; install an application that uses it ({installers}) in td-software"
-                ))
-            })
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(message(format_args!(
+            "the runtime {runtime} is not installed; install it in td-software"
+        ))),
         Err(e) => Err(message(format_args!("inspect the runtime {runtime}: {e}"))),
-    }
-}
-
-/// The declared applications that install the runtime it names, written
-/// as a list separated by commas without collecting them.
-struct Installers<'a>(&'a str);
-
-impl Installers<'_> {
-    fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        flathub_app::FLATHUB_SOURCES
-            .iter()
-            .filter(|source| source.runtime.name == self.0)
-            .map(|source| source.name)
-    }
-
-    fn none(&self) -> bool {
-        self.names().next().is_none()
-    }
-}
-
-impl fmt::Display for Installers<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, name) in self.names().enumerate() {
-            if index > 0 {
-                f.write_str(", ")?;
-            }
-            f.write_str(name)?;
-        }
-        Ok(())
     }
 }
 

@@ -1296,9 +1296,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
         assert!(!software.contains(forbidden), "software.rs: {forbidden}");
     }
     assert_eq!(software.matches("Command::new(").count(), 1);
-    assert!(software.contains(
-        "Command::new(\"/bin/td-authd\");\n    command.args([\"application-cache\", &owner.to_string(), name, verb.word()]);"
-    ));
+    assert!(software
+        .contains("command.args([\"application-cache\", &owner.to_string(), name, verb.word()]);"));
+    assert!(software.contains("command.args([\"runtime-cache\", name, verb.word()]);"));
     assert_eq!(software.matches(".spawn()").count(), 1);
     assert_eq!(software.matches(".env_clear()").count(), 1);
     assert_eq!(software.matches(".stdin(Stdio::null())").count(), 1);
@@ -1826,7 +1826,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x5f7221258ec5d3d1;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x48b5bc7296ae3585;
-const WORKSPACE_FINGERPRINT: u64 = 0x6b8b6d3339f5ebc1;
+const WORKSPACE_FINGERPRINT: u64 = 0xd1b24147eea7819a;
 const APPLICATION_FINGERPRINT: u64 = 0xd216cde5d8075fd7;
 
 fn fingerprint(source: &str) -> u64 {
@@ -1839,8 +1839,8 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0x8ecf8ebf4fff8eaf;
-const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
+const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
+const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
 const LAUNCH_FINGERPRINT: u64 = 0x33d421b9691fb2fb;
 const MAIN_FINGERPRINT: u64 = 0xed3640ea05832242;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;

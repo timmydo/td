@@ -1747,36 +1747,20 @@ runtime account, `/bin/td-login exec-service-as td-runtimes --
 runtime's td name, and the application's only once that succeeds, since
 td-app validates the application against the runtime store's `current`
 (APPLICATIONS.md §W.9); a failed runtime check fails the operation with
-td-app's diagnostic. A `remove`, once the application's succeeded, asks
-the status of every other declared application that names the same
-runtime and that the image's registry lists, as its own account, and
-when none has a `current` or a writer holding its cache's lock (an
-install or update in flight) runs `/bin/td-app runtime remove RUNTIME`
-as the runtime account: the last installed application to go takes its
-runtime's store contents with it. A declaration the registry does not
-list, or one with no ledger row, has no account on this machine and
-keeps nothing; it is neither admitted nor asked. One whose registry,
-policy, admission or status cannot be read counts as installed, so the
-runtime stays: that includes a row whose install failed in preparation,
-which keeps the runtime until a retried install completes it, and a
-registry name the declarations lack, which only an inconsistent image
-holds (both come from one application list), rather than guessing that
-nothing needs the runtime. A failed runtime removal fails the operation, saying the
-application is removed and its runtime is not. A removal leaves the
+td-app's diagnostic. An application's `remove` keeps its shared runtime:
+workspaces may still need it. Only explicit `runtime-cache remove` removes
+it, after checking every declared application that uses it: a registry,
+policy, admission or status that cannot be read counts as occupied;
+one outside the registry or without an account needs no runtime. A removal leaves the
 application's ledger row and home, whose jail state only `delete-data`
 deletes.
 
-That is a check, then an act. Another application's install that starts
-after the check, while its runtime half runs and before its own cache's
-lock is taken, can see its freshly installed runtime removed. The cost
-is recoverable: that install's application half refuses for want of a
-runtime, or a launch of it refuses until the owner updates it, which
-installs the runtime again: as `not installed` after a first install,
-and after an update as not revalidating offline against its runtime,
-td-app recording that the runtime is not installed. td-app cannot close the
-window: it runs as one account, and no account reads another's cache,
-so the runtime account cannot see who is about to need its store; only
-root could, by holding every such cache's lock across the removal. Every one of these runs
+The runtime removal's check and write are separate. Request `24` serializes
+mutations of a runtime and all applications that use it within one paired
+generation. A root operation outside that dispatcher can still race the
+check, so a concurrent external install may fail until retried; runtime
+leases keep running launches intact.
+Every one of these runs
 through one command builder (`td_app`), the credential drop into exactly
 an admitted or allocated `tdaUID` or the compiled `td-runtimes`, and one
 spawn. The environment is cleared, the working directory is `/` and stdin is null;
@@ -1848,10 +1832,11 @@ removals ask the applications before removing a runtime; unit tests
 drive each operation against a scripted host and check the runs it
 makes.
 
-Nothing on the compositor's channel reaches this operation: td-software
-installs applications, and their runtimes come with them through
-"Application cache operation". Root's own units run it; the QEMU
-oracles read the store's status through it (APPLICATIONS.md §W.9).
+The compositor's existing `status`, `install`, `update` and `remove`
+requests name a runtime by its compiled td name and reach this operation
+through request `24`. `delete-data` refuses for a runtime. Runtime names
+are reserved: an application registry containing one is rejected. Root's
+own units may also run it, including the QEMU status oracles.
 
 ## Application requests
 
@@ -1866,9 +1851,11 @@ peer names nothing else: root runs `/bin/td-authd application-cache
 OWNER APP VERB`, with OWNER the configured human, through the same
 cleared spawn as every authority child (null stdin, `/`, no
 environment), and that operation's own admission is what checks the
-name against the immutable deployment and selects the account. A name
-the deployment does not hold fails there, and the failure is reported
-like any other.
+name against the immutable deployment and selects the account. For a
+compiled runtime name it runs `runtime-cache NAME VERB` instead, and
+parses the answer with `RuntimeStatus`; runtime `delete-data` is refused
+before spawning. A name the deployment does not hold fails there, and
+the failure is reported like any other.
 
 Root runs it as a process of its own and never waits on it in the
 serving loop, which is the operation's obligation above: the answer
@@ -1917,21 +1904,21 @@ finished, `01` and the record when the last read began no earlier
 than the last operation ended, `02` and the record when it began before
 (a new read is then under way), and `03` when the last read failed. The
 record is exactly what the operation printed, which root parses again
-with `flathub_app::Status`, requiring it to name the requested
-application and to fit the frame beside the header; one that does not
-reads as `03`. A status read starts when a status request finds none running and
+with `flathub_app::Status` or `RuntimeStatus` according to the requested
+name, requiring it to name that application or runtime and to fit the
+frame beside the header; one that does not reads as `03`. A status read starts when a status request finds none running and
 none begun in the last two seconds, or an operation has ended since the
 last began: each read walks the generations' deploys, so a peer polling
 faster is answered from the last read and costs no more walks.
 
-The record is the application cache's alone. While an install or update
-runs its runtime's check, no writer holds that cache, so `OP` shows the
-operation running and the record shows no progress until the
-application's own check starts; the runtime store's progress reaches no
-peer until td-software's runtime views (WORKLOADS.md, "Landing order",
-step 10). For the same reason a read shows no writer while another
-application's install holds the runtime store: an operation started then
-waits on the runtime's lock within its own bound.
+Each record describes its own cache. td-software also polls a runtime's
+status while installing an application that needs it, so the application's
+details can show the runtime download before the application download.
+Runtime records never enter request `23`'s installed application set.
+One mutation per shared runtime is admitted through this dispatcher:
+an operation on that runtime or any application naming it refuses while
+another such operation runs. Status reads remain independent. Outside
+operations still serialize through td-app's store locks and bounds.
 
 Request `23`, with no operand, is the installed set the compositor's
 launcher follows (td-software/DESIGN.md §5). Root answers at once from

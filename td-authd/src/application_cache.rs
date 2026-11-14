@@ -403,7 +403,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
 /// An install or update then runs the declared runtime's check, as the
 /// runtime account: the application is validated against the runtime
 /// store's `current`. A removal keeps the account and its home, and
-/// removes the runtime when no other installed application names it.
+/// keeps its runtime for workspaces until explicitly removed.
 fn operate(
     host: &mut impl Host,
     request: &Request,
@@ -430,28 +430,9 @@ fn operate(
             )?;
             host.td_app(command(), false, deadline, &what)?;
         }
+        // Runtimes are shared with workspaces and are removed explicitly.
         Verb::Remove => {
             host.td_app(command(), false, deadline, &what)?;
-            if !named_elsewhere(
-                host,
-                flathub_app::FLATHUB_SOURCES,
-                source.runtime,
-                Some(&request.name),
-                deadline,
-            ) {
-                host.td_app(
-                    runtime_command(source.runtime, RuntimeVerb::Remove),
-                    false,
-                    deadline,
-                    &format!("runtime remove {}", source.runtime.name),
-                )
-                .map_err(|e| {
-                    format!(
-                        "{} is removed, but its runtime {} is not: {e}",
-                        request.name, source.runtime.name
-                    )
-                })?;
-            }
         }
         Verb::DeleteData => {
             host.td_app(command(), false, deadline, &what)?;
@@ -837,7 +818,7 @@ mod tests {
     /// removal succeeded, and then only because no other declaration
     /// names it (only Firefox names its runtime today).
     #[test]
-    fn the_runtime_comes_first_and_goes_last() {
+    fn the_runtime_comes_first_and_is_removed_only_explicitly() {
         for (verb, first) in [
             (Verb::Install, &["allocate firefox"][..]),
             (Verb::Update, &[][..]),
@@ -858,10 +839,7 @@ mod tests {
         }
         let mut host = Script::new(ok);
         operation(Verb::Remove, &mut host).unwrap();
-        assert_eq!(
-            host.runs,
-            runs(&["tda65536 remove firefox", RUNTIME_REMOVE])
-        );
+        assert_eq!(host.runs, runs(&["tda65536 remove firefox"]));
         // Firefox's own admission; no other application names the runtime.
         assert_eq!(host.admissions, 1);
         let mut host = Script::new(|run| match verb_of(run) {
@@ -870,14 +848,6 @@ mod tests {
         });
         assert!(operation(Verb::Remove, &mut host).is_err());
         assert_eq!(host.runs, runs(&["tda65536 remove firefox"]));
-        let mut host = Script::new(|run| match verb_of(run) {
-            "runtime" => Err("busy".into()),
-            _ => Ok(Vec::new()),
-        });
-        assert_eq!(
-            operation(Verb::Remove, &mut host).unwrap_err(),
-            "firefox is removed, but its runtime freedesktop-platform-25-08 is not: busy"
-        );
         for verb in [Verb::DeleteData, Verb::Status] {
             let mut host = Script::new(|_| {
                 Ok(
@@ -1071,7 +1041,6 @@ mod tests {
             host.runs,
             runs(&[
                 "tda66560 remove firefox",
-                RUNTIME_REMOVE,
                 "allocate firefox",
                 RUNTIME_UPDATE,
                 "tda66560 update firefox --force"

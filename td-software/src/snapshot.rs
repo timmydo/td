@@ -6,6 +6,73 @@ pub use crate::flathub_app::{
     Admitted, CacheStatus, DeployStatus, GenerationStatus, Part, Progress, Refusal, Stage, Status,
 };
 
+/// Presentation shared by application and runtime records. Runtime
+/// generations have no application payload; the wire records stay distinct.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewStatus {
+    pub name: String,
+    pub cache: Option<ViewCache>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewCache {
+    pub current: Option<ViewGeneration>,
+    pub previous: Option<ViewGeneration>,
+    pub checked: Option<u64>,
+    pub refused: Option<Refusal>,
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewGeneration {
+    pub generation: u64,
+    pub serves: bool,
+    pub application: Option<DeployStatus>,
+    pub runtime: DeployStatus,
+}
+
+impl ViewStatus {
+    fn parse(name: &str, text: &str) -> Result<Self, String> {
+        if crate::flathub_app::flathub_runtime(name).is_some() {
+            let status = crate::flathub_app::RuntimeStatus::parse(text)?;
+            let generation = |g: crate::flathub_app::RuntimeGenerationStatus| ViewGeneration {
+                generation: g.generation,
+                serves: g.serves,
+                application: None,
+                runtime: g.runtime,
+            };
+            Ok(Self {
+                name: status.name,
+                cache: Some(ViewCache {
+                    current: status.current.map(generation),
+                    previous: status.previous.map(generation),
+                    checked: status.checked,
+                    refused: status.refused,
+                    progress: status.progress,
+                }),
+            })
+        } else {
+            let status = Status::parse(text)?;
+            let generation = |g: GenerationStatus| ViewGeneration {
+                generation: g.generation,
+                serves: g.serves,
+                application: Some(g.application),
+                runtime: g.runtime,
+            };
+            Ok(Self {
+                name: status.name,
+                cache: status.cache.map(|cache| ViewCache {
+                    current: cache.current.map(generation),
+                    previous: cache.previous.map(generation),
+                    checked: cache.checked,
+                    refused: cache.refused,
+                    progress: cache.progress,
+                }),
+            })
+        }
+    }
+}
+
 /// Why a request got no `ok`, and whether that says root did not act on
 /// it: an `error` answer or a request never written does; an
 /// `unavailable` answer, or a conversation cut after the request was
@@ -79,9 +146,9 @@ pub enum Record {
     /// No read has finished yet.
     Unread,
     /// Read after the last operation ended.
-    Current(Status),
+    Current(ViewStatus),
     /// Read before the last operation ended; a new read is under way.
-    Older(Status),
+    Older(ViewStatus),
     /// The last read failed.
     Failed,
 }
@@ -98,7 +165,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// The record, current or older.
-    pub fn status(&self) -> Option<&Status> {
+    pub fn status(&self) -> Option<&ViewStatus> {
         match &self.record {
             Record::Current(status) | Record::Older(status) => Some(status),
             Record::Unread | Record::Failed => None,
@@ -106,7 +173,7 @@ impl Snapshot {
     }
 
     /// The cache, for a Flathub application's record.
-    pub fn cache(&self) -> Option<&CacheStatus> {
+    pub fn cache(&self) -> Option<&ViewCache> {
         self.status()?.cache.as_ref()
     }
 
@@ -188,8 +255,8 @@ pub fn parse(name: &str, body: &str) -> Result<Snapshot, String> {
     };
     let state = field(lines.next(), "record")?;
     let record = lines.next().unwrap_or_default();
-    let read = |record: &str| -> Result<Status, String> {
-        let status = Status::parse(record)?;
+    let read = |record: &str| -> Result<ViewStatus, String> {
+        let status = ViewStatus::parse(name, record)?;
         if status.name != name {
             return Err("the status is another application's".into());
         }

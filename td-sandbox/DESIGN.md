@@ -19,8 +19,7 @@ immutable entry; the target recipe stages engine's Flathub declarations
 (`flathub_app.rs`) and the ledger's names (`workload_accounts.rs`) too.
 
 Sandboxes run only on td, where the intake runs: on any other host every
-command but `help`, `runtime` and `stop`, which touch only the human's own
-records, fails naming the missing intake. `./install-apps` no longer
+command but `help`, `runtimes`, `runtime` and `stop`, which need no intake, fails naming the missing intake. `./install-apps` no longer
 installs td-sandbox and has no way to retire a program: a
 `~/.local/bin/td-sandbox` an earlier `./install-apps` left on a development
 host is stale, no longer updated, and should be removed by hand.
@@ -194,15 +193,17 @@ the application kind's D-Bus, portal and Wayland boundaries
 (APPLICATIONS.md §C). The launch holds that generation until it ends
 (WORKLOADS.md, "Runtimes").
 
-A sandbox installs no runtime. Its runtime is installed and kept only
-by an application that names it, today Firefox for
-`freedesktop-platform-25-08`. With no `current` in the runtime's store the
-launch is refused, naming the applications whose installation in
-td-software installs it, or saying that no application installs it yet,
-as for `freedesktop-sdk-25-08` until a runtime install path exists.
-Removing the last installed application that names a runtime removes the
-runtime: a running session keeps the generation it holds, and the next
-launch is refused.
+`td-sandbox runtimes` lists `native` and the compiled Flathub runtime
+names with their exact refs, without reading a home, contacting root or
+changing state. It lists supported choices, not installed payloads, and
+points to td-software to install them.
+
+A sandbox installs no runtime. Install the chosen runtime in td-software;
+Firefox also installs its platform runtime. With no `current` in the
+runtime store the launch refuses and names td-software. Runtimes remain
+until explicitly removed there, independently of application removal.
+A running session keeps the generation it holds after removal; its next
+launch requires the runtime to be installed again.
 
 ## Authority
 

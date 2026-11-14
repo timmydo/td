@@ -2981,7 +2981,7 @@ mod tests {
         assert!(require_td_for_runtime(&config).is_ok());
     }
 
-    /// A spec's runtime refuses a development host, names its installers
+    /// A spec's runtime refuses a development host, names Software
     /// when absent, and is held from the store and owner given while the
     /// plan lives; production gives td's compiled ones.
     #[test]
@@ -3010,7 +3010,7 @@ mod tests {
         assert!(spec_runtime(runtime, &source)
             .unwrap_err()
             .to_string()
-            .contains("no application installs it yet"));
+            .contains("install it in td-software"));
         // The store as td-app publishes it.
         let commit = "7".repeat(64);
         let root = store.join(runtime.name);

@@ -7,13 +7,13 @@ mod window;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "td-software [--select APP]
-  Open the application manager: the applications the image declares,
-  the Flathub ones installable on request, each with its status, and
+const USAGE: &str = "td-software [--select NAME]
+  Open the software manager: declared applications and Flathub runtimes,
+  installable on request, each with its status and download progress, and
   Install, Check now, Remove and Delete data. Requests go to the
   compositor's control socket ($TD_CONTROL_SOCKET), which asks root.
-  --select opens it at APP, a registry name, when the image declares
-  one; the launcher's Install row passes it.
+  --select opens it at an application or runtime name the image declares;
+  the launcher's Install row passes an application name.
 td-software --preview WIDTHxHEIGHT
   Write the window's first frame as a PPM to standard output, without
   asking the compositor anything.

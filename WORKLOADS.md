@@ -168,13 +168,12 @@ policy are keyed by. Every Flathub declaration uses the one repository
 constant. Application declarations name the runtime they accept.
 Workspaces name a runtime by its td name (td-sandbox/DESIGN.md,
 "Runtime"; td-agent/DESIGN.md §8, Runtime; `APPLICATIONS.md` §C) and
-install none: a runtime is installed and kept only by an application
-that names it, and a workspace launch finding no `current` is refused,
-naming those applications. The table
-also declares `org.freedesktop.Sdk//25.08` (`freedesktop-sdk-25-08`),
-which no application names, so a workspace naming it is refused as not
-installed until a runtime install path exists; it has no environment or
-dynamic-library policy, which are keyed by application.
+install none. td-software lists every declared runtime, including
+`freedesktop-sdk-25-08`, and installs or updates it through root's
+`runtime-cache` operation. A workspace launch without a runtime's
+`current` refuses and directs the human there. `td-sandbox runtimes`
+lists the supported names and refs. A runtime no application names has
+no application environment or dynamic-library policy.
 
 Runtimes live in one store, `/var/lib/td/runtimes/`, one store per
 runtime named by its td name, owned by the runtime account `td-runtimes`
@@ -183,7 +182,7 @@ with §W.9's layout and admission rules 1–3 and 5. Deploy trees are
 readable by every account. A workload can therefore no longer write its
 own runtime. td-firstboot makes the store root and the account's cgroup
 delegation; root's `runtime-cache` operation, and `application-cache`'s
-install, update and remove, are the only ways anything runs as the
+install and update, are the only ways anything runs as the
 account (td-authd/DESIGN.md).
 
 Each runtime keeps its `current` and `previous` generations and any
@@ -193,8 +192,10 @@ or updating an application checks it against the runtime's `current`
 under rule 4 and rule 5's dynamic validator, and an application whose
 runtime's `current` moved revalidates offline at its next launch or is
 refused; no application pins an older runtime commit. Installing an
-application installs or updates its runtime first; removing the last
-installed application that names a runtime empties that runtime's store.
+application installs or updates its runtime first. Removing an application
+keeps the shared runtime; explicit runtime removal in td-software refuses
+while an installed application needs it. A running workspace keeps its
+held generation, but its next launch requires a reinstall.
 
 Runtimes are never recipe inputs and are outside every closure, as §W.9
 already requires of Flathub bytes. No Flathub byte enters the image.
@@ -328,9 +329,7 @@ own account.
 2. Split `FLATHUB_SOURCES` into runtime and application declarations. No
    behaviour change.
 3. The runtime account, store and root `runtime-cache` operation; Firefox's
-   runtime moves out of its account's cache in the same landing. Landed;
-   until step 10 the runtime half of an install shows no progress in
-   td-software.
+   runtime moves out of its account's cache in the same landing. Landed.
 4. One td-jail runtime mount shared by the application and workspace
    kinds; workspace `runtime=`. Landed: the shared mount, the workspace
    kind's `runtime=`, td-sandbox's `runtime` and td-agent templates'
@@ -492,7 +491,8 @@ own account.
    Firstboot imports active human state once, retaining any older private
    home in a root-only archive (td-authd/DESIGN.md, "Application state
    preparation").
-10. td-software's runtime view (its folders panel landed with step 6).
+10. td-software's runtime view and runtime installation and progress
+    (its folders panel landed with step 6). Landed.
 
 ## Open questions
 

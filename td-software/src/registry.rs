@@ -29,6 +29,40 @@ pub struct Application {
     pub flathub: Option<&'static str>,
 }
 
+impl Application {
+    pub fn is_runtime(&self) -> bool {
+        crate::flathub_app::flathub_runtime(&self.name).is_some()
+    }
+}
+
+/// The same compiled catalog td-sandbox offers. These are installable
+/// choices, regardless of whether any application uses them.
+pub fn runtimes() -> Result<Vec<Application>, td_alloc::Error> {
+    let mut runtimes = Vec::new();
+    for runtime in crate::flathub_app::FLATHUB_RUNTIMES {
+        let entry = Application {
+            name: td_alloc::string(runtime.name)?,
+            display: td_alloc::format(format_args!("Runtime: {}", runtime.name))
+                .map_err(|_| td_alloc::Error)?,
+            flathub: Some(runtime.exact_ref),
+        };
+        td_alloc::push(&mut runtimes, entry)?;
+    }
+    Ok(runtimes)
+}
+
+/// Add the complete runtime catalog atomically. No partial list is shown
+/// when either its strings or the receiving list cannot be reserved.
+pub fn append_runtimes(applications: &mut Vec<Application>) -> Result<(), td_alloc::Error> {
+    let runtimes = runtimes()?;
+    td_alloc::reserve(applications, runtimes.len())?;
+    // The reservation above admits every element; moving strings allocates nothing.
+    for runtime in runtimes {
+        td_alloc::push(applications, runtime)?;
+    }
+    Ok(())
+}
+
 /// The registry's name grammar, which root and td-app hold too: one to 64
 /// lowercase letters, digits, `.`, `_` and `-`, first a letter.
 pub fn valid_name(name: &str) -> bool {
@@ -54,6 +88,12 @@ pub fn applications(registry: &str, launcher: Option<&str>) -> Result<Vec<Applic
             .next()
             .filter(|name| valid_name(name) && line.contains('\t'))
             .ok_or_else(|| "the application registry has a malformed line".to_string())?;
+        if crate::flathub_app::flathub_runtime(name).is_some() {
+            return Err(td_alloc::format(format_args!(
+                "application {name} conflicts with a runtime name"
+            ))
+            .unwrap_or_default());
+        }
         if applications.iter().any(|known| known.name == name) {
             return Err(format!("the application registry names {name} twice"));
         }

@@ -256,9 +256,8 @@ fn install_runs_through_root_and_reports_its_end() {
         "{details:?}"
     );
     assert!(
-        details.iter().any(|line| line.starts_with(
-            "1,200 of the 4,000 objects found so far (never more than 1,000,000), 52.0 MB"
-        )),
+        details.iter().any(|line| line
+            .starts_with("52.0 MB downloaded; 1,200 of 4,000 objects found so far completed.")),
         "{details:?}"
     );
     // A busy entry is asked again within the second.
@@ -1024,4 +1023,276 @@ fn the_folders_panel_lists_shares_and_stops_sharing() {
     assert!(app
         .message()
         .contains("this panel is for Flathub applications"));
+}
+
+fn runtime_record(name: &str, installed: bool, progress: Option<Progress>) -> String {
+    let exact_ref = registry::runtimes()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == name)
+        .unwrap()
+        .flathub
+        .unwrap();
+    let current = if installed {
+        format!("current=1\tserves\ncurrent.runtime={exact_ref}\t{RUNTIME_COMMIT}\t1759000000\t100000000\n")
+    } else {
+        "current=none\n".into()
+    };
+    format!("format=1\nname={name}\nkind=runtime\n{current}previous=none\nchecked=1760000000\nrefused=none\nprogress={}\n",
+        progress.map_or_else(|| "none".into(), |p| p.render()))
+}
+
+#[test]
+fn runtimes_install_update_and_remove_but_never_launch_delete_data_or_grant() {
+    let runtimes = registry::runtimes().unwrap();
+    let mut app = App::new(
+        runtimes.clone(),
+        None,
+        Surface::new(1024, 768, Scale::default()).unwrap(),
+    );
+    app.tick(0);
+    assert_eq!(app.take_jobs().len(), runtimes.len());
+    let name = "freedesktop-sdk-25-08";
+    app.select_name(name);
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "none",
+            "current",
+            &runtime_record(name, false, None),
+        ),
+    );
+    assert_eq!(app.actions(), [(Action::Install, true)]);
+    key(&mut app, "i");
+    assert_eq!(
+        app.take_jobs(),
+        [Job::Operation(snapshot::Operation::Install, name.into())]
+    );
+    app.reply(Reply::Operation(
+        snapshot::Operation::Install,
+        name.into(),
+        Ok(()),
+    ));
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "install\tok",
+            "current",
+            &runtime_record(name, true, None),
+        ),
+    );
+    assert_eq!(
+        app.actions(),
+        [(Action::Update, true), (Action::Remove, true)]
+    );
+    for chord in ["l", "D", "f"] {
+        key(&mut app, chord);
+    }
+    assert!(app.take_jobs().is_empty());
+    assert!(!app
+        .details()
+        .iter()
+        .any(|(line, _)| line.contains("application commit")));
+    key(&mut app, "c");
+    assert_eq!(
+        app.take_jobs(),
+        [Job::Operation(snapshot::Operation::Update, name.into())]
+    );
+    app.reply(Reply::Operation(
+        snapshot::Operation::Update,
+        name.into(),
+        Ok(()),
+    ));
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "update\tok",
+            "current",
+            &runtime_record(name, true, None),
+        ),
+    );
+    key(&mut app, "x");
+    assert!(app.dialog_open());
+    assert!(app.take_jobs().is_empty());
+    let (_, _, text) = td_ui::driven::text(&app.frame()).unwrap();
+    assert!(text.contains("Sandboxes using it cannot start again"));
+    key(&mut app, "Tab");
+    key(&mut app, "Return");
+    assert_eq!(
+        app.take_jobs(),
+        [Job::Operation(snapshot::Operation::Remove, name.into())]
+    );
+    // A runtime wire record cannot masquerade as an application or another runtime.
+    assert!(snapshot::parse(
+        "firefox",
+        &answer("none", "none", "current", &runtime_record(name, true, None))[3..]
+    )
+    .is_err());
+    assert!(snapshot::parse(
+        "freedesktop-platform-25-08",
+        &answer("none", "none", "current", &runtime_record(name, true, None))[3..]
+    )
+    .is_err());
+}
+
+#[test]
+fn firefox_shows_its_runtime_download_then_its_own_and_forgets_failed_progress() {
+    let mut catalog = applications();
+    catalog.extend(registry::runtimes().unwrap());
+    let mut app = App::new(
+        catalog,
+        None,
+        Surface::new(1024, 768, Scale::default()).unwrap(),
+    );
+    app.tick(0);
+    app.take_jobs();
+    let name = "freedesktop-platform-25-08";
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "none",
+            "current",
+            &runtime_record(name, false, None),
+        ),
+    );
+    status(
+        &mut app,
+        "firefox",
+        &answer("install", "none", "current", &firefox(None, None)),
+    );
+    app.tick(1000);
+    assert!(app.take_jobs().contains(&Job::Status(name.into())));
+    let mut progress = Progress {
+        stage: Stage::Fetch,
+        part: Some(snapshot::Part::Runtime),
+        objects: 10,
+        objects_known: 100,
+        objects_bound: 1000,
+        bytes: 1_000_000,
+        bytes_bound: 1_000_000_000,
+    };
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "none",
+            "current",
+            &runtime_record(name, false, Some(progress)),
+        ),
+    );
+    app.tick(3000);
+    progress.bytes = 5_000_000;
+    progress.objects = 50;
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "none",
+            "current",
+            &runtime_record(name, false, Some(progress)),
+        ),
+    );
+    let details = app
+        .details()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        details.contains("Working: Fetching the runtime."),
+        "{details}"
+    );
+    assert!(
+        details.contains("5.0 MB downloaded; 50 of 100"),
+        "{details}"
+    );
+    assert!(details.contains("2.0 MB/s observed; 2s"), "{details}");
+    assert!(!details.contains('%'));
+    // The same counter is not new progress and never divides by zero.
+    status(
+        &mut app,
+        name,
+        &answer(
+            "none",
+            "none",
+            "current",
+            &runtime_record(name, false, Some(progress)),
+        ),
+    );
+    app.tick(9000);
+    assert!(app
+        .details()
+        .iter()
+        .any(|(s, _)| s.contains("waiting for download progress")));
+    app.reply(Reply::Status(
+        name.into(),
+        Box::new(Err("disconnected".into())),
+    ));
+    assert!(!app.details().iter().any(|(s, _)| s.contains("5.0 MB")));
+    // New application stage starts its own measurement.
+    progress.part = Some(snapshot::Part::Application);
+    progress.bytes = 100;
+    progress.objects = 1;
+    status(
+        &mut app,
+        "firefox",
+        &answer("install", "none", "current", &firefox(None, Some(progress))),
+    );
+    let details = app
+        .details()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(details.contains("Fetching the application"));
+    assert!(details.contains("measuring download speed; 0s"));
+    assert!(!details.contains("Fetching the runtime"));
+}
+
+#[test]
+fn runtime_catalog_growth_is_atomic_when_reservation_is_refused() {
+    let mut succeeded = false;
+    for allowance in 0..32 {
+        let mut catalog = applications();
+        let before = catalog.clone();
+        let result =
+            td_alloc::with_reservation_limit(allowance, || registry::append_runtimes(&mut catalog));
+        if result.is_ok() {
+            assert_eq!(
+                catalog.len(),
+                before.len() + registry::runtimes().unwrap().len()
+            );
+            succeeded = true;
+            break;
+        }
+        assert_eq!(catalog, before);
+    }
+    assert!(succeeded);
+    let mut app = App::new(
+        registry::runtimes().unwrap(),
+        None,
+        Surface::new(1024, 768, Scale::default()).unwrap(),
+    );
+    let name = "freedesktop-sdk-25-08";
+    app.select_name(name);
+    status(
+        &mut app,
+        name,
+        &answer("none", "none", "current", &runtime_record(name, true, None)),
+    );
+    td_alloc::with_reservation_limit(0, || key(&mut app, "x"));
+    assert!(!app.dialog_open());
+    assert!(app.take_jobs().is_empty());
+    key(&mut app, "x");
+    assert!(app.dialog_open());
 }

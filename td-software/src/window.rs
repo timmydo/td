@@ -117,7 +117,12 @@ fn applications() -> (Vec<Application>, Option<String>) {
     match table(registry::REGISTRY)
         .and_then(|text| registry::applications(&text, launcher.as_deref()))
     {
-        Ok(applications) => (applications, None),
+        Ok(mut applications) => {
+            if registry::append_runtimes(&mut applications).is_err() {
+                return (Vec::new(), Some(String::new()));
+            }
+            (applications, None)
+        }
         Err(error) => (Vec::new(), Some(error)),
     }
 }
