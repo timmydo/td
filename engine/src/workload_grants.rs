@@ -760,7 +760,7 @@ impl Role {
     }
 }
 
-/// The role in which a workspace's plan may name one of td-agent's own
+/// The roles in which a workspace's plan may name one of td-agent's own
 /// trees below td's reserved `.local/share` and `.local/state`
 /// (td-agent/DESIGN.md §7, Layout; §8), each of one exact shape: a
 /// workspace repository `.local/share/td-agent/ws/W/R.git`, read-write
@@ -769,8 +769,12 @@ impl Role {
 /// conversation's scratch worktree `.local/state/td-agent/jail/ID/scratch`.
 /// W, R and S are td-agent's names, ASCII letters, digits, `-`, `_` and
 /// `.` beginning with a letter or digit; ID is 32 lowercase hexadecimal
-/// digits. None for any other path.
-fn agent_tree(path: &str) -> Option<Role> {
+/// digits. Reviews admit `.local/state/td-agent/review-runs/review-N/`
+/// only at `source` (Checkout or Read), `repository.git` (Repository or
+/// Read) and `scratch` (Worktree), with N in 1..=64. None otherwise.
+/// A conversation's staged `/review` exposes only
+/// `.local/state/td-agent/conversations/ID/review/review.git/objects`, as Read.
+fn agent_tree(path: &str) -> Option<&'static [Role]> {
     let plain = |name: &str| {
         name.len() <= MAX_NAME_BYTES
             && name
@@ -789,6 +793,10 @@ fn agent_tree(path: &str) -> Option<Role> {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
+    if let Some(staged) = path.strip_prefix(".local/state/td-agent/conversations/") {
+        let (conversation, tree) = staged.split_once('/')?;
+        return (id(conversation) && tree == "review/review.git/objects").then_some(&[Role::Read]);
+    }
     let mut names = path.split('/');
     let mut name = || names.next();
     let shape = [name(), name(), name(), name(), name(), name(), name()];
@@ -796,29 +804,42 @@ fn agent_tree(path: &str) -> Option<Role> {
         [Some(".local"), Some("share"), Some("td-agent"), Some("ws"), Some(workspace), Some(repository), None]
             if plain(workspace) && git(repository) =>
         {
-            Some(Role::Repository)
+            Some(&[Role::Repository])
         }
         [Some(".local"), Some("share"), Some("td-agent"), Some("store"), Some(store), Some("objects"), None]
             if git(store) =>
         {
-            Some(Role::Read)
+            Some(&[Role::Read])
         }
         [Some(".local"), Some("state"), Some("td-agent"), Some("jail"), Some(conversation), Some("scratch"), None]
             if id(conversation) =>
         {
-            Some(Role::Worktree)
+            Some(&[Role::Worktree])
+        }
+        [Some(".local"), Some("state"), Some("td-agent"), Some("review-runs"), Some(slot), Some(tree), None]
+            if matches!(
+                crate::workload_accounts::workspace_slot(slot),
+                Some((crate::workload_accounts::SlotPool::Review, _))
+            ) =>
+        {
+            match tree {
+                "source" => Some(&[Role::Checkout, Role::Read]),
+                "repository.git" => Some(&[Role::Repository, Role::Read]),
+                "scratch" => Some(&[Role::Worktree]),
+                _ => None,
+            }
         }
         _ => None,
     }
 }
 
 /// A directory a workspace launch's plan names in `role`: one of td-agent's
-/// own trees in its one role (`agent_tree`), or a path `validate_path`
+/// own trees in its admitted roles (`agent_tree`), or a path `validate_path`
 /// admits. Those trees lie below reserved ones, which no other role and no
 /// other shape reaches.
 pub fn validate_role(role: Role, relative: &[u8]) -> Result<(), String> {
     match std::str::from_utf8(relative).ok().and_then(agent_tree) {
-        Some(own) if own == role => Ok(()),
+        Some(own) if own.contains(&role) => Ok(()),
         Some(_) => Err("td-agent's own tree is named in a role it does not take".into()),
         None => validate_path(relative),
     }
@@ -830,7 +851,9 @@ pub fn validate_role(role: Role, relative: &[u8]) -> Result<(), String> {
 pub fn validate_view(kind: Kind, access: Access, relative: &[u8]) -> Result<(), String> {
     let own = std::str::from_utf8(relative).ok().and_then(agent_tree);
     match (kind, own) {
-        (Kind::Workspace, Some(role)) if role.access() == access => Ok(()),
+        (Kind::Workspace, Some(roles)) if roles.iter().any(|role| role.access() == access) => {
+            Ok(())
+        }
         (Kind::Workspace, Some(_)) => {
             Err("td-agent's own tree is listed at an access its role does not take".into())
         }
@@ -1651,6 +1674,104 @@ mod tests {
     const REPOSITORY: &str = ".local/share/td-agent/ws/td-agent-01234567/td-2.git";
     const OBJECTS: &str = ".local/share/td-agent/store/github.com-x_y-0123456789abcdef.git/objects";
     const SCRATCH: &str = ".local/state/td-agent/jail/0123456789abcdef0123456789abcdef/scratch";
+
+    #[test]
+    fn conversation_reviews_grant_only_the_exact_staged_objects_read_only() {
+        let base = ".local/state/td-agent/conversations/0123456789abcdef0123456789abcdef";
+        let objects = format!("{base}/review/review.git/objects");
+        for role in Role::ALL {
+            assert_eq!(
+                validate_role(*role, objects.as_bytes()).is_ok(),
+                *role == Role::Read
+            );
+        }
+        for kind in [Kind::Workspace, Kind::Sandbox, Kind::Application] {
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                assert_eq!(
+                    validate_view(kind, access, objects.as_bytes()).is_ok(),
+                    kind == Kind::Workspace && access == Access::ReadOnly
+                );
+            }
+        }
+        assert!(validate_path(objects.as_bytes()).is_err());
+        for path in [
+            base.to_string(),
+            format!("{base}/review"),
+            format!("{base}/review/review.git"),
+            format!("{objects}/info"),
+            format!("{base}/review/other.git/objects"),
+            format!("{base}/review/review.git/config"),
+            format!("{base}/conversation.json"),
+            objects.replace("0123456789abcdef0123456789abcdef", "invalid"),
+            objects.replace(
+                "0123456789abcdef0123456789abcdef",
+                "0123456789ABCDEF0123456789ABCDEF",
+            ),
+        ] {
+            for role in Role::ALL {
+                assert!(validate_role(*role, path.as_bytes()).is_err(), "{path}");
+            }
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                assert!(
+                    validate_view(Kind::Workspace, access, path.as_bytes()).is_err(),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reviews_expose_only_exact_staging_trees_in_their_declared_roles() {
+        for slot in ["review-1", "review-64"] {
+            for (tree, roles) in [
+                ("source", &[Role::Checkout, Role::Read][..]),
+                ("repository.git", &[Role::Repository, Role::Read][..]),
+                ("scratch", &[Role::Worktree][..]),
+            ] {
+                let path = format!(".local/state/td-agent/review-runs/{slot}/{tree}");
+                for role in Role::ALL {
+                    assert_eq!(
+                        validate_role(*role, path.as_bytes()).is_ok(),
+                        roles.contains(role)
+                    );
+                }
+                for access in [Access::ReadOnly, Access::ReadWrite] {
+                    assert_eq!(
+                        validate_view(Kind::Workspace, access, path.as_bytes()).is_ok(),
+                        roles.iter().any(|role| role.access() == access)
+                    );
+                    for kind in [Kind::Sandbox, Kind::Application] {
+                        assert!(validate_view(kind, access, path.as_bytes()).is_err());
+                    }
+                }
+                assert!(validate_path(path.as_bytes()).is_err());
+            }
+        }
+        for path in [
+            ".local/state/td-agent/review-runs",
+            ".local/state/td-agent/review-runs/review-1",
+            ".local/state/td-agent/review-runs/review-1/home",
+            ".local/state/td-agent/review-runs/review-1/source/child",
+            ".local/state/td-agent/review-runs/review-1/repository.git/objects",
+            ".local/state/td-agent/review-runs/review-0/source",
+            ".local/state/td-agent/review-runs/review-01/source",
+            ".local/state/td-agent/review-runs/review-65/source",
+            ".local/state/td-agent/review-runs/agent-1/source",
+            ".local/state/td-agent/review-slots/review-1",
+            ".local/state/td-agent/reviews/source",
+            ".config/td-agent/reviews/review-1/source",
+        ] {
+            for role in Role::ALL {
+                assert!(validate_role(*role, path.as_bytes()).is_err(), "{path}");
+            }
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                assert!(
+                    validate_view(Kind::Workspace, access, path.as_bytes()).is_err(),
+                    "{path}"
+                );
+            }
+        }
+    }
 
     /// A workspace's plan reaches td-agent's own trees below reserved ones
     /// only in their exact shapes and their one role each; every other

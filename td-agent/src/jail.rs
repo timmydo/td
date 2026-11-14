@@ -220,8 +220,8 @@ impl Programs {
 /// directories, read-only or read-write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
-    /// A td conversation's persistent account. Reviews acquire theirs
-    /// separately; host-only launches retain their caller-owned spec.
+    /// A td conversation's persistent account or a review's leased account.
+    /// Development hosts retain their caller-owned spec.
     pub account: Option<crate::workspace_slot::Account>,
     /// Host networking for ordinary development; reviews remain isolated.
     pub development: bool,
@@ -445,7 +445,7 @@ pub fn launch_linked(
     launched
 }
 
-fn host_arguments(policy: &Policy, linked: bool) -> Result<Vec<String>, String> {
+pub(crate) fn host_arguments(policy: &Policy, linked: bool) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut add = |word: &str| -> Result<(), String> {
         let word = td_alloc::string(word).map_err(crate::workspace_slot::error)?;

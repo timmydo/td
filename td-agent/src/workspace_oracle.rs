@@ -1,5 +1,5 @@
 //! The installed-image workspace-account oracle. No model or credentials
-//! are used: it drives the same Bench and conversation deletion as the UI.
+//! are used: it drives the UI's Bench and deletion and CLI review staging.
 
 use crate::workspace_slot::error;
 use std::fs;
@@ -72,7 +72,8 @@ pub fn run() -> Result<(), String> {
     let b = Id::random()?;
     // These are real conversation records, owned and deleted through the
     // production store. The only temporary grant trees have TempDir owners.
-    let result = exercise(&state, &a, &b, &first, &second, &secret);
+    let result = exercise(&state, &a, &b, &first, &second, &secret)
+        .and_then(|()| reviews(fixture.path(), &secret, &state, &a));
     let clean_a = state.delete(&a);
     let clean_b = state.delete(&b);
     result?;
@@ -81,6 +82,172 @@ pub fn run() -> Result<(), String> {
         "workspace oracle cleanup did not finish",
     )?;
     writeln!(std::io::stdout().lock(), "{MARKER}").map_err(error)
+}
+
+fn reviews(
+    fixture: &Path,
+    secret: &Path,
+    state: &StateDir,
+    conversation: &Id,
+) -> Result<(), String> {
+    let source = joined(fixture, "review-source")?;
+    fs::create_dir(&source).map_err(error)?;
+    fs::write(joined(&source, "file")?, b"review fixture\n").map_err(error)?;
+    let git = crate::repo::host_git()?;
+    for args in [
+        &["init"][..],
+        &["add", "file"][..],
+        &[
+            "-c",
+            "user.name=Oracle",
+            "-c",
+            "user.email=oracle@invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ][..],
+    ] {
+        crate::git::run(
+            std::process::Command::new(&git)
+                .current_dir(&source)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args),
+            4096,
+            Duration::from_secs(20),
+        )
+        .map_err(error)?;
+    }
+    // A dummy credential in a separate tree, never a real API key.
+    let credentials = joined(fixture, "credentials")?;
+    td_fs::private_dir(&credentials).map_err(error)?;
+    let key = joined(&credentials, "key")?;
+    fs::write(&key, b"not-an-api-key").map_err(error)?;
+    // The GUI's /review imports into this exact reserved conversation
+    // path; testing only a source directly under HOME misses its grant.
+    let stage = state.review_stage(conversation);
+    td_fs::private_dir(&stage).map_err(error)?;
+    let staged = joined(&stage, "review.git")?;
+    crate::git::run(
+        std::process::Command::new(&git)
+            .args(["clone", "--bare", "--shared"])
+            .arg(&source)
+            .arg(&staged),
+        4096,
+        Duration::from_secs(20),
+    )
+    .map_err(error)?;
+    let mut first = crate::review_workspace::Workspace::prepare(&source, "HEAD", &[], &key)?;
+    let mut second = crate::review_workspace::Workspace::prepare(&staged, "HEAD", &[], &key)?;
+    let first_uid = review_probe(&first, &key, secret)?;
+    need(
+        first_uid != review_probe(&second, &key, secret)?,
+        "reviews shared an account",
+    )?;
+    let read = td_alloc::format(format_args!(
+        "{{\"path\":{}}}",
+        td_json::Json::Str(path(&joined(&first.checkout, "file")?)?),
+    ))
+    .map_err(error)?;
+    need(
+        first.call("read_file", &read)?.contains("review fixture"),
+        "review tool did not read its checkout",
+    )?;
+    for tree in crate::workspace_slot::review_storage().map_err(error)? {
+        let log = joined(&tree, "forbidden-trace")?;
+        let options = crate::review::Options {
+            log_dir: Some(PathBuf::from(path(&log)?)),
+            ..Default::default()
+        };
+        need(
+            crate::review_log::Journal::create(&options, "oracle", &key).is_err(),
+            "trace admitted disposable review storage",
+        )?;
+        need(
+            !log.try_exists().map_err(error)?,
+            "trace refusal left disposable files",
+        )?;
+    }
+    let old_root = PathBuf::from(path(&first.root)?);
+    first.cleanup()?;
+    need(
+        !old_root.try_exists().map_err(error)?,
+        "review cleanup retained staging",
+    )?;
+    drop(first); // Release the slot lock only after cleanup.
+    let mut reused = crate::review_workspace::Workspace::prepare(&source, "HEAD", &[], &key)?;
+    need(
+        reused.root == old_root && review_probe(&reused, &key, secret)? == first_uid,
+        "review slot was not reused empty",
+    )?;
+    reused.cleanup()?;
+    second.cleanup()?;
+    need(
+        fs::read(joined(&source, "file")?).map_err(error)? == b"review fixture\n",
+        "review changed its source",
+    )?;
+    let refused = std::process::Command::new("/bin/td-jail")
+        .args([
+            "--workspace",
+            &td_alloc::format(format_args!("{}", std::process::id())).map_err(error)?,
+            "/nonexistent-workspace-spec",
+        ])
+        .output()
+        .map_err(error)?;
+    need(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("ledger account"),
+        "td-jail admitted the human workspace caller",
+    )
+}
+
+fn review_probe(
+    review: &crate::review_workspace::Workspace,
+    key: &Path,
+    secret: &Path,
+) -> Result<u32, String> {
+    let policy = review.policy()?;
+    let account = policy
+        .account
+        .as_ref()
+        .ok_or_else(|| error("review bypassed root"))?;
+    need(
+        account.name().starts_with("review-"),
+        "review used the conversation pool",
+    )?;
+    let repository = policy
+        .read
+        .get(1)
+        .ok_or_else(|| error("review lacks repository"))?;
+    let mut stream = account
+        .launch(
+            &policy,
+            &words(&[
+                "workspace-probe",
+                "review",
+                &path(&review.checkout)?,
+                &path(repository)?,
+                &path(&review.scratch)?,
+                &path(key)?,
+                &path(secret)?,
+            ])?,
+        )
+        .map_err(error)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(error)?;
+    let mut reply = Vec::new();
+    td_alloc::reserve_exact(&mut reply, 32).map_err(error)?;
+    (&mut stream)
+        .take(32)
+        .read_to_end(&mut reply)
+        .map_err(error)?;
+    need(reply.len() < 32, "review probe said too much")?;
+    std::str::from_utf8(&reply)
+        .map_err(error)?
+        .trim()
+        .parse()
+        .map_err(error)
 }
 
 fn exercise(
@@ -244,6 +411,39 @@ fn run_call(client: &mut Client, call: Call) -> Result<String, String> {
 /// authority: its caller supplies paths subject to the ordinary jail.
 pub fn inside(args: &[String]) -> Result<(), String> {
     match args {
+        [mode, checkout, repository, scratch, key, secret] if mode == "review" => {
+            let uid = fs::metadata("/proc/self").map_err(error)?.uid();
+            need((98304..=131071).contains(&uid), "review runs as the human")?;
+            need(
+                fs::read(key).is_err() && fs::read(secret).is_err(),
+                "review read an ungranted credential or file",
+            )?;
+            need(
+                fs::write(joined(Path::new(checkout), "file")?, b"changed").is_err()
+                    && fs::write(joined(Path::new(repository), "config")?, b"changed").is_err(),
+                "review source or metadata is writable",
+            )?;
+            let marker = joined(Path::new(scratch), "review-marker")?;
+            need(
+                !marker.try_exists().map_err(error)?,
+                "review reused dirty scratch",
+            )?;
+            fs::write(marker, b"private").map_err(error)?;
+            let home =
+                PathBuf::from(std::env::var_os("HOME").ok_or_else(|| error("no review home"))?);
+            let marker = joined(&home, "review-marker")?;
+            need(
+                !marker.try_exists().map_err(error)?,
+                "review reused dirty home",
+            )?;
+            fs::write(marker, b"private").map_err(error)?;
+            network_devices(&proc_text("/proc/net/dev")?, true)?;
+            offline_routes(
+                &proc_text("/proc/net/route")?,
+                &proc_text("/proc/net/ipv6_route")?,
+            )?;
+            writeln!(std::io::stdout().lock(), "{uid}").map_err(error)
+        }
         [mode] if mode == "offline-network" || mode == "host-network" => {
             let offline = mode == "offline-network";
             network_devices(&proc_text("/proc/net/dev")?, offline)?;

@@ -187,8 +187,8 @@ the caller supplies no prompt or generated diff. The reviewer inspects an
 internal checkout pinned to that commit, with source and Git metadata
 read-only and private writable scratch for test outputs. The existing
 confined checkout and tool loop described below applies. It removes the
-checkout and scratch on completion or error; a subsequent review sweeps
-scratch abandoned by abrupt process death.
+checkout and scratch on completion or error; abandoned scratch is collected
+on slot reuse on td, or by the next review on a development host.
 
 The default model is `opus-latest`. That alias and `gpt-sol-latest` resolve
 from the API model list to the highest numeric stable frontier release of
@@ -631,19 +631,44 @@ never the key, so retained runs can be grouped across key rotations. This is
 private diagnostic attribution, not authentication. Single-file summaries
 also expose start metadata/time and the fingerprint; legacy absence stays null.
 
-The disposable private run directory is below the key directory's `reviews/`,
-a different tree from the state directory's retained traces. Removing a run
-directory never removes its trace. Neither the retained traces nor their
-parent are mounted into the review jail; neither the private run parent nor
-the key is mounted either. The controller
-holds an owner lock and serializes creation and cleanup with a sweep lock.
-Ordinary completion and errors remove the checkout, metadata, home and
-scratch. After abrupt process death, the next repository review collects
-directories whose owner lock is free without following symlinks; live
-reviews remain untouched. Hard termination does not promise immediate
-disk cleanup. Cleanup failures are reported. A stale entry that cannot
-be safely collected is reported and left alone so it cannot prevent a
-new review; a successfully cleaned run is not cleaned again by `Drop`.
+On td, a repository review leases one of `review-1` through `review-64`
+from the canonical human home's `.local/state/td-agent/review-slots/`.
+Each slot has a private regular, single-link lock file, held throughout
+preparation, tools and cleanup, independent of the key or XDG state directory.
+Its disposable staging is `.local/state/td-agent/review-runs/review-N/`:
+`source`, `repository.git` and `scratch`. Only these exact trees are
+admitted below the reserved state directory: maintenance names the first
+two as checkout and repository; tools read both and write only scratch.
+The GUI's `/review` source lives under
+`.local/state/td-agent/conversations/ID/review/review.git`: only its exact
+`objects` directory is admitted read-only, with ID 32 lowercase hex digits;
+its configuration, conversation records and staging parent stay outside.
+Root launches each instance as that slot's ledger account with its own
+home. The trace records the typed `workspace_launch_request`.
+
+Before using an unlocked slot, root ends residual processes and empties
+the account; only then does td-agent remove abandoned staging and create
+fresh staging and an account instance. Cleanup uses the same order. A
+refused root deletion preserves staging and reports the error. After abrupt
+process death, the kernel releases the lock; that slot is collected on its
+next use. Other abandoned slots may remain until reused; live slots are
+untouched. Input repositories, borrowed objects and keys within either
+pool are refused before deletion. Neither pool admits parent aliases.
+
+On a development host, the disposable run directory is instead below the
+key directory's `reviews/`. The controller holds an owner lock and
+serializes creation and cleanup with a sweep lock. The next repository
+review collects abandoned run directories whose owner locks are free,
+without following symlinks. Cleanup failures are reported and an unsafe
+stale entry is left alone. Ordinary completion and errors remove the
+checkout, metadata, home and scratch on either platform; hard termination
+does not promise immediate disk cleanup. A cleaned run is not cleaned
+again by `Drop`.
+
+Retained traces are separate from these disposable trees. Neither a key,
+a staging parent, the slot locks nor retained traces enter a review jail.
+Trace creation refuses both product pools and the host's disposable parent
+before creating files, so slot reuse and cleanup cannot remove a trace.
 
 **One process per conversation.** The broker, `td-agent serve`, is the one
 that stays while conversations run; a window starts it when none answers. It
@@ -4119,14 +4144,15 @@ design is then additive:
   well as the conversation process; ancestry alone cannot impose it.
 
 The placement rule keeps one conversation process per conversation.
-Development-host instances, unconfined tools and the pending review path
-remain descendants of their conversation process; no host instance may
+Development-host instances and unconfined tools remain descendants of
+their conversation process; no host instance may
 move out of its launcher's cgroup. Confined td instances belong only to
 that conversation's slot delegation and end when their client closes.
 The broker runs no conversation tools. Its git worker's imports and
 pushes would take a limit of their own (§9); a `/review`'s staging import
-and its review remain the conversation process's children (§15) until
-the review account cutover.
+remains the conversation process's child (§15); the review controller
+also remains there, while its confined td tools run under a leased review
+account's delegation through root.
 
 **Mechanism.** td has one confinement implementation, td-jail
 (APPLICATIONS.md §C), and td-agent does not grow a second one. The jail is
@@ -4168,7 +4194,7 @@ host. There is no silent unconfined fallback.
 APPLICATIONS.md §C's `td-jail --workspace LAUNCHER-PID SPEC [ARG...]`,
 with §X.8
 naming its host divergences, and it settles four things this section
-left open. On a development host (and for reviews awaiting their cutover),
+left open. On a development host,
 the spec is td-agent's to write, per instance: an ordered keyfile of the entry and td-txt, the home, the
 worktrees and the shared directories, read-only or read-write, kept
 outside every directory it grants, since the instance runs as the
@@ -4324,7 +4350,8 @@ more than 32 entries, invalid runtime/profile combinations, more than
 home and scratch paths are root's to choose, never sent by the client.
 On td, confined conversations use it for every tool-host instance,
 background command, MCP server and repository maintenance operation.
-Reviews still use the caller-owned spec path pending their separate cutover.
+Reviews use it for checkout maintenance and tools under their leased
+`review-N` account, with the isolated profile (§2).
 The product configuration's presence selects this path; an inspection error
 refuses. Its absence alone selects the documented development-host launch,
 never a refusal from root. Connecting waits up to ten seconds for a missing
@@ -4390,7 +4417,11 @@ ungranted directory and world-readable-file refusal, old-layout home and
 scratch import, persistent reservation,
 a nonreading entry ended on client disconnect, and reuse of an emptied
 home and all four scratch directories. It deletes its conversations and
-prints the shared workspace marker only after success; the system QEMU
+also stages both a CLI source repository and the GUI's bare `/review`
+repository under conversation state, exercises concurrent review accounts,
+read-only source and metadata, private scratch and home, trace exclusions,
+empty slot reuse, and refusal of a direct human td-jail launch. It prints
+the shared workspace marker only after success; the system QEMU
 oracle requires that marker on each desktop oracle boot.
 
 The socket transport is shared with td-sandbox in

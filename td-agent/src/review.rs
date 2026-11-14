@@ -53,8 +53,8 @@ remote or fetch. td-agent generates the full diff and review instruction,
 creates an internal checkout pinned to the commit, and removes it and its
 scratch on completion or error. Source and Git metadata are read-only;
 private test outputs are writable. Network, edits, publication and peer
-tools are unavailable to the reviewer. Abruptly abandoned scratch is swept
-by the next review.
+tools are unavailable to the reviewer. Abruptly abandoned scratch is collected on slot reuse on td,
+or by the next review on a development host.
 
 The model defaults to opus-latest. opus-latest and gpt-sol-latest resolve to
 the newest concrete frontier release in the API model list, recorded in

@@ -23,6 +23,7 @@ pub struct Workspace {
     pub(crate) root: PathBuf,
     cleaned: bool,
     _lock: File,
+    account: Option<crate::workspace_slot::Account>,
     pub checkout: PathBuf,
     pub scratch: PathBuf,
     pub commit: String,
@@ -258,11 +259,20 @@ impl Workspace {
             8192,
         )?;
         let common = fs::canonicalize(common.trim()).map_err(|e| e.to_string())?;
-        let borrowed = borrowed(
-            &common.join("objects"),
-            &fs::canonicalize(key_path).map_err(|e| format!("the key: {e}"))?,
-        )?;
-        let (root, held) = owned_root(key_path)?;
+        let key = fs::canonicalize(key_path).map_err(|e| format!("the key: {e}"))?;
+        let borrowed = borrowed(&common.join("objects"), &key)?;
+        let (root, held, account) =
+            if crate::workspace_slot::product().map_err(crate::workspace_slot::error)? {
+                let (root, held, account) = crate::workspace_slot::review(
+                    [source.as_path(), common.as_path(), key.as_path()]
+                        .into_iter()
+                        .chain(borrowed.iter().map(PathBuf::as_path)),
+                )?;
+                (root, held, Some(account))
+            } else {
+                let (root, held) = owned_root(key_path)?;
+                (root, held, None)
+            };
         let mut result = Self {
             checkout: root.join("source"),
             scratch: root.join("scratch"),
@@ -272,6 +282,7 @@ impl Workspace {
             root,
             cleaned: false,
             _lock: held,
+            account,
             commit,
             subject: String::new(),
             diff: String::new(),
@@ -285,8 +296,10 @@ impl Workspace {
             git,
         };
         directory(&result.scratch)?;
-        directory(&result.root.join("home"))?;
-        directory(&result.root.join("specs"))?;
+        if result.account.is_none() {
+            directory(&result.root.join("home"))?;
+            directory(&result.root.join("specs"))?;
+        }
         repo::create(&result.repository, &common, &repo::Identity::default())?;
         let mut inspect = command(&result.git, &result.root);
         inspect.env("GIT_DIR", &result.repository).args([
@@ -358,7 +371,7 @@ impl Workspace {
         };
         jail::maintain(
             &result.programs,
-            &result.maintenance(),
+            &result.maintenance()?,
             &result.root.join("specs"),
             &task,
             GIT_TIME,
@@ -366,9 +379,18 @@ impl Workspace {
         Ok(result)
     }
 
-    fn maintenance(&self) -> jail::Policy {
-        jail::Policy {
-            home: self.root.join("home"),
+    fn maintenance(&self) -> Result<jail::Policy, String> {
+        Ok(jail::Policy {
+            account: self
+                .account
+                .as_ref()
+                .map(crate::workspace_slot::Account::try_clone)
+                .transpose()?,
+            home: if self.account.is_some() {
+                PathBuf::new()
+            } else {
+                self.root.join("home")
+            },
             checkouts: vec![self.checkout.clone()],
             repositories: vec![self.repository.clone()],
             objects: std::iter::once(self.objects.clone())
@@ -376,26 +398,46 @@ impl Workspace {
                 .collect(),
             directory: Some(self.checkout.clone()),
             ..jail::Policy::default()
-        }
+        })
     }
 
     pub(crate) fn log_environment(
         &self,
         journal: &mut crate::review_log::Journal,
     ) -> Result<(), String> {
-        let policy = self.policy();
+        let policy = self.policy()?;
         let mut visible = policy.roots();
         visible.extend(policy.repositories.iter().chain(&policy.objects).cloned());
-        visible.extend([policy.home.clone(), self.root.clone(), self.objects.clone()]);
+        visible.extend(
+            [policy.home.clone(), self.root.clone(), self.objects.clone()]
+                .into_iter()
+                .filter(|path| !path.as_os_str().is_empty()),
+        );
         visible.extend(self.borrowed.iter().cloned());
         journal.outside(&visible)?;
-        let spec = jail::host_spec_text(&self.programs, &policy)?;
-        journal.text("jail_spec", &spec)
+        if let Some(account) = &self.account {
+            let plan = account
+                .describe(&policy, &jail::host_arguments(&policy, false)?)
+                .map_err(crate::workspace_slot::error)?;
+            journal.text("workspace_launch_request", &plan)
+        } else {
+            let spec = jail::host_spec_text(&self.programs, &policy)?;
+            journal.text("jail_spec", &spec)
+        }
     }
 
-    pub fn policy(&self) -> jail::Policy {
+    pub fn policy(&self) -> Result<jail::Policy, String> {
         let mut policy = jail::Policy {
-            home: self.root.join("home"),
+            account: self
+                .account
+                .as_ref()
+                .map(crate::workspace_slot::Account::try_clone)
+                .transpose()?,
+            home: if self.account.is_some() {
+                PathBuf::new()
+            } else {
+                self.root.join("home")
+            },
             read: [
                 self.checkout.clone(),
                 self.repository.clone(),
@@ -411,7 +453,7 @@ impl Workspace {
         if let Some(vendor) = &self.vendor {
             policy.read.push(vendor.clone());
         }
-        policy
+        Ok(policy)
     }
 
     pub(crate) fn tracked_text(&self, path: &Path) -> Result<Option<String>, String> {
@@ -504,7 +546,7 @@ impl Workspace {
         };
         jail::maintain(
             &self.programs,
-            &self.maintenance(),
+            &self.maintenance()?,
             &self.root.join("specs"),
             &task,
             GIT_TIME,
@@ -649,7 +691,7 @@ impl Workspace {
         if matches!(call, host::Call::Background { .. }) {
             return Err("background processes are unavailable in the review profile".into());
         }
-        let mut client = jail::launch(&self.programs, &self.policy(), &self.root.join("specs"))?;
+        let mut client = jail::launch(&self.programs, &self.policy()?, &self.root.join("specs"))?;
         let id = client.call(call)?;
         let deadline = Instant::now()
             .checked_add(TOOL_TIME)
@@ -705,9 +747,15 @@ impl Workspace {
         if self.cleaned {
             return Ok(());
         }
-        let parent = self.root.parent().ok_or("review directory has no parent")?;
-        let serial = lock(&parent.join("sweep.lock"))?;
-        serial.lock().map_err(|e| e.to_string())?;
+        let _serial = if let Some(account) = &self.account {
+            account.delete().map_err(crate::workspace_slot::error)?;
+            None
+        } else {
+            let parent = self.root.parent().ok_or("review directory has no parent")?;
+            let serial = lock(&parent.join("sweep.lock"))?;
+            serial.lock().map_err(|e| e.to_string())?;
+            Some(serial)
+        };
         workspace::remove_tree(&self.root)
             .map_err(|e| format!("cleaning review workspace {}: {e}", self.root.display()))?;
         self.cleaned = true;

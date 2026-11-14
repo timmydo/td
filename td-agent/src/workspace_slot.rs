@@ -47,6 +47,31 @@ impl Account {
     pub fn name(&self) -> &str {
         &self.name
     }
+    pub(crate) fn try_clone(&self) -> Result<Self, String> {
+        Ok(Self {
+            name: td_alloc::string(&self.name).map_err(error)?,
+            home: PathBuf::from(
+                td_alloc::string(
+                    self.home
+                        .to_str()
+                        .ok_or_else(|| error("human home is not UTF-8"))?,
+                )
+                .map_err(error)?,
+            ),
+        })
+    }
+
+    pub(crate) fn delete(&self) -> io::Result<()> {
+        Root::default().delete(Slot::parse(&self.name)?)
+    }
+
+    pub(crate) fn describe(
+        &self,
+        policy: &crate::jail::Policy,
+        argv: &[String],
+    ) -> io::Result<String> {
+        crate::intake::launch_request(Slot::parse(&self.name)?, &self.home, policy, argv)
+    }
     pub fn launch(
         &self,
         policy: &crate::jail::Policy,
@@ -89,22 +114,7 @@ fn name(n: u16) -> io::Result<String> {
 
 fn lock(pool: &Path) -> io::Result<File> {
     td_fs::private_dir(pool)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(joined(pool, "lock")?)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != fs::metadata("/proc/self")?.uid()
-    {
-        return Err(io::Error::other("invalid workspace slot lock"));
-    }
+    let file = lock_file(&joined(pool, "lock")?)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match file.try_lock() {
@@ -118,6 +128,93 @@ fn lock(pool: &Path) -> io::Result<File> {
             Err(fs::TryLockError::Error(e)) => return Err(e),
         }
     }
+}
+
+fn lock_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != fs::metadata("/proc/self")?.uid()
+    {
+        return Err(io::Error::other("invalid workspace slot lock"));
+    }
+    Ok(file)
+}
+
+/// Reviews hold their slot's lock for their whole lifetime. Fixed staging
+/// names make interrupted runs discoverable without trusting a receipt.
+/// Root ends and empties the account before any old staging is removed.
+pub(crate) fn review<'a>(
+    protected: impl IntoIterator<Item = &'a Path>,
+) -> Result<(PathBuf, File, Account), String> {
+    let home = home().map_err(error)?;
+    let (root, held, name) = review_in(&home, &Root::default(), protected).map_err(error)?;
+    Ok((root, held, Account { name, home }))
+}
+
+pub(crate) fn review_storage() -> io::Result<[PathBuf; 2]> {
+    review_storage_in(&home()?)
+}
+
+fn review_storage_in(home: &Path) -> io::Result<[PathBuf; 2]> {
+    Ok([
+        joined(home, ".local/state/td-agent/review-slots")?,
+        joined(home, ".local/state/td-agent/review-runs")?,
+    ])
+}
+
+fn review_in<'a>(
+    home: &Path,
+    service: &impl Service,
+    protected: impl IntoIterator<Item = &'a Path>,
+) -> io::Result<(PathBuf, File, String)> {
+    let [pool, runs] = review_storage_in(home)?;
+    if protected
+        .into_iter()
+        .any(|path| path.starts_with(&pool) || path.starts_with(&runs))
+    {
+        return Err(io::Error::other(
+            "review input or credential lies in disposable review state",
+        ));
+    }
+    td_fs::private_dir(&pool)?;
+    td_fs::private_dir(&runs)?;
+    if fs::canonicalize(&pool)? != pool || fs::canonicalize(&runs)? != runs {
+        return Err(io::Error::other(
+            "review state must use its canonical home paths",
+        ));
+    }
+    for n in 1..=crate::workload_accounts::REVIEW_SLOTS {
+        let name =
+            td_alloc::format(format_args!("review-{n}")).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        let held = lock_file(&joined(&pool, &name)?)?;
+        match held.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => continue,
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let root = joined(&runs, &name)?;
+        let slot = Slot::parse(&name)?;
+        service.delete(slot)?;
+        crate::workspace::remove_tree(&root)?;
+        td_fs::private_dir(&root)?;
+        if service.create(slot)? == Created::Held {
+            return Err(io::Error::other(
+                "review slot changed while it was reserved",
+            ));
+        }
+        return Ok((root, held, name));
+    }
+    Err(io::Error::other("all 64 review slots are in use"))
 }
 
 /// `None` is absent; `Some(false)` belongs to another conversation. A
@@ -358,6 +455,84 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn review_leases_exclude_live_runs_and_reset_abandoned_state_before_reuse() {
+        let home = td_fs::TempDir::new("review-slots").unwrap();
+        let service = Fake::default();
+        let acquire = || review_in(home.path(), &service, std::iter::empty());
+        let (first, held, name) = acquire().unwrap();
+        assert_eq!(name, "review-1");
+        fs::write(first.join("old"), "private review data").unwrap();
+        let (second, second_lock, name) = acquire().unwrap();
+        assert_eq!(name, "review-2");
+        assert!(first.join("old").exists());
+        // Losing the owner lock models abrupt termination. A root refusal
+        // preserves staging; a later successful reset removes it first.
+        drop(held);
+        service.fail.set(true);
+        assert!(acquire().is_err());
+        assert!(first.join("old").exists());
+        service.fail.set(false);
+        let (again, held, name) = acquire().unwrap();
+        assert_eq!(name, "review-1");
+        assert_eq!(again, first);
+        assert!(!again.join("old").exists());
+        assert!(second.is_dir());
+        assert_eq!(
+            *service.deleted.borrow(),
+            ["review-1", "review-2", "review-1"]
+        );
+        drop((held, second_lock));
+    }
+
+    #[test]
+    fn review_pool_is_bounded_and_rejects_protected_or_aliased_state() {
+        let home = td_fs::TempDir::new("review-slot-bounds").unwrap();
+        let service = Fake::default();
+        let mut leases = Vec::new();
+        for n in 1..=crate::workload_accounts::REVIEW_SLOTS {
+            let (_, held, name) = review_in(home.path(), &service, []).unwrap();
+            assert_eq!(name, format!("review-{n}"));
+            leases.push(held);
+        }
+        assert!(review_in(home.path(), &service, [])
+            .unwrap_err()
+            .to_string()
+            .contains("64"));
+        drop(leases);
+        let sensitive = home.join(".local/state/td-agent/review-runs/review-1/source");
+        fs::create_dir(&sensitive).unwrap();
+        fs::write(sensitive.join("key"), "keep").unwrap();
+        let calls = service.deleted.borrow().len();
+        assert!(review_in(home.path(), &service, [sensitive.as_path()]).is_err());
+        assert_eq!(service.deleted.borrow().len(), calls);
+        assert_eq!(fs::read(sensitive.join("key")).unwrap(), b"keep");
+        let other = td_fs::TempDir::new("review-slot-alias").unwrap();
+        std::os::unix::fs::symlink(home.path(), other.join(".local")).unwrap();
+        assert!(review_in(other.path(), &service, []).is_err());
+        assert_eq!(service.deleted.borrow().len(), calls);
+    }
+
+    #[test]
+    fn review_lock_refuses_links_and_shared_permissions() {
+        let home = td_fs::TempDir::new("review-slot-lock").unwrap();
+        let service = Fake::default();
+        let (_, held, _) = review_in(home.path(), &service, []).unwrap();
+        drop(held);
+        let lock = home.join(".local/state/td-agent/review-slots/review-1");
+        let copy = home.join("linked");
+        fs::hard_link(&lock, &copy).unwrap();
+        assert!(review_in(home.path(), &service, []).is_err());
+        fs::remove_file(&copy).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(review_in(home.path(), &service, []).is_err());
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(&copy, &lock).unwrap();
+        assert!(review_in(home.path(), &service, []).is_err());
+    }
+
     #[test]
     fn initialization_retries_partial_import_but_not_a_finished_copy() {
         let dir = td_fs::TempDir::new("agent-slot-import").unwrap();

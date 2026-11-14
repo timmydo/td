@@ -1297,8 +1297,9 @@ The command labels their paths `retained trace` and asks callers to keep them.
 Never follow those paths to delete traces as part of report, session or
 worktree cleanup. An explicit `--log-dir` must likewise name retained storage
 outside disposable session trees. td-agent itself removes its private run
-directories under the key directory's `reviews/`; those are workspaces, not
-the state directory's retained traces. See `td-agent/DESIGN.md` §2.
+directories under the canonical home's `.local/state/td-agent/review-runs/` on td, or the key directory's
+`reviews/` on a development host; those are workspaces, not the state
+directory's retained traces. See `td-agent/DESIGN.md` §2.
 
 Do not alter a reviewer's report to make it agree with the change. The acting
 agent reconciles each finding, fixes valid issues and explains rejected ones

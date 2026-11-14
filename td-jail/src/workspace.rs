@@ -1,5 +1,5 @@
 //! The `workspace` launch kind (APPLICATIONS.md §C, td-agent/DESIGN.md §8):
-//! a launch on a development host, or on td by td's account or by a
+//! a launch on a development host, or on td by a
 //! sandbox's or workspace's ledger account that root's intake started,
 //! whose policy is a spec file its launcher writes, for an agent's tools or
 //! a sandbox's shell. It runs a program the launcher names, not
@@ -62,9 +62,7 @@ pub(crate) const PROGRAM_TREES: &[&str] = &["td", "usr"];
 /// `/lib` and `/lib64` links into it. Nothing of the host's is bound there.
 /// One list with the launchers that leave them out of a spec.
 pub(crate) const RUNTIME_TREES: &[&str] = flathub_app::WORKSPACE_RUNTIME_TREES;
-/// td's one account, the human's: where the product configuration is
-/// installed, the kind serves it alone, whose td-agent launches it
-/// (APPLICATIONS.md §X.8).
+/// The human whose directories root may expose through account views.
 const TD_ACCOUNT_UID: u32 = 1000;
 /// The caller's user namespace's map of ids.
 const UID_MAP: &str = "/proc/self/uid_map";
@@ -236,14 +234,11 @@ pub(crate) struct WorkspacePlan {
 /// instance takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Caller {
-    /// td's account, the human, launching itself (td-agent's workspaces,
-    /// until WORKLOADS.md step 8 gives them accounts), or any nonzero
-    /// identity on a development host: its own spec, its passwd home, the
-    /// spec's directories, and a socket pair to its launcher. Its spec may
-    /// not name the offline profile, which only a sandbox's names: root's
-    /// intake starts a sandbox as its account, and td-sandbox calls no
-    /// td-jail.
-    Human,
+    /// Any nonzero identity on a development host without product
+    /// configuration: its own spec, passwd home, directories and a
+    /// socket pair to its launcher. The offline development profile is
+    /// reserved for root's sandbox intake.
+    Host,
     /// A sandbox's or workspace's ledger account, which root's workspace
     /// intake started (td-authd/DESIGN.md, "Workspace launch intake"):
     /// root's spec, the account's own home, the views its manifest lists,
@@ -538,8 +533,8 @@ where
     let spec_path = Path::new(spec_path);
     let text = read_spec(spec_path, uid, caller)?;
     let mut spec = parse_spec(&text)?;
-    if caller == Caller::Human {
-        require_human_spec(&spec)?;
+    if caller == Caller::Host {
+        require_host_spec(&spec)?;
     }
     if let Caller::Account(kind) = caller {
         require_account_spec(&spec, kind, uid)?;
@@ -569,7 +564,7 @@ where
     // A ledger account's home is the spec's, its own; the human's is the
     // one no directory may be or contain.
     let real_home = authority::account_home(match caller {
-        Caller::Human => uid,
+        Caller::Host => uid,
         Caller::Account(_) => TD_ACCOUNT_UID,
     })?;
     // The home as the account names it and as it resolves, which differ
@@ -635,11 +630,11 @@ fn require_td_for_runtime(config: &Path) -> io::Result<()> {
 }
 
 /// Where the product configuration at `config` is installed, td's, the
-/// kind serves td's account and the sandbox and workspace accounts of the
+/// kind serves only the sandbox and workspace accounts of the
 /// ledger `ledger` reads, as the initial user namespace knows them
 /// (`uid_map`, the caller's map): a uid is the caller's namespace's, and
 /// an application's own is the account's. A ledger account's gid is its
-/// uid. On a development host, any nonzero identity, as td's account. It
+/// uid. On a development host, any nonzero identity. It
 /// grants nothing the caller could not do itself: td-jail is no more
 /// privileged than its caller, and the kind only narrows what the
 /// caller's tools reach.
@@ -650,9 +645,6 @@ fn require_account(
     ledger: impl FnOnce() -> Result<crate::workload_accounts::Ledger, String>,
 ) -> io::Result<Caller> {
     let initial = initial_user_namespace(uid_map)?;
-    if uid == TD_ACCOUNT_UID && initial {
-        return Ok(Caller::Human);
-    }
     if WORKLOAD_UIDS.contains(&uid) && initial && configuration_installed(config)? {
         let ledger = ledger().map_err(|error| {
             crate::error(
@@ -674,10 +666,10 @@ fn require_account(
     }
     authority::require_no_configuration_at(
         config,
-        "the workspace kind for any identity but td's account or a sandbox's or \
-         workspace's ledger account in the initial user namespace",
+        "the workspace kind for any identity but a sandbox's or workspace's ledger \
+         account in the initial user namespace",
     )?;
-    Ok(Caller::Human)
+    Ok(Caller::Host)
 }
 
 /// Whether td's product configuration is installed at `config`.
@@ -826,14 +818,14 @@ fn select_views(spec: &mut Spec, mut views: Vec<FilesystemGrant>, human: &Path) 
     Ok(())
 }
 
-/// A spec of td's account may not name `development-offline`: that is a
+/// A host spec may not name `development-offline`: that is a
 /// sandbox's profile, and a sandbox runs as its own account through
 /// root's workspace intake (td-sandbox/DESIGN.md), never as the human.
-fn require_human_spec(spec: &Spec) -> io::Result<()> {
+fn require_host_spec(spec: &Spec) -> io::Result<()> {
     if spec.development && !spec.shared_network {
         return Err(invalid(
             "profile=development-offline is a sandbox's, which runs as its own account \
-             through root's workspace intake, not as td's account",
+             through root's workspace intake, not through a host spec",
         ));
     }
     Ok(())
@@ -862,7 +854,7 @@ fn initial_user_namespace(uid_map: &Path) -> io::Result<bool> {
 /// the account nor a link it made can stand in for it.
 fn read_spec(path: &Path, uid: u32, caller: Caller) -> io::Result<String> {
     match caller {
-        Caller::Human => read_spec_of(path, uid, false),
+        Caller::Host => read_spec_of(path, uid, false),
         Caller::Account(_) if account_spec_path(path, uid) => read_spec_of(path, 0, true),
         Caller::Account(_) => Err(crate::error(
             io::ErrorKind::PermissionDenied,
@@ -1914,15 +1906,13 @@ mod tests {
         }
     }
 
-    /// Where td's product configuration is installed, td's account alone
-    /// may launch the kind, in the initial user namespace, not an
-    /// application whose own uid is the account's; without it, any
-    /// identity may.
+    /// Product callers must hold a sandbox/workspace ledger account in
+    /// the initial namespace. In particular the human is refused. Hosts
+    /// without the product configuration retain their own-identity path.
     #[test]
     fn on_td_the_kind_is_its_accounts_alone() {
-        let base = std::env::temp_dir().join(format!("td-jail-account-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
+        let owned = crate::test_temp::TempDir::new("td-jail-account").unwrap();
+        let base = owned.path();
         let config = base.join("td-app.conf");
         let initial = base.join("initial");
         fs::write(&initial, "         0          0 4294967295\n").unwrap();
@@ -1944,20 +1934,25 @@ mod tests {
         let account = |uid: u32, map: &Path, ledger: Reader| {
             require_account((uid, uid), map, &config, ledger)
         };
-        assert_eq!(account(1001, &initial, ledger).unwrap(), Caller::Human);
-        assert_eq!(
-            account(TD_ACCOUNT_UID, &jailed, ledger).unwrap(),
-            Caller::Human
-        );
-        // A development host knows no ledger: any identity is its own.
-        assert_eq!(account(98304, &initial, unread).unwrap(), Caller::Human);
-        fs::write(&config, "format=1\n").unwrap();
-        // On td both caller classes exist: td's account, which td-agent and
-        // td-sandbox launch as, and a sandbox's or workspace's ledger
-        // account, which root's intake starts.
+        assert_eq!(account(1001, &initial, ledger).unwrap(), Caller::Host);
         assert_eq!(
             account(TD_ACCOUNT_UID, &initial, unread).unwrap(),
-            Caller::Human
+            Caller::Host
+        );
+        assert_eq!(
+            account(TD_ACCOUNT_UID, &jailed, ledger).unwrap(),
+            Caller::Host
+        );
+        // A development host knows no ledger: any identity is its own.
+        assert_eq!(account(98304, &initial, unread).unwrap(), Caller::Host);
+        fs::write(&config, "format=1\n").unwrap();
+        // On td the human must use root's intake, even in the initial
+        // namespace. Only ledger accounts root starts enter this kind.
+        assert_eq!(
+            account(TD_ACCOUNT_UID, &initial, unread)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
         );
         assert_eq!(
             account(98304, &initial, ledger).unwrap(),
@@ -1984,7 +1979,6 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         // This process's own map reads as one or the other.
         assert!(initial_user_namespace(Path::new(UID_MAP)).is_ok());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A ledger caller's spec is root's, of one link in root's directory,
@@ -2001,7 +1995,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         let me = fs::metadata(&path).unwrap().uid();
         // The caller's own spec serves the human and never a ledger account.
-        assert!(read_spec(&path, me, Caller::Human).is_ok());
+        assert!(read_spec(&path, me, Caller::Host).is_ok());
         for kind in [Kind::Sandbox, Kind::Workspace] {
             let refused = read_spec(&path, me, Caller::Account(kind)).unwrap_err();
             assert!(refused.to_string().contains("root"), "{refused}");
@@ -2036,7 +2030,7 @@ mod tests {
         temp.cleanup().unwrap();
     }
 
-    /// td's account may not name the offline profile, which only a
+    /// A host caller may not name the offline profile, which only a
     /// sandbox's spec names: td-jail refuses it for that caller, td-agent
     /// writes only the online one, and td-sandbox calls no td-jail of its
     /// own.
@@ -2044,16 +2038,16 @@ mod tests {
     fn td_accounts_specs_may_not_name_the_sandbox_profile() {
         let spec =
             |profile: &str| parse_spec(&format!("format=1\n{profile}entry=/e\nhome=/h\n")).unwrap();
-        assert!(require_human_spec(&spec("profile=development\n")).is_ok());
-        assert!(require_human_spec(&spec("")).is_ok());
-        let refused = require_human_spec(&spec("profile=development-offline\n")).unwrap_err();
+        assert!(require_host_spec(&spec("profile=development\n")).is_ok());
+        assert!(require_host_spec(&spec("")).is_ok());
+        let refused = require_host_spec(&spec("profile=development-offline\n")).unwrap_err();
         assert!(refused.to_string().contains("its own account"), "{refused}");
         let production = include_str!("workspace.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
         assert!(production.contains(
-            "    if caller == Caller::Human {\n        require_human_spec(&spec)?;\n    }\n"
+            "    if caller == Caller::Host {\n        require_host_spec(&spec)?;\n    }\n"
         ));
         let agent = include_str!("../../td-agent/src/jail.rs")
             .split("#[cfg(test)]")

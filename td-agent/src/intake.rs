@@ -144,7 +144,7 @@ fn append(request: &mut String, text: &str) -> io::Result<()> {
     td_alloc::push_str(request, text).map_err(allocation)
 }
 
-fn launch_request(
+pub(crate) fn launch_request(
     slot: Slot<'_>,
     home: &Path,
     policy: &Policy,

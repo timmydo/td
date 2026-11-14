@@ -459,44 +459,70 @@ const RUNTIME: &str = "freedesktop-platform-25-08";
 #[test]
 #[ignore = "needs td: its product configuration, uid 1000 and an installed freedesktop-platform-25-08"]
 fn a_runtime_workspace_binds_the_held_runtime_at_usr() -> Result<(), Box<dyn Error>> {
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("workspace-runtime");
-    let _ = fs::remove_dir_all(&base);
-    for name in ["home", "bin"] {
-        fs::create_dir_all(base.join(name))?;
-    }
-    let base = fs::canonicalize(&base)?;
-    fs::set_permissions(base.join("home"), fs::Permissions::from_mode(0o700))?;
-    let probe = base.join("bin/probe");
+    // The installed root intake owns the launch. Product td-jail no
+    // longer accepts a human-owned spec or a uid-1000 caller.
+    let home = fs::canonicalize(std::env::var_os("HOME").ok_or("no HOME")?)?;
+    let base = td_fs::TempDir::new_in(&home, "workspace-runtime")?;
+    let probe = base.join("probe");
     fs::write(&probe, RUNTIME_PROBE)?;
     fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))?;
-    let spec = base.join("spec");
-    fs::write(
-        &spec,
-        format!(
-            "format=1\nruntime={RUNTIME}\nentry={}\nhome={}\n",
-            probe.display(),
-            base.join("home").display()
-        ),
-    )?;
-    fs::set_permissions(&spec, fs::Permissions::from_mode(0o600))?;
+    // Account ledger rows are permanent: reuse one fixture name and
+    // serialize invocations, rather than spending a row per test PID.
+    use std::os::unix::fs::OpenOptionsExt;
+    let locks = home.join(".local/state/td-jail-runtime-oracle");
+    td_fs::private_dir(&locks)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(0x20000)
+        .open(locks.join("lock"))?;
+    let meta = lock.metadata()?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.mode() & 0o077 != 0
+        || meta.uid() != fs::metadata("/proc/self")?.uid()
+    {
+        return Err("invalid runtime oracle lock".into());
+    }
+    lock.try_lock()?;
+    let name = "td-jail-runtime-oracle".to_string();
+    sandbox_command(&["create", &name])?;
+    let mut sandbox = RuntimeSandbox {
+        name,
+        child: None,
+        deleted: false,
+    };
+    sandbox_command(&[
+        "share",
+        &sandbox.name,
+        base.to_str().ok_or("non-UTF-8 home")?,
+        "--write",
+    ])?;
+    sandbox_command(&["runtime", &sandbox.name, RUNTIME])?;
     let store = Path::new("/var/lib/td/runtimes").join(RUNTIME);
     let selection = store
         .join(fs::read_link(store.join("current"))?)
         .join("selection");
 
-    let (mut ours, theirs) = UnixStream::pair()?;
-    let child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
-        .arg("--workspace")
-        .arg(std::process::id().to_string())
-        .arg(&spec)
-        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone()?)))
-        .stdout(Stdio::from(OwnedFd::from(theirs)))
-        .stderr(Stdio::piped())
-        .spawn()?;
+    sandbox.child = Some(
+        Command::new("/bin/td-sandbox")
+            .args(["run", &sandbox.name, "--", "/bin/sh"])
+            .arg(&probe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let child = sandbox.child.as_mut().ok_or("missing sandbox child")?;
+    let mut input = child.stdin.take().ok_or("no stdin")?;
+    let mut output = child.stdout.take().ok_or("no stdout")?;
     let mut ready = Vec::new();
     let mut byte = [0u8; 1];
     while ready.last() != Some(&b'\n') {
-        if ours.read(&mut byte)? == 0 {
+        if output.read(&mut byte)? == 0 {
             break;
         }
         ready.push(byte[0]);
@@ -506,10 +532,15 @@ fn a_runtime_workspace_binds_the_held_runtime_at_usr() -> Result<(), Box<dyn Err
         fs::File::open(&selection)?.try_lock(),
         Err(fs::TryLockError::WouldBlock)
     );
-    ours.write_all(b"go\n")?;
+    input.write_all(b"go\n")?;
     let mut reply = String::new();
-    ours.read_to_string(&mut reply)?;
-    let output = child.wait_with_output()?;
+    output.read_to_string(&mut reply)?;
+    drop(input);
+    let output = sandbox
+        .child
+        .take()
+        .ok_or("missing child")?
+        .wait_with_output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{reply}\n{stderr}");
     assert_eq!(ready, b"ready\n", "{reply}\n{stderr}");
@@ -533,8 +564,67 @@ fn a_runtime_workspace_binds_the_held_runtime_at_usr() -> Result<(), Box<dyn Err
     };
     let cache = field("cache=").ok_or("no cache line")?;
     assert_eq!(Some(cache), field("runtime-cache="), "{reply}");
-    // Once the launch ends, the lease goes with it.
-    fs::File::open(&selection)?.try_lock()?;
-    fs::remove_dir_all(&base)?;
+    // The CLI's exit frame precedes the outer jail's final teardown.
+    // Require normal teardown to release the lease, before explicit
+    // deletion could conceal a leaked lease by killing the account.
+    {
+        let lease = fs::File::open(&selection)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match lease.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(why) => return Err(why.into()),
+            }
+        }
+    }
+    sandbox.delete()?;
     Ok(())
+}
+
+fn sandbox_command(args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let result = Command::new("/bin/td-sandbox").args(args).output()?;
+    if !result.status.success() {
+        return Err(String::from_utf8_lossy(&result.stderr).into_owned().into());
+    }
+    Ok(())
+}
+
+struct RuntimeSandbox {
+    name: String,
+    child: Option<std::process::Child>,
+    deleted: bool,
+}
+
+impl RuntimeSandbox {
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.deleted {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match sandbox_command(&["delete", &self.name]) {
+                Ok(()) => {
+                    self.deleted = true;
+                    return Ok(());
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(why) => return Err(why),
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeSandbox {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = self.delete();
+    }
 }

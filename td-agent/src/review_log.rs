@@ -109,6 +109,13 @@ impl Journal {
             })
             .transpose()?;
         let mut excluded = vec![ephemeral, std::path::PathBuf::from("/etc")];
+        if crate::workspace_slot::product().map_err(crate::workspace_slot::error)? {
+            for path in
+                crate::workspace_slot::review_storage().map_err(crate::workspace_slot::error)?
+            {
+                td_alloc::push(&mut excluded, path).map_err(crate::workspace_slot::error)?;
+            }
+        }
         // The jail binds selected /etc entries, including directory aliases.
         // Excluding all resolved entries is a conservative superset.
         match std::fs::read_dir("/etc") {

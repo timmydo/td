@@ -2338,15 +2338,24 @@ end
 line, relative to the human's home. Root admits each by
 `workload_grants::validate_role`: a path `validate_path` admits, the
 directories every grant refuses refused, or one of td-agent's own trees
-below the `.local/share` and `.local/state` it reserves, each only in its
-one role:
+below the `.local/share` and `.local/state` it reserves, only in the
+listed roles:
 
 - `.local/share/td-agent/ws/W/R.git`, a workspace repository, as
   `repository`;
 - `.local/share/td-agent/store/S.git/objects`, the shared object store,
   as `read`;
 - `.local/state/td-agent/jail/ID/scratch`, ID 32 lowercase hex digits, a
-  conversation's scratch worktree, as `worktree`.
+  conversation's scratch worktree, as `worktree`;
+- `.local/state/td-agent/review-runs/review-N/source`, with N from 1
+  through 64, as `checkout` for maintenance or `read` for tools;
+- that review's `repository.git`, as `repository` for maintenance or
+  `read` for tools; and its `scratch`, as `worktree`. No review parent,
+  slot lock, private home or descendant is admitted by this exception;
+- `.local/state/td-agent/conversations/ID/review/review.git/objects`, ID
+  32 lowercase hex digits, the GUI's staged review objects, as `read`.
+  No conversation parent, record, repository configuration or object
+  descendant is admitted by this exception.
 
 Each name is 1 to 255 ASCII letters, digits, `-`, `_` or `.`, the first a
 letter or digit, a `.git` name with a stem. No two entries may be one

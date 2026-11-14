@@ -2114,14 +2114,7 @@ fn manifest_views(
             skip_view(&target, &error.to_string());
             continue;
         }
-        let identities = admit_view(
-            mountinfo,
-            &view,
-            entry,
-            &account,
-            reserved,
-            placement.executable(),
-        )?;
+        let identities = admit_view(mountinfo, &view, entry, &account, reserved, placement)?;
         let metadata = fs::symlink_metadata(&view)?;
         if !metadata.file_type().is_dir() || metadata.uid() != uid || metadata.gid() != uid {
             return Err(invalid(format!(
@@ -2185,8 +2178,9 @@ fn admit_view(
     entry: &crate::workload_grants::View,
     account: &crate::primary_account::PrimaryAccount,
     reserved: &BTreeSet<MountIdentity>,
-    executable: bool,
+    placement: ViewPlacement,
 ) -> io::Result<BTreeSet<MountIdentity>> {
+    let executable = placement.executable();
     let required = [entry.access.as_str(), "nosuid", "nodev", "idmapped"];
     let mut found = false;
     for line in mountinfo.lines() {
@@ -2218,7 +2212,13 @@ fn admit_view(
             view.display()
         )));
     }
-    let identity = projection_identity(mountinfo, view, account, Path::new(&entry.path))?;
+    let identity = projection_identity(
+        mountinfo,
+        view,
+        account,
+        Path::new(&entry.path),
+        (placement.kind(), entry.access),
+    )?;
     let identities = mount_tree_identities(mountinfo, view)?;
     require_projection_mounts(&identities, &identity, reserved)?;
     Ok(identities)
@@ -2337,9 +2337,13 @@ fn projection_identity(
     view: &Path,
     account: &crate::primary_account::PrimaryAccount,
     relative: &Path,
+    policy: (
+        crate::workload_accounts::Kind,
+        crate::workload_grants::Access,
+    ),
 ) -> io::Result<MountIdentity> {
     let identity = mount_identity_for_path(mountinfo, view)?;
-    let human = human_source_identity(mountinfo, &account.persistent_home(), relative)?;
+    let human = human_source_identity(mountinfo, &account.persistent_home(), relative, policy)?;
     // Path equality ignores repeated separators, and the kernel shows a
     // removed directory's root as `PATH//deleted`, which would otherwise
     // equal a directory named `deleted` below PATH; the roots must also
@@ -2362,13 +2366,18 @@ fn projection_identity(
 
 /// What a view of the human's `relative` directory must show, by the one
 /// derivation td-authd publishes by (`mount_identity::human_source_identity`),
-/// once the table's validator admits `relative`.
+/// once the manifest validator admits `relative` for this kind and access.
 fn human_source_identity(
     mountinfo: &str,
     home: &Path,
     relative: &Path,
+    policy: (
+        crate::workload_accounts::Kind,
+        crate::workload_grants::Access,
+    ),
 ) -> io::Result<MountIdentity> {
-    crate::workload_grants::validate_path(relative.as_os_str().as_bytes()).map_err(invalid)?;
+    crate::workload_grants::validate_view(policy.0, policy.1, relative.as_os_str().as_bytes())
+        .map_err(invalid)?;
     crate::mount_identity::human_source_identity(mountinfo, home, relative)
 }
 
@@ -4101,6 +4110,8 @@ mod tests {
     use super::*;
     use crate::permissions::PermissionSocket;
     use crate::workload_accounts::Kind;
+    const APPLICATION_VIEW: (Kind, crate::workload_grants::Access) =
+        (Kind::Application, crate::workload_grants::Access::ReadWrite);
     use std::ops::Deref;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4122,7 +4133,13 @@ mod tests {
                 source.root,
                 Path::new(&format!("/@var/home/{name}/Downloads"))
             );
-            let admitted = projection_identity(mounts, view, &account, Path::new("Downloads"));
+            let admitted = projection_identity(
+                mounts,
+                view,
+                &account,
+                Path::new("Downloads"),
+                APPLICATION_VIEW,
+            );
             if name == "alice" {
                 assert_eq!(admitted.unwrap(), source);
             } else {
@@ -4292,7 +4309,8 @@ mod tests {
         let stock = "22 1 0:19 /@ / rw,relatime shared:1 - btrfs /dev/vda2 rw\n\
                      25 22 0:19 /@var /var rw,relatime shared:2 - btrfs /dev/vda2 rw\n";
         let home = Path::new("/var/home/alice");
-        let identity = human_source_identity(stock, home, Path::new("Downloads")).unwrap();
+        let identity =
+            human_source_identity(stock, home, Path::new("Downloads"), APPLICATION_VIEW).unwrap();
         assert_eq!(
             identity,
             crate::mount_identity::human_source_identity(stock, home, Path::new("Downloads"))
@@ -4305,7 +4323,7 @@ mod tests {
         );
         for refused in [".td-update", ".config/foo", ".local/bin", ".gnupg"] {
             assert!(
-                human_source_identity(stock, home, Path::new(refused)).is_err(),
+                human_source_identity(stock, home, Path::new(refused), APPLICATION_VIEW).is_err(),
                 "{refused}"
             );
         }
@@ -4464,7 +4482,15 @@ mod tests {
         };
         let one = published(rw, "/@var/home/alice/Downloads");
         assert_eq!(
-            admit_view(&one, view, &downloads, &account, &none, false).unwrap(),
+            admit_view(
+                &one,
+                view,
+                &downloads,
+                &account,
+                &none,
+                ViewPlacement::Application
+            )
+            .unwrap(),
             BTreeSet::from([shown.clone()])
         );
         admit_view(
@@ -4473,7 +4499,7 @@ mod tests {
             &documents,
             &account,
             &none,
-            false,
+            ViewPlacement::Application,
         )
         .unwrap();
         // The access must be the entry's, both ways.
@@ -4483,7 +4509,7 @@ mod tests {
             &documents,
             &account,
             &none,
-            false
+            ViewPlacement::Application
         )
         .is_err());
         assert!(admit_view(
@@ -4492,7 +4518,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            false
+            ViewPlacement::Application
         )
         .is_err());
         for missing in ["nosuid", "nodev", "noexec", "idmapped"] {
@@ -4508,26 +4534,42 @@ mod tests {
                     &downloads,
                     &account,
                     &none,
-                    false
+                    ViewPlacement::Application
                 )
                 .is_err(),
                 "{missing}"
             );
         }
         // Unpublished, stacked, another directory, another view's path.
-        assert!(admit_view(base, view, &downloads, &account, &none, false).is_err());
+        assert!(admit_view(
+            base,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Application
+        )
+        .is_err());
         let stacked = format!(
             "{one}36 35 0:19 /@var/home/alice/Downloads {} {rw} - btrfs none rw\n",
             view.display()
         );
-        assert!(admit_view(&stacked, view, &downloads, &account, &none, false).is_err());
+        assert!(admit_view(
+            &stacked,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Application
+        )
+        .is_err());
         assert!(admit_view(
             &published(rw, "/@var/home/alice/src"),
             view,
             &downloads,
             &account,
             &none,
-            false
+            ViewPlacement::Application
         )
         .is_err());
         assert!(admit_view(
@@ -4536,7 +4578,7 @@ mod tests {
             &downloads,
             &account,
             &none,
-            false
+            ViewPlacement::Application
         )
         .is_err());
         // A mount below the view that is not the human's directory, and a
@@ -4545,14 +4587,22 @@ mod tests {
             "{one}36 35 0:30 / {}/x rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n",
             view.display()
         );
-        assert!(admit_view(&nested, view, &downloads, &account, &none, false).is_err());
+        assert!(admit_view(
+            &nested,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Application
+        )
+        .is_err());
         assert!(admit_view(
             &one,
             view,
             &downloads,
             &account,
             &BTreeSet::from([shown]),
-            false
+            ViewPlacement::Application
         )
         .is_err());
         // A sandbox's or workspace's view is executable: admitted without
@@ -4562,9 +4612,33 @@ mod tests {
             "rw,nosuid,nodev,relatime,idmapped",
             "/@var/home/alice/Downloads",
         );
-        assert!(admit_view(&executable, view, &downloads, &account, &none, false).is_err());
-        assert!(admit_view(&executable, view, &downloads, &account, &none, true).is_ok());
-        assert!(admit_view(&one, view, &downloads, &account, &none, true).is_err());
+        assert!(admit_view(
+            &executable,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Application
+        )
+        .is_err());
+        assert!(admit_view(
+            &executable,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Workspace(Kind::Sandbox)
+        )
+        .is_ok());
+        assert!(admit_view(
+            &one,
+            view,
+            &downloads,
+            &account,
+            &none,
+            ViewPlacement::Workspace(Kind::Sandbox)
+        )
+        .is_err());
         for missing in ["nosuid", "nodev", "idmapped", "rw"] {
             let options = "rw,nosuid,nodev,relatime,idmapped"
                 .split(',')
@@ -4578,7 +4652,7 @@ mod tests {
                     &downloads,
                     &account,
                     &none,
-                    true
+                    ViewPlacement::Workspace(Kind::Sandbox)
                 )
                 .is_err(),
                 "{missing}"
@@ -4637,9 +4711,102 @@ mod tests {
             &entry(Access::ReadWrite, ".cache/x"),
             &account,
             &none,
-            false
+            ViewPlacement::Application
         )
         .is_err());
+    }
+
+    /// Identity validation must use the same kind/access policy as the
+    /// manifest. The generic human-directory validator refuses these
+    /// reserved paths even when root correctly published their views.
+    #[test]
+    fn workspace_view_identity_admits_only_its_exact_agent_trees() {
+        use crate::workload_grants::{Access, View};
+        let account =
+            crate::primary_account::parse("alice:x:1000:1000:human:/home/alice:/bin/sh\n").unwrap();
+        let base = "22 1 0:19 /@ / rw - btrfs none rw\n25 22 0:19 /@var /var rw,nosuid,nodev - btrfs none rw\n";
+        let view = Path::new("/var/lib/td/grant-views/98304/0");
+        let admitted = |path: &str, access: Access, kind: Kind| {
+            let noexec = if kind == Kind::Application {
+                ",noexec"
+            } else {
+                ""
+            };
+            let mounts = format!(
+                "{base}35 25 0:19 /@var/home/alice/{path} {} {},nosuid,nodev,idmapped{noexec} - btrfs none rw\n",
+                view.display(), access.as_str(),
+            );
+            let placement = if kind == Kind::Application {
+                ViewPlacement::Application
+            } else {
+                ViewPlacement::Workspace(kind)
+            };
+            admit_view(
+                &mounts,
+                view,
+                &View {
+                    index: 0,
+                    access,
+                    path: path.into(),
+                },
+                &account,
+                &BTreeSet::new(),
+                placement,
+            )
+        };
+        let objects = ".local/state/td-agent/conversations/0123456789abcdef0123456789abcdef/review/review.git/objects";
+        for (path, access) in [
+            (
+                ".local/state/td-agent/review-runs/review-1/source",
+                Access::ReadWrite,
+            ),
+            (
+                ".local/state/td-agent/review-runs/review-1/source",
+                Access::ReadOnly,
+            ),
+            (
+                ".local/state/td-agent/review-runs/review-1/repository.git",
+                Access::ReadWrite,
+            ),
+            (
+                ".local/state/td-agent/review-runs/review-1/repository.git",
+                Access::ReadOnly,
+            ),
+            (
+                ".local/state/td-agent/review-runs/review-1/scratch",
+                Access::ReadWrite,
+            ),
+            (objects, Access::ReadOnly),
+            (".local/share/td-agent/ws/work/repo.git", Access::ReadWrite),
+            (
+                ".local/share/td-agent/store/repo.git/objects",
+                Access::ReadOnly,
+            ),
+        ] {
+            assert_eq!(
+                admitted(path, access, Kind::Workspace).unwrap(),
+                BTreeSet::from([MountIdentity {
+                    device: "0:19".into(),
+                    root: format!("/@var/home/alice/{path}").into()
+                }])
+            );
+            for kind in [Kind::Application, Kind::Sandbox] {
+                assert!(admitted(path, access, kind).is_err(), "{kind:?}: {path}");
+            }
+        }
+        assert!(admitted(objects, Access::ReadWrite, Kind::Workspace).is_err());
+        for path in [
+            ".local/state/td-agent/review-runs/review-1",
+            ".local/state/td-agent/review-runs/review-1/source/child",
+            ".local/state/td-agent/review-slots/review-1",
+            ".local/state/td-agent/conversations/0123456789abcdef0123456789abcdef/review/review.git",
+            ".local/state/td-agent/conversations/0123456789abcdef0123456789abcdef/review/review.git/config",
+            ".config/td-agent",
+        ] {
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                assert!(admitted(path, access, Kind::Workspace).is_err(), "{path}");
+            }
+        }
     }
 
     #[test]
@@ -4706,6 +4873,7 @@ mod tests {
             view,
             &account,
             downloads,
+            APPLICATION_VIEW,
         )
         .unwrap();
         assert_eq!(admitted, identity("0:19", "/@var/home/alice/Downloads"));
@@ -4717,7 +4885,8 @@ mod tests {
                 &published(own, "0:19", "/@alice/Downloads"),
                 view,
                 &account,
-                downloads
+                downloads,
+                APPLICATION_VIEW
             )
             .unwrap(),
             identity("0:19", "/@alice/Downloads")
@@ -4726,7 +4895,8 @@ mod tests {
             &published(own, "0:19", "/@var/home/alice/Downloads"),
             view,
             &account,
-            downloads
+            downloads,
+            APPLICATION_VIEW
         )
         .is_err());
         for (device, shown) in [
@@ -4744,8 +4914,14 @@ mod tests {
             ("0:19", "/@var/home/alice/Downloads//deleted"),
         ] {
             assert!(
-                projection_identity(&published("", device, shown), view, &account, downloads)
-                    .is_err(),
+                projection_identity(
+                    &published("", device, shown),
+                    view,
+                    &account,
+                    downloads,
+                    APPLICATION_VIEW
+                )
+                .is_err(),
                 "{device} {shown}"
             );
         }
@@ -4755,14 +4931,16 @@ mod tests {
             &published("", "0:19", "/@var/home/alice/Downloads//deleted"),
             view,
             &account,
-            Path::new("Downloads/deleted")
+            Path::new("Downloads/deleted"),
+            APPLICATION_VIEW
         )
         .is_err());
         assert!(projection_identity(
             &published("", "0:19", "/@var/home/alice/Downloads/deleted"),
             view,
             &account,
-            Path::new("Downloads/deleted")
+            Path::new("Downloads/deleted"),
+            APPLICATION_VIEW
         )
         .is_ok());
         // Mounts at the home or above it are its covering mount: the topmost
@@ -4785,7 +4963,8 @@ mod tests {
                     &published(covering, admitted.0, admitted.1),
                     view,
                     &account,
-                    downloads
+                    downloads,
+                    APPLICATION_VIEW
                 )
                 .unwrap(),
                 identity(admitted.0, admitted.1)
@@ -4794,7 +4973,8 @@ mod tests {
                 &published(covering, hidden.0, hidden.1),
                 view,
                 &account,
-                downloads
+                downloads,
+                APPLICATION_VIEW
             )
             .is_err());
         }
@@ -4809,7 +4989,8 @@ mod tests {
             ),
             view,
             &account,
-            downloads
+            downloads,
+            APPLICATION_VIEW
         )
         .is_err());
         // A directory deeper below the home: a mount at an intermediate
@@ -4822,7 +5003,8 @@ mod tests {
                     &published(extra, "0:19", "/@var/home/alice/Music/new"),
                     view,
                     &account,
-                    music
+                    music,
+                    APPLICATION_VIEW
                 )
                 .unwrap(),
                 identity("0:19", "/@var/home/alice/Music/new")
@@ -4832,7 +5014,8 @@ mod tests {
             &published(intermediate, "0:30", "/new"),
             view,
             &account,
-            music
+            music,
+            APPLICATION_VIEW
         )
         .is_err());
         // A mount stacked over the source is not the human's directory,
@@ -4855,7 +5038,7 @@ mod tests {
                 identity(device, root)
             );
             assert!(
-                projection_identity(&mounts, view, &account, downloads).is_err(),
+                projection_identity(&mounts, view, &account, downloads, APPLICATION_VIEW).is_err(),
                 "{stacked}"
             );
         }
@@ -4874,8 +5057,13 @@ mod tests {
             "a\tb",
         ] {
             assert!(
-                human_source_identity(base, Path::new("/var/home/alice"), Path::new(relative))
-                    .is_err(),
+                human_source_identity(
+                    base,
+                    Path::new("/var/home/alice"),
+                    Path::new(relative),
+                    APPLICATION_VIEW
+                )
+                .is_err(),
                 "{relative:?}"
             );
         }
@@ -4883,8 +5071,13 @@ mod tests {
         // bounds): a reserved tree of the home is no human directory here.
         for reserved in [".ssh", ".td/app", ".config/td-mail", ".local"] {
             assert!(
-                human_source_identity(base, Path::new("/var/home/alice"), Path::new(reserved))
-                    .is_err(),
+                human_source_identity(
+                    base,
+                    Path::new("/var/home/alice"),
+                    Path::new(reserved),
+                    APPLICATION_VIEW
+                )
+                .is_err(),
                 "{reserved}"
             );
         }

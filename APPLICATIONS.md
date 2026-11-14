@@ -3800,22 +3800,14 @@ td-jail --workspace LAUNCHER-PID SPEC [ARG...]
 
 under the exact `td-jail` argv[0], never inferred. On a development host
 any nonzero identity may launch it; wherever the product configuration
-is installed, td's, two caller classes may, as the initial user
-namespace knows them, and every other identity is refused before its
-spec is read:
-
-- td's account, uid 1000, retained for td-agent reviews until their
-  separate cutover (td-agent/DESIGN.md §8); confined conversations now
-  use their ledger accounts through root; td-sandbox no longer calls
-  td-jail, and a spec of this caller's may not name
-  `profile=development-offline`, which only a sandbox's names;
-- a ledger account, a uid in the sandbox and workspace range (98304
-  through 131071) that a `sandbox` or `workspace` row of the workload
-  account ledger holds, read through the shared reader
-  (`engine/src/workload_accounts.rs`), with gid equal to uid: root's
-  workspace launch intake starts it so (td-authd/DESIGN.md, "Workspace
-  launch intake"). A missing or unreadable ledger, an application's
-  row, or no row refuses.
+is installed, td's, only a ledger account may, as the initial user
+namespace knows it. Its uid must be in the sandbox and workspace range
+(98304 through 131071) and held by a `sandbox` or `workspace` row of the
+workload account ledger, read through the shared reader
+(`engine/src/workload_accounts.rs`), with gid equal to uid. Root's
+workspace launch intake starts it so (td-authd/DESIGN.md, "Workspace
+launch intake"). The human, a missing or unreadable ledger, an
+application's row, or no row refuses before its spec is read.
 
 A uid is the caller's namespace's, so the caller's map must be the
 initial namespace's, each id itself: an application is uid 1000 in its
@@ -3824,7 +3816,7 @@ which refuses every namespace and mount call. That grants nothing:
 td-jail is no more privileged than its caller, and the kind only
 narrows what the caller's own tools reach.
 Its policy
-is a spec its launcher writes: for td's account a direct regular file of
+is a spec its launcher writes: on a development host a direct regular file of
 the caller's that no one else can write, and for a ledger account a
 direct regular file of root's that no one else can write, of one link,
 at `/run/td-authd/workspaces/UID/N` (the account's uid, `N` canonical
@@ -3919,8 +3911,8 @@ with the kind's own departures:
   kind's seccomp filter (the development profile where that applies),
   as the caller: the sandbox's account for td-sandbox or the
   conversation's ledger account for a confined td-agent workspace on td,
-  and the human on a development host. Reviews retain their caller path
-  pending their separate account cutover. The runtime has the workspace's grants (its writable
+  and the caller on a development host. Reviews use their leased ledger
+  accounts on td and name no runtime. The runtime has the workspace's grants (its writable
   worktrees, shares or views, its network and the host-local sockets
   that reaches), and not behind the application kind's D-Bus, portal or
   Wayland boundaries. td's
@@ -3964,7 +3956,7 @@ with the kind's own departures:
   the same exception admits that exact private root and descendants when
   a reservation strictly contains it. Equal or nested reservations and
   sibling aliases still refuse. This does not exempt a grant or a spec
-  supplied by the human caller class; their home-relative checks remain.
+  supplied by a development-host caller; their home-relative checks remain.
   Refused too is a directory that
   is or contains the caller's own home, as passwd
   spells it, as it resolves, or through a bind mount of it or of a
@@ -12557,9 +12549,9 @@ are unchanged.
 
 §C's `workspace` kind was built for a development host, and its
 divergences from §X.1 are availability ones, named here as the
-two-configuration rule requires. On td it is td's account's alone (§C):
-root launches confined conversations as their ledger accounts with td's
-own trees; the human caller remains for reviews until their cutover. A host's own `/td`, where a development host builds for td's
+two-configuration rule requires. On td only sandbox and workspace ledger
+accounts may call it (§C): root launches confined conversations and reviews
+as their accounts with td's own trees. A host's own `/td`, where a development host builds for td's
 store, is bound read-only and reserved like the other trees, so a jailed
 tool reads td's store there and cannot write it.
 

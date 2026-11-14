@@ -65,7 +65,7 @@ login user (`APPLICATIONS.md` §L, "Firefox runs under external service UID
 | td-web | `tda65540`, with a fetch service of its own; on a host, the human | `application-start` from its launcher card; on a host, `./install-apps`, unjailed |
 | td-sandbox | `tdw<uid>`, the sandbox's own, from 98304 up | `td-sandbox` → root's workspace intake → `td-jail --workspace` as the account |
 | td-agent conversation tool jails | a per-conversation `agent-N` ledger account on td; the caller on a development host | td-agent → root intake → td-login → td-jail |
-| td-agent reviews | the human until the review cutover | td-agent → `td-jail --workspace` |
+| td-agent reviews | a leased `review-N` ledger account on td; the caller on a development host | td-agent → root intake → td-login → td-jail |
 | td-agent unconfined workspace | the human, no jail | td-agent `--unconfined` |
 
 Already built and reused by this design:
@@ -123,12 +123,11 @@ home as the account and marks it deleted, keeping the ledger row; root
 never creates over a sandbox holding files or grants, which td-sandbox
 adopts instead. The profiles td-sandbox kept before are imported once,
 their old homes left in place (td-sandbox/DESIGN.md, "Import").
-td-sandbox calls no td-jail, and td-jail refuses td's account the
-sandbox's offline profile.
+td-sandbox calls no td-jail, and td-jail refuses the human caller on td.
 
 Confined td-agent conversations use root's workspace intake and reusable
 ledger accounts, with private scratch and per-launch directory plans.
-Reviews still use the human's caller class until their account cutover.
+Reviews use the same intake with leased `review-N` accounts.
 
 Not built: subordinate accounts, the `map-subuid` operation
 `APPLICATIONS.md` names, and socket grants, whose rows the table already
@@ -312,14 +311,13 @@ All workload launches go through root:
   account in the ledger rather than uid 1000. For a sandbox this is
   root's workspace launch intake (td-authd/DESIGN.md, "Workspace launch
   intake"): the human's connection, once admitted, becomes the jail's
-  channel, and td-jail admits the account's caller class beside the
-  human's (`APPLICATIONS.md` §C, "The `workspace` kind"). The account's
+  channel, and td-jail admits only the ledger account caller class (`APPLICATIONS.md` §C, "The `workspace` kind"). The account's
   uid is the jail's inside as well as out; uid 1000 inside comes with
   the jail's subordinate mapping, which is not built.
 
 td-sandbox launches no jail itself; it asks root's intake for a launch,
-as do td-agent's confined conversations. Reviews retain their old path
-until the review cutover. td-agent's unconfined workspace, which runs tools as the human
+as do td-agent's confined conversations and reviews. td-agent's unconfined
+workspace, which runs tools as the human
 with no jail, stays as the decision's one deliberate exception, with
 what it holds (above); every other agent workspace is jailed under its
 own account.
@@ -416,7 +414,7 @@ own account.
    root-owned spec, and runs `td-jail --workspace` as `tdw<uid>` through
    `td-login exec-service-as` with the connection as the jail's channel;
    td-jail's workspace kind admits a sandbox's or workspace's ledger
-   account as a second caller class, with root's spec, the account's
+   account alone, with root's spec, the account's
    home and its manifest's views at the human's own paths,
    td-authd/DESIGN.md, "Workspace launch intake"); then td-sandbox's
    cutover (landed: the intake also creates a sandbox through
@@ -475,12 +473,16 @@ own account.
    or a failed instance; separate pools of 128 instances, 32 a slot; and
    a deletion, of a sandbox too, refused while a launch or instance of it
    runs, that first ends what they left in the account's delegation
-   through `cgroup.kill`, td-authd/DESIGN.md, "Workspace instances"); td-agent's intake client (landed, unused: typed slot operations and
+   through `cgroup.kill`, td-authd/DESIGN.md, "Workspace instances"); td-agent's intake client (landed: typed slot operations and
    role-validated launch plans, with td-sandbox's socket transport shared
    in engine); td-agent's conversation cutover and VM oracle (landed:
    durable slot reservations, tools and maintenance through root, deletion
    and scratch reuse, and a disconnect monitor independent of the entry's
-   reader); reviews on the `review-N` pool through root; and the
+   reader); reviews on the `review-N` pool through root (landed: 64 private
+   slot locks serialize reuse, root deletion ends and empties an abandoned
+   account before its staging is removed, and only the exact source,
+   repository and scratch trees enter each launch; td-jail refuses the
+   human caller on td); and the
    diagnose template.
 9. mail and news on their reserved rows, with fetch services of their
    own as td-web has (td-web/DESIGN.md §3).

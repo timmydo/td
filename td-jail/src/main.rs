@@ -436,7 +436,7 @@ mod confinement {
 
     /// The workspace kind (APPLICATIONS.md §C) is selected only by the exact
     /// `td-jail --workspace`, is refused where the product configuration is
-    /// installed to every identity but td's account and a sandbox's or
+    /// installed to every identity but a sandbox's or
     /// workspace's ledger account, before its spec is read, and ties the
     /// outer process to its launcher before anything else; its stage 2
     /// reads its plan back, then confines, then starts the entry on the
@@ -450,7 +450,7 @@ mod confinement {
         assert!(shipped_main.contains(
             "if kind == ApplicationLaunchKind::Workspace {\n            // `--workspace LAUNCHER-PID SPEC [ARG...]`\n            let arguments: Vec<std::ffi::OsString> = arguments.collect();\n            transition::tie_workspace_to_launcher(arguments.get(1))?;\n            return transition::spawn_application_session(argv0, arguments);"
         ));
-        // On td, its account's and the ledger's sandbox and workspace
+        // On td, only the ledger's sandbox and workspace
         // accounts': the product configuration refuses every other
         // identity, before the spec is read, whose owner the caller's
         // class decides.
@@ -467,8 +467,22 @@ mod confinement {
             .unwrap();
         assert!(account < resolve.find("read_spec(spec_path, uid, caller)?").unwrap());
         assert!(WORKSPACE.contains(
-            "    let initial = initial_user_namespace(uid_map)?;\n    if uid == TD_ACCOUNT_UID && initial {\n        return Ok(Caller::Human);\n    }\n    if WORKLOAD_UIDS.contains(&uid) && initial && configuration_installed(config)? {\n"
+            "    let initial = initial_user_namespace(uid_map)?;\n    if WORKLOAD_UIDS.contains(&uid) && initial && configuration_installed(config)? {\n"
         ));
+        let admission = WORKSPACE
+            .split_once("fn require_account(\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(!admission.contains("TD_ACCOUNT_UID"));
+        assert!(
+            admission
+                .find("authority::require_no_configuration_at(")
+                .unwrap()
+                < admission.find("Ok(Caller::Host)").unwrap()
+        );
         assert!(
             WORKSPACE.contains("    authority::require_no_configuration_at(\n        config,\n")
         );
@@ -477,7 +491,7 @@ mod confinement {
         assert!(WORKSPACE.contains(
             "        Caller::Account(_) if account_spec_path(path, uid) => read_spec_of(path, 0, true),\n"
         ));
-        assert!(WORKSPACE.contains("        Caller::Human => read_spec_of(path, uid, false),\n"));
+        assert!(WORKSPACE.contains("        Caller::Host => read_spec_of(path, uid, false),\n"));
         assert!(resolve.contains("        require_account_spec(&spec, kind, uid)?;\n"));
         assert!(resolve.contains("        let views = authority::workspace_views(\n            &mountinfo,\n            uid,\n            kind,\n"));
         // A workspace examines and binds the views its lines name; a
