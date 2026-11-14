@@ -17,7 +17,7 @@
 //! input.
 
 use crate::client::{App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
-use crate::clipboard::{Incoming, Outgoing, MAX_BYTES};
+use crate::clipboard::{Incoming, Outgoing, OwnedText, Text, MAX_BYTES};
 pub use crate::driven::PointerPhase;
 use crate::font::Font;
 use crate::keys::{self, Help, Overlay, Section, Step};
@@ -144,6 +144,8 @@ pub enum Refusal {
     /// No private endpoint for the paste could be made: the process is
     /// at its descriptor limit.
     NoEndpoint,
+    /// This adapter does not accept budget-owned clipboard text.
+    UnsupportedOwnership,
 }
 
 impl std::fmt::Display for Refusal {
@@ -158,6 +160,7 @@ impl std::fmt::Display for Refusal {
             Self::NoImage => "the clipboard holds no picture",
             Self::TooLong => "the text is too long for the clipboard",
             Self::NoEndpoint => "no endpoint for the paste could be made",
+            Self::UnsupportedOwnership => "the clipboard adapter cannot retain owned text",
         })
     }
 }
@@ -180,6 +183,11 @@ pub trait Clipboard {
     /// The text is kept for the sends that follow until the compositor
     /// cancels the source or another copy replaces it.
     fn copy(&mut self, text: Arc<str>) -> std::result::Result<(), Refusal>;
+    /// Offers text without converting or discarding its budget ownership.
+    /// Adapters must explicitly support this; the default refuses intact.
+    fn copy_owned(&mut self, _text: OwnedText) -> std::result::Result<(), Refusal> {
+        Err(Refusal::UnsupportedOwnership)
+    }
     /// Asks the selection for its text over a fresh private endpoint, the
     /// window focused; it arrives as `Input::Paste` when whole, or a
     /// notice says why not.
@@ -211,6 +219,9 @@ impl Clipboard for NoClipboard {
         false
     }
     fn copy(&mut self, _: Arc<str>) -> std::result::Result<(), Refusal> {
+        Err(Refusal::NoDevice)
+    }
+    fn copy_owned(&mut self, _: OwnedText) -> std::result::Result<(), Refusal> {
         Err(Refusal::NoDevice)
     }
     fn paste(&mut self) -> std::result::Result<(), Refusal> {
@@ -246,6 +257,24 @@ impl Clipboard for WindowClipboard<'_> {
     }
 
     fn copy(&mut self, text: Arc<str>) -> std::result::Result<(), Refusal> {
+        self.offer(Text::Legacy(text))
+    }
+
+    fn copy_owned(&mut self, text: OwnedText) -> std::result::Result<(), Refusal> {
+        self.offer(Text::Owned(text))
+    }
+
+    fn paste(&mut self) -> std::result::Result<(), Refusal> {
+        self.begin_paste(false)
+    }
+
+    fn paste_image(&mut self) -> std::result::Result<(), Refusal> {
+        self.begin_paste(true)
+    }
+}
+
+impl WindowClipboard<'_> {
+    fn offer(&mut self, text: Text) -> std::result::Result<(), Refusal> {
         if self.board.error.is_some() {
             return Err(Refusal::NoDevice);
         }
@@ -277,16 +306,6 @@ impl Clipboard for WindowClipboard<'_> {
         Ok(())
     }
 
-    fn paste(&mut self) -> std::result::Result<(), Refusal> {
-        self.begin_paste(false)
-    }
-
-    fn paste_image(&mut self) -> std::result::Result<(), Refusal> {
-        self.begin_paste(true)
-    }
-}
-
-impl WindowClipboard<'_> {
     /// A paste of the selection's text, or its picture.
     fn begin_paste(&mut self, image: bool) -> std::result::Result<(), Refusal> {
         if self.board.error.is_some() {
@@ -318,7 +337,7 @@ impl WindowClipboard<'_> {
         let (incoming, peer) = match begun {
             Ok(pair) => pair,
             Err(e) => {
-                self.board.notice = Some(format!("paste refused: clipboard endpoint: {e}"));
+                self.board.notice = Some(format!("paste refused: clipboard endpoint: {e}").into());
                 return Err(Refusal::NoEndpoint);
             }
         };
@@ -345,7 +364,7 @@ impl WindowClipboard<'_> {
 /// The transfers and the text behind the live source, the window's.
 #[derive(Default)]
 struct Board {
-    text: Option<Arc<str>>,
+    text: Option<Text>,
     outgoing: Option<Outgoing>,
     /// The paste in flight, with the picture MIME it asked for (none for
     /// text), kept together so neither outlives the other.
@@ -354,7 +373,7 @@ struct Board {
     serial: Option<u32>,
     /// A notice a request raised, given to the handler once the input
     /// it came from is handled.
-    notice: Option<String>,
+    notice: Option<std::borrow::Cow<'static, str>>,
     /// A connection error a request met, which ends the loop once the
     /// input it came from is handled.
     error: Option<String>,
@@ -888,14 +907,18 @@ impl<'h, H: Handler> Window<'h, H> {
                 }
                 // The live source and the text are set together by `copy`
                 // and cleared together on cancel, release and withdrawal.
-                let Some(text) = self.board.text.clone() else {
+                let Some(text) = self.board.text.as_ref() else {
                     self.handler
                         .notice("clipboard send: no text behind the source");
                     return;
                 };
-                match Outgoing::begin(right, text, self.clock) {
+                let Ok(text) = text.try_clone() else {
+                    self.handler.notice("clipboard send refused: memory limit");
+                    return;
+                };
+                match Outgoing::begin_text(right, text, self.clock) {
                     Ok(transfer) => self.board.outgoing = Some(transfer),
-                    Err(e) => self.handler.notice(&format!("clipboard send refused: {e}")),
+                    Err(_) => self.handler.notice("clipboard send refused"),
                 }
             }
             // A send already begun keeps its own copy of the text.
@@ -913,9 +936,8 @@ impl<'h, H: Handler> Window<'h, H> {
             return Ok(());
         }
         if let Some(transfer) = self.board.outgoing.take() {
-            if let Err(e) = transfer.cancel() {
-                self.handler
-                    .notice(&format!("clipboard send cancellation failed: {e}"));
+            if transfer.cancel().is_err() {
+                self.handler.notice("clipboard send cancellation failed");
             }
         }
         self.board.text = None;
@@ -939,9 +961,9 @@ impl<'h, H: Handler> Window<'h, H> {
                 .notice("paste cancelled: the clipboard went away");
         }
         if let Some(transfer) = self.board.outgoing.take() {
-            if let Err(e) = transfer.cancel() {
+            if transfer.cancel().is_err() {
                 self.handler
-                    .notice(&format!("clipboard send cancelled: {e}"));
+                    .notice("clipboard send cancelled: destination restore failed");
             }
         }
         self.board.text = None;
@@ -993,7 +1015,7 @@ impl<'h, H: Handler> Window<'h, H> {
                 match outgoing.step(now) {
                     Ok(false) => self.board.outgoing = Some(outgoing),
                     Ok(true) => {}
-                    Err(e) => self.handler.notice(&format!("clipboard send failed: {e}")),
+                    Err(_) => self.handler.notice("clipboard send failed"),
                 }
             }
         }

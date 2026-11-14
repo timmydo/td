@@ -101,6 +101,7 @@ struct Recorder {
     /// the clipboard answered each time, and what it said of itself at
     /// each input.
     copy_on: Option<(String, Arc<str>)>,
+    owned_copy: Option<td_ui::clipboard::OwnedText>,
     paste_on: Option<String>,
     image_on: Option<String>,
     outcomes: Vec<Result<(), Refusal>>,
@@ -135,6 +136,7 @@ impl Recorder {
             paints: Vec::new(),
             title: "Recorder".into(),
             copy_on: None,
+            owned_copy: None,
             paste_on: None,
             image_on: None,
             outcomes: Vec::new(),
@@ -238,6 +240,9 @@ impl Handler for Recorder {
             _ => None,
         };
         if let Some(name) = name {
+            if let Some(text) = self.owned_copy.take() {
+                self.outcomes.push(clipboard.copy_owned(text));
+            }
             if let Some((chord, text)) = &self.copy_on {
                 if *chord == name {
                     self.outcomes.push(clipboard.copy(text.clone()));
@@ -2344,4 +2349,40 @@ fn a_window_given_prose_faces_draws_prose_glyphs_through_them() {
     assert_eq!(proportional, direct(Some(&mut prose_faces())));
     assert_eq!(cell, direct(None));
     assert_ne!(proportional, cell, "the glyph's face differs");
+}
+
+#[test]
+fn owned_clipboard_lifetime_survives_cancel_and_releases_on_delivery_or_withdrawal() {
+    use td_alloc::{with_reservation_limit, Budget};
+    use td_ui::clipboard::OwnedText;
+    for withdraw in [false, true] {
+        let root = Budget::new(4 * MAX_BYTES).unwrap();
+        let empty = root.used();
+        let mut handler = Recorder::new();
+        let source_text = "owned é clipboard".repeat(20);
+        handler.owned_copy = Some(OwnedText::copy(&root, &source_text).unwrap());
+        let held = root.used();
+        let (mut w, peer, keyboard, _, _) = clipboard_fixture(&mut handler);
+        focus_with_map(&mut w, &peer, keyboard);
+        drain(&peer);
+        with_reservation_limit(0, || press(&mut w, keyboard, 12, 30));
+        assert_eq!(w.handler().outcomes, [Ok(())]);
+        assert_eq!(root.used(), held);
+        let (requests, _) = drain(&peer);
+        let source = Cursor::new(&requests[0].payload).u32().unwrap();
+        let (mut reader, writer) = endpoint();
+        with_reservation_limit(0, || send_right(&mut w, &peer, source, UTF8, &writer));
+        drop(writer);
+        // Source cancellation drops the board owner; a queued send retains it.
+        w.event(message(source, 2, &[])).unwrap();
+        assert_eq!(root.used(), held);
+        if withdraw {
+            w.handler_mut().withdraw = true;
+        }
+        w.end_turn(100, true).unwrap();
+        let mut received = String::new();
+        reader.read_to_string(&mut received).unwrap();
+        assert_eq!(received, if withdraw { "" } else { &source_text });
+        assert_eq!(root.used(), empty);
+    }
 }

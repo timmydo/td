@@ -1510,14 +1510,22 @@ mod tests {
         view.find("CRÈME BRÛLÉE", &mut rendered, metrics, 1);
         let (start, end) = view.selection.and_then(Selection::range).unwrap();
         assert_eq!(
-            rendered.page.text(start, end, 100).as_deref(),
+            rendered
+                .page
+                .text(rendered.page.budget().unwrap(), start, end, 100)
+                .ok()
+                .as_deref(),
             Some("crème brûlée")
         );
         view.find("€", &mut rendered, metrics, 1);
         assert_eq!(view.hits.len(), 1);
         let all = rendered.page.line_end(0);
         assert_eq!(
-            rendered.page.text(Place::default(), all, 100).as_deref(),
+            rendered
+                .page
+                .text(rendered.page.budget().unwrap(), Place::default(), all, 100)
+                .ok()
+                .as_deref(),
             Some("Café crème brûlée, € 5")
         );
     }

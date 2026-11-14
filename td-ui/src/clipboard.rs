@@ -22,6 +22,7 @@
 //! drop. The receive's endpoint is this process's own socket, made
 //! nonblocking by safe `std`.
 
+pub use crate::clipboard_text::{OwnedText, TextError};
 use crate::sys;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -49,6 +50,29 @@ enum State {
     Failed,
 }
 
+/// The legacy and budget-owned sources use the same transfer lifecycle.
+pub(crate) enum Text {
+    Legacy(Arc<str>),
+    Owned(OwnedText),
+}
+impl Text {
+    pub(crate) fn try_clone(&self) -> Result<Self, td_alloc::BudgetError> {
+        match self {
+            Self::Legacy(text) => Ok(Self::Legacy(Arc::clone(text))),
+            Self::Owned(text) => Ok(Self::Owned(text.try_clone()?)),
+        }
+    }
+}
+impl std::ops::Deref for Text {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Legacy(text) => text,
+            Self::Owned(text) => text,
+        }
+    }
+}
+
 /// The received write endpoint, never a regular file or a device. Its
 /// status flags are the open-file description's, shared with whoever
 /// else holds it, so the exact original word is restored on close.
@@ -62,13 +86,11 @@ impl Destination {
         let file = File::from(fd);
         let kind = file.metadata()?.file_type();
         if !kind.is_fifo() && !kind.is_socket() {
-            return Err(io::Error::other(
-                "clipboard destination must be a pipe or socket",
-            ));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let original = sys::status(&file)?;
         if !matches!(original & O_ACCMODE, 1 | 2) {
-            return Err(io::Error::other("clipboard destination is not writable"));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         // The owner exists before the flag is set, so every exit after
         // it, a refused readback included, restores the original word.
@@ -79,10 +101,10 @@ impl Destination {
         let file = destination
             .file
             .as_ref()
-            .ok_or_else(|| io::Error::other("closed clipboard destination"))?;
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
         sys::set_status(file, original | O_NONBLOCK)?;
         if sys::status(file)? != original | O_NONBLOCK {
-            return Err(io::Error::other("clipboard nonblocking readback differs"));
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(destination)
     }
@@ -90,7 +112,7 @@ impl Destination {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.file
             .as_mut()
-            .ok_or_else(|| io::Error::other("closed clipboard destination"))?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
             .write(bytes)
     }
 
@@ -102,7 +124,7 @@ impl Destination {
         };
         sys::set_status(&file, self.original)?;
         if sys::status(&file)? != self.original {
-            return Err(io::Error::other("clipboard status restore differs"));
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(())
     }
@@ -124,7 +146,7 @@ impl Drop for Destination {
 /// embedders must not restore the default signal action.
 pub struct Outgoing {
     destination: Destination,
-    text: Arc<str>,
+    text: Text,
     offset: usize,
     deadline: u64,
     clock: u64,
@@ -141,12 +163,21 @@ impl Outgoing {
     /// read-only endpoint and a text past `MAX_BYTES`, and makes it
     /// nonblocking, read back, before any write.
     pub fn begin(fd: OwnedFd, text: Arc<str>, now: u64) -> io::Result<Self> {
+        Self::begin_text(fd, Text::Legacy(text), now)
+    }
+
+    /// Retains the payload's original admission through completion or drop.
+    pub fn begin_owned(fd: OwnedFd, text: OwnedText, now: u64) -> io::Result<Self> {
+        Self::begin_text(fd, Text::Owned(text), now)
+    }
+
+    pub(crate) fn begin_text(fd: OwnedFd, text: Text, now: u64) -> io::Result<Self> {
         if text.len() > MAX_BYTES {
-            return Err(io::Error::other("clipboard source byte budget"));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let deadline = now
             .checked_add(DEADLINE_MS)
-            .ok_or_else(|| io::Error::other("clipboard clock exhausted"))?;
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         Ok(Self {
             destination: Destination::new(fd)?,
             text,
@@ -163,15 +194,15 @@ impl Outgoing {
     pub fn step(&mut self, now: u64) -> io::Result<bool> {
         match self.state {
             State::Complete => return Ok(true),
-            State::Failed => return Err(io::Error::other("clipboard write already failed")),
+            State::Failed => return Err(io::Error::from(io::ErrorKind::InvalidData)),
             State::Pending => {}
         }
         if now < self.clock {
-            return self.failed(io::Error::other("clipboard clock moved backwards"));
+            return self.failed(io::Error::from(io::ErrorKind::InvalidData));
         }
         self.clock = now;
         if now >= self.deadline {
-            return self.failed(io::Error::other("clipboard write deadline"));
+            return self.failed(io::Error::from(io::ErrorKind::TimedOut));
         }
         for _ in 0..4 {
             if self.offset == self.text.len() {
@@ -179,12 +210,12 @@ impl Outgoing {
             }
             let end = self.offset.saturating_add(CHUNK).min(self.text.len());
             let Some(bytes) = self.text.as_bytes().get(self.offset..end) else {
-                return self.failed(io::Error::other("clipboard write offset"));
+                return self.failed(io::Error::from(io::ErrorKind::InvalidData));
             };
             match self.destination.write(bytes) {
-                Ok(0) => return self.failed(io::Error::other("clipboard write returned zero")),
+                Ok(0) => return self.failed(io::Error::from(io::ErrorKind::InvalidData)),
                 Ok(count) if count <= bytes.len() => self.offset += count,
-                Ok(_) => return self.failed(io::Error::other("clipboard write length")),
+                Ok(_) => return self.failed(io::Error::from(io::ErrorKind::InvalidData)),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) => return self.failed(e),
@@ -205,9 +236,7 @@ impl Outgoing {
             }
             Err(error) => {
                 self.state = State::Failed;
-                Err(io::Error::other(format!(
-                    "clipboard payload sent; restoring destination failed: {error}"
-                )))
+                Err(error)
             }
         }
     }
@@ -216,9 +245,7 @@ impl Outgoing {
         self.state = State::Failed;
         match self.destination.close() {
             Ok(()) => Err(error),
-            Err(restore) => Err(io::Error::other(format!(
-                "{error}; restoring destination: {restore}"
-            ))),
+            Err(restore) => Err(restore),
         }
     }
 

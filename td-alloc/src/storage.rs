@@ -436,6 +436,16 @@ impl BudgetString {
         let values = String::from_utf8(values).map_err(|_| BudgetError::Overflow)?;
         Ok(Self { values, charge })
     }
+    /// Append only inside admitted capacity, without attempting growth.
+    /// A refusal leaves the string unchanged.
+    #[inline]
+    pub fn push_str_within_capacity(&mut self, value: &str) -> Result<(), BudgetError> {
+        if value.len() > self.values.capacity() - self.values.len() {
+            return Err(BudgetError::Limit);
+        }
+        self.values.push_str(value);
+        Ok(())
+    }
     #[inline]
     pub fn try_push_str(&mut self, value: &str) -> Result<(), BudgetError> {
         let needed = self

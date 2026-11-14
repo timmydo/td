@@ -56,6 +56,7 @@ pub mod charts;
 pub mod chrome;
 pub mod client;
 pub mod clipboard;
+mod clipboard_text;
 pub mod confirmations;
 pub mod control;
 pub mod control_socket;

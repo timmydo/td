@@ -604,7 +604,8 @@ of its own files may name each module.
   as `Limit`, so the entry holds one line without a tab; `set_text`
   leaves the caret at the end with no selection, also for the same
   text. `copy` and `cut` hand the selection out as the clipboard's
-  `Arc<str>`; `set_masked` makes them refuse with `Masked` and the word
+  `Arc<str>`; `selected_text` borrows the same UTF-8 range without allocating.
+  `set_masked` makes all three refuse with `Masked` and the word
   motions and deletes go to the ends. `place` maps a pointer point
   through `TextEntry::hit`; `drag` extends to any point, one column
   past a field edge, so a `reveal` after each drag event scrolls;
@@ -759,7 +760,8 @@ of its own files may name each module.
   `Payload`, the worker's request type for a driven consumer; `text`,
   the read-back of a composition's draw stream; `paint` and the `Frame`
   it returns with its `ppm`; and `fnv1a64`, the frame digest.
-- `clipboard`: `MAX_BYTES`, the text ceiling either way, and
+- `clipboard`: `OwnedText`, immutable budget-owned UTF-8 text, and
+  `TextError` (`TooLong`, `Resource`); `MAX_BYTES`, the text ceiling either way, and
   `MAX_IMAGE_BYTES`, a picture paste's; `Outgoing` (`begin` over the
   send's right, `step`, `expired`, `cancel`), the bounded nonblocking
   writer of an offered text, which owns the right's status flags for the
@@ -778,8 +780,8 @@ of its own files may name each module.
   vocabulary a widget program reads, `Paste` and `PasteImage` among it;
   `Refusal`, why a copy or paste was not made (`NoDevice`, `NoFocus`,
   `NoSerial`, `Sending`, `Pasting`, `NoSelection`, `NoImage`, `TooLong`,
-  `NoEndpoint`), with its `Display`; the `Clipboard` trait (`available`,
-  `has_text`, `pasting`, `copy`, `paste`, and `has_image` and
+  `NoEndpoint`, `UnsupportedOwnership`), with its `Display`; the `Clipboard` trait (`available`,
+  `has_text`, `pasting`, `copy`, `copy_owned`, `paste`, and `has_image` and
   `paste_image`, which default to none and a `NoImage` refusal), what a
   handler reaches with each input, `WindowClipboard<'w>`, the window's,
   and `NoClipboard`, which refuses everything, for a test or a headless
@@ -2205,7 +2207,31 @@ frame's commit when a frame follows and alone when none can; a retitle
 made while painting rides the next attempt.
 
 The clipboard is the window's, reached by the handler through the
-`Clipboard` handed it with every input. `copy` offers a text as the
+`Clipboard` handed it with every input. `copy_owned` accepts `OwnedText`,
+whose backing retains its caller's budget. Up to 80 bytes fit inline,
+without allocating; cloning copies that fixed value. As with `SmallText`,
+inline storage belongs to its containing value, not a separate heap charge;
+the window keeps at most one source and one active send. Longer text has exact
+byte capacity and a shared control block, both charged to the budget.
+`OwnedText::from_pieces` measures before gathering and refuses above
+the lesser of its caller's limit and `MAX_BYTES`; `copy` accepts a borrowed
+string under the same bound. Its iterator must repeat the same pieces and
+its implementation, like other caller callbacks, is outside the allocation
+guarantee. A changed iterator cannot exceed the measured capacity. Clones
+are checked and allocation-free, and no conversion to an uncharged Arc is
+available. Payload construction has a strict source allocation guard.
+The window and `Outgoing::begin_owned` retain this owner through every send;
+source cancellation leaves an already started send's owner alive, and release,
+withdrawal, replacement, completion and errors drop their respective owners.
+The legacy Arc entry points share this same transfer state machine. Custom
+clipboard adapters default to `UnsupportedOwnership` for an owned copy until
+they explicitly support retaining it; `NoClipboard` returns `NoDevice`.
+Outgoing errors use nonallocating I/O error kinds or OS errors. If restoration
+also fails, its error takes precedence. Window send notices are static.
+Wayland request/dispatch storage and incoming paste storage retain their
+existing allocation contracts.
+
+`copy` offers a text as the
 seat's selection at the serial of the key or button press being
 delivered, the window focused, the data device live, no earlier copy
 still being sent and the text within `clipboard::MAX_BYTES`; it refuses

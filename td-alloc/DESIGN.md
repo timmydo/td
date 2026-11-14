@@ -87,7 +87,13 @@ navigation state and paints a static notice. Their dedicated modules have
 strict source guards. Browser find scratch and both generations of match
 results share a 2 MiB child of the page budget. Scratch and alternate result
 buffers are reused; search and reveal must both succeed before new matches
-replace the old state. Its render-worker mailbox and typed request/result slots use
+replace the old state. Browser selection copies and the UI clipboard's owned
+text payload retain byte and shared-control-block charges through delivery
+(short text fits inline in its containing value, without a heap allocation),
+including sends that outlive their source page. Construction refuses above
+1 MiB and preserves the old clipboard on allocation failure; its dedicated
+payload module has a strict source guard. URL formatting, Wayland request
+metadata and incoming pastes remain outside this adoption. Its render-worker mailbox and typed request/result slots use
 one fallible shared owner on the page root, with four reusable request/result
 slots admitted at startup and a content-type copy held inline or in a
 BudgetString. Tickets keep the mailbox's charge through their lifetimes. Thread startup still uses std/OS machinery.
@@ -220,7 +226,8 @@ preserves validity, and constant-time str views expose no mutable bytes.
 It never allocates; an enclosing budgeted owner accounts for its storage.
 Its one private unchecked UTF-8 conversion is recorded in UNSAFE.md §28.
 
-BudgetString has fallible copy/clone and scalar append; immutable str
+BudgetString's `push_str_within_capacity` appends without reserving or growing,
+refusing before mutation when the bytes do not fit. BudgetString has fallible copy/clone and scalar append; immutable str
 borrowing exposes no unchecked mutation. ASCII lowercasing preserves size
 and UTF-8. Ordering, hashing and Borrow<str> expose existing values without
 allocating; user-defined comparison/hash implementations remain caller code.

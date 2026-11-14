@@ -255,6 +255,19 @@ without skipping its first selected result. Unrelated scrolling, resizing and fo
 dismiss that search refusal or replace the old marks. A resize stages its replacement marks until
 the whole reflow succeeds, retaining the previous marks on refusal.
 
+Selection copies measure their UTF-8 pieces before allocating, refuse above
+1 MiB, and retain their byte storage against the page's budget. Up to
+80 bytes fit inline without a heap allocation, inside the window's bounded
+source/send values; longer copies charge exact byte capacity and a shared owner. The window's clipboard source and each active send keep that ownership
+after navigation drops the page; credits return only when the last payload
+owner drops. Overlapping clipboard replacements count both owners. Address and
+find selections use the same fallible payload against the window root;
+cuts delete the entry only after
+the clipboard accepts it. A refused copy preserves the clipboard and selection
+and uses a static status notice. URL resolution/formatting and Wayland protocol
+metadata still use their existing allocations; budgeted text delivery does not
+claim to migrate that IPC machinery or incoming pastes.
+
 PNG reserves once from its validated inflated size before decoding.
 Bounds up to 16 MiB round up to a power of two for reuse; larger bounds
 reserve exactly. The smaller case fits below 81 MiB with RGBA and row
@@ -271,7 +284,7 @@ bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
 
 These legacy allowances are an admission model, distinct from exact
 ownership of the new parser, CSS and layout storage in §10. They do not
-instrument every std allocation inside the legacy rich renderer, selection-copy helpers, font and raster
+instrument every std allocation inside the legacy rich renderer, font and raster
 ownership, fetch/window IPC or URL/response metadata. Those source-inventory entries
 remain migration debt; this is not a whole-process allocation-failure
 guarantee. The root cap supplements the per-input/work limits and the
@@ -899,9 +912,15 @@ is.
   most `MAX_COPY`, td-ui's clipboard ceiling (`clipboard::MAX_BYTES`,
   1 MiB), which the window keeps for its sends: a selection past it is
   not copied and the status row says so. The selection's text is
-  measured before any of it is gathered and gathered into a string of
-  exactly its size, so a copy never holds more than `MAX_COPY`, even
-  `Ctrl+A` on the largest page, beside the memory §3 counts.
+  measured before any of it is gathered and gathered into budget-owned
+  storage retained through delivery: at most 80 inline bytes per owner,
+  otherwise exact capacity and a fallible shared owner. Allocation refusal
+  copies nothing, preserves the previous source and selection, and reports
+  a static notice. Copy and cut feedback shares the ordinary status message:
+  a later save result replaces it. Pending messages also occupy the Find
+  row until the next input restores its entry. Even `Ctrl+A` on the largest
+  page cannot gather more than `MAX_COPY`; this storage is included in
+  §3's root.
 - **No primary selection.** td-web sets no primary selection and pastes
   none on a middle click: td-ui's widget window binds the primary
   selection for no handler and delivers no middle button (td-ui/DESIGN.md,

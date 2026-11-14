@@ -257,7 +257,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     for path in TREE_STORAGE_SOURCES
         .iter()
         .chain(LAYOUT_STORAGE_SOURCES)
-        .chain(PROSE_STORAGE_SOURCES)
+        .chain(UI_STORAGE_SOURCES)
     {
         budgeted_source(&fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?)
             .map_err(|error| format!("{path}: {error}"))?;
@@ -275,12 +275,13 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     compare(&parse(&recorded)?, &inventory(root)?)
 }
 
-const PROSE_STORAGE_SOURCES: &[&str] = &[
+const UI_STORAGE_SOURCES: &[&str] = &[
     "td-ui/src/prose/cache.rs",
     "td-ui/src/prose/items.rs",
     "td-ui/src/prose/wrap.rs",
     "td-web/src/wrap.rs",
     "td-web/src/search.rs",
+    "td-ui/src/clipboard_text.rs",
 ];
 
 const TREE_STORAGE_SOURCES: &[&str] = &[
@@ -649,7 +650,7 @@ mod tests {
             .iter()
             .chain(CSS_STORAGE_SOURCES)
             .chain(LAYOUT_STORAGE_SOURCES)
-            .chain(PROSE_STORAGE_SOURCES)
+            .chain(UI_STORAGE_SOURCES)
         {
             let file = root.join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();

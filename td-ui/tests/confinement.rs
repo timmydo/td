@@ -27,6 +27,7 @@ const PURE: &[&str] = &[
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
+    "clipboard_text.rs",
     "confirmations.rs",
     "control.rs",
     "coverage.rs",
@@ -713,7 +714,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xe1cbd12dd735cac3,
+        hash, 0x2d62cbe23ccac268,
         "review the whole destination owner before updating its fingerprint"
     );
     assert_eq!(clipboard.matches("sys::").count(), 5);

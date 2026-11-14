@@ -6,6 +6,7 @@
 //! at the page's width in pixels, the ones near those shown, is the
 //! window's. A save into Downloads runs on a worker's thread too.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use td_ui::chrome::{Status, TextEntry, ROW};
+use td_ui::clipboard::{OwnedText, TextError};
 use td_ui::entry_model::{Action, EntryModel};
 use td_ui::keys::Section;
 use td_ui::picture::Fitted;
@@ -260,7 +262,7 @@ pub struct App {
     forward: Vec<Entry>,
     loading: Option<Loading>,
     /// What the last input made happen, said until the next input.
-    message: Option<String>,
+    message: Option<Cow<'static, str>>,
     /// A save out on its worker's thread.
     saving: Option<Saving>,
     /// The home whose Downloads a save goes to (`save::downloads`).
@@ -545,7 +547,7 @@ impl App {
     fn go(&mut self, typed: &str) {
         match td_url::address(typed) {
             Ok(reference) => self.follow(reference),
-            Err(why) => self.message = Some(why),
+            Err(why) => self.message = Some(why.into()),
         }
     }
 
@@ -564,10 +566,13 @@ impl App {
                 }
             }
             Reference::Other { scheme } => {
-                self.message = Some(format!(
-                    "td-web does not open {} addresses",
-                    document::visible(&scheme)
-                ));
+                self.message = Some(
+                    format!(
+                        "td-web does not open {} addresses",
+                        document::visible(&scheme)
+                    )
+                    .into(),
+                );
             }
         }
     }
@@ -582,7 +587,8 @@ impl App {
         let Ok(renderer) = self.renderer.try_clone() else {
             self.message = said(format_args!(
                 "the page could not be started: memory exhausted"
-            ));
+            ))
+            .map(Cow::Owned);
             return;
         };
         let (target, named) = (url.clone(), fragment.clone());
@@ -597,7 +603,7 @@ impl App {
                 let _ = send.send(arrive(fetcher.as_ref(), &renderer, target, named, &told));
             });
         if let Err(why) = spawned {
-            self.message = Some(format!("the page could not be fetched: {why}"));
+            self.message = Some(format!("the page could not be fetched: {why}").into());
             return;
         }
         self.loading = Some(Loading {
@@ -732,7 +738,7 @@ impl App {
         if stopped {
             // Its worker keeps its slot until its fetch returns.
             self.saving = None;
-            self.message = said(format_args!("save stopped: nothing was written"));
+            self.message = said(format_args!("save stopped: nothing was written")).map(Cow::Owned);
         }
         stopped
     }
@@ -759,35 +765,39 @@ impl App {
     /// again, as a reload fetches it.
     fn save(&mut self) {
         if self.saving.is_some() {
-            self.message = said(format_args!("a save is under way"));
+            self.message = said(format_args!("a save is under way")).map(Cow::Owned);
             return;
         }
         let doc = &self.current.doc;
         if doc.url.is_none() {
-            self.message = said(format_args!("nothing to save: this page is td-web's own"));
+            self.message =
+                said(format_args!("nothing to save: this page is td-web's own")).map(Cow::Owned);
             return;
         }
         if doc.status == 0 {
-            self.message = said(format_args!("not saved: the page could not be fetched"));
+            self.message =
+                said(format_args!("not saved: the page could not be fetched")).map(Cow::Owned);
             return;
         }
         if !(200..300).contains(&doc.status) {
             self.message = said(format_args!(
                 "not saved: the server answered {}",
                 doc.status
-            ));
+            ))
+            .map(Cow::Owned);
             return;
         }
         if self.workers.load(Ordering::SeqCst) >= MAX_WORKERS {
             self.message = said(format_args!(
                 "earlier pages are still loading; try again shortly"
-            ));
+            ))
+            .map(Cow::Owned);
             return;
         }
         let directory = match save::downloads(self.home.as_deref()) {
             Ok(directory) => directory,
             Err(why) => {
-                self.message = said(format_args!("{why}"));
+                self.message = said(format_args!("{why}")).map(Cow::Owned);
                 return;
             }
         };
@@ -820,7 +830,7 @@ impl App {
                     thread,
                 })
             }
-            Err(why) => self.message = said(format_args!("not saved: {why}")),
+            Err(why) => self.message = said(format_args!("not saved: {why}")).map(Cow::Owned),
         }
     }
 
@@ -837,7 +847,7 @@ impl App {
             }
         };
         self.saving = None;
-        self.message = answered;
+        self.message = answered.map(Cow::Owned);
     }
 
     /// The address row says where the page is, or where it is going.
@@ -892,7 +902,8 @@ impl App {
                 Ok(rendered) => self.current.rendered = rendered,
                 Err(_) => {
                     self.current.render_refused = true;
-                    self.message = said(format_args!("Page unavailable: memory budget exhausted."));
+                    self.message = said(format_args!("Page unavailable: memory budget exhausted."))
+                        .map(Cow::Owned);
                     self.current.rendered_for = None;
                     return;
                 }
@@ -951,7 +962,9 @@ impl App {
     fn follow_link(&mut self, link: usize) {
         match self.current.rendered.page.target(link) {
             Some(Ok(reference)) => self.follow(reference),
-            Some(Err(why)) => self.message = Some(format!("the link is not followed: {why}")),
+            Some(Err(why)) => {
+                self.message = Some(format!("the link is not followed: {why}").into())
+            }
             None => {}
         }
     }
@@ -1055,11 +1068,11 @@ impl App {
         self.serif = !self.serif;
         self.relayout();
         let family = if self.serif { "Serif" } else { "Sans" };
-        self.message = Some(if self.metrics.proportional() {
+        self.message = Some(Cow::Owned(if self.metrics.proportional() {
             format!("body text in Noto {family}")
         } else {
             format!("body text in Noto {family}, which is not loaded: the page draws on the cell")
-        });
+        }));
     }
 
     fn open_find(&mut self) {
@@ -1106,56 +1119,70 @@ impl App {
         self.refresh_hover();
     }
 
-    /// The page's selected text, when any is selected: `Err` past
-    /// `MAX_COPY`.
-    fn selected_text(&self) -> Option<Result<String, ()>> {
+    /// The page's selected text, when nonempty: refuses oversize or
+    /// unavailable memory before changing clipboard ownership.
+    fn selected_text(&self) -> Option<Result<OwnedText, TextError>> {
         let (start, end) = self.current.view.selection?.range()?;
         let page = &self.current.rendered.page;
-        match page.text(start, end, MAX_COPY) {
-            Some(text) if text.is_empty() => None,
-            Some(text) => Some(Ok(text)),
-            None => Some(Err(())),
+        let memory = page.budget().unwrap_or(self.renderer.budget());
+        match page.text(memory, start, end, MAX_COPY) {
+            Ok(text) if text.is_empty() => None,
+            text => Some(text),
         }
     }
 
-    /// Copies, first that applies: the address or find row's selection
-    /// while it has focus, the page's selection, the focused link's URL,
-    /// the page's.
+    /// Selection copies keep admission through the clipboard's final send.
     fn copy(&mut self, clipboard: &mut dyn Clipboard) {
-        let text = match self.focus {
-            Focus::Address => self.address.copy().ok().flatten(),
-            Focus::Find => self.query.copy().ok().flatten(),
+        let memory = self
+            .current
+            .rendered
+            .page
+            .budget()
+            .unwrap_or(self.renderer.budget());
+        let entry = match self.focus {
+            Focus::Address => self.address.selected_text().ok().flatten(),
+            Focus::Find => self.query.selected_text().ok().flatten(),
             Focus::Page => None,
         };
-        let text = match text {
-            Some(text) => Some(text),
-            None => match self.selected_text() {
-                Some(Ok(text)) => Some(text.into()),
-                Some(Err(())) => {
-                    self.message = Some(format!(
-                        "not copied: the selection is past {} MiB",
-                        MAX_COPY >> 20
-                    ));
-                    return;
-                }
-                None => None,
-            },
-        };
-        let text = text.or_else(|| {
-            let link = self.current.view.focus?;
-            Some(self.current.rendered.page.shown(link)?.into())
-        });
-        let text = text.or_else(|| Some(self.current.doc.url.as_ref()?.text().into()));
-        if let Some(text) = text {
-            self.message = Some(match clipboard.copy(text) {
-                Ok(()) => "copied".into(),
-                Err(why) => format!("not copied: {why}"),
-            });
+        let selected = entry
+            .map(|text| OwnedText::copy(self.renderer.budget(), text))
+            .or_else(|| self.selected_text());
+        if let Some(text) = selected {
+            self.offer_copy(text, clipboard);
+            return;
         }
+        // URL resolution/formatting is still part of the legacy metadata path.
+        let text = self
+            .current
+            .view
+            .focus
+            .and_then(|link| self.current.rendered.page.shown(link))
+            .or_else(|| self.current.doc.url.as_ref().map(|url| url.text()));
+        if let Some(text) = text {
+            let text = OwnedText::copy(memory, &text);
+            self.offer_copy(text, clipboard);
+        }
+    }
+
+    fn offer_copy(&mut self, text: Result<OwnedText, TextError>, clipboard: &mut dyn Clipboard) {
+        self.message = Some(Cow::Borrowed(match text {
+            Ok(text) => match clipboard.copy_owned(text) {
+                Ok(()) => "copied",
+                Err(_) => "not copied: the clipboard refused the selection",
+            },
+            Err(TextError::TooLong) => "not copied: the selection is past 1 MiB",
+            Err(TextError::Resource(_)) => "not copied: memory limit",
+        }));
     }
 
     /// An editing chord in `entry`; whether it was one.
-    fn edit(entry: &mut EntryModel, chord: &str, clipboard: &mut dyn Clipboard) -> bool {
+    fn edit(
+        entry: &mut EntryModel,
+        chord: &str,
+        clipboard: &mut dyn Clipboard,
+        memory: &td_alloc::Budget,
+        notice: &mut Option<Cow<'static, str>>,
+    ) -> bool {
         let action = match chord {
             "space" => Some(Action::Insert(' ')),
             "C-v" => {
@@ -1163,8 +1190,18 @@ impl App {
                 return true;
             }
             "C-x" => {
-                if let Ok(Some(text)) = entry.cut() {
-                    let _ = clipboard.copy(text);
+                if let Ok(Some(text)) = entry.selected_text() {
+                    *notice = Some(Cow::Borrowed(match OwnedText::copy(memory, text) {
+                        Ok(text) => match clipboard.copy_owned(text) {
+                            Ok(()) => {
+                                let _ = entry.act(Action::Delete);
+                                "copied"
+                            }
+                            Err(_) => "not copied: the clipboard refused the selection",
+                        },
+                        Err(TextError::TooLong) => "not copied: the selection is past 1 MiB",
+                        Err(TextError::Resource(_)) => "not copied: memory limit",
+                    }));
                 }
                 return true;
             }
@@ -1211,7 +1248,13 @@ impl App {
                 }
                 "Tab" | "Down" => self.focus = Focus::Page,
                 _ => {
-                    Self::edit(&mut self.address, chord, clipboard);
+                    Self::edit(
+                        &mut self.address,
+                        chord,
+                        clipboard,
+                        self.renderer.budget(),
+                        &mut self.message,
+                    );
                 }
             },
             Focus::Find => {
@@ -1226,7 +1269,13 @@ impl App {
                     "S-Return" => view.step_hit(false, rendered, &mut self.metrics, rows),
                     "Escape" => self.focus = Focus::Page,
                     _ => {
-                        if Self::edit(&mut self.query, chord, clipboard) {
+                        if Self::edit(
+                            &mut self.query,
+                            chord,
+                            clipboard,
+                            self.renderer.budget(),
+                            &mut self.message,
+                        ) {
                             self.refind();
                         }
                     }
@@ -1460,19 +1509,19 @@ impl App {
     /// What the status row says: what the last input made happen, else
     /// what loads, else where the link under the pointer or focused goes,
     /// else the page's status, place and notes.
-    fn status_text(&self) -> String {
+    fn status_text(&self) -> Cow<'_, str> {
         if let Some(message) = &self.message {
-            return message.clone();
+            return Cow::Borrowed(message);
         }
         if let Some(loading) = &self.loading {
-            return format!("loading {}", loading.url.text());
+            return format!("loading {}", loading.url.text()).into();
         }
         if self.saving.is_some() {
-            return said(format_args!("saving in Downloads")).unwrap_or_default();
+            return Cow::Borrowed("saving in Downloads");
         }
         let link = self.hover.or(self.current.view.focus);
         if let Some(shown) = link.and_then(|link| self.current.rendered.page.shown(link)) {
-            return shown;
+            return shown.into();
         }
         let doc = &self.current.doc;
         let rendered = &self.current.rendered;
@@ -1505,7 +1554,7 @@ impl App {
         if doc.url.is_none() && lines <= 1 {
             parts.push("Ctrl+L for an address, F1 for the keys".into());
         }
-        parts.join(" · ")
+        parts.join(" · ").into()
     }
 }
 
@@ -1690,7 +1739,7 @@ impl Handler for App {
         }
         let status = self.status();
         let mut sink = |draw| raster.draw(draw);
-        if self.focus == Focus::Find {
+        if self.focus == Focus::Find && self.message.is_none() {
             if let Some(entry) = TextEntry::new(surface, status.rect()) {
                 self.query.reveal(entry);
                 let field = self.query.field("find in the page", true, true);
@@ -1819,6 +1868,10 @@ mod tests {
         }
         fn copy(&mut self, text: Arc<str>) -> Result<(), td_ui::window::Refusal> {
             self.copies.push(text.to_string());
+            Ok(())
+        }
+        fn copy_owned(&mut self, text: OwnedText) -> Result<(), td_ui::window::Refusal> {
+            self.copies.push(text.as_str().to_string());
             Ok(())
         }
         fn paste(&mut self) -> Result<(), td_ui::window::Refusal> {
@@ -2084,7 +2137,7 @@ mod tests {
         for _ in 0..1000 {
             app.poll(0);
             if app.saving.is_none() {
-                return app.status_text();
+                return app.status_text().into_owned();
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -2218,6 +2271,68 @@ mod tests {
         assert_eq!(names, ["Q3 report.pdf"]);
         idle(&app);
         temp.cleanup().unwrap();
+    }
+
+    #[test]
+    fn save_result_replaces_intervening_copy_feedback() {
+        let temp = home();
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: downloads_site(),
+            release: Mutex::new(held),
+        }));
+        app.home = Some(temp.to_path_buf());
+        type_address(&mut app, "example.org/notes.txt");
+        release.send(()).unwrap();
+        settle(&mut app);
+        key(&mut app, "C-s");
+        key(&mut app, "C-c");
+        assert_eq!(app.status_text(), "copied");
+        release.send(()).unwrap();
+        assert_eq!(
+            save_done(&mut app),
+            "saved 10 bytes of example.org/notes.txt in Downloads as notes.txt"
+        );
+        idle(&app);
+    }
+
+    #[test]
+    fn find_paints_copy_and_cut_refusals() {
+        fn status_pixels(app: &mut App) -> Vec<u8> {
+            let font = td_ui::font::pinned().unwrap();
+            let surface = app.surface;
+            let mut pixels = vec![0u8; surface.width * surface.height * 4];
+            let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+            app.paint(&mut raster, surface).unwrap();
+            let status = app.status().rect();
+            let first = status.y as usize * surface.width * 4;
+            let end = (status.y as usize + status.height as usize) * surface.width * 4;
+            pixels[first..end].to_vec()
+        }
+        for chord in ["C-c", "C-x"] {
+            let mut app = app(site());
+            key(&mut app, "C-f");
+            let query = "abcdefghij".repeat(10);
+            app.query.set_text(&query).unwrap();
+            app.query.act(Action::SelectAll).unwrap();
+            td_alloc::with_reservation_limit(0, || key(&mut app, chord));
+            assert_eq!(app.status_text(), "not copied: memory limit");
+            assert_eq!(app.query.selected_text().unwrap(), Some(query.as_str()));
+            let actual = status_pixels(&mut app);
+            app.focus = Focus::Page;
+            let expected = status_pixels(&mut app);
+            assert!(
+                actual == expected,
+                "Find must paint the refusal for {chord}"
+            );
+            app.focus = Focus::Find;
+            key(&mut app, "Left");
+            assert!(app.message.is_none());
+            assert!(
+                status_pixels(&mut app) != expected,
+                "next input restores Find"
+            );
+        }
     }
 
     #[test]
@@ -2866,6 +2981,184 @@ mod tests {
             ["alpha beta gamma delta", "epsilon zeta", "", "second para"]
         );
         app
+    }
+
+    #[test]
+    fn copying_refuses_every_reservation_without_replacing_the_clipboard_or_selection() {
+        let mut app = app(site().page(
+            "https://example.org/copy",
+            "text/plain",
+            &"second para\n".repeat(100),
+        ));
+        typed(&mut app, "example.org/copy");
+        key(&mut app, "C-a");
+        let before = (
+            app.current.view.selection,
+            app.current.view.top,
+            app.current.view.focus,
+        );
+        let memory = app.renderer.budget().try_clone().unwrap();
+        let used = memory.used();
+        for allowed in 0..=2 {
+            let mut board = Board {
+                copies: vec!["previous".into()],
+            };
+            td_alloc::with_reservation_limit(allowed, || app.copy(&mut board));
+            assert_eq!(
+                (
+                    app.current.view.selection,
+                    app.current.view.top,
+                    app.current.view.focus
+                ),
+                before
+            );
+            assert_eq!(memory.used(), used);
+            if allowed < 2 {
+                assert_eq!(board.copies, ["previous"]);
+                assert_eq!(app.message.as_deref(), Some("not copied: memory limit"));
+            } else {
+                assert_eq!(board.copies.len(), 2);
+                assert!(board.copies[1].contains("second para"));
+                assert_eq!(app.message.as_deref(), Some("copied"));
+            }
+        }
+        let pressure = memory.charge(memory.limit() - memory.used()).unwrap();
+        assert!(matches!(
+            app.selected_text(),
+            Some(Err(TextError::Resource(td_alloc::BudgetError::Limit)))
+        ));
+        drop(pressure);
+        let owned = app.selected_text().unwrap().unwrap();
+        drop(app);
+        assert!(memory.used() > 0);
+        assert!(owned.contains("second para"));
+        drop(owned);
+        assert_eq!(memory.used(), td_alloc::Budget::metadata_bytes());
+    }
+
+    #[test]
+    fn cut_keeps_the_entry_when_allocation_or_the_clipboard_refuses() {
+        let memory = crate::memory::root().unwrap();
+        let mut entry = EntryModel::new(512).unwrap();
+        let text = "é hello".repeat(30);
+        let mut notice = None;
+        entry.set_text(&text).unwrap();
+        entry.act(Action::SelectAll).unwrap();
+        let mut board = Board::default();
+        td_alloc::with_reservation_limit(0, || {
+            App::edit(&mut entry, "C-x", &mut board, &memory, &mut notice)
+        });
+        assert_eq!(entry.text(), text);
+        assert_eq!(notice.as_deref(), Some("not copied: memory limit"));
+        App::edit(
+            &mut entry,
+            "C-x",
+            &mut td_ui::window::NoClipboard,
+            &memory,
+            &mut notice,
+        );
+        assert_eq!(entry.text(), text);
+        App::edit(&mut entry, "C-x", &mut board, &memory, &mut notice);
+        assert_eq!(entry.text(), "");
+        assert_eq!(board.copies, [text]);
+    }
+
+    /// Same fixture on the merged base and branch; select with TD_COPY_BENCH.
+    #[test]
+    #[ignore]
+    fn copy_benchmark() {
+        use std::hint::black_box;
+        #[derive(Default)]
+        struct Capture {
+            legacy: Option<Arc<str>>,
+            owned: Option<td_ui::clipboard::OwnedText>,
+        }
+        impl Clipboard for Capture {
+            fn available(&self) -> bool {
+                true
+            }
+            fn has_text(&self) -> bool {
+                false
+            }
+            fn pasting(&self) -> bool {
+                false
+            }
+            fn paste(&mut self) -> Result<(), td_ui::window::Refusal> {
+                Ok(())
+            }
+            fn copy(&mut self, text: Arc<str>) -> Result<(), td_ui::window::Refusal> {
+                self.legacy = Some(text);
+                Ok(())
+            }
+            fn copy_owned(
+                &mut self,
+                text: td_ui::clipboard::OwnedText,
+            ) -> Result<(), td_ui::window::Refusal> {
+                self.owned = Some(text);
+                Ok(())
+            }
+        }
+        impl Capture {
+            fn text(&self) -> &str {
+                self.owned
+                    .as_ref()
+                    .map(|text| text.as_str())
+                    .or(self.legacy.as_deref())
+                    .unwrap()
+            }
+        }
+
+        let case = std::env::var("TD_COPY_BENCH").unwrap();
+        let (kind, body, rounds) = match case.as_str() {
+            "short" => ("text/plain", "alpha beta gamma\n".repeat(4), 200_000),
+            "large" => ("text/plain", "abcd efgh ijkl mnop\n".repeat(45_000), 300),
+            "rich" => (
+                "text/html",
+                "<p><b>alpha</b> <i>beta</i> <a href='/x'>gamma</a> delta</p>".repeat(8_000),
+                600,
+            ),
+            "unicode" => ("text/plain", "é界 Αβγ café\n".repeat(35_000), 400),
+            "entry" => ("text/plain", "hello".into(), 100_000),
+            _ => panic!("unknown copy scenario"),
+        };
+        let mut app = app(site().page("https://example.org/copy", kind, &body));
+        typed(&mut app, "example.org/copy");
+        if case == "entry" {
+            app.focus = Focus::Address;
+            app.address.set_text(&"aé".repeat(1200)).unwrap();
+            app.address.act(Action::SelectAll).unwrap();
+        } else {
+            key(&mut app, "C-a");
+        }
+        let mut board = Capture::default();
+        app.copy(&mut board);
+        let expected = board.text().to_string();
+        let cpu_ns = || -> u64 {
+            std::fs::read_to_string("/proc/thread-self/schedstat")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let cpu_started = cpu_ns();
+        let started = Instant::now();
+        let mut count = 0;
+        for _ in 0..rounds {
+            app.copy(black_box(&mut board));
+            let text = black_box(board.text());
+            count += text.len();
+            assert_eq!(text, expected);
+        }
+        let cpu_ms = (cpu_ns() - cpu_started) as f64 / 1_000_000.0;
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let rss = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = rss.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+        println!(
+            "copy-bench {case} ms={elapsed} cpu_ms={cpu_ms} bytes={count} root={} {peak}",
+            app.renderer.budget().used()
+        );
     }
 
     #[test]

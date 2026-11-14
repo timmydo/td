@@ -353,16 +353,27 @@ impl EntryModel {
     /// The selected text for the clipboard; `None` when nothing is
     /// selected.
     pub fn copy(&self) -> Result<Option<Arc<str>>, Refusal> {
+        Ok(self.selected_text()?.map(Arc::from))
+    }
+
+    /// Borrow the selected UTF-8 bytes without allocating. Masked fields
+    /// refuse exactly as `copy` does.
+    pub fn selected_text(&self) -> Result<Option<&str>, Refusal> {
         if self.masked {
             return Err(Refusal::Masked);
         }
         let Some((start, end)) = self.selection() else {
             return Ok(None);
         };
-        Ok(self
-            .text
-            .get(self.byte(start)..self.byte(end))
-            .map(Arc::from))
+        // Counting UTF-8 starts is much cheaper than decoding every scalar
+        // to locate an end-of-field selection. Restrict the fast-path probe
+        // to ranges long enough that it cannot dominate a tiny prefix copy.
+        let to = if end >= self.text.len().div_ceil(4) && end == self.len() {
+            self.text.len()
+        } else {
+            self.byte(end)
+        };
+        Ok(self.text.get(self.byte(start)..to))
     }
 
     /// `copy`, then the selection removed.

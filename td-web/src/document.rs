@@ -503,28 +503,33 @@ impl Page {
     }
 
     /// The page's text from `start` to `end`, the runs of each logical
-    /// line joined and the lines joined by a newline; none when it is
-    /// longer than `most` bytes, which is found by measuring it before
-    /// any of it is gathered, so what is made is never larger.
-    pub fn text(&self, start: Place, end: Place, most: usize) -> Option<String> {
-        let size = self.pieces(start, end).try_fold(0usize, |size, piece| {
-            Some(size.saturating_add(piece.len())).filter(|&size| size <= most)
-        })?;
-        let mut out = String::with_capacity(size);
-        self.pieces(start, end)
-            .for_each(|piece| out.push_str(piece));
-        Some(out)
+    /// line joined and the lines joined by a newline. Refuses above `most`
+    /// or the clipboard ceiling, measured before gathering; heap storage
+    /// keeps the supplied budget until its last clipboard owner drops.
+    #[inline]
+    pub fn text(
+        &self,
+        budget: &Budget,
+        start: Place,
+        end: Place,
+        most: usize,
+    ) -> Result<td_ui::clipboard::OwnedText, td_ui::clipboard::TextError> {
+        td_ui::clipboard::OwnedText::from_pieces(budget, self.pieces(start, end), most)
     }
 
     /// The text from `start` to `end` in pieces: the part of each run
     /// between them, and a newline between two logical lines.
-    fn pieces(&self, start: Place, end: Place) -> impl Iterator<Item = &str> + '_ {
+    fn pieces(&self, start: Place, end: Place) -> impl Iterator<Item = &str> + Clone + '_ {
         let last = end.logical.min(self.lines.len().saturating_sub(1));
         (start.logical..=last).flat_map(move |logical| {
             let runs = self.lines.get(logical).map_or(&[][..], |line| &line.runs);
             let on_first = logical == start.logical;
             let on_last = logical == end.logical;
             let parts = runs.iter().enumerate().filter_map(move |(run, part)| {
+                // Interior lines copy whole runs, with no UTF-8 slicing.
+                if !on_first && !on_last {
+                    return Some(part.text.as_str());
+                }
                 if (on_first && run < start.run) || (on_last && run > end.run) {
                     return None;
                 }
@@ -2932,37 +2937,54 @@ pub(crate) mod tests {
     /// with it; none past the bound.
     #[test]
     fn the_text_between_two_places_joins_runs_and_lines() {
+        let memory = memory::root().unwrap();
         let page = of_runs(&[&["> ", "alpha ", "beta"], &[], &["gamma"]]);
         let whole = "> alpha beta\n\ngamma";
         let end = page.line_end(2);
         assert_eq!(end, at(2, 0, 5));
         assert_eq!(page.line_end(1), at(1, 0, 0));
-        assert_eq!(page.text(at(0, 0, 0), end, usize::MAX).unwrap(), whole);
-        assert_eq!(page.text(at(0, 1, 2), at(0, 2, 2), 100).unwrap(), "pha be");
         assert_eq!(
-            page.text(at(0, 2, 2), at(2, 0, 3), 100).unwrap(),
+            page.text(&memory, at(0, 0, 0), end, usize::MAX).unwrap(),
+            whole
+        );
+        assert_eq!(
+            page.text(&memory, at(0, 1, 2), at(0, 2, 2), 100).unwrap(),
+            "pha be"
+        );
+        assert_eq!(
+            page.text(&memory, at(0, 2, 2), at(2, 0, 3), 100).unwrap(),
             "ta\n\ngam"
         );
-        assert_eq!(page.text(at(0, 1, 6), at(0, 2, 0), 100).unwrap(), "");
-        assert_eq!(page.text(at(0, 0, 0), end, whole.len()).unwrap(), whole);
-        assert_eq!(page.text(at(0, 0, 0), end, whole.len() - 1), None);
-        assert_eq!(page.text(at(0, 0, 0), end, 3), None);
+        assert_eq!(
+            page.text(&memory, at(0, 1, 6), at(0, 2, 0), 100).unwrap(),
+            ""
+        );
+        assert_eq!(
+            page.text(&memory, at(0, 0, 0), end, whole.len()).unwrap(),
+            whole
+        );
+        assert!(matches!(
+            page.text(&memory, at(0, 0, 0), end, whole.len() - 1),
+            Err(td_ui::clipboard::TextError::TooLong)
+        ));
+        assert!(page.text(&memory, at(0, 0, 0), end, 3).is_err());
         // A run longer than the bound is refused before it is copied.
         let long = "x".repeat(1 << 20);
         let page = of_runs(&[&["ab", &long]]);
-        assert_eq!(page.text(at(0, 0, 0), page.line_end(0), 1000), None);
-        let text = page
-            .text(at(0, 0, 0), page.line_end(0), 2 + long.len())
-            .unwrap();
-        assert_eq!(
-            (text.len(), text.capacity()),
-            (2 + long.len(), 2 + long.len())
-        );
+        assert!(page
+            .text(&memory, at(0, 0, 0), page.line_end(0), 1000)
+            .is_err());
+        assert!(matches!(
+            page.text(&memory, at(0, 0, 0), page.line_end(0), 2 + long.len()),
+            Err(td_ui::clipboard::TextError::TooLong)
+        ));
         // Several runs, which a string grown run by run would hold with
         // room to spare (eight bytes, then sixteen).
         let page = of_runs(&[&["aaaaa", "bbbb"]]);
-        let text = page.text(at(0, 0, 0), page.line_end(0), 100).unwrap();
-        assert_eq!((text.as_str(), text.capacity()), ("aaaaabbbb", 9));
+        let text = page
+            .text(&memory, at(0, 0, 0), page.line_end(0), 100)
+            .unwrap();
+        assert_eq!(text.as_str(), "aaaaabbbb");
         // A quote's marks its continuations repeat are not its text.
         let doc = html_doc(b"<blockquote>alpha beta gamma delta epsilon</blockquote>");
         let laid = cells(&doc, 10);
@@ -2971,7 +2993,7 @@ pub(crate) mod tests {
         let page = &laid.page;
         let last = page.lines.len() - 1;
         assert_eq!(
-            page.text(Place::default(), page.line_end(last), 1000)
+            page.text(&memory, Place::default(), page.line_end(last), 1000)
                 .unwrap(),
             "> alpha beta gamma delta epsilon"
         );

@@ -512,3 +512,22 @@ fn fixed_text_keeps_utf8_and_never_allocates_or_partially_appends() {
         assert!(SmallText::<256>::copy(&"x".repeat(256)).is_none());
     });
 }
+
+#[test]
+fn string_append_inside_capacity_never_reserves_and_refuses_atomically() {
+    let budget = Budget::new(4096).unwrap();
+    let mut text = BudgetString::with_capacity(&budget, 5).unwrap();
+    let held = budget.used();
+    td_alloc::with_reservation_limit(0, || {
+        text.push_str_within_capacity("é").unwrap();
+        assert_eq!(
+            text.push_str_within_capacity("abcd"),
+            Err(BudgetError::Limit)
+        );
+        assert_eq!(text.as_str(), "é");
+        text.push_str_within_capacity("界").unwrap();
+        assert_eq!(text.as_str(), "é界");
+        text.push_str_within_capacity("").unwrap();
+    });
+    assert_eq!(budget.used(), held);
+}

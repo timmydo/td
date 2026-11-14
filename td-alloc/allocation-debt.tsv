@@ -1072,7 +1072,7 @@ td-alloc/src/lib.rs	unchecked-growth-or-clone	8
 td-alloc/src/raw.rs	raw-allocator	4
 td-alloc/src/storage.rs	allocating-constructor	8
 td-alloc/src/storage.rs	direct-reservation	4
-td-alloc/src/storage.rs	unchecked-growth-or-clone	6
+td-alloc/src/storage.rs	unchecked-growth-or-clone	7
 td-audio/src/alsa.rs	allocation-macro	22
 td-audio/src/device.rs	allocating-conversion	1
 td-audio/src/device.rs	allocation-macro	5
@@ -4018,7 +4018,7 @@ td-ui/src/client.rs	allocating-conversion	6
 td-ui/src/client.rs	allocation-macro	20
 td-ui/src/client.rs	unchecked-growth-or-clone	11
 td-ui/src/clipboard.rs	allocating-conversion	1
-td-ui/src/clipboard.rs	allocation-macro	3
+td-ui/src/clipboard.rs	allocation-macro	1
 td-ui/src/clipboard.rs	direct-reservation	1
 td-ui/src/clipboard.rs	unchecked-growth-or-clone	1
 td-ui/src/confirmations.rs	direct-reservation	3
@@ -4149,8 +4149,8 @@ td-ui/src/wayland.rs	allocation-macro	9
 td-ui/src/wayland.rs	heap-owner	1
 td-ui/src/wayland.rs	unchecked-growth-or-clone	8
 td-ui/src/window.rs	allocating-conversion	5
-td-ui/src/window.rs	allocation-macro	11
-td-ui/src/window.rs	unchecked-growth-or-clone	2
+td-ui/src/window.rs	allocation-macro	7
+td-ui/src/window.rs	unchecked-growth-or-clone	1
 td-ui/src/xdg.rs	allocating-conversion	2
 td-ui/src/xdg.rs	allocation-macro	1
 td-ui/src/xkb.rs	allocating-conversion	7
@@ -4325,13 +4325,13 @@ td-vm/src/vm_workspace.rs	allocating-conversion	4
 td-vm/src/vm_workspace.rs	allocation-macro	6
 td-vm/src/vm_workspace.rs	unchecked-growth-or-clone	9
 td-web/src/app.rs	allocating-conversion	5
-td-web/src/app.rs	allocation-macro	19
+td-web/src/app.rs	allocation-macro	17
 td-web/src/app.rs	heap-owner	4
-td-web/src/app.rs	unchecked-growth-or-clone	18
-td-web/src/document.rs	allocating-constructor	4
+td-web/src/app.rs	unchecked-growth-or-clone	17
+td-web/src/document.rs	allocating-constructor	3
 td-web/src/document.rs	allocating-conversion	7
 td-web/src/document.rs	allocation-macro	4
-td-web/src/document.rs	unchecked-growth-or-clone	17
+td-web/src/document.rs	unchecked-growth-or-clone	16
 td-web/src/fetch.rs	allocating-conversion	1
 td-web/src/fetch.rs	allocation-macro	3
 td-web/src/main.rs	allocating-conversion	1

@@ -305,3 +305,179 @@ fn an_originally_nonblocking_destination_keeps_its_flags() {
     reader.read_to_string(&mut text).unwrap();
     assert_eq!(text, "x");
 }
+
+#[test]
+fn owned_text_refuses_each_allocation_and_retains_credit_until_the_last_send() {
+    use td_alloc::{with_reservation_limit, Budget, BudgetError};
+    use td_ui::clipboard::{OwnedText, TextError};
+    let root = Budget::new(4 * MAX_BYTES).unwrap();
+    let empty = root.used();
+    let payload = "payload".repeat(30);
+    let expected = format!("é\n{payload}");
+    let pieces = ["é", "\n", payload.as_str()];
+    for allowed in 0..=2 {
+        let result = with_reservation_limit(allowed, || {
+            OwnedText::from_pieces(&root, pieces.into_iter(), MAX_BYTES)
+        });
+        if allowed < 2 {
+            assert!(matches!(
+                result,
+                Err(TextError::Resource(BudgetError::Allocation))
+            ));
+            assert_eq!(root.used(), empty);
+        } else {
+            let text = result.unwrap();
+            assert_eq!(text.as_str(), expected);
+            let held = root.used();
+            let second = with_reservation_limit(0, || text.try_clone()).unwrap();
+            assert_eq!(root.used(), held);
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            let mut send =
+                with_reservation_limit(0, || Outgoing::begin_owned(writer.into(), second, 0))
+                    .unwrap();
+            drop(text);
+            assert_eq!(root.used(), held);
+            assert!(with_reservation_limit(0, || send.step(1)).unwrap());
+            let mut received = String::new();
+            reader.read_to_string(&mut received).unwrap();
+            assert_eq!(received, expected);
+            assert_eq!(root.used(), held, "completed owner still retains its bytes");
+            drop(send);
+            assert_eq!(root.used(), empty);
+        }
+    }
+    let large = "x".repeat(MAX_BYTES + 1);
+    assert!(matches!(
+        with_reservation_limit(0, || OwnedText::copy(&root, &large)),
+        Err(TextError::TooLong)
+    ));
+    let pressure = root.charge(root.limit() - root.used()).unwrap();
+    assert!(matches!(
+        OwnedText::copy(&root, &"x".repeat(129)),
+        Err(TextError::Resource(BudgetError::Limit))
+    ));
+    drop(pressure);
+    assert!(OwnedText::copy(&root, "recovered").is_ok());
+    assert_eq!(root.used(), empty);
+}
+
+#[test]
+fn owned_send_timeout_broken_peer_and_cancel_release_their_credit() {
+    use td_alloc::{with_reservation_limit, Budget};
+    use td_ui::clipboard::OwnedText;
+    let root = Budget::new(4 * MAX_BYTES).unwrap();
+    let empty = root.used();
+    for mode in 0..3 {
+        let text = OwnedText::copy(&root, "payload").unwrap();
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let mut send = Outgoing::begin_owned(writer.into(), text, 0).unwrap();
+        if mode == 0 {
+            assert!(with_reservation_limit(0, || send.step(5000)).is_err());
+            drop(send);
+        } else if mode == 1 {
+            drop(reader);
+            assert!(with_reservation_limit(0, || send.step(1)).is_err());
+            drop(send);
+        } else {
+            with_reservation_limit(0, || send.cancel()).unwrap();
+        }
+        assert_eq!(root.used(), empty);
+    }
+}
+
+// Keep receiver validation independent of the sending owner's code generation.
+#[inline(never)]
+fn receive_benchmark_bytes(reader: &mut UnixStream) -> usize {
+    static EXPECTED: [u8; 65536] = [b'x'; 65536];
+    let mut count = 0;
+    let mut chunk = [0u8; 65536];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return count,
+            Ok(n) => {
+                count += n;
+                assert_eq!(&chunk[..n], &EXPECTED[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return count,
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn owned_send_benchmark() {
+    use std::hint::black_box;
+    use td_alloc::Budget;
+    use td_ui::clipboard::OwnedText;
+    let case = std::env::var("TD_SEND_BENCH").unwrap();
+    let (size, rounds) = if case == "short" {
+        (80, 20_000)
+    } else {
+        (MAX_BYTES, 600)
+    };
+    let source = "x".repeat(size);
+    let budget = Budget::new(4 * MAX_BYTES).unwrap();
+    let cpu_ns = || -> u64 {
+        std::fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let cpu_started = cpu_ns();
+    let started = std::time::Instant::now();
+    let mut count = 0;
+    for _ in 0..rounds {
+        let text = OwnedText::copy(&budget, black_box(&source)).unwrap();
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut send = Outgoing::begin_owned(writer.into(), text, 0).unwrap();
+        let mut received = 0;
+        loop {
+            let done = send.step(1).unwrap();
+            received += receive_benchmark_bytes(&mut reader);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(received, size);
+        count += black_box(received);
+    }
+    let cpu_ms = (cpu_ns() - cpu_started) as f64 / 1_000_000.0;
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    let rss = std::fs::read_to_string("/proc/self/status").unwrap();
+    let peak = rss.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    println!("send-bench {case} ms={elapsed} cpu_ms={cpu_ms} bytes={count} {peak}");
+}
+
+#[test]
+fn inline_text_needs_no_allocation_and_long_replacements_keep_both_charges() {
+    use td_alloc::{with_reservation_limit, Budget};
+    use td_ui::clipboard::{OwnedText, TextError};
+    let root = Budget::new(3 * MAX_BYTES).unwrap();
+    let empty = root.used();
+    let short = with_reservation_limit(0, || OwnedText::copy(&root, "é hello")).unwrap();
+    let clone = with_reservation_limit(0, || short.try_clone()).unwrap();
+    assert_eq!(clone.as_str(), "é hello");
+    assert_eq!(root.used(), empty, "inline values allocate no backing");
+    let payload = "x".repeat(MAX_BYTES);
+    let old = OwnedText::copy(&root, &payload).unwrap();
+    let old_usage = root.used();
+    let replacement = OwnedText::copy(&root, &payload).unwrap();
+    assert!(root.used() >= old_usage + MAX_BYTES);
+    let pressure = root.charge(root.limit() - root.used()).unwrap();
+    assert!(matches!(
+        OwnedText::copy(&root, &payload),
+        Err(TextError::Resource(_))
+    ));
+    assert_eq!(old.as_str(), payload);
+    assert_eq!(replacement.as_str(), payload);
+    drop(pressure);
+    drop(replacement);
+    assert_eq!(root.used(), old_usage);
+    drop(old);
+    assert_eq!(root.used(), empty);
+}
