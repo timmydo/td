@@ -32,8 +32,7 @@ use td_ui::face_file::Family;
 use td_ui::font::pinned;
 use td_ui::pinned_face::{load_styled_in, prose_from, prose_in, prose_in_or_note};
 use td_ui::prose::{
-    draw, wrap, wrap_at_most, Faces, Line, LineBox, Metrics, Refused, Run, Source, CELL_BASELINE,
-    OVERHANG, SIZE, UNIT,
+    draw, Faces, Line, LineBox, Metrics, Refused, Run, Source, CELL_BASELINE, OVERHANG, SIZE, UNIT,
 };
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily,
@@ -1144,4 +1143,114 @@ fn pinned_glyphs_clip_to_their_bounds_not_to_a_cell() {
             }
         }
     }
+}
+
+// Existing geometry oracles use ample admission; refusal tests call the API directly.
+fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
+    td_ui::prose::wrap(
+        metrics,
+        runs,
+        width,
+        &td_alloc::Budget::new(64 << 20).unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .collect()
+}
+fn wrap_at_most(metrics: &mut Metrics, runs: &[Run], width: u32, most: usize) -> Vec<Line> {
+    td_ui::prose::wrap_at_most(
+        metrics,
+        runs,
+        width,
+        most,
+        &td_alloc::Budget::new(64 << 20).unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .collect()
+}
+
+#[test]
+fn every_wrapping_allocation_may_refuse_and_owners_return_their_credit() {
+    use td_alloc::{with_reservation_limit, Budget};
+    let budget = Budget::new(2 << 20).unwrap();
+    let base = budget.used();
+    let runs = [
+        run("a long word and\n", TextFamily::Sans, 3),
+        run("miiii  mii", TextFamily::Serif, 4),
+    ];
+    let expected = wrap(&mut Metrics::new(None, scale(1)), &runs, 40);
+    let mut succeeded = false;
+    for n in 0..256 {
+        let result = with_reservation_limit(n, || {
+            td_ui::prose::wrap(&mut Metrics::new(None, scale(1)), &runs, 40, &budget)
+        });
+        if let Ok(lines) = result {
+            assert_eq!(lines.as_slice(), expected.as_slice());
+            assert!(budget.used() > base);
+            // Moving and consuming iteration retain admission until the backing drops.
+            let mut moved = lines.into_iter();
+            let first = moved.next().unwrap();
+            drop(moved);
+            assert!(budget.used() > base);
+            drop(first);
+            succeeded = true;
+        }
+        assert_eq!(budget.used(), base, "allowance {n}");
+        if succeeded {
+            break;
+        }
+    }
+    assert!(succeeded);
+    let blocker = budget.charge(budget.limit() - budget.used()).unwrap();
+    assert!(td_ui::prose::wrap(&mut Metrics::new(None, scale(1)), &runs, 40, &budget).is_err());
+    drop(blocker);
+    assert!(td_ui::prose::wrap(&mut Metrics::new(None, scale(1)), &runs, 40, &budget).is_ok());
+}
+
+#[test]
+fn cache_refusal_is_exact_and_clones_keep_the_same_budget() {
+    use td_alloc::{with_reservation_limit, Budget};
+    let faces = faces_with_mono();
+    let budget = Budget::new(1 << 20).unwrap();
+    let base = budget.used();
+    let text = "mi0 Tj\u{301}─🦀 ";
+    let mut expected = Metrics::new(Some(&faces), scale(2));
+    for allowance in 0..10 {
+        let mut metrics = Metrics::new_in(Some(&faces), scale(2), &budget);
+        with_reservation_limit(allowance, || {
+            for _ in 0..3 {
+                for family in [TextFamily::Sans, TextFamily::Serif, TextFamily::Mono] {
+                    for scalar in text.chars() {
+                        assert_eq!(
+                            metrics.advance(family, Style::Italic, scalar),
+                            expected.advance(family, Style::Italic, scalar)
+                        );
+                        assert_eq!(
+                            metrics.source(family, Style::Italic, scalar),
+                            expected.source(family, Style::Italic, scalar)
+                        );
+                    }
+                }
+            }
+        });
+        let mut copied = metrics.clone();
+        drop(metrics);
+        assert_eq!(
+            copied.width(TextFamily::Sans, Style::Regular, text),
+            expected.width(TextFamily::Sans, Style::Regular, text)
+        );
+        drop(copied);
+        assert_eq!(budget.used(), base);
+    }
+    // Actual shared cap refusal also uses the uncached result.
+    let blocker = budget.charge(budget.limit() - budget.used()).unwrap();
+    let mut uncached = Metrics::new_in(Some(&faces), scale(2), &budget);
+    assert_eq!(
+        uncached.width(TextFamily::Sans, Style::Regular, text),
+        expected.width(TextFamily::Sans, Style::Regular, text)
+    );
+    assert_eq!((budget.limit() - budget.used()), 0);
+    drop((uncached, blocker));
+    assert_eq!(budget.used(), base);
 }

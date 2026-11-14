@@ -112,6 +112,90 @@ fn first_not(count: usize, before: impl Fn(usize) -> bool) -> usize {
 }
 
 impl View {
+    /// A navigation action may partially fill a cache, but a refused action
+    /// keeps the logical viewport, focus and selection. Painting reports it;
+    /// the next action retries after any pressure has been released.
+    fn navigate(&mut self, rendered: &mut Rendered, action: impl FnOnce(&mut Self, &mut Rendered)) {
+        let previous = (self.top, self.focus, self.at, self.selection);
+        rendered.retry();
+        action(self, rendered);
+        if rendered.refused() {
+            (self.top, self.focus, self.at, self.selection) = previous;
+            self.at = self.at.min(self.hits.len().saturating_sub(1));
+        }
+    }
+    #[cfg(test)]
+    pub fn settle(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+        self.navigate(rendered, |this, rendered| {
+            this.settle_inner(rendered, metrics, rows)
+        });
+    }
+    pub fn scroll(
+        &mut self,
+        delta: isize,
+        rendered: &mut Rendered,
+        metrics: &mut Metrics,
+        rows: usize,
+    ) {
+        self.navigate(rendered, |this, rendered| {
+            this.scroll_inner(delta, rendered, metrics, rows)
+        });
+    }
+    pub fn home(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+        self.navigate(rendered, |this, rendered| {
+            this.home_inner(rendered, metrics, rows)
+        });
+    }
+    pub fn end(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+        self.navigate(rendered, |this, rendered| {
+            this.end_inner(rendered, metrics, rows)
+        });
+    }
+    pub fn reveal(
+        &mut self,
+        place: Place,
+        rendered: &mut Rendered,
+        metrics: &mut Metrics,
+        rows: usize,
+    ) {
+        self.navigate(rendered, |this, rendered| {
+            this.reveal_inner(place, rendered, metrics, rows)
+        });
+    }
+    pub fn step_link(
+        &mut self,
+        forward: bool,
+        rendered: &mut Rendered,
+        metrics: &mut Metrics,
+        rows: usize,
+    ) {
+        self.navigate(rendered, |this, rendered| {
+            this.step_link_inner(forward, rendered, metrics, rows)
+        });
+    }
+    pub fn find(
+        &mut self,
+        query: &str,
+        rendered: &mut Rendered,
+        metrics: &mut Metrics,
+        rows: usize,
+    ) {
+        self.navigate(rendered, |this, rendered| {
+            this.find_inner(query, rendered, metrics, rows)
+        });
+    }
+    pub fn step_hit(
+        &mut self,
+        forward: bool,
+        rendered: &mut Rendered,
+        metrics: &mut Metrics,
+        rows: usize,
+    ) {
+        self.navigate(rendered, |this, rendered| {
+            this.step_hit_inner(forward, rendered, metrics, rows)
+        });
+    }
+
     /// Selects `selection`, or nothing. A selection and a focused link
     /// exclude each other, so a copy takes the one there is: selecting
     /// lets the focused link go, and focusing a link clears the selection.
@@ -124,7 +208,7 @@ impl View {
 
     /// Keeps the view inside the page, its top no further down than the
     /// last screenful's first line, and lays the lines shown.
-    pub fn settle(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+    fn settle_inner(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
         let rows = rows.max(1);
         let (_, below) = rendered.forward(metrics, self.top, rows - 1);
         if below < rows - 1 {
@@ -134,7 +218,7 @@ impl View {
     }
 
     /// Moves `delta` lines, kept inside the page.
-    pub fn scroll(
+    fn scroll_inner(
         &mut self,
         delta: isize,
         rendered: &mut Rendered,
@@ -147,23 +231,23 @@ impl View {
         } else {
             rendered.forward(metrics, self.top, steps).0
         };
-        self.settle(rendered, metrics, rows);
+        self.settle_inner(rendered, metrics, rows);
     }
 
-    pub fn home(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+    fn home_inner(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
         self.top = Place::default();
-        self.settle(rendered, metrics, rows);
+        self.settle_inner(rendered, metrics, rows);
     }
 
     /// The last screenful, laid back from the page's last logical line.
-    pub fn end(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
+    fn end_inner(&mut self, rendered: &mut Rendered, metrics: &mut Metrics, rows: usize) {
         let last = rendered.last(metrics);
         self.top = rendered.back(metrics, last, rows.max(1) - 1).0;
-        self.settle(rendered, metrics, rows);
+        self.settle_inner(rendered, metrics, rows);
     }
 
     /// Scrolls as little as shows the line holding `place`.
-    pub fn reveal(
+    fn reveal_inner(
         &mut self,
         place: Place,
         rendered: &mut Rendered,
@@ -177,13 +261,13 @@ impl View {
         } else if line > rendered.forward(metrics, self.top, rows - 1).0 {
             self.top = rendered.back(metrics, line, rows - 1).0;
         }
-        self.settle(rendered, metrics, rows);
+        self.settle_inner(rendered, metrics, rows);
     }
 
     /// Focuses the next link (`forward`) or the previous one: from the
     /// focused link, else from the screen, the first starting at or after
     /// its top or the last starting before its bottom.
-    pub fn step_link(
+    fn step_link_inner(
         &mut self,
         forward: bool,
         rendered: &mut Rendered,
@@ -223,12 +307,12 @@ impl View {
             }
         };
         self.focus = Some(next);
-        self.reveal(place(next), rendered, metrics, rows);
+        self.reveal_inner(place(next), rendered, metrics, rows);
     }
 
     /// Marks every match of `query` (`mark`) and makes current the first
     /// at or after the screen's top, scrolling to it.
-    pub fn find(
+    fn find_inner(
         &mut self,
         query: &str,
         rendered: &mut Rendered,
@@ -312,7 +396,7 @@ impl View {
     }
 
     /// Moves to the next match or the previous one, around the ends.
-    pub fn step_hit(
+    fn step_hit_inner(
         &mut self,
         forward: bool,
         rendered: &mut Rendered,
@@ -344,9 +428,9 @@ impl View {
                 at: hit.end.at.saturating_sub(1),
                 ..hit.end
             };
-            self.reveal(last, rendered, metrics, rows);
+            self.reveal_inner(last, rendered, metrics, rows);
             let first = rendered.page.drawn(hit.start, hit.end);
-            self.reveal(first, rendered, metrics, rows);
+            self.reveal_inner(first, rendered, metrics, rows);
         }
     }
 
@@ -362,6 +446,9 @@ impl View {
     /// width, so a mark stays with its base. None with no line shown
     /// whole.
     pub fn spot(&self, rendered: &Rendered, pane: &Pane, x: i64, y: i64) -> Option<Spot> {
+        if rendered.refused() {
+            return None;
+        }
         let rect = pane.rect;
         let shown = || rendered.shown(self.top, pane.shown());
         let first = shown().next()?;
@@ -418,6 +505,9 @@ impl View {
     /// The link painted at a point of `pane`: none in the inset left of
     /// the lines, and none on the line below the last shown whole.
     pub fn link_at(&self, rendered: &Rendered, pane: &Pane, x: i64, y: i64) -> Option<usize> {
+        if rendered.refused() {
+            return None;
+        }
         let rect = pane.rect;
         let left = rect.x.saturating_add(pane.inset);
         if !rect.contains(x, y) || x < left {

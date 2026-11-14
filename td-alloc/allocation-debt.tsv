@@ -4091,7 +4091,7 @@ td-ui/src/picture.rs	unchecked-growth-or-clone	1
 td-ui/src/pinned_face.rs	allocating-conversion	2
 td-ui/src/pinned_face.rs	allocation-macro	3
 td-ui/src/pinned_face.rs	unchecked-growth-or-clone	1
-td-ui/src/prose.rs	unchecked-growth-or-clone	17
+td-ui/src/prose.rs	unchecked-growth-or-clone	9
 td-ui/src/pty.rs	allocating-constructor	1
 td-ui/src/pty.rs	allocating-conversion	7
 td-ui/src/pty.rs	allocation-macro	25
@@ -4328,10 +4328,10 @@ td-web/src/app.rs	allocating-conversion	7
 td-web/src/app.rs	allocation-macro	19
 td-web/src/app.rs	heap-owner	4
 td-web/src/app.rs	unchecked-growth-or-clone	18
-td-web/src/document.rs	allocating-constructor	7
-td-web/src/document.rs	allocating-conversion	9
+td-web/src/document.rs	allocating-constructor	4
+td-web/src/document.rs	allocating-conversion	7
 td-web/src/document.rs	allocation-macro	4
-td-web/src/document.rs	unchecked-growth-or-clone	40
+td-web/src/document.rs	unchecked-growth-or-clone	17
 td-web/src/fetch.rs	allocating-conversion	1
 td-web/src/fetch.rs	allocation-macro	3
 td-web/src/main.rs	allocating-conversion	1

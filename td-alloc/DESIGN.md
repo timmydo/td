@@ -78,8 +78,13 @@ overlapping replacements are constructed. CSS tokens may outlive their
 stylesheet through computed-style references; that lifetime retains the
 original budget charge. td-web's displayed/incoming legacy pages, wrapping, decoded pictures,
 fitted copies and held save bodies retain shared admissions through their
-owners; its legacy rendering allowances remain conservative external
-models. Its render-worker mailbox and typed request/result slots use
+owners; its legacy page-production and picture-decoding allowances remain
+conservative external models. Prose measurement caches and browser wrapping
+scratch, line arrays and navigation caches own actual capacity, under the
+page root and a 24 MiB per-wrap child respectively. Cache admission failure
+falls back to uncached measurement; wrapping refusal preserves logical
+navigation state and paints a static notice. Their dedicated modules have
+strict source guards. Its render-worker mailbox and typed request/result slots use
 one fallible shared owner on the page root, with four reusable request/result
 slots admitted at startup and a content-type copy held inline or in a
 BudgetString. Tickets keep the mailbox's charge through their lifetimes. Thread startup still uses std/OS machinery.

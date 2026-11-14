@@ -221,12 +221,24 @@ actual RGBA capacity. A held save body owns its capacity charge through
 the save worker, even after its Document is dropped. A wrapper frees its
 value before releasing its charge.
 
-Each Rendered instance admits 24 MiB for its legacy wrapping work and
-retains that reservation until dropped. A fitted picture admits at most
+Each Rendered instance creates a child budget capped at 24 MiB, including
+its metadata. Its wrapping scratch, sliced runs, glyphs, pieces, navigation
+checkpoints and retained row ring own their actual capacities against that
+child. It reserves no blanket working allowance. A default empty rendering
+allocates nothing. The browser's optional measurement cache shares the
+renderer root across pages; cache refusal computes uncached measurements.
+Wrapping is strictly source-guarded against standard heap owners and
+recognized unchecked allocations. A fitted picture admits at most
 64 MiB before fitting, then retains its actual buffer capacity. Overlapping
 owners keep both charges. The current resize path drops its old wrap or
 fit before asking for the replacement. A refused page, fit or wrap shows
-a static resource notice; cap refusal does not abort or panic. Error-page
+a static resource notice; cap refusal does not abort or panic. A refused
+navigation action preserves the logical viewport, focus and selection;
+partially filled caches remain valid. Its refusal latches through that
+action and paints a notice without allocating error text. The next user
+navigation action retries. Resize drops the old wrap first, preserves the
+page and logical position on refusal, and retries creation on a later
+relayout or scroll. Failed cache filling never changes the immutable page. Error-page
 text is bounded to 4096 UTF-8 bytes before plain-text conversion.
 
 PNG reserves once from its validated inflated size before decoding.
@@ -245,8 +257,8 @@ bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
 
 These legacy allowances are an admission model, distinct from exact
 ownership of the new parser, CSS and layout storage in §10. They do not
-instrument every std allocation inside the legacy rich renderer, window
-wrapping, fetch/window IPC or URL/response metadata. Those source-inventory entries
+instrument every std allocation inside the legacy rich renderer, find/selection helpers, font and raster
+ownership, fetch/window IPC or URL/response metadata. Those source-inventory entries
 remain migration debt; this is not a whole-process allocation-failure
 guarantee. The root cap supplements the per-input/work limits and the
 jail's process-wide limit; it does not replace them. The memory ownership

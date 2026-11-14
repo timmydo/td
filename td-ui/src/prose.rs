@@ -10,9 +10,14 @@
 //! consumer hands over the bytes (`pinned_face::prose_or_note` reads the
 //! pinned ones).
 
-use std::collections::BTreeMap;
+use td_alloc::Budget;
+mod cache;
+mod items;
+mod wrap;
+pub use items::Items;
 use std::ops::Range;
 use std::sync::Arc;
+pub use wrap::{wrap, wrap_at_most, Line, Piece, Placed};
 
 use crate::atlas::Style;
 use crate::face::Face;
@@ -291,13 +296,21 @@ pub struct Metrics {
     line: LineBox,
     /// The monospace face's one advance at the prose size, in `UNIT`s.
     mono_advance: u32,
-    measures: BTreeMap<(TextFamily, Style, char), (Source, u32)>,
+    measures: cache::Cache,
 }
 
 impl Metrics {
     /// The metrics of `faces` at `scale`, or of the cell without them.
     pub fn new(faces: Option<&Faces>, scale: Scale) -> Self {
         Self::of(faces.map(|faces| faces.bytes.clone()), scale)
+    }
+
+    /// Measures using a caller's shared budget for the optional cache.
+    /// Cache admission failure falls back to the same uncached measurements.
+    pub fn new_in(faces: Option<&Faces>, scale: Scale, budget: &Budget) -> Self {
+        let mut out = Self::new(faces, scale);
+        out.measures = cache::Cache::new(budget);
+        out
     }
 
     fn of(bytes: Option<Bytes>, scale: Scale) -> Self {
@@ -348,7 +361,7 @@ impl Metrics {
             bytes: line.and(bytes),
             line: line.unwrap_or(cell),
             mono_advance,
-            measures: BTreeMap::new(),
+            measures: cache::Cache::default(),
         }
     }
 
@@ -404,7 +417,7 @@ impl Metrics {
             TextFamily::Mono => None,
         };
         let key = (family, style, scalar);
-        if let Some(&measured) = self.measures.get(&key) {
+        if let Some(measured) = self.measures.get(key) {
             return measured;
         }
         let size = i64::from(SIZE) * self.scale.value() as i64;
@@ -427,9 +440,6 @@ impl Metrics {
             None if in_mono() => (Source::Mono, self.mono_advance),
             None => (Source::Bitmap, cell),
         };
-        if self.measures.len() >= MAX_MEASURES {
-            self.measures.clear();
-        }
         self.measures.insert(key, measured);
         measured
     }
@@ -473,192 +483,6 @@ pub struct Run<'a> {
     pub text: &'a str,
     pub style: GlyphStyle,
     pub tag: usize,
-}
-
-/// The part of one run on one line: the run's index and tag, its style,
-/// the bytes of its text the line shows, the pixels it spans from the
-/// line's left (`left` inclusive, `right` exclusive) and its glyphs in the
-/// line's list.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Piece {
-    pub run: usize,
-    pub tag: usize,
-    pub style: GlyphStyle,
-    pub text: Range<usize>,
-    pub left: u32,
-    pub right: u32,
-    pub glyphs: Range<usize>,
-}
-
-/// A glyph on a line, its pen `x` pixels from the line's left.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Placed {
-    pub x: u32,
-    pub scalar: char,
-}
-
-/// One wrapped line: its width in pixels, which its trailing spaces do
-/// not count, its pieces in order and its glyphs.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Line {
-    pub width: u32,
-    pub pieces: Vec<Piece>,
-    pub glyphs: Vec<Placed>,
-}
-
-impl Line {
-    /// The piece under a point `x` pixels from the line's left; none past
-    /// its ends or between pieces.
-    pub fn hit(&self, x: i64) -> Option<&Piece> {
-        self.pieces
-            .iter()
-            .find(|piece| i64::from(piece.left) <= x && x < i64::from(piece.right))
-    }
-}
-
-/// A glyph while its line is laid: its run, where its scalar is in the
-/// run's text, and its pen and advance in `UNIT`s from the line's left.
-#[derive(Clone, Copy)]
-struct Pending {
-    run: usize,
-    tag: usize,
-    style: GlyphStyle,
-    at: usize,
-    len: usize,
-    scalar: char,
-    pen: u64,
-    advance: u64,
-    space: bool,
-}
-
-/// Lays `runs` into lines no wider than `width` pixels, measured with
-/// `metrics`: a line breaks after a space, and inside a word only when the
-/// word alone is wider than a line; spaces at a line's end take no width
-/// and are dropped with the break, and a line never ends holding only
-/// spaces: those before a word that moves to the next line go with the
-/// break, leading spaces included; a newline ends a line and is not shown,
-/// and a line holds at least one glyph however narrow. Each glyph's pen is
-/// its advances summed in `UNIT`s and then rounded, so a line's width does
-/// not drift with its length. There is always one line, empty for empty
-/// text, and one more after each newline. Work and memory are linear in
-/// the runs' text: a consumer bounds what it hands over.
-pub fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
-    wrap_at_most(metrics, runs, width, usize::MAX)
-}
-
-/// `wrap`'s first `most` lines, none for none: it stops laying out once it
-/// has them, so a consumer that keeps a bounded number of lines pays for
-/// no more however narrow the width or long the text.
-pub fn wrap_at_most(metrics: &mut Metrics, runs: &[Run], width: u32, most: usize) -> Vec<Line> {
-    let limit = u64::from(width);
-    let mut lines = Vec::new();
-    if most == 0 {
-        return lines;
-    }
-    let mut line: Vec<Pending> = Vec::new();
-    let mut pen = 0u64;
-    // Where the line may break: the glyphs before this index stay.
-    let mut after_space: Option<usize> = None;
-    for (index, run) in runs.iter().enumerate() {
-        for (at, scalar) in run.text.char_indices() {
-            if scalar == '\n' {
-                lines.push(finish(&line));
-                if lines.len() >= most {
-                    return lines;
-                }
-                line.clear();
-                (pen, after_space) = (0, None);
-                continue;
-            }
-            let shown = shown(scalar);
-            let space = shown == ' ';
-            let advance = u64::from(metrics.advance(run.style.family, run.style.font_style, shown));
-            let over = |pen: u64| u64::from(pixels(pen.saturating_add(advance))) > limit;
-            if !space && over(pen) && !line.is_empty() {
-                // The word so far moves to a new line; if it is alone
-                // wider than a line, it breaks here instead.
-                let rest = match after_space.take() {
-                    Some(keep) => line.split_off(keep.min(line.len())),
-                    None => Vec::new(),
-                };
-                // A line never ends holding only spaces: those before a
-                // word moved from them go with the break.
-                if line.iter().any(|glyph| !glyph.space) {
-                    lines.push(finish(&line));
-                    if lines.len() >= most {
-                        return lines;
-                    }
-                }
-                let shift = rest.first().map_or(pen, |first| first.pen);
-                line = rest;
-                for glyph in &mut line {
-                    glyph.pen = glyph.pen.saturating_sub(shift);
-                }
-                pen -= shift.min(pen);
-                if over(pen) && !line.is_empty() {
-                    lines.push(finish(&line));
-                    if lines.len() >= most {
-                        return lines;
-                    }
-                    line.clear();
-                    pen = 0;
-                }
-            }
-            line.push(Pending {
-                run: index,
-                tag: run.tag,
-                style: run.style,
-                at,
-                len: scalar.len_utf8(),
-                scalar: shown,
-                pen,
-                advance,
-                space,
-            });
-            pen = pen.saturating_add(advance);
-            if space {
-                after_space = Some(line.len());
-            }
-        }
-    }
-    lines.push(finish(&line));
-    lines
-}
-
-/// A laid line from its pending glyphs, its trailing spaces dropped.
-fn finish(pending: &[Pending]) -> Line {
-    let end = pending
-        .iter()
-        .rposition(|glyph| !glyph.space)
-        .map_or(0, |last| last + 1);
-    let mut line = Line::default();
-    for glyph in pending.iter().take(end) {
-        let x = pixels(glyph.pen);
-        let right = pixels(glyph.pen.saturating_add(glyph.advance));
-        let next = line.glyphs.len();
-        match line.pieces.last_mut() {
-            Some(piece) if piece.run == glyph.run => {
-                piece.text.end = glyph.at + glyph.len;
-                piece.right = piece.right.max(right);
-                piece.glyphs.end = next + 1;
-            }
-            _ => line.pieces.push(Piece {
-                run: glyph.run,
-                tag: glyph.tag,
-                style: glyph.style,
-                text: glyph.at..glyph.at + glyph.len,
-                left: x,
-                right,
-                glyphs: next..next + 1,
-            }),
-        }
-        line.glyphs.push(Placed {
-            x,
-            scalar: glyph.scalar,
-        });
-        line.width = line.width.max(right);
-    }
-    line
 }
 
 /// Streams `line`'s glyphs with its left at `x` and its top at `y`, each

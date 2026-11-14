@@ -56,6 +56,9 @@ const PURE: &[&str] = &[
     "picture.rs",
     "pointer.rs",
     "prose.rs",
+    "prose/cache.rs",
+    "prose/items.rs",
+    "prose/wrap.rs",
     "raster.rs",
     "repeat.rs",
     "rich.rs",
@@ -128,13 +131,24 @@ fn source_inventory_and_shared_mounts_are_closed() {
         .map(|name| name.to_string())
         .collect();
     let mut actual = BTreeSet::new();
-    for entry in std::fs::read_dir(root.join("src")).unwrap() {
-        let entry = entry.unwrap();
+    let source = root.join("src");
+    let mut entries: Vec<_> = std::fs::read_dir(&source)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    while let Some(entry) = entries.pop() {
+        let path = entry.path();
+        let name = path.strip_prefix(&source).unwrap().to_str().unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            assert_eq!(name, "prose", "only the inventoried prose directory");
+            entries.extend(std::fs::read_dir(&path).unwrap().map(Result::unwrap));
+            continue;
+        }
         assert!(
             entry.file_type().unwrap().is_file(),
-            "no nested or symlinked source"
+            "no symlinked or special source"
         );
-        let name = entry.file_name().into_string().unwrap();
+        let name = name.to_string();
         actual.insert(name.clone());
         let text = std::fs::read_to_string(entry.path()).unwrap();
         let compact = compact(&text);

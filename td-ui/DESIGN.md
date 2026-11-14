@@ -1956,7 +1956,8 @@ and grid, and the reader, writer and waiter lifecycles.
 `td-ui-import-libvterm` is a developer tool, run only by hand against a
 supplied archive tree.
 
-`tests/confinement.rs` pins the source inventory, the exact six shared
+`tests/confinement.rs` pins the source inventory (including each pure
+module under `prose/`, the only nested source directory), the exact six shared
 source mounts, the absence of ambient I/O in pure modules, that `notices` is
 three embedded texts and the outline face's literal and nothing else, the
 absence of `include!`, `cfg_attr` and any dependency declaration, that the
@@ -4237,9 +4238,16 @@ with, the ones its faces hold at its scale, whose remembered
 measurements last as long as those faces at that scale (the cell's
 without faces), so measurement and drawing agree and a paint measures
 without a copy; a consumer laying out outside a paint builds the same
-from its own clone of the faces it gave the window. A metrics remembers
-at most `MAX_MEASURES` scalars and then
-starts again. Advances are summed in `UNIT`s and each glyph's pen
+from its own clone of the faces it gave the window. A metrics remembers at most `MAX_MEASURES` family/style/scalar keys in a
+fallible open-addressed cache and then starts again. Its slot array grows
+from 128 to twice that key bound, admitting old and new arrays during
+replacement. `Metrics::new_in(faces, scale, budget)` owns that storage
+against a caller's shared budget; `new` lazily creates a private bounded
+budget. A refused cache growth disables further allocation attempts for
+that metrics instance; measuring continues with the same uncached answer.
+Cloning a metrics shares font bytes and the cache's budget identity, with
+an empty cache of its own. Font ownership and raster atlas allocations
+remain separate from this cache guarantee. Advances are summed in `UNIT`s and each glyph's pen
 rounded, so a line's width does not drift with its length. Without
 proportional faces `Metrics` answers the cell: every scalar one
 `CELL_WIDTH` at the scale, the line one `CELL_HEIGHT` with
@@ -4247,7 +4255,7 @@ proportional faces `Metrics` answers the cell: every scalar one
 interface and its oracles stay on the bitmap face, as a cell consumer's
 do.
 
-`prose::wrap` lays `Run`s (text, a `GlyphStyle` whose family and font
+`prose::wrap` takes an explicit `td_alloc::Budget` and lays `Run`s (text, a `GlyphStyle` whose family and font
 style it is measured in, and a caller's tag, such as a link's index)
 into `Line`s no wider than a width in pixels. It breaks after a space,
 and inside a word only when the word alone is wider than the line; a
@@ -4275,7 +4283,19 @@ is exactly `text_run`'s of its text. Wrapping is bounded by its input: a
 consumer caps what it hands over, as td-web caps its rendering.
 `wrap_at_most` is `wrap`'s first lines up to a count, and stops laying
 out once it has them, so a consumer keeping a bounded number of lines
-pays for no more however narrow the width or long the text.
+pays for no more however narrow the width or long the text. Both wrapping
+functions return `Result<BudgetVec<Line>, BudgetError>`: temporary pending
+glyphs, the result array, pieces and placed glyphs own admission, including
+replacement overlap, and refusal drops partial output. Word breaks reuse
+the pending buffer. Line arrays use `Items<T>`, optional budget-owned
+storage: default is an allocation-free empty value that cannot grow; a
+funded instance retains its original budget. Slice access cannot grow it;
+`try_clone_with` delegates element copying to a fallible callback whose
+own allocation behavior remains the caller's responsibility. `Line::try_clone`
+uses only nonallocating element copies. Moving a line or consuming the
+outer result retains the respective backing charges until their owners
+drop. The cache, Items and wrapping modules have strict allocation-source
+guards; font construction elsewhere in prose remains inventoried debt.
 
 The default size is `SIZE`, 16 pixels per em at scale 1, the device size
 the scale times that; its line is 22 pixels with the baseline at 17.

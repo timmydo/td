@@ -6,7 +6,6 @@
 //! thread, a few at a time near the ones shown, for each width and body
 //! face the page is shown at.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -594,874 +593,7 @@ impl Place {
     }
 }
 
-/// One wrapped line: the logical line it is part of, where its own text
-/// starts there (its logical line's start for its first line; past the
-/// marks a continuation repeats for the rest), and its pieces and
-/// glyphs, each piece tagged with its link, `NO_LINK` for none.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Wrapped {
-    pub logical: usize,
-    pub start: (usize, usize),
-    pub line: prose::Line,
-}
-
-impl Wrapped {
-    /// Where it starts, as a place another wrap of the page finds.
-    pub fn place(&self) -> Place {
-        Place {
-            logical: self.logical,
-            run: self.start.0,
-            at: self.start.1,
-        }
-    }
-
-    /// Whether `piece` shows the page's text at the bytes it names,
-    /// rather than marks its continuation repeats from the line's start.
-    pub fn shows(&self, piece: &prose::Piece) -> bool {
-        self.start == (0, 0) || piece.run >= self.start.0
-    }
-}
-
-/// A page laid out at one width in one body family, as it is shown: only
-/// the wrapped lines near those shown are laid and kept, a stretch of
-/// consecutive ones from wherever the reader is, made again from the
-/// logical lines when the reader moves past it (DESIGN.md §5). Every
-/// place it answers is where one of its wrapped lines starts.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct Rendered {
-    pub page: PageRef,
-    /// The width in pixels it is wrapped at.
-    pub width: u32,
-    body: TextFamily,
-    /// Consecutive wrapped lines of the page, in order.
-    laid: VecDeque<Wrapped>,
-    /// Where the wrapped line after the last laid starts; none past the
-    /// page's end.
-    after: Option<Place>,
-    /// For the last `WALKED` logical lines walked, the last last, where
-    /// every `STRIDE`th of its wrapped lines starts, from its first, as a
-    /// walk along it found them: a walk back into it starts near where it
-    /// is going, and one between two long lines walks neither again.
-    stops: Vec<(usize, Vec<Place>)>,
-    memory: WrapCharge,
-}
-
-#[derive(Default)]
-struct WrapCharge(Option<Charge>);
-impl std::fmt::Debug for WrapCharge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("WrapCharge")
-            .field(&self.0.as_ref().map(Charge::bytes))
-            .finish()
-    }
-}
-impl PartialEq for WrapCharge {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-impl Eq for WrapCharge {}
-#[cfg(test)]
-impl Clone for Rendered {
-    #[allow(clippy::unwrap_used)]
-    fn clone(&self) -> Self {
-        Self {
-            page: self.page.clone(),
-            width: self.width,
-            body: self.body,
-            laid: self.laid.clone(),
-            after: self.after,
-            stops: self.stops.clone(),
-            memory: WrapCharge(
-                self.memory
-                    .0
-                    .as_ref()
-                    .map(|c| c.budget().charge(memory::WRAP_WORK).unwrap()),
-            ),
-        }
-    }
-}
-impl Rendered {
-    /// `page` to be laid into lines no wider than `width` pixels (at
-    /// least one), its body text in `body`; a line that may not wrap is
-    /// one line however wide. Nothing is laid yet.
-    pub fn new(page: &PageRef, width: u32, body: TextFamily) -> Result<Self, BudgetError> {
-        let memory = WrapCharge(
-            page.budget()
-                .map(|b| b.charge(memory::WRAP_WORK))
-                .transpose()?,
-        );
-        Ok(Self {
-            page: page.try_clone()?,
-            memory,
-            width: width.max(1),
-            body,
-            ..Self::default()
-        })
-    }
-
-    /// The laid line starting at `place`, by its index.
-    fn index(&self, place: Place) -> Option<usize> {
-        self.laid
-            .binary_search_by(|wrapped| wrapped.place().cmp(&place))
-            .ok()
-    }
-
-    /// Where the logical line after `logical` starts; none after the
-    /// page's last.
-    fn next_line(&self, logical: usize) -> Option<Place> {
-        let next = logical.saturating_add(1);
-        (next < self.page.lines.len()).then(|| Place::line(next))
-    }
-
-    /// The lines shown from `top`, at most `rows`, as laid: none when
-    /// `top` is not (`settle` lays them).
-    pub fn shown(&self, top: Place, rows: usize) -> impl Iterator<Item = &Wrapped> {
-        let from = self.index(top).unwrap_or(self.laid.len());
-        self.laid.range(from..).take(rows)
-    }
-
-    /// Where the reader is, as the status row says it, when `rows` lines
-    /// from `top` do not show all of the page: the logical line the last
-    /// of them is part of, counted from one. Read from the lines laid
-    /// (`settle`), which reach a line past those shown where there is one.
-    pub fn bottom(&self, top: Place, rows: usize) -> Option<usize> {
-        let at = self.index(top)?;
-        let rows = rows.max(1);
-        let after = self.laid.len() - at;
-        if top == Place::default() && self.after.is_none() && after <= rows {
-            return None;
-        }
-        let last = self.laid.get(at + after.min(rows) - 1)?;
-        Some(last.logical + 1)
-    }
-
-    /// The laid lines from `top` through the line after `rows` more,
-    /// where the page has them, and none further than a screenful, or
-    /// `STRIDE` lines, either side: the wrap held, however long the page.
-    pub fn settle(&mut self, metrics: &mut Metrics, top: Place, rows: usize) {
-        if self.page.lines.is_empty() {
-            return;
-        }
-        let mut at = match self.index(top) {
-            Some(at) => at,
-            None => {
-                self.reset(metrics, top);
-                0
-            }
-        };
-        while self.laid.len() <= at.saturating_add(rows) && self.grow(metrics) {}
-        let margin = rows.max(STRIDE);
-        while at > margin && self.laid.pop_front().is_some() {
-            at -= 1;
-        }
-        while self.laid.len() > at.saturating_add(rows).saturating_add(margin) {
-            if let Some(gone) = self.laid.pop_back() {
-                self.after = Some(gone.place());
-            }
-        }
-    }
-
-    /// The laid lines from `top`, where a line starts, and no others.
-    fn reset(&mut self, metrics: &mut Metrics, top: Place) {
-        let (lines, next) = self.lay(metrics, top, STRIDE);
-        self.laid = lines.into();
-        self.after = next.or_else(|| self.next_line(top.logical));
-    }
-
-    /// Lays up to `STRIDE` lines after those laid; whether there were any.
-    fn grow(&mut self, metrics: &mut Metrics) -> bool {
-        let Some(from) = self.after.filter(|_| !self.laid.is_empty()) else {
-            return false;
-        };
-        let (lines, next) = self.lay(metrics, from, STRIDE);
-        if lines.is_empty() {
-            self.after = None;
-            return false;
-        }
-        self.laid.extend(lines);
-        self.after = next.or_else(|| self.next_line(from.logical));
-        true
-    }
-
-    /// Lays up to `STRIDE` lines before those laid; whether there were
-    /// any.
-    fn grow_back(&mut self, metrics: &mut Metrics) -> bool {
-        let Some(first) = self.laid.front().map(Wrapped::place) else {
-            return false;
-        };
-        let (lines, _) = if !first.starts_line() {
-            self.walk(metrics, first.logical, Some(first), STRIDE)
-        } else if first.logical > 0 {
-            self.walk(metrics, first.logical - 1, None, STRIDE)
-        } else {
-            return false;
-        };
-        let grew = !lines.is_empty();
-        for line in lines.into_iter().rev() {
-            self.laid.push_front(line);
-        }
-        grew
-    }
-
-    /// Where the line `count` lines after the one starting at `top`
-    /// starts, else the page's last line, and how many lines on that is.
-    /// The lines passed are laid and kept until `settle`, so a caller
-    /// moves a screenful or so at a time.
-    pub fn forward(&mut self, metrics: &mut Metrics, top: Place, count: usize) -> (Place, usize) {
-        let (mut at, mut moved) = (top, 0);
-        if self.page.lines.is_empty() || count == 0 {
-            return (at, moved);
-        }
-        loop {
-            let index = match self.index(at) {
-                Some(index) => index,
-                None => {
-                    self.reset(metrics, at);
-                    0
-                }
-            };
-            let step = (count - moved).min(self.laid.len().saturating_sub(index + 1));
-            if let Some(line) = self.laid.get(index + step) {
-                at = line.place();
-            }
-            moved += step;
-            if moved == count || !self.grow(metrics) {
-                return (at, moved);
-            }
-        }
-    }
-
-    /// Where the line `count` lines before the one starting at `top`
-    /// starts, else the page's first, and how many lines back that is.
-    pub fn back(&mut self, metrics: &mut Metrics, top: Place, count: usize) -> (Place, usize) {
-        let (mut at, mut moved) = (top, 0);
-        if self.page.lines.is_empty() || count == 0 {
-            return (at, moved);
-        }
-        loop {
-            let index = match self.index(at) {
-                Some(index) => index,
-                None => {
-                    self.reset(metrics, at);
-                    0
-                }
-            };
-            let step = (count - moved).min(index);
-            if let Some(line) = self.laid.get(index - step) {
-                at = line.place();
-            }
-            moved += step;
-            if moved == count || !self.grow_back(metrics) {
-                return (at, moved);
-            }
-        }
-    }
-
-    /// Where the page's last line starts, laying it and those before it
-    /// back from the last logical line, none of the rest.
-    pub fn last(&mut self, metrics: &mut Metrics) -> Place {
-        if self.after.is_none() {
-            if let Some(last) = self.laid.back() {
-                return last.place();
-            }
-        }
-        let Some(logical) = self.page.lines.len().checked_sub(1) else {
-            return Place::default();
-        };
-        let (lines, _) = self.walk(metrics, logical, None, STRIDE);
-        self.laid = lines;
-        self.after = None;
-        self.laid
-            .back()
-            .map_or(Place::line(logical), Wrapped::place)
-    }
-
-    /// Where the line that shows `place` starts: the last that starts at
-    /// or before it, else the first; a place past the page's end is on
-    /// its last line. Found among those laid, else by laying its logical
-    /// line up to it.
-    pub fn snap(&mut self, metrics: &mut Metrics, place: Place) -> Place {
-        if place.logical >= self.page.lines.len() {
-            return self.last(metrics);
-        }
-        let at = self
-            .laid
-            .partition_point(|wrapped| wrapped.place() <= place);
-        if let Some(line) = at.checked_sub(1).and_then(|at| self.laid.get(at)) {
-            let next = self.laid.get(at).map(Wrapped::place).or(self.after);
-            if next.is_none_or(|next| next > place) {
-                return line.place();
-            }
-        }
-        let (lines, _) = self.walk(metrics, place.logical, Some(place.after()), 1);
-        lines
-            .back()
-            .map_or(Place::line(place.logical), Wrapped::place)
-    }
-
-    /// Lays logical line `logical` from its start, or from the nearest
-    /// start a walk along it remembered, keeping the last `keep` lines
-    /// that start before `before` (to its end when none) and remembering
-    /// where every `STRIDE`th starts; and where the line after those kept
-    /// starts, when it is in this logical line.
-    fn walk(
-        &mut self,
-        metrics: &mut Metrics,
-        logical: usize,
-        before: Option<Place>,
-        keep: usize,
-    ) -> (VecDeque<Wrapped>, Option<Place>) {
-        let mut starts = match self.stops.iter().position(|(line, _)| *line == logical) {
-            Some(at) => self.stops.remove(at).1,
-            None => Vec::new(),
-        };
-        if starts.is_empty() {
-            starts.push(Place::line(logical));
-        }
-        let walked = self.walk_from(metrics, before, keep, &mut starts);
-        if self.stops.len() == WALKED {
-            self.stops.remove(0);
-        }
-        self.stops.push((logical, starts));
-        walked
-    }
-
-    /// `walk` along the logical line whose remembered starts are
-    /// `starts`, the first its own start, remembering more as it finds
-    /// them.
-    fn walk_from(
-        &self,
-        metrics: &mut Metrics,
-        before: Option<Place>,
-        keep: usize,
-        starts: &mut Vec<Place>,
-    ) -> (VecDeque<Wrapped>, Option<Place>) {
-        // The last remembered start before where it is going.
-        let mut stop = match before {
-            Some(before) => starts.partition_point(|&start| start < before),
-            None => starts.len(),
-        }
-        .saturating_sub(1);
-        let mut kept = VecDeque::new();
-        let Some(&first) = starts.get(stop) else {
-            return (kept, None);
-        };
-        let mut from = first;
-        loop {
-            let (lines, next) = self.lay(metrics, from, STRIDE);
-            for line in lines {
-                if before.is_some_and(|before| line.place() >= before) {
-                    return (kept, Some(line.place()));
-                }
-                if kept.len() == keep {
-                    kept.pop_front();
-                }
-                kept.push_back(line);
-            }
-            let Some(next) = next else {
-                return (kept, None);
-            };
-            stop += 1;
-            if stop == starts.len() {
-                starts.push(next);
-            }
-            from = next;
-        }
-    }
-
-    /// Calls `found` with each character of logical line `logical` that
-    /// find searches, as it is, and where it is, until `found` says to
-    /// stop: all of a line that wraps, and only what is laid of one that
-    /// does not, the characters whose pens fall before the pane's edge and
-    /// `prose::OVERHANG` past it, as `within` lays them.
-    pub fn searched(
-        &self,
-        metrics: &mut Metrics,
-        logical: usize,
-        mut found: impl FnMut(char, Place) -> bool,
-    ) {
-        let Some(line) = self.page.lines.get(logical) else {
-            return;
-        };
-        let edge = (!line.wrap).then(|| self.width.saturating_add(prose::OVERHANG));
-        let mut pen = 0u64;
-        for (run, part) in line.runs.iter().enumerate() {
-            let style = part.style.glyph(self.body);
-            for (at, scalar) in part.text.char_indices() {
-                if let Some(edge) = edge {
-                    if pixels(pen) >= edge {
-                        return;
-                    }
-                    let shown = prose::shown(scalar);
-                    let advance = metrics.advance(style.family, style.font_style, shown);
-                    pen = pen.saturating_add(u64::from(advance));
-                }
-                if !found(scalar, Place { logical, run, at }) {
-                    return;
-                }
-            }
-        }
-    }
-
-    /// The lines of logical line `from.logical` from `from`, where one of
-    /// its lines starts, at most `most`, and where its next line starts,
-    /// none after its last. A line that may not wrap is one line, laid
-    /// only as far as the pane shows it. One that starts with leading
-    /// structure (`leading`) hangs: its text after that structure is
-    /// wrapped at the width less the structure's, every line of it set
-    /// that far in, the first after the whole structure and each
-    /// continuation after its marks alone; a structure wider than half the
-    /// width does not hang, so the text keeps room. The text is handed to
-    /// `prose` a slice at a time (`slice`): every line but a slice's last
-    /// is as the whole line would wrap, and the wrap starts again at the
-    /// last. A slice of `MAX_ROW_BYTES` holding no whole line is one line,
-    /// and the next starts at the first character after it that is no
-    /// space, as at any break: when spaces, which a line never breaks at,
-    /// overflowed it, that is the line a wrap of the whole would make, and
-    /// a line of spaces alone is none. When the slice starts with spaces
-    /// its wrap drops, a line of their own, the wrap starts again after
-    /// them, as the whole wrap does, so a word past the slice is not cut.
-    /// Only characters of no advance end a line there that the whole wrap
-    /// would not.
-    fn lay(
-        &self,
-        metrics: &mut Metrics,
-        from: Place,
-        most: usize,
-    ) -> (Vec<Wrapped>, Option<Place>) {
-        let mut out = Vec::new();
-        let Some(logical) = self.page.lines.get(from.logical) else {
-            return (out, None);
-        };
-        let line = |line: prose::Line, start: (usize, usize)| Wrapped {
-            logical: from.logical,
-            start,
-            line,
-        };
-        if !logical.wrap {
-            let runs: Vec<prose::Run> = logical
-                .runs
-                .iter()
-                .map(|run| run.prose(self.body, &run.text))
-                .collect();
-            let shown = within(metrics, &runs, self.width.saturating_add(prose::OVERHANG));
-            let mut laid = prose::wrap_at_most(metrics, &shown, u32::MAX, 1)
-                .pop()
-                .unwrap_or_default();
-            laid.pieces.shrink_to_fit();
-            laid.glyphs.shrink_to_fit();
-            out.push(line(laid, (0, 0)));
-            return (out, None);
-        }
-        let hang = Hang::of(metrics, logical, self.body, self.width);
-        let (base, width) = match &hang {
-            Some(hang) => (hang.first, self.width - hang.width),
-            None => (0, self.width),
-        };
-        let mut first = from.starts_line();
-        let mut at = if first {
-            (base, 0)
-        } else {
-            (from.run, from.at).max((base, 0))
-        };
-        let mut budget = FIRST_SLICE;
-        while out.len() < most {
-            let want = most - out.len();
-            let (runs, cut) = slice(logical, self.body, at, budget);
-            let lines = prose::wrap_at_most(metrics, &runs, width, want + 1);
-            let whole = match cut {
-                None => lines.len(),
-                Some(_) if lines.len() > want => want + 1,
-                Some(_) => lines.len().saturating_sub(1),
-            };
-            if whole == 0 {
-                if budget < MAX_ROW_BYTES {
-                    budget = budget.saturating_mul(2).min(MAX_ROW_BYTES);
-                    continue;
-                }
-                // A slice's text that holds no break is one line, but for
-                // spaces alone, which a break drops.
-                let laid = lines.into_iter().next().unwrap_or_default();
-                // Spaces a slice starts with that its wrap dropped, a line
-                // of their own, leave a wrap starting afresh after them,
-                // whose line may hold more than this slice.
-                let dropped = first_scalar(logical, at).is_some_and(|c| prose::shown(c) == ' ')
-                    && laid
-                        .glyphs
-                        .first()
-                        .is_some_and(|glyph| prose::shown(glyph.scalar) != ' ');
-                if let Some(past) = past_spaces(logical, at).filter(|_| dropped) {
-                    at = past;
-                    continue;
-                }
-                let next = cut.and_then(|cut| past_spaces(logical, cut));
-                if !laid.glyphs.is_empty() || (next.is_none() && out.is_empty()) {
-                    let start = if first { (0, 0) } else { at };
-                    out.push(line(
-                        hung(laid, at, hang.as_ref(), first, logical, self.body),
-                        start,
-                    ));
-                    first = false;
-                }
-                match next {
-                    Some(next) => at = next,
-                    None => return (out, None),
-                }
-                continue;
-            }
-            for (number, laid) in lines.into_iter().enumerate() {
-                let start = if number == 0 { at } else { started(&laid, at) };
-                if number == whole {
-                    // A slice's last line, which another slice lays.
-                    at = start;
-                    break;
-                }
-                if out.len() == most {
-                    let next = Place {
-                        logical: from.logical,
-                        run: start.0,
-                        at: start.1,
-                    };
-                    return (out, Some(next));
-                }
-                let shown = if first { (0, 0) } else { start };
-                out.push(line(
-                    hung(laid, at, hang.as_ref(), first, logical, self.body),
-                    shown,
-                ));
-                first = false;
-            }
-            if cut.is_none() {
-                return (out, None);
-            }
-        }
-        let next = Place {
-            logical: from.logical,
-            run: at.0,
-            at: at.1,
-        };
-        (out, Some(next))
-    }
-}
-
-/// One character of a line's leading structure, from where it is in its
-/// run, and whether it is a mark its continuation lines repeat: a
-/// quote's `>` or a heading's `#`.
-#[derive(Clone, Copy)]
-struct Lead {
-    run: usize,
-    at: usize,
-    scalar: char,
-    mark: bool,
-}
-
-/// What a logical line starts with that its continuation lines hang
-/// from, as td-html lays out a list, a nested list, a quote, a heading
-/// or a definition at width 0, and the first run after it. It is whole
-/// runs, at most `MAX_LEAD` characters in all, each holding only
-/// structure (`structure`): td-html puts each prefix in a run of its own,
-/// so marks sharing a run with text, as every line of plain text does,
-/// do not hang. td-html's rich output also gives each word of a
-/// paragraph a run of its own, so a paragraph of the document's own
-/// that begins `> ` or `- ` hangs as td-html's structure does: nothing
-/// in that output tells the two apart.
-fn leading(runs: &[Run]) -> (Vec<Lead>, usize) {
-    let mut lead = Vec::new();
-    for (index, run) in runs.iter().enumerate() {
-        let before = lead.len();
-        if run.text.is_empty() || !structure(&run.text, index, &mut lead) || lead.len() > MAX_LEAD {
-            lead.truncate(before);
-            return (lead, index);
-        }
-    }
-    (lead, runs.len())
-}
-
-/// Appends `text`, run `run`, to `lead` when all of it is structure, in
-/// any order: spaces, a quote's `> `, a heading's one to six `#` and a
-/// space, and a list's marker: `*`, `-`, `+`, `•`, `◦` or `▪` and a
-/// space, or digits, after a `-` or not, then `.` or `)` and a space.
-/// Whether it was.
-fn structure(text: &str, run: usize, lead: &mut Vec<Lead>) -> bool {
-    let chars: Vec<(usize, char)> = text.char_indices().take(MAX_LEAD + 1).collect();
-    if chars.len() > MAX_LEAD {
-        return false;
-    }
-    let c = |k: usize| chars.get(k).map(|&(_, c)| c);
-    let digit = |k: usize| c(k).is_some_and(|d| d.is_ascii_digit());
-    let mut i = 0;
-    while i < chars.len() {
-        let (taken, mark) = match c(i) {
-            Some(' ') => (1, false),
-            Some('>') if c(i + 1) == Some(' ') => (2, true),
-            Some('#') => {
-                let mut k = i;
-                while c(k) == Some('#') {
-                    k += 1;
-                }
-                if k - i <= 6 && c(k) == Some(' ') {
-                    (k + 1 - i, true)
-                } else {
-                    (0, false)
-                }
-            }
-            Some('*' | '-' | '+' | '•' | '◦' | '▪') if c(i + 1) == Some(' ') => (2, false),
-            Some('-' | '0'..='9') if digit(i) || digit(i + 1) => {
-                let mut k = i + 1;
-                while digit(k) {
-                    k += 1;
-                }
-                if matches!(c(k), Some('.' | ')')) && c(k + 1) == Some(' ') {
-                    (k + 2 - i, false)
-                } else {
-                    (0, false)
-                }
-            }
-            _ => (0, false),
-        };
-        if taken == 0 {
-            return false;
-        }
-        for &(at, scalar) in chars.get(i..i + taken).unwrap_or_default() {
-            lead.push(Lead {
-                run,
-                at,
-                scalar,
-                mark: mark && scalar != ' ',
-            });
-        }
-        i += taken;
-    }
-    true
-}
-
-/// `units` of `prose::UNIT` rounded to the nearest pixel, as `prose`
-/// rounds a pen.
-fn pixels(units: u64) -> u32 {
-    let unit = u64::from(prose::UNIT);
-    u32::try_from(units.saturating_add(unit / 2) / unit).unwrap_or(u32::MAX)
-}
-
-/// The start of `runs` that an unwrapped line shows at `edge` pixels: the
-/// characters whose pens, laid as prose lays them, fall before it. A pane
-/// never shows the rest, so it is neither laid nor kept; each run keeps
-/// its offsets, so pieces still name their run's text.
-fn within<'r>(metrics: &mut Metrics, runs: &[prose::Run<'r>], edge: u32) -> Vec<prose::Run<'r>> {
-    let mut pen = 0u64;
-    let mut shown = Vec::new();
-    for run in runs {
-        let mut end = run.text.len();
-        for (at, scalar) in run.text.char_indices() {
-            if pixels(pen) >= edge {
-                end = at;
-                break;
-            }
-            let advance =
-                metrics.advance(run.style.family, run.style.font_style, prose::shown(scalar));
-            pen = pen.saturating_add(u64::from(advance));
-        }
-        shown.push(prose::Run {
-            text: run.text.get(..end).unwrap_or_default(),
-            ..*run
-        });
-        if end < run.text.len() {
-            break;
-        }
-    }
-    shown
-}
-
-/// Where a line of a slice's wrap starts, as the logical line has it: a
-/// slice starting at `at` holds its run from that byte on, and the runs
-/// after it whole. A line holding nothing starts where the slice does.
-fn started(line: &prose::Line, at: (usize, usize)) -> (usize, usize) {
-    match line.pieces.first() {
-        Some(piece) if piece.run == 0 => (at.0, at.1 + piece.text.start),
-        Some(piece) => (at.0 + piece.run, piece.text.start),
-        None => at,
-    }
-}
-
-/// The first character of `logical` at or after `at`, past empty runs.
-fn first_scalar(logical: &Logical, at: (usize, usize)) -> Option<char> {
-    logical
-        .runs
-        .iter()
-        .enumerate()
-        .skip(at.0)
-        .find_map(|(index, run)| {
-            let from = if index == at.0 { at.1 } else { 0 };
-            run.text.get(from..).and_then(|text| text.chars().next())
-        })
-}
-
-/// Where the first character of `logical` at or after `at` that is no
-/// space is, as `prose` takes a tab for one; none when only spaces are
-/// left.
-fn past_spaces(logical: &Logical, at: (usize, usize)) -> Option<(usize, usize)> {
-    for (index, run) in logical.runs.iter().enumerate().skip(at.0) {
-        let from = if index == at.0 { at.1 } else { 0 };
-        let text = run.text.get(from..).unwrap_or_default();
-        if let Some((byte, _)) = text.char_indices().find(|&(_, c)| prose::shown(c) != ' ') {
-            return Some((index, from + byte));
-        }
-    }
-    None
-}
-
-/// The runs of `logical` from `at` as prose measures them, holding at most
-/// `budget` bytes of text with one more for each run, and where they stop
-/// when that is before the logical line's end: within a run, at a
-/// character, so a slice holds at least one character of the first.
-fn slice(
-    logical: &Logical,
-    body: TextFamily,
-    at: (usize, usize),
-    budget: usize,
-) -> (Vec<prose::Run<'_>>, Option<(usize, usize)>) {
-    let mut runs = Vec::new();
-    let mut spent = 0usize;
-    for (index, run) in logical.runs.iter().enumerate().skip(at.0) {
-        let from = if index == at.0 { at.1 } else { 0 };
-        let text = run.text.get(from..).unwrap_or_default();
-        let room = budget.saturating_sub(spent.saturating_add(1));
-        if spent >= budget || text.len() > room {
-            let mut end = room.min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            if end > 0 {
-                runs.push(run.prose(body, text.get(..end).unwrap_or_default()));
-            }
-            return (runs, Some((index, from + end)));
-        }
-        runs.push(run.prose(body, text));
-        spent += text.len() + 1;
-    }
-    (runs, None)
-}
-
-/// What a logical line's lines hang from (`leading`): the first run after
-/// its leading structure, that structure's width in pixels, and each of
-/// its characters with its pen and advance in `prose::UNIT`s.
-struct Hang {
-    first: usize,
-    width: u32,
-    placed: Vec<(Lead, u64, u64)>,
-}
-
-impl Hang {
-    /// How `logical`'s lines hang at `width` pixels, its body text in
-    /// `body`; none when it starts with no structure, holds nothing after
-    /// it, or the structure is wider than half the width.
-    fn of(metrics: &mut Metrics, logical: &Logical, body: TextFamily, width: u32) -> Option<Self> {
-        let (lead, first) = leading(&logical.runs);
-        let rest = logical.runs.get(first..).unwrap_or_default();
-        if lead.is_empty() || rest.iter().all(|run| run.text.is_empty()) {
-            return None;
-        }
-        let mut pen = 0u64;
-        let mut placed = Vec::with_capacity(lead.len());
-        for one in lead {
-            let style = logical.runs.get(one.run)?.style.glyph(body);
-            let shown = prose::shown(one.scalar);
-            let advance = u64::from(metrics.advance(style.family, style.font_style, shown));
-            placed.push((one, pen, advance));
-            pen = pen.saturating_add(advance);
-        }
-        let hang = pixels(pen);
-        (hang.saturating_mul(2) <= width).then_some(Self {
-            first,
-            width: hang,
-            placed,
-        })
-    }
-}
-
-/// `line`, laid from a slice of `logical` starting at `at`, as the logical
-/// line has it: its pieces naming the line's runs and bytes, and, when it
-/// hangs, set in by the hang after its structure, the first line's
-/// whole, a continuation's marks alone, as one piece a run with the text
-/// between them left out.
-fn hung(
-    line: prose::Line,
-    at: (usize, usize),
-    hang: Option<&Hang>,
-    first: bool,
-    logical: &Logical,
-    body: TextFamily,
-) -> prose::Line {
-    let placed = hang.map_or(&[][..], |hang| &hang.placed);
-    let shift = hang.map_or(0, |hang| hang.width);
-    let marks = placed
-        .iter()
-        .filter(|(one, _, _)| first || one.mark)
-        .count();
-    let mut laid = prose::Line {
-        width: 0,
-        pieces: Vec::with_capacity(line.pieces.len() + marks),
-        glyphs: Vec::with_capacity(line.glyphs.len() + marks),
-    };
-    for &(one, pen, advance) in placed {
-        if !first && !one.mark {
-            continue;
-        }
-        let Some(run) = logical.runs.get(one.run) else {
-            continue;
-        };
-        let x = pixels(pen);
-        let right = pixels(pen.saturating_add(advance));
-        let glyph = laid.glyphs.len();
-        let end = one.at + one.scalar.len_utf8();
-        match laid.pieces.last_mut() {
-            Some(piece) if piece.run == one.run => {
-                piece.text.end = end;
-                piece.right = piece.right.max(right);
-                piece.glyphs.end = glyph + 1;
-            }
-            _ => laid.pieces.push(prose::Piece {
-                run: one.run,
-                tag: run.link.unwrap_or(NO_LINK),
-                style: run.style.glyph(body),
-                text: one.at..end,
-                left: x,
-                right,
-                glyphs: glyph..glyph + 1,
-            }),
-        }
-        laid.glyphs.push(prose::Placed {
-            x,
-            scalar: prose::shown(one.scalar),
-        });
-        laid.width = laid.width.max(right);
-    }
-    let base = laid.glyphs.len();
-    for piece in line.pieces {
-        let text = if piece.run == 0 {
-            piece.text.start + at.1..piece.text.end + at.1
-        } else {
-            piece.text
-        };
-        laid.pieces.push(prose::Piece {
-            run: piece.run + at.0,
-            text,
-            left: piece.left.saturating_add(shift),
-            right: piece.right.saturating_add(shift),
-            glyphs: piece.glyphs.start + base..piece.glyphs.end + base,
-            ..piece
-        });
-    }
-    laid.glyphs
-        .extend(line.glyphs.iter().map(|glyph| prose::Placed {
-            x: glyph.x.saturating_add(shift),
-            ..*glyph
-        }));
-    if !line.glyphs.is_empty() || hang.is_none() {
-        laid.width = laid.width.max(line.width.saturating_add(shift));
-    }
-    laid
-}
+include!("wrap.rs");
 
 /// `text` with every control character and line or paragraph separator
 /// percent-encoded, so a single-line row shows all of it.
@@ -2333,11 +1465,17 @@ pub(crate) mod tests {
         assert!(page_bytes > 0 && page_bytes < memory::TEXT_WORK);
         let first = doc.render(80, TextFamily::Sans).unwrap();
         let second = doc.render(40, TextFamily::Sans).unwrap();
-        assert_eq!(root.used(), base + page_bytes + 2 * memory::WRAP_WORK);
+        assert_eq!(
+            root.used(),
+            base + page_bytes + 2 * Budget::metadata_bytes()
+        );
         drop(doc);
-        assert_eq!(root.used(), base + page_bytes + 2 * memory::WRAP_WORK);
+        assert_eq!(
+            root.used(),
+            base + page_bytes + 2 * Budget::metadata_bytes()
+        );
         drop(first);
-        assert_eq!(root.used(), base + page_bytes + memory::WRAP_WORK);
+        assert_eq!(root.used(), base + page_bytes + Budget::metadata_bytes());
         drop(second);
         assert_eq!(root.used(), base);
     }
@@ -2384,9 +1522,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let kept = root.used();
-        let blocker = root
-            .charge(root.limit() - root.used() - memory::SMALL_WORK)
-            .unwrap();
+        let blocker = root.charge(root.limit() - root.used()).unwrap();
         assert!(old.render(40, TextFamily::Sans).is_err());
         let refused = Document::from_reply_in(
             base_url(),
@@ -2545,7 +1681,7 @@ pub(crate) mod tests {
     }
 
     /// The laid lines `rendered` holds.
-    pub(crate) fn laid(rendered: &mut Rendered) -> &mut VecDeque<Wrapped> {
+    pub(crate) fn laid(rendered: &mut Rendered) -> &mut Rows {
         &mut rendered.laid
     }
 
@@ -3037,7 +2173,7 @@ pub(crate) mod tests {
             page.lines[0].runs[0].text.len()
         );
         for line in &laid.lines {
-            let (again, _) = rendered.lay(&mut cell(), line.place(), 1);
+            let (again, _) = rendered.lay(&mut cell(), line.place(), 1).unwrap();
             assert_eq!(again[0].line, line.line);
         }
     }
@@ -3086,10 +2222,17 @@ pub(crate) mod tests {
                         .iter()
                         .map(|run| run.prose(TextFamily::Sans, &run.text))
                         .collect();
-                    whole.extend(prose::wrap(metrics, &runs, width));
+                    whole.extend(
+                        prose::wrap(metrics, &runs, width, &Budget::new(64 << 20).unwrap())
+                            .unwrap(),
+                    );
                 }
                 let laid = cells(&doc, columns);
-                let lines: Vec<prose::Line> = laid.lines.iter().map(|w| w.line.clone()).collect();
+                let lines: Vec<prose::Line> = laid
+                    .lines
+                    .iter()
+                    .map(|w| w.line.try_clone().unwrap())
+                    .collect();
                 assert_eq!(glyphs_of(&lines), glyphs_of(&whole), "{columns}");
                 for wrapped in laid.lines.iter().filter(|w| w.start != (0, 0)) {
                     let (run, at) = wrapped.start;
@@ -3952,5 +3095,109 @@ pub(crate) mod tests {
             picture::tests::WEBP.to_vec(),
         );
         assert!(doc.picture().is_none());
+    }
+}
+#[cfg(test)]
+#[path = "../../td-ui/tests/fonts/mod.rs"]
+#[allow(clippy::indexing_slicing)]
+mod bench_fonts;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod wrap_bench {
+    use super::*;
+    use crate::view::View;
+    use std::time::Instant;
+    use td_ui::prose::Faces;
+    use td_ui::raster::Scale;
+    fn faces() -> Faces {
+        use super::bench_fonts::{Builder, Glyph, Segment};
+        let mut b = Builder::new(vec![Glyph::Empty; 97]);
+        b.format4 = vec![
+            Segment::Delta(32, 126, 1u16.wrapping_sub(32)),
+            Segment::Delta(0x301, 0x301, 96u16.wrapping_sub(0x301)),
+        ];
+        b.advances = (0..97)
+            .map(|n| if n == 96 { 0 } else { 200 + (n % 7) * 100 })
+            .collect();
+        let bytes = b.font();
+        Faces::new(
+            std::array::from_fn(|_| bytes.clone()),
+            std::array::from_fn(|_| bytes.clone()),
+        )
+        .unwrap()
+    }
+    #[test]
+    #[ignore = "paired release performance measurement, TD_WRAP_BENCH selects fixture"]
+    fn navigation() {
+        let scenario = std::env::var("TD_WRAP_BENCH").unwrap_or_else(|_| "scroll".into());
+        let faces = faces();
+        let mut metrics = Metrics::new(Some(&faces), Scale::new(1).unwrap());
+        let text = match scenario.as_str() {
+            "marks" => format!(
+                "<p>e{} word {}</p>",
+                "\u{301}".repeat(50_000),
+                "alphabet ".repeat(20_000)
+            ),
+            "runs" => format!(
+                "<blockquote><ul>{}</ul></blockquote>",
+                "<li>alpha <b>beta</b> <i>gamma</i> delta epsilon zeta</li>".repeat(3000)
+            ),
+            "unicode" => format!(
+                "<p>{}</p>",
+                (0x20..0x2800)
+                    .filter_map(char::from_u32)
+                    .collect::<String>()
+                    .repeat(8)
+            ),
+            _ => format!(
+                "<p>{}</p>",
+                "alpha beta gamma delta epsilon zeta ".repeat(10_000)
+            ),
+        };
+        let doc = Document::from_reply(
+            Url::parse("https://bench.invalid/").unwrap(),
+            200,
+            Some("text/html"),
+            text.into_bytes(),
+        );
+        let mut rendered = doc.render(640, TextFamily::Sans).unwrap();
+        let mut view = View::default();
+        let start = Instant::now();
+        let mut checksum = 0u64;
+        let mut retained = 0;
+        for i in 0..if scenario == "resize" { 1200 } else { 12000 } {
+            if scenario == "resize" {
+                rendered = Rendered::default();
+                std::hint::black_box(&rendered);
+                rendered = doc.render(240 + (i % 31) * 17, TextFamily::Sans).unwrap();
+                view.top = rendered.snap(&mut metrics, view.top);
+            }
+            view.scroll(
+                if i % 200 < 100 { 7 } else { -7 },
+                &mut rendered,
+                &mut metrics,
+                40,
+            );
+            retained = retained.max(rendered.page.budget().unwrap().used());
+            for line in rendered.shown(view.top, 40) {
+                checksum = checksum.wrapping_mul(31).wrapping_add(line.logical as u64);
+                for glyph in &line.line.glyphs {
+                    checksum = checksum
+                        .wrapping_mul(31)
+                        .wrapping_add(glyph.x as u64)
+                        .wrapping_add(glyph.scalar as u64);
+                }
+            }
+        }
+        let elapsed = start.elapsed().as_nanos();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .unwrap()
+            .trim();
+        println!(
+            "BENCH {scenario} ns={elapsed} checksum={checksum} retained={retained} peak={peak}"
+        );
     }
 }

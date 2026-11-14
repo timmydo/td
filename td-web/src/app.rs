@@ -423,10 +423,11 @@ impl App {
         faces: Option<Faces>,
     ) -> Result<Self, String> {
         let entry = |limit| EntryModel::new(limit).map_err(|why| format!("{why:?}"));
-        let metrics = Metrics::new(faces.as_ref(), surface.scale);
+        let renderer = Renderer::start()?;
+        let metrics = Metrics::new_in(faces.as_ref(), surface.scale, renderer.budget());
         Ok(Self {
             fetcher,
-            renderer: Renderer::start()?,
+            renderer,
             workers: Arc::new(AtomicUsize::new(0)),
             surface,
             focus: Focus::Address,
@@ -865,24 +866,42 @@ impl App {
     /// ones are laid.
     fn relayout(&mut self) {
         if self.metrics.scale() != self.surface.scale {
-            self.metrics = Metrics::new(self.faces.as_ref(), self.surface.scale);
+            self.metrics = Metrics::new_in(
+                self.faces.as_ref(),
+                self.surface.scale,
+                self.renderer.budget(),
+            );
         }
         let layout = self.layout();
-        if self.current.rendered_for != Some(layout) {
+        let reflow = self.current.rendered_for != Some(layout);
+        let before = (
+            self.current.view.top,
+            self.current.view.focus,
+            self.current.view.at,
+            self.current.view.selection,
+        );
+        if reflow {
             let top = self.current.view.top;
-            self.current.rendered = Rendered::default();
+            self.current.rendered.discard_layout();
             self.current.render_refused = false;
             match self.current.doc.render(layout.width, layout.body) {
                 Ok(rendered) => self.current.rendered = rendered,
                 Err(_) => {
                     self.current.render_refused = true;
                     self.message = said(format_args!("Page unavailable: memory budget exhausted."));
+                    self.current.rendered_for = None;
+                    return;
                 }
             }
             self.current.rendered_for = Some(layout);
             let rendered = &mut self.current.rendered;
             let view = &mut self.current.view;
             view.top = rendered.snap(&mut self.metrics, top);
+            if rendered.refused() {
+                self.current.rendered_for = None;
+                self.current.render_refused = true;
+                return;
+            }
             view.focus = view.focus.filter(|&link| link < rendered.page.links.len());
             if !view.hits.is_empty() || self.focus == Focus::Find {
                 let query = self.query.text().to_string();
@@ -890,6 +909,13 @@ impl App {
             }
         }
         self.scroll(0);
+        if reflow && self.current.rendered.refused() {
+            let view = &mut self.current.view;
+            (view.top, view.focus, view.at, view.selection) = before;
+            view.at = view.at.min(view.hits.len().saturating_sub(1));
+            self.current.rendered_for = None;
+            self.current.render_refused = true;
+        }
     }
 
     fn refind(&mut self) {
@@ -911,6 +937,12 @@ impl App {
     }
 
     fn scroll(&mut self, delta: isize) {
+        if self.current.render_refused {
+            self.relayout();
+            if self.current.render_refused {
+                return;
+            }
+        }
         let rows = self.rows();
         let current = &mut self.current;
         current
@@ -924,6 +956,12 @@ impl App {
     }
 
     fn page_key(&mut self, chord: &str) {
+        if self.current.render_refused {
+            self.relayout();
+            if self.current.render_refused {
+                return;
+            }
+        }
         let rows = self.rows();
         let page = rows.saturating_sub(1).max(1) as isize;
         let metrics = &mut self.metrics;
@@ -1033,8 +1071,10 @@ impl App {
             "S-Up" => page.line_up(at),
             _ => page.line_down(at),
         };
-        view.select(Some(Selection { focus, ..selection }));
         view.reveal(focus, rendered, &mut self.metrics, rows);
+        if !rendered.refused() {
+            view.select(Some(Selection { focus, ..selection }));
+        }
         self.refresh_hover();
     }
 
@@ -1212,6 +1252,9 @@ impl App {
             return;
         }
         self.focus = Focus::Page;
+        if self.current.render_refused || self.current.rendered.refused() {
+            return;
+        }
         let now = self.clock.now();
         let near = (NEAR * self.scale()).unsigned_abs();
         let count = match click {
@@ -1597,13 +1640,17 @@ impl Handler for App {
                 current
                     .rendered
                     .settle(&mut self.metrics, current.view.top, rows);
-                view::paint(
-                    &self.current.rendered,
-                    &self.current.view,
-                    self.hover,
-                    &self.pane(),
-                    &mut sink,
-                )
+                if current.rendered.refused() {
+                    picture_notice(surface, page, bounds, &mut sink);
+                } else {
+                    view::paint(
+                        &self.current.rendered,
+                        &self.current.view,
+                        self.hover,
+                        &self.pane(),
+                        &mut sink,
+                    )
+                }
             }
         }
         let status = self.status();
@@ -3071,7 +3118,7 @@ mod tests {
         assert_eq!(painted_selection(&app), words);
         key(&mut app, "End");
         let first = crate::document::tests::laid(&mut app.current.rendered)
-            .front()
+            .first()
             .unwrap()
             .place();
         assert!(first > selection.unwrap().focus, "its lines are not laid");
@@ -3092,6 +3139,75 @@ mod tests {
             key(&mut app, "Down");
         }
         assert_eq!(painted_selection(&app), words);
+    }
+
+    #[test]
+    fn refused_keyboard_extension_keeps_selection_and_focus_then_retries() {
+        let text = "alpha beta gamma delta ".repeat(2000);
+        let mut app = app(site().page("https://example.org/p", "text/plain", &text));
+        typed(&mut app, "example.org/p");
+        for selected in [false, true] {
+            if selected {
+                app.current.view.select(Some(Selection {
+                    anchor: Place::default(),
+                    focus: Place {
+                        at: 5,
+                        ..Place::default()
+                    },
+                }));
+            }
+            let before = (
+                app.current.view.top,
+                app.current.view.focus,
+                app.current.view.selection,
+            );
+            td_alloc::with_reservation_limit(0, || key(&mut app, "S-Down"));
+            assert!(app.current.rendered.refused());
+            assert_eq!(
+                (
+                    app.current.view.top,
+                    app.current.view.focus,
+                    app.current.view.selection
+                ),
+                before
+            );
+        }
+        key(&mut app, "S-Down");
+        assert!(!app.current.rendered.refused());
+        assert_eq!(app.current.view.selection.unwrap().focus.at, text.len());
+    }
+
+    #[test]
+    fn refused_resize_keeps_the_page_view_and_copy_then_retries() {
+        let text = "alpha beta gamma delta ".repeat(2000);
+        let mut app = app(site().page("https://example.org/p", "text/plain", &text));
+        typed(&mut app, "example.org/p");
+        for _ in 0..20 {
+            key(&mut app, "Down");
+        }
+        app.drag_from(point(&app, 0, 0), point(&app, 1, 3));
+        let before = (app.current.view.top, app.current.view.selection);
+        let text = copied(&mut app);
+        assert!(!text.is_empty());
+        // 147 admits snap but refuses while settling the new viewport.
+        for allowance in [0, 1, 3, 8, 147] {
+            td_alloc::with_reservation_limit(allowance, || {
+                app.input(Input::Resize(surface(300)), &mut Board::default());
+            });
+            assert!(app.current.render_refused, "allowance {allowance}");
+            assert_eq!((app.current.view.top, app.current.view.selection), before);
+            assert_eq!(copied(&mut app), text);
+        }
+        assert!(app.current.render_refused);
+        assert_eq!((app.current.view.top, app.current.view.selection), before);
+        assert_eq!(copied(&mut app), text);
+        td_alloc::with_reservation_limit(0, || key(&mut app, "Home"));
+        assert_eq!((app.current.view.top, app.current.view.selection), before);
+        key(&mut app, "Down");
+        assert!(!app.current.render_refused);
+        assert!(!app.current.rendered.refused());
+        assert_eq!(app.current.view.selection, before.1);
+        assert_eq!(copied(&mut app), text);
     }
 
     #[test]
