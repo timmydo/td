@@ -247,15 +247,17 @@ inch), independent of display scale. Accepted units are px, pt, pc, in,
 cm, mm, q, em and rem; bare zero is a length. Percentages on margin,
 padding, width and height stay percentages for layout to resolve.
 Font-size percentages and em use the parent's computed font size; other
-em lengths use the element's computed font size. Unsupported units and
-functions other than calc() invalidate the declaration. Negative margins are valid;
+em lengths use the element's computed font size. Other units, and
+functions other than calc() and the colour functions below, invalidate
+the declaration, but in the `background` shorthand's position and size
+slots, which nothing stores (below). Negative margins are valid;
 negative font sizes, padding, border widths and dimensions are invalid
 as bare values; calc() clamps its result to the property range.
 
 | Property | Accepted values | Initial; inherited |
 |---|---|---|
 | display | none, inline, block, inline-block, list-item, table, inline-table, table-row-group, table-header-group, table-footer-group, table-row, table-cell, table-column-group, table-column, table-caption, flex, inline-flex | inline; no |
-| color, background-color | sixteen CSS basic names plus orange and rebeccapurple, transparent, currentcolor, #rgb/#rgba/#rrggbb/#rrggbbaa | black / transparent; color only |
+| color, background-color | CSS Color 4's 148 named colours, transparent, currentcolor, #rgb/#rgba/#rrggbb/#rrggbbaa, rgb()/rgba(), hsl()/hsla() (below) | black / transparent; color only |
 | font-family | comma-separated quoted strings or identifier sequences, including generic families | serif; yes |
 | font-size | lengths, percentages, xx-small through xx-large, smaller, larger | 16px; yes |
 | font-weight | normal, bold, bolder, lighter, integers 100 through 900 in steps of 100 | 400; yes |
@@ -278,7 +280,8 @@ accepts optional style, variant and weight (each at most once, with normal
 filling omitted slots), a required size, optional slash line-height, and
 a required family list. It resets all six implemented font longhands;
 system-font keywords, stretch and other font extension/reset properties
-are unsupported. Other shorthands remain unsupported. `text-decoration`
+are unsupported. `background` sets the colour of its final layer (below).
+Other shorthands remain unsupported. `text-decoration`
 here is the line-set subset, without style, color or thickness. Its propagation to
 descendants is a layout/painting concern, not inheritance. Border widths
 compute to zero for none/hidden styles. Border colors default to the
@@ -292,6 +295,69 @@ neither visible nor clip. No scrolling or box generation occurs here.
 Font keyword sizes are 9, 10, 13, 16,
 18, 24 and 32px; smaller/larger multiply the parent's size by 1/1.2 or
 1.2. Thin/medium/thick are 1/3/5px. These are td's UA choices.
+
+Colours follow the sRGB part of
+[CSS Color 4, 12 November 2026](https://www.w3.org/TR/2026/CRD-css-color-4-20261112/):
+§6.1's 148 named colours, ASCII case-insensitive and held in a sorted
+table searched by bisection, `transparent` (§6.3), `currentcolor`
+(§6.4), the hex notations (§5.2), and rgb()/rgba() (§5.1) and
+hsl()/hsla() (§7), each pair aliases. The legacy syntax (§4.1.2)
+separates three components and an optional alpha with commas and takes
+no `none`; its rgb() channels are all numbers or all percentages and
+its hsl() saturation and lightness are percentages. The modern syntax
+separates components with whitespace and an optional `/` before alpha,
+mixes numbers and percentages, and reads `none` as zero. A hue is a
+number of degrees or a deg, grad, rad or turn angle, normalized into
+[0, 360); alpha is a number or a percentage. A wrong type, a missing or
+extra component, a mixed separator, or more than seven significant
+components makes the value invalid. rgb() channels and alpha clamp to
+their ranges and negative saturation to 0%; the other hsl() components
+convert by §7.1 unclamped, their magnitudes bounded by
+MAX_ABSOLUTE_VALUE, and the channels that result clamp to sRGB's gamut.
+Each channel and alpha then rounds to eight bits: the nearest integer on
+the 0–255 scale, halves toward +∞ (§5.1), so 50% and an alpha of 0.5
+are both 128. The computed colour is that RGBA; a consumer that paints
+on opaque fills blends it itself. A calc() component counts as a number
+or a percentage when it types as that alone; one with a length, an
+angle or a mix of the two makes the colour invalid, so a hue angle
+cannot come from calc(). hwb(), lab(), lch(), oklab(), oklch(),
+color(), color-mix(), relative colours and the system colours (§6.2)
+are unsupported, so invalid. `currentcolor` computes to the element's
+computed `color` (for `color` itself, the parent's) rather than staying
+the keyword §6.4 specifies: the two differ only where a non-inherited
+colour property is explicitly inherited from a parent whose value was
+`currentcolor`, and the child then takes the parent's colour.
+
+The `background` shorthand follows
+[Backgrounds 3 §2.10, 11 March 2024](https://www.w3.org/TR/2024/CRD-css-backgrounds-3-20240311/#background):
+comma-separated layers of which only the last may carry a colour. It
+sets `background-color` to that colour, or to the initial transparent
+when there is none; td-css has no other background longhand, so it
+resets nothing else. A layer is a nonempty set, in any order, of at
+most one image, one position with an optional `/` size, one repeat
+style, one attachment, two boxes and, in the last layer, one colour. An
+image is `none`, a URL token, url() or src(); td-css fetches nothing.
+Gradients (linear, radial and conic, their repeating forms and every
+`-webkit-` form) and image-set(), cross-fade() and element() are
+unsupported, so a layer naming one makes the declaration invalid, as
+CSS Conditional 3's usable support requires of `@supports`: td-web
+paints no image, and accepting one would reset the colour of a page's
+usual fallback, `background: #1e5799; background:
+linear-gradient(...)`, to transparent. The cost is that a gradient
+in the same declaration as its colour loses that colour too. A
+position is §2.6's `<bg-position>`, one to four keywords and
+length-percentages; a size is cover, contain, or one or two of auto and
+nonnegative length-percentages. Since nothing stores a position or a
+size, their length-percentages are any CSS Values 4 length unit
+(absolute, font-relative, viewport and container units, ASCII
+case-insensitive), a percentage, bare zero, or a calc(), min(), max()
+or clamp() stepped over whole; other units and functions are invalid.
+A repeat style is repeat-x, repeat-y or
+one or two of repeat, space, round and no-repeat; an attachment is
+scroll, fixed or local; a box is border-box, padding-box or
+content-box. Anything else, a repeated component, an empty layer or a
+colour before the last layer invalidates the declaration; a var() in it
+defers as in any shorthand.
 
 Additional values use [CSS 2.2](https://www.w3.org/TR/CSS22/) property
 semantics, the two-axis visible/clip rule from
@@ -339,7 +405,13 @@ require a number operand; division requires a nonzero number divisor.
 Unitless zero inside calc() is a number, not a length. Unsupported units,
 dimensionally invalid expressions, non-finite arithmetic, min/max/clamp
 and numeric constants are invalid. No pure-number property calc() grammar
-is claimed by this length subset. Bounds also inspect invalid tails.
+is claimed by this length subset; a colour component's calc() may be a
+bare number or a bare percentage (above). Bounds also inspect invalid
+tails, except in a colour function or a `background` layer: each stops
+at its first invalid component, so an over-limit calc() after one is
+merely invalid there, not fatal, and the math functions a background
+position or size steps over are bounded by MAX_NESTING and MAX_TOKENS
+alone.
 
 Absolute units combine into px; em/rem compute with the same font bases
 as ordinary lengths. Font-size percentages resolve against the parent.
@@ -434,6 +506,10 @@ linear string search; an `i` selector compiles a bounded KMP prefix array
 and folds ASCII bytes while scanning, without allocating in the match.
 Numeric input may be larger than a supported value; finite values beyond
 the computed bound are clamped, without wrapping or creating NaN.
+A colour function stops at its eighth significant component, and a
+background layer's url(), src() and math functions are stepped over
+whole, their depth already bounded by MAX_NESTING; neither stores
+anything.
 All td-css-owned heap storage uses td-alloc. Token text up to 14 UTF-8
 bytes lives inline in its enclosing owner.
 Text from 15 through 62 bytes uses one shared fixed SmallText allocation;
@@ -479,10 +555,9 @@ completion; consumed steps exclude the charge that refused. `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
 td-web's styled pages (td-web/DESIGN.md §10, increment 6) need first a
-refusal naming the sheet it arose in, a media condition per sheet, the `background` shorthand's colour,
-and rgb()/hsl() and CSS Color 4's extended named colours, and will use
-an answer to whether a changed environment changes which of its rules
-apply.
+refusal naming the sheet it arose in and a media condition per sheet,
+and will use an answer to whether a changed environment changes which
+of its rules apply.
 
 `cascade` exports `StyleSet`, `Origin`, `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
@@ -648,7 +723,9 @@ their companion longhands, font shorthand, clear, visibility, text-indent,
 text-transform, box-sizing and letter-spacing. Relative offsets are needed
 with relative positioning; absolute/fixed/sticky positioning, flex/grid
 layout, border-radius, shadows, generated content and images remain beyond
-that property increment. Functional colors are a distinct remaining gap.
+that property increment. These captures, and the runs below, predate
+§4's functional colours and `background` shorthand, which they counted
+as discarded; the corpus has not been replayed since.
 
 Capture identities below are SHA-256. The CSS identity hashes, in capture
 order, each filename, NUL, its file SHA-256 in lowercase hex, and LF; it

@@ -13,6 +13,7 @@ pub(crate) struct Linear {
     rem: f64,
     percent: f64,
     has_percent: bool,
+    has_length: bool,
 }
 impl Linear {
     fn map(self, f: impl Fn(f64) -> f64) -> Option<Self> {
@@ -22,6 +23,7 @@ impl Linear {
             rem: f(self.rem),
             percent: f(self.percent),
             has_percent: self.has_percent,
+            has_length: self.has_length,
         };
         [result.px, result.em, result.rem, result.percent]
             .iter()
@@ -35,6 +37,7 @@ impl Linear {
             rem: self.rem + sign * other.rem,
             percent: self.percent + sign * other.percent,
             has_percent: self.has_percent || other.has_percent,
+            has_length: self.has_length || other.has_length,
         }
         .map(|n| n)
     }
@@ -164,6 +167,26 @@ pub(crate) fn parse(value: &Component, allow_percent: bool) -> Result<Option<Lin
         _ => None,
     })
 }
+/// A colour component's calc(): a bare number or a bare percentage.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Scalar {
+    Number(f64),
+    Percent(f64),
+}
+pub(crate) fn scalar(value: &Component) -> Result<Option<Scalar>, Error> {
+    let Component::Function { name, values } = value else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("calc") {
+        return Ok(None);
+    }
+    validate(std::slice::from_ref(value), 0, &mut 0)?;
+    Ok(match expression(values) {
+        Some(Expr::Number(n)) => Some(Scalar::Number(n)),
+        Some(Expr::Length(v)) if v.has_percent && !v.has_length => Some(Scalar::Percent(v.percent)),
+        _ => None,
+    })
+}
 fn expression(values: &[Component]) -> Option<Expr> {
     let mut parser = Parser { values, pos: 0 };
     let result = parser.sum()?;
@@ -237,7 +260,10 @@ impl Parser<'_> {
             }
             _ => {
                 let (n, unit) = values::length(c)?;
-                let mut result = Linear::default();
+                let mut result = Linear {
+                    has_length: !matches!(unit, Unit::Percent),
+                    ..Linear::default()
+                };
                 match unit {
                     Unit::Em => result.em = n,
                     Unit::Rem => result.rem = n,

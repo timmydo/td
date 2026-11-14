@@ -47,6 +47,7 @@ pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
         "border-left" => Some(&[BorderLeftWidth, BorderLeftStyle, BorderLeftColor]),
         "font" => Some(FONT),
         "overflow" => Some(&[OverflowX, OverflowY]),
+        "background" => Some(&[BackgroundColor]),
         _ => None,
     }
 }
@@ -155,6 +156,16 @@ pub(super) fn shorthand(
         }
         return Ok(output);
     }
+    if name == "background" {
+        if let Some(value) = color::background(v)? {
+            output.try_push(ValueDeclaration {
+                property: BackgroundColor,
+                value,
+                important,
+            })?;
+        }
+        return Ok(output);
+    }
     let parsed = match name {
         "font" => font(v, memory)?,
         "overflow" => overflow(v, memory)?,
@@ -214,7 +225,7 @@ fn border(
             if Option::replace(&mut style, v).is_some() {
                 return Ok(None);
             }
-        } else if let Some(v) = parse_color(one) {
+        } else if let Some(v) = parse_color(one)? {
             if Option::replace(&mut color, v).is_some() {
                 return Ok(None);
             }

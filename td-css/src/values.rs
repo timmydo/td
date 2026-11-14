@@ -3,7 +3,9 @@ use crate::syntax::{self, Text};
 use crate::syntax::{Component, Declaration, Token};
 use crate::{calc, variables, Error};
 use td_alloc::{Budget, BudgetMap, BudgetShared, BudgetString, BudgetVec};
+mod color;
 mod layout;
+use color::parse_color;
 
 pub const MAX_FAMILIES: usize = 32;
 pub const MAX_ABSOLUTE_VALUE: f64 = 1_000_000.0;
@@ -807,7 +809,7 @@ fn parse_value(
             ],
         ),
         Color | BackgroundColor | BorderTopColor | BorderRightColor | BorderBottomColor
-        | BorderLeftColor => parse_color(values),
+        | BorderLeftColor => parse_color(values)?,
         FontFamily => {
             parse_families(values, memory)?.map(|v| Specified::Ready(ComputedValue::FontFamily(v)))
         }
@@ -1048,97 +1050,6 @@ fn parse_families(
         families.try_push(Family::Named(Text::from_string(memory, joined)?))?;
     }
     Ok(Some(BudgetShared::new(memory, families)?))
-}
-
-fn parse_color(values: &[Component]) -> Option<Specified> {
-    let [value] = values else {
-        return None;
-    };
-    let color = match value {
-        Component::Token(Token::Ident(name)) => {
-            if name.eq_ignore_ascii_case("currentcolor") {
-                return Some(Specified::CurrentColor);
-            }
-            let (red, green, blue, alpha) = match syntax::keyword(
-                name,
-                &[
-                    "black",
-                    "silver",
-                    "gray",
-                    "white",
-                    "maroon",
-                    "red",
-                    "purple",
-                    "fuchsia",
-                    "green",
-                    "lime",
-                    "olive",
-                    "yellow",
-                    "navy",
-                    "blue",
-                    "teal",
-                    "aqua",
-                    "orange",
-                    "rebeccapurple",
-                    "transparent",
-                ],
-            )? {
-                "black" => (0, 0, 0, 255),
-                "silver" => (192, 192, 192, 255),
-                "gray" => (128, 128, 128, 255),
-                "white" => (255, 255, 255, 255),
-                "maroon" => (128, 0, 0, 255),
-                "red" => (255, 0, 0, 255),
-                "purple" => (128, 0, 128, 255),
-                "fuchsia" => (255, 0, 255, 255),
-                "green" => (0, 128, 0, 255),
-                "lime" => (0, 255, 0, 255),
-                "olive" => (128, 128, 0, 255),
-                "yellow" => (255, 255, 0, 255),
-                "navy" => (0, 0, 128, 255),
-                "blue" => (0, 0, 255, 255),
-                "teal" => (0, 128, 128, 255),
-                "aqua" => (0, 255, 255, 255),
-                "orange" => (255, 165, 0, 255),
-                "rebeccapurple" => (102, 51, 153, 255),
-                "transparent" => (0, 0, 0, 0),
-                _ => return None,
-            };
-            Color {
-                red,
-                green,
-                blue,
-                alpha,
-            }
-        }
-        Component::Token(Token::Hash { value, .. }) => {
-            if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return None;
-            }
-            let channels = match value.len() {
-                3 | 4 => value.len(),
-                6 | 8 => value.len() / 2,
-                _ => return None,
-            };
-            let mut bytes = [0u8, 0, 0, 255];
-            for (index, byte) in bytes.iter_mut().take(channels).enumerate() {
-                *byte = if value.len() <= 4 {
-                    u8::from_str_radix(value.get(index..index + 1)?, 16).ok()? * 17
-                } else {
-                    u8::from_str_radix(value.get(index * 2..index * 2 + 2)?, 16).ok()?
-                };
-            }
-            let [red, green, blue, alpha] = bytes;
-            Color {
-                red,
-                green,
-                blue,
-                alpha,
-            }
-        }
-        _ => return None,
-    };
-    Some(Specified::Ready(ComputedValue::Color(color)))
 }
 
 pub(crate) fn compute_value(

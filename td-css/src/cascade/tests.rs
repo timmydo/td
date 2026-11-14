@@ -505,7 +505,7 @@ fn shorthand_expansion_is_atomic_and_has_longhand_precedence() {
 fn unsupported_or_invalid_values_do_not_erase_valid_ones() {
     for invalid in [
         "nonsense",
-        "rgb(1,2,3)",
+        "rgb(1,2%,3)",
         "#12",
         "red blue",
         "revert",

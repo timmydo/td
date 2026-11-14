@@ -1592,10 +1592,11 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      space is preserved; a cascade without `style` attributes; and a
      byte limit for each layout request, where today it is fixed when
      the page is cascaded.
-   - **td-css**: the owned-budget API supplies compilation admission;
-     remaining prerequisites are a refusal that names the sheet it arose in; a media condition for each sheet given to a set; the
-     `background` shorthand's colour; and `rgb()`, `hsl()` and CSS
-     Color 4's extended named colours.
+   - **td-css**: the owned-budget API supplies compilation admission,
+     and `rgb()`, `hsl()`, CSS Color 4's named colours and the
+     `background` shorthand's colour have landed; remaining
+     prerequisites are a refusal that names the sheet it arose in and
+     a media condition for each sheet given to a set.
    - **td-alloc** (available): `Charge::shrink_to`, which returns the difference
      between a charged ceiling and the actual, so td-web need not
      return the whole charge and charge the actual anew.
