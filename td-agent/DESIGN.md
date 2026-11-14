@@ -3057,6 +3057,11 @@ creates nothing.
   no repository, making an Empty workspace, and its own shared
   directories, which its workspaces bind in place of the configured
   `shared` list.
+- **Diagnose, unconfined** makes a scratch workspace whose commands run
+  as the human, with the human's environment, filesystem access and
+  network access, outside any jail and with no workspace account. It
+  uses the unconfined workspace path (§8), including its confirmation,
+  approval policy and status indicator. It grants no root privileges.
 - **Any template** may turn on the system view (§8, System view), so
   its conversations can see what the whole machine is doing; the
   built-ins never do.
@@ -3196,8 +3201,9 @@ template… instead. The driven actions include `new-template` and
 item, open the model picker's finder over Empty (its
 meta `scratch`), Directory… (`folder`) and each configured template in
 the order written (`scratch`, or `repositories` for one naming any),
-Empty selected, then `Empty, unconfined` and `Directory…, unconfined`
-(`scratch, no jail` and `folder, no jail`, §8, Unconfined workspaces)
+Empty selected, then `Diagnose, unconfined` and `Directory…, unconfined`
+(`runs as you` and `folder, no jail`,
+§8, Unconfined workspaces)
 and New template…: typing filters, `Return` or a second press chooses,
 and `Escape` makes nothing. Empty starts a conversation in a scratch
 workspace, and Directory… opens the folder chooser; no template may be
@@ -4465,17 +4471,19 @@ launching process with `SIGKILL` and find no process of its instance
 left, the command it was running included.
 
 **Unconfined workspaces.** The one way to run tools without a jail is a
-choice the human makes when creating an Empty or Directory… workspace;
-a template's and a repository workspace are always jailed. It is shown
-in the status row and the list. Its commands have the whole of the conversation
-process's environment and nothing stands between them and the machine; what td
-itself does not ship they lack as the person does. They can reach the key file, the
-store and the publish repositories, the fetch and egress sockets, the
+choice the human makes through Diagnose or Directory…, unconfined.
+Diagnose creates an unconfined Empty workspace for system troubleshooting;
+a configured template's and a repository workspace are always jailed.
+It is shown in the status row and the list. Its commands have the whole
+of the conversation process's environment and nothing stands between
+them and the machine; what td itself does not ship they lack as the
+person does. They can reach the key file, the store and the publish
+repositories, the fetch and egress sockets, the
 human's SSH agent, and the control socket, through which they could
 answer their own cards; it is a decision to trust the model with
 everything the human has, and its card says so.
 
-The chooser lists `Empty, unconfined` and `Directory…,
+The chooser lists `Diagnose, unconfined` and `Directory…,
 unconfined` after the templates (§7, "Templates"); either
 opens a card, the second once its folder is chosen, titled `Run without
 the jail`, which says what the tools reach and that stopping a command
@@ -7634,8 +7642,9 @@ Conversation → Routing chooses another
 
 **Templates.** `template` is read. A `name` is visible text
 of at most 64 bytes with no space at either end and nothing a card
-would show as `<U+XXXX>` (§11), unique among the templates and neither
-`Empty` nor `Directory…` (nor `Directory...`), each ASCII case aside;
+would show as `<U+XXXX>` (§11), unique among the templates and not named as
+any chooser built-in (§7), `Diagnose`, or the former `Empty, unconfined`
+name, each ASCII case aside (an ellipsis may also be written `...`);
 there are at most 64 templates. Each of `repos` has a `remote`, a
 `base` and a `branch`, text of at most 2,048 bytes with no control
 character, and an optional `sparse` list of paths, each relative, with

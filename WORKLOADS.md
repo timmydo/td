@@ -21,9 +21,10 @@ read-only runtime, owns a private writable home, and reaches anything of
 the human's only through a grant the human made and td-authd performed.
 
 One exception is deliberate, and the repository user chose it:
-td-agent's unconfined workspace, which the human picks for a
-conversation, or which is all the chooser offers where td-jail cannot
-run and the human enabled `unconfined_without_jail` (td-agent/DESIGN.md
+td-agent's unconfined workspace, which the human picks through
+Diagnose or Directory…, unconfined for a conversation, or which is all
+the chooser offers where td-jail cannot run and the human enabled
+`unconfined_without_jail` (td-agent/DESIGN.md
 §8, "Unconfined workspaces"), runs its tools as the human with no jail.
 The model drives those tools and its input can be hostile, so this is
 the workload the decision otherwise forbids, with everything the human
@@ -441,9 +442,9 @@ own account.
    account) and clears its rows, freeing it, and the next conversation
    creates it again fresh, as a deleted sandbox is created again. The
    human's directories reach the account as per-launch views from
-   td-agent's plan. A built-in "diagnose" template follows, and reviews
-   move through root onto a `review-N` slot pool, retiring td-jail's
-   uid-1000 workspace class. In six landings:
+   td-agent's plan. The built-in Diagnose choice runs unconfined as the
+   human, and reviews move through root onto a `review-N` slot pool,
+   retiring td-jail's uid-1000 workspace class. In six landings:
    workspace accounts in the ledger, with nothing launched as one (landed:
    `allocate-workload` and `prepare-workload` admit the `workspace` kind,
    only td-agent's slots, `agent-1` through `agent-960` and `review-1`
@@ -483,7 +484,9 @@ own account.
    account before its staging is removed, and only the exact source,
    repository and scratch trees enter each launch; td-jail refuses the
    human caller on td); and the
-   diagnose template.
+   Diagnose built-in (landed: the chooser's `Diagnose, unconfined` creates
+   a scratch workspace on the existing unconfined path, as the human
+   with no jail or ledger slot, after its explicit confirmation).
 9. mail and news on their reserved rows, with fetch services of their
    own as td-web has (td-web/DESIGN.md §3).
 10. td-software's runtime view (its folders panel landed with step 6).

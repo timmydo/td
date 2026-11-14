@@ -5641,8 +5641,8 @@ impl App {
         }
         let unconfined = [
             (
-                crate::config::EMPTY_UNCONFINED.to_string(),
-                "scratch, no jail".to_string(),
+                crate::config::DIAGNOSE.to_string(),
+                "runs as you".to_string(),
             ),
             (
                 crate::config::DIRECTORY_UNCONFINED.to_string(),
@@ -6052,7 +6052,7 @@ impl App {
                 let onward = [
                     crate::config::DIRECTORY,
                     crate::config::NEW_TEMPLATE,
-                    crate::config::EMPTY_UNCONFINED,
+                    crate::config::DIAGNOSE,
                     crate::config::DIRECTORY_UNCONFINED,
                 ];
                 if picking == Picking::Edit
@@ -6079,7 +6079,7 @@ impl App {
                     }
                     // Its card first: running without the jail is the
                     // person's decision, made knowing what it gives.
-                    Picking::Template if name == crate::config::EMPTY_UNCONFINED => {
+                    Picking::Template if name == crate::config::DIAGNOSE => {
                         self.ask_unconfine(None);
                         if self.confirm.is_none() {
                             self.offer();
@@ -12874,9 +12874,18 @@ pub mod tests {
             key(app, "Return");
             assert!(app.confirm().is_none());
         };
-        // Empty, unconfined: the card, then a scratch workspace unconfined;
+        // Diagnose: the card, then a scratch workspace unconfined;
         // its Cancel starts nothing.
-        choose(&mut app, 2);
+        key(&mut app, "C-n");
+        for c in "Diagnose".chars() {
+            key(&mut app, &c.to_string());
+        }
+        assert_eq!(
+            app.picker().unwrap().selected(),
+            Some(crate::config::DIAGNOSE)
+        );
+        assert!(text(&app).contains("runs as you"));
+        key(&mut app, "Return");
         assert!(matches!(
             app.confirm().map(|c| c.purpose()),
             Some(confirm::Purpose::Unconfine(None))
@@ -12950,7 +12959,7 @@ pub mod tests {
             .collect();
         assert_eq!(
             listed,
-            ["Empty, unconfined", "Directory\u{2026}, unconfined"]
+            ["Diagnose, unconfined", "Directory\u{2026}, unconfined"]
         );
         key(&mut app, "Return");
         answer(&mut app, "run without the jail");
@@ -13485,7 +13494,7 @@ pub mod tests {
                 "Directory\u{2026}",
                 "notes",
                 "td",
-                "Empty, unconfined",
+                "Diagnose, unconfined",
                 "Directory\u{2026}, unconfined",
                 "New template\u{2026}"
             ]
@@ -13515,13 +13524,9 @@ pub mod tests {
         key(&mut app, "C-n");
         key(&mut app, "Escape");
         assert!(app.picker().is_none() && app.take_requests().is_empty());
-        let base = std::env::temp_dir().join(format!(
-            "td-agent-ui-chooser-{}-{}",
-            std::process::id(),
-            crate::store::random_hex(4).unwrap()
-        ));
-        std::fs::create_dir_all(base.join("notes")).unwrap();
-        let base = std::fs::canonicalize(&base).unwrap();
+        let owned = td_fs::TempDir::new("ui-chooser").unwrap();
+        let base = std::fs::canonicalize(owned.path()).unwrap();
+        std::fs::create_dir(base.join("notes")).unwrap();
         app.set_chooser_start(base.clone());
         // Directory… opens the folder chooser.
         let directory = |app: &mut App| {
@@ -13550,8 +13555,8 @@ pub mod tests {
         assert_eq!(app.chooser().unwrap().folder(), base);
         key(&mut app, "Escape");
         assert!(app.chooser().is_none() && app.take_requests().is_empty());
-        std::fs::remove_dir_all(&base).unwrap();
         // Its folder gone, it opens elsewhere rather than not at all.
+        std::fs::remove_dir_all(&base).unwrap();
         directory(&mut app);
         assert!(app
             .chooser()

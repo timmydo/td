@@ -1381,7 +1381,7 @@ pub const EMPTY: &str = "Empty";
 pub const DIRECTORY: &str = "Directory\u{2026}";
 pub const NEW_TEMPLATE: &str = "New template\u{2026}";
 /// The chooser's unconfined built-ins (DESIGN.md §8).
-pub const EMPTY_UNCONFINED: &str = "Empty, unconfined";
+pub const DIAGNOSE: &str = "Diagnose, unconfined";
 pub const DIRECTORY_UNCONFINED: &str = "Directory\u{2026}, unconfined";
 
 /// A template's name: visible, at most `MAX_TEMPLATE_NAME` bytes, and
@@ -1402,13 +1402,16 @@ pub fn template_name(name: &str) -> Result<String, String> {
         "directory...",
         "new template\u{2026}",
         "new template...",
+        "diagnose",
+        "diagnose, unconfined",
+        // Keep the former built-in name reserved.
         "empty, unconfined",
         "directory\u{2026}, unconfined",
         "directory..., unconfined",
     ];
     if RESERVED.contains(&lower.as_str()) {
         return Err(format!(
-            "no template may be named {name:?}: the chooser lists {EMPTY}, {DIRECTORY}, {EMPTY_UNCONFINED}, {DIRECTORY_UNCONFINED} and {NEW_TEMPLATE} itself"
+            "no template may be named {name:?}: the chooser lists {EMPTY}, {DIRECTORY}, {DIAGNOSE}, {DIRECTORY_UNCONFINED} and {NEW_TEMPLATE} itself"
         ));
     }
     Ok(name.to_string())
@@ -3945,6 +3948,8 @@ mod tests {
             "New template\u{2026}",
             "new template...",
             "Empty, unconfined",
+            "Diagnose",
+            "DIAGNOSE, UNCONFINED",
             "directory..., unconfined",
         ] {
             assert!(template_name(reserved)

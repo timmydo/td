@@ -42,7 +42,7 @@ standard input and output to HOST's td-agent serve.\n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
 C-n starts a conversation from a workspace template\n\
-(Empty, Directory..., one configured, or Empty or Directory... unconfined,\n\
+(Empty, Directory..., one configured, or Diagnose or Directory... unconfined,\n\
 whose tools run outside any jail; td-agent/DESIGN.md §7, §8), or\n\
 with no workspace when its jail is absent (unconfined ones only, with\n\
 unconfined_without_jail); C-PageUp and C-PageDown\n\
