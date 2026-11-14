@@ -84,7 +84,10 @@ scratch, line arrays and navigation caches own actual capacity, under the
 page root and a 24 MiB per-wrap child respectively. Cache admission failure
 falls back to uncached measurement; wrapping refusal preserves logical
 navigation state and paints a static notice. Their dedicated modules have
-strict source guards. Its render-worker mailbox and typed request/result slots use
+strict source guards. Browser find scratch and both generations of match
+results share a 2 MiB child of the page budget. Scratch and alternate result
+buffers are reused; search and reveal must both succeed before new matches
+replace the old state. Its render-worker mailbox and typed request/result slots use
 one fallible shared owner on the page root, with four reusable request/result
 slots admitted at startup and a content-type copy held inline or in a
 BudgetString. Tickets keep the mailbox's charge through their lifetimes. Thread startup still uses std/OS machinery.
@@ -148,6 +151,8 @@ its children is fallible; `try_clone` shares the identity without allocating
 and refuses reference-count overflow. There is no implicit thread-local
 budget, reset operation or unlimited constructor. A chain has at most 16
 nodes, including the root, bounding admission, rollback and destruction.
+`ptr_eq` compares live budget identity without allocating; clones share an
+identity, while a child or an independently created budget has its own.
 Each budget charges its own control block; a child also charges that block
 to every ancestor. Its limit includes this metadata. The control block
 stays charged while any handle, descendant or storage owner remains alive.

@@ -81,6 +81,10 @@ impl Budget {
     pub fn try_clone(&self) -> Result<Self, BudgetError> {
         Ok(Self(self.0.try_clone()?))
     }
+    /// Whether both handles name the same live budget, without allocating.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0.get(), other.0.get())
+    }
     pub fn limit(&self) -> usize {
         self.0.get().limit
     }
@@ -198,6 +202,23 @@ impl Drop for Charge {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    #[test]
+    fn identity_distinguishes_shared_handles_from_equal_limits_and_children() {
+        let root = Budget::new(4096).unwrap();
+        let shared = root.try_clone().unwrap();
+        let other = Budget::new(4096).unwrap();
+        let child = root.child(4096).unwrap();
+        let used = root.used();
+        crate::with_reservation_limit(0, || {
+            assert!(root.ptr_eq(&shared));
+            assert!(shared.ptr_eq(&root));
+            assert!(!root.ptr_eq(&other));
+            assert!(!root.ptr_eq(&child));
+            assert!(child.ptr_eq(&child.try_clone().unwrap()));
+        });
+        assert_eq!(root.used(), used);
+    }
+
     #[test]
     fn replacement_admission_survives_refusal_and_unwind() {
         let root = Budget::new(4096).unwrap();

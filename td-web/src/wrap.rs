@@ -292,6 +292,9 @@ impl Rendered {
     pub fn refused(&self) -> bool {
         self.refused
     }
+    pub(crate) fn refuse(&mut self) {
+        self.refused = true;
+    }
     /// Begin another user action; previously admitted cache entries remain usable.
     pub fn retry(&mut self) {
         self.refused = false;

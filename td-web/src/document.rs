@@ -194,7 +194,7 @@ impl PageRef {
         let memory = memory::root().unwrap();
         Self::new(page, memory.charge(memory::PAGES).unwrap()).unwrap()
     }
-    fn budget(&self) -> Option<&Budget> {
+    pub(crate) fn budget(&self) -> Option<&Budget> {
         self.0.as_ref().map(|page| page.budget())
     }
 }
@@ -3198,6 +3198,78 @@ mod wrap_bench {
             .trim();
         println!(
             "BENCH {scenario} ns={elapsed} checksum={checksum} retained={retained} peak={peak}"
+        );
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod search_bench {
+    use super::*;
+    use crate::view::View;
+    use std::time::Instant;
+    use td_ui::raster::Scale;
+
+    #[test]
+    #[ignore = "paired release search measurement; TD_SEARCH_BENCH selects fixture"]
+    fn find() {
+        let scenario = std::env::var("TD_SEARCH_BENCH").unwrap_or_else(|_| "sparse".into());
+        let (text, query, iterations) = match scenario.as_str() {
+            "dense" => ("a ".repeat(300_000), "a".to_string(), 2000),
+            "fallback" => ("a".repeat(2 << 20), format!("{}b", "a".repeat(200)), 100),
+            "unicode" => (
+                ("é界 Αβγ ".repeat(200) + "needle\n").repeat(500),
+                "NEEDLE".to_string(),
+                100,
+            ),
+            "short" | "typing" => (
+                "alpha beta gamma\n".to_string(),
+                "beta".to_string(),
+                300_000,
+            ),
+            _ => (
+                ("alpha beta gamma ".repeat(100) + "needle\n").repeat(1000),
+                "needle".to_string(),
+                100,
+            ),
+        };
+        let doc = Document::from_reply(
+            Url::parse("https://bench.invalid/").unwrap(),
+            200,
+            Some("text/plain; charset=utf-8"),
+            text.into_bytes(),
+        );
+        let mut rendered = doc.render(640, TextFamily::Sans).unwrap();
+        let mut metrics = Metrics::new(None, Scale::new(1).unwrap());
+        let mut view = View::default();
+        let start = Instant::now();
+        for i in 0..iterations {
+            let query = if scenario == "typing" && i % 2 == 0 {
+                "gamma"
+            } else {
+                &query
+            };
+            view.find(std::hint::black_box(query), &mut rendered, &mut metrics, 30);
+            assert!(!rendered.refused());
+            std::hint::black_box(&view);
+        }
+        let ns = start.elapsed().as_nanos();
+        let checksum = view.hits.iter().fold(0u64, |sum, hit| {
+            sum.wrapping_mul(31)
+                .wrapping_add(hit.start.logical as u64)
+                .wrapping_add(hit.start.run as u64)
+                .wrapping_add(hit.start.at as u64)
+                .wrapping_add(hit.end.at as u64)
+        });
+        let retained = rendered.page.budget().unwrap().used();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find_map(|s| s.strip_prefix("VmHWM:"))
+            .unwrap()
+            .trim();
+        println!(
+            "SEARCH {scenario} ns={ns} hits={} checksum={checksum} retained={retained} peak={peak}",
+            view.hits.len()
         );
     }
 }

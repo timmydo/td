@@ -28,6 +28,10 @@ impl<T> Items<T> {
     pub fn try_reserve(&mut self, n: usize) -> Result<(), BudgetError> {
         td_alloc::BudgetVec::try_reserve(self.0.as_mut().ok_or(BudgetError::Limit)?, n)
     }
+    /// Admit exactly the requested additional capacity, relative to length.
+    pub fn try_reserve_exact(&mut self, n: usize) -> Result<(), BudgetError> {
+        td_alloc::BudgetVec::try_reserve_exact(self.0.as_mut().ok_or(BudgetError::Limit)?, n)
+    }
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), BudgetError> {
         self.0.as_mut().ok_or(BudgetError::Limit)?.try_push(value)

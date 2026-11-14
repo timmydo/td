@@ -280,6 +280,7 @@ const PROSE_STORAGE_SOURCES: &[&str] = &[
     "td-ui/src/prose/items.rs",
     "td-ui/src/prose/wrap.rs",
     "td-web/src/wrap.rs",
+    "td-web/src/search.rs",
 ];
 
 const TREE_STORAGE_SOURCES: &[&str] = &[

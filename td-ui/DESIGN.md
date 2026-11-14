@@ -4289,7 +4289,8 @@ glyphs, the result array, pieces and placed glyphs own admission, including
 replacement overlap, and refusal drops partial output. Word breaks reuse
 the pending buffer. Line arrays use `Items<T>`, optional budget-owned
 storage: default is an allocation-free empty value that cannot grow; a
-funded instance retains its original budget. Slice access cannot grow it;
+funded instance retains its original budget. Its fallible exact reservation
+lets bounded consumers limit spare capacity. Slice access cannot grow it;
 `try_clone_with` delegates element copying to a fallible callback whose
 own allocation behavior remains the caller's responsibility. `Line::try_clone`
 uses only nonallocating element copies. Moving a line or consuming the

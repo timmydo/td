@@ -10,6 +10,7 @@ mod fetch;
 mod memory;
 mod picture;
 mod save;
+mod search;
 mod view;
 mod worker;
 

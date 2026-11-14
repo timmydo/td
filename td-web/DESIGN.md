@@ -241,6 +241,20 @@ page and logical position on refusal, and retries creation on a later
 relayout or scroll. Failed cache filling never changes the immutable page. Error-page
 text is bounded to 4096 UTF-8 bytes before plain-text conversion.
 
+Find owns its query scalars, prefix table, position ring and match arrays
+under a 2 MiB child of the page budget, including metadata, scratch and
+old/new result overlap. Its query is bounded to 256 Unicode scalar values
+and its matches to 10,000. Scratch and alternate result buffers retain their
+capacity for reuse; clearing find releases them. Changing pages rebinds the
+cache to the new page's budget identity. The search module has a strict
+allocation source guard. Results are staged until searching and revealing
+the chosen match both succeed. A refused search preserves the old marks,
+current-match index, viewport, focus and selection, and shows the static
+resource notice. Enter in find, or n/N on the page, retries a refused query
+without skipping its first selected result. Unrelated scrolling, resizing and font changes do not
+dismiss that search refusal or replace the old marks. A resize stages its replacement marks until
+the whole reflow succeeds, retaining the previous marks on refusal.
+
 PNG reserves once from its validated inflated size before decoding.
 Bounds up to 16 MiB round up to a power of two for reuse; larger bounds
 reserve exactly. The smaller case fits below 81 MiB with RGBA and row
@@ -257,7 +271,7 @@ bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
 
 These legacy allowances are an admission model, distinct from exact
 ownership of the new parser, CSS and layout storage in §10. They do not
-instrument every std allocation inside the legacy rich renderer, find/selection helpers, font and raster
+instrument every std allocation inside the legacy rich renderer, selection-copy helpers, font and raster
 ownership, fetch/window IPC or URL/response metadata. Those source-inventory entries
 remain migration debt; this is not a whole-process allocation-failure
 guarantee. The root cap supplements the per-input/work limits and the
@@ -772,8 +786,9 @@ line not shown whole. Find searches the page's logical lines, all of
 them however few are laid (§5), and matches within one, across its
 runs and the ends of its wrapped lines and ignoring case, looking at
 each character once (Knuth, Morris and Pratt), so a search costs the
-text searched whatever the query: 16 to 19 ms for a word of 2 MiB,
-200-character queries included. Showing a match lays the lines around
+text searched whatever the query. The ignored `document::search_bench::find`
+benchmark exercises sparse and dense matches, a repeated-prefix query,
+Unicode and short pages in release builds. Showing a match lays the lines around
 it and shows it whole where the pane holds it, from the line its last
 character is on up to the one its first drawn glyph is on, a space a
 wrapped line ends with being dropped there; each line it is on marks

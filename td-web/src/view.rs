@@ -2,9 +2,7 @@
 //! starts, the focused link and what find matched; and the page painted
 //! over its pane in prose, each glyph at the pen its line was laid with.
 
-use std::collections::VecDeque;
-
-use td_ui::prose::{self, LineBox, Metrics, OVERHANG, SIZE};
+use td_ui::prose::{Items, LineBox, Metrics, OVERHANG, SIZE};
 use td_ui::raster::{
     fill, Draw, GlyphStyle, Primitive, Rect, ACCENT, CHROME, INACTIVE_SELECTION, INK, PAPER,
     SELECTED,
@@ -12,8 +10,6 @@ use td_ui::raster::{
 
 use crate::document::{Place, Rendered, Wrapped, NO_LINK};
 
-/// The most matches find marks.
-pub const MAX_HITS: usize = 10_000;
 /// The most glyphs drawn at one pen: combining marks take no advance in
 /// Noto, so without a bound one line could ask a paint for as many glyphs
 /// as the page has characters.
@@ -82,14 +78,15 @@ pub struct Spot {
     pub under: Option<Place>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct View {
     /// Where the first line shown starts.
     pub top: Place,
     /// The focused link.
     pub focus: Option<usize>,
     /// Every match, in the page's order.
-    pub hits: Vec<Hit>,
+    pub hits: Items<Hit>,
+    search: crate::search::Search,
     /// The current match, an index into `hits`.
     pub at: usize,
     /// The text selected, which find's current match becomes.
@@ -112,6 +109,27 @@ fn first_not(count: usize, before: impl Fn(usize) -> bool) -> usize {
 }
 
 impl View {
+    /// Commit a successful re-mark without moving the viewport or selection.
+    pub(crate) fn replace_marks(&mut self, hits: Items<Hit>) {
+        let old = std::mem::replace(&mut self.hits, hits);
+        self.search.recycle(old);
+        self.at = self.at.min(self.hits.len().saturating_sub(1));
+    }
+    pub(crate) fn prepare_marks(
+        &mut self,
+        query: &str,
+        rendered: &Rendered,
+        metrics: &mut Metrics,
+    ) -> Result<Items<Hit>, td_alloc::BudgetError> {
+        self.search.prepare(query, rendered, metrics)
+    }
+    pub(crate) fn discard_marks(&mut self, hits: Items<Hit>) {
+        self.search.recycle(hits);
+    }
+    pub(crate) fn clear_marks(&mut self) {
+        self.hits = Items::default();
+        self.search = crate::search::Search::default();
+    }
     /// A navigation action may partially fill a cache, but a refused action
     /// keeps the logical viewport, focus and selection. Painting reports it;
     /// the next action retries after any pressure has been released.
@@ -180,9 +198,26 @@ impl View {
         metrics: &mut Metrics,
         rows: usize,
     ) {
-        self.navigate(rendered, |this, rendered| {
-            this.find_inner(query, rendered, metrics, rows)
-        });
+        rendered.retry();
+        let Ok(hits) = self.prepare_marks(query, rendered, metrics) else {
+            rendered.refuse();
+            return;
+        };
+        let before = (self.top, self.focus, self.at, self.selection);
+        let old = std::mem::replace(&mut self.hits, hits);
+        let first = self.hits.partition_point(|hit| hit.start < self.top);
+        self.at = if first < self.hits.len() { first } else { 0 };
+        if self.hits.is_empty() {
+            self.selection = None;
+        }
+        self.show_hit(rendered, metrics, rows);
+        if rendered.refused() {
+            let refused = std::mem::replace(&mut self.hits, old);
+            (self.top, self.focus, self.at, self.selection) = before;
+            self.discard_marks(refused);
+        } else {
+            self.search.recycle(old);
+        }
     }
     pub fn step_hit(
         &mut self,
@@ -308,91 +343,6 @@ impl View {
         };
         self.focus = Some(next);
         self.reveal_inner(place(next), rendered, metrics, rows);
-    }
-
-    /// Marks every match of `query` (`mark`) and makes current the first
-    /// at or after the screen's top, scrolling to it.
-    fn find_inner(
-        &mut self,
-        query: &str,
-        rendered: &mut Rendered,
-        metrics: &mut Metrics,
-        rows: usize,
-    ) {
-        self.mark(query, rendered, metrics);
-        let top = self.top;
-        let first = self.hits.partition_point(|hit| hit.start < top);
-        self.at = if first < self.hits.len() { first } else { 0 };
-        if self.hits.is_empty() {
-            self.selection = None;
-        }
-        self.show_hit(rendered, metrics, rows);
-    }
-
-    /// Marks every match of `query` again on lines wrapped anew, keeping
-    /// which is current as far as there are as many, and not scrolling.
-    pub fn remark(&mut self, query: &str, rendered: &Rendered, metrics: &mut Metrics) {
-        let at = self.at;
-        self.mark(query, rendered, metrics);
-        self.at = at.min(self.hits.len().saturating_sub(1));
-    }
-
-    /// Marks every match of `query` in each logical line, across its runs
-    /// and its wrapped lines and ignoring case, at most `MAX_HITS`: all of
-    /// a line that wraps, and only what is laid of one that does not
-    /// (`Rendered::searched`), the query's characters and the page's
-    /// alike as they are shown, a tab as a space. Matches do not overlap,
-    /// the first found first. Each character is looked at once (Knuth,
-    /// Morris and Pratt), so a search costs the page's text whatever the
-    /// query.
-    fn mark(&mut self, query: &str, rendered: &Rendered, metrics: &mut Metrics) {
-        self.hits.clear();
-        self.at = 0;
-        let needle: Vec<char> = query.chars().map(|c| fold(prose::shown(c))).collect();
-        if needle.is_empty() {
-            return;
-        }
-        let borders = borders(&needle);
-        let hits = &mut self.hits;
-        // Where the characters last matched are.
-        let mut window: VecDeque<Place> = VecDeque::with_capacity(needle.len());
-        let mut full = false;
-        for logical in 0..rendered.page.lines.len() {
-            window.clear();
-            let mut matched = 0;
-            rendered.searched(metrics, logical, |scalar, place| {
-                let seen = fold(prose::shown(scalar));
-                while matched > 0 && needle.get(matched) != Some(&seen) {
-                    matched = borders.get(matched - 1).copied().unwrap_or(0);
-                }
-                if needle.get(matched) == Some(&seen) {
-                    matched += 1;
-                }
-                window.push_back(place);
-                while window.len() > matched {
-                    window.pop_front();
-                }
-                if matched < needle.len() {
-                    return true;
-                }
-                if hits.len() == MAX_HITS {
-                    full = true;
-                    return false;
-                }
-                let start = window.front().copied().unwrap_or(place);
-                let end = Place {
-                    at: place.at + scalar.len_utf8(),
-                    ..place
-                };
-                hits.push(Hit { start, end });
-                window.clear();
-                matched = 0;
-                true
-            });
-            if full {
-                return;
-            }
-        }
     }
 
     /// Moves to the next match or the previous one, around the ends.
@@ -586,35 +536,6 @@ fn line_end(rendered: &Rendered, wrapped: &Wrapped) -> Place {
         Some(place.past(c))
     })
     .unwrap_or_else(|| wrapped.place())
-}
-
-/// For each prefix of `needle`, how long its longest prefix that is also
-/// its suffix, and not all of it, is: where a match that fails after it
-/// goes on from.
-fn borders(needle: &[char]) -> Vec<usize> {
-    let mut table = vec![0; needle.len()];
-    let mut k = 0;
-    for i in 1..needle.len() {
-        while k > 0 && needle.get(i) != needle.get(k) {
-            k = table.get(k - 1).copied().unwrap_or(0);
-        }
-        if needle.get(i) == needle.get(k) {
-            k += 1;
-        }
-        if let Some(slot) = table.get_mut(i) {
-            *slot = k;
-        }
-    }
-    table
-}
-
-/// One character as find compares it.
-fn fold(c: char) -> char {
-    let mut lower = c.to_lowercase();
-    match (lower.next(), lower.next()) {
-        (Some(single), None) => single,
-        _ => c,
-    }
 }
 
 /// What a pass over a line paints: the grounds under its glyphs, the
@@ -944,7 +865,7 @@ mod tests {
         let mut view = View::default();
         view.find("alpha", &mut page, metrics, 5);
         assert_eq!(
-            view.hits,
+            &*view.hits,
             [
                 Hit {
                     start: at(0, 0, 0),
@@ -964,7 +885,7 @@ mod tests {
         assert_eq!(view.at, 2);
         view.find("a b", &mut page, metrics, 5);
         assert_eq!(
-            view.hits,
+            &*view.hits,
             [Hit {
                 start: at(0, 0, 4),
                 end: at(0, 1, 1)
@@ -1036,7 +957,7 @@ mod tests {
         let (metrics, mut view) = (&mut cell(), View::default());
         view.find("aab", &mut page, metrics, 1);
         assert_eq!(
-            view.hits,
+            &*view.hits,
             [Hit {
                 start: at(0, 0, 1),
                 end: at(0, 0, 4)
@@ -1079,13 +1000,14 @@ mod tests {
         let mut wide = Rendered::new(&page, 300 * CELL_WIDTH as u32, TextFamily::Sans).unwrap();
         view.find("needle", &mut wide, metrics, 1);
         assert_eq!(
-            view.hits,
+            &*view.hits,
             [Hit {
                 start: at(0, 0, 200),
                 end: at(0, 0, 206)
             }]
         );
-        view.remark("needle", &narrow, metrics);
+        let hits = view.prepare_marks("needle", &narrow, metrics).unwrap();
+        view.replace_marks(hits);
         assert!(view.hits.is_empty(), "made again at the narrow width");
     }
 
@@ -1560,7 +1482,8 @@ mod tests {
         assert_eq!(selected(&view), Some((at(0, 0, 0), at(0, 0, 5))));
         view.step_hit(true, &mut rendered, metrics, 1);
         assert_eq!(selected(&view), Some((at(0, 0, 11), at(0, 0, 16))));
-        view.remark("alpha", &rendered, metrics);
+        let hits = view.prepare_marks("alpha", &rendered, metrics).unwrap();
+        view.replace_marks(hits);
         assert_eq!(selected(&view), Some((at(0, 0, 11), at(0, 0, 16))), "kept");
         view.find("zeta", &mut rendered, metrics, 1);
         assert_eq!(view.selection, None);

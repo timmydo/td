@@ -33,7 +33,7 @@ use crate::view::{self, Pane, Selection, View};
 /// The longest address the row holds, in characters.
 const MAX_ADDRESS: usize = 4096;
 /// The longest find query.
-const MAX_QUERY: usize = 256;
+const MAX_QUERY: usize = crate::search::MAX_QUERY;
 /// The most pages kept behind or ahead.
 pub const MAX_HISTORY: usize = 100;
 /// The most fetches running at once, stopped ones included: a stopped
@@ -202,6 +202,7 @@ struct Current {
     rendered: Rendered,
     rendered_for: Option<Layout>,
     render_refused: bool,
+    find_refused: bool,
     fitted: PictureFit,
 }
 
@@ -440,6 +441,7 @@ impl App {
                 rendered: Rendered::default(),
                 rendered_for: None,
                 render_refused: false,
+                find_refused: false,
                 fitted: PictureFit::Empty,
             },
             back: Vec::new(),
@@ -671,6 +673,7 @@ impl App {
             rendered: Rendered::default(),
             rendered_for: None,
             render_refused: false,
+            find_refused: false,
             fitted: PictureFit::Empty,
         };
         self.relayout();
@@ -880,6 +883,7 @@ impl App {
             self.current.view.at,
             self.current.view.selection,
         );
+        let mut marks = None;
         if reflow {
             let top = self.current.view.top;
             self.current.rendered.discard_layout();
@@ -903,28 +907,44 @@ impl App {
                 return;
             }
             view.focus = view.focus.filter(|&link| link < rendered.page.links.len());
-            if !view.hits.is_empty() || self.focus == Focus::Find {
-                let query = self.query.text().to_string();
-                view.remark(&query, rendered, &mut self.metrics);
+            if !self.current.find_refused && (!view.hits.is_empty() || self.focus == Focus::Find) {
+                match view.prepare_marks(self.query.text(), rendered, &mut self.metrics) {
+                    Ok(hits) => marks = Some(hits),
+                    Err(_) => rendered.refuse(),
+                }
             }
         }
-        self.scroll(0);
+        if !self.current.rendered.refused() {
+            self.scroll(0);
+        }
         if reflow && self.current.rendered.refused() {
             let view = &mut self.current.view;
+            if let Some(hits) = marks {
+                view.discard_marks(hits);
+            }
             (view.top, view.focus, view.at, view.selection) = before;
             view.at = view.at.min(view.hits.len().saturating_sub(1));
             self.current.rendered_for = None;
             self.current.render_refused = true;
+        } else if let Some(hits) = marks {
+            self.current.view.replace_marks(hits);
         }
     }
 
     fn refind(&mut self) {
+        if self.current.render_refused {
+            self.relayout();
+            if self.current.render_refused {
+                return;
+            }
+        }
         let rows = self.rows();
-        let query = self.query.text().to_string();
+        let query = self.query.text();
         let current = &mut self.current;
         current
             .view
-            .find(&query, &mut current.rendered, &mut self.metrics, rows);
+            .find(query, &mut current.rendered, &mut self.metrics, rows);
+        current.find_refused = current.rendered.refused();
         self.refresh_hover();
     }
 
@@ -956,6 +976,10 @@ impl App {
     }
 
     fn page_key(&mut self, chord: &str) {
+        if self.current.find_refused && matches!(chord, "n" | "N" | "S-n") {
+            self.refind();
+            return;
+        }
         if self.current.render_refused {
             self.relayout();
             if self.current.render_refused {
@@ -1004,7 +1028,11 @@ impl App {
             "?" => self.show_keys = true,
             "Escape" if !self.stop() => {
                 self.current.view.focus = None;
-                self.current.view.hits.clear();
+                self.current.view.clear_marks();
+                if self.current.find_refused {
+                    self.current.rendered.retry();
+                }
+                self.current.find_refused = false;
                 self.current.view.selection = None;
             }
             "C-a" => {
@@ -1187,6 +1215,10 @@ impl App {
                 }
             },
             Focus::Find => {
+                if self.current.find_refused && matches!(chord, "Return" | "S-Return") {
+                    self.refind();
+                    return;
+                }
                 let rows = self.rows();
                 let Current { view, rendered, .. } = &mut self.current;
                 match chord {
@@ -1252,7 +1284,10 @@ impl App {
             return;
         }
         self.focus = Focus::Page;
-        if self.current.render_refused || self.current.rendered.refused() {
+        if self.current.render_refused
+            || self.current.rendered.refused()
+            || self.current.find_refused
+        {
             return;
         }
         let now = self.clock.now();
@@ -1640,7 +1675,7 @@ impl Handler for App {
                 current
                     .rendered
                     .settle(&mut self.metrics, current.view.top, rows);
-                if current.rendered.refused() {
+                if current.rendered.refused() || current.find_refused {
                     picture_notice(surface, page, bounds, &mut sink);
                 } else {
                     view::paint(
@@ -3141,6 +3176,154 @@ mod tests {
         assert_eq!(painted_selection(&app), words);
     }
 
+    fn search_state(
+        app: &App,
+    ) -> (
+        Place,
+        Option<usize>,
+        usize,
+        Option<Selection>,
+        Vec<crate::view::Hit>,
+    ) {
+        let view = &app.current.view;
+        (
+            view.top,
+            view.focus,
+            view.at,
+            view.selection,
+            view.hits.to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_refused_query_keeps_old_results_and_enter_retries_the_new_query() {
+        let mut app = app(site().page(
+            "https://example.org/search",
+            "text/html",
+            "<p>alpha beta beta a-long-target</p>",
+        ));
+        typed(&mut app, "example.org/search");
+        app.focus = Focus::Find;
+        app.query.set_text("alpha").unwrap();
+        app.refind();
+        let before = search_state(&app);
+        app.query.set_text("beta").unwrap();
+        td_alloc::with_reservation_limit(0, || app.refind());
+        assert!(app.current.find_refused);
+        assert_eq!(search_state(&app), before);
+        // Unrelated navigation cannot dismiss the failed-query indication.
+        app.scroll(0);
+        assert!(app.current.find_refused);
+        key(&mut app, "Return");
+        assert!(!app.current.find_refused);
+        assert_eq!(app.current.view.hits.len(), 2);
+        assert_eq!(
+            app.current.view.at, 0,
+            "retry does not skip the first match"
+        );
+        assert_eq!(app.selected_text().unwrap().unwrap(), "beta");
+        app.query.set_text("a-long-target").unwrap();
+        td_alloc::with_reservation_limit(0, || app.refind());
+        assert!(app.current.find_refused);
+        key(&mut app, "Escape");
+        key(&mut app, "n");
+        assert!(!app.current.find_refused);
+        assert_eq!(app.current.view.hits.len(), 1);
+        key(&mut app, "Escape");
+        assert!(app.current.view.hits.is_empty());
+        assert!(
+            app.current.view.hits.budget().is_none(),
+            "clear releases storage"
+        );
+    }
+
+    #[test]
+    fn reflow_keeps_a_refused_query_pending_until_find_and_reveal_succeed() {
+        for change in ["resize", "font", "refused-resize"] {
+            for retry in ["Return", "n"] {
+                let mut app = app(site().page(
+                    "https://example.org/search",
+                    "text/html",
+                    "<p>alpha beta beta</p>",
+                ));
+                typed(&mut app, "example.org/search");
+                app.focus = Focus::Find;
+                app.query.set_text("alpha").unwrap();
+                app.refind();
+                let old = app.current.view.hits.to_vec();
+                let selected = app.current.view.selection;
+                app.query.set_text("beta").unwrap();
+                td_alloc::with_reservation_limit(0, || app.refind());
+                assert!(app.current.find_refused);
+                match change {
+                    "font" => key(&mut app, "F8"),
+                    "refused-resize" => td_alloc::with_reservation_limit(0, || {
+                        app.input(Input::Resize(surface(300)), &mut Board::default());
+                    }),
+                    _ => {
+                        app.input(Input::Resize(surface(300)), &mut Board::default());
+                    }
+                }
+                assert!(
+                    app.current.find_refused,
+                    "{change}: pending query was dismissed"
+                );
+                assert_eq!(&*app.current.view.hits, old);
+                assert_eq!(app.current.view.selection, selected);
+                if retry == "n" {
+                    key(&mut app, "Escape");
+                }
+                key(&mut app, retry);
+                assert!(!app.current.find_refused, "{change}/{retry}");
+                assert_eq!(
+                    app.current.view.at, 0,
+                    "{change}/{retry}: first result was skipped"
+                );
+                assert_eq!(app.current.view.hits.len(), 2);
+                assert_eq!(app.selected_text().unwrap().unwrap(), "beta");
+            }
+        }
+    }
+
+    #[test]
+    fn every_refused_resize_preserves_search_results_until_reflow_commits() {
+        let text = format!("<pre>needle {} needle</pre>", "x".repeat(50)).repeat(10);
+        let prepared = || {
+            let mut app = app(site().page("https://example.org/search", "text/html", &text));
+            typed(&mut app, "example.org/search");
+            app.focus = Focus::Find;
+            app.query.set_text("needle").unwrap();
+            app.refind();
+            assert_eq!(app.current.view.hits.len(), 20);
+            key(&mut app, "S-Return");
+            app
+        };
+        let mut expected = prepared();
+        expected.input(Input::Resize(surface(300)), &mut Board::default());
+        assert_eq!(expected.current.view.hits.len(), 10);
+        let wanted = search_state(&expected);
+        let mut passed = false;
+        for n in 0..512 {
+            let mut app = prepared();
+            let before = search_state(&app);
+            td_alloc::with_reservation_limit(n, || {
+                app.input(Input::Resize(surface(300)), &mut Board::default());
+            });
+            if app.current.render_refused {
+                assert_eq!(search_state(&app), before, "allowance {n}");
+                app.relayout();
+                assert!(!app.current.render_refused, "retry {n}");
+            } else {
+                passed = true;
+            }
+            assert_eq!(search_state(&app), wanted, "allowance {n}");
+            if passed {
+                break;
+            }
+        }
+        assert!(passed);
+    }
+
     #[test]
     fn refused_keyboard_extension_keeps_selection_and_focus_then_retries() {
         let text = "alpha beta gamma delta ".repeat(2000);
@@ -3464,5 +3647,43 @@ mod tests {
             row.chunks(4).any(|pixel| pixel != &row[..4])
         });
         assert!(ink, "the first line is drawn");
+    }
+    #[test]
+    #[ignore = "paired release search/reflow measurement"]
+    fn search_resize_benchmark() {
+        let text = format!("<pre>needle {} needle</pre>", "x".repeat(50)).repeat(500);
+        let mut app = app(site().page("https://example.org/search", "text/html", &text));
+        typed(&mut app, "example.org/search");
+        app.focus = Focus::Find;
+        app.query.set_text("needle").unwrap();
+        app.refind();
+        let start = std::time::Instant::now();
+        for i in 0..2000 {
+            app.input(
+                Input::Resize(surface(if i % 2 == 0 { 300 } else { 800 })),
+                &mut Board::default(),
+            );
+            assert!(!app.current.render_refused && !app.current.rendered.refused());
+            std::hint::black_box(&app.current.view);
+        }
+        let ns = start.elapsed().as_nanos();
+        let checksum = app.current.view.hits.iter().fold(0u64, |sum, hit| {
+            sum.wrapping_mul(31)
+                .wrapping_add(hit.start.logical as u64)
+                .wrapping_add(hit.start.run as u64)
+                .wrapping_add(hit.start.at as u64)
+                .wrapping_add(hit.end.at as u64)
+        });
+        let retained = app.renderer.budget().used();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find_map(|s| s.strip_prefix("VmHWM:"))
+            .unwrap()
+            .trim();
+        println!(
+            "SEARCH resize ns={ns} hits={} checksum={checksum} retained={retained} peak={peak}",
+            app.current.view.hits.len()
+        );
     }
 }
