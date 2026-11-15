@@ -5843,9 +5843,9 @@ network byte is the one its kind has; the
 path's rules, the account's admission (an application's declaration, a
 sandbox's ledger row) and the source's checks are root's, whose refusal
 is an `error` carrying its reason. A grant changes what the account's
-next launch publishes, never a running jail; a sandbox's grants and
-network take effect only once its launches go through root (WORKLOADS.md
-step 7).
+next launch publishes, never a running jail. A sandbox's next launch
+through root applies its directory grants and network policy
+(WORKLOADS.md, "Launch path").
 
 They travel the application requests' capacity-one queue, one a turn
 after the physical queue, and wait for the worker's answer at most four

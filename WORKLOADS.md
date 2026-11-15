@@ -1,12 +1,11 @@
 # Workloads: accounts, runtimes and grants
 
-**Status: decided by the repository user; not landed.** Each increment in
-"Landing order" amends the documents that state the current contract
-(`AGENTS.md`, `APPLICATIONS.md`, `td-authd/DESIGN.md`, `td-sandbox/DESIGN.md`,
-`td-agent/DESIGN.md`, `td-software/DESIGN.md`, `td-web/DESIGN.md`,
-`UNSAFE.md`) in the landing that changes it. Until then those documents
-describe the system as built, and where this one disagrees with them it
-describes the target.
+This document states td's workload account, runtime and grant contract.
+The implementation boundaries are specified in `APPLICATIONS.md`,
+`td-authd/DESIGN.md`, `td-sandbox/DESIGN.md`, `td-agent/DESIGN.md`,
+`td-software/DESIGN.md`, `td-web/DESIGN.md` and `UNSAFE.md`. Development-host
+launches are fixtures, with the exceptions listed below; the account
+requirements here describe the installed td system.
 
 A **workload** is anything td starts to run code on the human's behalf
 that td did not review as part of the target graph, or that acts on
@@ -16,7 +15,7 @@ workspace.
 
 ## The decision
 
-No workload runs as the human. Each runs as an account of its own, sees a
+Each confined workload runs as an account of its own, sees a
 read-only runtime, owns a private writable home, and reaches anything of
 the human's only through a grant the human made and td-authd performed.
 
@@ -36,10 +35,9 @@ of the human's directories, or a sandbox the host's network; td-agent's
 own control socket, so it can answer its own cards; root's workspace
 intake, so it
 can create, delete and launch any sandbox and spend workload rows, and
-from step 8 empty or enter any confined conversation's slot; and no
-bound on the processes it leaves (td-login/THREAT-MODEL.md §1). Every
-other td-agent workspace is jailed and, from step 8, runs as an account
-of its own.
+empty or enter any confined conversation's slot; and no bound on the
+processes it leaves (td-login/THREAT-MODEL.md §1). Every other td-agent
+workspace on td is jailed and runs as an account of its own.
 
 The alternative, every workload as the human with sharing by plain bind
 mounts, is simpler and was rejected. Its jail is then the only wall: an
@@ -74,7 +72,8 @@ Already built and reused by this design:
   row through td-authd, and which never reuses a uid; td-login resolves
   application accounts from it and every application identity consumer
   reads it (td-authd/DESIGN.md, "Workload account ledger");
-- td-jail's mapping of an external uid to 1000 inside the jail;
+- td-jail's application mapping of an external uid to 1000 inside the
+  jail; workspace jails map the caller's uid to itself;
 - the workload grant table `/var/lib/td/grants.tsv`, root's alone,
   whose directory rows keyed by account td-authd publishes as idmapped
   views at each application launch and lists in the account's manifest,
@@ -106,7 +105,7 @@ Already built and reused by this design:
 - td-portal's caller identity from the bus broker's uid and jail lineage
   (`APPLICATIONS.md` §E).
 
-Step 7 landed: each sandbox runs as an account of its own, `tdw<uid>`
+Each sandbox runs as an account of its own, `tdw<uid>`
 from 98304 up, which root's workspace intake allocates through
 `td-firstboot allocate-workload 1000 sandbox NAME` with an empty home
 under `/var/lib/td/workloads` and a `td-workload-UID` delegation, and
@@ -134,14 +133,14 @@ plan rather than through persistent grant-table requests.
 
 ## A launch
 
-Every workload launch combines the same four parts:
+Every confined workload launch combines the same four parts:
 
 | Part | What it is | Who may write it |
 | --- | --- | --- |
 | Runtime | read-only trees at `/usr` (and `/app` for a Flathub application) | the runtime account, through td-app |
-| Account | the external uid the workload runs as; 1000 inside its jail | nobody; root allocates it |
+| Account | the ledger uid outside; 1000 inside an application jail, the same ledger uid inside a workspace jail | root allocates it |
 | Home | the account's private home | the workload |
-| Grants | the human's directories and sockets the human granted | root, through td-authd |
+| Access | directory views, declared service sockets and network policy | root, through td-authd and the admitted launch policy |
 
 What differs between Firefox, mail, a sandbox and an agent workspace is
 only what fills each part and which td-jail launch kind applies its
@@ -255,7 +254,8 @@ td-agent adopts (td-authd/DESIGN.md, "Workload account ledger").
 
 ## Grants
 
-Everything a workload reaches outside its runtime and home is a grant:
+Directory views, service sockets and network policy bound what a confined
+workload reaches outside its runtime and home:
 
 - **a directory** of the human's: a detached idmapped bind mount mapping
   filesystem uid/gid 1000 to the workload's account, read-only or
@@ -276,11 +276,21 @@ Everything a workload reaches outside its runtime and home is a grant:
   `.config/td-mail` and `.config/td-news` directories are exceptions only
   for application `mail` and `news`, respectively. Parents, descendants
   and other accounts receive no exception; these views remain noexec;
-- **a socket**: Wayland, the fetch service, and others named per grant;
-- **network**: `off` or `host`: one
-  row per sandbox or workspace account, which the human sets as a
-  directory is granted, and no row for none. An application's network
-  is its reviewed declaration's, never a grant.
+- **service sockets**: an application's reviewed launch policy admits
+  services such as Wayland and its fetch service. General socket grants
+  are not implemented; no request writes the socket rows the table can
+  parse;
+- **network**: a sandbox's `off` or `host`, with one `host` row per
+  account and no row for `off`. An application's network comes from its
+  reviewed declaration. A td-agent workspace's network comes from its
+  per-launch profile, `development` or `isolated`, never a grant row.
+
+Persistent grant requests admit applications and sandboxes. A td-agent
+workspace instead carries a directory plan with each launch. Root admits
+its role/path pairs, including only the fixed td-agent staging exceptions
+to the directory exclusions above, and publishes the views its instances
+need (td-authd/DESIGN.md, "Workspace instances"). The workspace's jail
+binds only the directories its own plan names.
 
 The human requests a grant through the compositor control socket, as
 td-software's install requests arrive. A grant is not elevation: it
@@ -293,28 +303,32 @@ read. The table's rows are root's alone, but a mounted view is visible
 in the host's mountinfo to any unjailed process. A revoked grant's view
 is released at the account's next launch, or at shutdown, whichever
 comes first; until then the root mount stays, and a running jail keeps
-what it was launched with. A workload
-cannot grant itself anything; when it needs a file it asks td-portal
-(FileChooser and its successors), whose dialog the human answers.
+what it was launched with. These standing-row revocation rules apply to
+applications and sandboxes; workspace views follow their active launch
+plans. A confined workload cannot grant itself anything. An application's
+FileChooser request goes through td-portal's existing view and copy rules
+(`APPLICATIONS.md` §E); it does not create a standing grant.
 
 There is no FUSE document portal: `CONFIG_FUSE_FS` stays off, and grants
 are mounts.
 
 ## Launch path
 
-All workload launches go through root:
+All confined workload launches on td go through root:
 
-- applications: `application-start`, unchanged except that mail and news
-  use `exec-service-as` with their reserved accounts;
-- workspaces: a new operation that checks the workspace's ledger row,
-  applies its grants, and runs `td-jail --workspace` as that account.
-  td-jail's workspace kind then requires its caller to be a workspace
-  account in the ledger rather than uid 1000. For a sandbox this is
-  root's workspace launch intake (td-authd/DESIGN.md, "Workspace launch
-  intake"): the human's connection, once admitted, becomes the jail's
-  channel, and td-jail admits only the ledger account caller class (`APPLICATIONS.md` §C, "The `workspace` kind"). The account's
-  uid is the jail's inside as well as out; uid 1000 inside comes with
-  the jail's subordinate mapping, which is not built.
+- applications: `application-start` checks the application's ledger
+  account, publishes its grant views and uses `exec-service-as` to start
+  it as that account;
+- sandboxes and confined td-agent workspaces: root's workspace launch
+  intake checks the sandbox or workspace ledger row, publishes the
+  sandbox's grant-table views or the instance's directory plan, and runs
+  `td-jail --workspace` as that account. The human's admitted connection
+  becomes the jail's channel (td-authd/DESIGN.md, "Workspace launch
+  intake" and "Workspace instances"). td-jail admits only the ledger
+  account caller class (`APPLICATIONS.md` §C, "The `workspace` kind").
+  The account's uid is the jail's inside as well as out; mapping workspace
+  processes to uid 1000 would require subordinate mapping, which is not
+  built.
 
 td-sandbox launches no jail itself; it asks root's intake for a launch,
 as do td-agent's confined conversations and reviews. td-agent's unconfined
