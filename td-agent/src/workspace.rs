@@ -1529,6 +1529,7 @@ pub fn policy(
         // Its template's, as the settings give it at each turn, which
         // `Bench::prepare` sets.
         runtime: None,
+        sandbox: None,
     };
     let trees = policy.roots().len() + policy.repositories.len() + policy.objects.len();
     if trees > MAX_TREES {
@@ -1576,6 +1577,7 @@ mod tests {
                 .collect(),
             shared: None,
             runtime: None,
+            sandbox: None,
         }
     }
 

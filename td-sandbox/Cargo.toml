@@ -7,6 +7,9 @@ license = "MIT"
 
 [workspace]
 
+[lib]
+doctest = false
+
 [dependencies]
 td-alloc = { path = "../td-alloc" }
 td-fs = { path = "../td-fs" }

@@ -62,6 +62,7 @@ td-jpeg = { path = "../td-jpeg" }
 td-json = { path = "../td-json" }
 td-markdown = { path = "../td-markdown" }
 td-png = { path = "../td-png" }
+td-sandbox = { path = "../td-sandbox" }
 td-remote = { path = "../td-remote" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }

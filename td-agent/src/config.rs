@@ -130,6 +130,8 @@ pub struct TemplateShared {
     /// The Flathub runtime its instances bind at `/usr`, by td name
     /// (DESIGN.md §8, Runtime).
     pub runtime: Option<String>,
+    /// An existing td-sandbox profile, replacing the agent workspace.
+    pub sandbox: Option<String>,
 }
 
 /// A workspace's network policy (DESIGN.md §10).
@@ -339,6 +341,9 @@ impl Client {
     /// and none when its template is no longer configured, so removing or
     /// renaming one never widens what its conversations reach.
     pub fn shared_for(&self, workspace: &Workspace) -> &[Shared] {
+        if self.sandbox_for(workspace).is_some() {
+            return &[];
+        }
         let template = match workspace {
             Workspace::Template(name) => Some(name),
             Workspace::Repositories(repositories) => Some(&repositories.template),
@@ -373,6 +378,18 @@ impl Client {
     /// Runtime): its template's, as the settings give it now; none for a
     /// workspace with no template, the only kind that may be unconfined,
     /// or whose template is no longer configured.
+    pub fn sandbox_for(&self, workspace: &Workspace) -> Option<&str> {
+        let name = match workspace {
+            Workspace::Template(name) => name,
+            Workspace::Repositories(repos) => &repos.template,
+            _ => return None,
+        };
+        self.template_shared
+            .iter()
+            .find(|t| &t.name == name)
+            .and_then(|t| t.sandbox.as_deref())
+    }
+
     pub fn runtime_for(&self, workspace: &Workspace) -> Option<&str> {
         let template = match workspace {
             Workspace::Template(name) => name,
@@ -541,6 +558,10 @@ impl Client {
                                         .map_or(Json::Null, |n| Json::Str(n.name().into())),
                                 ),
                                 ("system".into(), Json::Bool(template.system)),
+                                (
+                                    "sandbox".into(),
+                                    template.sandbox.clone().map_or(Json::Null, Json::Str),
+                                ),
                                 (
                                     "runtime".into(),
                                     template.runtime.clone().map_or(Json::Null, Json::Str),
@@ -779,6 +800,12 @@ impl Client {
                                     .and_then(|text| runtime_name(name, text))?,
                             ),
                         };
+                        let sandbox = match item.get("sandbox") {
+                            None | Some(Json::Null) => None,
+                            Some(value) => {
+                                Some(sandbox_name(value.as_str().ok_or("sandbox is a name")?)?)
+                            }
+                        };
                         Ok(TemplateShared {
                             system,
                             name: template_name(name)?,
@@ -786,6 +813,7 @@ impl Client {
                             network,
                             mcp,
                             runtime,
+                            sandbox,
                         })
                     })
                     .collect::<Result<_, String>>()?,
@@ -1128,6 +1156,8 @@ pub struct Template {
     /// file's. Kept to the name's syntax alone: one this system does not
     /// declare is a note, and td-jail refuses its instances.
     pub runtime: Option<String>,
+    /// An existing td-sandbox profile, replacing the agent workspace.
+    pub sandbox: Option<String>,
 }
 
 /// One of a template's MCP servers (DESIGN.md §12, MCP servers; §15).
@@ -1484,7 +1514,7 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             return Err(wrong.into());
         }
         item.check_known_keys(&[
-            "name", "repos", "shared", "network", "system", "mcp", "runtime",
+            "name", "repos", "shared", "network", "system", "mcp", "runtime", "sandbox",
         ])
         .map_err(|e| format!("`template`: {e}"))?;
         let name = item
@@ -1549,7 +1579,12 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             Ok(Some(text)) => Some(runtime_name(&name, text)?),
             Err(e) => return Err(format!("template {name:?}: {e}")),
         };
-        templates.push(Template {
+        let sandbox = item
+            .optional_str("sandbox")
+            .map_err(crate::workspace_slot::error)?
+            .map(sandbox_name)
+            .transpose()?;
+        let template = Template {
             system,
             name,
             repos,
@@ -1557,7 +1592,10 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             network,
             mcp,
             runtime,
-        });
+            sandbox,
+        };
+        template.check_sandbox()?;
+        templates.push(template);
     }
     Ok(templates)
 }
@@ -1696,6 +1734,9 @@ pub fn templates_json(templates: &[Template]) -> Json {
 /// One template of `templates_json`.
 pub(crate) fn template_json(template: &Template) -> Json {
     let mut fields = vec![("name".into(), Json::Str(template.name.clone()))];
+    if let Some(sandbox) = &template.sandbox {
+        fields.push(("sandbox".into(), Json::Str(sandbox.clone())));
+    }
     // Only a template given one names a network policy.
     if let Some(network) = template.network {
         fields.push(("network".into(), Json::Str(network.name().into())));
@@ -1800,7 +1841,10 @@ pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
     let wrong = NOT_TEMPLATES;
     let wrong_shared =
         "a template's shared directories are a list, each a path and whether it may be written";
-    if !only_keys(item, &["name", "network", "system", "shared", "repos"]) {
+    if !only_keys(
+        item,
+        &["name", "network", "system", "shared", "repos", "sandbox"],
+    ) {
         return Err(wrong.into());
     }
     let network = match item.get("network") {
@@ -1893,9 +1937,13 @@ pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
         })
         .collect::<Result<Vec<_>, String>>()
         .map_err(|e| format!("template {name:?}: {e}"))?;
+    let sandbox = item
+        .get("sandbox")
+        .map(|value| sandbox_name(value.as_str().ok_or("sandbox is a name")?))
+        .transpose()?;
     // A template made in the window names no MCP server and no runtime;
     // its file's keys leave no room for either.
-    Ok(Template {
+    let template = Template {
         system,
         network,
         name,
@@ -1903,10 +1951,32 @@ pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
         shared,
         mcp: Vec::new(),
         runtime: None,
-    })
+        sandbox,
+    };
+    template.check_sandbox()?;
+    Ok(template)
+}
+
+fn sandbox_name(name: &str) -> Result<String, String> {
+    if td_sandbox::client::valid_name(name) {
+        td_alloc::string(name).map_err(crate::workspace_slot::error)
+    } else {
+        Err(crate::workspace_slot::error(
+            "sandbox must be an existing td-sandbox profile name",
+        ))
+    }
 }
 
 impl Template {
+    pub fn check_sandbox(&self) -> Result<(), String> {
+        if let Some(name) = &self.sandbox {
+            sandbox_name(name)?;
+            if !self.repos.is_empty() || self.shared.is_some() || self.runtime.is_some() {
+                return Err(crate::workspace_slot::error("a sandbox template uses its sandbox’s home, shared folders and runtime; clear Remote, Shared folders and runtime overrides"));
+            }
+        }
+        Ok(())
+    }
     /// Its shared directories as configured, `~` expanded against `home`;
     /// none when it names none of its own.
     pub fn shared(&self, home: &Path) -> Option<Vec<Shared>> {
@@ -2479,6 +2549,7 @@ mod tests {
                 }],
                 shared: None,
                 runtime: None,
+                sandbox: None,
             }]
         );
         assert_eq!(
@@ -2780,6 +2851,7 @@ mod tests {
             repos: vec![repo.clone()],
             shared: None,
             runtime: None,
+            sandbox: None,
         })
         .collect();
         let written = templates_json(&templates);
@@ -2830,6 +2902,7 @@ mod tests {
             repos: Vec::new(),
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let off = Template {
             system: false,
@@ -2864,6 +2937,7 @@ mod tests {
                     network: None,
                     system: true,
                     runtime: None,
+                    sandbox: None,
                 },
                 TemplateShared {
                     mcp: Vec::new(),
@@ -2872,6 +2946,7 @@ mod tests {
                     network: None,
                     system: false,
                     runtime: None,
+                    sandbox: None,
                 },
             ],
             ..Client::default()
@@ -3011,6 +3086,7 @@ mod tests {
                 system: false,
                 mcp: servers.clone(),
                 runtime: None,
+                sandbox: None,
             }],
             ..Client::default()
         };
@@ -3050,6 +3126,7 @@ mod tests {
             system: false,
             mcp: Vec::new(),
             runtime: None,
+            sandbox: None,
         }]);
         assert!(!written.to_string().contains("mcp"));
         let with = td_json::parse(
@@ -3115,6 +3192,7 @@ mod tests {
                 system: false,
                 mcp: Vec::new(),
                 runtime: Some("freedesktop-sdk-25-08".into()),
+                sandbox: None,
             }],
             ..Client::default()
         };
@@ -3174,6 +3252,7 @@ mod tests {
             system: false,
             mcp: Vec::new(),
             runtime: None,
+            sandbox: None,
         }]);
         let with = td_json::parse(&written.to_string().replace(
             "\"name\":\"w\"",
@@ -3181,6 +3260,44 @@ mod tests {
         ))
         .unwrap();
         assert!(templates_from_json(&with).is_err());
+    }
+
+    #[test]
+    fn sandbox_templates_persist_and_do_not_inherit_agent_grants() {
+        let configured = parse("[[template]]\nname = \"tools\"\nsandbox = \"default\"\n").unwrap();
+        let template = configured.templates.first().unwrap();
+        assert_eq!(template.sandbox.as_deref(), Some("default"));
+        let stored = templates_json(std::slice::from_ref(template));
+        assert_eq!(
+            templates_from_json(&stored).unwrap(),
+            std::slice::from_ref(template)
+        );
+        let mut client = Client::default();
+        client.shared.push(Shared {
+            path: "/human/extra".into(),
+            write: true,
+        });
+        client.template_shared.push(TemplateShared {
+            name: "tools".into(),
+            shared: None,
+            network: None,
+            system: false,
+            mcp: Vec::new(),
+            runtime: None,
+            sandbox: Some("default".into()),
+        });
+        let client = Client::from_json(&client.to_json()).unwrap();
+        let workspace = Workspace::Template("tools".into());
+        assert_eq!(client.sandbox_for(&workspace), Some("default"));
+        assert!(client.shared_for(&workspace).is_empty());
+        for extra in [
+            "sandbox = \"../default\"",
+            "sandbox = \"default\"\nshared = []",
+            "sandbox = \"default\"\nruntime = \"freedesktop-platform-25-08\"",
+            "sandbox = \"default\"\nrepos = [{remote = \"https://example.org/repo\", base = \"main\", branch = \"work\"}]",
+        ] {
+            assert!(parse(&format!("[[template]]\nname = \"tools\"\n{extra}\n")).is_err(), "{extra}");
+        }
     }
 
     /// The dialog's shared folders: paths parted by spaces, read-only
@@ -3242,6 +3359,7 @@ mod tests {
                     write: true,
                 }]),
                 runtime: None,
+                sandbox: None,
             },
             Template {
                 mcp: Vec::new(),
@@ -3251,6 +3369,7 @@ mod tests {
                 repos: Vec::new(),
                 shared: None,
                 runtime: None,
+                sandbox: None,
             },
         ];
         let written = templates_json(&templates);
@@ -3369,6 +3488,7 @@ mod tests {
                 repos: vec![repo.clone(), local.clone()],
                 shared: None,
                 runtime: None,
+                sandbox: None,
             },
             Template {
                 mcp: Vec::new(),
@@ -3378,6 +3498,7 @@ mod tests {
                 repos: vec![local],
                 shared: None,
                 runtime: None,
+                sandbox: None,
             },
         ];
         let value = templates_json(&templates);
@@ -3464,6 +3585,7 @@ mod tests {
             repos: vec![repo.clone(), repo.clone()],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         assert!(templates_from_json(&templates_json(&[twice]))
             .unwrap_err()
@@ -3487,6 +3609,7 @@ mod tests {
             repos: vec![long],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         assert!(templates_from_json(&templates_json(&[long]))
             .unwrap_err()
@@ -3499,6 +3622,7 @@ mod tests {
             repos: vec![checked_repo("/srv/td", "main", "a", Some(Vec::new())).unwrap()],
             shared: None,
             runtime: None,
+            sandbox: None,
         }];
         assert_eq!(templates_from_json(&templates_json(&none)).unwrap(), none);
     }
@@ -3766,6 +3890,7 @@ mod tests {
                 shared: None,
                 network: Some(Network::Open),
                 runtime: None,
+                sandbox: None,
             },
             TemplateShared {
                 mcp: Vec::new(),
@@ -3774,6 +3899,7 @@ mod tests {
                 shared: None,
                 network: None,
                 runtime: None,
+                sandbox: None,
             },
         ];
         let crossed = Client::from_json(&client.to_json()).unwrap();
@@ -3977,6 +4103,7 @@ mod tests {
                     shared: Some(own.clone()),
                     network: None,
                     runtime: None,
+                    sandbox: None,
                 },
                 TemplateShared {
                     mcp: Vec::new(),
@@ -3985,6 +4112,7 @@ mod tests {
                     shared: None,
                     network: None,
                     runtime: None,
+                    sandbox: None,
                 },
             ],
             ..Client::default()

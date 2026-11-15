@@ -252,6 +252,7 @@ mod tests {
             write: vec![],
             directory: None,
             runtime: None,
+            sandbox: None,
         }
     }
 

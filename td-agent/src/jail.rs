@@ -244,6 +244,7 @@ pub struct Policy {
     /// §8, Runtime): a development instance's whose template names one,
     /// never a maintenance or review instance's.
     pub runtime: Option<String>,
+    pub sandbox: Option<td_sandbox::client::Sandbox>,
 }
 
 impl Policy {
@@ -421,6 +422,29 @@ pub fn launch_linked(
     if policy.development && linked.is_some() {
         return Err("development commands use host networking, not the egress proxy".into());
     }
+    if let Some(sandbox) = &policy.sandbox {
+        if linked.is_some() {
+            return Err("a named sandbox uses its own network policy".into());
+        }
+        // Keep root's bounded run request independent of the number and
+        // length of grants. The unprivileged tool host receives its path
+        // guidance over stdin; root alone decides which grants are mounted.
+        let arguments = ["/bin/td-agent", "sandbox-tool-host"]
+            .map(|word| td_alloc::string(word).map_err(crate::workspace_slot::error));
+        let [program, personality] = arguments;
+        let (reader, mut writer, shutdown) = sandbox
+            .launch(&[program?, personality?])
+            .map_err(crate::workspace_slot::error)?;
+        if let Err(error) = crate::toolhost::write_sandbox_roots(
+            &mut writer,
+            std::iter::once(sandbox.home.as_path())
+                .chain(sandbox.shares.iter().map(|(path, _)| path.as_path())),
+        ) {
+            let _ = shutdown.shutdown(std::net::Shutdown::Both);
+            return Err(crate::workspace_slot::error(error));
+        }
+        return Ok(Client::over(reader, writer).owning_root(shutdown));
+    }
     if let Some(account) = &policy.account {
         let arguments = host_arguments(policy, linked.is_some())?;
         let stream = account
@@ -550,6 +574,9 @@ pub(crate) fn unconfined_runtime(runtime: &str) -> String {
 /// and kills it only if it has not ended within a few seconds; what a
 /// command started beside its `sh` is not ended.
 pub fn launch_unjailed(programs: &Unjailed, policy: &Policy) -> Result<Client, String> {
+    if policy.sandbox.is_some() {
+        return Err("a named sandbox cannot run unconfined".into());
+    }
     if let Some(runtime) = &policy.runtime {
         return Err(unconfined_runtime(runtime));
     }
@@ -1142,6 +1169,7 @@ mod tests {
             read: vec!["/d".into()],
             write: vec!["/e".into()],
             runtime: None,
+            sandbox: None,
         };
         assert_eq!(
             spec_text(&programs(), &policy, &["/gnu/store/x-profile/bin".into()]).unwrap(),
@@ -1182,6 +1210,7 @@ mod tests {
             home: "/s/jail/a/home".into(),
             worktrees: vec!["/w/a".into()],
             runtime: Some("freedesktop-sdk-25-08".into()),
+            sandbox: None,
             ..Policy::default()
         };
         let path: Vec<PathBuf> = ["/td/store/x-git/bin", "/usr/bin", "/lib64/x", "/usrx/bin"]
@@ -1207,6 +1236,7 @@ mod tests {
         // Native, the same trees are named as they were.
         let native = Policy {
             runtime: None,
+            sandbox: None,
             ..policy.clone()
         };
         let text = spec_text_with_aliases(&programs(), &native, &path, &aliases).unwrap();
@@ -1232,6 +1262,7 @@ mod tests {
         for bad in ["", "Sdk", "a\nentry=/x", "../x", &"a".repeat(65)] {
             let policy = Policy {
                 runtime: Some(bad.to_string()),
+                sandbox: None,
                 ..policy.clone()
             };
             assert!(spec_text(&programs(), &policy, &[]).is_err(), "{bad:?}");

@@ -1383,7 +1383,20 @@ impl App {
         });
         parts.push(part(
             format!(
-                "network host; web {}{}",
+                "network {}; web {}{}",
+                if self
+                    .book
+                    .active
+                    .as_ref()
+                    .and_then(|id| self.book.rows.iter().find(|r| &r.id == id))
+                    .and_then(|row| row.workspace.as_ref())
+                    .and_then(|workspace| self.networks.sandbox_for(workspace))
+                    .is_some()
+                {
+                    "sandbox profile"
+                } else {
+                    "host"
+                },
                 self.shown_network().name(),
                 if self.networks.host_commands {
                     "; host execution enabled"
@@ -1440,6 +1453,7 @@ impl App {
                     network: template.network,
                     mcp: Vec::new(),
                     runtime: None,
+                    sandbox: template.sandbox.clone(),
                 })
                 .collect(),
             ..crate::config::Client::default()
@@ -5662,8 +5676,18 @@ impl App {
             (crate::config::DIRECTORY.to_string(), "folder".to_string()),
         ];
         rows.extend(self.templates.iter().map(|(name, repos)| {
-            let meta = if *repos { "repositories" } else { "scratch" };
-            (name.clone(), meta.to_string())
+            let meta = self
+                .networks
+                .sandbox_for(&crate::workspace::Workspace::Template(name.clone()))
+                .map(|sandbox| format!("sandbox {sandbox}"))
+                .unwrap_or_else(|| {
+                    if *repos {
+                        "repositories".into()
+                    } else {
+                        "scratch".into()
+                    }
+                });
+            (name.clone(), meta)
         }));
         rows.extend(unconfined);
         rows.push((
@@ -6483,12 +6507,18 @@ impl App {
             .saved_templates
             .iter()
             .map(|template| {
-                let kind = if template.repos.is_empty() {
-                    "scratch"
-                } else {
-                    "repositories"
-                };
-                (template.name.clone(), kind.to_string())
+                let kind = template
+                    .sandbox
+                    .as_ref()
+                    .map(|sandbox| format!("sandbox {sandbox}"))
+                    .unwrap_or_else(|| {
+                        if template.repos.is_empty() {
+                            "scratch".into()
+                        } else {
+                            "repositories".into()
+                        }
+                    });
+                (template.name.clone(), kind)
             })
             .collect();
         let opened = Picker::templates(
@@ -12796,7 +12826,7 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         assert_eq!(app.template_dialog().unwrap().editing(), Some("td"));
         assert!(text(&app).contains("Edit template"));
-        for _ in 0..9 {
+        for _ in 0..10 {
             key_live(&mut app, "Tab");
         }
         assert_eq!(app.template_dialog().unwrap().part(), "remove");
@@ -13705,6 +13735,7 @@ pub mod tests {
                     shared: None,
                     network: Some(Network::Open),
                     runtime: None,
+                    sandbox: None,
                 },
                 crate::config::TemplateShared {
                     mcp: Vec::new(),
@@ -13713,6 +13744,7 @@ pub mod tests {
                     shared: None,
                     network: None,
                     runtime: None,
+                    sandbox: Some("default".into()),
                 },
             ],
             ..crate::config::Client::default()
@@ -13746,6 +13778,12 @@ pub mod tests {
             });
             app.set_active(id(n));
             assert_eq!(network(&app), said, "row {n}");
+            if n == 11 {
+                assert!(app
+                    .status_line()
+                    .contains("network sandbox profile; web allowlist"));
+                assert!(!app.status_line().contains("network host"));
+            }
         }
     }
 

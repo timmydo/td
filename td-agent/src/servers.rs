@@ -336,6 +336,7 @@ pub type Launch = (
     Vec<crate::workspace::Shared>,
     Vec<std::path::PathBuf>,
     Option<String>,
+    Option<td_sandbox::client::Sandbox>,
 );
 
 /// A server the main thread started.
@@ -1004,7 +1005,7 @@ mod tests {
 
     fn launch(prepared: usize) -> Launch {
         let path = std::path::PathBuf::from(format!("/r{prepared}"));
-        (Vec::new(), vec![path], None)
+        (Vec::new(), vec![path], None, None)
     }
 
     #[test]

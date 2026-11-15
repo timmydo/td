@@ -124,7 +124,7 @@ fn worked(workspace: Option<&Workspace>) -> String {
             "Its scratch workspace and every file in it are removed with it.".to_string()
         }
         Some(Workspace::Template(name)) => format!(
-            "Its workspace, a scratch directory made from template {name}, and every file in it are removed with it."
+            "Any private scratch directory made for template {name} and every file in it are removed with it. A named sandbox’s home and shared files are kept."
         ),
         Some(Workspace::Directory(directory)) => format!(
             "The directory it works in, {}, is yours and stays.",
@@ -613,9 +613,10 @@ mod tests {
     #[test]
     fn the_question_says_whether_the_workspace_goes_by_its_kind() {
         assert!(worked(Some(&Workspace::Scratch)).contains("removed with it"));
-        // A template's is td-agent's scratch directory, whatever its name.
+        // Only td-agent-owned scratch is removed; a named sandbox stays.
         let template = worked(Some(&Workspace::Template("notes".into())));
         assert!(template.contains("template notes") && template.contains("removed with it"));
+        assert!(template.contains("sandbox’s home and shared files are kept"));
         let directory = worked(Some(&Workspace::Directory("/home/u/notes".into())));
         assert_eq!(
             directory,

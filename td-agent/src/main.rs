@@ -240,6 +240,12 @@ fn main() -> ExitCode {
         Some((first, rest)) if first == "workspace-probe" => {
             td_agent::workspace_oracle::inside(rest)
         }
+        Some((first, [])) if first == "sandbox-tool-host" => {
+            let mut input = std::io::stdin();
+            td_agent::toolhost::sandbox_config(&mut input)
+                .map_err(|e| td_alloc::format(format_args!("{e}")).unwrap_or_default())
+                .and_then(|config| td_agent::toolhost::serve(input, std::io::stdout(), config))
+        }
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
             .and_then(|config| {
                 td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)

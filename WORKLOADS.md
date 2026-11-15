@@ -37,7 +37,10 @@ intake, so it
 can create, delete and launch any sandbox and spend workload rows, and
 empty or enter any confined conversation's slot; and no bound on the
 processes it leaves (td-login/THREAT-MODEL.md §1). Every other td-agent
-workspace on td is jailed and runs as an account of its own.
+workspace on td is jailed and runs as a workload account. A template
+explicitly naming a td-sandbox profile shares that sandbox’s account,
+home and grants with its other commands and conversations
+(td-agent/DESIGN.md, "Named sandboxes").
 
 The alternative, every workload as the human with sharing by plain bind
 mounts, is simpler and was rejected. Its jail is then the only wall: an
@@ -59,7 +62,7 @@ anything an application can become").
 | mail, news | `tda65537`, `tda65538`, each with its own fetch service | td-authd `application-start` from the launcher card |
 | td-web | `tda65540`, with a fetch service of its own; on a host, the human | `application-start` from its launcher card; on a host, `./install-apps`, unjailed |
 | td-sandbox | `tdw<uid>`, the sandbox's own, from 98304 up | `td-sandbox` → root's workspace intake → `td-jail --workspace` as the account |
-| td-agent conversation tool jails | a per-conversation `agent-N` ledger account on td; the caller on a development host | td-agent → root intake → td-login → td-jail |
+| td-agent conversation tool jails | a per-conversation `agent-N` ledger account on td, or the existing sandbox account explicitly named by its template; the caller on a development host | td-agent → root intake → td-login → td-jail |
 | td-agent reviews | a leased `review-N` ledger account on td; the caller on a development host | td-agent → root intake → td-login → td-jail |
 | td-agent unconfined workspace | the human, no jail | td-agent `--unconfined` |
 

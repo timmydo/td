@@ -3079,7 +3079,8 @@ editing the configuration, which td-agent never writes: File →
 `New template…`, or the chooser's `New template…` row, opens a dialog of
 td-ui's entries asking a name, a remote, a base, a branch and,
 optionally, sparse paths parted by spaces, a network policy (§10),
-shared folders and the system view (§8, System view), `on` or `off`.
+shared folders, the system view (§8, System view), `on` or `off`, and
+an existing td-sandbox profile name ("Named sandboxes", below).
 With the remote left empty the template names no
 repository and its workspace is a scratch directory, as Empty's is,
 the base, branch and sparse paths unread; the shared folders are paths
@@ -3113,7 +3114,7 @@ refused, until they are deleted, rather than handing them the new
 template's folders and network. They are kept
 in the state directory's `templates` file, a JSON list of each
 template's name, its network policy and shared folders when it names
-them, and its repositories, with no other key, rewritten whole from the
+them, its optional sandbox name, and its repositories, with no other key, rewritten whole from the
 file's own list, never from the chooser's, and read back as written;
 one past 64, a name a template in the file has, ASCII case aside, a
 built-in's name, a template with more repositories than a workspace
@@ -3143,12 +3144,12 @@ of `None`) when it names none.
 `templatedialog::TemplateDialog` is composed as the key dialog is, from
 td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
 its label, `chrome::Buttons` and td-ui's confirmation, centred and at
-most 72 cells wide: a title, what it does, the eight fields (name;
+most 72 cells wide: a title, what it does, the nine fields (name;
 remote, empty for a scratch workspace; base, `main` at first; branch,
 `agent` at first; sparse paths; network, `off`, `allowlist` or `open`,
 any case, or empty for the settings' `network`; shared folders,
 `config::shared_field`'s; system view, `on`, or `off` or empty, any
-case),
+case; sandbox profile, an existing name or empty for its own workspace),
 two rows for a refusal, and Cancel and Save, with Remove between them
 for a template being edited. `Tab`/`Down` and `S-Tab`/`Up` move round
 the fields and buttons; `Return` saves from a field and presses a
@@ -4608,10 +4609,70 @@ workspace is the workspace jail and the approval policy (§11), as on a
 host, not an application jail around td-agent itself. td-agent is a
 standalone program: no boot test starts it.
 
+**Named sandboxes.** A template's `sandbox` names an existing td-sandbox
+profile. File → New template… and Edit template… expose it in the
+Sandbox profile field; empty keeps the conversation's own workspace.
+Saving checks the profile and asks root for its account and grants. A
+missing or unreadable profile, absent account or unreachable intake
+refuses the save or tool preparation, never falling back to another
+workspace. The file also accepts `sandbox` on a template. The name uses
+td-sandbox's ledger grammar and is kept in the saved templates file and
+conversation setup. Changing it applies on the next preparation, without
+restarting the broker. Profiles live on the broker's machine.
+
+Such a template names no repository, shared-folder override or runtime
+override: those conflicting settings refuse Save. Its tools work in the
+sandbox account's existing home and reach its existing grants, including
+tools installed in that home. Top-level agent shares and conversation
+directory grants are not added; `request_directory` directs the human to
+td-sandbox's grant commands. Web fetch retains the template's separate
+policy; commands and MCP servers use the sandbox's network policy.
+A conversation previously made with repository worktrees refuses this
+selection at preparation, so a new conversation must be made from it.
+
+The broker and model API client stay outside the sandbox. Every tool host
+is `/bin/td-agent sandbox-tool-host`, with `/bin/td-txt`, run through td-sandbox's
+shared library and the existing root `run` intake in pipes mode. The
+library shares the CLI's profile reader, intake codec and relay framing;
+only stdout reaches the tool protocol, while bounded stderr is retained
+for errors. No caller supplies a mount plan. Root alone chooses the
+sandbox account, network and grant views for every launch. Each instance
+has its own jail and channel; closing the channel ends that instance.
+After launch, the tool connection carries a bounded root bootstrap: at
+most 33 absolute UTF-8 paths (home and 32 grants), each at most 4096 bytes,
+each preceded by its big-endian u32 length, with a zero length terminator.
+Tool protocol frames follow on that same stream. These paths guide file
+tools within the jail; they grant no mount. Keeping them out of the
+hex-encoded root request allows all valid profiles to launch. The status
+row says `network sandbox profile`; the model prompt reports the network
+root returned, separately from web fetch.
+Concurrent conversations and commands naming one sandbox intentionally
+share its account and home, as commands in that sandbox do. They do not
+hold the CLI's exclusive interactive-session lock or own its stop socket.
+
+Preparation rereads the profile and grants. A changed selection, runtime,
+account, network or grant list retires the cached file host and restarts
+MCP servers on their next reconciliation. Running calls keep their
+existing jail until they end. Conversation/template deletion never deletes
+the named sandbox or its files, and no per-conversation account is acquired
+for these tool launches. A runtime-bearing sandbox remains outside the
+td control-plane build boundary (AGENTS.md, "Trust zones").
+
+The named-sandbox adapter retains specific allocation debt in the existing
+String/Clone-based agent interfaces: `bench.rs` copies the selected name
+and builds/clones the bounded Policy snapshot (home, at most 32 shares,
+runtime); `broker.rs` and `config.rs` copy the name into template setup and
+JSON fields; `conversation.rs` formats the grant-edit refusal; `ui.rs`
+copies template metadata and formats the picker labels. These sites are
+listed by category in `td-alloc/allocation-debt.tsv`. The new stdin
+bootstrap and relay buffer growth use td-alloc; this is not whole-operation
+allocation safety for the existing policy, config, JSON or UI APIs.
+
 **Runtime.** A template of the configuration file may name a Flathub
 runtime by its td name (`runtime`, §15), so its workspaces' tools can
 run programs linked against a glibc userland td does not ship
-(WORKLOADS.md, "Runtimes"). A template made in the window names none.
+(WORKLOADS.md, "Runtimes"). A template made in the window may instead name a sandbox whose runtime
+it uses ("Named sandboxes", below).
 The broker reads the configuration file's templates when it starts and
 hands each one's runtime to conversations in their setup
 (`broker::template_entry`; saving a template made in the window keeps a
@@ -7546,6 +7607,9 @@ default; `jev_threshold`'s is calibrated (§11):
     `timeout`, a call's whole seconds, default 120, at most 600. A
     template's servers' commands and tools are at most 16 KiB together,
     so its servers alone cannot fill a conversation's setup.
+  - `sandbox`: an existing td-sandbox profile name ("Named sandboxes",
+    §8), also editable in the window; absent, the conversation’s own
+    workspace. It excludes `repos`, `shared` and `runtime` overrides.
   - `runtime`: on td, the td name of a Flathub runtime its workspaces'
     instances bind read-only at `/usr` (§8, Runtime), such as
     `freedesktop-platform-25-08`; absent, none. Only in a template of

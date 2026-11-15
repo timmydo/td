@@ -98,6 +98,70 @@ impl Config {
     }
 }
 
+/// A sandbox has at most 32 grants and one home. Roots are path guidance
+/// inside its jail, never a request for a mount. A zero length ends the
+/// bootstrap; tool protocol frames follow immediately on the same stream.
+const SANDBOX_ROOTS: usize = 33;
+const SANDBOX_PATH_BYTES: usize = 4096;
+
+pub(crate) fn write_sandbox_roots<'a>(
+    output: &mut impl Write,
+    roots: impl Iterator<Item = &'a Path>,
+) -> std::io::Result<()> {
+    for (index, root) in roots.enumerate() {
+        let text = root.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
+        if index >= SANDBOX_ROOTS || !sandbox_root(text) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        output.write_all(&(text.len() as u32).to_be_bytes())?;
+        output.write_all(text.as_bytes())?;
+    }
+    output.write_all(&0u32.to_be_bytes())?;
+    output.flush()
+}
+
+fn sandbox_root(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= SANDBOX_PATH_BYTES
+        && !text.contains('\0')
+        && Path::new(text).is_absolute()
+}
+
+/// Read the bounded bootstrap for `sandbox-tool-host`. Its launch command
+/// stays small even when the sandbox grants have long paths.
+pub fn sandbox_config(input: &mut impl Read) -> std::io::Result<Config> {
+    let refused = |_| std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+    let mut roots = Vec::new();
+    loop {
+        let mut header = [0; 4];
+        input.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 {
+            break;
+        }
+        if roots.len() >= SANDBOX_ROOTS || length > SANDBOX_PATH_BYTES {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = td_alloc::filled(length, 0).map_err(refused)?;
+        input.read_exact(&mut bytes)?;
+        let text = String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData)?;
+        if !sandbox_root(&text) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        td_alloc::push(&mut roots, PathBuf::from(text)).map_err(refused)?;
+    }
+    if roots.is_empty() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(Config {
+        roots,
+        txt: Some(PathBuf::from(
+            td_alloc::string("/bin/td-txt").map_err(refused)?,
+        )),
+        ..Config::default()
+    })
+}
+
 /// The calls running, by id, each with its cancel flag.
 type Running = Arc<Mutex<BTreeMap<u64, Arc<AtomicBool>>>>;
 
@@ -812,6 +876,66 @@ mod tests {
     }
 
     /// A tool host on a thread, served over a socketpair.
+    #[test]
+    fn sandbox_bootstrap_handles_all_long_grants_and_leaves_tool_frames() {
+        let roots: Vec<PathBuf> = std::iter::once(PathBuf::from("/var/lib/td/workloads/98304"))
+            .chain((0..32).map(|n| PathBuf::from(format!("/home/person/{n}/{}", "a".repeat(1020)))))
+            .collect();
+        let mut bytes = Vec::new();
+        write_sandbox_roots(&mut bytes, roots.iter().map(PathBuf::as_path)).unwrap();
+        assert!(bytes.len() > 8192);
+        bytes.extend_from_slice(b"next tool frame");
+        let mut input = bytes.as_slice();
+        let config = sandbox_config(&mut input).unwrap();
+        assert_eq!(config.roots, roots);
+        assert_eq!(config.first("path").unwrap(), roots[0]);
+        assert_eq!(config.txt.as_deref(), Some(Path::new("/bin/td-txt")));
+        assert_eq!(input, b"next tool frame");
+        let mut succeeded = false;
+        for limit in 0..80 {
+            let result =
+                td_alloc::with_reservation_limit(limit, || sandbox_config(&mut bytes.as_slice()));
+            match result {
+                Ok(_) => {
+                    assert!(limit > 0);
+                    succeeded = true;
+                    break;
+                }
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory),
+            }
+        }
+        assert!(succeeded);
+        assert!(sandbox_config(&mut bytes.as_slice()).is_ok());
+    }
+
+    #[test]
+    fn sandbox_bootstrap_refuses_bad_paths_counts_and_truncation() {
+        for payload in ["relative", "/with\0nul"] {
+            let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(payload.as_bytes());
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            assert_eq!(
+                sandbox_config(&mut bytes.as_slice()).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        let mut bytes = Vec::new();
+        write_sandbox_roots(&mut bytes, std::iter::repeat_n(Path::new("/home/a"), 33)).unwrap();
+        bytes.truncate(bytes.len() - 4);
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            sandbox_config(&mut bytes.as_slice()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        for bytes in [
+            0u32.to_be_bytes().to_vec(),
+            4097u32.to_be_bytes().to_vec(),
+            vec![0, 0, 0, 5, b'/'],
+        ] {
+            assert!(sandbox_config(&mut bytes.as_slice()).is_err());
+        }
+    }
+
     fn host(roots: Vec<PathBuf>) -> Client {
         hosted(Config {
             roots,

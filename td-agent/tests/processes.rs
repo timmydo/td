@@ -236,6 +236,7 @@ fn repositories(id: &Id, base: &Path) -> Workspace {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -509,6 +510,7 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
             .collect(),
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let made = td_agent::workspace::repositories(
         &template,
@@ -1762,4 +1764,63 @@ fn deleting_a_conversation_just_left_ends_its_retiring_process() {
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(!state.conversation(&left).exists());
     assert_eq!(supervisor.open_id(), Some(&other));
+}
+
+#[test]
+fn a_sandbox_tool_host_bootstraps_long_roots_before_serving_calls() {
+    use std::io::Write;
+    use td_agent::host::{Call, Down as ToolDown, Up as ToolUp};
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let home = td_fs::TempDir::new("sandbox-tool-host").unwrap();
+    std::fs::write(home.join("note"), "sandbox home file").unwrap();
+    let (mut ours, theirs) = UnixStream::pair().unwrap();
+    ours.set_read_timeout(Some(TIMEOUT)).unwrap();
+    ours.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let mut child = Child(
+        Command::new(PROGRAM)
+            .arg("sandbox-tool-host")
+            .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+            .stdout(Stdio::from(OwnedFd::from(theirs)))
+            .spawn()
+            .unwrap(),
+    );
+    let roots: Vec<String> = std::iter::once(home.to_str().unwrap().to_string())
+        .chain((0..32).map(|n| format!("/home/person/{n}/{}", "a".repeat(1020))))
+        .collect();
+    assert!(roots.iter().map(String::len).sum::<usize>() > 8192);
+    for root in roots {
+        ours.write_all(&(root.len() as u32).to_be_bytes()).unwrap();
+        ours.write_all(root.as_bytes()).unwrap();
+    }
+    ours.write_all(&0u32.to_be_bytes()).unwrap();
+    frame::write(
+        &mut ours,
+        &ToolDown::Call {
+            id: 1,
+            call: Call::Read {
+                path: home.join("note").display().to_string(),
+                offset: None,
+                limit: None,
+            },
+        }
+        .encode(),
+    )
+    .unwrap();
+    loop {
+        match ToolUp::decode(&frame::read(&mut ours).unwrap().unwrap()).unwrap() {
+            ToolUp::Done { id: 1, outcome } => {
+                assert!(outcome.unwrap().text.contains("sandbox home file"));
+                break;
+            }
+            _ => continue,
+        }
+    }
+    drop(ours);
+    assert!(wait(&mut child.0).success());
 }

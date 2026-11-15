@@ -80,6 +80,7 @@ pub struct Place<'a> {
     /// Its tools run outside any jail (DESIGN.md §8, Unconfined
     /// workspaces).
     pub unconfined: bool,
+    pub sandbox: Option<&'a td_sandbox::client::Sandbox>,
 }
 
 /// What a workspace's commands reach of the network, as its prefix says
@@ -94,8 +95,12 @@ fn network(place: &Place) -> String {
         .map(|d| d.text())
         .collect::<Vec<_>>()
         .join(", ");
+    let commands = match place.sandbox {
+        Some(sandbox) if !sandbox.host_network => "off. Commands use the sandbox's private network namespace",
+        _ => "host. Commands share this machine's network, including localhost, LAN, internet and Unix sockets reachable through granted paths",
+    };
     format!(
-        "\n- Network: host. Commands share this machine's network, including localhost, LAN, internet and Unix sockets reachable through granted paths. No proxy or destination approval applies to commands. The web_fetch tool separately uses {} policy; its configured destinations are: {}.",
+        "\n- Network: {commands}. No proxy or destination approval applies to commands. The web_fetch tool separately uses {} policy; its configured destinations are: {}.",
         place.network.name(),
         if list.is_empty() { "none" } else { &list },
     )
@@ -349,7 +354,9 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
     let workspace = match place {
         None => "- Working directory, files and git: none. This conversation has no workspace, so no working directory, repository, branch or shell; do not guess at paths, branches or repository state, and ask the person to paste what you need.".to_string(),
         Some(place) => {
-            let what = if place.scratch {
+            let what = if place.sandbox.is_some() {
+                "the existing sandbox’s private home, shared with its other commands and retained when this conversation is deleted"
+            } else if place.scratch {
                 "a scratch directory td-agent made for this conversation, empty at first and removed when the conversation is deleted"
             } else {
                 "a directory of the person's, which stays theirs"
@@ -576,6 +583,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -716,6 +724,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -801,6 +810,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -833,6 +843,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -894,6 +905,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         // An explorer of a directory or scratch is told it searches there,
         // never that a shell runs, whatever the block's wording.
@@ -925,6 +937,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(
@@ -1012,6 +1025,7 @@ mod tests {
             system: false,
             host_commands: false,
             unconfined: false,
+            sandbox: None,
         };
         for policy in [
             crate::config::Network::Allowlist,
@@ -1027,6 +1041,18 @@ mod tests {
             );
             assert!(block.contains("web_fetch tool separately uses"), "{block}");
         }
+        let sandbox = td_sandbox::client::Sandbox {
+            name: "default".into(),
+            runtime: None,
+            home: "/var/lib/td/workloads/98304".into(),
+            host_network: false,
+            shares: Vec::new(),
+        };
+        place.sandbox = Some(&sandbox);
+        let block = environment(0, "td", Some(&place));
+        assert!(block.contains("- Network: off."));
+        assert!(block.contains("retained when this conversation is deleted"));
+        assert!(!block.contains("empty at first"));
         place.removed = true;
         assert!(!environment(0, "td", Some(&place)).contains("- Network:"));
         assert!(!environment(0, "td", None).contains("- Network:"));

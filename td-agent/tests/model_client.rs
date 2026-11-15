@@ -2257,6 +2257,7 @@ fn a_template_workspace_binds_its_own_shared_directories() {
                     write: true,
                 }]),
                 runtime: None,
+                sandbox: None,
             }],
             ..Client::default()
         });
@@ -2305,6 +2306,7 @@ fn only_a_system_view_template_offers_and_runs_system_status() {
                     name: template.into(),
                     shared: Some(Vec::new()),
                     runtime: None,
+                    sandbox: None,
                 })
                 .collect(),
             ..Client::default()
@@ -2362,6 +2364,7 @@ fn a_task_runs_a_sub_agent_whose_report_is_its_result() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     });
@@ -2483,6 +2486,7 @@ fn an_explore_sub_agent_reads_alone_on_its_own_model() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         explore_model: Some("anthropic/claude-haiku-4.5".into()),
         ..Client::default()
@@ -2563,6 +2567,7 @@ fn an_explore_sub_agent_reads_alone_on_its_own_model() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         explore_model: Some("nobody/no-such-model".into()),
         ..Client::default()
@@ -2779,6 +2784,7 @@ fn a_sub_agent_at_a_limit_is_told_its_last_request_is_its_last() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     });
@@ -2858,6 +2864,7 @@ fn a_stop_during_a_sub_agent_ends_the_callers_turn() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     };
@@ -2925,6 +2932,7 @@ fn a_sub_agents_rate_limit_is_waited_out_and_its_failure_reported() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     };
@@ -3011,6 +3019,7 @@ fn a_system_view_taken_away_mid_turn_is_taken_at_once() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     };
@@ -3303,6 +3312,7 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -3375,6 +3385,7 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -3504,6 +3515,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -3688,6 +3700,7 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -5298,6 +5311,7 @@ fn a_review_is_of_a_repository_workspace_alone() {
             name: "sys".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     });
@@ -6722,6 +6736,7 @@ fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -8558,6 +8573,7 @@ fn git_push_is_refused_until_it_can_export() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -8718,6 +8734,7 @@ fn prepared(
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let made = td_agent::workspace::repositories(
         &template,
@@ -9509,6 +9526,7 @@ fn git_fetch_asks_the_window_and_says_what_came() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -9731,6 +9749,7 @@ fn mcp_settings(servers: &[(&str, &str)]) -> Client {
             name: "t".into(),
             shared: Some(Vec::new()),
             runtime: None,
+            sandbox: None,
         }],
         ..Client::default()
     }

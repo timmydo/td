@@ -23,6 +23,7 @@ use crate::workspace::{self, Shared, Workspace};
 /// What a conversation's tools are run with.
 #[derive(Default)]
 pub struct Bench {
+    sandbox: Option<String>,
     /// The jail's programs, found once; why there are none otherwise.
     programs: Option<Result<Programs, String>>,
     /// Whether the workspace is unconfined (DESIGN.md §8), its tool hosts
@@ -61,6 +62,10 @@ pub fn fresh(call: &Call) -> bool {
 }
 
 impl Bench {
+    pub fn set_sandbox(&mut self, name: Option<&str>) {
+        self.sandbox = name.map(str::to_string);
+    }
+
     /// Works out the policy for `workspace` with `shared`, the
     /// repositories `prepared` and the Flathub `runtime` its template
     /// names, unless it is worked out for them already; a new one retires
@@ -75,6 +80,13 @@ impl Bench {
         prepared: &[PathBuf],
         runtime: Option<&str>,
     ) -> Result<&Policy, String> {
+        let sandbox = self.sandbox.as_deref().map(|name| {
+            if self.unconfined || !matches!(workspace, Workspace::Template(_)) || runtime.is_some() {
+                return Err(crate::workspace_slot::error("a named sandbox needs a confined template without repositories or a runtime override"));
+            }
+            let home = std::env::var_os("HOME").ok_or("no human home for sandbox profiles")?;
+            td_sandbox::client::Sandbox::load(Path::new(&home), name).map_err(crate::workspace_slot::error)
+        }).transpose()?;
         if self.unconfined {
             // Only a jail binds one (DESIGN.md §8, Runtime); `take` refuses
             // it again.
@@ -93,14 +105,24 @@ impl Bench {
             .is_some_and(|(with, ready, policy, _)| {
                 with.as_slice() == shared
                     && ready.as_slice() == prepared
-                    && policy.runtime.as_deref() == runtime
+                    && policy.runtime.as_deref()
+                        == sandbox
+                            .as_ref()
+                            .and_then(|s| s.runtime.as_deref())
+                            .or(runtime)
+                    && policy.sandbox == sandbox
             });
         if !current {
-            let (mut policy, specs) = workspace::policy(workspace, state, id, shared, prepared)?;
-            if !self.unconfined {
+            let (mut policy, specs) = match sandbox {
+                Some(sandbox) => (sandbox_policy(sandbox), PathBuf::new()),
+                None => workspace::policy(workspace, state, id, shared, prepared)?,
+            };
+            if !self.unconfined && policy.sandbox.is_none() {
                 policy.account = crate::workspace_slot::ensure(state, id)?;
             }
-            policy.runtime = runtime.map(str::to_string);
+            if policy.sandbox.is_none() {
+                policy.runtime = runtime.map(str::to_string);
+            }
             self.files = None;
             self.policy = Some((shared.to_vec(), prepared.to_vec(), policy, specs));
         }
@@ -320,7 +342,12 @@ impl Bench {
         self.policy
             .as_ref()
             .map(|(shared, prepared, policy, _)| {
-                (shared.clone(), prepared.clone(), policy.runtime.clone())
+                (
+                    shared.clone(),
+                    prepared.clone(),
+                    policy.runtime.clone(),
+                    policy.sandbox.clone(),
+                )
             })
             .unwrap_or_default()
     }
@@ -521,6 +548,31 @@ pub fn limit(call: &Call) -> Duration {
 /// What a call's limit allows past its own time.
 const LIMIT_GRACE: Duration = Duration::from_secs(15);
 
+/// A sandbox contributes only its existing account home and root-owned grants.
+/// Agent scratch, repository staging and template shares never widen it.
+fn sandbox_policy(sandbox: td_sandbox::client::Sandbox) -> Policy {
+    Policy {
+        development: true,
+        home: sandbox.home.clone(),
+        worktrees: vec![sandbox.home.clone()],
+        read: sandbox
+            .shares
+            .iter()
+            .filter(|(_, write)| !write)
+            .map(|(path, _)| path.clone())
+            .collect(),
+        write: sandbox
+            .shares
+            .iter()
+            .filter(|(_, write)| *write)
+            .map(|(path, _)| path.clone())
+            .collect(),
+        runtime: sandbox.runtime.clone(),
+        sandbox: Some(sandbox),
+        ..Policy::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -530,6 +582,28 @@ mod tests {
     /// An unconfined workspace's call keeps to its roots only when every
     /// path it names resolves inside one (DESIGN.md §8): through a link
     /// or `..` out of them it does not, nor does a command, ever.
+    #[test]
+    fn a_named_sandbox_uses_only_its_existing_home_and_grants() {
+        let sandbox = td_sandbox::client::Sandbox {
+            name: "default".into(),
+            runtime: Some("freedesktop-platform-25-08".into()),
+            home: "/var/lib/td/workloads/98304".into(),
+            host_network: false,
+            shares: vec![
+                ("/home/person/sandbox".into(), true),
+                ("/home/person/reference".into(), false),
+            ],
+        };
+        let policy = sandbox_policy(sandbox.clone());
+        assert!(policy.account.is_none());
+        assert_eq!(policy.worktrees, std::slice::from_ref(&sandbox.home));
+        assert_eq!(policy.read, [PathBuf::from("/home/person/reference")]);
+        assert_eq!(policy.write, [PathBuf::from("/home/person/sandbox")]);
+        assert!(policy.repositories.is_empty());
+        assert!(policy.scratch.is_empty());
+        assert_eq!(policy.sandbox, Some(sandbox));
+    }
+
     #[test]
     fn an_unconfined_call_is_contained_only_inside_its_roots() {
         let owned = td_fs::TempDir::new("contained").unwrap();

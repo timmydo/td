@@ -1973,6 +1973,7 @@ mod tests {
                 system: false,
                 mcp: Vec::new(),
                 runtime: None,
+                sandbox: None,
             },
             Template {
                 name: "whole".into(),
@@ -1982,6 +1983,7 @@ mod tests {
                 system: true,
                 mcp: mcp(),
                 runtime: None,
+                sandbox: None,
             },
         ]
     }
@@ -2001,6 +2003,7 @@ mod tests {
                         system: true,
                         mcp: mcp(),
                         runtime: None,
+                        sandbox: None,
                     },
                     TemplateShared {
                         name: "plain".into(),
@@ -2012,6 +2015,7 @@ mod tests {
                         system: false,
                         mcp: Vec::new(),
                         runtime: None,
+                        sandbox: None,
                     },
                 ],
                 shared: vec![Shared {
@@ -3062,6 +3066,7 @@ mod tests {
             system: true,
             mcp: Vec::new(),
             runtime: None,
+            sandbox: None,
         };
         assert_eq!(
             crate::config::templates_json(&[whole]).to_string(),

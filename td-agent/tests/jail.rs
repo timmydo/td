@@ -657,6 +657,7 @@ fn a_repository_conversation_prepares_its_workspace() {
         }],
         shared: None,
         runtime: None,
+        sandbox: None,
     };
     let made = td_agent::workspace::repositories(
         &template,

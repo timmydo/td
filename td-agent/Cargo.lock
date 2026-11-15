@@ -17,6 +17,7 @@ dependencies = [
  "td-markdown",
  "td-png",
  "td-remote",
+ "td-sandbox",
  "td-test-compositor",
  "td-toml",
  "td-ui",
@@ -80,6 +81,15 @@ name = "td-remote"
 version = "0.1.0"
 dependencies = [
  "td-fs",
+]
+
+[[package]]
+name = "td-sandbox"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-fs",
+ "td-ui",
 ]
 
 [[package]]

@@ -1021,6 +1021,12 @@ impl Session {
         template: Template,
         replacing: Option<&str>,
     ) -> Result<String, String> {
+        template.check_sandbox()?;
+        if let Some(name) = &template.sandbox {
+            let home = std::env::var_os("HOME").ok_or("no human home for sandbox profiles")?;
+            td_sandbox::client::Sandbox::load(Path::new(&home), name)
+                .map_err(crate::workspace_slot::error)?;
+        }
         let saved = self.saved.as_ref().map_err(Clone::clone)?;
         let next = with_template(&self.configured, saved, template.clone(), replacing)?;
         // Workspaces find their template by name: a new name that
@@ -3452,6 +3458,7 @@ fn template_entry(
         network: template.network,
         mcp: template.mcp.clone(),
         runtime: template.runtime.clone(),
+        sandbox: template.sandbox.clone(),
     }
 }
 
@@ -3830,6 +3837,7 @@ mod tests {
             repos: vec![repo.clone()],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let configured = [template("td")];
         let saved = [template("notes"), template("mail")];
@@ -3875,6 +3883,7 @@ mod tests {
                 shared: own.clone(),
                 network: None,
                 runtime: None,
+                sandbox: None,
             },
             TemplateShared {
                 mcp: Vec::new(),
@@ -3883,6 +3892,7 @@ mod tests {
                 shared: None,
                 network: None,
                 runtime: None,
+                sandbox: None,
             },
         ];
         let mut own_folder = template("own");
@@ -3902,6 +3912,7 @@ mod tests {
                 }),
                 network: t.network,
                 runtime: None,
+                sandbox: None,
             })
         });
         let entries: Vec<(&str, Option<usize>)> = shared
@@ -3925,6 +3936,7 @@ mod tests {
             repos: Vec::new(),
             shared: None,
             runtime: runtime.map(str::to_string),
+            sandbox: None,
         };
         let sdk = template("sdk", Some("freedesktop-sdk-25-08"));
         let entry = template_entry(&sdk, None);
@@ -3968,6 +3980,7 @@ mod tests {
             repos: Vec::new(),
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let (merged, clashes) = merged_templates(
             &[template("td"), template("notes")],
@@ -4008,6 +4021,7 @@ mod tests {
             repos: Vec::new(),
             shared: own,
             runtime: None,
+            sandbox: None,
         };
         let (admitted, refused) = own_shared(
             &template(Some(vec![shared("~/notes", true), shared("~/gone", false)])),
@@ -4050,6 +4064,7 @@ mod tests {
             system: false,
             mcp: Vec::new(),
             runtime: None,
+            sandbox: None,
         };
         let chosen = |templates: &[crate::config::Template], name: &str| {
             crate::broker::chosen(templates, name)
@@ -4159,6 +4174,7 @@ mod tests {
                 shared: Some(vec![shared(repo.join("refs"))]),
                 network: None,
                 runtime: None,
+                sandbox: None,
             }],
             ..Client::default()
         };
@@ -4187,6 +4203,7 @@ mod tests {
                 .collect(),
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let id = crate::store::Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();

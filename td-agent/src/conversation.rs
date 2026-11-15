@@ -749,6 +749,7 @@ fn bench_policy<'a>(
     shared: &[crate::workspace::Shared],
 ) -> Result<&'a crate::jail::Policy, String> {
     bench.set_unconfined(meta.unconfined);
+    bench.set_sandbox(client.sandbox_for(workspace));
     bench.prepare(
         workspace,
         state,
@@ -4120,6 +4121,7 @@ impl Session {
             system: client.system_for(workspace) && !self.system_revoked,
             host_commands: client.host_commands,
             unconfined: meta.unconfined,
+            sandbox: policy.sandbox.as_ref(),
         };
         Ok(made(meta.created, Some(&place)))
     }
@@ -5850,6 +5852,9 @@ impl Session {
         let Some((_, client)) = &self.setup else {
             return Ok(Err("workspace is not configured".into()));
         };
+        if let Some(name) = client.sandbox_for(workspace) {
+            return Ok(Err(format!("this template uses sandbox {name:?}; change its grants with td-sandbox share or unshare")));
+        }
         let client = client.clone();
         let state = StateDir::at(self.state.clone());
         let path = if access == "revoke" {
@@ -8645,6 +8650,7 @@ mod tests {
             system: false,
             mcp: Vec::new(),
             runtime: runtime.map(str::to_string),
+            sandbox: None,
         };
         let client = Client {
             template_shared: vec![
@@ -8714,6 +8720,7 @@ mod tests {
             ],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let id = Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
@@ -8792,6 +8799,7 @@ mod tests {
             ],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let admitted = [crate::git::Admission::parse("example.org").unwrap()];
         let made = crate::workspace::repositories(

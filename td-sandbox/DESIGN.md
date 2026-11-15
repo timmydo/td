@@ -324,6 +324,37 @@ its channel end and returns, and td-jail tears the namespace down. A
 client that dies closes the connection the same way. A stale `control` is
 replaced only while the record's lock is held.
 
+## Other frontends
+
+The crate's library shares its CLI implementation, profile reader, intake
+and relay codecs with td-agent. `client::Sandbox` reads an existing profile
+without creating or locking it and asks root for its account and grants.
+Its pipes-mode launch uses the existing `run` request. The stream adapter
+frames stdin, yields stdout alone, bounds retained stderr to 4096 bytes,
+and refuses malformed frames, an unreported end or a nonzero exit. A
+partial input-frame failure shuts down the channel and cannot be retried
+as another frame. Closing the channel ends the relay and its jail.
+
+A td-agent template may name one of these profiles (td-agent/DESIGN.md,
+"Named sandboxes"). Its tool instances share the sandbox account, home,
+runtime and root-owned grants and network. They add no mounts or grants,
+allocate no account and never delete the sandbox. Each instance has its
+own connection; the CLI's interactive-session lock and stop socket are
+not taken, so multiple tool instances can run concurrently. Root still
+orders deletion against every running instance. Profile and grant edits
+affect new launches; an existing jail retains its views.
+
+The client owns its new name/share-vector and stderr growth through
+`td-alloc`. Its two PathBuf joins (profile directory and absolute grant
+path), filesystem canonicalization, derived snapshot Clone, account-home
+constructor, and std io::Error boxing remain specific adapter debt. The
+source inventory records the joins; implicit/dependency allocations stay
+outside its proof. It calls the existing record/intake/frame readers,
+whose legacy debt is unchanged. Moving the CLI into lib.rs transfers its
+inventory entries without increasing them. Bootstrap and relay adoption
+make no whole-operation allocation guarantee.
+
+
 ## Validation
 
 Unit tests cover bounded frames, the record and its lock, an unreadable

@@ -1,6 +1,6 @@
 //! The dialog File → New template… and Edit template… open (DESIGN.md §7,
 //! Templates made in the window): a modal panel over the window holding a
-//! title, what the dialog does, eight td-ui entries (`entry_model`, painted
+//! title, what the dialog does, nine td-ui entries (`entry_model`, painted
 //! by `chrome::TextEntry`), each under its label, a line for why the
 //! template is refused, and td-ui's buttons: Cancel and Save, and Remove
 //! between them for a template being edited, which td-ui's confirmation
@@ -55,7 +55,7 @@ const FIELDS: &[(&str, &str, usize)] = &[
         SPARSE_BYTES,
     ),
     (
-        "Web fetch: off, allowlist or open; commands use host networking",
+        "Web fetch: off, allowlist or open; separate from sandbox networking",
         "off, allowlist or open",
         NETWORK_BYTES,
     ),
@@ -68,6 +68,11 @@ const FIELDS: &[(&str, &str, usize)] = &[
         "System view: on shows it every process, command lines too",
         "off or on",
         SYSTEM_BYTES,
+    ),
+    (
+        "Sandbox profile: reuse its home, shares and runtime; empty for own",
+        "default",
+        64,
     ),
 ];
 /// How many fields the dialog has.
@@ -82,6 +87,7 @@ const SPARSE: usize = 4;
 const NETWORK: usize = 5;
 const SHARED: usize = 6;
 const SYSTEM: usize = 7;
+const SANDBOX: usize = 8;
 /// The most bytes the system view's field takes.
 const SYSTEM_BYTES: usize = 8;
 /// The most bytes the shared folders' field takes: every folder a
@@ -122,7 +128,8 @@ impl Part {
             Self::Field(SPARSE) => "sparse",
             Self::Field(NETWORK) => "network",
             Self::Field(SHARED) => "shared",
-            Self::Field(_) => "system",
+            Self::Field(SYSTEM) => "system",
+            Self::Field(_) => "sandbox",
             Self::Cancel => "cancel",
             Self::Remove => "remove",
             Self::Save => "save",
@@ -220,7 +227,17 @@ impl TemplateDialog {
     pub fn new_template(surface: Surface, remote: Option<&str>) -> Result<Self, String> {
         Self::open(
             surface,
-            ["", remote.unwrap_or(""), "main", "agent", "", "", "", ""],
+            [
+                "",
+                remote.unwrap_or(""),
+                "main",
+                "agent",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
             None,
         )
     }
@@ -256,6 +273,7 @@ impl TemplateDialog {
                 network,
                 &shared,
                 system,
+                template.sandbox.as_deref().unwrap_or(""),
             ],
             Some(template.clone()),
         )
@@ -520,6 +538,7 @@ impl TemplateDialog {
             Ok(name) => name,
             Err(why) => return self.refuse(NAME, why),
         };
+        let sandbox = text(SANDBOX);
         let (remote, network, shared, system) =
             (text(REMOTE), text(NETWORK), text(SHARED), text(SYSTEM));
         let others: Vec<crate::config::Repo> = self
@@ -565,16 +584,21 @@ impl TemplateDialog {
             "on" => true,
             _ => return self.refuse(SYSTEM, "the system view is on or off"),
         };
+        let template = Template {
+            system,
+            network,
+            name,
+            repos,
+            shared,
+            mcp: Vec::new(),
+            runtime: None,
+            sandbox: (!sandbox.is_empty()).then_some(sandbox),
+        };
+        if let Err(why) = template.check_sandbox() {
+            return self.refuse(SANDBOX, why);
+        }
         Reply::Save {
-            template: Template {
-                system,
-                network,
-                name,
-                repos,
-                shared,
-                mcp: Vec::new(),
-                runtime: None,
-            },
+            template,
             replacing: self.editing().map(str::to_string),
         }
     }
@@ -1094,6 +1118,7 @@ mod tests {
                     .unwrap()],
                     shared: None,
                     runtime: None,
+                    sandbox: None,
                 },
                 replacing: None,
             }
@@ -1165,8 +1190,8 @@ mod tests {
             panic!("not saved");
         };
         assert!(template.system);
-        // Escape cancels, from anywhere; Tab goes round the buttons.
-        for _ in 0..2 {
+        // Escape cancels, from anywhere; Tab goes through Sandbox and the buttons.
+        for _ in 0..3 {
             dialog.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(dialog.part(), "save");
@@ -1258,6 +1283,7 @@ mod tests {
             repos: vec![first, second.clone()],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let mut dialog = TemplateDialog::edit(surface(), template.clone()).unwrap();
         assert_eq!(dialog.editing(), Some("td"));
@@ -1277,7 +1303,7 @@ mod tests {
         assert_eq!(saved.repos[0].base, "next");
         assert_eq!(saved.repos[1], second);
         // Remove: asked, cancelled, kept; asked, confirmed, removed.
-        for _ in 0..7 {
+        for _ in 0..8 {
             dialog.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(dialog.part(), "remove");
@@ -1296,7 +1322,7 @@ mod tests {
         );
         // A new template's dialog has no Remove.
         let mut new = TemplateDialog::new_template(surface(), None).unwrap();
-        for _ in 0..9 {
+        for _ in 0..FIELD_COUNT + 1 {
             new.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(new.part(), "save");
@@ -1317,6 +1343,7 @@ mod tests {
                 repos: vec![repo],
                 shared: None,
                 runtime: None,
+                sandbox: None,
             };
             let mut dialog = TemplateDialog::edit(surface(), template).unwrap();
             let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
@@ -1349,6 +1376,7 @@ mod tests {
             repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
             shared: None,
             runtime: None,
+            sandbox: None,
         };
         let mut dialog = TemplateDialog::edit(surface(), template).unwrap();
         let layout = dialog.layout().unwrap();
@@ -1385,6 +1413,54 @@ mod tests {
             dialog.pointer(PointerPhase::Release, cancel.0, cancel.1, false),
             Reply::Closed
         );
+    }
+
+    #[test]
+    fn an_existing_sandbox_is_named_saved_edited_and_cleared() {
+        let mut dialog = TemplateDialog::new_template(surface(), None).unwrap();
+        typed(&mut dialog, "Tools");
+        for _ in 0..SANDBOX {
+            dialog.key("Tab", false, &mut NoClipboard);
+        }
+        assert_eq!(dialog.part(), "sandbox");
+        typed(&mut dialog, "default");
+        let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
+            panic!("not saved")
+        };
+        assert_eq!(template.sandbox.as_deref(), Some("default"));
+        let mut edited = TemplateDialog::edit(surface(), template).unwrap();
+        assert_eq!(edited.text(SANDBOX), "default");
+        for _ in 0..SANDBOX {
+            edited.key("Tab", false, &mut NoClipboard);
+        }
+        clear(&mut edited);
+        typed(&mut edited, "../escape");
+        assert_eq!(
+            edited.key("Return", false, &mut NoClipboard),
+            Reply::Stay(true)
+        );
+        assert_eq!(edited.part(), "sandbox");
+        clear(&mut edited);
+        let Reply::Save {
+            template,
+            replacing,
+        } = edited.key("Return", false, &mut NoClipboard)
+        else {
+            panic!("not saved")
+        };
+        assert_eq!(template.sandbox, None);
+        assert_eq!(replacing.as_deref(), Some("Tools"));
+        let mut conflict = TemplateDialog::new_template(surface(), Some("/srv/repo")).unwrap();
+        typed(&mut conflict, "Tools");
+        for _ in 0..SANDBOX {
+            conflict.key("Tab", false, &mut NoClipboard);
+        }
+        typed(&mut conflict, "default");
+        assert_eq!(
+            conflict.key("Return", false, &mut NoClipboard),
+            Reply::Stay(true)
+        );
+        assert!(conflict.message().unwrap().contains("clear Remote"));
     }
 
     /// A paste goes to the field last focused, its first line trimmed; a

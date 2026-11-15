@@ -2056,7 +2056,7 @@ mod tests {
         assert!(agent.contains("text.push_str(\"profile=development\\n\");"));
         assert!(!agent.contains("development-offline"));
         for (file, source) in [
-            ("main.rs", include_str!("../../td-sandbox/src/main.rs")),
+            ("lib.rs", include_str!("../../td-sandbox/src/lib.rs")),
             ("relay.rs", include_str!("../../td-sandbox/src/relay.rs")),
             ("intake.rs", include_str!("../../td-sandbox/src/intake.rs")),
         ] {
