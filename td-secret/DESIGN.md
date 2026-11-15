@@ -245,8 +245,9 @@ or name another block device `/dev/zram0`. Admitting zram also accepts
 that a page swapped out and back leaves its compressed copy in the
 kernel's zram pool, freed but not cleared, as freed memory is; clearing
 in the process does not reach it. td-pass's portable host
-(`src/portable_host.rs`) still carries its own copy of the zram rule,
-with the same verdicts, until it moves onto this one.
+(`src/portable_host.rs`) asks this rule which devices are storage and
+whether the core-dump limit is zero; it adds only the account's
+acceptance of named storage devices.
 
 The fingerprint rejects a release for another enrolled key.
 Updates rewrite the encrypted bundle atomically and never persist a

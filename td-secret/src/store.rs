@@ -1022,9 +1022,10 @@ mod root;
 pub use root::require_root;
 
 /// The memory a secret-holding process requires, compiled by path so
-/// td-install's storage worker shares it with this file's consumers.
+/// td-install's storage worker shares it with this file's consumers, and
+/// td-pass's portable host asks it which swap devices are storage.
 #[path = "memory.rs"]
-mod memory;
+pub(crate) mod memory;
 use memory::with_memory_state;
 
 /// `/sys/block/DEVICE/ATTRIBUTE`, which the memory rule asks of a zram

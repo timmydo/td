@@ -76,93 +76,33 @@ fn memory(accepted: &[String]) -> Result<(), Refusal> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(_) => return Err(Refusal::Host("cannot read the host's swap".into())),
     };
-    admitted(&limits, swaps.as_deref(), accepted, &|device, attribute| {
-        fs::read_to_string(Path::new("/sys/block").join(device).join(attribute))
+    admitted(&limits, swaps.as_deref(), accepted, &|path| {
+        fs::read_to_string(path)
     })
 }
 
 /// `memory` over the process's `limits`, the host's `swaps`, `None`
-/// without swap support, and `sysfs` as `storage_swap` reads it.
+/// without swap support, and `sysfs` reading one `/sys/block` attribute
+/// by the path td-secret's memory rule composes. That rule
+/// (`src/memory.rs`) decides which devices are storage and that the
+/// core-dump soft limit is zero; this adapter only lets the account accept
+/// named storage devices.
 fn admitted(
     limits: &str,
     swaps: Option<&str>,
     accepted: &[String],
-    sysfs: &dyn Fn(&str, &str) -> io::Result<String>,
+    sysfs: &dyn Fn(&Path) -> io::Result<String>,
 ) -> Result<(), Refusal> {
-    core_limit_zero(limits)?;
-    let storage = match swaps {
-        Some(swaps) => storage_swap(swaps, sysfs)?,
-        None => Vec::new(),
-    };
+    crate::store::memory::check_core_limit(limits).map_err(Refusal::Host)?;
+    let mut storage = Vec::new();
+    if let Some(swaps) = swaps {
+        crate::store::memory::storage_swap(swaps, sysfs, &mut |name| storage.push(name.to_owned()))
+            .map_err(|reason| Refusal::Host(reason.into()))?;
+    }
     if storage.iter().all(|device| accepted.contains(device)) {
         Ok(())
     } else {
         Err(Refusal::Swap(storage))
-    }
-}
-
-fn core_limit_zero(limits: &str) -> Result<(), Refusal> {
-    let core = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max core file size"));
-    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
-        return Err(Refusal::Host(
-            "credential input requires a zero core-dump soft limit".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// The active swap devices in `/proc/swaps`'s `swaps` that can put memory
-/// on storage. A zram device keeps its compressed pages in memory unless
-/// it has a writeback device: `backing_dev` reads `none`, or is absent in
-/// a kernel built without writeback, which `sysfs` shows by the zram
-/// attribute `comp_algorithm`. Every other device, a swap file, or a zram
-/// device whose attributes cannot be read is storage. `sysfs(device,
-/// attribute)` reads one block device attribute.
-fn storage_swap(
-    swaps: &str,
-    sysfs: &dyn Fn(&str, &str) -> io::Result<String>,
-) -> Result<Vec<String>, Refusal> {
-    let mut lines = swaps.lines();
-    if lines.next().is_none() {
-        return Err(Refusal::Host("the host's swap table is unreadable".into()));
-    }
-    let mut storage = Vec::new();
-    for line in lines {
-        // The kernel escapes space, tab, newline and backslash in a name and
-        // nothing else, so only those separate columns: a name holding any
-        // other whitespace stays whole and is never another device's.
-        let mut fields = line.split([' ', '\t']).filter(|field| !field.is_empty());
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        let Some(kind) = fields.next() else {
-            return Err(Refusal::Host("the host's swap table is unreadable".into()));
-        };
-        if !in_memory(name, kind, sysfs) {
-            storage.push(name.to_owned());
-        }
-    }
-    Ok(storage)
-}
-
-fn in_memory(name: &str, kind: &str, sysfs: &dyn Fn(&str, &str) -> io::Result<String>) -> bool {
-    let Some(device) = name.strip_prefix("/dev/") else {
-        return false;
-    };
-    let Some(number) = device.strip_prefix("zram") else {
-        return false;
-    };
-    if kind != "partition" || number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    match sysfs(device, "backing_dev") {
-        Ok(backing) => backing.trim_end_matches('\n') == "none",
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            sysfs(device, "comp_algorithm").is_ok()
-        }
-        Err(_) => false,
     }
 }
 
@@ -446,79 +386,13 @@ mod tests {
 
     const HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
-    /// A sysfs where zram0 has no writeback device, zram1 writes back to
-    /// sda3, zram2 is from a kernel without writeback, and zram3's
-    /// attributes cannot be read.
-    fn sysfs(device: &str, attribute: &str) -> io::Result<String> {
-        match (device, attribute) {
-            ("zram0", "backing_dev") => Ok("none\n".into()),
-            ("zram1", "backing_dev") => Ok("/dev/sda3\n".into()),
-            ("zram2", "comp_algorithm") => Ok("lzo [zstd]\n".into()),
-            ("zram3", _) => Err(io::ErrorKind::PermissionDenied.into()),
+    /// A sysfs where zram0 has no writeback device. Which devices are
+    /// storage is td-secret's memory rule, tested in `src/memory.rs`.
+    fn sysfs(path: &Path) -> io::Result<String> {
+        match path.to_str() {
+            Some("/sys/block/zram0/backing_dev") => Ok("none\n".into()),
             _ => Err(io::ErrorKind::NotFound.into()),
         }
-    }
-
-    fn storage(swaps: &str) -> Vec<String> {
-        match storage_swap(swaps, &sysfs) {
-            Ok(storage) => storage,
-            Err(_) => vec!["refused".to_owned()],
-        }
-    }
-
-    #[test]
-    fn zram_without_writeback_is_memory_and_everything_else_storage() {
-        assert!(storage(HEADER).is_empty());
-        assert!(storage(&format!("{HEADER}\n")).is_empty());
-        let line = |name: &str, kind: &str| format!("{name} {kind} 16777212 0 100\n");
-        for kept in [
-            line("/dev/zram0", "partition"),
-            line("/dev/zram2", "partition"),
-        ] {
-            assert!(storage(&format!("{HEADER}{kept}")).is_empty(), "{kept}");
-        }
-        for (name, kind) in [
-            ("/dev/zram1", "partition"),
-            ("/dev/zram3", "partition"),
-            ("/dev/zram4", "partition"),
-            ("/dev/zram0", "file"),
-            ("/dev/zramx", "partition"),
-            ("/dev/zram", "partition"),
-            ("/dev/sda2", "partition"),
-            ("/swapfile", "file"),
-            ("/tmp/dev/zram0", "partition"),
-        ] {
-            assert_eq!(
-                storage(&format!("{HEADER}{}", line(name, kind))),
-                [name],
-                "{name} {kind}"
-            );
-        }
-        assert_eq!(
-            storage(&format!(
-                "{HEADER}{}{}{}",
-                line("/dev/zram0", "partition"),
-                line("/dev/sda2", "partition"),
-                line("/swapfile", "file")
-            )),
-            ["/dev/sda2", "/swapfile"]
-        );
-        assert_eq!(storage(""), ["refused"]);
-        assert_eq!(storage(&format!("{HEADER}/dev/sda2\n")), ["refused"]);
-    }
-
-    #[test]
-    fn a_name_keeps_whitespace_the_kernel_does_not_escape() {
-        let table =
-            format!("{HEADER}/swap\u{a0}one file 1 0 -2\n/swap\u{a0}two\u{2003}x file 1 0 -3\n");
-        assert_eq!(
-            storage(&table),
-            ["/swap\u{a0}one", "/swap\u{a0}two\u{2003}x"]
-        );
-        assert_eq!(
-            storage(&format!("{HEADER}/swap\\040one\tfile\t1\t0\t-2\n")),
-            ["/swap\\040one"]
-        );
     }
 
     #[test]
@@ -566,20 +440,6 @@ mod tests {
             admitted(limits, Some(""), &[], &sysfs),
             Err(Refusal::Host(_))
         ));
-    }
-
-    #[test]
-    fn only_a_zero_core_limit_is_admitted() {
-        let limits = |soft: &str| {
-            format!(
-                "Limit Soft Limit Hard Limit Units\nMax core file size {soft} unlimited bytes\n"
-            )
-        };
-        assert!(core_limit_zero(&limits("0")).is_ok());
-        for soft in ["unlimited", "1", "00 x"] {
-            assert!(core_limit_zero(&limits(soft)).is_err(), "{soft}");
-        }
-        assert!(core_limit_zero("").is_err());
     }
 
     #[test]

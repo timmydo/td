@@ -3597,7 +3597,7 @@ td-secret/src/portable.rs	unchecked-growth-or-clone	39
 td-secret/src/portable_events.rs	allocating-conversion	21
 td-secret/src/portable_events.rs	allocation-macro	18
 td-secret/src/portable_events.rs	unchecked-growth-or-clone	5
-td-secret/src/portable_host.rs	allocating-conversion	7
+td-secret/src/portable_host.rs	allocating-conversion	5
 td-secret/src/portable_host.rs	allocation-macro	3
 td-secret/src/portable_host.rs	unchecked-growth-or-clone	4
 td-secret/src/portable_lifecycle.rs	allocating-conversion	16
