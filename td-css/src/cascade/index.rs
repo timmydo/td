@@ -73,6 +73,11 @@ impl RuleIndex {
         self.universal.truncate(mark.universal);
         self.entries = mark.entries;
     }
+    /// Rules every element is tested against.
+    #[cfg(test)]
+    pub(super) fn universal_count(&self) -> usize {
+        self.universal.len()
+    }
     #[cfg(test)]
     pub(super) fn spare_bytes(&self) -> usize {
         fn spare<T>(values: &BudgetVec<T>) -> usize {

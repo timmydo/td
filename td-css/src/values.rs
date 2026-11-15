@@ -68,6 +68,9 @@ pub enum Property {
     Bottom,
     Left,
     ListStylePosition,
+    BorderCollapse,
+    BorderSpacing,
+    TableLayout,
 }
 
 impl Property {
@@ -128,6 +131,9 @@ impl Property {
         Self::Bottom,
         Self::Left,
         Self::ListStylePosition,
+        Self::BorderCollapse,
+        Self::BorderSpacing,
+        Self::TableLayout,
     ];
 
     pub fn name(self) -> &'static str {
@@ -188,6 +194,9 @@ impl Property {
             Self::Bottom => "bottom",
             Self::Left => "left",
             Self::ListStylePosition => "list-style-position",
+            Self::BorderCollapse => "border-collapse",
+            Self::BorderSpacing => "border-spacing",
+            Self::TableLayout => "table-layout",
         }
     }
 
@@ -209,6 +218,8 @@ impl Property {
                 | Self::TextTransform
                 | Self::Visibility
                 | Self::LetterSpacing
+                | Self::BorderCollapse
+                | Self::BorderSpacing
         )
     }
 
@@ -240,6 +251,10 @@ impl Property {
                 | Self::BorderBottomColor
                 | Self::BorderLeftColor
         )
+    }
+    /// Lengths that take no percentage.
+    fn no_percentage(self) -> bool {
+        self.border() || matches!(self, Self::LetterSpacing | Self::BorderSpacing)
     }
     fn border(self) -> bool {
         matches!(
@@ -298,6 +313,12 @@ impl Property {
             Self::Position => ComputedValue::Keyword("static"),
             Self::BoxSizing => ComputedValue::Keyword("content-box"),
             Self::VerticalAlign => ComputedValue::Keyword("baseline"),
+            Self::BorderCollapse => ComputedValue::Keyword("separate"),
+            Self::BorderSpacing => ComputedValue::Spacing {
+                horizontal: 0.0,
+                vertical: 0.0,
+            },
+            Self::TableLayout => ComputedValue::Keyword("auto"),
             Self::Opacity => ComputedValue::Number(1.0),
             Self::Top | Self::Right | Self::Bottom | Self::Left => {
                 ComputedValue::Length(Length::Auto)
@@ -399,6 +420,11 @@ pub enum ComputedValue {
     FontFamily(BudgetShared<BudgetVec<Family>>),
     Weight(u16),
     Decoration(Decoration),
+    /// `border-spacing`: horizontal then vertical, nonnegative px.
+    Spacing {
+        horizontal: f64,
+        vertical: f64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -447,6 +473,13 @@ impl ComputedValue {
             Self::FontFamily(_) => return None,
             Self::Weight(v) => Self::Weight(*v),
             Self::Decoration(v) => Self::Decoration(*v),
+            Self::Spacing {
+                horizontal,
+                vertical,
+            } => Self::Spacing {
+                horizontal: *horizontal,
+                vertical: *vertical,
+            },
         })
     }
     pub fn try_clone(&self) -> Result<Self, Error> {
@@ -457,6 +490,13 @@ impl ComputedValue {
             Self::Length(v) => Self::Length(*v),
             Self::FontFamily(v) => Self::FontFamily(v.try_clone()?),
             Self::Weight(v) => Self::Weight(*v),
+            Self::Spacing {
+                horizontal,
+                vertical,
+            } => Self::Spacing {
+                horizontal: *horizontal,
+                vertical: *vertical,
+            },
             Self::Decoration(v) => Self::Decoration(*v),
         })
     }
@@ -473,6 +513,7 @@ impl Specified {
             Self::Length(n, u) => Self::Length(*n, *u),
             Self::Calculated(v) => Self::Calculated(*v),
             Self::RelativeWeight(v) => Self::RelativeWeight(*v),
+            Self::Spacing(axes) => Self::Spacing(axes.try_clone()?),
         })
     }
 }
@@ -525,6 +566,14 @@ pub(crate) enum Specified {
     Length(f64, Unit),
     Calculated(calc::Linear),
     RelativeWeight(bool),
+    /// `border-spacing`'s two axes, each a length or calc(), shared so
+    /// every other value stays as small as it was.
+    Spacing(BudgetShared<(Axis, Axis)>),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Axis {
+    Length(f64, Unit),
+    Calculated(calc::Linear),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -861,7 +910,7 @@ fn parse_value(
             decoration(values).map(|v| Specified::Ready(ComputedValue::Decoration(v)))
         }
         FontWeight => weight(values),
-        p if layout::extra(p) => layout::parse(p, values)?,
+        p if layout::extra(p) => layout::parse(p, values, memory)?,
         _ => parse_length(property, values)?,
     };
     Ok(result)
@@ -869,11 +918,7 @@ fn parse_value(
 
 fn parse_length(property: Property, values: &[Component]) -> Result<Option<Specified>, Error> {
     if let [value @ Component::Function { .. }] = values {
-        Ok(calc::parse(
-            value,
-            !property.border() && property != Property::LetterSpacing,
-        )?
-        .map(Specified::Calculated))
+        Ok(calc::parse(value, !property.no_percentage())?.map(Specified::Calculated))
     } else {
         Ok(parse_length_property(property, values))
     }
@@ -937,7 +982,7 @@ fn length_property(property: Property, value: &Component) -> Option<Specified> {
     {
         return None;
     }
-    if matches!(unit, Unit::Percent) && (property.border() || property == Property::LetterSpacing) {
+    if matches!(unit, Unit::Percent) && property.no_percentage() {
         return None;
     }
     Some(Specified::Length(number, unit))
@@ -1147,6 +1192,7 @@ pub(crate) fn compute_value(
                 !property.signed_length(),
             ))
         }
+        Specified::Spacing(axes) => spacing(axes, font_size, root_font_size),
         Specified::Length(value, unit) => {
             let em = if property == Property::FontSize {
                 parent.map(ComputedStyle::font_size).unwrap_or(16.0)
@@ -1159,27 +1205,46 @@ pub(crate) fn compute_value(
                 Unit::Percent if !matches!(property, Property::FontSize | Property::LineHeight) => {
                     Length::Percent(clamp(*value))
                 }
-                _ => {
-                    let factor = match unit {
-                        Unit::Px => 1.0,
-                        Unit::Pt => 96.0 / 72.0,
-                        Unit::Pc => 16.0,
-                        Unit::In => 96.0,
-                        Unit::Cm => 96.0 / 2.54,
-                        Unit::Mm => 96.0 / 25.4,
-                        Unit::Q => 96.0 / 101.6,
-                        Unit::Em => em,
-                        Unit::Rem => root_font_size,
-                        Unit::Percent => em / 100.0,
-                        Unit::Auto => 0.0,
-                    };
-                    Length::Px(clamp(value * factor))
-                }
+                _ => Length::Px(clamp(value * unit_px(*unit, em, root_font_size))),
             };
             ComputedValue::Length(length)
         }
     };
     Ok(result)
+}
+/// `border-spacing` computed: out of compute_value's common path, which
+/// every property of every element takes.
+#[inline(never)]
+fn spacing(axes: &(Axis, Axis), em: f64, root_font_size: f64) -> ComputedValue {
+    let axis = |axis: &Axis| match axis {
+        Axis::Length(value, unit) => {
+            (value * unit_px(*unit, em, root_font_size)).clamp(0.0, MAX_ABSOLUTE_VALUE)
+        }
+        Axis::Calculated(value) => match value.compute(em, root_font_size, Some(0.0), true) {
+            Length::Px(px) => px,
+            _ => 0.0,
+        },
+    };
+    ComputedValue::Spacing {
+        horizontal: axis(&axes.0),
+        vertical: axis(&axes.1),
+    }
+}
+/// Px in one `unit`; a percentage is of `em`, as font-size's is.
+fn unit_px(unit: Unit, em: f64, root_font_size: f64) -> f64 {
+    match unit {
+        Unit::Px => 1.0,
+        Unit::Pt => 96.0 / 72.0,
+        Unit::Pc => 16.0,
+        Unit::In => 96.0,
+        Unit::Cm => 96.0 / 2.54,
+        Unit::Mm => 96.0 / 25.4,
+        Unit::Q => 96.0 / 101.6,
+        Unit::Em => em,
+        Unit::Rem => root_font_size,
+        Unit::Percent => em / 100.0,
+        Unit::Auto => 0.0,
+    }
 }
 
 pub(crate) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error> {

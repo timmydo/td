@@ -10,7 +10,8 @@ text and rich renderers remain independent and byte-identical.
 
 The first formatting model is horizontal, left-to-right normal flow. Its
 references are CSS 2.2 [box generation and normal flow][flow], [used sizes
-and line height][sizes], and [CSS Text 3][text]. This is an explicitly
+and line height][sizes], and [CSS Text 3][text], with CSS 2.2's tables
+(§5, "Tables"). This is an explicitly
 bounded subset, not a claim to implement browser layout generally.
 
 [flow]: https://www.w3.org/TR/CSS22/visuren.html
@@ -380,9 +381,10 @@ and their margins add. Block relative offsets move visual geometry, not the spac
 in flow. Overflow is reported geometrically; clipping,
 scroll containers and stacking contexts are consumer/future work.
 
-Tables, flex and inline-block formatting are not implemented: those
-containers use ordinary block flow and their descendants remain visible.
-List items use block flow, with the markers below. visibility:hidden
+Tables are laid as grids (below, "Tables"). Flex and inline-block
+formatting are not implemented: those containers use ordinary block flow
+and their descendants remain visible. List items use block flow, with
+the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
 Floats use their computed blockified display in ordinary flow with **no
 exclusion region**; clear has no effect. Float placement is a later
@@ -398,8 +400,9 @@ the CSS values; attributes and intrinsic sizes are content sizes.
 
 **Intrinsic sizes.** `Request::intrinsic` names the caller's
 `IntrinsicSizes` lookup, `Sync` so a request stays `Send` and `Sync`,
-which a layout asks once for each image box it sizes, by the img's
-NodeId and StyleId, and no other node: the style lets a caller measure
+which a layout asks once for each image box it sizes, and again for
+each time a table measures that box's widths (below, "Tables"), by the
+img's NodeId and StyleId, and no other node: the style lets a caller measure
 a stand-in in the image's own font. Layout holds the caller's
 FontMetrics mutably while it asks, so a lookup cannot borrow them: it
 answers what was measured before the layout, or measures with a handle
@@ -646,6 +649,240 @@ lines' 68 MiB step refuses the layout `Limit("MAX_PAGE_BYTES")`; 131,000
 items of one letter, which lay a line each anyway, charge 189.6 MiB
 with markers either way and 171.6 without.
 
+### Tables
+
+A box whose computed display is a table display is laid by CSS 2.2
+[§17][tables] in its separated borders model, with HTML's
+[table processing model][html-tables] for the grid. The roles, read from
+`display` alone, are `table` and `inline-table`, `table-caption`,
+`table-column-group`, `table-column`, the three row groups, `table-row`
+and `table-cell`; `StyledDocument::table_role` reports a box's and
+`has_tables` whether any box has one, so a page without one never looks.
+`inline-table` is laid as a block-level table where its box is: td-layout
+has no inline-block formatting (above).
+
+[tables]: https://www.w3.org/TR/CSS22/tables.html
+[html-tables]: https://html.spec.whatwg.org/multipage/tables.html#table-processing-model
+
+**Anonymous objects** (§17.2.1). Text of HTML white space alone between
+table boxes makes no box. In a table, anything but a caption, column,
+column group, row group or row is wrapped with its neighbours in an
+anonymous row; in a row group, anything but a row; in a row, anything
+but a cell is wrapped in an anonymous cell, laid with the row's style.
+A run of internal table boxes (rows, cells, groups, captions, columns)
+among a block's children with no table box around it is wrapped in one
+anonymous table, which takes its parent's inherited values and has no
+margins, borders or padding. A column group's children other than
+columns are not rendered; a column, and anything in it, has no content.
+Real HTML parses rows into a `tbody`, so only CSS-made tables lean on
+these rules.
+
+**Grid.** Rows are in tree order, row groups' rows in their place: a
+`tfoot` is not moved to the bottom, a `thead` not to the top, unlike a
+browser. Cells take the first column free of rowspans in their row.
+`colspan` is HTML's non-negative integer, 0 or junk being 1 and above
+MAX_COLSPAN (1,000) being 1,000; `rowspan` likewise, 0 meaning to the end
+of its row group and above MAX_ROWSPAN (65,534) being 65,534, and every
+span ends with its row group. A cell that overlaps a rowspan (HTML's
+table model error) does not shorten it: a column stays held to the
+latest row any span in the group holds it to. `span` on a column or
+column group is 1 to 1,000. A grid of more than MAX_TABLE_COLUMNS (4,096) columns, counting
+spans and column elements, refuses the layout `Limit("MAX_TABLE_COLUMNS")`.
+Spans are recorded per column as a row-group epoch and an end row, so a
+cell's placement costs its span, charged as work, and no row-by-column
+array exists. The grid's columns are then merged into **effective
+columns** wherever no cell or column element starts between them, as
+browsers do, so `colspan=100` over three cells is three columns and not a
+hundred gaps of spacing.
+
+**Widths** (§17.5.2). With `table-layout: fixed` and a width other than
+auto, column elements' widths set their columns, then the first row's
+cells' widths theirs, each span divided evenly; columns with no width
+share what remains evenly, and where every column has one the rest is
+spread by their widths. No cell is measured, and such a table measured
+as a cell's content is its set width or its columns', the wider.
+Otherwise the automatic algorithm measures each cell's min-content and
+max-content width with §4's white space, wrap opportunities, tabs and
+advances (a separate walker, `block/intrinsic.rs`, that emits nothing),
+an inside list marker counted as the first item of its line, each
+unbreakable piece rounded to whole px as a line's fit test is, plus its
+padding and border rounded up. A percentage of a cell's padding is
+zero, measured and laid alike. A cell's set width is its preferred
+width, as browsers take it (CSS Tables 3's outer max-content): its
+maximum is that width, never under its minimum, which only its content
+and its `min-width` set. A percentage width is kept as its column's
+share. Single-column cells set their columns' minimum and maximum, a
+column with set cells preferring the widest of those and not its other
+cells' content; a column element's width replaces a column's maximum
+the same way. Spanning cells then spread their excess over the columns
+they span, narrowest span first, in proportion to the columns' own
+values (evenly where those are zero); a spanning cell's percentage is
+spread over its columns by their maxima where none has one, and its
+set width marks them set. Nested tables, images and blocks in a cell
+contribute their own intrinsic widths, a replaced box's minimum being
+its border alone when its width or max-width is a percentage. A
+caption's min-content width raises the table's minimum.
+
+The table's width is its set width (border-box in HTML's sheet), never
+under the columns' minimum, else its columns' preferred width within
+the room its margins leave, never under their minimum: a table wider
+than its container overflows it. The preferred width counts percentage
+columns as Gecko does, as the width their maximum is that share of.
+Each percentage column takes its share of the table's room, then auto
+columns their maximum, columns with a set width theirs. Extra room goes
+to auto columns by their maxima, else to set columns by theirs, else to
+percentage ones by their percentages; a shortfall comes from auto
+columns, then set ones, then percentage ones, each down to its minimum.
+Widths are integers of 1/64 px, the table's floored from the room it is
+given, and every share given or taken sums exactly, rounding's remainder
+going to the last column or to those with room left, so columns sum
+exactly to the table and never past its container. A cell's width is
+its columns' own sum, not a difference of two x's, which at a
+fractional table x fell an ulp short and wrapped content measured to
+fit. Auto margins center a table as §10.3.3 would a block of that
+width.
+
+**Rows and cells.** Cells are laid in their columns' width, less
+spacing, at their row's top, as §5's blocks in their own context; a
+row is as tall as its tallest single-row cell, and a row-spanning cell
+taller than the rows it spans grows the last of them. Cell `height` and
+row `height` raise the row; a table's set height beyond its rows is
+added below the last row, not spread over the rows. Within its row's
+height a cell's content is aligned by `vertical-align` (§17.5.3),
+against the height its content takes and not a height set on the cell:
+top, middle and bottom, and baseline, where every single-row baseline cell's
+first line's baseline meets the row's lowest such, and any other value
+is baseline; such a cell makes its row the taller of its set height and
+its content moved to the baseline. A spanning baseline cell is laid at
+the top. HTML's sheet
+gives cells `vertical-align: middle` through their row group. A cell's
+box keeps the row's top and full height; its lines, replaced boxes,
+markers and descendants' geometry move by the alignment offset, rounded
+to 1/64 px. `empty-cells` has no effect; an empty cell has its
+column's width and row's height.
+
+**Borders and spacing** (§17.6). `border-spacing`, one td-css
+longhand holding both axes, lies around every column and row, inside the
+table's padding.
+`border-collapse: collapse` is approximated, not resolved: no spacing,
+no table padding, and the table's and every cell's border width halved
+in their geometry, so adjacent cells' halves sum to one width. Conflict
+resolution (§17.6.2.1) is not done; a painter draws each box's own
+half. Row, row group, column and column group boxes have geometry for
+backgrounds and are given none of the edges; a column box spans the
+table's rows, a row group its rows, a row its columns.
+
+**Captions.** A caption before the table's first row is laid above
+the table box, at the table's border-box width (HTML centres its text);
+one after any row is laid below it, in tree order, whatever its
+`caption-side`. The table's vertical margins lie outside its captions,
+as on §17.4's table wrapper box, and a caption's own margins add.
+
+**Output and lines.** Geometry is in postorder, as every box's: each
+cell, then its row, then its group, then the table. Lines are in tree
+order: row by row, and within a row, cell by cell left to right, each
+cell's lines top to bottom. Line order is therefore not y order inside
+a table: within a row a middle-aligned cell's first line can lie below
+its neighbour's second, a rowspan's lines come with its first row's
+though a bottom-aligned one lies beside later rows, and a caption after
+the rows comes after them whatever their heights. A table's lines are
+one contiguous run of the layout's lines (its nested tables' inside
+it), so a consumer seeking a line by y may binary-search the ordered
+lines around a table but must scan a table's run, by y and then x.
+Every fragment keeps its DOM node and byte range, as in §3; a table adds
+no fragment kind and generates no text. Anonymous rows and cells have
+no box and so no geometry.
+
+**Windows.** A cell's lines move once its row's height is known, and
+only down, so while any table is laid layout drops a line that starts
+at or below the window's end as it would outside a table, but keeps
+those above the window, and each cell's first line whatever the
+window, since its row's baseline is that line's. The outermost table
+keeps those its window meets and drops the rest, renumbering its
+markers' lines, as each of its rows ends with no rowspan still open,
+and once more as it ends. A windowed layout equals the filtered whole
+one, as everywhere. What a window holds at once is the lines above it
+in the row being laid, those of rows a rowspan still holds open, and
+a line for each cell: 20,000 lines in one cell windowed at the top
+charge 1/20 of the whole layout's bytes, and a window at the end of
+20,000 rows no more than one at their top. Each filtering moves what it
+kept into vectors of their size where the old ones are four times too
+large, charging the new and giving back the old capacity's charge, so a
+window far down a long row returns its few lines in a few lines'
+capacity and output bytes, which a next layout passed as
+`retained_output_bytes` can admit. A million lines of `pre` in one
+cell, windowed at 0 to 1,000 px, lay out where the whole layout is
+refused `MAX_PAGE_BYTES` (measured below); a window there holding more
+than 524,288 of those lines above it, past 10,485,763 px or 52% of the
+page, needs the lines vector to double past that and is refused
+`MAX_PAGE_BYTES` too.
+
+**Bounds.** Every box looked at, span column visited, scalar measured,
+line moved and line filtered is charged to MAX_LAYOUT_WORK, and a block
+or table measured, a cell, or an inline image measured, eight units
+(`MEASURE_BOX`), its style
+read, edges resolved and children gathered taking some ten scalars'
+time. The grid, cell, row, column, item and span-order records live in
+one stack of BudgetVecs a nested table extends after its ancestors' and
+truncates when done, charged to the page budget as they grow. Measuring
+is linear in the content per level of table nesting: a table measures
+its cells, a table nested in one is measured with its cell and again
+when laid, so a scalar d tables deep is measured d times, bounded by
+MAX_DEPTH and MAX_LAYOUT_WORK. The child lists a measure gathers are
+charged while held and given back after, so content d tables deep
+charges them at their peak, not d times. A table level spends four of
+MAX_DEPTH, whatever elements the page wrote for it, since laying one
+recurses through the table, its row, its cell and the cell's content
+and measuring as deep: nested HTML tables, four elements a level,
+reach td-html's own 256 first, but cells nested in cells with nothing
+between, one element a level wrapped in an anonymous table and row,
+are refused `Limit("MAX_DEPTH")` at the 64th (DOM depth 66), where
+blocks reach 256.
+
+**Measured.** Release, the host of §6, §6's deterministic metrics,
+pinned to one CPU, 2026-11-15 under a load average of 3 to 5, medians of
+three to nine layouts per process. Wikipedia articles fetched that day
+with their stylesheets (nothing kept):
+
+| Page | Layout ms, tables as block flow / as tables | Height px |
+| --- | ---: | ---: |
+| *List of countries and dependencies by population* (1,390,111 bytes, 3 tables) | 3.8 / 4.4 | 57,405 / 22,220 |
+| *Germany* (1,647,153 bytes, 15 tables and infoboxes) | 5.7 / 6.2 | 51,261 / 45,129 |
+| *List of chemical elements* (495,772 bytes, 9 tables) | 1.8 / 2.3 | 76,567 / 12,255 |
+
+Pages without tables lay out with identical work: §6's 2 MiB prose in
+51.4 and 51.3 ms, word in 50.7 and 49.4, blocks in 69.2 to 74.4 ms
+against 71.1 to 72.2 over four alternated runs. Blocks' cascade takes
+22% fewer instructions and 4% fewer cycles than before td-css's faster
+cascade and these longhands, and the Wikipedia articles' about 4% fewer
+instructions and the same cycles (td-css/DESIGN.md, "Computed-style
+sharing").
+
+Worst cases, in one process each, the same day:
+
+| Shape | Result |
+| --- | --- |
+| 100,000 cells, 1,000 rows of 100 (604,015 bytes) | 59 ms, 152 MiB charged with the styled document |
+| 28 rows of 4,096 columns | 64 ms, 167 MiB |
+| 2,000 rows each one `colspan=1000` cell | 2.6 ms |
+| 200 `rowspan=65534` cells beside 20,000 rows | 70 ms |
+| a 4 MiB cell of words, `Limits::input` at MAX_INPUT, 1 / 2 / 8 / 10 tables deep | 137 / 177 / 409 / 476 ms (54,473,298 work at 10) |
+| the same 30 deep | `Limit("MAX_LAYOUT_WORK")` after 583 ms |
+| 4,097 columns | `Limit("MAX_TABLE_COLUMNS")` in 0.5 ms |
+| 20,000 / 50,000 rows of four `colspan=1000` cells | `Limit("MAX_LAYOUT_WORK")` in 38 ms / `Limit("MAX_PAGE_BYTES")` in 9 ms |
+| 2 MiB of one-cell tables each holding 62 nested empty divs | 62 ms, 2,120,466 work (29 ns a unit) |
+| 300 one-cell tables nested 61 deep | 249 ms, 20,369,104 work (12 ns a unit) |
+| 100,000 empty divs in a cell 45 tables deep | 575 ms, 40,737,039 work, 73 MiB |
+| a million lines of `pre` in one cell | whole `Limit("MAX_PAGE_BYTES")` in 106 ms; windowed at 0 to 1,000 px 76 ms, 9.6 MiB, as without the table; at 10,000,000 px 143 ms, 9.6 MiB, no output bytes past its 51 lines'; past 10,485,763 px `Limit("MAX_PAGE_BYTES")` |
+| 100,000 inline images 5 px square in a cell 60 tables deep | 744 ms, 54,465,584 work (14 ns a unit; 59 before images measured at `MEASURE_BOX`) |
+
+Measuring is weighted so its boxes cost what text does: text in cells
+runs about 9 ns a unit, and empty divs before `MEASURE_BOX` ran 83 ns
+a unit and tables nested 61 deep 34. Laying deep empty blocks outside
+tables, at 84 ns a unit, is §6's own and unchanged. Before measuring's
+child lists were charged at their peak, the 45-deep divs were refused
+`Limit("MAX_PAGE_BYTES")`.
+
 ## 6. Work bounds, resize and validation
 
 All limits are named constants and tested at and beyond their edges.
@@ -662,13 +899,15 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_POOL_BYTES | 64 MiB | style pool within page budget |
 | MAX_POOL_WORK | 67,108,864 | pool field/component and string-byte visits |
 | MAX_STYLE_COMPARISONS | 1,048,576 | pool equality probes |
-| MAX_DEPTH | 256 | layout ancestor stack |
-| MAX_LAYOUT_WORK | 64,000,000 | visited records/scalars per layout |
+| MAX_DEPTH | 256 | layout ancestor stack; a table level spends four (§5, "Tables", "Bounds") |
+| MAX_LAYOUT_WORK | 64,000,000 | visited records/scalars per layout; a measured block, table or cell eight (§5, "Tables": worst cases there) |
 | MAX_CASCADE_WORK | 128,000,000 | weighted cascade units per styled document |
 | MAX_LINE_SCALARS | 65,536 | pending single-line scratch; a line past it breaks or is cut (§4) |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
 | MAX_FRAGMENTS | 1,048,576 | emitted text, replaced and marker fragments |
 | MAX_MARKER_BYTES | 17 | one list marker's text (§5, "List markers") |
+| MAX_TABLE_COLUMNS | 4,096 | one table's grid columns (§5, "Tables") |
+| MAX_COLSPAN, MAX_ROWSPAN | 1,000, 65,534 | HTML's clamps on a cell's spans |
 | MAX_VIEWPORT | 1,000,000 px | viewport width and height |
 | MAX_COORDINATE | 1,000,000,000 px | absolute geometry extent |
 
@@ -1230,14 +1469,25 @@ stayed under it.
 5. Real-page and 2 MiB cost validation, synthetic regressions and measured
    memory/latency table. Reconcile the 132 MiB baseline after interning.
 
-Tables, flexbox, float exclusion, advanced text, painting and td-web
-integration need subsequent designs. No existing consumer switches to this
+Flexbox, float exclusion, advanced text, painting and td-web
+integration need subsequent designs. Open for tables: a windowed layout
+holds the lines above its window in the row being laid and in rows a
+rowspan holds open (§5, "Tables", "Windows"). A window past 524,288
+lines held in one row is refused `MAX_PAGE_BYTES`, as the lines vector
+would double past the page budget: on a page that is one cell of a
+million lines, any window past 10,485,763 px, about 52% of it.
+Filtering a cell's lines at its row's end whatever rowspans remain
+open would bound that to the open spans' own lines; a row's own lines
+above the window cannot be dropped before the row's height is known. No existing
+consumer switches to this
 library as part of these increments. td-web's integration
-(td-web/DESIGN.md §10, increment 6) needs a basic automatic table
-layout (rows and cells, colspan and rowspan within bounds), a style pool
+(td-web/DESIGN.md §10, increment 6) needs a style pool
 that admits The Guardian's front page, whose token-identity index
 charges each insertion its length (§6, "Style-pool work on The
-Guardian"). List markers as a fragment kind of their own, outside and
+Guardian"). Basic table layout, the automatic and fixed algorithms,
+`colspan` and `rowspan` within HTML's bounds and MAX_TABLE_COLUMNS,
+separated borders with collapse approximated, vertical alignment and
+captions, is §5's "Tables". List markers as a fragment kind of their own, outside and
 inside, numbered as HTML numbers list items, are §5's "List markers".
 Intrinsic sizes for replaced elements supplied by the caller, a change
 needing a layout and no cascade, are §5's "Intrinsic sizes". The input

@@ -431,6 +431,9 @@ and opacity's number/percentage range from
 | letter-spacing | normal, signed length (no percentage) | normal; yes |
 | opacity | number or percentage, clamped to [0,1] | 1; no |
 | list-style-position | outside, inside | outside; yes |
+| border-collapse | separate, collapse | separate; yes |
+| border-spacing | one nonnegative length for both axes, or the horizontal then the vertical; no percentage | 0; yes |
+| table-layout | auto, fixed | auto; no |
 
 Line-height numbers stay numbers through inheritance; lengths and
 percentages compute against the declaring element's font size and then
@@ -516,6 +519,33 @@ two `:is()` rules, circle and then square. Physical left stands for
 inline-start, and `counter-reset` and `text-align: match-parent` are
 absent: td-layout numbers by HTML's list owners itself.
 Presentational hints such as a list's `type` attribute are not mapped.
+`border-spacing` is one longhand, as [CSS 2.2
+§17.6.1](https://www.w3.org/TR/CSS22/tables.html#separated-borders) and
+CSS Tables 3 define it, computing to `ComputedValue::Spacing`, both axes
+in px, each em or rem against the element's font sizes as any length's;
+td-layout lays tables from it (td-layout/DESIGN.md §5, "Tables"). The
+per-axis `-webkit-border-horizontal-spacing` and
+`-webkit-border-vertical-spacing`, which Chrome and Safari expose, are
+not parsed: a single longhand cannot take one axis alone, and one
+longhand costs each element's style one value where two cost two
+(below, "Computed-style sharing").
+Its hidden elements follow HTML §15.3.1 as far as the rest of the
+sheet's tags: a hidden `input` (`type=hidden`, any case) is not
+rendered anywhere, over any author display.
+Its tables follow HTML §15.3.9 without the presentational hints of
+`cellspacing`, `cellpadding`, `align` or `valign`: a table is
+border-box with 2px spacing, separate borders and an initial
+text-indent, cells have 1px padding, rows inherit `vertical-align:
+middle` from their group (or table, for a row HTML left there) and cells
+from their rows, and a `form` that HTML's parser left directly in a
+table, group or row is not rendered. Tables and cells have gray
+borders, which row groups and rows inherit. Of `border`, attribute
+selectors read only whether it is `0`: any other value gives the table
+a 1px outset border and the cells of its rows, its own and its groups',
+1px inset ones, where HTML takes the table's width from the value. Every rule the sheet adds for
+tables, forms and hidden inputs is keyed by tag in the rule index, so a
+page without those elements tests none of them; a test holds that the
+sheet has no rule the index tests against every element.
 
 ## 5. Bounds and failure
 
@@ -692,13 +722,13 @@ rules apply (td-web/DESIGN.md §11), which td-css does not give yet.
 `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed 56-longhand roster. `initial` supplies context-free seeds; border
+the fixed 59-longhand roster. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
 computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
 borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`
 is fallible for owning values. `ComputedStyle::get` yields immutable typed
 values (keywords, RGBA colors, px/percentage/auto and unresolved calc() lengths, family lists,
-weights, scalar numbers and decoration flags); `font_size` and `color` are convenient
+weights, scalar numbers, decoration flags and border spacing's px pair); `font_size` and `color` are convenient
 typed accessors. `custom_property(name)` exposes an immutable computed
 token slice, or None for missing/guaranteed-invalid values. A computed style owns its values and cannot be populated
 with caller-constructed non-finite values. The crate documentation has
@@ -1041,6 +1071,22 @@ The blocks cascade's wall time is 398 to 402 ms against 435 to 449
 (fastest of five, three processes each). The Guardian's front page is
 refused MAX_POOL_WORK either way (td-layout/DESIGN.md §6, "Style-pool
 work on The Guardian").
+
+Table layout's three longhands (border-collapse, border-spacing,
+table-layout) and the sheet's table rules cost some of that back,
+measured as above (median of five, 2026-11-15, load average 3 to 5):
+
+| Page | Instructions before / faster / with tables (M) | Cycles (M) |
+| --- | ---: | ---: |
+| 2 MiB blocks | 5,541 / 4,140 / 4,324 | 1,801 / 1,615 / 1,723 |
+| Wikipedia, *Cascading Style Sheets* | 1,870 / 1,784 / 1,801 | 666 / 657 / 669 |
+| Wikipedia, *Germany* (1,647,153 bytes) | 4,076 / 3,901 / 3,929 | 1,461 / 1,431 / 1,465 |
+
+The blocks cascade's wall time is 392 to 397 ms with them, 371 to 374
+without, 404 to 408 before both (fastest of five, three processes
+each). The longhands' own cost would need styles that do not hold
+every longhand (a rare-property group, shared until a rule sets one),
+which td-css does not have.
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
 MAX_POOL_WORK (67,108,864 field/component and string-byte visits), and

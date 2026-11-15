@@ -1419,3 +1419,11 @@ fn unset_inherited_values_keep_their_sign_and_negative_zero() {
         assert_eq!(bits(&child, property), value.to_bits());
     }
 }
+
+#[test]
+fn the_html_sheet_tests_no_rule_against_every_element() {
+    // Its table, form and hidden-input rules are keyed by tag, so a page
+    // without those elements does not test them.
+    let set = StyleSet::new(&[(Origin::UserAgent, HTML_UA_CSS)]).unwrap();
+    assert_eq!(set.index.universal_count(), 0);
+}

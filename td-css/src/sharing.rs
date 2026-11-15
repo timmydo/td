@@ -403,6 +403,13 @@ fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
         }
         ComputedValue::Weight(w) => w.hash(hash),
         ComputedValue::Decoration(d) => (d.underline, d.overline, d.line_through).hash(hash),
+        ComputedValue::Spacing {
+            horizontal,
+            vertical,
+        } => {
+            hash_number(*horizontal, hash);
+            hash_number(*vertical, hash);
+        }
     }
 }
 

@@ -3,6 +3,8 @@ html, body, address, article, aside, blockquote, dir, div, dl, dt, dd,
 fieldset, figcaption, figure, footer, form, h1, h2, h3, h4, h5, h6, header,
 hr, main, menu, nav, ol, p, pre, section, ul { display: block }
 head, title, base, link, meta, script, style, template { display: none }
+/* HTML §15.3.1, Hidden elements. */
+input[type=hidden i] { display: none !important }
 body { margin: 8px }
 p, dir, dl, menu, ol, ul, pre, blockquote, figure { margin: 1em 0 }
 blockquote, figure { margin-left: 40px; margin-right: 40px }
@@ -31,6 +33,7 @@ big { font-size: larger }
 a:link { color: blue; text-decoration: underline }
 s, strike, del { text-decoration: line-through }
 u, ins { text-decoration: underline }
+/* HTML §15.3.9, Tables, less its presentational hints. */
 table { display: table }
 thead { display: table-header-group }
 tbody { display: table-row-group }
@@ -41,3 +44,24 @@ th { font-weight: bold; text-align: center }
 colgroup { display: table-column-group }
 col { display: table-column }
 caption { display: table-caption; text-align: center }
+table {
+  box-sizing: border-box; border-spacing: 2px; border-collapse: separate;
+  text-indent: initial }
+td, th { padding: 1px }
+table, td, th { border-color: gray }
+thead, tbody, tfoot, tr { border-color: inherit }
+/* The border attribute's hints: any value but 0 read as 1px. */
+table[border]:not([border="0"]) { border-width: 1px; border-style: outset }
+table[border]:not([border="0"]) > tr > td,
+table[border]:not([border="0"]) > tr > th,
+table[border]:not([border="0"]) > thead > tr > td,
+table[border]:not([border="0"]) > thead > tr > th,
+table[border]:not([border="0"]) > tbody > tr > td,
+table[border]:not([border="0"]) > tbody > tr > th,
+table[border]:not([border="0"]) > tfoot > tr > td,
+table[border]:not([border="0"]) > tfoot > tr > th {
+  border-width: 1px; border-style: inset }
+thead, tbody, tfoot, table > tr { vertical-align: middle }
+tr, td, th { vertical-align: inherit }
+table > form, thead > form, tbody > form, tfoot > form, tr > form {
+  display: none !important }

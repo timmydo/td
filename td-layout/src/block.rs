@@ -4,13 +4,18 @@ use crate::inline::{
     Pending, TextRun,
 };
 use crate::list::{MarkerFragment, MarkerKind};
-use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, MAX_PAGE_BYTES};
+use crate::{
+    keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, TableRole, MAX_PAGE_BYTES,
+};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
 use td_html::document::NodeId;
+
+mod intrinsic;
+mod table;
 
 pub const MAX_VIEWPORT: f64 = td_css::values::MAX_ABSOLUTE_VALUE;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -229,6 +234,10 @@ pub fn layout_with_budget(
         last_dimensions: None,
         last_marker: None,
         list_cursor: 0,
+        retain: 0,
+        first_line: false,
+        filtered: (0, 0),
+        tables: table::Scratch::new(memory)?,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -238,6 +247,7 @@ pub fn layout_with_budget(
         let strut = styled.box_node(first).ok_or(Error::Invalid)?.style;
         engine.children(
             Some(first),
+            None,
             Place {
                 container: Rect {
                     x: 0.0,
@@ -292,6 +302,18 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     last_marker: Option<Marker>,
     /// Layout meets list items in box order: the next one's index.
     list_cursor: usize,
+    /// Tables being laid: while any is, a line the window may yet meet is
+    /// kept, since a cell's lines move down once its row is done; the
+    /// outermost filters them for the window as each row with no rowspan
+    /// open ends, and as it ends.
+    retain: u32,
+    /// Keep the next line whatever the window: a cell's first, whose
+    /// baseline its row is aligned by.
+    first_line: bool,
+    /// The lines and markers before these the outermost table has filtered.
+    filtered: (usize, usize),
+    /// Tables' grids, a stack: a nested table's after its ancestors'.
+    tables: table::Scratch,
     left: f64,
     top: f64,
     right: f64,
@@ -352,6 +374,33 @@ impl Dimensions {
         self.padding.plus(self.border)
     }
 }
+/// Which lines and markers layout keeps.
+#[derive(Clone, Copy)]
+enum Keep<'r> {
+    All,
+    Window(&'r Range<f64>),
+    /// In a table: those the window may meet once moved down, as a cell's
+    /// alignment only moves them.
+    Above(&'r Range<f64>),
+}
+impl Keep<'_> {
+    fn meets(self, y: f64, height: f64) -> bool {
+        match self {
+            Self::All => true,
+            Self::Window(window) => meets(window, y, height),
+            Self::Above(window) => window.start < window.end && y < window.end,
+        }
+    }
+}
+impl<'r, M> Engine<'_, '_, '_, 'r, M> {
+    fn window(&self) -> Keep<'r> {
+        match self.request.window.as_ref() {
+            None => Keep::All,
+            Some(window) if self.retain > 0 => Keep::Above(window),
+            Some(window) => Keep::Window(window),
+        }
+    }
+}
 impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn block_dimensions(
         &mut self,
@@ -386,7 +435,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             rect,
         )
     }
-    fn events(&mut self, first: Option<BoxId>) -> Result<Events, Error> {
+    /// The inline items and blocks of the siblings from `first` up to
+    /// `until`, inline boxes flattened.
+    fn events(&mut self, first: Option<BoxId>, until: Option<BoxId>) -> Result<Events, Error> {
         let mut events = Events {
             inline: [None; 4],
             len: 0,
@@ -394,7 +445,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         };
         let mut stack: Option<BudgetVec<BoxId>> = None;
         let mut next = first;
-        while let Some(id) = next {
+        while let Some(id) = next.filter(|id| Some(*id) != until) {
             self.counters.step(1)?;
             let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
             if b.kind == BoxKind::Inline {
@@ -432,6 +483,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn children(
         &mut self,
         first: Option<BoxId>,
+        until: Option<BoxId>,
         place: Place,
         depth: usize,
         mut inside: Option<Marker>,
@@ -445,7 +497,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if depth > self.counters.limits.depth {
             return Err(Error::Limit("MAX_DEPTH"));
         }
-        let events = self.events(first)?;
+        let events = self.events(first, until)?;
         let mut at = 0;
         let mut run = Run {
             y: container.y,
@@ -459,12 +511,34 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         self.inline_run(&events, at..at, &place, &mut run, Some(marker))?;
                     }
                     let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
+                    let role = self.role(&b)?;
+                    if let Some(end) = self.table_run(&events, at, role)? {
+                        // Table boxes without a table: one anonymous table,
+                        // with no margins of its own (CSS 2.2 §17.2.1).
+                        run.y += run.previous_margin.unwrap_or(0.0);
+                        run.y += self.table(
+                            table::Source::Anonymous(&events, at..end),
+                            &place,
+                            run.y,
+                            depth + 1,
+                        )?;
+                        run.previous_margin = Some(0.0);
+                        at = end;
+                        if !coordinate(run.y) {
+                            return Err(Error::Limit("MAX_COORDINATE"));
+                        }
+                        continue;
+                    }
                     let dims = self.block_dimensions(&b, container.width, definite)?;
                     let gap = run.previous_margin.map_or(dims.margin.top, |previous| {
                         collapse(previous, dims.margin.top)
                     });
                     run.y += gap;
-                    run.y += self.block(id, b, dims, (container.x, run.y), offset, depth + 1)?;
+                    run.y += if role == Some(TableRole::Table) {
+                        self.table(table::Source::Root(id, dims), &place, run.y, depth + 1)?
+                    } else {
+                        self.block(id, b, dims, (container.x, run.y), offset, depth + 1)?
+                    };
                     run.previous_margin = Some(dims.margin.bottom);
                     at += 1;
                 }
@@ -511,11 +585,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let before = self.counters.lines;
         let style = self.styled.style(strut).ok_or(Error::Invalid)?;
         let align = keyword(style, Property::TextAlign);
+        let window = self.window();
         let mut sink = Positioned {
             lines: &mut self.lines,
             markers: &mut self.markers,
             waiting: &mut self.waiting,
-            window: self.request.window.as_ref(),
+            window,
+            first: &mut self.first_line,
             x: container.x + offset.0,
             dy: offset.1,
             width: container.width,
@@ -689,6 +765,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         } else {
             self.children(
                 b.first_child,
+                None,
                 Place {
                     container: Rect {
                         x: content_x,
@@ -757,9 +834,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             width: fragment.width,
             height: fragment.height,
         })?;
-        if self.request.window.as_ref().is_none_or(|w| {
-            w.start < w.end && fragment.y + fragment.height > w.start && fragment.y < w.end
-        }) {
+        if self.window().meets(fragment.y, fragment.height) {
             fragment_count(&mut self.counters)?;
             self.counters.admit_growth(&mut self.markers)?;
             self.markers.try_push(fragment)?;
@@ -781,6 +856,10 @@ struct Place {
     offset: (f64, f64),
     strut: StyleId,
 }
+/// Whether a non-empty window meets the span from `y`, `height` tall.
+fn meets(window: &Range<f64>, y: f64, height: f64) -> bool {
+    window.start < window.end && y + height > window.start && y < window.end
+}
 fn fragment_count(counters: &mut Counters) -> Result<(), Error> {
     if counters.fragments >= counters.limits.fragments {
         return Err(Error::Limit("MAX_FRAGMENTS"));
@@ -792,7 +871,8 @@ struct Positioned<'a> {
     lines: &'a mut BudgetVec<Line>,
     markers: &'a mut BudgetVec<MarkerFragment>,
     waiting: &'a mut BudgetVec<Waiting>,
-    window: Option<&'a Range<f64>>,
+    window: Keep<'a>,
+    first: &'a mut bool,
     x: f64,
     dy: f64,
     width: f64,
@@ -822,9 +902,7 @@ impl LineSink for Positioned<'_> {
         )
     }
     fn wants(&self, y: f64, height: f64) -> bool {
-        self.window.is_none_or(|w| {
-            w.start < w.end && y + self.dy + height > w.start && y + self.dy < w.end
-        })
+        *self.first || self.window.meets(y + self.dy, height)
     }
     fn line(
         &mut self,
@@ -844,6 +922,7 @@ impl LineSink for Positioned<'_> {
             counters.admit_growth(self.markers)?;
             self.markers.try_push(marker)?;
         }
+        *self.first = false;
         let local_y = line.y;
         line.y += self.dy;
         for f in &mut line.fragments {
@@ -939,7 +1018,20 @@ fn dimensions(
     height: Option<f64>,
     intrinsic: Option<IntrinsicSize>,
 ) -> Result<Dimensions, Error> {
+    sized(styled, b, style, Some(width), height, intrinsic)
+}
+/// dimensions() against a containing width, or none: then percentages of
+/// it are auto, or 0 for edges, as an intrinsic contribution takes them.
+fn sized(
+    styled: &StyledDocument<'_>,
+    b: &BoxNode,
+    style: &ComputedStyle,
+    basis: Option<f64>,
+    height: Option<f64>,
+    intrinsic: Option<IntrinsicSize>,
+) -> Result<Dimensions, Error> {
     use Property::*;
+    let width = basis.unwrap_or(0.0);
     let padding = edges(
         style,
         [PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
@@ -972,14 +1064,14 @@ fn dimensions(
             value.max(0.0)
         }
     };
-    let specified_width = length(style, Width, Some(width)).map(|v| content(v, decor.horizontal()));
+    let specified_width = length(style, Width, basis).map(|v| content(v, decor.horizontal()));
     let specified_height = length(style, Height, height).map(|v| content(v, decor.vertical()));
     let stretch = (width - margin.horizontal() - decor.horizontal()).max(0.0);
     let bounds = Bounds {
-        min_width: length(style, MinWidth, Some(width))
+        min_width: length(style, MinWidth, basis)
             .map(|v| content(v, decor.horizontal()))
             .unwrap_or(0.0),
-        max_width: length(style, MaxWidth, Some(width))
+        max_width: length(style, MaxWidth, basis)
             .map(|v| content(v, decor.horizontal()))
             .unwrap_or(f64::INFINITY),
         min_height: length(style, MinHeight, height)

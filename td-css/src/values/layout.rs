@@ -118,9 +118,16 @@ pub(super) fn extra(p: Property) -> bool {
             | Left
             | ListStyleType
             | ListStylePosition
+            | BorderCollapse
+            | BorderSpacing
+            | TableLayout
     )
 }
-pub(super) fn parse(p: Property, v: &[Component]) -> Result<Option<Specified>, Error> {
+pub(super) fn parse(
+    p: Property,
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<Specified>, Error> {
     let result = match p {
         BorderTopStyle | BorderRightStyle | BorderBottomStyle | BorderLeftStyle => {
             keyword(v, STYLES)
@@ -135,6 +142,9 @@ pub(super) fn parse(p: Property, v: &[Component]) -> Result<Option<Specified>, E
         BoxSizing => keyword(v, &["content-box", "border-box"]),
         ListStyleType => keyword(v, LIST_STYLE_TYPES),
         ListStylePosition => keyword(v, LIST_STYLE_POSITIONS),
+        BorderCollapse => keyword(v, &["separate", "collapse"]),
+        TableLayout => keyword(v, &["auto", "fixed"]),
+        BorderSpacing => border_spacing(v, memory)?,
         LineHeight => {
             if let Some(v) = keyword(v, &["normal"]) {
                 Some(v)
@@ -295,6 +305,40 @@ fn list_style(
     Ok(Some(output))
 }
 
+/// `border-spacing` (CSS 2.2 §17.6.1), one longhand: one length for both
+/// axes, or the horizontal then the vertical; nonnegative, no percentage.
+fn border_spacing(v: &[Component], memory: &Budget) -> Result<Option<Specified>, Error> {
+    let mut values = v.iter().filter(|c| !c.whitespace());
+    let axis = |c: Option<&Component>| -> Result<Option<Axis>, Error> {
+        let Some(c) = c else {
+            return Ok(None);
+        };
+        Ok(
+            match parse_length(BorderSpacing, std::slice::from_ref(c))? {
+                Some(Specified::Length(n, unit)) if !matches!(unit, Unit::Auto) => {
+                    Some(Axis::Length(n, unit))
+                }
+                Some(Specified::Calculated(value)) => Some(Axis::Calculated(value)),
+                _ => None,
+            },
+        )
+    };
+    let Some(x) = axis(values.next())? else {
+        return Ok(None);
+    };
+    let y = match values.next() {
+        Some(c) => match axis(Some(c))? {
+            Some(y) => y,
+            None => return Ok(None),
+        },
+        None => x,
+    };
+    if values.next().is_some() {
+        return Ok(None);
+    }
+    Ok(Some(Specified::Spacing(BudgetShared::new(memory, (x, y))?)))
+}
+
 fn border(
     v: &[Component],
     targets: &[Property],
@@ -394,7 +438,7 @@ fn font(
         let Some((_, c)) = tokens.next() else {
             return Ok(None);
         };
-        let Some(height) = parse(LineHeight, std::slice::from_ref(c))? else {
+        let Some(height) = parse(LineHeight, std::slice::from_ref(c), memory)? else {
             return Ok(None);
         };
         prefix.try_insert(LineHeight, height)?;

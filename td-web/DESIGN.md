@@ -1379,7 +1379,10 @@ td-layout keeps no glyphs.
 
 **Selection** is two places, kept unchanged by scrolling, a relayout,
 `F8` and a resize. A point of the pane falls on a line by its height
-(an index of the layout's lines by height), on a fragment by its x,
+(an index of the layout's lines by height, which cannot be a binary
+search of their order inside a table, where line order is not y order:
+it scans a table's run of lines by y and then x, td-layout/DESIGN.md
+§5, "Tables"), on a fragment by its x,
 and between scalars by the halves of their advances, replayed through
 td-layout's `inline::replay` with the layout's metrics and the style of
 the block that laid the line (the nearest block box enclosing it,
@@ -1408,9 +1411,21 @@ item laid no line, an empty item, is copied as a paragraph of its own
 where its item begins. A marker is no place: a point on an outside
 marker, left of its line, falls on the line's start, and one on an
 inside marker, before the line's first fragment, on the same start,
-and the keys step over it. What §5 copies and td-web no longer does:
-a quote's marks, which nothing draws now; and a table's row, which
-copies a cell a line.
+and the keys step over it. A table is copied as rows of cells: within
+a row, a cell's paragraphs are joined by a space and cells by a tab, and
+each row ends in a newline, so a copied table pastes into a spreadsheet
+a row a line. Cells come in tree order, as td-layout lays them (row by
+row, each row's cells left to right, td-layout/DESIGN.md §5, "Tables"),
+and td-web tells a cell's and a row's boundaries from the box parents of
+the block that laid each line, by `StyledDocument::table_role`. A row
+or cell CSS left anonymous has no box (td-layout/DESIGN.md §5,
+"Anonymous objects"), so a CSS table's anonymous ones give no boundary
+and their content is copied as the paragraphs it lays; a
+selection that starts or ends inside a table copies the cells it holds,
+partly held ones from or to its place, with the same separators. What
+§5 copies and td-web no longer does: a quote's marks, which nothing
+draws now; and a table's row, which §5's renderer copies a cell a line,
+the rule this one replaces at the cutover.
 
 **Links** are `a` and `area` elements with an `href` (td-dom's rule),
 joined against the page's base: the first `<base href>` in tree order,
@@ -1638,11 +1653,18 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      owned tree, DOM and CSS storage (above, "Memory"); a styled document
      holding its document by shared
      ownership, so a page passes between threads, as td-web, which
-     forbids `unsafe`, cannot hold a borrowed one beside its owner;
-     a basic automatic table
-     layout, rows and cells with `colspan` and `rowspan` within bounds,
-     so a page's tables line up as §5's do rather than stacking as
-     blocks. Available: list markers as a fragment kind of their own
+     forbids `unsafe`, cannot hold a borrowed one beside its owner.
+     Available: a basic table layout, so a page's tables line up as
+     §5's do rather than stacking as blocks: the automatic and fixed
+     width algorithms, rows and cells with `colspan` and `rowspan`
+     within HTML's bounds, refused past `MAX_TABLE_COLUMNS`, border
+     spacing with collapsed borders approximated, cells' vertical
+     alignment and captions, a box's part read by
+     `StyledDocument::table_role`; lines stay in tree order, row by row
+     and cell by cell left to right, which is not y order inside a
+     table, so the index of lines by height must take each table's
+     contiguous run of lines apart, by y and then x
+     (td-layout/DESIGN.md §5, "Tables"); list markers as a fragment kind of their own
      (`Layout::markers`, each a `MarkerFragment` naming its item, its
      ordinal and type, its line and its box, and no DOM byte), outside
      and inside, the ordinals HTML gives `ol`, `ul` and `menu` items

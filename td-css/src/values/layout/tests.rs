@@ -109,8 +109,23 @@ fn each_added_longhand_has_a_typed_value() {
             "inside",
             ComputedValue::Keyword("inside"),
         ),
+        (
+            BorderCollapse,
+            "collapse",
+            ComputedValue::Keyword("collapse"),
+        ),
+        (
+            BorderSpacing,
+            "1em 3pt",
+            ComputedValue::Spacing {
+                horizontal: 16.0,
+                vertical: 4.0,
+            },
+        ),
+        (TableLayout, "fixed", ComputedValue::Keyword("fixed")),
     ];
     assert_eq!(cases.len() + 25, Property::ALL.len());
+    assert_eq!(Property::ALL.len(), 59);
     for (p, value, want) in cases {
         assert_eq!(
             child(&format!("{}:{value}", p.name())).get(p),
@@ -415,4 +430,62 @@ fn state_selectors_join_indexed_cascade_without_exposing_history() {
         set.compute(&handle, None, 16.0, "").unwrap().get(Opacity),
         Some(&ComputedValue::Number(0.5))
     );
+}
+#[test]
+fn table_properties_inherit_but_the_layout_and_take_no_percentage() {
+    let word = |p| ComputedValue::Keyword(p);
+    fn spacing(s: &ComputedStyle) -> (f64, f64) {
+        match s.get(BorderSpacing) {
+            Some(ComputedValue::Spacing {
+                horizontal,
+                vertical,
+            }) => (*horizontal, *vertical),
+            other => panic!("{other:?}"),
+        }
+    }
+    let initial = child("");
+    assert_eq!(spacing(&initial), (0.0, 0.0));
+    assert_eq!(initial.get(BorderCollapse), Some(&word("separate")));
+    assert_eq!(initial.get(TableLayout), Some(&word("auto")));
+    for (input, x, y) in [
+        ("border-spacing:2px", 2.0, 2.0),
+        ("border-spacing:2px 1em", 2.0, 16.0),
+        ("border-spacing:0 calc(1px + 1em)", 0.0, 17.0),
+        ("border-spacing:1em;font-size:10px", 10.0, 10.0),
+        ("border-spacing:0.5in 2rem", 48.0, 32.0),
+        // One longhand, as CSS 2.2 has it: no per-axis names.
+        (
+            "border-spacing:2px;-webkit-border-vertical-spacing:5px",
+            2.0,
+            2.0,
+        ),
+        ("--s:3px 4px;border-spacing:var(--s)", 3.0, 4.0),
+        // Invalid: dropped, the initials stay.
+        ("border-spacing:10%", 0.0, 0.0),
+        ("border-spacing:-1px", 0.0, 0.0),
+        ("border-spacing:1px 2px 3px", 0.0, 0.0),
+        ("border-spacing:auto", 0.0, 0.0),
+        ("border-spacing:1px red", 0.0, 0.0),
+        ("border-spacing:calc(10% + 1px)", 0.0, 0.0),
+    ] {
+        let s = child(input);
+        assert_eq!(spacing(&s), (x, y), "{input}");
+    }
+    assert_eq!(
+        spacing(&child("border-spacing:calc(1px - 5px)")),
+        (0.0, 0.0)
+    );
+    for bad in ["border-collapse:bogus", "table-layout:none"] {
+        let s = child(bad);
+        assert_eq!(s.get(BorderCollapse), Some(&word("separate")), "{bad}");
+        assert_eq!(s.get(TableLayout), Some(&word("auto")), "{bad}");
+    }
+    let parent = child("border-spacing:3px 4px;border-collapse:collapse;table-layout:fixed");
+    let s = style("", Some(&parent));
+    assert_eq!(spacing(&s), (3.0, 4.0));
+    assert_eq!(s.get(BorderCollapse), Some(&word("collapse")));
+    assert_eq!(s.get(TableLayout), Some(&word("auto")));
+    let s = style("border-spacing:inherit;table-layout:inherit", Some(&parent));
+    assert_eq!(s.get(TableLayout), Some(&word("fixed")));
+    assert_eq!(spacing(&s), (3.0, 4.0));
 }

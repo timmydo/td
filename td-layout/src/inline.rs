@@ -1104,7 +1104,7 @@ pub fn replay(
 }
 /// (preserve spaces, preserve newlines, soft wrap); break-spaces is laid
 /// as pre-wrap.
-fn white_space(style: &ComputedStyle) -> (bool, bool, bool) {
+pub(crate) fn white_space(style: &ComputedStyle) -> (bool, bool, bool) {
     let mode = keyword(style, Property::WhiteSpace);
     let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
     (
@@ -1113,7 +1113,7 @@ fn white_space(style: &ComputedStyle) -> (bool, bool, bool) {
         !matches!(mode, "pre" | "nowrap"),
     )
 }
-fn shown(scalar: char, preserve: bool) -> (char, DisplayText) {
+pub(crate) fn shown(scalar: char, preserve: bool) -> (char, DisplayText) {
     if preserve && scalar == '\t' {
         ('\t', DisplayText::Source)
     } else if !preserve && matches!(scalar, ' ' | '\t' | '\n' | '\r' | '\x0c') {
@@ -1132,13 +1132,13 @@ fn shown(scalar: char, preserve: bool) -> (char, DisplayText) {
     }
 }
 /// letter-spacing in 1/64 CSS px.
-fn letter_spacing(style: &ComputedStyle) -> f64 {
+pub(crate) fn letter_spacing(style: &ComputedStyle) -> f64 {
     match style.get(Property::LetterSpacing) {
         Some(ComputedValue::Length(Length::Px(n))) => (*n * f64::from(UNIT)).round(),
         _ => 0.0,
     }
 }
-fn advance(
+pub(crate) fn advance(
     metrics: &mut impl FontMetrics,
     style: &ComputedStyle,
     shown: char,
@@ -1147,7 +1147,7 @@ fn advance(
     (f64::from(metrics.advance(style, shown)) + spacing).max(0.0) as i64
 }
 /// TAB_SPACES spaces as this style lays a space, letter-spacing included.
-fn tab_interval(
+pub(crate) fn tab_interval(
     metrics: &mut impl FontMetrics,
     style: &ComputedStyle,
     spacing: f64,
@@ -1158,14 +1158,17 @@ fn tab_interval(
 }
 /// To the next stop after `pen`, measured from the line's start; a zero
 /// interval lays a tab with no advance.
-fn tab_advance(pen: i64, interval: i64) -> i64 {
+pub(crate) fn tab_advance(pen: i64, interval: i64) -> i64 {
     if interval > 0 {
         interval - pen.rem_euclid(interval)
     } else {
         0
     }
 }
-fn vertical(metrics: &mut impl FontMetrics, style: &ComputedStyle) -> Result<(i64, i64), Error> {
+pub(crate) fn vertical(
+    metrics: &mut impl FontMetrics,
+    style: &ComputedStyle,
+) -> Result<(i64, i64), Error> {
     let font = metrics.line(style);
     if font.baseline > font.height {
         return Err(Error::Invalid);

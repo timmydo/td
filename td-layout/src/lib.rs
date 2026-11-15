@@ -26,6 +26,11 @@ pub const MAX_LINE_SCALARS: usize = 65_536;
 pub const MAX_LINES: usize = 1_048_576;
 pub const MAX_FRAGMENTS: usize = 1_048_576;
 pub const MAX_COORDINATE: f64 = 1_000_000_000.0;
+/// Columns one table's grid may hold (DESIGN.md §5, "Tables").
+pub const MAX_TABLE_COLUMNS: usize = 4096;
+/// HTML's ceilings on a cell's `colspan` and `rowspan` (HTML §4.9.11).
+pub const MAX_COLSPAN: u32 = 1000;
+pub const MAX_ROWSPAN: u32 = 65534;
 /// Weighted cascade work per page, summed as CascadeWork::total.
 pub const MAX_CASCADE_WORK: usize = 128_000_000;
 // Unit weights (DESIGN.md §6): no measured shape costs much over 25 ns a
@@ -213,6 +218,33 @@ pub enum BoxKind {
     Image,
     Break,
 }
+/// A box's part in CSS 2.2's table model (§17.2), by its display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableRole {
+    /// `table` or `inline-table`, laid as a block-level table.
+    Table,
+    Caption,
+    ColumnGroup,
+    Column,
+    /// `table-row-group`, `table-header-group` or `table-footer-group`.
+    RowGroup,
+    Row,
+    Cell,
+}
+impl TableRole {
+    pub fn of(display: &str) -> Option<Self> {
+        Some(match display {
+            "table" | "inline-table" => Self::Table,
+            "table-caption" => Self::Caption,
+            "table-column-group" => Self::ColumnGroup,
+            "table-column" => Self::Column,
+            "table-row-group" | "table-header-group" | "table-footer-group" => Self::RowGroup,
+            "table-row" => Self::Row,
+            "table-cell" => Self::Cell,
+            _ => return None,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct BoxNode {
     pub node: NodeId,
@@ -236,6 +268,9 @@ pub struct StyledDocument<'d> {
     list_items: BudgetVec<list::ListItem>,
     /// List items with a marker: list-style-type is not none.
     marker_count: usize,
+    /// Whether any block box has a table display; layout looks for tables
+    /// only then.
+    tables: bool,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -387,6 +422,7 @@ impl<'d> StyledDocument<'d> {
             cascade,
             list_items: BudgetVec::new(memory)?,
             marker_count: 0,
+            tables: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
         let list_base = out.charged;
@@ -455,6 +491,9 @@ impl<'d> StyledDocument<'d> {
                     first_child: None,
                     next_sibling: None,
                 })?;
+                if kind == BoxKind::Block {
+                    out.tables |= TableRole::of(keyword(computed, Property::Display)).is_some();
+                }
                 if let Some(element) = node.element() {
                     if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
                     {
@@ -581,6 +620,19 @@ impl<'d> StyledDocument<'d> {
     pub(crate) fn list_items(&self) -> &[list::ListItem] {
         &self.list_items
     }
+    /// A block box's part in a table, by its display: what a consumer
+    /// walking box parents needs to tell cells and rows apart.
+    pub fn table_role(&self, id: BoxId) -> Option<TableRole> {
+        let b = self.boxes.get(id.0)?;
+        if b.kind != BoxKind::Block {
+            return None;
+        }
+        TableRole::of(keyword(self.styles.get(b.style)?, Property::Display))
+    }
+    /// Whether any box has a table display.
+    pub fn has_tables(&self) -> bool {
+        self.tables
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -602,6 +654,7 @@ impl StyledDocument<'static> {
             cascade,
             list_items,
             marker_count,
+            tables,
             ..
         } = built;
         Ok(Self {
@@ -615,6 +668,7 @@ impl StyledDocument<'static> {
             cascade,
             list_items,
             marker_count,
+            tables,
         })
     }
 }
