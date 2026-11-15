@@ -4,7 +4,8 @@
 //! the committed diff, plus the review record every commit not yet on the base
 //! has to carry. Landing replays those commits one at a time, so the record is
 //! per commit — a branch-wide claim would say nothing about the commit the
-//! integrator actually stops at.
+//! integrator actually stops at. For the same reason each commit answers for
+//! AGENTS.md's word budget.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -18,14 +19,91 @@ const HELP: &str = "\
 usage: td-builder ready [options]
 
   Gate a rolling branch before pushing it: run the bounded checks over the
-  committed diff, and verify that every commit not yet on the base carries
-  its review record (AGENTS.md, `Code review`).
+  committed diff, verify that every commit not yet on the base carries
+  its review record (AGENTS.md, `Code review`), and refuse a branch that
+  grows AGENTS.md past its word budget.
 
 options:
   --base <ref>    base to land on (default: origin/main, falling back to main)
-  --record-only   scan the record only; do not run the checks
+  --record-only   scan the record only; do not run the checks (all a
+                  trivial rebase after a passing ready needs:
+                  DEVELOPMENT.md, `Rebasing after ready`)
   -h, --help      this text
 ";
+
+/// AGENTS.md is loaded on every task, and each landing that appends a
+/// qualifier to it makes every later task read it. A branch that leaves it
+/// past this many words, and longer than it found it, moves detail to the
+/// document that owns it.
+const AGENTS_WORD_BUDGET: usize = 2300;
+
+/// Whether a branch that took AGENTS.md from `fork` words to `head` breaks
+/// the budget. Only growth counts: a file two replays carried over budget
+/// blocks no branch that leaves it alone, trims it or fixes a typo in it.
+fn grows_over_budget(head: usize, fork: usize) -> bool {
+    head > AGENTS_WORD_BUDGET && head > fork
+}
+
+/// AGENTS.md's words at `rev`, 0 where it has none, or why they cannot be
+/// counted. A symlink's blob is its target's name, a word or so whatever the
+/// file it names holds, so it is refused rather than counted.
+fn agents_words(root: &Path, rev: &str) -> Result<usize, &'static str> {
+    let listing =
+        git_try(root, &["ls-tree", rev, "--", "AGENTS.md"]).ok_or("git could not list it")?;
+    let mut fields = listing.split_whitespace();
+    let (Some(mode), Some(_), Some(oid)) = (fields.next(), fields.next(), fields.next()) else {
+        // Absent is an empty listing; anything else is a line not understood.
+        return if listing.trim().is_empty() {
+            Ok(0)
+        } else {
+            Err("git listed it in a form not understood")
+        };
+    };
+    if mode != "100644" && mode != "100755" {
+        return Err("it is not a regular file, so its words cannot be counted");
+    }
+    let text = git_try(root, &["cat-file", "blob", oid]).ok_or("git could not read it")?;
+    Ok(text.split_whitespace().count())
+}
+
+/// Whether any of `commits` breaks AGENTS.md's budget against where the
+/// branch forked from `base`, saying which and why. Each commit answers, not
+/// only HEAD: the integrator may land a prefix and stop, so a later trim
+/// does not cover an earlier growth. What git cannot report fails: a gate
+/// may not take silence for a pass.
+fn agents_budget_fails(root: &Path, base: &str, commits: &[&str]) -> bool {
+    let Some(fork) = git_try(root, &["merge-base", base, "HEAD"]) else {
+        println!("  AGENTS.md: no merge base with {base} to measure its budget from");
+        return true;
+    };
+    let start = match agents_words(root, fork.trim()) {
+        Ok(words) => words,
+        Err(why) => {
+            println!("  AGENTS.md at the merge base: {why}");
+            return true;
+        }
+    };
+    let mut fails = false;
+    for oid in commits {
+        let short = oid.get(..8).unwrap_or(oid);
+        match agents_words(root, oid) {
+            Ok(words) if grows_over_budget(words, start) => {
+                println!(
+                    "  {short}: AGENTS.md grows from {start} to {words} words, over its budget \
+                     of {AGENTS_WORD_BUDGET} — move detail to the document that owns it \
+                     (AGENTS.md, opening)"
+                );
+                fails = true;
+            }
+            Ok(_) => {}
+            Err(why) => {
+                println!("  {short}: AGENTS.md: {why}");
+                fails = true;
+            }
+        }
+    }
+    fails
+}
 
 pub use reviewer::problems;
 #[cfg(test)]
@@ -235,6 +313,9 @@ fn run_at(
         }
     }
 
+    // Measured against the fork point, not the base tip: a branch answers
+    // only for what its own commits did to the file.
+    let over_budget = agents_budget_fails(&root, &base, &commits);
     if dirty > 0 {
         println!("  {dirty} uncommitted change(s) to tracked files — in no commit's record");
     }
@@ -246,7 +327,12 @@ fn run_at(
         println!("  note: {scratch} other untracked path(s), ignored here");
     }
     if behind > 0 {
-        println!("  note: {base} is {behind} commit(s) ahead — rebase before pushing");
+        // A pass on a stale base does not cover the rebase that follows it:
+        // the record-only exemption is for a base that moves after the pass.
+        println!(
+            "  note: {base} is {behind} commit(s) ahead — rebase, then run ready again \
+             before pushing"
+        );
     }
     if !branch.ends_with("-rolling") && branch != "HEAD" {
         // A note, not a failure: the suffix governs what the integrator's sweep
@@ -282,7 +368,7 @@ fn run_at(
 
     println!();
     let clean = dirty == 0 && blocking.is_empty();
-    if unready == 0 && clean && checks == 0 {
+    if unready == 0 && clean && checks == 0 && !over_budget {
         if record_only {
             // A different WORD, not a different exit status — `--record-only`
             // did what it was asked, so it exits 0 and a `&&` chain cannot tell
@@ -300,6 +386,9 @@ fn run_at(
         // Not "missing their record": a merge commit or one that could not be
         // read is counted here too, and neither is a missing record.
         println!("NOT READY: {unready} commit(s) not ready — see above");
+    }
+    if over_budget {
+        println!("NOT READY: AGENTS.md word budget — see above");
     }
     if dirty > 0 {
         println!("NOT READY: {dirty} uncommitted change(s)");
@@ -327,10 +416,10 @@ mod tests {
         })
     }
 
-    #[test]
-    fn empty_selection_still_checks_the_real_branch() {
-        let _root_cleanup = crate::test_temp::TempDir::new(&format!(
-            "td-ready-empty-{}-{}",
+    /// A scratch directory for a fixture repository, owned by its guard.
+    fn fixture_root(tag: &str) -> (crate::test_temp::TempDir, PathBuf) {
+        let cleanup = crate::test_temp::TempDir::new(&format!(
+            "{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -338,23 +427,32 @@ mod tests {
                 .as_nanos()
         ))
         .unwrap();
-        let root = _root_cleanup.join("fixture");
+        let root = cleanup.join("fixture");
         std::fs::create_dir_all(&root).unwrap();
-        let git = |args: &[&str]| {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{args:?}: {output:?}");
-        };
+        (cleanup, root)
+    }
+
+    /// git in a fixture repository, away from the user's configuration.
+    fn fixture_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    #[test]
+    fn empty_selection_still_checks_the_real_branch() {
+        let (_root_cleanup, root) = fixture_root("td-ready-empty");
+        let git = |args: &[&str]| fixture_git(&root, args);
         git(&["init", "-q", "-b", "main"]);
         std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
         git(&["add", "code.rs"]);
@@ -427,6 +525,71 @@ mod tests {
             ExitCode::from(23)
         );
         assert!(forwarded.get());
+    }
+
+    #[test]
+    fn only_growth_past_the_budget_breaks_it() {
+        let b = AGENTS_WORD_BUDGET;
+        assert!(!grows_over_budget(b, b - 1));
+        assert!(grows_over_budget(b + 1, b));
+        assert!(grows_over_budget(b + 1, 0));
+        // Already over at the fork: unchanged or trimmed is not this branch's.
+        assert!(!grows_over_budget(b + 5, b + 5));
+        assert!(!grows_over_budget(b + 4, b + 5));
+    }
+
+    /// A branch answers only for what its own commits did to AGENTS.md: one
+    /// over budget at the fork blocks no branch that leaves it alone, trims it
+    /// or deletes it. Each commit answers, so a later trim does not cover an
+    /// earlier growth, and a symlink, whose words cannot be counted, fails.
+    #[test]
+    fn a_branch_answers_for_growing_agents_md_past_its_budget() {
+        let (_root_cleanup, root) = fixture_root("td-ready-budget");
+        let git = |args: &[&str]| fixture_git(&root, args);
+        let docs = "\n\nReview-waiver: docs-only\nChecks: prose\n";
+        let over = "w ".repeat(AGENTS_WORD_BUDGET + 1);
+        let record_only = ["--record-only".to_string()];
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("AGENTS.md"), &over).unwrap();
+        git(&["add", "AGENTS.md"]);
+        git(&["commit", "-qm", "seed"]);
+        assert_eq!(agents_words(&root, "HEAD"), Ok(AGENTS_WORD_BUDGET + 1));
+
+        git(&["switch", "-qc", "other"]);
+        std::fs::write(root.join("notes.md"), "Notes\n").unwrap();
+        git(&["add", "notes.md"]);
+        git(&["commit", "-qm", &format!("notes{docs}")]);
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::SUCCESS);
+
+        git(&["switch", "-qc", "grow", "main"]);
+        std::fs::write(root.join("AGENTS.md"), format!("{over}w\n")).unwrap();
+        git(&["commit", "-qam", &format!("grow{docs}")]);
+        assert!(agents_budget_fails(&root, "main", &["HEAD"]));
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::FAILURE);
+        std::fs::write(root.join("AGENTS.md"), "w ".repeat(AGENTS_WORD_BUDGET)).unwrap();
+        git(&["commit", "-qam", &format!("trim{docs}")]);
+        assert!(!agents_budget_fails(&root, "main", &["HEAD"]));
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::FAILURE);
+        git(&["reset", "-q", "--soft", "main"]);
+        git(&["commit", "-qm", &format!("trimmed{docs}")]);
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::SUCCESS);
+
+        git(&["switch", "-qc", "delete", "main"]);
+        git(&["rm", "-q", "AGENTS.md"]);
+        git(&["commit", "-qm", &format!("delete{docs}")]);
+        assert_eq!(agents_words(&root, "HEAD"), Ok(0));
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::SUCCESS);
+
+        git(&["switch", "-qc", "link", "main"]);
+        git(&["rm", "-q", "AGENTS.md"]);
+        std::os::unix::fs::symlink("notes.md", root.join("AGENTS.md")).unwrap();
+        git(&["add", "AGENTS.md"]);
+        git(&["commit", "-qm", &format!("link{docs}")]);
+        assert!(agents_words(&root, "HEAD").is_err());
+        assert_eq!(local_ready(root.clone(), &record_only), ExitCode::FAILURE);
+
+        // A base git cannot resolve fails closed.
+        assert!(agents_budget_fails(&root, "no-such-ref", &["HEAD"]));
     }
 
     const COMPLETE: &str = "\

@@ -88,7 +88,13 @@ scanner limits and migration rules live in `td-alloc/DESIGN.md`.
 
 `td-builder ready` is the pre-push gate. It runs
 `affected-checks --committed-only --run` and verifies that every commit not on
-the base carries the review record described below.
+the base carries the review record described below. It also refuses a
+branch any of whose commits leaves `AGENTS.md` over its word budget
+(`AGENTS_WORD_BUDGET` in `builder/src/ready.rs`) and longer than at the
+merge base, or makes it a symlink. Each commit answers, since the
+integrator may land a prefix of them; and only growth counts, so a file
+over budget at the fork blocks no branch that leaves it alone or trims
+it.
 
 ```text
 td-builder ready
@@ -96,7 +102,8 @@ td-builder ready --record-only
 ```
 
 `--record-only` scans records but does not run builds; its successful output
-says `checks NOT run` and is not permission to push. The same agent that
+says `checks NOT run` and is not permission to push, except after the
+rebase "Rebasing after ready" describes. The same agent that
 finishes an increment carries it through the full ready gate.
 
 `ready` resolves the committed check selection locally. When it selects no
@@ -300,6 +307,37 @@ recorded pass, or marks the preflight failed on this content, before it
 runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
+
+### Rebasing after ready
+
+When the base moves after a full `ready` passed, the rebase onto it does
+not need the full gate again. The pass must be on these same commits,
+current with a base fetched just before it ran (`ready` never fetches; it
+notes a base it is behind, and a pass there does not count), with no
+change since but the rebase's
+own trivial resolution and message edits. A clean replay, or one whose
+conflicts were resolved trivially, then needs only `td-builder ready
+--record-only` before the push, which still verifies each commit's review
+record, the docs-only waiver's paths, the AGENTS.md word budget and a
+clean tree.
+
+A resolution is trivial when it keeps both sides' lines as each wrote
+them, drops none and leaves no conflict marker: adjacent additions to a
+document section, a table, a data list, or a context line the other side
+changed. A conflict resolved in Rust source, even that way, is trivial
+only once `cargo check` of each crate it touches passes with no new
+warnings: a line merge can duplicate an import, a variant or an arm, or
+leave an import unused, and `-D unused` refuses that. Anything else is a
+new change: editing a line both sides changed, or adapting the branch to a
+name, interface or behaviour main changed. A new change runs the full
+`ready` and takes a follow-up review pass on the resolved tree.
+
+A clean or trivially resolved rebase keeps its review record, since the
+reviewed change is unchanged, and its `Checks:` trailer names the
+pre-rebase tree the checks ran on (`UPDATING.md` asks the same of a pin
+bump). This takes the risk of a semantic conflict no line shows: main's
+checks and its integration tier find it after landing, as they would one
+the integrator's own clean replay onto main introduces.
 
 ## Reclaiming the shared build cache
 
@@ -743,7 +781,9 @@ rolling workstream onto the current base:
 git fetch origin && git rebase origin/main
 ```
 
-Commits whose patches landed drop out; unfinished commits replay. The remote
+Commits whose patches landed drop out; unfinished commits replay; a clean
+or trivially resolved replay of commits whose `ready` passed needs only
+`ready --record-only` ("Rebasing after ready"). The remote
 workstream still contains the pre-landing copies, so the next push is normally
 non-fast-forward. Before replacing them, compare stable patch IDs on the
 landed and workstream copies; equal IDs prove that the discarded copies are
@@ -1367,7 +1407,8 @@ confirms the resulting diff. Re-run the panel only for a named escalation:
 a new source file, unsafe surface or dependency, a material design change,
 or a disagreement that needs the other model's judgment. Record the trigger.
 Stop and ask the user if passes stop converging. Review the exact final
-source tree; a message-only amendment does not invalidate a source review.
+source tree; a message-only amendment does not invalidate a source review,
+nor does a rebase that needs no new `ready` ("Rebasing after ready").
 
 Close the commit message with a review/check trailer block. Both reviewers
 may use the same transport. For example:

@@ -4,7 +4,8 @@ You are one of possibly several agents building a functional Linux
 distribution. This file is the always-loaded contract. It holds the rules
 every task needs and routes to the rest; state a rule in one place. Status,
 rosters, version numbers and exceptions to exceptions belong in the owning
-document, not here.
+document, not here. `td-builder ready` refuses a branch that grows this
+file past its word budget (`AGENTS_WORD_BUDGET`, `builder/src/ready.rs`).
 
 # What to read
 
@@ -211,7 +212,9 @@ boundaries are:
 - never signal a process by matching its command line: every worktree runs the
   same binary path, so `pkill -f td-builder` cannot mean "mine". Stop your own
   check run with `td-builder stop`, or signal a pid you recorded yourself;
-- `td-builder ready` is the pre-push gate. `--record-only` is not a substitute;
+- `td-builder ready` is the pre-push gate. `--record-only` is not a
+  substitute, except after a clean or trivially resolved rebase of a branch
+  whose `ready` passed (`DEVELOPMENT.md`, "Rebasing after ready");
 - a change request authorizes pushing the ready branch to `origin`; that branch
   is the PR the separate integrator lands.
 
