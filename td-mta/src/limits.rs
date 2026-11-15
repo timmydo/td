@@ -101,6 +101,10 @@ macro_rules! limits {
         }
 
         impl Limits {
+            /// Configured and fixed ceilings, in declaration order.
+            pub fn values(&self) -> impl Iterator<Item = (&'static str, usize)> {
+                [$((stringify!($field), self.$field),)+ $((stringify!($fixed), self.$fixed),)+].into_iter()
+            }
             pub(crate) const CONFIG_FIELDS: &'static [&'static str] = &[$(stringify!($field),)+];
             // Cold bounded string dispatch keeps declarations in one place.
             pub(crate) fn set_config(&mut self, index: usize, value: usize) -> bool {

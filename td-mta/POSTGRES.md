@@ -1964,7 +1964,7 @@ recipients, one unread/unstarred Email, membership, anchor, history, shared
 quota effects and the operation receipt in one synchronous transaction.
 Each delivery advances account state once; repeated envelope recipients still
 produce one Email. Body and blob quotas are charged once. Retained receipts
-are capped at 1024 per account and survive deletion of the delivered Email.
+are capped at 16,384 per account and survive deletion of the delivered Email.
 
 Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
 account publisher and uses the retained operation/digest; known success stays

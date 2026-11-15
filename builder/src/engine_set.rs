@@ -61,6 +61,7 @@ pub const HOST_ONLY: &[&str] = &[
     "host_run.rs",
     "install_apps.rs",
     "install_mta.rs",
+    "install_mta_alerts.rs",
     "install_mta_backup.rs",
     "install_mta_notifications.rs",
     "install_mta_operations.rs",

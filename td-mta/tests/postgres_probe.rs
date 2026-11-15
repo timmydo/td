@@ -10198,7 +10198,60 @@ fn exercise_receiving(
     assert!(bulk_outcome.length > large.len() as u64);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE email_id=decode('{}','hex')",bulk_outcome.email)),"1000");
     assert_eq!(sql(fixture,&format!("SELECT sum(octet_length(bytes)) FROM td_mta.blob_chunks WHERE blob_id=decode('{}','hex')",bulk_outcome.blob)),bulk_outcome.length.to_string());
+    // Crossing the former lifetime cap must still publish a fresh delivery.
     sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
+    let capacity =
+        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
+    let metrics = capacity.get("metrics").unwrap().as_arr().unwrap();
+    let receiving_capacity = metrics
+        .iter()
+        .find(|r| {
+            r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts")
+                && r.get("scope").and_then(td_json::Json::as_str)
+                    == Some(&binding.account().to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        receiving_capacity.get("limit").unwrap().to_string(),
+        receiving::MAX_RECEIPTS.to_string()
+    );
+    assert_eq!(
+        receiving_capacity.get("used").unwrap().to_string(),
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+    );
+    assert_eq!(
+        capacity
+            .get("runtime_occupancy_measured")
+            .and_then(td_json::Json::as_bool),
+        Some(false)
+    );
+    // Exercise all sixteen account query groups under one bounded connection.
+    sql(fixture,"INSERT INTO td_mta.accounts SELECT decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex') FROM generate_series(1001,1015) n; INSERT INTO td_mta.account_usage SELECT id,0,0,0,0,0 FROM td_mta.accounts WHERE id IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n)");
+    let maximum =
+        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
+    assert_eq!(
+        maximum
+            .get("metrics")
+            .unwrap()
+            .as_arr()
+            .unwrap()
+            .iter()
+            .filter(|r| r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts"))
+            .count(),
+        16
+    );
+    sql(fixture,"DELETE FROM td_mta.account_usage WHERE account IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n); DELETE FROM td_mta.accounts WHERE id IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n)");
+    let above_old_limit = prepare(b"\r\nabove old receipt limit\r\n").unwrap();
+    let accepted = receiving::publish(request, trust, deadline(), &above_old_limit).unwrap();
+    assert_eq!(
+        receiving::publish(request, trust, deadline(), &above_old_limit).unwrap(),
+        accepted
+    );
+    sql(
+        fixture,
+        "DELETE FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+    );
+    sql(fixture,&format!("INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,{}) n",receiving::MAX_RECEIPTS));
     assert_eq!(
         receiving::publish(request, trust, deadline(), &fresh),
         Err(receiving::Error::Capacity)

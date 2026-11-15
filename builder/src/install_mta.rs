@@ -291,9 +291,14 @@ fn supervisor_files(
         .collect::<Vec<_>>()
         .join(" ");
     let description = name.replacen("td-mta-", "td-mta ", 1);
-    let unit = format!("[Unit]\nDescription={description}\n\n[Service]\nType=exec\nExecStart=:{exec}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec={stop_seconds}\nUMask=0077\n\n[Install]\nWantedBy=default.target\n");
+    let unit = format!(
+        "[Unit]\nDescription={description}\n\n[Service]\nType=exec\nExecStart=:{exec}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec={stop_seconds}\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"
+    );
     let command = argv.iter().map(|s| scheme(s)).collect::<Vec<_>>().join(" ");
-    let scm = format!("(use-modules (shepherd service))\n(register-services\n (service '({name})\n  #:documentation \"{description}; check readiness with {status}.\"\n  #:respawn? #t\n  #:respawn-delay 5\n  #:start (make-forkexec-constructor\n           '({command})\n           #:log-file {}\n           #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGTERM #:grace-period {stop_seconds})))\n", scheme(text(log)?));
+    let scm = format!(
+        "(use-modules (shepherd service))\n(register-services\n (service '({name})\n  #:documentation \"{description}; check readiness with {status}.\"\n  #:respawn? #t\n  #:respawn-delay 5\n  #:start (make-forkexec-constructor\n           '({command})\n           #:log-file {}\n           #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGTERM #:grace-period {stop_seconds})))\n",
+        scheme(text(log)?)
+    );
     Ok((unit, scm))
 }
 
@@ -340,7 +345,7 @@ fn retain_services(services: &Path, name: &str, files: (String, String)) -> Resu
                 return Err(format!(
                     "{} differs; retain or remove it explicitly before regeneration",
                     path.display()
-                ))
+                ));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 write_new(&path, content.as_bytes())?
@@ -435,8 +440,15 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
                 &format!("td-mta-acme-{}", acme.profile),
                 acme_service_files(&bin, connection, state, acme)?,
             )?;
-            println!("  certificate status: {} acme-status --connection-file {} --certificate-profile {}", shell(&bin), shell(connection), acme.profile);
-            println!("Start this worker before importing managed mail profiles. Wait for ready certificate status, then import/check/select matching ACME configuration (td-mta/ACME.md). DNS and public port 80 must reach its listener; provision low-port access separately. The runtime validates the CA settings. Services were not started.");
+            println!(
+                "  certificate status: {} acme-status --connection-file {} --certificate-profile {}",
+                shell(&bin),
+                shell(connection),
+                acme.profile
+            );
+            println!(
+                "Start this worker before importing managed mail profiles. Wait for ready certificate status, then import/check/select matching ACME configuration (td-mta/ACME.md). DNS and public port 80 must reach its listener; provision low-port access separately. The runtime validates the CA settings. Services were not started."
+            );
         }
     }
     Ok(())
@@ -449,6 +461,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     for (flag, mode) in [
         ("--notifications-monitor", "monitor"),
         ("--notifications-preview", "preview"),
+        ("--alerts-preview", "alerts-preview"),
+        ("--alerts-test", "alerts-test"),
         ("--notifications-digest", "digest"),
         ("--notifications-resolve", "resolve"),
     ] {

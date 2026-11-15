@@ -11,6 +11,9 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "install_mta_alerts.rs"]
+mod install_mta_alerts;
+
 const LIMIT: u64 = 3 * 1024 * 1024;
 const EVENTS: usize = 512;
 const PAGE_LIMIT: usize = 16;
@@ -328,7 +331,11 @@ fn collect(root: &Path, cfg: &Json) -> Result<()> {
     if string(&state, "epoch")? != epoch {
         return Err("monitor epoch changed; retain old evidence".into());
     }
+    let until = Instant::now() + Duration::from_secs(10);
     for _ in 0..PAGE_LIMIT {
+        if Instant::now() >= until {
+            break;
+        }
         let before = number(&state, "before")?;
         let page = logs(root, cfg, before)?;
         if string(&page, "store_epoch")? != epoch {
@@ -354,7 +361,14 @@ fn render(root: &Path, cfg: &Json, previous: &Json, monitor: &Json) -> Result<(S
     if cursor < old {
         return Err("monitor cursor went backwards".into());
     }
-    let mut report=format!("td-mta operational digest\nUTC epoch window: {} to {current}\nCollector log IDs: {old} through {cursor}\n\n",previous.get("through").map(integer).transpose()?.unwrap_or(current));
+    let mut report = format!(
+        "td-mta operational digest\nUTC epoch window: {} to {current}\nCollector log IDs: {old} through {cursor}\n\n",
+        previous
+            .get("through")
+            .map(integer)
+            .transpose()?
+            .unwrap_or(current)
+    );
     if current.saturating_sub(number(monitor, "checked")?) > 180 || number(monitor, "before")? != 0
     {
         report.push_str("ATTENTION: collector stale or backlog incomplete.\n");
@@ -396,6 +410,14 @@ fn render(root: &Path, cfg: &Json, previous: &Json, monitor: &Json) -> Result<(S
     for (kind, count) in counts {
         report.push_str(&format!("{kind}: {count}\n"));
     }
+    report.push_str(&format!(
+        "Collector diagnostic ring: {}/{} retained (rotates).\n",
+        field(monitor, "events")?
+            .as_arr()
+            .ok_or("invalid events")?
+            .len(),
+        EVENTS
+    ));
     for name in ["evicted", "database_suppressed", "capacity_evicted"] {
         report.push_str(&format!(
             "{name} (cumulative): {}\n",
@@ -446,10 +468,26 @@ fn render(root: &Path, cfg: &Json, previous: &Json, monitor: &Json) -> Result<(S
                     Err(_) => report.push_str("ATTENTION: disk snapshot unavailable.\n"),
                 }
             }
+        } else if string(check, "kind")? == "capacity" {
+            if let Ok(output) = result {
+                match capacity_summary(&output) {
+                    Ok(summary) => report.push_str(&summary),
+                    Err(_) => {
+                        report.push_str("ATTENTION: capacity unavailable; usage is unknown.\n")
+                    }
+                }
+            }
+        } else if string(check, "kind")? == "backup" {
+            if let Ok(output) = result {
+                match backup_summary(&output, check) {
+                    Ok(summary) => report.push_str(&summary),
+                    Err(_) => report.push_str("ATTENTION: backup capacity unavailable.\n"),
+                }
+            }
         }
     }
     report.push_str("\nPublication counters do not prove peers received SMTP replies.\nSampling, retention and process restarts limit completeness.\nLocal delivery cannot alert when this mail server is down; inspect the supervisor.\n");
-    if report.len() > 32768 {
+    if report.len() > 224 * 1024 {
         return Err("digest report exceeds bound".into());
     }
     Ok((
@@ -460,6 +498,96 @@ fn render(root: &Path, cfg: &Json, previous: &Json, monitor: &Json) -> Result<(S
             ("snapshots", Json::Obj(snapshots)),
             ("evicted", num(evicted)),
         ]),
+    ))
+}
+fn capacity_summary(output: &str) -> Result<String> {
+    let value = json::parse(output).map_err(|e| e.to_string())?;
+    if number(&value, "schema")? != 1 || string(&value, "status")? != "ok" {
+        return Err("capacity unavailable".into());
+    }
+    let rows = field(&value, "metrics")?
+        .as_arr()
+        .ok_or("missing capacity metrics")?;
+    if rows.len() > 2048 {
+        return Err("capacity row bound".into());
+    }
+    let mut measured = BTreeMap::<String, Vec<String>>::new();
+    let mut settings = BTreeMap::<(String, String, u64), Vec<String>>::new();
+    for row in rows {
+        let scope = string(row, "scope")?;
+        let name = string(row, "name")?;
+        let kind = string(row, "kind")?;
+        if [scope, name, kind].iter().any(|s| {
+            s.len() > 64
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        }) {
+            return Err("invalid capacity label".into());
+        }
+        let limit = number(row, "limit")?;
+        match field(row, "used")? {
+            Json::Null => settings
+                .entry((kind.into(), name.into(), limit))
+                .or_default()
+                .push(scope.into()),
+            used => {
+                let used = integer(used)?;
+                let pressure = if limit == 0 {
+                    100
+                } else {
+                    ((u128::from(used) * 100) / u128::from(limit)).min(u128::from(u64::MAX)) as u64
+                };
+                let warning = if kind == "reservation" {
+                    " (planned, not RSS)"
+                } else if kind == "rotation" {
+                    " (rotates)"
+                } else if used >= limit {
+                    " ATTENTION: exhausted"
+                } else if pressure >= 80 {
+                    " ATTENTION: >=80%"
+                } else {
+                    ""
+                };
+                measured.entry(scope.into()).or_default().push(format!(
+                    "  {name}: {used}/{limit} ({pressure}%), remaining {}{warning}\n",
+                    limit.saturating_sub(used)
+                ));
+            }
+        }
+    }
+    let mut report = String::from(
+        "Capacity: current usage / ceiling; byte limits are in bytes.\nCounters are not an integrity audit. Final-result receipts include reserved claims.\nBounded table counts stop at ceiling + 1.\n",
+    );
+    for (scope, lines) in measured {
+        report.push_str(&format!("{scope}:\n"));
+        for line in lines {
+            report.push_str(&line);
+        }
+    }
+    report.push_str(
+        "\nConfigured limits (instantaneous/peak usage unavailable; never assumed zero):\n",
+    );
+    for ((kind, name, limit), scopes) in settings {
+        for group in scopes.chunks(8) {
+            report.push_str(&format!("  {kind} {name}={limit} [{}]\n", group.join(",")));
+        }
+    }
+    if report.len() > 200 * 1024 {
+        return Err("capacity report bound".into());
+    }
+    Ok(report)
+}
+fn backup_summary(output: &str, check: &Json) -> Result<String> {
+    let value = json::parse(output).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Backups: {}/{} retained; directory bytes {}/{}; age {} seconds; maximum archive {} bytes.\nRetention count is a rotation target, not an exhaustion threshold.\n",
+        number(&value, "archives")?,
+        number(check, "retain")?,
+        number(&value, "directory_bytes")?,
+        number(check, "total_bytes")?,
+        number(&value, "age_seconds")?,
+        number(check, "archive_bytes")?
     ))
 }
 fn performance_summary(output: &str, previous: Option<&Json>) -> Result<(String, Json)> {
@@ -586,18 +714,7 @@ fn write(stream: &mut TcpStream, mut data: &[u8], until: Instant) -> Result<()> 
     Ok(())
 }
 
-fn send(root: &Path, cfg: &Json, report: &str, mut receipt: Json) -> Result<()> {
-    let day = now()? / 86400;
-    let mut entropy = [0u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut entropy))
-        .map_err(|e| e.to_string())?;
-    let random = entropy
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let id = format!("td-mta-digest-{day}-{random}@localhost");
-    let stamp = now()?;
+fn mail_date(stamp: u64) -> Result<String> {
     if stamp > 253402300799 {
         return Err("date outside supported range".into());
     }
@@ -613,12 +730,28 @@ fn send(root: &Path, cfg: &Json, report: &str, mut receipt: Json) -> Result<()> 
     let month = months
         .get(month.checked_sub(1).ok_or("invalid month")?)
         .ok_or("invalid month")?;
-    let mail_date = format!(
+    Ok(format!(
         "{} {month} {} {} +0000",
         date.get(8..10).ok_or("invalid day")?,
         date.get(..4).ok_or("invalid year")?,
         date.get(11..19).ok_or("invalid time")?
-    );
+    ))
+}
+
+fn send(root: &Path, cfg: &Json, report: &str, mut receipt: Json) -> Result<()> {
+    let day = now()? / 86400;
+    let mut entropy = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut entropy))
+        .map_err(|e| e.to_string())?;
+    let random = entropy
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let id = format!("td-mta-digest-{day}-{random}@localhost");
+    let stamp = now()?;
+    let date = crate::gate_timing::utc_iso(stamp);
+    let mail_date = mail_date(stamp)?;
     let label = date.get(..10).ok_or("invalid date")?;
     let recipient = string(cfg, "recipient")?;
     let address: SocketAddr = string(cfg, "smtp")?
@@ -627,7 +760,9 @@ fn send(root: &Path, cfg: &Json, report: &str, mut receipt: Json) -> Result<()> 
     if !address.ip().is_loopback() {
         return Err("notification SMTP must be loopback".into());
     }
-    let mut message=format!("From: td-mta operations <postmaster@localhost>\r\nTo: {recipient}\r\nSubject: [td-mta daily] {label}\r\nDate: {mail_date}\r\nMessage-ID: <{id}>\r\nAuto-Submitted: auto-generated\r\nX-TD-MTA-Report: daily-operations\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
+    let mut message = format!(
+        "From: td-mta operations <postmaster@localhost>\r\nTo: {recipient}\r\nSubject: [td-mta daily] {label}\r\nDate: {mail_date}\r\nMessage-ID: <{id}>\r\nAuto-Submitted: auto-generated\r\nX-TD-MTA-Report: daily-operations\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
+    );
     for line in report.lines() {
         if line.len() > 990 {
             return Err("report line too long".into());
@@ -638,7 +773,7 @@ fn send(root: &Path, cfg: &Json, report: &str, mut receipt: Json) -> Result<()> 
         message.push_str(line);
         message.push_str("\r\n");
     }
-    if message.len() > 65536 {
+    if message.len() > 256 * 1024 {
         return Err("digest exceeds message bound".into());
     }
     set(&mut receipt, "day", num(day))?;
@@ -758,7 +893,17 @@ pub(super) fn run(args: &[String], mode: &str) -> ExitCode {
         };
         let _lock = lock(&root, wait)?;
         match mode {
-            "monitor" => collect(&root, &cfg),
+            "monitor" => {
+                let collected = collect(&root, &cfg);
+                let complete = collected.is_ok()
+                    && read(&root.join("monitor.json"))
+                        .ok()
+                        .is_some_and(|state| number(&state, "before").ok() == Some(0));
+                let alerted = install_mta_alerts::run(&root, &cfg, complete, false);
+                collected.and(alerted)
+            }
+            "alerts-preview" => install_mta_alerts::run(&root, &cfg, true, true),
+            "alerts-test" => install_mta_alerts::test(&root, &cfg),
             "preview" => digest(&root, &cfg, true),
             "digest" => digest(&root, &cfg, false),
             "resolve" => {
@@ -785,6 +930,7 @@ pub(super) fn run(args: &[String], mode: &str) -> ExitCode {
     }
 }
 pub(super) fn validate(cfg: &Json) -> Result<()> {
+    install_mta_alerts::validate(cfg)?;
     for k in ["mta", "state", "connection"] {
         absolute(string(cfg, k)?)?;
     }
@@ -825,7 +971,9 @@ pub(super) fn validate(cfg: &Json) -> Result<()> {
         if !super::profile_name(name) {
             return Err("invalid check name".into());
         }
-        if !["status", "performance", "disk"].contains(&string(check, "kind")?) {
+        if !["status", "performance", "disk", "capacity", "backup"]
+            .contains(&string(check, "kind")?)
+        {
             return Err("invalid check kind".into());
         }
         let args = strings(field(check, "argv")?)?;
@@ -848,6 +996,57 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    #[test]
+    fn maximum_capacity_report_preserves_accounts_and_long_profile_names() {
+        let mut rows = Vec::new();
+        for profile in 0..16 {
+            let scope = format!("profile{profile:02}{}", "x".repeat(55));
+            assert_eq!(scope.len(), 64);
+            for setting in 0..70 {
+                rows.push(object(&[
+                    ("scope", Json::Str(scope.clone())),
+                    ("name", Json::Str(format!("configured_limit_{setting:02}"))),
+                    ("used", Json::Null),
+                    ("limit", num(u64::MAX - profile)),
+                    ("kind", Json::Str("setting".into())),
+                ]));
+            }
+            for count in 0..24 {
+                rows.push(object(&[
+                    ("scope", Json::Str(format!("{profile:032x}"))),
+                    (
+                        "name",
+                        Json::Str(format!("receipt_capacity_table_{count:02}")),
+                    ),
+                    ("used", num(16384)),
+                    ("limit", num(16384)),
+                    ("kind", Json::Str("capacity".into())),
+                ]));
+            }
+        }
+        let input = object(&[
+            ("schema", num(1)),
+            ("status", Json::Str("ok".into())),
+            ("metrics", Json::Arr(rows)),
+        ])
+        .to_canonical();
+        assert!(input.len() < 262144);
+        let report = capacity_summary(&input).unwrap();
+        assert_eq!(report.matches("ATTENTION: exhausted").count(), 16 * 24);
+        assert!(report.lines().all(|line| line.len() <= 990));
+        assert!(report.contains("configured_limit_69"));
+    }
+    #[test]
+    fn capacity_report_distinguishes_unknown_exhausted_and_reservations() {
+        let input = r#"{"schema":1,"status":"ok","metrics":[{"scope":"account","name":"receiving_receipts","used":1024,"limit":1024,"kind":"capacity"},{"scope":"receive","name":"smtp_sessions","used":null,"limit":8,"kind":"setting"},{"scope":"receive","name":"planned_memory_bytes","used":99,"limit":100,"kind":"reservation"}]}"#;
+        let report = capacity_summary(input).unwrap();
+        assert!(report.contains("1024/1024 (100%), remaining 0 ATTENTION: exhausted"));
+        assert!(report.contains("usage unavailable"));
+        assert!(report.contains("smtp_sessions=8"));
+        assert!(report.contains("planned, not RSS"));
+        assert!(capacity_summary(&input.replace("1024,\"limit", "null,\"limit")).is_ok());
+        assert!(capacity_summary(&input.replace("\"schema\":1", "\"schema\":2")).is_err());
+    }
     fn config(root: &Path, address: SocketAddr) -> Json {
         object(&[
             ("mta", Json::Str("/mta".into())),

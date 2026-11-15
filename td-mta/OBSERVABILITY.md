@@ -575,3 +575,19 @@ cell, without allocation, I/O or waiting; contention loses only a diagnostic
 observation. The logger retains one fixed previous-sample array. Neither metrics
 nor their loss can renew a deadline, retry a mutation, hold account authority or
 change a known publication result.
+
+## Capacity observations
+
+`postgres capacity-inspect --connection-file PATH --epoch HEX` emits bounded
+schema-1 JSON with selected generation/version and `metrics` rows containing
+scope, name, used (nullable), limit and kind. Owner access is required. It reads
+selected source policy and a repeatable-read database snapshot, then rechecks
+the selection. It exports no message bodies, envelopes or credentials. Durable
+usage counters are observed without an integrity audit. Account tables are
+counted only through their ceiling plus one; reserved final-result claims are
+included in each affected receipt table's occupancy. Connection usage includes
+this inspection and other client backends; its ceiling excludes reserved slots.
+Configured protocol, disk/work and concurrency limits have null usage when no
+live gauge exists. Memory reservations are distinct from measured memory.
+The host notification helper renders the report and can alert through external
+SMTP as specified in [DEPLOYMENT.md](DEPLOYMENT.md#capacity-reports-and-direct-external-alerts).

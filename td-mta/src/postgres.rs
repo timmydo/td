@@ -12,6 +12,7 @@ mod account_admin;
 mod audit;
 mod blob_audit;
 mod blob_scrub;
+mod capacity;
 mod configuration;
 mod configuration_snapshot;
 mod device_create;
@@ -95,6 +96,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("capacity-inspect")) {
+        return capacity::run(args);
+    }
     if command.as_deref() == Some(OsStr::new("blob-scrub")) {
         return scrub::run(args, false);
     }
@@ -195,16 +199,29 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     };
     match check(&loaded, operation) {
         Ok(Outcome::Probe(status)) => {
-            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"server_version\":{},\"schema_checked\":false,\"profile_checked\":false}}", status.server_version)?;
+            writeln!(
+                io::stdout().lock(),
+                "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"server_version\":{},\"schema_checked\":false,\"profile_checked\":false}}",
+                status.server_version
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Ok(Outcome::Schema(receipt)) => {
             let encoded = receipt.store_epoch;
-            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{encoded}\",\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false}}", receipt.version)?;
+            writeln!(
+                io::stdout().lock(),
+                "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{encoded}\",\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false}}",
+                receipt.version
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Ok(Outcome::Runtime(receipt)) => {
-            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{}\",\"runtime_privileges_checked\":true,\"profile_checked\":false}}", receipt.version, receipt.store_epoch)?;
+            writeln!(
+                io::stdout().lock(),
+                "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{}\",\"runtime_privileges_checked\":true,\"profile_checked\":false}}",
+                receipt.version,
+                receipt.store_epoch
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Err((stage, code)) => {
@@ -215,7 +232,10 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
 }
 
 fn report_error(command: &str, stage: &str, code: &str) -> io::Result<()> {
-    writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{command}\",\"status\":\"error\",\"stage\":\"{stage}\",\"error\":\"{code}\"}}")
+    writeln!(
+        io::stdout().lock(),
+        "{{\"schema\":1,\"command\":\"{command}\",\"status\":\"error\",\"stage\":\"{stage}\",\"error\":\"{code}\"}}"
+    )
 }
 
 enum Outcome {

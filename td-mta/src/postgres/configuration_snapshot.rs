@@ -11,7 +11,7 @@ use td_mta::{
     postgres_selection,
 };
 
-fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<(String, StoreEpoch)> {
+pub(super) fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<(String, StoreEpoch)> {
     let (mut connection, mut epoch) = (None, None);
     while let Some(flag) = args.next() {
         let value = args.next()?.into_string().ok()?;

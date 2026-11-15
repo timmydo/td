@@ -36,6 +36,13 @@ impl Input {
         }
     }
 
+    pub(super) fn capacity() -> Self {
+        Self {
+            frames: 4096,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn mailboxes() -> Self {
         Self {
             frames: 512,

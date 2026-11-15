@@ -327,3 +327,6 @@ pub mod postgres_replica_mailboxes;
 pub mod replica_mailboxes;
 
 pub mod replica_copy;
+
+/// Passive operational capacity inspection.
+pub mod postgres_capacity;

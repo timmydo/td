@@ -1044,7 +1044,7 @@ are needed beyond the existing PostgreSQL installation and schema-40 extension.
 ## Native operational notifications
 
 `--operations-services` can generate a bounded collector and a local daily
-mail digest alongside the existing readiness, certificate, backup, scrub and
+mail digest and optional direct external alerts alongside the existing readiness, certificate, backup, scrub and
 search jobs. These are host operator commands in `td-mta-operator`, built
 from this repository; no Python helper or source checkout is needed at runtime.
 They do not add a target distribution dependency.
@@ -1128,7 +1128,7 @@ the digest cursor; non-delivery keeps the previous cursor for a future retry.
 Archive the evidence before another resolution overwrites that bounded file.
 Do not delete the directory to
 clear a delivery error. Configuration, monitor, report and acknowledgement
-files are bounded to 3 MiB each; each generated message is at most 64 KiB.
+files are bounded to 3 MiB each; each generated message is at most 256 KiB.
 Inspection subprocesses have 20-second deadlines and bounded stdout/stderr;
 SMTP has a 30-second exchange deadline. The service supervisor additionally
 bounds the overall invocation. No elapsed-time performance threshold is a test.
@@ -1137,3 +1137,68 @@ This digest uses the local receive path and does not need SES or Migadu. It
 cannot reliably alert when that path or the host is unavailable. The failed
 oneshot result and private diagnostics remain independent local evidence;
 external uptime alerts and off-host backup copies are separate configuration.
+
+### Capacity reports and direct external alerts
+
+Generated notification configurations include `postgres capacity-inspect
+--connection-file PATH --epoch HEX`. It reads selected policy without loading
+secrets and observes account quota counters, bounded receipt/route/device/mailbox
+counts, log storage and database connections. Final-result receipt occupancy
+includes reserved claims. Counts stop at ceiling plus one; over-limit counts
+are lower bounds. A policy selection change or incomplete inspection refuses;
+missing data is never zero. The result is an observation, not a quota audit or
+serving permission. Configured concurrency and protocol ceilings are included,
+but instantaneous and peak occupancy are unavailable. Planned memory is labeled
+as a reservation, not RSS. The digest shows usage, ceiling, percentage and
+remaining capacity, warning at 80 percent. Backup counts are rotation targets.
+
+The private notification configuration may additionally contain:
+
+```json
+"alerts": {
+  "curl": "/usr/bin/curl",
+  "credentials": "/private/mail/alert-smtp.conf",
+  "host": "smtp.migadu.com",
+  "from": "operations@example.test",
+  "recipient": "external@example.net"
+}
+```
+
+This is an optional host-only curl invocation, not a target build dependency.
+The operator provisions curl with SMTP/TLS support and its CA trust store.
+The credentials file must be owned by the service user and mode 0600 under
+trusted ancestors. It is curl configuration containing only a quoted `user =
+"username:password"`; never place the password in argv or notification JSON.
+The helper uses implicit TLS on port 465 with certificate validation, a fixed
+recipient and sender, and an 18-second transport timeout. It bypasses local
+submission, PostgreSQL and the MTA's relay workers for delivery.
+
+The minute collector checks configured readiness/freshness, disk and capacity,
+and new SMTP commit/publication failures. Capacity warnings start at 80 percent,
+critical at 95 percent; rotating log row occupancy is not an incident. Failure
+counter differences require the same boot ID. First observations and restarts
+establish a baseline, not an invented interval. Missing inspections are incidents.
+Collection has a ten-second paging budget, inspections a 35-second scheduling
+budget (one bounded child may finish afterward); incomplete work is reported.
+
+Incidents remain active until ten quiet minutes, with hourly reminders and a
+recovery message. Failed or uncertain sends retry after five minutes, so alerts
+may duplicate after an ambiguous SMTP outcome. Private `alerts.json` retains
+counters, active incident keys and delivery timestamps separately from digest
+receipts. Neither preview nor a delivery test advances this incident state.
+`--alerts-preview --config-file PATH` inspects without sending; `--alerts-test
+--config-file PATH` explicitly sends a labeled configuration test. Both commands
+use the same operator entry point as the notification commands above.
+
+A host or network outage can prevent these alerts. An off-host heartbeat or
+end-to-end delivery monitor is still required to detect that class of failure.
+
+Capacity rendering admits 200 KiB within the 224 KiB daily report and 256 KiB
+message bound. Repeated scope lists wrap at eight names per line so maximum
+profile names stay within SMTP line bounds. External alert bodies admit 192 KiB.
+The capacity database connection separately admits 4,096 frames, 1 MiB input
+and 256 KiB output for the fixed roster across at most sixteen accounts; it
+retains the existing ten-second operation deadline and per-frame validation.
+These cold owner/host command paths retain bounded standard collection/JSON
+allocation debt in the reviewed inventory; they do not claim allocation safety
+or extend the serving path's allocation boundary.

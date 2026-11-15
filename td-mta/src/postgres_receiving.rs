@@ -24,7 +24,7 @@ pub use fanout::{
     inspect_fanout, prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Target,
 };
 pub use input::Message;
-pub const MAX_RECEIPTS: i64 = 1024;
+pub const MAX_RECEIPTS: i64 = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

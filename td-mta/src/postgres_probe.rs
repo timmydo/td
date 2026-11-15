@@ -121,6 +121,24 @@ pub(crate) fn with_client<T>(
     with_output_limit(request, trust, deadline, 64 * 1024, Input::new(), operation)
 }
 
+// Capacity observation: schema ledger plus at most 16 accounts, each with
+// twenty bounded count queries, and global counters. No body contents.
+pub(crate) fn with_capacity_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        256 * 1024,
+        Input::capacity(),
+        operation,
+    )
+}
+
 // One bounded configuration-material operation, at most 128 KiB in two chunks.
 pub(crate) fn with_material_client<T>(
     request: &Request<'_>,

@@ -34,6 +34,10 @@ macro_rules! settings {
             fn default() -> Self { Self { $($field: $default,)+ } }
         }
         impl $name {
+            /// Configured ceilings, in declaration order.
+            pub fn values(&self) -> impl Iterator<Item = (&'static str, u64)> {
+                [$((stringify!($field), self.$field),)+].into_iter()
+            }
             pub(crate) const CONFIG_FIELDS: &'static [&'static str] = &[$(stringify!($field),)+];
             // Cold bounded string dispatch keeps declarations in one place.
             pub(crate) fn set_config(&mut self, index: usize, value: u64) -> bool {

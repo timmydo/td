@@ -621,7 +621,10 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .iter()
         .map(|v| format!("Environment={}\n", systemd(v)))
         .collect::<String>();
-    let unit = format!("[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n", job.name);
+    let unit = format!(
+        "[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n",
+        job.name
+    );
     let digest_calendar = if let Schedule::Digest(hour) = job.schedule {
         format!(
             "OnCalendar=*-*-* {hour:02}:00:00{}\nPersistent=true\n",
@@ -639,18 +642,23 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         Schedule::QuarterHour => "OnBootSec=2min\nOnUnitActiveSec=15min\n",
         Schedule::Minute => "OnBootSec=2min\nOnUnitActiveSec=1min\n",
     };
-    let timer = format!("[Unit]\nDescription=Schedule {}\n\n[Timer]\n{schedule}Unit={}.service\n\n[Install]\nWantedBy=timers.target\n", job.name, job.name);
+    let timer = format!(
+        "[Unit]\nDescription=Schedule {}\n\n[Timer]\n{schedule}Unit={}.service\n\n[Install]\nWantedBy=timers.target\n",
+        job.name, job.name
+    );
     let digest_event = if let Schedule::Digest(hour) = job.schedule {
         format!("(calendar-event #:hours '({hour}) #:minutes '(0))")
     } else {
         String::new()
     };
     let event = match job.schedule {
- Schedule::Digest(_) => &digest_event,
- Schedule::Daily => "(calendar-event #:hours '(3) #:minutes '(15))",
- Schedule::QuarterHour => "(calendar-event #:minutes '(0 15 30 45))",
- Schedule::Minute => "(calendar-event #:minutes '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59))",
- };
+        Schedule::Digest(_) => &digest_event,
+        Schedule::Daily => "(calendar-event #:hours '(3) #:minutes '(15))",
+        Schedule::QuarterHour => "(calendar-event #:minutes '(0 15 30 45))",
+        Schedule::Minute => {
+            "(calendar-event #:minutes '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59))"
+        }
+    };
     let argv = job
         .argv
         .iter()
@@ -676,7 +684,12 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .collect::<Vec<_>>()
         .join(" ");
     let log = state.join(".operations").join(format!("{}.log", job.name));
-    let scm = format!("(use-modules (shepherd service) (shepherd service timer))\n(register-services\n (service '({name})\n  #:documentation \"Scheduled mail operation; inspect timer past runs and logs.\"\n  #:respawn? #f\n  #:start (make-timer-constructor\n    {event}\n    (command '({argv})\n      #:directory {state}\n      #:environment-variables (append '({env}) (filter (lambda (entry) (and {keep})) (default-environment-variables))))\n    #:log-file {log}\n    #:max-duration {seconds}\n    #:termination-signal SIGKILL\n    #:wait-for-termination? #t)\n  #:stop (make-timer-destructor)\n  #:actions (list timer-trigger-action)))\n", name=job.name, state=scheme(text(state)?), log=scheme(text(&log)?));
+    let scm = format!(
+        "(use-modules (shepherd service) (shepherd service timer))\n(register-services\n (service '({name})\n  #:documentation \"Scheduled mail operation; inspect timer past runs and logs.\"\n  #:respawn? #f\n  #:start (make-timer-constructor\n    {event}\n    (command '({argv})\n      #:directory {state}\n      #:environment-variables (append '({env}) (filter (lambda (entry) (and {keep})) (default-environment-variables))))\n    #:log-file {log}\n    #:max-duration {seconds}\n    #:termination-signal SIGKILL\n    #:wait-for-termination? #t)\n  #:stop (make-timer-destructor)\n  #:actions (list timer-trigger-action)))\n",
+        name = job.name,
+        state = scheme(text(state)?),
+        log = scheme(text(&log)?)
+    );
     Ok(vec![
         (format!("{}.service", job.name), unit),
         (format!("{}.timer", job.name), timer),
@@ -731,6 +744,42 @@ fn notification_config(opts: &Options, jobs: &[Job]) -> Result<Option<Json>> {
             vec![text(df)?.into(), "-Pk".into(), text(&opts.state)?.into()],
         );
     }
+    check(
+        "capacity".into(),
+        "capacity",
+        vec![
+            text(&opts.prefix.join("bin/td-mta"))?.into(),
+            "postgres".into(),
+            "capacity-inspect".into(),
+            "--connection-file".into(),
+            text(&notification.connection)?.into(),
+            "--epoch".into(),
+            notification.epoch.clone(),
+        ],
+    );
+    if let Some(backup) = &opts.backup {
+        let bounds = backup.bounds.unwrap_or(Bounds::DEFAULT);
+        for item in &mut checks {
+            if item.get("name").and_then(Json::as_str) == Some("backup-status") {
+                let Json::Obj(fields) = item else {
+                    return Err("invalid backup check".into());
+                };
+                fields.retain(|(name, _)| name != "kind");
+                fields.extend([
+                    ("kind".into(), Json::Str("backup".into())),
+                    ("retain".into(), Json::Num(bounds.retain.to_string())),
+                    (
+                        "total_bytes".into(),
+                        Json::Num(bounds.total_bytes.to_string()),
+                    ),
+                    (
+                        "archive_bytes".into(),
+                        Json::Num(bounds.archive_bytes.to_string()),
+                    ),
+                ]);
+            }
+        }
+    }
     let mut fields = vec![("checks".into(), Json::Arr(checks))];
     for (name, value) in [
         ("mta", text(&opts.prefix.join("bin/td-mta"))?.to_string()),
@@ -775,7 +824,7 @@ fn install(opts: &Options) -> Result<()> {
                 return Err(format!(
                     "{} differs; retain or remove explicitly",
                     path.display()
-                ))
+                ));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.to_string()),
@@ -843,7 +892,9 @@ fn install(opts: &Options) -> Result<()> {
             job.name
         );
     }
-    println!("No services started. Inspect each job's last result; active timers alone do not prove success. Off-host copies and external failure notification remain explicit. Local notification SMTP is not an independent uptime alert.");
+    println!(
+        "No services started. Inspect each job's last result; active timers alone do not prove success. Off-host copies and external failure notification remain explicit. Local notification SMTP is not an independent uptime alert."
+    );
     Ok(())
 }
 

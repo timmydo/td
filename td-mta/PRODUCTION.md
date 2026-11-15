@@ -158,9 +158,14 @@ and `td-mta-maint-notifications-digest.timer` (08:00 Pacific). The digest is
 local SMTP mail to the Inbox with subject prefix `[td-mta daily]`; it does not
 use an external relay. It reports sampled refusals and interruptions, native
 suppression, readiness, certificate and configured maintenance checks,
-process-counter differences and free disk space. Inspect their oneshot results
-and journal, not only enabled timers. No immediate external outage alert is
-configured. A broken host or local mail path can prevent its own digest.
+process-counter differences, operational capacity and free disk space. Inspect
+their oneshot results and journal, not only enabled timers. Direct external
+alerts use Migadu SMTP to `timmyd983@gmail.com`, bypassing local submission.
+The private `alerts` configuration and `alert-smtp.conf` credential live beside
+the notification state. Capacity pressure, new SMTP publication failures,
+failed inspections and recovery follow the bounded policy in DEPLOYMENT.md.
+A broken host or network still requires an off-host heartbeat monitor.
+The daily digest remains local mail to `timmy@882015.xyz`.
 
 The private configuration and bounded receipts are in
 `/var/lib/td-mta/mail/.operations/notifications/`, owned by `td-mta`. Run the
