@@ -733,7 +733,7 @@ impl Lexer<'_> {
     }
 }
 
-fn lexer<'a>(input: &'a str, memory: &'a Budget) -> Result<Lexer<'a>, Error> {
+fn lexer<'a>(input: &'a str, memory: &'a Budget, bom: Bom) -> Result<Lexer<'a>, Error> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(Error::Limit("MAX_INPUT_BYTES"));
     }
@@ -746,11 +746,11 @@ fn lexer<'a>(input: &'a str, memory: &'a Budget) -> Result<Lexer<'a>, Error> {
         });
     }
     let mut chars = td_alloc::BudgetVec::with_capacity(memory, input.len())?;
-    let mut source = input
-        .strip_prefix('\u{feff}')
-        .unwrap_or(input)
-        .chars()
-        .peekable();
+    let text = match bom {
+        Bom::Strip => input.strip_prefix('\u{feff}').unwrap_or(input),
+        Bom::Keep => input,
+    };
+    let mut source = text.chars().peekable();
     while let Some(ch) = source.next() {
         chars
             .push_within_capacity(match ch {
@@ -781,7 +781,16 @@ pub fn tokenize_with_budget(
     input: &str,
     memory: &Budget,
 ) -> Result<Parsed<BudgetVec<Token>>, Error> {
-    let mut lexer = lexer(input, memory)?;
+    tokens(input, memory, Bom::Strip)
+}
+/// Whether an initial U+FEFF is a stylesheet's byte order mark or text.
+#[derive(Clone, Copy)]
+pub(crate) enum Bom {
+    Strip,
+    Keep,
+}
+fn tokens(input: &str, memory: &Budget, bom: Bom) -> Result<Parsed<BudgetVec<Token>>, Error> {
+    let mut lexer = lexer(input, memory, bom)?;
     let mut tokens = BudgetVec::new(memory)?;
     while let Some(token) = lexer.token()? {
         if tokens.len() == MAX_TOKENS {
@@ -889,7 +898,15 @@ pub fn parse_components_with_budget(
     input: &str,
     memory: &Budget,
 ) -> Result<Parsed<BudgetVec<Component>>, Error> {
-    let tokens = tokenize_with_budget(input, memory)?;
+    components(input, memory, Bom::Strip)
+}
+/// An attribute's value is text, not a decoded sheet: U+FEFF stays.
+pub(crate) fn components(
+    input: &str,
+    memory: &Budget,
+    bom: Bom,
+) -> Result<Parsed<BudgetVec<Component>>, Error> {
+    let tokens = tokens(input, memory, bom)?;
     let mut parser = Components {
         memory,
         tokens: tokens.value.into_iter(),

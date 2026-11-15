@@ -41,6 +41,86 @@ impl Origin {
     }
 }
 
+/// One input to [`StyleSet::from_sheets`], in cascade order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sheet<'a> {
+    pub origin: Origin,
+    pub source: &'a str,
+    /// Media query lists that must all match: a `<style media>` or `<link
+    /// media>` attribute, then each `@import` list on the way to the sheet.
+    /// Empty applies the sheet everywhere, as absent attributes do.
+    pub media: &'a [&'a str],
+}
+impl<'a> Sheet<'a> {
+    pub const fn new(origin: Origin, source: &'a str) -> Self {
+        Self {
+            origin,
+            source,
+            media: &[],
+        }
+    }
+    pub const fn with_media(self, media: &'a [&'a str]) -> Self {
+        Self { media, ..self }
+    }
+    /// Text and media together, against the sheet's own input bound. Each
+    /// list counts at least one byte, so their number is bounded too, and
+    /// the sum stops once past the bound.
+    fn bytes(&self) -> usize {
+        let mut total = self.source.len();
+        for list in self.media {
+            if total > crate::MAX_INPUT_BYTES {
+                break;
+            }
+            total = total.saturating_add(list.len().max(1));
+        }
+        total
+    }
+}
+
+/// A sheet `from_sheets` left out: its index in the caller's list, its
+/// origin and the bound it met alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub index: usize,
+    pub origin: Origin,
+    pub error: Error,
+}
+
+/// The sheets a compilation left out, in input order; at most MAX_SHEETS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    list: [Option<Refusal>; MAX_SHEETS],
+    len: usize,
+}
+impl Refused {
+    const fn new() -> Self {
+        Self {
+            list: [None; MAX_SHEETS],
+            len: 0,
+        }
+    }
+    fn record(&mut self, refusal: Refusal) -> Result<(), Error> {
+        *self.list.get_mut(self.len).ok_or(Error::InvalidContext)? = Some(refusal);
+        self.len += 1;
+        Ok(())
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Refusal> {
+        self.list.iter().flatten()
+    }
+}
+impl std::fmt::Debug for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 #[derive(Debug)]
 struct Rule {
     selectors: SelectorList,
@@ -100,43 +180,101 @@ impl StyleSet {
     pub fn new_with_budget(sheets: &[(Origin, &str)], memory: &Budget) -> Result<Self, Error> {
         Self::new_with_environment_and_budget(sheets, &Environment::default(), memory)
     }
+    /// The tuple forms stop at the first refusal, a sheet's or the set's.
     pub fn new_with_environment_and_budget(
         sheets: &[(Origin, &str)],
         environment: &Environment,
         memory: &Budget,
     ) -> Result<Self, Error> {
+        let at = |index: usize| {
+            sheets
+                .get(index)
+                .map(|&(origin, source)| Sheet::new(origin, source))
+        };
+        Self::compile(sheets.len(), &at, environment, memory, false).map(|(set, _)| set)
+    }
+
+    /// Sheets with media conditions. A sheet a per-sheet bound refuses is
+    /// left out, as if never given, and listed in Refused; a set-wide
+    /// refusal is the Err.
+    pub fn from_sheets(
+        sheets: &[Sheet<'_>],
+        environment: &Environment,
+        memory: &Budget,
+    ) -> Result<(Self, Refused), Error> {
+        Self::compile(
+            sheets.len(),
+            &|index| sheets.get(index).copied(),
+            environment,
+            memory,
+            true,
+        )
+    }
+
+    /// Capacity a rollback can leave unused in the set's own arrays.
+    #[cfg(test)]
+    pub(crate) fn spare_bytes(&self) -> usize {
+        (self.rules.capacity() - self.rules.len()) * std::mem::size_of::<Rule>()
+            + self.index.spare_bytes()
+    }
+
+    /// One body for both slice forms; `at` yields each of `count` sheets.
+    fn compile<'a>(
+        count: usize,
+        at: &dyn Fn(usize) -> Option<Sheet<'a>>,
+        environment: &Environment,
+        memory: &Budget,
+        leave_out: bool,
+    ) -> Result<(Self, Refused), Error> {
         environment.validate()?;
-        if sheets.len() > MAX_SHEETS {
+        if count > MAX_SHEETS {
             return Err(Error::Limit("MAX_SHEETS"));
         }
+        // A sheet past its own bound is refused below, not counted here.
         let mut bytes = 0usize;
-        for (_, source) in sheets {
-            bytes = bytes
-                .checked_add(source.len())
-                .ok_or(Error::Limit("MAX_STYLE_BYTES"))?;
-            if bytes > MAX_STYLE_BYTES {
-                return Err(Error::Limit("MAX_STYLE_BYTES"));
+        for sheet in (0..count).filter_map(at) {
+            let own = sheet.bytes();
+            if own <= crate::MAX_INPUT_BYTES {
+                bytes = bytes.saturating_add(own);
             }
         }
-        let mut compiler = Compiler {
-            output: Self {
-                rules: BudgetVec::new(memory)?,
-                index: index::RuleIndex::new(memory)?,
-            },
-            declarations: 0,
-            walked: 0,
-            environment,
-        };
-        for (origin, source) in sheets {
-            compiler.add(
-                syntax::parse_stylesheet_with_budget(source, memory)?.into_inner(),
-                *origin,
-                0,
-                true,
-            )?;
+        if bytes > MAX_STYLE_BYTES {
+            return Err(Error::Limit("MAX_STYLE_BYTES"));
+        }
+        let mut compiler = Compiler::new(environment, memory)?;
+        let mut refused = Refused::new();
+        for index in 0..count {
+            let Some(sheet) = at(index) else {
+                continue;
+            };
+            let mark = compiler.mark();
+            match compiler.sheet(sheet, memory) {
+                Ok(()) => {}
+                // Only a limit within one sheet is its own; memory is the set's.
+                Err(error @ Error::Limit(_)) if leave_out => {
+                    // A total the sheets before it filled is the set's,
+                    // unless the sheet alone meets a bound of its own.
+                    let total = compiler.total;
+                    compiler.rollback(mark);
+                    let own = if total {
+                        Compiler::new(environment, memory)?.alone(sheet, memory)?
+                    } else {
+                        Some(error)
+                    };
+                    let Some(own) = own else {
+                        return Err(error);
+                    };
+                    refused.record(Refusal {
+                        index,
+                        origin: sheet.origin,
+                        error: own,
+                    })?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         compiler.output.index.finish();
-        Ok(compiler.output)
+        Ok((compiler.output, refused))
     }
 
     /// Parent styles must be computed first. None identifies the root, whose
@@ -369,13 +507,89 @@ impl StyleSet {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Mark {
+    rules: usize,
+    index: index::Mark,
+    declarations: usize,
+    walked: usize,
+}
+
 struct Compiler<'a> {
     output: StyleSet,
     declarations: usize,
     walked: usize,
     environment: &'a Environment,
+    /// Set when a set-wide total, not the sheet, refused.
+    total: bool,
 }
-impl Compiler<'_> {
+impl<'a> Compiler<'a> {
+    fn new(environment: &'a Environment, memory: &Budget) -> Result<Self, Error> {
+        Ok(Self {
+            output: StyleSet {
+                rules: BudgetVec::new(memory)?,
+                index: index::RuleIndex::new(memory)?,
+            },
+            declarations: 0,
+            walked: 0,
+            environment,
+            total: false,
+        })
+    }
+
+    fn exceeded(&mut self, total: &'static str) -> Error {
+        self.total = true;
+        Error::Limit(total)
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            rules: self.output.rules.len(),
+            index: self.output.index.mark(),
+            declarations: self.declarations,
+            walked: self.walked,
+        }
+    }
+    /// Forget a refused sheet: everything it added, nothing before it.
+    fn rollback(&mut self, mark: Mark) {
+        self.output.rules.truncate(mark.rules);
+        self.output.index.rollback(mark.index);
+        self.declarations = mark.declarations;
+        self.walked = mark.walked;
+        self.total = false;
+    }
+
+    /// The per-sheet bound `sheet` meets compiled alone, from empty totals;
+    /// None when it compiles, or alone exceeds a set-wide total. Its storage
+    /// is charged to the same budget and dropped on return.
+    fn alone(mut self, sheet: Sheet<'_>, memory: &Budget) -> Result<Option<Error>, Error> {
+        match self.sheet(sheet, memory) {
+            Ok(()) => Ok(None),
+            Err(error @ Error::Limit(_)) => Ok((!self.total).then_some(error)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A sheet's media conditions act as enclosing @media groups would,
+    /// without a group level, and cannot be closed by the sheet's text.
+    /// Every list is evaluated, so its bounds hold whatever the others say.
+    fn sheet(&mut self, sheet: Sheet<'_>, memory: &Budget) -> Result<(), Error> {
+        if sheet.bytes() > crate::MAX_INPUT_BYTES {
+            return Err(Error::Limit("MAX_INPUT_BYTES"));
+        }
+        let mut active = true;
+        for list in sheet.media {
+            let list = syntax::components(list, memory, syntax::Bom::Keep)?;
+            active &= conditions::media(list.value(), self.environment, memory)?;
+        }
+        self.add(
+            syntax::parse_stylesheet_with_budget(sheet.source, memory)?.into_inner(),
+            sheet.origin,
+            0,
+            active,
+        )
+    }
+
     fn add(
         &mut self,
         rules: BudgetVec<syntax::Rule>,
@@ -386,7 +600,7 @@ impl Compiler<'_> {
         let memory = self.output.rules.budget().try_clone()?;
         for rule in rules {
             if self.walked == MAX_GROUP_RULES {
-                return Err(Error::Limit("MAX_GROUP_RULES"));
+                return Err(self.exceeded("MAX_GROUP_RULES"));
             }
             self.walked += 1;
             if let Some(name) = &rule.name {
@@ -423,7 +637,7 @@ impl Compiler<'_> {
             for declaration in rule.declarations()?.value() {
                 if let Some(value) = variables::parse(declaration, &memory)? {
                     if self.declarations == MAX_DECLARATIONS {
-                        return Err(Error::Limit("MAX_DECLARATIONS"));
+                        return Err(self.exceeded("MAX_DECLARATIONS"));
                     }
                     self.declarations += 1;
                     custom.try_push(value)?;
@@ -431,18 +645,23 @@ impl Compiler<'_> {
                 }
                 for value in values::parse_declaration(declaration, &memory)? {
                     if self.declarations == MAX_DECLARATIONS {
-                        return Err(Error::Limit("MAX_DECLARATIONS"));
+                        return Err(self.exceeded("MAX_DECLARATIONS"));
                     }
                     self.declarations += 1;
                     declarations.try_push(value)?;
                 }
             }
             if self.output.rules.len() == MAX_COMPILED_RULES {
-                return Err(Error::Limit("MAX_COMPILED_RULES"));
+                return Err(self.exceeded("MAX_COMPILED_RULES"));
             }
-            self.output
+            if let Err(error) = self
+                .output
                 .index
-                .admit_rule(self.output.rules.len(), &selectors)?;
+                .admit_rule(self.output.rules.len(), &selectors)
+            {
+                self.total = true;
+                return Err(error);
+            }
             self.output.rules.try_push(Rule {
                 selectors,
                 declarations,
@@ -512,5 +731,7 @@ fn choose_custom(
     Ok(())
 }
 
+#[cfg(test)]
+mod sheet_tests;
 #[cfg(test)]
 mod tests;

@@ -1148,6 +1148,15 @@ fn index_entry_bound_has_an_exact_admitted_edge() {
         StyleSet::new(&input),
         Err(Error::Limit("MAX_INDEX_ENTRIES"))
     ));
+    let input: Vec<_> = more
+        .iter()
+        .map(|source| Sheet::new(Origin::Author, source))
+        .collect();
+    assert_eq!(
+        StyleSet::from_sheets(&input, &Environment::default(), &crate::memory().unwrap()).err(),
+        Some(Error::Limit("MAX_INDEX_ENTRIES")),
+        "a set-wide bound leaves no sheet out"
+    );
 }
 
 #[test]

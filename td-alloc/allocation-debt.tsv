@@ -1606,7 +1606,10 @@ td-crypto/src/trust_tests.rs	heap-owner	3
 td-crypto/src/trust_tests.rs	unchecked-growth-or-clone	17
 td-css/src/calc/tests.rs	allocating-conversion	5
 td-css/src/calc/tests.rs	allocation-macro	4
-td-css/src/cascade/tests.rs	allocating-conversion	24
+td-css/src/cascade/sheet_tests.rs	allocating-conversion	75
+td-css/src/cascade/sheet_tests.rs	allocation-macro	68
+td-css/src/cascade/sheet_tests.rs	unchecked-growth-or-clone	18
+td-css/src/cascade/tests.rs	allocating-conversion	25
 td-css/src/cascade/tests.rs	allocation-macro	46
 td-css/src/cascade/tests.rs	unchecked-growth-or-clone	4
 td-css/src/conditions/tests.rs	allocating-conversion	6

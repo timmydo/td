@@ -41,7 +41,7 @@ pub mod syntax;
 pub mod values;
 pub mod variables;
 
-pub use cascade::{ComputeStats, Origin, StyleSet, HTML_UA_CSS};
+pub use cascade::{ComputeStats, Origin, Refusal, Refused, Sheet, StyleSet, HTML_UA_CSS};
 pub use values::{ComputedStyle, ComputedValue, Property};
 
 #[cfg(test)]

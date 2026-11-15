@@ -234,11 +234,38 @@ not whether a layout engine exists. Both public text entry points,
 `conditions::media_matches` and `supports_matches`, have the same bounds
 and syntax handling used for compiled groups.
 
+A sheet given to `StyleSet::from_sheets` may carry media conditions, a
+slice of media query lists that must all match: the `media` attribute of
+the `<style>` or `<link>` that supplied it, then the media list of each
+`@import` on the way to it, since a list has no conjunction of lists.
+HTML applies such a sheet when each text
+[matches the environment](https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#matches-the-environment):
+empty or ASCII whitespace alone matches, as an absent attribute (an
+empty slice) does, and anything else is a media query list evaluated as
+above, so an invalid member is `not all` (Media Queries 4 §3.2) and a
+list matches when any member does. An attribute is text, not a decoded
+sheet, so a leading U+FEFF is no byte order mark but part of an
+identifier, and matches nothing. (A `style` attribute's declarations
+still go through the decoded-sheet path, which strips a leading U+FEFF,
+so an attribute `\u{feff}color: red` applies its colour where keeping
+the U+FEFF, as for media lists, would make the property unknown.) Each
+list is
+parsed as a component list
+of its own, never spliced into the sheet's text, so a stray `}` in the
+sheet cannot close a condition, nor can a list add rules; every list is
+evaluated, so each list's bounds hold whatever the others answer. A
+sheet whose conditions fail is parsed and walked as the rules of a false
+`@media` block are: counted, its nested conditions parsed, its selectors
+and values not compiled. It contributes no rule, and the other sheets
+keep their order. The conditions are no group level: the sheet's own
+groups may still nest MAX_GROUP_DEPTH deep. A sheet without any compiles
+as before.
+
 Imports remain unfetched. A future fetch-owning caller may resolve an
 import under its own URL, depth and byte policy, then supply its sheets
-at the import's source position, with its inherited import conditions.
-The current ordered-sheet API is not an import resolver and does not
-retain import-layer/supports metadata.
+at the import's source position, with the chain's media lists, outermost
+first, as the sheet's conditions. The ordered-sheet API is not an import
+resolver and carries no import layer or supports() condition.
 
 ## 4. Computed property set
 
@@ -453,9 +480,56 @@ before the allocation or recursive step they guard. A fatal `Error`
 names the exhausted bound; callers must report refusal rather than treat
 it as a stylesheet matching nothing.
 
+`StyleSet::from_sheets` leaves out a sheet that a bound it meets alone
+refuses, and compiles on: it returns the set with `Refused`, each sheet
+left out as a `Refusal` (its index in the caller's list, its origin and
+the `Error`), in input order, at most MAX_SHEETS, held inline. Those
+bounds are the per-input syntax bounds (MAX_INPUT_BYTES, MAX_TOKEN_BYTES,
+MAX_TOKENS, MAX_NESTING, MAX_RULES), MAX_GROUP_DEPTH, MAX_DECLARATIONS in
+one list, MAX_FAMILIES, and the selector (MAX_SELECTORS,
+MAX_SELECTOR_PARTS, MAX_SELECTOR_DEPTH, MAX_COMPOUNDS,
+MAX_NTH_COEFFICIENT), condition and calc() bounds, met in the sheet's
+text or its media lists. A refused sheet is rolled back whole: its
+compiled rules, index entries and declaration and visited-rule counts
+return to what they were before it, so the set equals the one the other
+sheets make alone, but that the arrays keep the capacity it grew.
+Whether a sheet meets these bounds depends on its text, its conditions
+and the environment alone, never on the sheets before it: a sheet past
+its own MAX_INPUT_BYTES is refused, and kept out of MAX_STYLE_BYTES,
+whatever the others hold; and a sheet that overfills a set-wide total
+on its way to a bound of its own is rolled back and compiled once more
+alone, from empty totals, against the same budget, that storage dropped
+at once. Refused alone, it is left out like any other; compiled alone,
+or exceeding a total alone, the set is refused. The environment matters
+because an inactive group, or a sheet whose conditions fail, compiles no
+selector or value, so a width change can newly refuse a sheet.
+
+A call's work is bounded by MAX_STYLE_BYTES of input: each sheet's text
+and lists are parsed and walked once, and once more alone only when it
+overfills a total. Rollback restores the totals, so the rolled-back work
+of the refused sheets can reach about MAX_SHEETS times what one set's
+totals admit; review measured 38 refused sheets of 108,699 bytes in all
+in 298 ms. Each media list counts at least one byte toward its sheet's
+MAX_INPUT_BYTES, so a sheet holds at most that many lists, and counting
+stops once past it.
+
+The Err is a set-wide refusal: MAX_SHEETS and MAX_STYLE_BYTES, checked
+before any sheet is parsed; the totals MAX_GROUP_RULES,
+MAX_COMPILED_RULES, MAX_DECLARATIONS per set and MAX_INDEX_ENTRIES, when
+a sheet that meets no bound alone overfills them; an invalid
+environment; and the memory budget, the compile ceiling every sheet
+spends. A sheet that alone exceeds a total is a set-wide refusal all the
+same. Inactive sheets and groups spend MAX_GROUP_RULES as active ones
+do, so a page heavy with print-only rules can exhaust it and lose its
+screen styles with them. The `(Origin, &str)` constructors stop at the
+first refusal, a sheet's or the set's, and return its bare `Error`; as
+sheets past their own MAX_INPUT_BYTES are left out of MAX_STYLE_BYTES,
+such a set reports MAX_INPUT_BYTES where it once reported
+MAX_STYLE_BYTES.
+
 | Constant | Limit and accounting |
 |---|---|
-| MAX_INPUT_BYTES | 1 MiB per syntax input |
+| MAX_INPUT_BYTES | 1 MiB per syntax input, and per sheet's text and media lists together |
 | MAX_TOKEN_BYTES | 16 KiB per decoded token string or numeric representation |
 | MAX_TOKENS | 131,072 emitted tokens per input, whitespace included |
 | MAX_NESTING | 32 function/block levels, also on skipped syntax |
@@ -477,7 +551,7 @@ it as a stylesheet matching nothing.
 | MAX_ELEMENT_BYTES | 65,536 bytes per observed tag or attribute string |
 | MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
 | MAX_SHEETS | 64 sheets per style set |
-| MAX_STYLE_BYTES | 4 MiB total sheet source bytes per style set |
+| MAX_STYLE_BYTES | 4 MiB total sheet text and media list bytes per style set, sheets past their own MAX_INPUT_BYTES excluded |
 | MAX_CALC_PARTS | 1,024 recursive component values per calc(), root and whitespace included |
 | MAX_CALC_DEPTH | 16 nested functions/blocks per calc(), root included |
 | MAX_CUSTOM_PROPERTIES | 8,192 distinct computed custom names per element, invalid entries included |
@@ -545,7 +619,10 @@ custom-property counts and pool work bounds limit their construction.
 Syntax objects expose immutable views; parsing never accepts an arbitrary
 caller-constructed recursive AST. `selectors::SelectorList::parse` and
 `matching_specificity` return a parsed list and `Result<Option<Specificity>>`.
-`StyleSet::new` compiles ordered `(Origin, &str)` sheets; `compute` takes
+`StyleSet::new` compiles ordered `(Origin, &str)` sheets, and
+`from_sheets` ordered `Sheet`s (`Sheet::new(origin, text)`, then
+`with_media(lists)`; the type is non-exhaustive so later fields do not
+break callers) under an environment and a budget; `compute` takes
 an element, optional parent `ComputedStyle`, root font size and inline
 style text. `ComputedStyle` exposes typed read-only property values.
 `compute_with_stats` has the same arguments plus a mutable `ComputeStats`.
@@ -554,12 +631,13 @@ counts, plus substitution component and byte charges, even on refusal. Candidate
 completion; consumed steps exclude the charge that refused. `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
-td-web's styled pages (td-web/DESIGN.md §10, increment 6) need first a
-refusal naming the sheet it arose in and a media condition per sheet,
-and will use an answer to whether a changed environment changes which
-of its rules apply.
+td-web's styled pages (td-web/DESIGN.md §10) will compile through
+`from_sheets` once its cutover adds td-css to its dependencies, and will
+use an answer to whether a changed environment changes which of a set's
+rules apply (td-web/DESIGN.md §11), which td-css does not give yet.
 
-`cascade` exports `StyleSet`, `Origin`, `ComputeStats` and `HTML_UA_CSS`; these and
+`cascade` exports `StyleSet`, `Sheet`, `Refused`, `Refusal`, `Origin`,
+`ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
 the fixed 55-longhand roster. `initial` supplies context-free seeds; border

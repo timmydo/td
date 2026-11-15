@@ -1223,7 +1223,7 @@ A page's sheets, in cascade order:
    reaches the canvas as CSS 2.2 §14.2 has it (below, "Painting").
 3. The page's own: each `<style>` element in tree order whose `type`
    is empty or `text/css`, its `media` attribute, if any, its media
-   condition (td-css, increment 6, rather than wrapping its text in
+   condition (td-css's `Sheet::with_media`, rather than wrapping its text in
    `@media`, which a stray `}` in it would escape); then each element's
    `style` attribute, inline, as td-layout joins it. `<link
    rel=stylesheet>` and `@import` are subresources (increment 8);
@@ -1233,7 +1233,8 @@ td-css takes no presentational attributes (`bgcolor`, `align`, a
 table's `width`, `<font>`), so none applies; an image's `width` and
 `height` are td-layout's. td-css's bounds hold (td-css/DESIGN.md §5):
 at most 64 sheets in a set and 4 MiB of their text in all, the two
-user-agent sheets included, 1 MiB each; a sheet past them is left out,
+user-agent sheets included, 1 MiB each, a sheet's media lists counted
+with it; a sheet past them is left out,
 in tree order, and the status row says so.
 
 **Colours.** The colours a page names are applied, unlike §5's: a page
@@ -1277,8 +1278,10 @@ A page's stylesheets (increment 8) are its first subresources (§4):
 each `<link>` whose `rel` holds `stylesheet` and not `alternate`, with
 an `href`, and each `@import` at the head of a sheet (td-css's syntax
 keeps an at-rule's prelude), in the order the cascade takes them, an
-import standing at its rule's place with its media list as its
-condition, a link with its `media`; an import naming `layer()` or
+import standing at its rule's place with the media lists of its chain as
+its conditions, all of which must match: the `<style>`'s or `<link>`'s
+`media`, then each import's list, outermost first (a `<link media=print>`
+importing `x screen` applies in neither); an import naming `layer()` or
 `supports()` is skipped, as td-css skips layers. Every sheet is fetched
 whatever its media, so what is fetched says nothing of the viewport.
 Inline pictures (increment 9) are each `img` with a `src`, in tree
@@ -1433,11 +1436,14 @@ the status row's note that the rest is too large: no page is shown as
 a prefix. A refusal, by a crate's limit or by the page's budget, steps
 down, each rung on the render thread:
 
-1. The page with its own sheets. A sheet td-css refuses alone, past a
-   per-sheet bound, is left out and the set compiled again without it,
-   the status row saying so; td-css's refusal names the sheet
-   (increment 6).
-2. On a refusal by td-css's compile ceiling, td-layout's cascade work
+1. The page with its own sheets. A sheet past a per-sheet bound of
+   td-css's is left out in the one compilation, as if never given
+   (`from_sheets` lists it in `Refused`), and the status row says how
+   many were.
+2. On a set-wide refusal by td-css (its compile ceiling and its
+   set-wide totals, such as `MAX_COMPILED_RULES`, even when one sheet
+   alone exceeds them; td-web validates the environment it passes, so
+   `InvalidContext` never arrives here), td-layout's cascade work
    ceiling or any other td-layout limit with the page's sheets, the
    page with the user-agent sheets alone and no `style` attributes;
    the status row says the page's styles were refused and names the
@@ -1592,11 +1598,14 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      space is preserved; a cascade without `style` attributes; and a
      byte limit for each layout request, where today it is fixed when
      the page is cascaded.
-   - **td-css**: the owned-budget API supplies compilation admission,
-     and `rgb()`, `hsl()`, CSS Color 4's named colours and the
-     `background` shorthand's colour have landed; remaining
-     prerequisites are a refusal that names the sheet it arose in and
-     a media condition for each sheet given to a set.
+   - **td-css** (available): the owned-budget API supplies compilation
+     admission; `rgb()`, `hsl()`, CSS Color 4's named colours and the
+     `background` shorthand's colour; and `StyleSet::from_sheets`, media
+     conditions for each sheet given to a set, and one compilation that
+     leaves out each sheet a per-sheet bound refuses and names it
+     (td-css/DESIGN.md §3 and §5). Nothing of td-css remains before the
+     cutover; whether a changed environment changes which rules apply is
+     §11's.
    - **td-alloc** (available): `Charge::shrink_to`, which returns the difference
      between a charged ceiling and the actual, so td-web need not
      return the whole charge and charge the actual anew.

@@ -4,6 +4,14 @@ use crate::Error;
 use td_alloc::{Budget, BudgetVec};
 
 pub const MAX_INDEX_ENTRIES: usize = 262_144;
+#[derive(Clone, Copy)]
+pub(super) struct Mark {
+    ids: usize,
+    classes: usize,
+    tags: usize,
+    universal: usize,
+    entries: usize,
+}
 #[derive(Debug)]
 pub(super) struct RuleIndex {
     ids: BudgetVec<(Text, usize)>,
@@ -44,6 +52,31 @@ impl RuleIndex {
             map.try_push((name.try_clone()?, rule))?;
         }
         Ok(())
+    }
+    /// Entries are appended until finish, so a mark is their lengths.
+    pub(super) fn mark(&self) -> Mark {
+        Mark {
+            ids: self.ids.len(),
+            classes: self.classes.len(),
+            tags: self.tags.len(),
+            universal: self.universal.len(),
+            entries: self.entries,
+        }
+    }
+    /// Drops what was admitted after `mark`; capacity is kept.
+    pub(super) fn rollback(&mut self, mark: Mark) {
+        self.ids.truncate(mark.ids);
+        self.classes.truncate(mark.classes);
+        self.tags.truncate(mark.tags);
+        self.universal.truncate(mark.universal);
+        self.entries = mark.entries;
+    }
+    #[cfg(test)]
+    pub(super) fn spare_bytes(&self) -> usize {
+        fn spare<T>(values: &BudgetVec<T>) -> usize {
+            (values.capacity() - values.len()) * std::mem::size_of::<T>()
+        }
+        spare(&self.ids) + spare(&self.classes) + spare(&self.tags) + spare(&self.universal)
     }
     pub(super) fn finish(&mut self) {
         for entries in [&mut self.ids, &mut self.classes, &mut self.tags] {
