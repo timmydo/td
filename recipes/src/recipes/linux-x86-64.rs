@@ -202,6 +202,13 @@ const CONFIG: &[&str] = &[
     "# CONFIG_RT_GROUP_SCHED is not set",
     "CONFIG_MEMCG=y",
     "CONFIG_CGROUP_PIDS=y",
+    // Compressed swap in RAM, td's only swap (td-init's `zram-swap`):
+    // no writeback device and no hibernation, so nothing swapped reaches
+    // storage (td-secret/DESIGN.md, the memory rule).
+    "CONFIG_SWAP=y",
+    "CONFIG_ZRAM=y",
+    "CONFIG_ZRAM_BACKEND_ZSTD=y",
+    "CONFIG_ZRAM_DEF_COMP_ZSTD=y",
     "CONFIG_SOUND=y",
     "CONFIG_SND=y",
     "CONFIG_SND_PCM=y",
@@ -1465,6 +1472,9 @@ mod tests {
         ("CONFIG_CFS_BANDWIDTH=y", "CFS_BANDWIDTH off — cpu.max cannot throttle a jailed application"),
         ("CONFIG_MEMCG=y", "MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process"),
         ("CONFIG_CGROUP_PIDS=y", "CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail"),
+        ("CONFIG_SWAP=y", "SWAP off — swapon(2) is ENOSYS, so td-init's zram-swap has nothing to enable, and memory.swap.max does not exist, so every td-jail launch and every td-svc service leaf fails to write its swap bound, on every profile"),
+        ("CONFIG_ZRAM=y", "ZRAM off — /sys/block/zram0 does not exist, so the desktop has no compressed swap"),
+        ("CONFIG_ZRAM_DEF_COMP_ZSTD=y", "ZRAM_DEF_COMP_ZSTD off — zram0 would compress with another algorithm than the zstd zram-swap asks for"),
         ("CONFIG_SND_PCM=y", "SND_PCM off — /dev/snd/pcmC*D*p would not exist, so td-audio has no device to open (APPLICATIONS.md K.4)"),
         ("CONFIG_SND_HDA_INTEL=y", "SND_HDA_INTEL off — QEMU -device intel-hda and ordinary desktop codecs both go through it, so /proc/asound/pcm would be empty"),
         ("CONFIG_SND_HDA_GENERIC=y", "SND_HDA_GENERIC off — the HDA controller would bind no codec, so the card would enumerate with no playback device"),
@@ -1632,6 +1642,8 @@ mod tests {
             "CONFIG_INTEL_IOMMU_PERF_EVENTS",
             "VT-d PMU on - nothing here asked for it",
         ),
+        ("CONFIG_ZRAM_WRITEBACK", "ZRAM_WRITEBACK on — a zram device could write swapped pages, secrets included, to a backing device on storage"),
+        ("CONFIG_HIBERNATION", "HIBERNATION on — all of memory, secrets included, could be written to storage"),
         ("CONFIG_OVERLAY_FS", "OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains"),
         ("CONFIG_NVME_MULTIPATH", "NVME_MULTIPATH on - installation fixture requires direct controller namespaces"),
         ("CONFIG_SERIAL_8250_MOXA_PCIE", "SERIAL_8250_MOXA_PCIE set — it defaults to SERIAL_8250 since Linux 7.3, and td supports no such card"),

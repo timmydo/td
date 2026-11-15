@@ -4124,8 +4124,10 @@ design is then additive:
   conversation process joins its node by writing to the node's
   `cgroup.procs` before starting anything. Every instance inherits the
   node, whose `memory.max`, `memory.high`, `cpu.max` and `pids.max` then
-  bound the whole conversation. Joining a cgroup is a file write, so
-  td-agent still needs no `unsafe`. A node per workspace above its
+  bound the whole conversation, with `memory.swap.max` equal to
+  `memory.max` as td-jail writes it (`APPLICATIONS.md` §P), since the
+  desktop's zram pool is charged to no cgroup. Joining a cgroup is a
+  file write, so td-agent still needs no `unsafe`. A node per workspace above its
   conversations, and a total above those, hold no processes and are the
   same mechanism one level up.
 - **A leaf per instance.** cgroup v2 lets a node either hold processes

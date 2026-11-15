@@ -900,6 +900,13 @@ fn configure(directory: &Path, limits: ResolvedResourceLimits) -> io::Result<()>
         &directory.join("memory.max"),
         &limits.memory_max_bytes.to_string(),
     )?;
+    // zram's pool is charged to no cgroup, so swap takes the same ceiling
+    // as memory rather than the kernel's unbounded default (APPLICATIONS.md
+    // §P).
+    write_control(
+        &directory.join("memory.swap.max"),
+        &limits.memory_max_bytes.to_string(),
+    )?;
     write_control(&directory.join("memory.oom.group"), "1")?;
     write_control(&directory.join("pids.max"), &limits.pids_max.to_string())?;
     write_control(
@@ -913,6 +920,7 @@ fn require_configuration(directory: &Path, limits: ResolvedResourceLimits) -> io
     for (name, expected) in [
         ("memory.high", limits.memory_high_bytes.to_string()),
         ("memory.max", limits.memory_max_bytes.to_string()),
+        ("memory.swap.max", limits.memory_max_bytes.to_string()),
         ("memory.oom.group", "1".to_string()),
         ("pids.max", limits.pids_max.to_string()),
         (

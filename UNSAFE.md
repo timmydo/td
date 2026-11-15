@@ -191,7 +191,7 @@ one.
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)`, `memfd_create(2)` with pinned flags including `MFD_NOEXEC_SEAL`, `fcntl(2)` pinned to `F_ADD_SEALS` and one seal set (plus a test-only `F_SETLEASE` probe) — see [§1](#1-td-kexec--the-guest-kexec-helper) |
 | 2 | `td-netd` | `ioctl(2)` with seven interface-config requests and `TCGETS`/`TCSETS` on standard input, `socket(2)`, `setsockopt(2)`, `sendto(2)`, `recvfrom(2)` and `close(2)` for one owned `NETLINK_GENERIC` socket, `poll(2)` over at most two descriptors, and one ordered credential change of `prctl(2)`, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `capset(2)` — see [§2](#2-td-netd--the-network-bring-up-daemon) |
-| 3 | `td-init` | eleven — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines |
+| 3 | `td-init` | twelve — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines, `swapon(2)` fixed flags |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
@@ -403,7 +403,7 @@ compiled copy to no `unsafe` and admit that one `#[path]` alone.
 ## 3. `td-init` — the boot-glue multicall
 
 The `td-init` boot-glue multicall, whose one `syscall5` body in
-`td-init/src/sys.rs` carries EXACTLY these eleven syscalls, one per
+`td-init/src/sys.rs` carries EXACTLY these twelve syscalls, one per
 applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
 (reboot/poweroff/halt), `mount(2)` + `umount2(2)` (mount/umount, and
 switch_root's `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` +
@@ -411,7 +411,8 @@ switch_root's `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` +
 flag uutils lacks), `wait4(2)` (init, which as PID 1 must reap the
 orphans a targeted `Child::wait` cannot see), `mknod(2)` — the tenth,
 and the last privileged busybox job on the boot path — and `poll(2)`,
-the eleventh, secret-line's wait over its two lines (below). Both
+the eleventh, secret-line's wait over its two lines (below), and
+`swapon(2)`, the twelfth, zram-swap's (below). Both
 initramfs link `losetup` and `mknod`: the deployment's binds the
 verified root, and the selector's binds `current`'s `root.erofs`
 read-only to authenticate a staged selector update
@@ -442,7 +443,7 @@ permitted caller of `sys::mknod`, asserted like `mount`'s and
 `attach_loop`'s, because `mode`'s top bits are the node type and so
 choose the driver class. Only BLOCK nodes are served; `c`/`u`/`p` are
 refused, since nothing on td's boot path creates one and the type is the
-part of `mode` that picks the driver. A TWELFTH syscall is an amendment
+part of `mode` that picks the driver. A THIRTEENTH syscall is an amendment
 here. `ioctl(2)` is the one with SIX permitted requests — `TIOCSCTTY`
 for cttyhack and getty, `LOOP_SET_FD` for the `losetup` applet,
 `TCGETS`/`TCSETS` for the line settings getty applies and secret-line
@@ -506,6 +507,25 @@ flushed input and then waited for pending output to drain, so a stopped
 line would have held the applet: `TCSETSF` left the roster with no caller,
 and the confinement tests refuse its name, `TCSETSW`'s and `TIOCGDEV`'s in
 `sys.rs`. Every restore, and getty, stays on plain `TCSETS`.
+
+`swapon(2)` is the twelfth syscall, zram-swap's alone, which the
+desktop's td-svc table runs once at boot to make `/dev/zram0`, half of
+`MemTotal` compressed with zstd, the machine's swap. Its one wrapper,
+`sys::swapon`, takes only the path; the flags are the constant
+`SWAP_FLAG_PREFER | 100`, so no caller can ask for discard or another
+priority. `main.rs`'s `the_swap_is_pinned_whole` holds the flag word by
+value, the wrapper's signature and body, and its one call:
+`zramswap.rs` alone may call it, once, on `DEVICE_C`, which is
+`c"/dev/zram0"`, at the priority constant the applet reads back. The
+applet refuses a device whose `backing_dev` reads anything but `none`,
+reads back the compressor and size it set, and writes the swap header
+only through a descriptor whose block device number matches sysfs's
+`zram0`; it then reads `/proc/swaps` back for the device, as a
+partition, at priority 100. The kernel is built without
+`CONFIG_ZRAM_WRITEBACK` and `CONFIG_HIBERNATION`, which the kernel recipe
+holds off, so this swap
+never reaches storage (td-secret/DESIGN.md, the memory rule). `swapoff(2)`
+is not on the surface: nothing turns the swap off before power-off.
 
 `poll(2)` is the eleventh syscall, secret-line's alone: in one loop the
 applet waits for the first of its lines to complete a canonical record and
@@ -691,7 +711,7 @@ Deliberately NOT in that surface:
 the mount as util-linux and busybox do), `fork`/`execve` (`Command` plus
 the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires
 the console), and any signal handler — which is why td's init supports no
-`ctrlaltdel`, `shutdown` or `restart` inittab action. A TWELFTH syscall,
+`ctrlaltdel`, `shutdown` or `restart` inittab action. A THIRTEENTH syscall,
 a new `MS_*` bit, or a second scoped `#[allow]` is an amendment here;
 `td-init/src/main.rs`'s confinement tests assert all three against the
 crate's own source, since the compiler alone cannot.

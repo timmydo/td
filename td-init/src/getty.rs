@@ -16,7 +16,7 @@
 //!
 //! Deliberately NOT here: `vhangup(2)`, which util-linux's agetty offers to
 //! evict whatever still holds the line before a login starts on it. It would be
-//! an ELEVENTH syscall on this surface to duplicate work td-svc already does —
+//! one more syscall on this surface to duplicate work td-svc already does —
 //! a `tty=` unit's containment is the leader together with every process
 //! holding that device, so the supervisor has torn the previous session down
 //! before it respawns the greeter (td-svc/DESIGN.md, "Stopping").

@@ -366,6 +366,9 @@ v2's own default is `max`, and a number nobody chose is how a service acquires
 a bound its author never reasoned about. Zero is refused for both counts:
 `memory.max=0` kills the service on its first page, and a unit that may hold
 no process cannot start, so neither spelling can be what a table meant.
+`memory-max` also sets `memory.swap.max` to the same figure, and its absence
+resets both to `max`: the desktop's zram pool is charged to no cgroup, so a
+bound on memory alone would let a capped service spill past it into swap.
 
 **Nothing is accepted-and-ignored.** A key the supervisor would silently
 drop reads in the table as a guarantee it does not make, so each is
@@ -1553,8 +1556,12 @@ installed name, initialize an absent value from the deployment default,
 and activate and verify the kernel hostname. It retains the first place
 in the serialized sysinit chain. Deployment success strictly requires
 this unit, alongside graphical readiness; a failed hostname operation
-cannot acknowledge the deployment as healthy. The console still has only
-ordering edges and retains I5. `td-install/INSTALLER.md` owns the saved
+cannot acknowledge the deployment as healthy. On the desktop it equally
+requires the `zram` oneshot, and the health target reads `/proc/swaps`
+for `/dev/zram0` at priority 100: a deployment that cannot turn on its
+compressed swap is not acknowledged, so td-boot falls back to the one
+before it rather than keep a desktop that has lost its memory headroom.
+The console still has only ordering edges and retains I5. `td-install/INSTALLER.md` owns the saved
 name format, file validation and default-preservation contract.
 
 The mounts stay with PID 1 deliberately: td-svc reads `/proc` for its own
@@ -1701,8 +1708,12 @@ notebook), and the server ships none. Its table is the desktop's units
 restricted to what a headless machine needs: hostname, td-firstboot,
 rootcheck, the profiler and its evidence, netup, network, sshd and
 bootsuccess, plus the server's own metadata, cloud-metadata and
-healthwatch. Each shared unit is the desktop's stanza key for key,
-which a recipe test holds, except three. hostname is ordered after
+healthwatch. The desktop's `zram` oneshot, which turns on compressed swap
+in RAM (UNSAFE.md §3, `swapon(2)`), is not among them: a server has no
+swap. It shares the kernel, which has zram built in, and `/bin/zram-swap`,
+which nothing there runs, so its `zram0` stays an uninitialized device.
+Each shared unit is the desktop's stanza key for key, which a recipe test
+holds, except three. hostname is ordered after
 metadata, which may save the name it applies ("Instance metadata"
 below). td-firstboot provisions the identity alone, with no
 application homes or session principals. bootsuccess requires sshd's

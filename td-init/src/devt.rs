@@ -1,7 +1,8 @@
 //! The crate's ONE `dev_t` packing, both directions.
 //!
-//! Two modules need it — `losetup` decodes an `rdev` to reach a device's sysfs
-//! node, `mknod` encodes a pair to create one — and two copies that could
+//! Three modules need it — `losetup` decodes an `rdev` to reach a device's
+//! sysfs node, `zramswap` decodes one to match `/dev/zram0` to sysfs's
+//! `zram0`, `mknod` encodes a pair to create one — and two copies that could
 //! disagree is exactly the failure this packing invites: every wrong answer is a
 //! well-formed device number naming a DIFFERENT device, which the kernel then
 //! serves without complaint.

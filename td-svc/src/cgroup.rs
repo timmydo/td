@@ -144,14 +144,16 @@ pub(crate) fn create_service(leaf: &Path, limits: &Limits) -> io::Result<()> {
 /// Every control this crate sets, and what it is set to — including the ones
 /// the unit did not declare. Split out from the writing so the mapping can be
 /// asserted without a cgroupfs, which the test tier does not have.
-fn controls(limits: &Limits) -> [(&'static str, String); 3] {
+fn controls(limits: &Limits) -> [(&'static str, String); 4] {
+    let memory_max = limits
+        .memory_max
+        .map_or_else(|| UNBOUNDED.to_string(), |bytes| bytes.to_string());
     [
-        (
-            "memory.max",
-            limits
-                .memory_max
-                .map_or_else(|| UNBOUNDED.to_string(), |bytes| bytes.to_string()),
-        ),
+        ("memory.max", memory_max.clone()),
+        // Swap takes the same figure: zram's pool is charged to no cgroup,
+        // so without it a capped service could spill past its ceiling into
+        // memory nobody accounts to it (DESIGN.md §3).
+        ("memory.swap.max", memory_max),
         (
             "pids.max",
             limits
@@ -672,8 +674,9 @@ mod tests {
     fn an_undeclared_limit_is_written_back_to_its_default() {
         let none = controls(&Limits::default());
         assert_eq!(none[0], ("memory.max", "max".to_string()));
-        assert_eq!(none[1], ("pids.max", "max".to_string()));
-        assert_eq!(none[2], ("cpu.weight", "100".to_string()));
+        assert_eq!(none[1], ("memory.swap.max", "max".to_string()));
+        assert_eq!(none[2], ("pids.max", "max".to_string()));
+        assert_eq!(none[3], ("cpu.weight", "100".to_string()));
 
         // A declared limit is written as itself, and the OTHERS still reset.
         let some = controls(&Limits {
@@ -682,8 +685,9 @@ mod tests {
             cpu_weight: None,
         });
         assert_eq!(some[0], ("memory.max", "67108864".to_string()));
-        assert_eq!(some[1], ("pids.max", "max".to_string()));
-        assert_eq!(some[2], ("cpu.weight", "100".to_string()));
+        assert_eq!(some[1], ("memory.swap.max", "67108864".to_string()));
+        assert_eq!(some[2], ("pids.max", "max".to_string()));
+        assert_eq!(some[3], ("cpu.weight", "100".to_string()));
     }
 
     /// The membership a placed process reads back is the leaf path without the

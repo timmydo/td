@@ -988,7 +988,21 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
         "umount",
         Probe::Refuses("--not-an-option", "unrecognised argument"),
     ),
+    // Probed by REFUSAL: its success path turns swap on, which the desktop's
+    // `zram` unit already did at boot, and the greeter is unprivileged. The
+    // refusal proves the packed name and that arguments are read before any
+    // device is touched.
+    (
+        "zram-swap",
+        Probe::Refuses("--not-an-option", "usage: zram-swap"),
+    ),
 ];
+
+/// The desktop's swap, as `/proc/swaps` lists it once zram-swap ran: the device, a
+/// partition, and priority 100 last on its line. Pasted into the health target's
+/// single-quoted `sh -c`, so it holds no `'`.
+const ZRAM_SWAP_PROBE: &str = "/bin/rg -q \"^/dev/zram0\\s+partition\\s.*\\s100$\" /proc/swaps || \
+     { echo \"td-init: /proc/swaps lists no /dev/zram0 at priority 100\"; i=0; }; ";
 
 /// How the greeter proves one td-init farm name on the booted image. Three of these applets
 /// are IRREVERSIBLE — running them successfully ENDS the boot — so they are proven by their
@@ -1556,6 +1570,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// regression this catches: the boot comes up missing a service and says nothing.
 const TD_SVC_UNITS: &[&str] = &[
     "hostname",
+    "zram",
     "td-firstboot",
     "time",
     "volumes",
@@ -1948,6 +1963,15 @@ fn build_desktop_td_svc_conf() -> String {
          type=oneshot\n\
          exec=/bin/td-firstboot hostname\n\
          timeout={hostname}\n\
+         \n\
+         # Compressed swap in RAM (/bin/zram-swap): half of memory, zstd,\n\
+         # priority 100, no writeback device, so td-secret's memory rule admits\n\
+         # it beside a process holding a key. bootsuccess waits for and\n\
+         # requires it: a desktop without its swap is not acknowledged.\n\
+         [zram]\n\
+         type=oneshot\n\
+         exec=/bin/zram-swap\n\
+         timeout=30\n\
          \n\
          # Mints the per-machine identity everything below reads or checks.\n\
          # after=hostname serializes both provisioners' initialization of\n\
@@ -2731,8 +2755,8 @@ fn build_desktop_td_svc_conf() -> String {
          # Keep the process-heavy runtime probe farm out of the profiler's first\n\
          # bounded capture. This is ordering only: profiler evidence cannot decide\n\
          # whether a deployment is healthy, and a failed evidence unit still settles.\n\
-         after={sysinit},busd,wayland,terminal,seat-access-evidence,profiler-evidence,sshd\n\
-         requires=terminal,seat-access-evidence,hostname\n\
+         after={sysinit},busd,wayland,terminal,seat-access-evidence,profiler-evidence,sshd,zram\n\
+         requires=terminal,seat-access-evidence,hostname,zram\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -3950,6 +3974,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     for (applet, probe) in TD_INIT_FARM {
         td_init_probes.push_str(&td_init_probe(applet, probe));
     }
+    // The desktop's `zram` unit ran zram-swap as root at boot; what it left is
+    // readable here: /dev/zram0 in the swap table at the priority it pins.
+    let zram_swap_probe = if sys.desktop() { ZRAM_SWAP_PROBE } else { "" };
     let health_user_setup = match sys.users.iter().find(|user| user.name == sys.autologin) {
         Some(_) => format!("health_user=$({PRIMARY_PROBE_LAUNCHER} /bin/printenv USER) || fail"),
         None => "echo \"td-boot: no autologin account for health probes\"; fail".into(),
@@ -4254,7 +4281,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'i=1; e=; /bin/td-init --list >/dev/null 2>&1 || \
          {{ echo \"td-init: --list failed\"; i=0; }}; \
-         {td_init_probes}[ \"$i\" = 1 ]'; then \
+         {td_init_probes}{zram_swap_probe}[ \"$i\" = 1 ]'; then \
          [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '{td_login_probe}' && {td_login_exec_as_probe}; then \
@@ -7655,7 +7682,7 @@ mod tests {
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence,hostname"),
+            Some("terminal,seat-access-evidence,hostname,zram"),
             "profiler evidence is an ordering boundary, not deployment health"
         );
 
@@ -7848,7 +7875,7 @@ mod tests {
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence,hostname")
+            Some("terminal,seat-access-evidence,hostname,zram")
         );
         assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
         assert!(!unit_after("bootsuccess").contains(&"firefox".to_string()));
@@ -10260,6 +10287,7 @@ mod tests {
                         "seat-access-evidence",
                         "profiler-evidence",
                         "sshd",
+                        "zram",
                     ])
                     .collect(),
             ),
@@ -10784,7 +10812,7 @@ mod tests {
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence,hostname"),
+            Some("terminal,seat-access-evidence,hostname,zram"),
             "deployment health must be skipped when the terminal failed, while the \
              mutable Firefox launch remains independent QEMU evidence"
         );
@@ -17566,6 +17594,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "reboot" | "poweroff" | "halt" => "halt",
                 "switch_root" => "switchroot",
                 "umount" => "mount",
+                "zram-swap" => "zramswap",
                 other => other,
             }
         }
@@ -17589,6 +17618,19 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             checked >= 5,
             "expected every refusal probe to be pinned, checked only {checked}"
         );
+    }
+
+    /// The desktop's swap is proven on the booted image inside the td-init leg, so an
+    /// absent TD-INIT-RUN-OK names it; the server has no swap and no such probe.
+    #[test]
+    fn only_the_desktop_health_target_proves_its_zram_swap() {
+        assert!(!ZRAM_SWAP_PROBE.contains('\''));
+        assert!(ZRAM_SWAP_PROBE.contains("i=0"));
+        assert!(
+            build_bootsuccess(&SYSTEM).contains(&format!("{ZRAM_SWAP_PROBE}[ \"$i\" = 1 ]'; then"))
+        );
+        assert!(!build_bootsuccess(&SERVER).contains("/dev/zram0"));
+        assert!(build_desktop_td_svc_conf().contains("[zram]\ntype=oneshot\nexec=/bin/zram-swap\n"));
     }
 
     /// Every script that decides to end the boot must go through td-svc.

@@ -111,11 +111,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in boot-menu cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot reread-partitions secret-line switch_root sync umount; do \
+                     for a in boot-menu cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot reread-partitions secret-line switch_root sync umount zram-swap; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 17 ] || {{ echo \"td-init serves $n applets, expected exactly 17 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 18 ] || {{ echo \"td-init serves $n applets, expected exactly 18 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -181,6 +181,9 @@ pub fn recipe() -> Recipe {
                      [ ! -e {{root}}/mknod-probe ] && [ ! -L {{root}}/mknod-probe ] || {{ echo 'a refused mknod must not have created anything' >&2; exit 1; }}; \
                      e=$('{bin}' mknod {{root}}/mknod-probe b 7 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'mknod must refuse a short operand list with exit 1' >&2; exit 1; }}; \
+                     e=$('{bin}' zram-swap --not-an-option 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'zram-swap must refuse an argument with exit 1 — it takes none, and reaching swapon here would put swap on the build host' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'usage: zram-swap' || {{ echo \"zram-swap refused the argument without saying so: '$e'\" >&2; exit 1; }}; \
                      e=$('{bin}' losetup -r dev/loop0 /img 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}; \
                      e=$('{bin}' devpts /dev/pts 2>&1); \
@@ -377,7 +380,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the seventeen applets boot-menu/cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/reread-partitions/secret-line/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses a missing, extra or non-printable secret-line prompt or a stdout that is not a pipe before touching a terminal, refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the eighteen applets boot-menu/cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/reread-partitions/secret-line/switch_root/sync/umount/zram-swap, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses a missing, extra or non-printable secret-line prompt or a stdout that is not a pipe before touching a terminal, refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, refuses any zram-swap argument before reading anything, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

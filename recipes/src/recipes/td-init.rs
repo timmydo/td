@@ -89,6 +89,7 @@ const MODULES: &[(&str, &str)] = &[
     ("syncfs", include_str!("../../../td-init/src/syncfs.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),
     ("term", include_str!("../../../td-init/src/term.rs")),
+    ("zramswap", include_str!("../../../td-init/src/zramswap.rs")),
 ];
 
 /// The embedded source of one applet module. Lets a consumer that hard-codes a diagnostic

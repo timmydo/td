@@ -13,14 +13,16 @@
 //! — then compiles. `main.rs`'s confinement tests are what close that, and they
 //! are the durable enforcement here.
 //!
-//! The amended surface is exactly the eleven syscalls below, one per boot-glue
-//! applet requirement that safe `std` does not expose. A TWELFTH is a reviewed
-//! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
+//! The amended surface is exactly the twelve syscalls below, one per boot-glue
+//! applet requirement that safe `std` does not expose. A THIRTEENTH is a
+//! reviewed amendment, not an edit; `main.rs`'s confinement test asserts the
+//! roster.
 //! `ioctl(2)` is the one with SIX permitted requests — `TIOCSCTTY` for
 //! cttyhack and getty, `LOOP_SET_FD` for losetup, `TCGETS`/`TCSETS` for the
 //! line settings getty applies and secret-line silences and restores,
 //! `TCFLSH` for secret-line's input flush, plus BLKRRPART for partition
-//! rereads. `poll(2)`, the eleventh, is secret-line's wait over its lines.
+//! rereads. `poll(2)`, the eleventh, is secret-line's wait over its lines;
+//! `swapon(2)`, the twelfth, is zram-swap's, with its flags fixed here.
 //! Each request is
 //! pinned by value and checked against the roster by the one `ioctl` entry
 //! point below, so widening it is as reviewable as adding a syscall.
@@ -39,7 +41,7 @@ use std::ptr;
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-init is x86_64-linux only (raw syscall ABI)");
 
-// The amended eleven (x86_64 syscall numbers).
+// The amended twelve (x86_64 syscall numbers).
 const SYS_POLL: usize = 7;
 const SYS_IOCTL: usize = 16;
 const SYS_MKNOD: usize = 133;
@@ -49,6 +51,7 @@ const SYS_CHROOT: usize = 161;
 const SYS_SYNC: usize = 162;
 const SYS_MOUNT: usize = 165;
 const SYS_UMOUNT2: usize = 166;
+const SYS_SWAPON: usize = 167;
 const SYS_REBOOT: usize = 169;
 const SYS_SETHOSTNAME: usize = 170;
 
@@ -240,6 +243,28 @@ pub fn sethostname(name: &[u8]) -> io::Result<()> {
 /// `S_IFBLK | 0o600`, which fits.
 pub fn mknod(path: &CStr, mode: usize, dev: usize) -> io::Result<()> {
     check(syscall5(SYS_MKNOD, path.as_ptr() as usize, mode, dev, 0, 0)).map(|_| ())
+}
+
+// ── swapon(2) ───────────────────────────────────────────────────────────────
+
+// linux/swap.h: `SWAP_FLAG_PREFER` with priority 100 in `SWAP_FLAG_PRIO_MASK`,
+// and no discard flag. A priority above any other swap the machine could
+// gain makes the zram device the one used first.
+const SWAP_FLAGS: usize = 0x8000 | 100;
+
+/// `swapon(2)` over `path` at the one priority zram-swap uses. The flags are
+/// fixed here rather than passed, so no caller can ask for discard or a
+/// priority the applet does not read back.
+pub fn swapon(path: &CStr) -> io::Result<()> {
+    check(syscall5(
+        SYS_SWAPON,
+        path.as_ptr() as usize,
+        SWAP_FLAGS,
+        0,
+        0,
+        0,
+    ))
+    .map(|_| ())
 }
 
 // ── cttyhack's two syscalls ─────────────────────────────────────────────────

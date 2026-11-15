@@ -6,7 +6,8 @@
 //! `reboot`/`poweroff`/`halt` (`reboot(2)`), `switch_root` (`mount(MS_MOVE)` +
 //! `chroot(2)`), `mount`/`umount` (`mount(2)` + `umount2(2)`), `cttyhack`
 //! (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and `hostname`
-//! (`sethostname(2)` — the `-F` flag uutils lacks).
+//! (`sethostname(2)` — the `-F` flag uutils lacks). `zram-swap` turns on the
+//! desktop's compressed swap in RAM (`swapon(2)`, at one fixed priority).
 //!
 //! `secret-line` reads one line with echo off for the selector's recovery-key
 //! entry, from `/dev/console` and, when that is not the VT, `/dev/tty1`,
@@ -26,7 +27,7 @@
 //! to `sys.rs` — one `syscall5` body under a scoped `#[allow]`. That is the THIRD
 //! target-side unsafe exception UNSAFE.md records, after td-kexec and td-netd.
 //! The `deny` above is the first line of that, not the last: `mod confinement`
-//! below is what actually holds the surface to eleven syscalls and one asm body,
+//! below is what actually holds the surface to twelve syscalls and one asm body,
 //! because a lint level can be demoted and the compiler cannot count syscalls.
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils convention, so a
@@ -52,6 +53,7 @@ mod switchroot;
 mod syncfs;
 mod sys;
 mod term;
+mod zramswap;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -79,6 +81,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("switch_root", switchroot::run),
     ("sync", syncfs::run),
     ("umount", mount::umount),
+    ("zram-swap", zramswap::run),
 ];
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
@@ -392,7 +395,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_seventeen() {
+    fn the_roster_is_the_amended_eighteen() {
         assert_eq!(
             names(),
             vec![
@@ -412,7 +415,8 @@ mod tests {
                 "secret-line",
                 "switch_root",
                 "sync",
-                "umount"
+                "umount",
+                "zram-swap"
             ]
         );
     }
@@ -512,7 +516,7 @@ mod confinement {
     }
 
     /// The syscalls UNSAFE.md records for this crate, with the x86_64 number
-    /// each name must carry. An ELEVENTH is a reviewed amendment; this test is
+    /// each name must carry. A THIRTEENTH is a reviewed amendment; this test is
     /// what makes that more than an aspiration.
     ///
     /// The NUMBERS are pinned, not just the names: renumbering `SYS_MOUNT` to
@@ -527,6 +531,7 @@ mod confinement {
         ("SYS_REBOOT", "169"),
         ("SYS_SETHOSTNAME", "170"),
         ("SYS_SETSID", "112"),
+        ("SYS_SWAPON", "167"),
         ("SYS_SYNC", "162"),
         ("SYS_UMOUNT2", "166"),
         ("SYS_WAIT4", "61"),
@@ -560,8 +565,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            18,
-            "expected eighteen modules beside the crate root"
+            19,
+            "expected nineteen modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
@@ -576,7 +581,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these eight files and nothing else.
+    /// `src/` holds these nineteen files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -614,6 +619,7 @@ mod confinement {
                 "syncfs.rs",
                 "sys.rs",
                 "term.rs",
+                "zramswap.rs",
             ],
             "the crate's file set changed"
         );
@@ -756,7 +762,7 @@ mod confinement {
     /// and call-site assertion here still green. Squeezed, position on a line
     /// stops existing.
     #[test]
-    fn the_syscall_surface_is_the_amended_eleven() {
+    fn the_syscall_surface_is_the_amended_twelve() {
         const DECL: &str = concat!("const", "SYS_");
         let sys = squeeze(&source("sys.rs"));
         let mut declared = Vec::new();
@@ -774,7 +780,7 @@ mod confinement {
             }
         }
         // Nothing was dropped by the parse: an entry the loop skipped would
-        // leave a roster that matches while an eleventh declaration exists.
+        // leave a roster that matches while a thirteenth declaration exists.
         assert_eq!(
             declared.len(),
             sys.matches(DECL).count(),
@@ -899,7 +905,7 @@ mod confinement {
         }
     }
 
-    /// All eleven calls, pinned WHOLE — every register, not just the selector.
+    /// All twelve calls, pinned WHOLE — every register, not just the selector.
     ///
     /// `every_syscall_call_site_uses_a_named_constant` reads argument ONE and
     /// stops. The other five are where the amendment's restrictions actually
@@ -928,6 +934,7 @@ mod confinement {
             "(SYS_IOCTL,fdasusize,request,arg,0,0)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
             "(SYS_POLL,fds.as_mut_ptr()asusize,fds.len(),NO_TIMEOUT,0,0,)",
+            "(SYS_SWAPON,path.as_ptr()asusize,SWAP_FLAGS,0,0,0,)",
         ];
         // One pin per SYSCALL now: the six ioctl requests share a single entry
         // point, so what each one passes is pinned at its wrapper instead —
@@ -1134,6 +1141,9 @@ mod confinement {
             // the driver class. A caller outside `mknod.rs` could compose a
             // character node and skip the readback that makes this applet safe.
             (concat!("sys::", "mknod"), &["mknod.rs"][..]),
+            // The one swap the machine has; any other caller could turn swap on
+            // over a device that writes to storage.
+            (concat!("sys::", "swapon"), &["zramswap.rs"][..]),
             // The two termios wrappers pass a pointer the kernel reads or writes
             // 36 bytes through, and `term.rs` is the only module that knows what
             // those bytes mean. A caller elsewhere could write a buffer it
@@ -1327,7 +1337,7 @@ mod confinement {
                 .collect();
             assert!(
                 AMENDED.iter().any(|(name, _)| *name == selector),
-                "called with '{selector}', which is not one of the amended eleven"
+                "called with '{selector}', which is not one of the amended twelve"
             );
             // The constant must BE the argument, not the start of an expression:
             // `SYS_REBOOT - 130` selects getpid(2) while spelling an audited
@@ -1339,7 +1349,7 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the ten exactly once, ioctl included: its six permitted
+        // Each of the twelve exactly once, ioctl included: its six permitted
         // requests share ONE entry point, so the request register is pinned at
         // the six wrappers rather than here. Membership alone would let every
         // site name SYS_REBOOT while a wrapper quietly issued a different call
@@ -1353,15 +1363,15 @@ mod confinement {
             "each amended syscall is issued exactly once"
         );
         // One call per wrapper: reboot, sync, mount, umount2, chroot,
-        // sethostname, setsid, mknod, ioctl, wait4, poll.
-        assert_eq!(sites, 11, "expected exactly eleven call sites");
+        // sethostname, setsid, mknod, ioctl, wait4, poll, swapon.
+        assert_eq!(sites, 12, "expected exactly twelve call sites");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
         // every later call goes through a name this scan does not know.
         assert_eq!(
             mentions,
             sites + 1,
-            "mentioned somewhere that is not one of the eleven calls or its definition"
+            "mentioned somewhere that is not one of the twelve calls or its definition"
         );
     }
 
@@ -1549,6 +1559,36 @@ mod confinement {
         let term = squeeze(&code_only(&source("term.rs")));
         assert_eq!(term.matches(concat!("sys::", "poll(")).count(), 1);
         assert_eq!(term.matches(concat!("sys::", "PollFd::new(")).count(), 1);
+    }
+
+    /// `swapon(2)` is pinned whole: the flag word by value, the wrapper's
+    /// signature and body, and its one call, on the one device. The priority
+    /// in the flags is the one `zramswap.rs` reads back from `/proc/swaps`.
+    #[test]
+    fn the_swap_is_pinned_whole() {
+        let sys = squeeze(&code_only(&source("sys.rs")));
+        for pinned in [
+            "constSWAP_FLAGS:usize=0x8000|100;",
+            concat!(
+                "pubfnswapon(path:&CStr)->io::Result<()>{check(sys",
+                "call5(SYS_SWAPON,path.as_ptr()asusize,SWAP_FLAGS,0,0,0,)).map(|_|())}"
+            ),
+        ] {
+            assert_eq!(sys.matches(pinned).count(), 1, "swapon changed: {pinned}");
+        }
+        assert_eq!(sys.matches("SWAP_FLAGS").count(), 2);
+        let zram = squeeze(&code_only(&source("zramswap.rs")));
+        assert_eq!(zram.matches(concat!("sys::", "swapon(")).count(), 1);
+        assert_eq!(
+            zram.matches(concat!("sys::", "swapon(DEVICE_C)")).count(),
+            1
+        );
+        assert_eq!(
+            zram.matches("constDEVICE_C:&CStr=c\"/dev/zram0\";").count(),
+            1
+        );
+        assert_eq!(zram.matches("DEVICE_C").count(), 2);
+        assert_eq!(zram.matches("constPRIORITY:i32=100;").count(), 1);
     }
 
     /// `console.rs` is compiled into td-boot as well, by `#[path]`: it reads
