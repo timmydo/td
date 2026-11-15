@@ -390,7 +390,8 @@ name-free `0d` (as built: §6, increment 3).
 The proposal:
 
 - The card keeps fixed entries: the terminal first, then td-software,
-  the six desktop programs, and close.
+  the desktop programs (td-compositor/DESIGN.md, the launcher), and
+  close.
 - Installed applications follow, sorted by display name.
 - The card shows a window of rows that scrolls with the selection.
 - The existing filter narrows the list. The keyboard already walks

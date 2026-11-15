@@ -2856,7 +2856,15 @@ Coding Agent issue fixed private requests 22, 07, 08, 09, 0a, 0b and 0c, and
 run with the human credentials described in td-authd/DESIGN.md (the task
 manager with its system PID view). No request carries a path; Code Review's
 fixed `--choose-repo`, added by the authority, has td-review ask which
-repository, for the reason td-authd/DESIGN.md gives. The card has no update
+repository, for the reason td-authd/DESIGN.md gives. Password Notebook,
+last of them, issues the secret session's request 28 instead, and root
+starts td-pass and its vault service itself (td-pass/DESIGN.md, "Trusted
+td backend"); its `a8 01`, that root could not open one, is reported only
+on standard error, as a refused desktop program is, and root's log says
+why. A press the authority worker takes in the turn a session lock
+revoked the notebook is dropped, so no window opens behind the lock.
+With the notebook already open the entry starts nothing and raises no
+window. The card has no update
 entry: an application updates only from td-software (td-software/DESIGN.md
 §7), and `--update-application` and private request `0e` are retired with the
 row. A filter that matches no other entry but
@@ -8191,8 +8199,10 @@ ADMIN KEY ENROLLED. This does not replace an existing admin key.
 Notebook token descriptions use the shared consent tag 41 and its
 `asks_pin` predicate for the protected PIN field. The operation and exact
 step are rendered by the shared codec; ordinary notebook windows never
-receive PIN input. The attention menu's N opens the notebook or selects its pending
-operation in the one authority slot. Root's `a9 03`, a window or vault
+receive PIN input. The attention menu's N, AUTHORIZE NOTEBOOK, selects the
+notebook's pending operation in the one authority slot; it opens no window,
+which only the launcher's entry does, and with none it says to open the
+notebook from the launcher. Root's `a9 03`, a window or vault
 service that exited unsuccessfully, shows THE NOTEBOOK WINDOW STOPPED and
 the log root wrote its reason to (td-authd/DESIGN.md, "Notebook token
 descriptions"); the notice is fixed text, never the process's. Each exchange requires its own physical

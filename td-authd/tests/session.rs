@@ -2541,9 +2541,90 @@ fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
     }
 }
 
+/// `28`, the launcher's, takes no slot and opens nothing before the
+/// session is prepared. A start root cannot make is logged and armed as
+/// a failed window, which the next selection names (`a9 03`).
+#[test]
+fn a_notebook_open_refuses_unprepared_and_arms_a_failed_start() {
+    assert_eq!(Request::decode(&[0x28]).unwrap(), Request::NotebookOpen);
+    assert!(!Request::NotebookOpen.takes_slot());
+    let mut session = quiet();
+    let open = |session: &mut Session| {
+        session
+            .answer_with(
+                Request::NotebookOpen,
+                |_| panic!("cleanup"),
+                unexpected_begin,
+            )
+            .unwrap()
+    };
+    assert_eq!(open(&mut session), [0xa8, 1]);
+    assert!(session.notebook.is_none());
+    assert!(!session.notebook_failed);
+    // Prepared, but the test host has no notebook account to start.
+    session.prepared = true;
+    assert_eq!(open(&mut session), [0xa8, 1]);
+    assert!(session.notebook.is_none());
+    assert!(session.notebook_failed);
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookBegin,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xa9, 3]
+    );
+}
+
+/// An open window is kept, not started again: `28` answers that it is
+/// open.
+#[test]
+fn a_notebook_open_keeps_an_open_window() {
+    let mut session = quiet();
+    session.prepared = true;
+    let (bridge, pids) = crate::notebook::tests::bridge();
+    session.notebook = Some(bridge);
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookOpen,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xa8, 0]
+    );
+    assert!(session.notebook.is_some());
+    for pid in pids {
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+}
+
+/// Only the launcher's `28` opens the notebook: a prepared session's
+/// selection with no window selects nothing and starts no window.
+#[test]
+fn a_notebook_selection_with_no_window_opens_none() {
+    let mut session = quiet();
+    session.prepared = true;
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookBegin,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xa9, 0]
+    );
+    assert!(session.notebook.is_none());
+    assert!(session.operation.is_none());
+}
+
 /// A window that exits unsuccessfully is reported once, to the next
-/// selection, as `a9 03`, and only once: the selection after it opens a
-/// window again.
+/// selection, as `a9 03`, and only once: the selection after it is an
+/// ordinary one.
 #[test]
 fn a_notebook_window_that_failed_answers_the_next_selection_once() {
     let mut session = quiet();
@@ -2567,8 +2648,7 @@ fn a_notebook_window_that_failed_answers_the_next_selection_once() {
         [0xa9, 3]
     );
     assert!(!session.notebook_failed);
-    // Said once: the next selection is an ordinary one (this session was
-    // never prepared, so it opens nothing).
+    // Said once: the next selection is an ordinary one.
     assert_eq!(
         session
             .answer_with(

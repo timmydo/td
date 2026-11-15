@@ -498,7 +498,17 @@ impl Session {
                 Ok(vec![0xab])
             }
             Request::NotebookOpen => {
-                if !self.prepared || self.cleanup.is_some() || self.suspending.is_some() {
+                // A window that just closed is seen before it is counted open.
+                self.tick()?;
+                let restarting = self
+                    .revocation
+                    .as_ref()
+                    .is_some_and(crate::revocation::Revocation::restarting);
+                if !self.prepared
+                    || self.cleanup.is_some()
+                    || self.suspending.is_some()
+                    || restarting
+                {
                     return Ok(vec![0xa8, 1]);
                 }
                 if self.notebook.is_none() && !matches!(self.operation, Some(Active::Notebook(_))) {
@@ -507,7 +517,14 @@ impl Session {
                             self.notebook = Some(bridge);
                             self.notebook_failed = false;
                         }
-                        Err(_) => return Ok(vec![0xa8, 1]),
+                        // Root's own reason, logged; the next N names the log.
+                        Err(why) => {
+                            crate::notebook::log(&crate::message(format_args!(
+                                "notebook not opened: {why}"
+                            )));
+                            self.notebook_failed = true;
+                            return Ok(vec![0xa8, 1]);
+                        }
                     }
                 }
                 Ok(vec![0xa8, 0])
@@ -521,21 +538,10 @@ impl Session {
             }
             Request::NotebookBegin => {
                 self.tick()?;
-                // Said once; the selection after it opens a window again.
+                // Said once. Only `28`, the launcher's, opens a window: a
+                // selection with none selects nothing.
                 if self.notebook.is_none() && std::mem::take(&mut self.notebook_failed) {
                     return Ok(vec![0xa9, 3]);
-                }
-                if self.prepared
-                    && self.cleanup.is_none()
-                    && self.operation.is_none()
-                    && self.inspection.is_none()
-                    && self.notebook.is_none()
-                {
-                    self.notebook = match crate::notebook::Bridge::start(self.owner) {
-                        Ok(bridge) => Some(bridge),
-                        Err(_) => return Ok(vec![0xa9, 2]),
-                    };
-                    return Ok(vec![0xa9, 0]);
                 }
                 if !self.prepared
                     || self.cleanup.is_some()
@@ -1088,7 +1094,7 @@ impl Session {
                         .as_mut()
                         .is_some_and(|bridge| bridge.mail(id, &binding).unwrap_or(false));
                 if !mail_accepted {
-                    intake.reply(id, crate::notebook_mail::refused("Open td-pass through secure attention, unlock it, and approve this mail account; then retry mail")?);
+                    intake.reply(id, crate::notebook_mail::refused("Open td-pass from the launcher, unlock it, and approve this mail account; then retry mail")?);
                 }
             }
         }

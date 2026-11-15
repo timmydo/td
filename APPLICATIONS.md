@@ -12615,7 +12615,7 @@ not target build inputs. No foreign runtime acquisition is added here.
 For the mail application, `secret = "td-pass"` selects the trusted
 notebook credential path. Its packaged td-secret helper sends the exact
 account name, configured discovery URL and username through the authenticated
-secret portal. In td-pass, opened through Ctrl+Alt+Esc then N, unlock the
+secret portal. In td-pass, opened from the launcher, unlock the
 notebook, select a saved entry with a password/token, choose Mail and approve
 the displayed tuple. Retry mail after approval. The binding is remembered;
 a changed tuple needs new approval. The jail needs no password-file mount,

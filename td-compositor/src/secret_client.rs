@@ -872,6 +872,15 @@ impl Removal {
 /// rather than clipped: the operation ends before its token I/O.
 pub(crate) const TOO_SMALL: &[&str] = &["THIS SCREEN IS TOO SMALL", "FOR THIS PROMPT"];
 
+/// Root's `a9 00`: no notebook operation waits for its token, whether
+/// no window is open or its window has none chosen. N opens nothing; the
+/// launcher does.
+pub(crate) const NOTEBOOK_NOTHING_WAITING: &[&str] = &[
+    "OPEN THE NOTEBOOK FROM THE LAUNCHER",
+    "OR CHOOSE AN OPERATION IN ITS WINDOW",
+    "THEN RETURN HERE AND PRESS N",
+];
+
 /// Root's `a9 03`: the last notebook window or vault service exited
 /// unsuccessfully. Its words are the person's account's, so they go to
 /// root's log, never this screen, which names only where they are.
@@ -1685,13 +1694,9 @@ impl Client {
         // this build's (td-authd/DESIGN.md amendment 10).
         let answer = selection.answer();
         let nonce = match response.as_slice() {
-            [0xa9, 2] if answer == 0xa9 => return attempt.notice(Notice::NotAvailable),
             [0xa9, 3] if answer == 0xa9 => return attempt.notice(Notice::Login(NOTEBOOK_FAILED)),
             [0xa9, 0] if answer == 0xa9 => {
-                return attempt.notice(Notice::Login(&[
-                    "CHOOSE AN OPERATION IN THE NOTEBOOK WINDOW",
-                    "THEN RETURN HERE AND PRESS N",
-                ]))
+                return attempt.notice(Notice::Login(NOTEBOOK_NOTHING_WAITING))
             }
             [0xa0, 0] if answer == 0xa0 => return attempt.notice(Notice::NotAvailable),
             [tag, 1, nonce @ ..] if *tag == answer => {
@@ -2941,38 +2946,49 @@ mod tests {
         }
     }
 
-    /// Root's `a9 03` shows the fixed notice and starts no operation.
+    /// Root's `a9 03` and `a9 00` show their fixed notices and start no
+    /// operation; `a9 02`, retired with N's opening, is a violation.
     #[test]
     fn a_failed_notebook_window_names_root_s_log() {
-        let temp = crate::temp_dir::TempDir::new("td-notebook-failed").unwrap();
-        let path = temp.path().join("frame");
-        let mut runtime = Runtime::new(
-            crate::framebuffer::Framebuffer::test_file(&path, 800, 600, 3200).unwrap(),
-        );
-        runtime.enable_attention(true);
-        runtime
-            .attention(&crate::input::test_origin(), true)
-            .unwrap();
-        let screen = Screen {
-            path,
-            attempt: Attempt::new(
-                crate::input::test_origin(),
-                Arc::new(Mutex::new(runtime)),
-                Selection::Login(LoginSelection::Notebook),
-            ),
-        };
-        let mut wire = Wire {
-            replies: VecDeque::from([vec![0xa9, 3]]),
-            calls: Vec::new(),
-            typist: None,
-        };
-        let mut client = Client::trusting_memory();
-        client
-            .start(&mut wire, Arc::clone(&screen.attempt))
-            .unwrap();
-        assert!(client.login.is_none());
-        assert_eq!(wire.calls, [vec![0x29]]);
-        assert_eq!(screen.shown(), Some(Notice::Login(NOTEBOOK_FAILED)));
+        for (reply, notice) in [
+            ([0xa9, 3], Some(NOTEBOOK_FAILED)),
+            ([0xa9, 0], Some(NOTEBOOK_NOTHING_WAITING)),
+            ([0xa9, 2], None),
+        ] {
+            let temp = crate::temp_dir::TempDir::new("td-notebook-failed").unwrap();
+            let path = temp.path().join("frame");
+            let mut runtime = Runtime::new(
+                crate::framebuffer::Framebuffer::test_file(&path, 800, 600, 3200).unwrap(),
+            );
+            runtime.enable_attention(true);
+            runtime
+                .attention(&crate::input::test_origin(), true)
+                .unwrap();
+            let screen = Screen {
+                path,
+                attempt: Attempt::new(
+                    crate::input::test_origin(),
+                    Arc::new(Mutex::new(runtime)),
+                    Selection::Login(LoginSelection::Notebook),
+                ),
+            };
+            let mut wire = Wire {
+                replies: VecDeque::from([reply.to_vec()]),
+                calls: Vec::new(),
+                typist: None,
+            };
+            let mut client = Client::trusting_memory();
+            let started = client.start(&mut wire, Arc::clone(&screen.attempt));
+            assert!(client.login.is_none());
+            assert_eq!(wire.calls, [vec![0x29]]);
+            match notice {
+                Some(lines) => {
+                    started.unwrap();
+                    assert_eq!(screen.shown(), Some(Notice::Login(lines)));
+                }
+                None => assert!(started.is_err(), "{reply:?}"),
+            }
+        }
     }
 
     struct Wire {

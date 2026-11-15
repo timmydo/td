@@ -753,7 +753,7 @@ fn notebook_credential(binding: &MailBinding) -> Result<Bytes, String> {
         }
     }
     let metadata = fs::symlink_metadata(notebook_wire::MAIL_SOCKET)
-        .map_err(|_| "open td-pass through secure attention first")?;
+        .map_err(|_| "open td-pass from the launcher first")?;
     if !metadata.file_type().is_socket()
         || metadata.uid() != PORTAL_UID
         || metadata.gid() != PORTAL_UID

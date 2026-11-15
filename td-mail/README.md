@@ -504,14 +504,15 @@ server at once, where td-pass would ask for a new approval. td-pass is the
 source that guards these.
 
 On td, the protected source is `secret = "td-pass"`. Try connecting the
-account, then open td-pass with Ctrl+Alt+Esc followed by N. Unlock it, select a saved entry
-with a password/token, choose Mail, and approve the exact account, server
-URL and username shown. Retry mail. The binding is remembered, but the
-notebook must be unlocked for release. Changing the URL or username needs
-a new approval. This source preserves the password exactly, including
-trailing newlines. Clearing the entry’s password revokes its bindings.
-Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
-its portal credential is mail/default.
+account, then open td-pass from the launcher (PASSWORD NOTEBOOK). Unlock
+it, select a saved entry with a password/token, choose Mail, and approve
+the exact account, server URL and username shown. Retry mail. The
+binding is remembered, but the notebook must be unlocked for release.
+Changing the URL or username needs a new approval. This source preserves
+the password exactly, including trailing newlines. Clearing the entry’s
+password revokes its bindings. Legacy fallback is supported via `[jmap]`
+with `well_known_url`, `username`, and one of those; its portal
+credential is mail/default.
 
 The window opens before any account is connected, so the credential and
 discovery round trips never hold it; the mailbox list loads once the

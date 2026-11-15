@@ -21,7 +21,8 @@ use std::process::ExitCode;
 const HELP: &str = "usage: td-pass\n\
     A two-pane encrypted notebook over td-secret's portable vault, \
     opened with a FIDO2 key and its PIN. It runs standalone on a foreign \
-    Wayland desktop. On td, press Ctrl+Alt+Esc then N to open it through the trusted vault service.";
+    Wayland desktop. On td, open it from the launcher (PASSWORD NOTEBOOK), \
+    which starts it with the trusted vault service.";
 
 fn main() -> ExitCode {
     // An argument that is not text is no worker's and no window's.
@@ -54,9 +55,7 @@ fn main() -> ExitCode {
     }
     match mode::admit(os_release().as_deref()) {
         Ok(mode::Mode::Standalone) => exit(window::run_with(None)),
-        Ok(mode::Mode::TrustedRequired) => exit(Err(
-            "open td-pass through td’s trusted notebook launcher".into(),
-        )),
+        Ok(mode::Mode::TrustedRequired) => exit(Err("open td-pass from td’s launcher".into())),
         Err(reason) => exit(Err(reason.to_owned())),
     }
 }

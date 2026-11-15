@@ -526,19 +526,22 @@ as the image's does.
 
 ## Trusted td backend
 
-Physical secure attention, Ctrl+Alt+Esc followed by N, opens the notebook
-through td-authd. The GUI runs as the primary human; the vault service runs
-as that owner's reserved notebook identity. Root creates both private
-socketpairs and validates the account registry before dropping credentials.
-The GUI and vault have no pathname listener, caller-selected program, or
-UID-only vault admission. The GUI accepts only root's inherited endpoint, with one thread,
-all UID/GID columns 1000, no effective capabilities, and no extra inherited
+The launcher's PASSWORD NOTEBOOK entry opens the notebook through
+td-authd (td-compositor/DESIGN.md, the launcher). The GUI runs as the
+primary human; the vault service runs as that owner's reserved notebook
+identity. Root creates both private socketpairs and validates the
+account registry before dropping credentials. The GUI and vault have no
+pathname listener, caller-selected program, or UID-only vault admission.
+The GUI accepts only root's inherited endpoint, with one thread, all
+UID/GID columns 1000, no effective capabilities, and no extra inherited
 descriptors. Its transport rechecks protected memory and accepts no swap
-exception. Closing it shuts down the socket, including the inherited stdin
-alias, so root observes revocation even if the process remains alive.
+exception. Closing it shuts down the socket, including the inherited
+stdin alias, so root observes revocation even if the process remains
+alive.
 
 Browsing and edits use the service protocol. A hardware operation first
-asks the person to return to secure attention and press N. Its PIN fields
+asks the person to press Ctrl+Alt+Esc, then N, which authorizes it on the
+secure-attention screen; N opens no window. Its PIN fields
 exist only there; the ordinary window shows a waiting status and receives
 no PIN or vault key. Creation, unlock, key addition/replacement, encrypted
 export and encrypted-copy import use the same lifecycle as standalone mode.
@@ -573,7 +576,7 @@ Lock clears the question. Clearing an entry's password revokes all its
 bindings. The password can be changed without changing its bindings.
 
 The window never receives tag-12 credential replies. Mail requests cannot
-open or unlock the notebook. The person opens it through secure attention,
+open or unlock the notebook. The person opens it from the launcher,
 unlocks, selects an entry, approves the binding, then retries mail.
 
 The window protocol reexports only `pass::MailBinding`, the shared bounded,

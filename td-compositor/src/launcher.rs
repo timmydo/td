@@ -53,6 +53,8 @@ pub enum LaunchRequest {
     Dua,
     Agent,
     Software,
+    /// The password notebook, which root opens (td-pass/DESIGN.md).
+    Notebook,
     /// The launcher table's application at this position in the card's
     /// order (`Launcher::application`): raise its window or start it.
     Application(usize),
@@ -73,7 +75,11 @@ impl LaunchRequest {
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
             Self::Software => Some(crate::authority::Program::Software),
-            Self::UiDemo | Self::Terminal | Self::Application(_) | Self::Install(_) => None,
+            Self::UiDemo
+            | Self::Terminal
+            | Self::Notebook
+            | Self::Application(_)
+            | Self::Install(_) => None,
         }
     }
 }
@@ -142,6 +148,11 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         label: "CODING AGENT",
         search: "coding agent ai assistant model llm openrouter",
         request: Some(LaunchRequest::Agent),
+    },
+    Entry {
+        label: "PASSWORD NOTEBOOK",
+        search: "password notebook passwords secrets vault td-pass",
+        request: Some(LaunchRequest::Notebook),
     },
 ];
 
@@ -349,6 +360,10 @@ impl LaunchBackend {
             Self::Direct(processes) => processes.launch(request),
             Self::Authority(authority) if request == LaunchRequest::Terminal => {
                 authority.launch()?;
+                Ok(Vec::new())
+            }
+            Self::Authority(authority) if request == LaunchRequest::Notebook => {
+                authority.open_notebook()?;
                 Ok(Vec::new())
             }
             Self::Authority(authority) => match request.authority_program() {
@@ -880,6 +895,9 @@ pub(crate) fn launch_command(
         }
         LaunchRequest::Application(_) | LaunchRequest::Install(_) => {
             return Err("applications require the paired authority".into());
+        }
+        LaunchRequest::Notebook => {
+            return Err("the password notebook requires the paired authority".into());
         }
         LaunchRequest::UiDemo => options.client.clone(),
         LaunchRequest::Terminal => options.terminal.clone(),
@@ -1728,6 +1746,7 @@ mod authority_entry_tests {
         "CODE REVIEW",
         "DISK USAGE",
         "CODING AGENT",
+        "PASSWORD NOTEBOOK",
         "CLOSE LAUNCHER",
     ];
 
@@ -1873,6 +1892,8 @@ mod authority_entry_tests {
         for request in [LaunchRequest::Application(0), LaunchRequest::Install(0)] {
             assert!(backend.launch(request).is_err());
         }
+        assert!(backend.launch(LaunchRequest::Notebook).unwrap().is_empty());
+        assert!(queued.notebook());
     }
 
     #[test]
@@ -1904,10 +1925,24 @@ mod authority_entry_tests {
             assert_eq!(launcher.apply(LauncherAction::Activate), Some(request));
             assert!(request.authority_program().is_some());
         }
+        // Root opens the notebook itself: no program is started for it.
+        launcher.apply(LauncherAction::Open);
+        for character in "password".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["PASSWORD NOTEBOOK"]);
+        assert_eq!(
+            launcher.apply(LauncherAction::Activate),
+            Some(LaunchRequest::Notebook)
+        );
         launcher.set_authority(false);
         launcher.apply(LauncherAction::Open);
         assert_eq!(launcher.matched_labels().len(), 3);
-        for request in [LaunchRequest::UiDemo, LaunchRequest::Terminal] {
+        for request in [
+            LaunchRequest::UiDemo,
+            LaunchRequest::Terminal,
+            LaunchRequest::Notebook,
+        ] {
             assert!(request.authority_program().is_none());
         }
     }
@@ -1995,6 +2030,7 @@ mod authority_entry_tests {
             LaunchRequest::Dua,
             LaunchRequest::Agent,
             LaunchRequest::Software,
+            LaunchRequest::Notebook,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
         }

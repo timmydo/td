@@ -56,6 +56,8 @@ enum Work {
     Program(Program),
     /// `22` and a name: td-software, opened at that application.
     SoftwareAt(String),
+    /// `28`: root opens the password notebook's window.
+    Notebook,
     Supervised(Supervised),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
@@ -922,7 +924,8 @@ impl Login {
             .notebook_lock = true;
     }
 
-    fn revoke_notebook(&self, wire: &mut impl Exchange) -> Result<(), String> {
+    /// Sends a pending lock's `2b`; says whether it sent one.
+    fn revoke_notebook(&self, wire: &mut impl Exchange) -> Result<bool, String> {
         let pending = {
             let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             std::mem::take(&mut shared.notebook_lock)
@@ -930,7 +933,7 @@ impl Login {
         if pending && wire.exchange(&[0x2b])? != [0xab] {
             return Err("authority refused notebook lock".into());
         }
-        Ok(())
+        Ok(pending)
     }
 
     /// The last answer's state; none before the first answer, and in the
@@ -1279,6 +1282,16 @@ impl Launcher {
         }
     }
 
+    /// Asks root to open the password notebook, which it starts as the
+    /// human with its vault service (td-pass/DESIGN.md).
+    pub(crate) fn open_notebook(&self) -> Result<(), String> {
+        match self.send.try_send(Work::Notebook) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("program launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
+        }
+    }
+
     /// Queues td-software, opened at `name`, already in the registry's
     /// grammar.
     pub(crate) fn launch_software_at(&self, name: &str) -> Result<(), String> {
@@ -1323,6 +1336,11 @@ impl Queued {
             Ok(Work::Supervised(request)) => Some(request),
             _ => None,
         }
+    }
+
+    /// Whether the queue holds the notebook's open request.
+    pub(crate) fn notebook(&self) -> bool {
+        matches!(self.0.try_recv(), Ok(Work::Notebook))
     }
 
     /// The td-software selection the queue holds, if that is what it holds.
@@ -1785,6 +1803,24 @@ fn grants(
     }
 }
 
+/// `28`: root opens the notebook, or says it cannot (`a8 01`: the
+/// session is not ready or the window would not start), which is no
+/// failure of the channel; any other answer is. A press taken in the
+/// turn a session lock revoked the notebook is dropped, so no window
+/// opens behind the lock.
+fn open_notebook(wire: &mut impl Exchange, revoked: bool) -> Result<Option<&'static str>, String> {
+    if revoked {
+        return Ok(Some(
+            "the session locked before the password notebook opened",
+        ));
+    }
+    match wire.exchange(&[0x28])?.as_slice() {
+        [0xa8, 0] => Ok(None),
+        [0xa8, 1] => Ok(Some("root could not open the password notebook")),
+        _ => Err("invalid notebook open answer".into()),
+    }
+}
+
 fn worker(
     mut wire: impl Exchange,
     receive: Receiver<Work>,
@@ -1796,7 +1832,7 @@ fn worker(
     let mut secrets = crate::secret_client::Client::default();
     loop {
         let work = receive.recv_timeout(login.wait());
-        login.login.revoke_notebook(&mut wire)?;
+        let revoked = login.login.revoke_notebook(&mut wire)?;
         secrets.set_revocation(login.revocation());
         match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
@@ -1812,6 +1848,11 @@ fn worker(
             }
             Ok(Work::SoftwareAt(name)) => {
                 if let Some(error) = processes.start_software_at(&mut wire, &name)? {
+                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+                }
+            }
+            Ok(Work::Notebook) => {
+                if let Some(error) = open_notebook(&mut wire, revoked)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
             }
@@ -1852,16 +1893,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_launcher_asks_root_to_open_the_notebook() {
+        let mut wire = wire(vec![vec![0xa8, 0], vec![0xa8, 1], vec![0xa9, 0]]);
+        assert_eq!(open_notebook(&mut wire, false).unwrap(), None);
+        assert!(open_notebook(&mut wire, false).unwrap().is_some());
+        assert!(open_notebook(&mut wire, false).is_err());
+        assert_eq!(wire.requests, [vec![0x28], vec![0x28], vec![0x28]]);
+        // The turn a lock revoked the notebook sends nothing.
+        let mut wire = super::tests::wire(Vec::new());
+        assert!(open_notebook(&mut wire, true).unwrap().is_some());
+        assert!(wire.requests.is_empty());
+    }
+
+    #[test]
     fn a_session_lock_revokes_the_notebook_even_after_repeated_lock_events() {
         let login = Login::default();
         let mut wire = wire(vec![vec![0xab], vec![0xab], vec![0]]);
         login.lock_notebook();
         login.lock_notebook();
-        login.revoke_notebook(&mut wire).unwrap();
-        login.revoke_notebook(&mut wire).unwrap();
+        assert!(login.revoke_notebook(&mut wire).unwrap());
+        assert!(!login.revoke_notebook(&mut wire).unwrap());
         assert_eq!(wire.requests, [vec![0x2b]]);
         login.lock_notebook();
-        login.revoke_notebook(&mut wire).unwrap();
+        assert!(login.revoke_notebook(&mut wire).unwrap());
         login.lock_notebook();
         assert!(login.revoke_notebook(&mut wire).is_err());
         assert_eq!(wire.requests, [vec![0x2b], vec![0x2b], vec![0x2b]]);

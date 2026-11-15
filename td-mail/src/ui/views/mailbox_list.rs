@@ -139,7 +139,7 @@ fn placeholder_text(account: &str, setup: &AccountSetup) -> String {
          into its configuration and connects.\n\n",
     );
     if setup.notebook {
-        text.push_str("Open td-pass with Ctrl+Alt+Esc then N, unlock it, select a saved entry with a password/token, and choose Mail to approve this account. Then retry here.");
+        text.push_str("Open td-pass from the launcher (PASSWORD NOTEBOOK), unlock it, select a saved entry with a password/token, and choose Mail to approve this account. Then retry here.");
         return text;
     }
     match &setup.portal {
@@ -186,7 +186,7 @@ fn shell_text(account: &str, error: &str) -> String {
          password_command line with secret = \"td-pass\".\n\
          2. Close this window and type mail in a terminal to start it again: R \
          reconnects with the configuration td-mail started with.\n\
-         3. Open td-pass with Ctrl+Alt+Esc then N and unlock it. Select an entry \
+         3. Open td-pass from the launcher (PASSWORD NOTEBOOK) and unlock it. Select an entry \
          holding this account's password/token, choose Mail, and approve this exact \
          account, server URL and username. Then press R in the new mail window.\n\n\
          Or keep it in a file, unencrypted and guarded by no token: password_file, \
@@ -395,7 +395,7 @@ impl MailboxListView {
         let error = self.error.as_deref().unwrap_or_default();
         match self.screen()? {
             Screen::Placeholder => Some(placeholder_text(&self.current_account, &self.setup)),
-            Screen::Credential if self.setup.notebook => Some(format!("Open td-pass with Ctrl+Alt+Esc then N and unlock it. Select a saved entry with the account’s password/token, choose Mail, and approve this exact account, server URL, and username. Then {AGAIN} here.\n\nWhat td-mail was told: {error}")),
+            Screen::Credential if self.setup.notebook => Some(format!("Open td-pass from the launcher (PASSWORD NOTEBOOK) and unlock it. Select a saved entry with the account’s password/token, choose Mail, and approve this exact account, server URL, and username. Then {AGAIN} here.\n\nWhat td-mail was told: {error}")),
             Screen::Credential => {
                 let name = self.setup.portal.as_deref()?;
                 Some(credential_text(name, error))
@@ -1649,7 +1649,10 @@ mod tests {
         assert!(text.contains("under [account.personal], replace"), "{text}");
         assert!(text.contains("secret = \"td-pass\""), "{text}");
         assert!(text.contains("type mail in a terminal"), "{text}");
-        assert!(text.contains("Ctrl+Alt+Esc then N"), "{text}");
+        assert!(
+            text.contains("from the launcher (PASSWORD NOTEBOOK)"),
+            "{text}"
+        );
         assert!(text.contains(&missing), "{text}");
         assert!(!text.contains("press s"), "{text}");
         assert!(view.scene().status.contains("R:reconnect"));
