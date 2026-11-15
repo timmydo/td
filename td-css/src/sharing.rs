@@ -20,6 +20,9 @@ pub struct PoolLimits {
     pub bytes: usize,
     pub work: usize,
     pub comparisons: usize,
+    /// The fingerprint key; None takes one from addresses ASLR places,
+    /// with no system call.
+    pub seed: Option<u64>,
 }
 impl Default for PoolLimits {
     fn default() -> Self {
@@ -28,6 +31,7 @@ impl Default for PoolLimits {
             bytes: MAX_POOL_BYTES,
             work: MAX_POOL_WORK,
             comparisons: MAX_STYLE_COMPARISONS,
+            seed: None,
         }
     }
 }
@@ -43,6 +47,9 @@ pub struct StylePool {
     bytes: usize,
     work: usize,
     comparisons: usize,
+    /// This pool's fingerprint key, so a page cannot be built offline to
+    /// collide in it.
+    seed: u64,
 }
 impl StylePool {
     pub fn new(limits: PoolLimits) -> Result<Self, Error> {
@@ -66,10 +73,12 @@ impl StylePool {
                 bytes: limits.bytes.min(MAX_POOL_BYTES),
                 work: limits.work.min(MAX_POOL_WORK),
                 comparisons: limits.comparisons.min(MAX_STYLE_COMPARISONS),
+                seed: limits.seed,
             },
             bytes: 0,
             work: 0,
             comparisons: 0,
+            seed: limits.seed.unwrap_or_else(|| address_key(memory)),
         })
     }
     pub fn get(&self, id: StyleId) -> Option<&ComputedStyle> {
@@ -89,7 +98,7 @@ impl StylePool {
     }
     pub fn intern(&mut self, mut style: ComputedStyle) -> Result<StyleId, Error> {
         self.share_custom(&mut style.custom)?;
-        let mut hash = DefaultHasher::new();
+        let mut hash = Fingerprint::new(self.seed);
         // Canonical maps have a stable address while retained by this pool.
         (std::ptr::from_ref(&*style.custom.entries).addr()).hash(&mut hash);
         let value_work = style.values.values().map(value_work).sum::<usize>();
@@ -289,6 +298,74 @@ fn components_charge(values: &[Component], work: &mut usize, max: usize) -> Resu
     }
     Ok(bytes)
 }
+/// A key from where ASLR placed the pool's budget, this call's frame and
+/// a static, mixed as fingerprints are: as hard to guess as those
+/// addresses, and needing no system call, which RandomState would make
+/// and std would panic on failing. A caller with entropy passes its own.
+fn address_key(memory: &Budget) -> u64 {
+    static ANCHOR: u8 = 0;
+    let local = 0u8;
+    let mut key = Fingerprint::new(0x243f_6a88_85a3_08d3);
+    key.add(std::ptr::from_ref(memory) as usize as u64);
+    key.add(std::ptr::from_ref(&local) as usize as u64);
+    key.add(std::ptr::from_ref(&ANCHOR) as usize as u64);
+    key.finish()
+}
+/// A style's bucket key: each word, with the state and the pool's key,
+/// multiplied out to 128 bits and its halves folded (as wyhash's mum
+/// step), far cheaper than SipHash over a style's 230 or so small writes.
+/// The fold has no input difference that survives with certainty, and
+/// the key is unknown to a page, so colliding styles must be found by
+/// chance; a collided bucket is still bounded by MAX_STYLE_COMPARISONS and
+/// MAX_POOL_WORK, and equality, not the key, decides sharing.
+struct Fingerprint {
+    state: u64,
+    seed: u64,
+}
+impl Fingerprint {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    /// The key enters with every word, the first included.
+    fn new(seed: u64) -> Self {
+        Self { state: 0, seed }
+    }
+    fn add(&mut self, word: u64) {
+        let product = u128::from(self.state ^ word ^ self.seed) * u128::from(Self::K);
+        self.state = (product >> 64) as u64 ^ product as u64;
+    }
+}
+impl Hasher for Fingerprint {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
+        }
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            if let Some(head) = word.get_mut(..rest.len()) {
+                head.copy_from_slice(rest);
+            }
+            self.add(u64::from_le_bytes(word) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.add(u64::from(n));
+    }
+    fn write_u16(&mut self, n: u16) {
+        self.add(u64::from(n));
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
 fn hash_number(value: f64, hash: &mut impl Hasher) {
     // PartialEq identifies signed zero; its fingerprints must agree too.
     (if value == 0.0 { 0 } else { value.to_bits() }).hash(hash);
@@ -333,6 +410,147 @@ fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn fingerprints_tell_apart_lengths_orders_and_values() {
+        let key = |f: &dyn Fn(&mut Fingerprint)| {
+            let mut h = Fingerprint::new(0x1234);
+            f(&mut h);
+            h.finish()
+        };
+        let keys = [
+            key(&|h| h.write(b"a")),
+            key(&|h| h.write(b"a\0")),
+            key(&|h| h.write(b"abcdefgh")),
+            key(&|h| h.write(b"abcdefgh\0")),
+            key(&|h| "auto".hash(h)),
+            key(&|h| "none".hash(h)),
+            key(&|h| (1u8, 2u8).hash(h)),
+            key(&|h| (2u8, 1u8).hash(h)),
+            key(&|h| hash_number(0.0, h)),
+            key(&|h| hash_number(1.0, h)),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in keys.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        // Equal values, equal keys: -0 and 0 compare equal.
+        assert_eq!(
+            key(&|h| hash_number(-0.0, h)),
+            key(&|h| hash_number(0.0, h))
+        );
+    }
+    /// Styles of the test tree's element 3 under each inline declaration.
+    fn styles(declarations: &[String]) -> Vec<ComputedStyle> {
+        let source = crate::StyleSet::new(&[]).unwrap();
+        let nodes = crate::test_tree::tree();
+        let element = crate::test_tree::Handle {
+            nodes: &nodes,
+            index: 3,
+        };
+        declarations
+            .iter()
+            .map(|d| source.compute(&element, None, 16.0, d).unwrap())
+            .collect()
+    }
+    /// Pool work and comparisons interning `declarations`' styles.
+    fn interned(declarations: &[String]) -> (usize, usize) {
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        for style in styles(declarations) {
+            pool.intern(style).unwrap();
+        }
+        (pool.work, pool.comparisons)
+    }
+    #[test]
+    fn styles_differing_by_a_sign_and_an_ulp_do_not_collide() {
+        // A multiply-rotate fold passed bit 63 through its multiply and
+        // cancelled it with the next word's bit 4: these two always shared
+        // a key, and k such properties gave 2^k styles one bucket.
+        let pair = [
+            "width: calc(3px + 50%)".to_string(),
+            "width: calc(-3px + 50.000000000000114%)".to_string(),
+        ];
+        let control = [
+            "width: calc(3px + 50%)".to_string(),
+            "width: calc(4px + 50%)".to_string(),
+        ];
+        let [a, b] = styles(&pair).try_into().unwrap();
+        let pool = StylePool::new(PoolLimits::default()).unwrap();
+        let key = |style: &ComputedStyle| {
+            let mut hash = Fingerprint::new(pool.seed);
+            for (property, value) in &style.values {
+                (*property as u8).hash(&mut hash);
+                hash_value(value, &mut hash);
+            }
+            hash.finish()
+        };
+        assert_ne!(a, b);
+        assert_ne!(key(&a), key(&b));
+        // The one comparison each is the shared empty custom map's.
+        assert_eq!(interned(&pair), interned(&control));
+    }
+    #[test]
+    fn a_caller_key_is_used_and_none_needs_no_system_call() {
+        let keyed = |seed| {
+            StylePool::new(PoolLimits {
+                seed,
+                ..PoolLimits::default()
+            })
+            .unwrap()
+            .seed
+        };
+        assert_eq!(keyed(Some(7)), 7);
+        assert_eq!(keyed(Some(7)), keyed(Some(7)));
+        // From addresses: nonzero, and a fingerprint's first word is keyed.
+        assert_ne!(keyed(None), 0);
+        let first = |seed| {
+            let mut hash = Fingerprint::new(seed);
+            hash.write_u8(1);
+            hash.finish()
+        };
+        assert_ne!(first(1), first(2));
+    }
+    #[test]
+    fn two_thousand_crafted_styles_intern_without_scanning_each_other() {
+        // Eleven properties, each one of the pair above: 2,048 styles a
+        // keyless fold put in one bucket, refused MAX_STYLE_COMPARISONS.
+        const PROPERTIES: &[&str] = &[
+            "width",
+            "height",
+            "text-indent",
+            "margin-top",
+            "margin-right",
+            "margin-bottom",
+            "margin-left",
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ];
+        let declarations: Vec<String> = (0..1usize << PROPERTIES.len())
+            .map(|bits| {
+                PROPERTIES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let (px, percent) = if bits >> i & 1 == 1 {
+                            ("-3px", "50.000000000000114%")
+                        } else {
+                            ("3px", "50%")
+                        };
+                        format!("{p}: calc({px} + {percent});")
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        for style in styles(&declarations) {
+            pool.intern(style).unwrap();
+        }
+        assert_eq!(pool.len(), 2048);
+        // One custom-map probe each, and no style scanned another's bucket.
+        assert!(pool.comparisons < 2048 + 16, "{}", pool.comparisons);
+    }
     #[test]
     fn partial_interning_refusal_keeps_all_published_identities_owned() {
         use td_alloc::{with_reservation_limit, BudgetError};

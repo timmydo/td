@@ -789,7 +789,9 @@ are filled with `x`. They use HTML_UA_CSS alone. All have three interned
 styles; prose and word have six DOM nodes, blocks has 182,365. Desktop
 full layout is followed by a 1280-to-832 px resize with frozen styles and
 a 1000..1800 px vertical window at the resized width. Measured again on
-2026-11-15 under a load average of 1 to 2.
+2026-11-15 under a load average of 1 to 2, before td-css's faster
+cascade, which styles blocks in about 400 ms on the same host
+(td-css/DESIGN.md, "Computed-style sharing").
 
 | Shape | Parse / cascade ms | Full / resize / window ms | Full / window lines | Full / resized / window charged MiB | Peak RSS MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -838,6 +840,12 @@ hold 4 MiB of markup as they hold 2 MiB; td-html's MAX_NODES refuses the
 blocks shape doubled. What does not hold is a margin under
 MAX_PAGE_BYTES: 4 MiB of markup within MAX_NODES can lay out denser than
 any 2 MiB shape, and MAX_PAGE_BYTES then refuses it by name (below).
+
+`Limits::styles` is td-css's PoolLimits, passed to the style pool:
+its `seed`, None by default, keys the pool's style fingerprints, which
+without one td-css takes from addresses ASLR places, with no system call
+(td-css/DESIGN.md, "Computed-style sharing"). A caller with entropy of
+its own passes it there; td-layout adds none.
 
 `Limits::style_attributes`, true by default, cascades every element as
 if it had no `style` attribute when false: the attribute is not looked
@@ -992,7 +1000,8 @@ List markers (§5) do not slow a page's layout, and styling a page
 without list items takes about 3% longer, which is accepted: medians of
 nine rounds, as in §5, "List markers", 2 MiB prose laid out in 45.6 ms
 without them and 45.5 with, one word 44.4 and 44.1, blocks 62.9 and
-62.6; the blocks shape styled in 406 ms without and 417 to 420 with.
+62.6; the blocks shape styled in 406 ms without and 417 to 420 with,
+before td-css's faster cascade.
 None of that is the new `list-style-position` longhand (the blocks
 shape styled in 402.7 ms with td-css's change alone against 403.8
 without it), and the box walk's numbering adds at most 0.3 ms. Built

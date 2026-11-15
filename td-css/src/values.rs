@@ -253,15 +253,25 @@ impl Property {
 
     /// Context-free seed; complete computation also applies dependent properties.
     pub fn initial(self, memory: &Budget) -> Result<ComputedValue, Error> {
-        Ok(match self {
+        if self == Self::FontFamily {
+            let mut list = BudgetVec::new(memory)?;
+            list.try_push(Family::Generic("serif"))?;
+            return Ok(ComputedValue::FontFamily(BudgetShared::new(memory, list)?));
+        }
+        self.seed().ok_or(Error::InvalidContext)
+    }
+    /// The initial value of every property but font-family, which owns
+    /// storage. Inlined, with no Result, into the cascade's path for an
+    /// unset property, which every element takes for most properties: a
+    /// call returning its Result through memory stalled there on store
+    /// forwarding.
+    #[inline(always)]
+    fn seed(self) -> Option<ComputedValue> {
+        Some(match self {
             Self::Display => ComputedValue::Keyword("inline"),
             Self::Color => ComputedValue::Color(Color::BLACK),
             Self::BackgroundColor => ComputedValue::Color(Color::TRANSPARENT),
-            Self::FontFamily => ComputedValue::FontFamily({
-                let mut list = BudgetVec::new(memory)?;
-                list.try_push(Family::Generic("serif"))?;
-                BudgetShared::new(memory, list)?
-            }),
+            Self::FontFamily => return None,
             Self::FontSize => ComputedValue::Length(Length::Px(16.0)),
             Self::FontWeight => ComputedValue::Weight(400),
             Self::FontStyle | Self::WhiteSpace => ComputedValue::Keyword("normal"),
@@ -426,6 +436,19 @@ impl ComputedStyle {
     }
 }
 impl ComputedValue {
+    /// A copy of any value that owns no storage: all but font-family's.
+    #[inline(always)]
+    fn plain(&self) -> Option<Self> {
+        Some(match self {
+            Self::Number(v) => Self::Number(*v),
+            Self::Keyword(v) => Self::Keyword(v),
+            Self::Color(v) => Self::Color(*v),
+            Self::Length(v) => Self::Length(*v),
+            Self::FontFamily(_) => return None,
+            Self::Weight(v) => Self::Weight(*v),
+            Self::Decoration(v) => Self::Decoration(*v),
+        })
+    }
     pub fn try_clone(&self) -> Result<Self, Error> {
         Ok(match self {
             Self::Number(v) => Self::Number(*v),
@@ -1062,6 +1085,21 @@ pub(crate) fn compute_value(
         Some(value) => value.try_clone(),
         None => initial(),
     };
+    // The common case, a property no rule sets, without a Result between.
+    if matches!(value, Specified::Unset) {
+        let plain = if property.inherited() {
+            parent
+                .and_then(|style| style.get(property))
+                .and_then(ComputedValue::plain)
+        } else if property.border_color() {
+            None
+        } else {
+            property.seed()
+        };
+        if let Some(value) = plain {
+            return Ok(value);
+        }
+    }
     let result = match value {
         Specified::Pending(_) => return Err(Error::InvalidContext),
         Specified::Initial => initial()?,

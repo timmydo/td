@@ -511,6 +511,13 @@ impl StyleSet {
                 .copied()
                 .filter(|p| !matches!(p, Property::FontSize | Property::Color)),
         );
+        // The style's own font size and color, once computed: what
+        // style.font_size() and style.color() would answer, without a
+        // search of the incomplete map for every property. Before them
+        // they hold those accessors' defaults: font-size, computed first,
+        // takes no color, and color, second, resolves `currentcolor` from
+        // its parent; both match the accessors on a map lacking them.
+        let (mut font_size, mut color) = (16.0, values::Color::BLACK);
         for property in properties {
             let specified = winners
                 .get(&property)
@@ -526,19 +533,22 @@ impl StyleSet {
                 property,
                 &specified,
                 parent,
-                style.font_size(),
-                style.color(),
+                font_size,
+                color,
                 if parent.is_none() {
-                    if property == Property::FontSize {
-                        16.0
-                    } else {
-                        style.font_size()
-                    }
+                    font_size
                 } else {
                     root_font_size
                 },
                 &memory,
             )?;
+            match (property, &value) {
+                (Property::FontSize, values::ComputedValue::Length(values::Length::Px(px))) => {
+                    font_size = *px;
+                }
+                (Property::Color, values::ComputedValue::Color(c)) => color = *c,
+                _ => {}
+            }
             style.values.try_insert(property, value)?;
         }
         values::finish(&mut style, parent.is_none())?;

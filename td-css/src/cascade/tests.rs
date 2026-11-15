@@ -1386,3 +1386,36 @@ fn stats_count_declarations_local_custom_names_and_inspected_bytes() {
     assert!(stats.match_steps > stats.match_bytes);
     assert_eq!((stats.declarations, stats.local_custom_properties), (0, 0));
 }
+
+#[test]
+fn unset_inherited_values_keep_their_sign_and_negative_zero() {
+    let nodes = tree();
+    let element = Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let set = StyleSet::new(&[]).unwrap();
+    let root = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
+    let parent = set
+        .compute(
+            &element,
+            Some(&root),
+            16.0,
+            "text-indent: -5px; letter-spacing: -0px; line-height: -0",
+        )
+        .unwrap();
+    let child = set.compute(&element, Some(&parent), 16.0, "").unwrap();
+    // Bits tell -0.0 from 0.0, which equality does not.
+    let bits = |style: &ComputedStyle, property| match style.get(property) {
+        Some(V::Length(Length::Px(n)) | V::Number(n)) => n.to_bits(),
+        other => panic!("{other:?}"),
+    };
+    for (property, value) in [
+        (Property::TextIndent, -5.0f64),
+        (Property::LetterSpacing, -0.0),
+        (Property::LineHeight, -0.0),
+    ] {
+        assert_eq!(bits(&parent, property), value.to_bits());
+        assert_eq!(bits(&child, property), value.to_bits());
+    }
+}

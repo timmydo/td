@@ -1002,7 +1002,45 @@ canonical value. Equal values with equal custom properties share an ID,
 including separately computed siblings. Custom maps are canonicalized
 independently, and inherited token allocations retain their BudgetShared sharing.
 A fingerprint only selects an equality bucket. Signed zero hashes alike.
-No global cache or tree dependency is introduced.
+No global cache or tree dependency is introduced. Custom maps, keys of
+arbitrary page strings, keep the standard library's SipHash. A complete
+style's fingerprint takes about 230 writes, some 1 KiB, which SipHash-1-3
+would run a round per 8-byte block over and buffer write by write; it is
+instead a fold of 64-bit words, each with the state and the pool's own
+key multiplied out to 128 bits and the halves combined (wyhash's mum
+step). No input difference survives that step with certainty, as one
+did a multiply-rotate fold's (a sign and an ulp, `calc(3px + 50%)`
+against `calc(-3px + 50.000000000000114%)`, always shared its key, so
+eleven such properties made 2,048 styles one bucket), and a page cannot
+search offline for a pool's key: `PoolLimits::seed`, which a caller with
+entropy sets, else one mixed from the addresses ASLR gave the pool's
+budget, the constructing frame and a static. td-css makes no system call
+for it (§6): RandomState would read the OS's entropy and std panics where
+that fails. The default is as strong as ASLR and no stronger; a page that
+learns an address can collide styles. The defence either way is that a
+collided bucket is bounded by MAX_STYLE_COMPARISONS and MAX_POOL_WORK,
+and equality, not the key, decides sharing.
+
+Each element's style holds every longhand, so a longhand costs every
+element its computation, its insertion, and its share of the pool's
+fingerprint and equality test. The cascade reads the style's own font
+size and colour once each is computed, and an unset property, most of
+every element's, copies its parent's value or its initial one inline,
+with no Result between. Measured per cascade, release, pinned to one
+CPU, user-mode `perf stat` (median of five, four cascades less one),
+2026-11-15 under a load average of 7 to 12, against the 56-longhand
+cascade before these:
+
+| Page | Instructions before / now (M) | Cycles before / now (M) |
+| --- | ---: | ---: |
+| 2 MiB blocks (td-layout §6; 91,183 elements, HTML_UA_CSS alone) | 5,541 / 4,140 | 1,847 / 1,699 |
+| Wikipedia, *Cascading Style Sheets* (637,078 bytes) | 1,870 / 1,790 | 747 / 698 |
+| Bootstrap 5.3 examples index (65,263 bytes) | 120 / 113 | 58 / 53 |
+
+The blocks cascade's wall time is 398 to 402 ms against 435 to 449
+(fastest of five, three processes each). The Guardian's front page is
+refused MAX_POOL_WORK either way (td-layout/DESIGN.md §6, "Style-pool
+work on The Guardian").
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
 MAX_POOL_WORK (67,108,864 field/component and string-byte visits), and
