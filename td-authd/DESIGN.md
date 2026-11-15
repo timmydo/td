@@ -5104,8 +5104,11 @@ failed poll but arms nothing.
 
 The fixed human GUI command is
 `td-login exec-as PRIMARY -- /bin/td-authd notebook-ui 1000`; the checked
-helper sets only the fixed Wayland endpoint and execs `/bin/td-pass
---trusted`. The service command is `td-login exec-service-as tdv1000 --
+helper sets only the fixed Wayland endpoint and the session's runtime
+directory, `/run/user/1000`, and execs `/bin/td-pass --trusted`: exec-as
+passes on neither, and td-pass draws its frames only onto a memory
+filesystem, tmpfs or ramfs, which that directory lies on as part of
+`/run`. The service command is `td-login exec-service-as tdv1000 --
 /bin/td-secret notebook-service --uid 1000`. Account validation remains
 root-side. Both channels are root-created unnamed socketpairs.
 

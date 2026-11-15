@@ -649,6 +649,29 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
     );
 }
 
+/// The helper adds the display and the session's runtime directory, and
+/// no other variable, to the five exec-as passes on: td-pass refuses to
+/// draw unless its frames can live on a memory filesystem.
+#[test]
+fn the_notebook_helper_adds_only_the_display_and_the_runtime_directory() {
+    let command = notebook_command(1000).unwrap();
+    assert_eq!(command.get_program(), "/bin/td-pass");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["--trusted"]);
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        vec![
+            (
+                std::ffi::OsStr::new("WAYLAND_DISPLAY"),
+                Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
+            ),
+            (
+                std::ffi::OsStr::new("XDG_RUNTIME_DIR"),
+                Some(std::ffi::OsStr::new("/run/user/1000"))
+            ),
+        ]
+    );
+}
+
 /// `22` with a name opens td-software at that application: the name rides
 /// the credential helper's argv after `software` and becomes td-software's
 /// one `--select`, checked in the registry grammar at both ends; no other

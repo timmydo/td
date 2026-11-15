@@ -358,12 +358,27 @@ pub(crate) fn notebook_ui(arguments: &[String]) -> Result<(), String> {
         &bounded_file("/proc/self/status")?,
         &bounded_file("/proc/self/cgroup")?,
     )?;
-    let mut command = Command::new("/bin/td-pass");
-    command.arg("--trusted").env(
-        "WAYLAND_DISPLAY",
-        format!("/run/td-compositor/{uid}/wayland-0"),
-    );
+    let mut command = notebook_command(uid)?;
     Err(format!("exec notebook window: {}", command.exec()))
+}
+
+/// The notebook window: the display, and the session's runtime directory
+/// on /run's tmpfs, where td-pass keeps its frames. td-login's exec-as
+/// passed on neither, and td-pass refuses to draw without a memory-backed
+/// directory.
+fn notebook_command(uid: u32) -> Result<Command, String> {
+    let mut command = Command::new("/bin/td-pass");
+    command
+        .arg("--trusted")
+        .env(
+            "WAYLAND_DISPLAY",
+            format!("/run/td-compositor/{uid}/wayland-0"),
+        )
+        .env(
+            "XDG_RUNTIME_DIR",
+            crate::text(format_args!("/run/user/{uid}"))?,
+        );
+    Ok(command)
 }
 
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
