@@ -113,7 +113,7 @@ preparation alone does not execute them or prove their runtime closure.
 
 The host linker for build scripts and proc macros, the binutils that list
 symbols and split debug companions, and the host runtime the upstream Rust
-tools run on are td's pinned Debian build root (AGENTS.md, "Debian build root";
+tools run on are td's pinned Debian build root (TRUST.md, "Debian build root";
 `recipes/src/debian-root.lock`), the same tree td's C recipes build in. The
 kit stays host-only: it is not a recipe and adds nothing to the target graph.
 The preparer rebuilds or reuses a source-fingerprinted td-recipe-eval and

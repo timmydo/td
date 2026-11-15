@@ -2346,7 +2346,7 @@ members minus marked payloads, and members of this very closure are
 prebuilt or built by prebuilt tools: `rust-toolchain` is the upstream Rust
 release, the Debian build root compiles the source-built C members, and
 `glibc-x86-64` and `gcc-runtime` import Debian runtime bytes. Both are td's
-declared trust roots, which AGENTS.md's claim names as its own exceptions —
+declared trust roots, which TRUST.md's claim names as its own exceptions —
 "no foreign binary other than the Debian build root's tools and reviewed runtime exports, the
 upstream Rust toolchain, the non-executable pinned upstream data below
 and the device firmware after it" — and §B.8's mark is about APPLICATION payloads
@@ -2357,7 +2357,7 @@ the wire says `unmarked`, the design sentence stays what it is, and
 `audited-seeds` — the distinct seed inputs the planning pass classified —
 is printed beside it so the seeds are visible rather than absent.
 
-A member built or imported in the Debian build root (AGENTS.md, "Debian build root")
+A member built or imported in the Debian build root (TRUST.md, "Debian build root")
 uses tools or bytes td did not build, so the answer names the root
 beside it as a build-tool trust root, one fixed-arity line per such
 member, after the payload lines:
@@ -2374,12 +2374,12 @@ The two imported Debian runtime members additionally report
 upstream Rust toolchain, but are not source-built. Static consumers inherit
 their prebuilt code; a closure's runtime lines make that dependency visible.
 
-Device firmware (AGENTS.md, "Device firmware") a member stages is named
+Device firmware (TRUST.md, "Device firmware") a member stages is named
 next, one `device-firmware\tlinux-firmware\t<pin>` line per pin; only
 the `device-firmware` recipe may stage it. It is
 unmarked and counted among the audited seeds, like pinned data, but it
 is code a peripheral runs, so the answer says so rather than leaving it
-inside the count. CPU microcode (AGENTS.md, "CPU microcode") follows it,
+inside the count. CPU microcode (TRUST.md, "CPU microcode") follows it,
 one `cpu-microcode\tvendor\t<pin>` line per pin, staged only by the
 `cpu-microcode` recipe, on the same terms for code the host CPU runs.
 
@@ -3921,7 +3921,7 @@ with the kind's own departures:
   Wayland boundaries. td's
   own glibc programs in the workspace can load the runtime's code too
   (the loader boundary below), so such a workspace is no host for td's
-  control plane (AGENTS.md, "Trust zones"), and td-builder refuses
+  control plane (TRUST.md, "Trust zones"), and td-builder refuses
   there, as on any system whose os-release says td and that has a `/usr`
   (td-agent/DESIGN.md §8, Runtime); `cargo` run outside td-builder is
   not refused.
@@ -7376,7 +7376,7 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   approved source-built tzdata zones and license under `files/share`
   and td-ui's pinned faces and their notices, one directory per font
   recipe under `files/etc/fonts` (`jetbrains-mono-nerd` and `noto`;
-  AGENTS.md, pinned upstream data), with no
+  TRUST.md, "Pinned upstream data"), with no
   fontconfig configuration. It has no executable, loader, or rendering
   override. Their launcher
   can therefore answer a named zone with the runtime's own file.
@@ -10855,7 +10855,7 @@ Configuration remains editable in the human's `.config/td-mail` and
 ### W.8 td-mail and td-news: the two applications as td code
 
 **Decision.** `tmc` and `tn` come into this repository as `td-mail` and
-`td-news`: root crates that AGENTS.md's discovery rule gates as
+`td-news`: root crates that DEVELOPMENT.md's discovery rule gates as
 dependency-free, built as td-firstboot, td-sh and td-util are built, by
 rustc on a local source and linked static, and shipped through the same
 `mail` and `news` packages, units and provisioning as

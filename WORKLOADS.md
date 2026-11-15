@@ -355,7 +355,7 @@ own account.
    under its seccomp filter and outside the application kind's bus,
    portal and Wayland boundaries, and td's own glibc programs there can
    load its code (APPLICATIONS.md §C), so such a workspace is no host
-   for td's control plane (AGENTS.md, "Trust zones"). The target above
+   for td's control plane (TRUST.md, "Trust zones"). The target above
    is unchanged.
 5. The ledger allocator in td-authd, with applications moved onto it:
    the bus broker and td-portal read application uids from the ledger,

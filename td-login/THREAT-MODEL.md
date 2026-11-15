@@ -26,6 +26,32 @@ existing `!td-service` path and cannot log in. Neither account belongs to
 another account's supplementary groups. The existing credential-switching
 implementation is unchanged.
 
+## How far principle 7 holds
+
+`AGENTS.md` principle 7 is a target, not a current claim. The stock VM
+writes an empty password field for `tester` and auto-logs in. Root is
+locked (`!`) and there is no `su`; no console or SSH login reaches root.
+Administration is the session owner's consent operations; without
+consent, recovery is td-boot's automatic rollback or physical access
+(`APPLICATIONS.md` §L.1, "Recovery"). The paired compositor and
+`td-authd` provide physical secure attention, explicit token enrollment
+and token-gated secret release. File and TPM-only stores cannot serve
+application credentials. Typed credential writes require their own
+presented token operation; they cannot use an existing session release.
+The stock VM remains unenrolled. See `APPLICATIONS.md` §L.1. The
+device-bound encrypted default, which the installer chooses on machines
+with a usable TPM and a keyboard console unless the person chooses
+unencrypted storage, releases storage to TPM possession alone; it is
+device binding under principle 7 and advances no authentication or
+protector-authorization claim. The TPM-free login-key tier
+(`TOKEN-LOGIN.md`) lets the installed account's owner enroll FIDO2 keys
+on the attention screen, trading auto-login and the ordinary SSH form
+for a key plus PIN at boot and session lock. Until a key is enrolled,
+login, SSH, updates and the lock change only where the login directory
+is invalid, though every paired session consumes `Super+l` and shows
+`L`. That document says when the tier may be called usable and what it
+does not protect.
+
 ## 1. Assets and adversaries
 
 Assets, in the order an attacker wants them:

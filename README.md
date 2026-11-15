@@ -22,7 +22,7 @@ this repository, from pinned build inputs to the bootable image.
   also supported with a configured publisher policy.
 
 The [repository principles](AGENTS.md#principles) and
-[build and trust model](AGENTS.md#build-and-trust-model) describe these choices
+[build and trust model](TRUST.md) describe these choices
 in detail.
 
 ## Get started

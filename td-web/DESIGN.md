@@ -34,7 +34,7 @@ not registered as `BROWSER` or as the OpenURI target.
 
 ## 2. Trust and build
 
-td-web is a zone-one program (AGENTS.md "Trust zones"): the `td-web`
+td-web is a zone-one program (TRUST.md "Trust zones"): the `td-web`
 crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
 and td's own crates by path: `td-ui` for the window, `td-html` for

@@ -891,6 +891,63 @@ saying so, until it does. rustfmt also reads a `rustfmt.toml` above the
 repository or in the user's configuration directory, as `cargo fmt` does;
 keep none there.
 
+# Crate manifests and locks
+
+`builder`, `recipes`, and `engine` are one zero-external-dependency
+workspace. Target crates and the host tool `td-vm` have standalone locks
+that list their own package and, at most, other `td-*` roster crates they
+depend on by path (except the named crypto admission below): no registry
+or git crate, and no path outside the roster, so engine sources reach a
+target crate only as shared source. A sibling is declared only as
+`NAME = { path = "../NAME" }` on its own line under a bare
+`[dependencies]` or `[dev-dependencies]` header (`cargo add` also writes a
+`version`; remove it). The manifest is where the guard establishes what a
+path points at, since a lock cannot say; the lock is then held to exactly
+the declared closure. So that a line reader can be exact, a roster
+manifest keeps its table headers bare and its values on one line and
+carries no `[target]`, `[patch]` or `[replace]` table; a roster crate
+carries no `.cargo` directory of its own, the repository's `.cargo` config
+carries no `paths`, `[patch]`, `[source]` or `include` key, and a declared
+`test-args` or `gate-test-args` carries no `--config` or `-Z`.
+
+`td-net` retains its existing reviewed vendored closure. The other named
+exception is `td-crypto`'s private Rustls closure: exact manifests, locks,
+root Cargo configuration and active features are pinned in
+`builder/src/crypto_policy.rs`. `td-mta` depends directly on local
+`td-crypto` and std-only `td-civil`, `td-header` plus `td-html`,
+`td-json`, `td-mime`, `td-nfc` and `td-fs`, and the approved private
+`tokio-postgres` 0.7.18 closure with its runtime feature disabled.
+PostgreSQL is the sole mail backend described in `td-mta/POSTGRES.md`. Its
+exact manifest, lock and active features are pinned in the same policy.
+The std-only `td-fs` owns bounded private socket dialing and test scratch.
+`td-tls-provider`, td-primitives behind rustls's `CryptoProvider`, depends
+on rustls 0.23.46 with no built-in backend and on local `td-primitives`;
+its exact manifest, lock and active features are pinned in the same
+policy. `td-crypto` depends on rustls with no built-in backend and on
+local `td-tls-provider` and `td-primitives`, which supply all its
+cryptography. All twelve local manifests and locks are pinned,
+`td-primitives` among them, and `td-source-scan`, which the portable
+builds stage only so Cargo can compile td-primitives' tests. No roster
+crate outside the admission may depend on `td-crypto`, `td-mta` or
+`td-tls-provider`, directly or transitively; `td-header`, `td-civil`,
+`td-html`, `td-json`, `td-mime`, `td-nfc` and `td-primitives` remain
+ordinary std-only shared crates. `td-crypto/DESIGN.md` owns offline
+preparation and crypto confinement; `td-mta/STORAGE.md` owns local scratch
+and the storage boundary. No other roster crate may consume the PostgreSQL
+closure, directly or transitively. Any new external dependency needs
+principle-2 sign-off (`AGENTS.md`).
+
+A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
+discovers every `td-*/Cargo.toml` at the repo root and derives both the
+dependency-free lock roster and the cargo test/clippy commands from it.
+Commit the crate's `Cargo.lock` or the gate reds. A crate wanting
+non-default gating declares it in its own `[package.metadata.td-gate]`; a
+crate that cannot wear the `td-` prefix is an amendment to that discovery
+rule. The in-sandbox gate `builder/src/gate_defs/325-cargo-test.rs` asks
+for the same roster (`td-builder gate-crates`), so one derivation feeds
+both tiers. A crate whose in-sandbox suite differs from the host
+preflight's declares `gate-test-args` beside `test-args`.
+
 # Test binaries run under a memory ceiling
 
 Namespace workloads inherit only their configured standard descriptors.
@@ -987,7 +1044,7 @@ td-vm and td-vm-guest test fixtures that link with `-Clinker=gcc` (GNU ld,
 not bundled LLD) for want of a `gcc`; run `ready` on a host with a C
 toolchain. Nor is a workspace naming a Flathub runtime one, whose `/usr`
 would supply that `gcc`: td-builder refuses to run on a td system that
-has a `/usr` (AGENTS.md, "Trust zones").
+has a `/usr` (TRUST.md, "Trust zones").
 
 ## Native compositor fixture builds
 

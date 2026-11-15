@@ -60,7 +60,7 @@ target, not yet an acceptance claim: test repeated short and long sleeps on
 AC and battery, panel recovery, keyboard/TrackPoint/touchpad, Wi-Fi, token
 unlock and the kernel's hardware sleep statistics on the machine. It has
 no wired port. Its Qualcomm WCN6855 Wi-Fi is its network: ath11k is
-built in with linux-firmware's pinned files (AGENTS.md, "Device firmware"),
+built in with linux-firmware's pinned files (TRUST.md, "Device firmware"),
 and `td-netd wifi join` names the network
 ("Installed Ethernet and remote access"). Only WCN6855 silicon is carried
 (QCA2066 and QCA6698AQ share its PCI ID), and its board data is chosen
@@ -75,7 +75,7 @@ Intel's 6005 and 6205, and its cards from the 7000 series through the BE200;
 MediaTek's MT7921, MT7922, MT7925, MT7920 and MT7902; Realtek's 8822CE, 8821CE,
 8822BE and 8852A, B and C; and Qualcomm's QCA6174 hw3 and WCN7850. Each driver
 is built in with linux-firmware's pinned files in the deployment initramfs
-(AGENTS.md, "Device firmware"), which adds 63 MB to every desktop's initramfs
+(TRUST.md, "Device firmware"), which adds 63 MB to every desktop's initramfs
 for a card most machines do not have, until switch_root frees it.
 
 A card outside that list misses in one of two ways. Where the driver binds and
@@ -99,7 +99,7 @@ A Ryzen 7 5700G desktop on an AMD 500-series board is a third target on
 the same terms. It shares the T14s's AMD platform set; beside it, its
 Intel I225-V wired port is driven by igc and its ALC1220 by the Realtek
 ALC882 family. Its Cezanne Radeon is driven by AMDGPU and DC with the
-ten reviewed linux-firmware files amdgpu requests for it (AGENTS.md, "Device
+ten reviewed linux-firmware files amdgpu requests for it (TRUST.md, "Device
 firmware"); its DisplayPort audio is the AMD HDMI codec on AMDGPU's audio endpoint. The same kernel can
 host KVM guests and mount ext4, FAT, exFAT and UDF, and builds in the
 common Intel IGB and Realtek wired NICs, USB Ethernet (CDC, NCM, ASIX
@@ -139,7 +139,7 @@ has a selector-to-deployment kexec on the Intel graphics whose remapping unit
 the kernel leaves on (`quirk_igfx_skip_te_disable`, Ice Lake through Meteor Lake).
 
 Each deployment's initramfs offers the CPU its vendor's current microcode, which
-the kernel log shows it taking or not (AGENTS.md, "CPU microcode").
+the kernel log shows it taking or not (TRUST.md, "CPU microcode").
 
 td starts only through UEFI, and with Secure Boot off. Nothing signs td's selector,
 so firmware enforcing Secure Boot refuses it and the medium does not start until
@@ -1665,7 +1665,7 @@ boundary.
 
 Use source-built target executables and declared inputs throughout image
 composition. Host-seeded control-plane executables never enter the image.
-Any marked foreign application payload remains subject to AGENTS.md and
+Any marked foreign application payload remains subject to TRUST.md and
 APPLICATIONS.md, including the dedicated read-only payload-input channel.
 No new external dependency is approved by this document.
 

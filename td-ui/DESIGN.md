@@ -3824,7 +3824,7 @@ A compiled TTF is not source: JetBrains builds it with fontmake from
 toolchain is in td's graph, so td cannot rebuild the face. It is not an
 executable either: td never runs its bytecode, and no program but td-ui's
 reader parses it. It is read at runtime, never embedded, so it is not a
-compilation input. AGENTS.md names it pinned upstream data: unmarked,
+compilation input. TRUST.md names it pinned upstream data: unmarked,
 because nothing executes, links or loads it as code, and reached only as
 bytes a td-built program parses under its own bounds.
 
@@ -4158,7 +4158,7 @@ quadratic `glyf` outlines that `sfnt` already reads. They carry no
 hinting programs, and their kerning is in `GPOS`, which td-ui does not
 read, so text in them is unkerned (see "Not yet").
 
-They are pinned upstream data (AGENTS.md), each file on its own by its
+They are pinned upstream data (TRUST.md), each file on its own by its
 URL at the distribution repository's commit and its SHA-256, with
 `OFL.txt` from the source repository at the release's tag (the recipe
 `noto-fonts`):

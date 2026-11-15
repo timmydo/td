@@ -4656,7 +4656,7 @@ MCP servers on their next reconciliation. Running calls keep their
 existing jail until they end. Conversation/template deletion never deletes
 the named sandbox or its files, and no per-conversation account is acquired
 for these tool launches. A runtime-bearing sandbox remains outside the
-td control-plane build boundary (AGENTS.md, "Trust zones").
+td control-plane build boundary (TRUST.md, "Trust zones").
 
 The named-sandbox adapter retains specific allocation debt in the existing
 String/Clone-based agent interfaces: `bench.rs` copies the selected name
@@ -4730,7 +4730,7 @@ as the workspace's own ledger account on td, with the workspace's worktrees,
 shared directories, network and the host-local sockets that reaches,
 outside the application kind's bus, portal and Wayland boundaries, and
 td's own glibc programs there can load its code. Its workspace is
-therefore no place for td's control plane (AGENTS.md, "Trust zones"):
+therefore no place for td's control plane (TRUST.md, "Trust zones"):
 anything td's `/bin` lacks resolves into the runtime's `/usr/bin`
 (`gcc`, `ar`, `make`, `pkg-config`); td-builder's host provisioning on
 td, whose `cc` is td-link, would take the first `gcc` on `PATH` as the

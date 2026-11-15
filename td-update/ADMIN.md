@@ -192,7 +192,7 @@ existing `exec-service-as` credential switch as `td-admin-build`, UID/GID
 the selected commit into a fresh private clone, verifies HEAD, then uses
 td-update's normal source build and deployment assembly. No source code is
 executed as root; source-built control-plane programs remain host control
-plane under AGENTS.md's build model.
+plane under TRUST.md's build model.
 
 Every helper waits on a pipe start gate. The parent places its PID in the
 owned subgroup before releasing the gate; EOF refuses execution, and the

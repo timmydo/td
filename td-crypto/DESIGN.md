@@ -71,7 +71,7 @@ are not inputs to a target artifact.
 mail protocols, storage, logging, workers or service administration. Its own
 code uses std and follows the panic/indexing and unsafe contracts. Its
 backend is the approved Rustls engine over td-tls-provider and td-primitives.
-AGENTS.md and the shared
+DEVELOPMENT.md ("Crate manifests and locks") and the shared
 host/sandbox gate admit only the exact named manifests, locks, root Cargo
 configuration and selected normal/build features in
 `builder/src/crypto_policy.rs`. Other roster closures remain std-only.

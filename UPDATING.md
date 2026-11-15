@@ -2,7 +2,7 @@
 
 td builds only from what it pins, so nothing moves until a reviewed commit moves
 it. This file is the procedure for finding what upstream has released past
-those pins and for carrying each bump to a landed branch. `AGENTS.md` owns the
+those pins and for carrying each bump to a landed branch. `TRUST.md` owns the
 trust model and `DEVELOPMENT.md` the commit, review and `ready` workflow; this
 file restates neither.
 
@@ -235,7 +235,7 @@ The four `rust-*-dist` pins move together, to one dated directory of
 so it follows them. The version and the dist date are restated elsewhere:
 grep for both. The places include:
 
-- `AGENTS.md`, the normative toolchain paragraph, and `README.md`;
+- `TRUST.md`, the normative toolchain paragraph, and `README.md`;
 - the engine's and builder's toolchain code (`builder/src/stage0.rs`,
   `builder/src/host_bin.rs`, `engine/src/target_profile.rs`),
   `td-link/src/plan.rs` and the rust-toolchain test;
@@ -371,7 +371,7 @@ waiver, so that commit has to touch a document.
   `TLS_PROVIDER_ACTIVE`).
   Also update the inventory tables in `td-crypto/DEPENDENCIES.md`. A
   tokio-postgres bump also amends the normative documents that name its
-  version: `AGENTS.md`, `td-crypto/DESIGN.md`, `td-mta/DESIGN.md`,
+  version: `DEVELOPMENT.md`, `td-crypto/DESIGN.md`, `td-mta/DESIGN.md`,
   `td-mta/POSTGRES.md` and `UNSAFE.md`. Check each crate with
   `td-builder gate-crates crypto-cargo test --manifest-path
   td-crypto/Cargo.toml` (and `td-mta/Cargo.toml`,
