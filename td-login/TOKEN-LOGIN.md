@@ -473,8 +473,10 @@ when the send fails and when the buffer is dropped. The `1c` request is
 written from a fixed buffer of its own, zeroed as soon as the write
 returns, whether it succeeded or not, before root's answer is awaited.
 The field opens only after the compositor checks its own process as
-td-secret's worker checks itself: no active swap in `/proc/swaps` and a
-zero core-dump soft limit in `/proc/self/limits`. A refusal cancels the
+td-secret's worker checks itself, by td-secret's one memory rule: no
+swap on storage in `/proc/swaps` (zram without a writeback device keeps
+its pages in memory) and a zero core-dump soft limit in
+`/proc/self/limits`. A refusal cancels the
 operation before any field opens. A zero `RLIMIT_CORE` does not stop a
 core dump piped to a `core_pattern` handler, and td-secret's worker
 shares that gap; neither check reads `core_pattern`. The keycodes of the

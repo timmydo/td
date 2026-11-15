@@ -84,22 +84,20 @@ impl Target {
 
 pub(crate) struct Credential(pub Vec<u8>);
 
+// td-secret's memory rules, mounted here so td-secret, which compiles this
+// file too, reaches the same copy.
+#[path = "../../td-secret/src/memory.rs"]
+mod memory;
+
+/// td-secret's credential-holder check: no active swap on storage and a
+/// zero core-dump soft limit.
 pub(crate) fn require_protected_memory() -> Result<(), String> {
-    match std::fs::read_to_string("/proc/swaps") {
-        Ok(text)
-            if text.lines().next().is_some()
-                && !text.lines().skip(1).any(|line| !line.trim().is_empty()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        _ => return Err("credential input requires swap to be disabled".into()),
-    }
-    let limits = std::fs::read_to_string("/proc/self/limits").map_err(|e| e.to_string())?;
-    let core = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max core file size"));
-    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
-        return Err("credential input requires a zero core-dump soft limit".into());
-    }
-    Ok(())
+    memory::with_memory_state(
+        std::fs::read_to_string("/proc/swaps"),
+        std::fs::read_to_string("/proc/self/limits"),
+        &|path| std::fs::read_to_string(path),
+        || Ok(()),
+    )
 }
 
 impl Drop for Credential {

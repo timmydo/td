@@ -2801,8 +2801,10 @@ uses O_NONBLOCK and checks the original operation deadline around input;
 poll readiness alone grants no secret release. `prctl(157)` is fixed to
 PR_SET_DUMPABLE(4, 0), followed by PR_GET_DUMPABLE(3) requiring zero.
 Unused syscall argument registers are zero. There is no restore-to-dumpable
-API. The diagnostic calls this before PIN/crypto work and also requires no
-active swap and a zero core soft limit. A trusted host kernel, root and
+API. The diagnostic calls this before PIN/crypto work and also requires
+td-secret's memory rule: no swap on storage (zram without a writeback
+device keeps its pages in memory) and a zero core soft limit. A trusted
+host kernel, root and
 terminal are prerequisites; suspend/hibernation integration and
 ordinary-account Guix use are not admitted by this diagnostic. The portable
 vault's standalone host adapter calls the same protection, under the same

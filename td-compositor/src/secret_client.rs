@@ -13,6 +13,7 @@ use crate::runtime::Runtime;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -49,7 +50,8 @@ pub(crate) const DISK_PROOFS: bool = cfg!(test);
 /// `1c` as written: its tag, the length byte, the longest description that
 /// byte counts, and the longest PIN.
 const PIN_REQUEST: usize = 2 + 255 + PIN_LONGEST;
-/// `/proc/swaps` and `/proc/self/limits` are read up to this many bytes.
+/// `/proc/swaps`, `/proc/self/limits` and a zram device's `/sys/block`
+/// attributes are read up to this many bytes.
 const PROC_TEXT: u64 = 64 * 1024;
 
 /// Why a PIN field did not open: this process's memory could reach swap or
@@ -310,12 +312,15 @@ impl Drop for PinRequest {
 }
 
 /// td-secret's PIN-holder check (`store::require_protected_memory`), for
-/// this process: no active swap and a zero core-dump soft limit.
+/// this process: no active swap on storage and a zero core-dump soft limit.
 fn protected_memory() -> Result<(), String> {
-    memory_state(proc_text("/proc/swaps"), proc_text("/proc/self/limits"))
+    memory_state(
+        proc_text(Path::new("/proc/swaps")),
+        proc_text(Path::new("/proc/self/limits")),
+    )
 }
 
-fn proc_text(path: &str) -> io::Result<String> {
+fn proc_text(path: &Path) -> io::Result<String> {
     let mut text = String::new();
     File::open(path)?
         .take(PROC_TEXT + 1)
@@ -327,26 +332,7 @@ fn proc_text(path: &str) -> io::Result<String> {
 }
 
 fn memory_state(swaps: io::Result<String>, limits: io::Result<String>) -> Result<(), String> {
-    match swaps {
-        // Linux registers /proc/swaps only when CONFIG_SWAP is enabled.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
-        Ok(swaps) => {
-            if swaps.lines().next().is_none()
-                || swaps.lines().skip(1).any(|line| !line.trim().is_empty())
-            {
-                return Err("a PIN needs swap to be disabled".into());
-            }
-        }
-    }
-    let limits = limits.map_err(|error| error.to_string())?;
-    let core = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max core file size"));
-    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
-        return Err("a PIN needs a zero core-dump soft limit".into());
-    }
-    Ok(())
+    crate::secret_memory::with_memory_state(swaps, limits, &proc_text, || Ok(()))
 }
 
 /// A login step's or an upgrade's new key's PIN step.

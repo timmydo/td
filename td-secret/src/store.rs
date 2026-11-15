@@ -583,6 +583,7 @@ impl Store {
         with_memory_state(
             fs::read_to_string("/proc/swaps"),
             fs::read_to_string("/proc/self/limits"),
+            &block_attribute,
             || {
                 self.set_token_with(app, name, plaintext, &protector, || {
                     request.unseal(response, client)
@@ -1025,13 +1026,18 @@ pub use root::require_root;
 #[path = "memory.rs"]
 mod memory;
 use memory::with_memory_state;
-#[cfg(test)]
-use memory::{check_core_limit, check_swap_state};
+
+/// `/sys/block/DEVICE/ATTRIBUTE`, which the memory rule asks of a zram
+/// device.
+fn block_attribute(path: &Path) -> io::Result<String> {
+    fs::read_to_string(path)
+}
 
 pub fn require_protected_memory() -> Result<(), String> {
     with_memory_state(
         fs::read_to_string("/proc/swaps"),
         fs::read_to_string("/proc/self/limits"),
+        &block_attribute,
         || Ok(()),
     )
 }
@@ -1502,18 +1508,6 @@ mod tests {
     }
 
     #[test]
-    fn swap_compiled_out_is_safe_and_active_or_unreadable_swap_is_refused() {
-        assert!(check_swap_state(Err(io::ErrorKind::NotFound.into())).is_ok());
-        assert!(check_swap_state(Ok("Filename Type Size Used Priority\n".into())).is_ok());
-        assert!(check_swap_state(Ok(
-            "Filename Type Size Used Priority\n/dev/zram0 partition 1024 0 1\n".into()
-        ))
-        .is_err());
-        assert!(check_swap_state(Err(io::ErrorKind::PermissionDenied.into())).is_err());
-        assert!(check_swap_state(Ok(String::new())).is_err());
-    }
-
-    #[test]
     fn runtime_requires_tmpfs_without_nested_mounts() {
         let good = "12 1 0:12 / /run rw - tmpfs tmpfs rw\n";
         assert!(check_runtime_mount(good).is_ok());
@@ -1531,13 +1525,13 @@ mod tests {
         fs::DirBuilder::new().mode(0o755).create(&root).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
         assert!(root::check_root("Uid:\t0\t0\t0\t0\n").is_ok());
-        assert!(check_core_limit("Max core file size        0 unlimited bytes\n").is_ok());
+        assert!(memory::check_core_limit("Max core file size        0 unlimited bytes\n").is_ok());
         for limits in [
             "",
             "Max core file size 1024 unlimited bytes",
             "Max core file size unlimited unlimited bytes",
         ] {
-            assert!(check_core_limit(limits).is_err());
+            assert!(memory::check_core_limit(limits).is_err());
         }
         for status in ["", "Uid: 1000 0 0 0", "Uid: 0 0 0", "Uid: 0 0 0 0 0"] {
             assert!(root::check_root(status).is_err());
@@ -1979,45 +1973,6 @@ mod tests {
         assert!(Store::open(&base.join("alias"), uid, false).is_err());
         fs::remove_dir_all(base).unwrap();
     }
-    #[test]
-    fn protected_memory_refusal_prevents_the_key_operation() {
-        let never = || -> Result<(), String> { panic!("unsafe memory reached unseal") };
-        let no_swap = || Ok("Filename Type Size Used Priority\n".into());
-        let no_core = || Ok("Max core file size 0 unlimited bytes\n".into());
-        assert!(with_memory_state(
-            Ok("Filename Type Size Used Priority\n/swap file 1 1 0\n".into()),
-            no_core(),
-            never
-        )
-        .is_err());
-        assert!(with_memory_state(
-            Err(io::ErrorKind::PermissionDenied.into()),
-            no_core(),
-            never
-        )
-        .is_err());
-        assert!(with_memory_state(
-            no_swap(),
-            Ok("Max core file size unlimited unlimited bytes\n".into()),
-            never
-        )
-        .is_err());
-        assert!(with_memory_state(
-            no_swap(),
-            Err(io::ErrorKind::PermissionDenied.into()),
-            never
-        )
-        .is_err());
-        assert_eq!(
-            with_memory_state(no_swap(), no_core(), || Ok(42)).unwrap(),
-            42
-        );
-        assert_eq!(
-            with_memory_state(Err(io::ErrorKind::NotFound.into()), no_core(), || Ok(43)).unwrap(),
-            43
-        );
-    }
-
     #[test]
     fn token_write_refuses_invalid_target_or_protector_before_unseal() {
         let root = std::env::temp_dir().join(format!(

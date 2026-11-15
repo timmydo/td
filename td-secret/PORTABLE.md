@@ -630,7 +630,8 @@ integration and durable primary/backup vault lifecycle remain prerequisites.
 `td-secret check-portable-token --create-test-credential` explicitly requests
 creation of one nonresident `td.invalid` test credential. It requires a
 root console, exactly one device admitted by the existing root-owned 0600
-USB policy, no active swap, zero core-dump soft limit, and a controlling
+USB policy, no swap on storage (td-secret/DESIGN.md's memory rule), a
+zero core-dump soft limit, and a controlling
 terminal. It disables the diagnostic process's dumpability and checks that
 setting before reading a PIN. The re-executed HID worker relays encrypted
 PIN/hmac-secret frames and may be dumpable; it receives no plaintext PIN.

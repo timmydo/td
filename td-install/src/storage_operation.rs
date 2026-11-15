@@ -1868,6 +1868,7 @@ pub(crate) fn run(uid: u32) -> Result<(), String> {
     let memory = crate::memory::with_memory_state(
         paths::read_to_string(Path::new("/proc/swaps")),
         paths::read_to_string(Path::new("/proc/self/limits")),
+        &|path| paths::read_to_string(path),
         || paths::open_read(Path::new("/dev/urandom")).map_err(|e| e.to_string()),
     );
     let mut random = match memory {

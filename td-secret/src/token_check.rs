@@ -12,8 +12,9 @@ use std::time::Instant;
 
 pub(super) fn run() -> Result<(), String> {
     crate::store::require_root()?;
-    crate::secret_request::require_protected_memory()
-        .map_err(|_| "host token check requires disabled swap and a zero core-dump soft limit")?;
+    crate::secret_request::require_protected_memory().map_err(|_| {
+        "host token check requires no swap on storage and a zero core-dump soft limit"
+    })?;
     pin_sys::protect_process().map_err(|_| "disable token-check process dumps")?;
     let console = Console::open()?;
     let devices = Device::discover()?;

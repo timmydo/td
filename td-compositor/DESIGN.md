@@ -7111,10 +7111,13 @@ It opens when root answers a poll with `0c` for the current step, which
 must ask for a PIN (consent's `asks_pin`) and have this client's
 presentation receipt, and only once. First the client checks its own
 process as td-secret's login worker checks itself
-(`store::require_protected_memory`): `/proc/swaps` lists no active swap,
-or is absent because swap is compiled out, and `/proc/self/limits` gives
-a zero core-dump soft limit. Both are bounded safe `std` reads; no
-syscall is added. A refusal cancels (`15`) and shows `PIN ENTRY NEEDS NO
+(`store::require_protected_memory`), by mounting td-secret's memory rule
+(td-secret/DESIGN.md): `/proc/swaps` lists no swap on storage (zram
+without a writeback device keeps its pages in memory), or is absent
+because swap is compiled out, and `/proc/self/limits` gives a zero
+core-dump soft limit. All are bounded safe `std` reads of `/proc` and
+`/sys/block`; no syscall is added. A refusal cancels (`15`) and shows
+`PIN ENTRY NEEDS NO
 SWAP AND NO CORE DUMPS`; no field opens.
 
 The field is drawn beneath the presented step's prompt, which stays on

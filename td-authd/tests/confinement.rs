@@ -492,6 +492,24 @@ fn the_production_source_and_raw_boundary_are_closed() {
         SHARED_LOGIN_TIER_FINGERPRINT,
         "shared tier reader changed: reconcile td-secret's confinement and this pin"
     );
+    // Credential intake's memory rule: td-secret's one copy, mounted once,
+    // inside the write request it guards.
+    assert_eq!(
+        include_str!("../src/secret_request.rs")
+            .matches("#[path = \"../../td-secret/src/memory.rs\"]\nmod memory;\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fingerprint(
+            include_str!("../../td-secret/src/memory.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+        ),
+        SHARED_MEMORY_FINGERPRINT,
+        "shared memory rule changed: reconcile td-secret's, td-install's and td-compositor's consumers and this pin"
+    );
     let session = include_str!("../src/session.rs")
         .split("#[cfg(test)]")
         .next()
@@ -1848,10 +1866,11 @@ const SESSION_FINGERPRINT: u64 = 0x9991a82824bab5fd;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0x755e883a75780a83;
-const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
+const WRITE_REQUEST_FINGERPRINT: u64 = 0x368ac6e54431d9ce;
 
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
+const SHARED_MEMORY_FINGERPRINT: u64 = 0xaa29e6a2cc052889;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
 const ELEVATION_FINGERPRINT: u64 = 0x21e50efe028ca4b6;
 const SET_HOSTNAME_FINGERPRINT: u64 = 0x9c3353d7916f6012;

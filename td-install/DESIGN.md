@@ -1677,8 +1677,9 @@ process that runs a key-bearing td-luks command or writes the ESP
 ("Full-system volume consumers"). It reaches the command line only through
 `main`, accepts no other operand, and keeps the login worker's startup,
 unnamed socketpair, descriptor inventory and bounded framing
-(td-secret/DESIGN.md, "Login-key worker"): it requires no active swap and a
-zero core-dump soft limit before its baseline, since it may hold a recovery
+(td-secret/DESIGN.md, "Login-key worker"): it requires td-secret's memory
+rule, no swap on storage and a zero core-dump soft limit, before its
+baseline, since it may hold a recovery
 key, a PIN, a derived passphrase or a volume key, and reads every frame into
 clearing storage.
 

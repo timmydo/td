@@ -381,6 +381,11 @@ pub fn recipe() -> Recipe {
             "{src}/td-secret/src/login_tier.rs",
             include_str!("../../../td-secret/src/login_tier.rs"),
         ),
+        // The memory rules a credential holder requires.
+        (
+            "{src}/td-secret/src/memory.rs",
+            include_str!("../../../td-secret/src/memory.rs"),
+        ),
         (
             "{src}/engine/src/sha256.rs",
             include_str!("../../../engine/src/sha256.rs"),

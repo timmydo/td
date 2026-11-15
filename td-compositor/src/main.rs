@@ -99,6 +99,9 @@ mod runtime;
 mod scene;
 mod screenshot;
 mod secret_client;
+// td-secret's memory rules for a process holding a PIN (secret_client.rs).
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-secret/src/memory.rs")]
+mod secret_memory;
 mod server;
 mod session;
 mod socket;
@@ -1231,6 +1234,7 @@ mod confinement {
         "gzip.rs",
         "png_encode.rs",
         "scm.rs",
+        "secret_memory.rs",
         "sfnt.rs",
         "temp_dir.rs",
         "timezone.rs",
@@ -1282,6 +1286,10 @@ mod confinement {
         ("scene.rs", include_str!("scene.rs")),
         ("screenshot.rs", include_str!("screenshot.rs")),
         ("secret_client.rs", include_str!("secret_client.rs")),
+        (
+            "secret_memory.rs",
+            include_str!("../../td-secret/src/memory.rs"),
+        ),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
         ("scm.rs", SCM),

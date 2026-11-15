@@ -1197,7 +1197,6 @@ td-authd/src/secret_intake.rs	allocating-constructor	1
 td-authd/src/secret_intake.rs	allocating-conversion	13
 td-authd/src/secret_intake.rs	allocation-macro	1
 td-authd/src/secret_intake.rs	unchecked-growth-or-clone	2
-td-authd/src/secret_request.rs	allocating-conversion	1
 td-authd/src/secret_request.rs	allocation-macro	1
 td-authd/src/secret_request.rs	unchecked-growth-or-clone	7
 td-authd/src/secret_sys.rs	unchecked-growth-or-clone	2
@@ -1482,7 +1481,7 @@ td-compositor/src/screenshot.rs	allocating-constructor	1
 td-compositor/src/screenshot.rs	allocating-conversion	3
 td-compositor/src/screenshot.rs	allocation-macro	8
 td-compositor/src/screenshot.rs	unchecked-growth-or-clone	1
-td-compositor/src/secret_client.rs	allocating-conversion	13
+td-compositor/src/secret_client.rs	allocating-conversion	11
 td-compositor/src/secret_client.rs	allocation-macro	27
 td-compositor/src/secret_client.rs	heap-owner	1
 td-compositor/src/secret_client.rs	unchecked-growth-or-clone	20

@@ -15,6 +15,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/secret_client.rs"),
     ),
     (
+        "secret_memory",
+        include_str!("../../../td-secret/src/memory.rs"),
+    ),
+    (
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),

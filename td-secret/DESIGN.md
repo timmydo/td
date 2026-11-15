@@ -223,10 +223,32 @@ fingerprint followed by the 32-byte master. Root owns the traversable
 runtime directories; the single-link 0600 file belongs to the reserved
 portal UID. Every directory and file is opened without following links.
 `/run` must be tmpfs, with no nested mount beneath the secret directory,
-no active swap, and a zero process core-dump soft limit. A missing
-`/proc/swaps` is accepted: Linux omits it when swap support is compiled
-out. Other swap-table read errors and an empty or active table are
-refused. The fingerprint rejects a release for another enrolled key.
+no swap on storage, and a zero process core-dump soft limit.
+
+The memory rule, `src/memory.rs`, is that last pair. It is one copy,
+compiled by path into each process that checks it before holding a key,
+a PIN or a passphrase: this crate's store and its workers (with every
+crate compiling the store), td-install's storage worker, td-authd's
+credential intake and the compositor's PIN field. An active swap device
+is admitted only when it keeps its pages in memory: a zram device
+(`/dev/zramN`, type `partition`) whose `backing_dev` reads `none`, or is
+absent in a kernel built without writeback while the zram attribute
+`comp_algorithm` is present. zram refuses a writeback device once it is
+initialized, so a device that is swapping cannot gain one. A partition,
+a swap file, a zram device that writes back or one whose attributes
+cannot be read is storage, where a secret could outlive the process, and
+is refused. A missing `/proc/swaps` is accepted: Linux omits it when swap
+support is compiled out. Other swap-table read errors and an empty or
+malformed table are refused. The check is of the moment it runs, and
+trusts the device's name: root could still turn on storage swap later,
+or name another block device `/dev/zram0`. Admitting zram also accepts
+that a page swapped out and back leaves its compressed copy in the
+kernel's zram pool, freed but not cleared, as freed memory is; clearing
+in the process does not reach it. td-pass's portable host
+(`src/portable_host.rs`) still carries its own copy of the zram rule,
+with the same verdicts, until it moves onto this one.
+
+The fingerprint rejects a release for another enrolled key.
 Updates rewrite the encrypted bundle atomically and never persist a
 plaintext key. There is no additional daemon or external service.
 
@@ -767,8 +789,8 @@ protector, including both credentials and recovery policy, supplies the
 volatile release fingerprint.
 
 The safe root enrollment API requires an already proved metadata value
-from the trusted enrollment flow. It validates the no-swap, zero-core and
-volatile-runtime requirements and clears any prior runtime release before
+from the trusted enrollment flow. It validates the memory rule and the
+volatile-runtime requirement and clears any prior runtime release before
 parsing enrollment metadata or reading the old protector. For an existing
 TPM-only store it unseals the old master directly into the root operation's
 memory; that migration key is never published to the portal runtime. The
@@ -883,7 +905,8 @@ refusal, and migration plus volatile release of a real encrypted store
 without persisting the new master in its store directory. Filesystem
 fixtures cover volatile release, fingerprint mismatch, missing keys,
 metadata, stale temporary cleanup, failed unseal, root identity, core
-limits, and compiled-out swap. The fixture paths and ownership enter
+limits, compiled-out and in-memory swap. The fixture paths and ownership
+enter
 private helpers; production callers retain the fixed `/run` path and root
 checks. Ordinary tests also exercise malformed envelopes and replies,
 backend selection, failed enrollment, master rotation and interrupted
@@ -1648,8 +1671,8 @@ The paired consumer below supplies that admission and captures exactly one
 sealed credential descriptor before starting the worker.
 
 The store keeps its existing exclusive lock throughout the operation.
-The API checks that swap is disabled and the core-dump soft limit is zero
-through the same memory prerequisite helper as runtime access, without
+The API checks that no swap is on storage and the core-dump soft limit is
+zero through the same memory prerequisite helper as runtime access, without
 opening or changing a runtime key. Unreadable or unsafe settings refuse
 before the write callback can acquire a master.
 Before signature verification or TPM unseal, it refuses malformed targets,
@@ -1680,7 +1703,8 @@ oracles, not evidence of descriptor intake, a physical touch or UI consent.
 
 `write-operation --uid UID` admits only the existing root-owned unnamed
 socketpair startup contract. Before receiving credential bytes it requires
-no active swap and a zero core-dump soft limit. It accepts one canonical
+the memory rule: no swap on storage and a zero core-dump soft limit. It
+accepts one canonical
 Set description for its configured owner and verifies the application name
 and UID against the active account set from the immutable installed registry
 and verified account databases. A reservation whose application account is
@@ -1761,8 +1785,9 @@ The public command is `td-secret set [--recovery] APPLICATION/NAME` in the
 human session. It reads exactly 1..4096 bytes from stdin, preserving newlines;
 stdin must be redirected or piped, so terminal echo cannot expose a typed
 credential. No credential value or digest enters argv, logs, the prompt or
-result messages. Swap must be disabled and the core-dump soft limit zero
-before input is read. The client creates a close-on-exec memfd, writes the
+result messages. The memory rule above must hold (no swap on storage, a
+zero core-dump soft limit) before input is read. The client creates a
+close-on-exec memfd, writes the
 bytes, and seals write, growth, shrinkage and further seal changes. The
 private raw implementation is shared from `td-authd/src/secret_sys.rs` and
 specified in UNSAFE.md §16. Owned buffers use best-effort clearing; a sealed
@@ -2283,8 +2308,9 @@ first, root's own description, which the worker repeats exactly after
 deriving the same step from the decoded operation; no step it derives
 later awaits approval.
 
-1. After startup it requires no active swap and a zero core-dump soft
-   limit, as the named-write worker does, since it will hold a PIN and an
+1. After startup it requires the memory rule, no swap on storage and a
+   zero core-dump soft limit, as the named-write worker does, since it
+   will hold a PIN and an
    hmac-secret output; a refusal is INTERNAL and comes before the
    baseline. Then, before any presentation or token I/O, it reads
    `/var/lib/td/login` (root:root) once and sends the baseline: `18 00`
