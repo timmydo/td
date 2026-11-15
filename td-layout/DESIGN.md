@@ -123,8 +123,9 @@ local to this styled document; accessors return Option for invalid IDs.
 `block::layout` takes the styled document, mutable FontMetrics and a
 Request with viewport dimensions, an optional vertical window, the
 charged bytes of any previous layout output retained during the call, an
-optional byte limit of its own (§6, "Caller-set limits") and an optional
-cancel flag (below). Its Result owns
+optional byte limit of its own (§6, "Caller-set limits"), an optional
+lookup of replaced elements' intrinsic sizes (§5, "Intrinsic sizes") and
+an optional cancel flag (below). Its Result owns
 geometry and emitted lines, with resource usage, work counters and the
 lines cut at MAX_LINE_SCALARS (`cuts`, §4, "Long lines").
 BoxGeometry records are in postorder and name DOM elements; this is not
@@ -337,7 +338,8 @@ and one replaced fragment can live directly in a line; additional
 fragments use budgeted arrays. These inline values count as part of the
 containing line allocation. Within one layout, the most recent ordinary
 block dimensions are cached by StyleId and containing width/height;
-replaced elements always read their own intrinsic attributes. Styling counts
+replaced elements always read their own attributes and intrinsic size
+(§5). Styling counts
 the geometry-producing boxes, allowing layout to admit and allocate its
 geometry array once at the exact required capacity.
 
@@ -381,17 +383,107 @@ exclusion region**; clear has no effect. Float placement is a later
 increment, not silently approximated by text wrapping around placeholders.
 
 HTML img is a replaced element even when no image bytes are available.
-Non-negative finite width/height attributes provide placeholder intrinsic
-dimensions. With neither dimension it uses 300 by 150 CSS px; a single
-attribute replaces that dimension and leaves the other default. These are
-placeholder dimensions, not a guessed decoded aspect ratio. CSS dimensions
-override attributes; a known two-attribute ratio supplies an auto opposite
-dimension. Min/max sizes and box-sizing apply; the first model clamps the two
-dimensions independently rather than preserving the ratio through those
-constraints. Invalid or attribute dimensions over td-css MAX_ABSOLUTE_VALUE
-(1,000,000 px) use the corresponding placeholder default. Inline images are atomic; wrapping modes allow a break before or after
-them. No image decode or load can change geometry inside a layout call. SVG/MathML remain excluded with the
-td-dom projection; object/embed/canvas have no content-specific renderer.
+Its content size comes from its CSS width and height, then its width
+and height attributes, then the intrinsic size the caller supplies, then
+the 300 by 150 CSS px placeholder. An attribute counts when it parses as
+a finite number from 0 to td-css MAX_ABSOLUTE_VALUE (1,000,000 px);
+otherwise, a percentage included, it is absent. Box-sizing applies to
+the CSS values; attributes and intrinsic sizes are content sizes.
+
+**Intrinsic sizes.** `Request::intrinsic` names the caller's
+`IntrinsicSizes` lookup, `Sync` so a request stays `Send` and `Sync`,
+which a layout asks once for each image box it sizes, by the img's
+NodeId and StyleId, and no other node: the style lets a caller measure
+a stand-in in the image's own font. Layout holds the caller's
+FontMetrics mutably while it asks, so a lookup cannot borrow them: it
+answers what was measured before the layout, or measures with a handle
+of its own. An `IntrinsicSize` holds an optional width and height in
+1/64 CSS px, FontMetrics' unit, so neither can be NaN or infinite, each
+clamped to MAX_VIEWPORT, and an optional natural ratio of two `u32`
+terms, none when either is zero. The ratio is given, not derived from
+the dimensions: `IntrinsicSize::picture` sets all three for a decoded
+picture (`picture_px` from whole CSS px, saturating), while a caller
+sizing a stand-in (td-web: an `alt` text's line, td-web/DESIGN.md §10)
+gives dimensions without one, so the stand-in does not scale as a
+picture would. Zero is a size: an image given 0 by 0 takes no space
+beyond its margins, borders and padding. An answer of None, or no
+lookup, gives no intrinsic width, height or ratio.
+
+The ratio is the natural one, else the attributes' when both are
+positive (HTML maps them to `aspect-ratio: auto w / h`), and is used
+only when finite and positive. The used size follows CSS 2.2 §10.3.2
+and §10.6.2, with CSS Images 3 §5.2's fallbacks to a natural dimension
+and then the default:
+
+- Both CSS dimensions set: each, clamped by its own min and max.
+- One set: that one is clamped by its min and max first. With a ratio
+  the other is that used value through it, else its attribute, else its
+  intrinsic dimension, else 300 or 150; then it is clamped by its own
+  min and max, which can distort, as CSS has it.
+- Neither set: the width is the width attribute, else the height
+  attribute through the ratio, else the intrinsic width, else the
+  intrinsic height through the ratio, else for a ratio alone the
+  containing width less the box's margins, borders and padding (§10.3.2's
+  suggestion for a ratio with no size), else 300. The height is the
+  height attribute, else the width attribute through the ratio, else the
+  intrinsic height, else the used width through the ratio, else 150.
+  With a ratio, min and max sizes then resolve by §10.4's table, which
+  keeps the ratio where the constraints allow; without one, each
+  dimension is clamped alone.
+
+The table's rows are taken on the tentative size, unclamped, as §10.4
+writes them: each fixes one side at its bound and derives the other
+through the tentative size's own ratio, which is the ratio above unless
+two attributes disagree with a picture's, and is the ratio above where a
+side is zero and the size has none of its own. Where both sides are
+over their maxima, or both under their minima, the side fixed is chosen
+by that ratio (the width's maximum through it against the height's
+maximum, the height's minimum through it against the width's minimum).
+Both sides are then clamped by their min and max, a minimum winning
+over a smaller maximum, so a size with a zero side still meets every
+bound it can. Two attributes beside a picture of another ratio keep
+their own proportions, and the picture's ratio applies where the
+tentative size is on it or a dimension is auto: `<img width=300
+height=300>` with a 4:1 picture under `max-width:500px` is 300 by 300
+at `max-height:300px`, 299 by 299 at 299 px and 200 by 200 at 200 px,
+continuous as the bound tightens, where a browser, keeping both
+attributes as hints, lays 300 by 200 at the last.
+
+Every size derived through a ratio, and every side the rules above
+return, is clamped to 0 to MAX_VIEWPORT; a ratio is finite and
+positive, so no product or quotient of a finite size is NaN, and a
+hostile ratio, from a caller or from attributes such as `width=1000000
+height=0.000001`, costs only the box it sizes. Boxes are bounded each,
+not together: enough images at MAX_VIEWPORT still pass MAX_COORDINATE
+and refuse the layout, so a picture arriving can turn a page that laid
+out into one that is refused on its relayout.
+
+HTML maps the attributes to presentational `width` and `height` hints,
+which any author `width` or `height` overrides, `auto` included. td-css's
+computed style cannot tell `auto` from no declaration, so td-layout
+treats the attributes as a fallback for an auto dimension, which departs
+from a browser toward the common responsive sheet,
+`max-width:100%; height:auto`: a sheet that sets one dimension alone
+gets the other through the ratio rather than from its attribute, and
+`<img width=1200 height=800>` under `max-width:100%` at 500 px is 500 by
+333, its ratio kept, where a browser whose sheet does not say
+`height:auto` keeps the height attribute and lays 500 by 800. A test
+holds the rules with no lookup against the attribute rule written out
+on its own (CSS over the attributes, the attributes' ratio for an auto
+side, 300 by 150, each side clamped alone) wherever the attributes give
+no ratio or no bound applies, against the same attributes given as a
+picture's size where both do, and against values worked by hand for a
+row of each kind.
+
+The lookup belongs to the request, not the styled document: no style,
+box or geometry count depends on it, so a changed intrinsic size needs
+another layout of the same styled document, not a cascade, and that
+layout equals one of a fresh build. The lookup is the caller's code and
+is not timed or charged; the image box it answers for is charged its
+work as before. Inline images are atomic; wrapping modes allow a break
+before or after them. No image decode or load can change geometry inside
+a layout call. SVG/MathML remain excluded with the td-dom projection;
+object/embed/canvas have no content-specific renderer.
 
 ## 6. Work bounds, resize and validation
 
@@ -725,6 +817,15 @@ The queue keeps the bound's handling and a line's break out of line
 advance until it is queued: inlining either, or a pending scalar 16
 bytes wider, measured 1 to 40% slower.
 
+Intrinsic sizes and ratios kept through min and max (§5) do not slow
+a page without images: pinned to one CPU and interleaved with a build
+of the crate without them, medians of five rounds of nine layouts at
+1280 px under a load average of 2 to 3 (2026-11-15): 2 MiB prose 51.2
+ms without and 51.1 with, one word 50.5 and 50.6, blocks 69.2 and
+69.7. 2 MiB of `ab <img width=20 height=10> ` (74,898 images, each
+now sized through its attributes' ratio) takes 22.6 and 23.5, or 23.6
+with a lookup answering every image.
+
 ### Cascade work
 
 td-css bounds each compute call, not a page (td-css/DESIGN.md §5), so a
@@ -948,12 +1049,13 @@ stayed under it.
 Tables, flexbox, float exclusion, advanced text, painting and td-web
 integration need subsequent designs. No existing consumer switches to this
 library as part of these increments. td-web's integration
-(td-web/DESIGN.md §10, increment 6) needs intrinsic sizes for replaced
-elements supplied by the caller, list markers as a fragment kind, a
-basic automatic table layout (rows and cells, colspan and rowspan
-within bounds), a style pool that admits The Guardian's front page,
-whose token-identity index charges each insertion its length (§6,
-"Style-pool work on The Guardian"). The input limit a caller sets, the
+(td-web/DESIGN.md §10, increment 6) needs list markers as a fragment
+kind, a basic automatic table layout (rows and cells, colspan and
+rowspan within bounds), a style pool that admits The Guardian's front
+page, whose token-identity index charges each insertion its length (§6,
+"Style-pool work on The Guardian"). Intrinsic sizes for replaced
+elements supplied by the caller, a change needing a layout and no
+cascade, are §5's "Intrinsic sizes". The input limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
 are §6's "Caller-set limits"; eight-column tab stops where white space
 is preserved, a tab costing no fragment, and a line past

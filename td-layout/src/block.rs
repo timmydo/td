@@ -42,11 +42,62 @@ impl Edges {
         }
     }
 }
+/// A replaced element's natural size as the caller knows it (DESIGN.md
+/// §5). Dimensions are in 1/64 CSS px, FontMetrics' unit, so none is NaN
+/// or infinite; each is clamped to MAX_VIEWPORT. The ratio is width to
+/// height in any one unit, and one with a zero term is none: it is not
+/// derived from the two dimensions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntrinsicSize {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub ratio: Option<(u32, u32)>,
+}
+impl IntrinsicSize {
+    /// A decoded picture's size in 1/64 CSS px: both dimensions and their
+    /// ratio.
+    pub fn picture(width: u32, height: u32) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+            ratio: Some((width, height)),
+        }
+    }
+    /// picture() from whole CSS px, saturating; the ratio keeps the px.
+    pub fn picture_px(width: u32, height: u32) -> Self {
+        Self {
+            width: Some(width.saturating_mul(64)),
+            height: Some(height.saturating_mul(64)),
+            ratio: Some((width, height)),
+        }
+    }
+}
+/// The caller's intrinsic sizes, asked once for each image box a layout
+/// sizes, with the image's style (td-web measures an alt line in its
+/// font); None keeps the attribute placeholder (DESIGN.md §5). Layout
+/// holds the FontMetrics mutably meanwhile, so a lookup measures with its
+/// own handle or answers what was measured before the layout.
+pub trait IntrinsicSizes {
+    fn intrinsic(&self, node: NodeId, style: StyleId) -> Option<IntrinsicSize>;
+}
+impl<F: Fn(NodeId, StyleId) -> Option<IntrinsicSize>> IntrinsicSizes for F {
+    fn intrinsic(&self, node: NodeId, style: StyleId) -> Option<IntrinsicSize> {
+        self(node, style)
+    }
+}
+impl std::fmt::Debug for dyn IntrinsicSizes + Sync + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IntrinsicSizes")
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Request<'c> {
     pub width: f64,
     pub height: f64,
     pub window: Option<Range<f64>>,
+    /// Replaced elements' intrinsic sizes; changing them needs only a
+    /// new layout of the same styled document.
+    pub intrinsic: Option<&'c (dyn IntrinsicSizes + Sync)>,
     /// Old layout output kept alive during this call, excluding shared input.
     pub retained_output_bytes: usize,
     /// This call's ceiling on charged bytes, in place of the styled
@@ -64,6 +115,7 @@ impl Request<'_> {
             width,
             height,
             window: None,
+            intrinsic: None,
             retained_output_bytes: 0,
             bytes: None,
             cancel: None,
@@ -263,7 +315,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         height: Option<f64>,
     ) -> Result<Dimensions, Error> {
         // Ordinary block dimensions depend only on the shared style and
-        // containing dimensions. Replaced elements also read node attributes.
+        // containing dimensions. Replaced elements also read node attributes
+        // and the request's intrinsic sizes.
         if b.kind == BoxKind::Block {
             if let Some((style, w, h, value)) = self.last_dimensions {
                 if style == b.style && w == width && h == height {
@@ -272,7 +325,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-        let value = dimensions(self.styled, b, style, width, height)?;
+        let intrinsic = lookup(self.request, b);
+        let value = dimensions(self.styled, b, style, width, height, intrinsic)?;
         if b.kind == BoxKind::Block {
             self.last_dimensions = Some((b.style, width, height, value));
         }
@@ -418,8 +472,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                             }
                             BoxKind::Image => {
                                 let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-                                let dims =
-                                    dimensions(self.styled, b, style, container.width, definite)?;
+                                let dims = dimensions(
+                                    self.styled,
+                                    b,
+                                    style,
+                                    container.width,
+                                    definite,
+                                    lookup(self.request, b),
+                                )?;
                                 let decor = dims.decoration();
                                 flow.image(
                                     ImageRun {
@@ -618,6 +678,7 @@ fn dimensions(
     style: &ComputedStyle,
     width: f64,
     height: Option<f64>,
+    intrinsic: Option<IntrinsicSize>,
 ) -> Result<Dimensions, Error> {
     use Property::*;
     let padding = edges(
@@ -654,10 +715,22 @@ fn dimensions(
     };
     let specified_width = length(style, Width, Some(width)).map(|v| content(v, decor.horizontal()));
     let specified_height = length(style, Height, height).map(|v| content(v, decor.vertical()));
-    let mut used_width =
-        specified_width.unwrap_or((width - margin.horizontal() - decor.horizontal()).max(0.0));
-    let mut used_height = specified_height;
-    if b.kind == BoxKind::Image {
+    let stretch = (width - margin.horizontal() - decor.horizontal()).max(0.0);
+    let bounds = Bounds {
+        min_width: length(style, MinWidth, Some(width))
+            .map(|v| content(v, decor.horizontal()))
+            .unwrap_or(0.0),
+        max_width: length(style, MaxWidth, Some(width))
+            .map(|v| content(v, decor.horizontal()))
+            .unwrap_or(f64::INFINITY),
+        min_height: length(style, MinHeight, height)
+            .map(|v| content(v, decor.vertical()))
+            .unwrap_or(0.0),
+        max_height: length(style, MaxHeight, height)
+            .map(|v| content(v, decor.vertical()))
+            .unwrap_or(f64::INFINITY),
+    };
+    let (used_width, used_height) = if b.kind == BoxKind::Image {
         let element = styled
             .document()
             .node(b.node)
@@ -669,41 +742,25 @@ fn dimensions(
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .filter(|n| n.is_finite() && (0.0..=MAX_VIEWPORT).contains(n))
         };
-        let attr_width = attribute("width");
-        let attr_height = attribute("height");
-        let ratio = attr_width
-            .zip(attr_height)
-            .filter(|(w, h)| *w > 0.0 && *h > 0.0)
-            .map(|(w, h)| w / h);
-        used_width = specified_width.unwrap_or_else(|| {
-            specified_height
-                .zip(ratio)
-                .map(|(h, r)| h * r)
-                .unwrap_or(attr_width.unwrap_or(300.0))
-        });
-        used_height = Some(specified_height.unwrap_or_else(|| {
-            specified_width
-                .zip(ratio)
-                .map(|(w, r)| w / r)
-                .unwrap_or(attr_height.unwrap_or(150.0))
-        }));
-    }
-    let min = length(style, MinWidth, Some(width))
-        .map(|v| content(v, decor.horizontal()))
-        .unwrap_or(0.0);
-    let max = length(style, MaxWidth, Some(width))
-        .map(|v| content(v, decor.horizontal()))
-        .unwrap_or(f64::INFINITY);
-    used_width = used_width.min(max).max(min);
-    let min_height = length(style, MinHeight, height)
-        .map(|v| content(v, decor.vertical()))
-        .unwrap_or(0.0);
-    let max_height = length(style, MaxHeight, height)
-        .map(|v| content(v, decor.vertical()))
-        .unwrap_or(f64::INFINITY);
-    if let Some(h) = used_height {
-        used_height = Some(h.min(max_height).max(min_height));
-    }
+        let (w, h) = replaced(
+            (specified_width, specified_height),
+            (attribute("width"), attribute("height")),
+            intrinsic,
+            stretch,
+            bounds,
+        );
+        (w, Some(h))
+    } else {
+        (
+            bounds.width(specified_width.unwrap_or(stretch)),
+            specified_height.map(|h| bounds.height(h)),
+        )
+    };
+    let Bounds {
+        min_height,
+        max_height,
+        ..
+    } = bounds;
     let block = b.kind == BoxKind::Block
         || (b.kind == BoxKind::Image
             && !matches!(keyword(style, Display), "inline" | "inline-block"));
@@ -747,6 +804,147 @@ fn dimensions(
         max_height,
         relative,
     })
+}
+#[derive(Clone, Copy)]
+struct Bounds {
+    min_width: f64,
+    max_width: f64,
+    min_height: f64,
+    max_height: f64,
+}
+impl Bounds {
+    // A minimum wins over a smaller maximum (CSS 2.2 §10.4, §10.7).
+    fn width(self, w: f64) -> f64 {
+        w.min(self.max_width).max(self.min_width)
+    }
+    fn height(self, h: f64) -> f64 {
+        h.min(self.max_height).max(self.min_height)
+    }
+}
+/// A replaced element's used content size (DESIGN.md §5): CSS 2.2
+/// §10.3.2 and §10.6.2, with the attributes between the CSS value and the
+/// intrinsic size, and with a ratio §10.4's table.
+fn replaced(
+    (css_width, css_height): (Option<f64>, Option<f64>),
+    (attr_width, attr_height): (Option<f64>, Option<f64>),
+    intrinsic: Option<IntrinsicSize>,
+    stretch: f64,
+    bounds: Bounds,
+) -> (f64, f64) {
+    let natural = intrinsic.unwrap_or_default();
+    let px = |v: Option<u32>| v.map(|v| (f64::from(v) / 64.0).min(MAX_VIEWPORT));
+    let (width, height) = (px(natural.width), px(natural.height));
+    // The natural ratio, else the attributes' (HTML maps them to
+    // `aspect-ratio: auto w / h`). Finite and positive, so a finite size
+    // through it is never NaN, and bound() makes it finite.
+    let ratio = natural
+        .ratio
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| f64::from(w) / f64::from(h))
+        .or_else(|| attr_width.zip(attr_height).map(|(w, h)| w / h))
+        .filter(|r| r.is_finite() && *r > 0.0);
+    match (css_width, css_height) {
+        (Some(w), Some(h)) => (bounds.width(w), bounds.height(h)),
+        (Some(css), None) => {
+            let w = bounds.width(css);
+            let h = match ratio {
+                Some(r) => w / r,
+                None => attr_height.or(height).unwrap_or(150.0),
+            };
+            (w, bound(bounds.height(h)))
+        }
+        (None, Some(css)) => {
+            let h = bounds.height(css);
+            let w = match ratio {
+                Some(r) => h * r,
+                None => attr_width.or(width).unwrap_or(300.0),
+            };
+            (bound(bounds.width(w)), h)
+        }
+        (None, None) => {
+            let by_height = |h: Option<f64>| ratio.zip(h).map(|(r, h)| h * r);
+            let w = attr_width
+                .or_else(|| by_height(attr_height))
+                .or(width)
+                .or_else(|| by_height(height))
+                // CSS 2.2 §10.3.2's suggestion for a ratio alone.
+                .or(ratio.map(|_| stretch))
+                .unwrap_or(300.0);
+            let by_width = |w: Option<f64>| ratio.zip(w).map(|(r, w)| w / r);
+            let h = attr_height
+                .or_else(|| by_width(attr_width))
+                .or(height)
+                .or_else(|| by_width(Some(w)))
+                .unwrap_or(150.0);
+            let (w, h) = match ratio {
+                // §10.4 scales the tentative size by its own ratio, which
+                // is the given one unless two attributes disagree with a
+                // picture; a zero side has none of its own.
+                Some(r) => {
+                    let own = Some(w / h).filter(|q| w > 0.0 && q.is_finite() && *q > 0.0);
+                    constrain(w, h, own.unwrap_or(r), bounds)
+                }
+                None => (w, h),
+            };
+            (bound(bounds.width(w)), bound(bounds.height(h)))
+        }
+    }
+}
+fn bound(v: f64) -> f64 {
+    v.clamp(0.0, MAX_VIEWPORT)
+}
+/// CSS 2.2 §10.4's table for auto width and height with a ratio, before
+/// the caller clamps both sides to their min and max, which stands for
+/// the table's own max() and min() of the side it derives. Each row fixes
+/// one side and derives the other through the ratio. A double violation
+/// picks its side by the ratio, as the table does when w/h is the ratio,
+/// so a tentative size with a zero side, whose ratio is the given one,
+/// still meets its bounds.
+fn constrain(w: f64, h: f64, ratio: f64, bounds: Bounds) -> (f64, f64) {
+    let Bounds {
+        min_width,
+        min_height,
+        ..
+    } = bounds;
+    let max_width = bounds.max_width.max(min_width);
+    let max_height = bounds.max_height.max(min_height);
+    let by_width = |w: f64| (w, w / ratio);
+    let by_height = |h: f64| (h * ratio, h);
+    let (over_w, under_w) = (w > max_width, w < min_width);
+    let (over_h, under_h) = (h > max_height, h < min_height);
+    if over_w && over_h {
+        if max_width / ratio <= max_height {
+            by_width(max_width)
+        } else {
+            by_height(max_height)
+        }
+    } else if under_w && under_h {
+        if min_height * ratio >= min_width {
+            by_height(min_height)
+        } else {
+            by_width(min_width)
+        }
+    } else if under_w && over_h {
+        (min_width, max_height)
+    } else if over_w && under_h {
+        (max_width, min_height)
+    } else if over_w {
+        by_width(max_width)
+    } else if under_w {
+        by_width(min_width)
+    } else if over_h {
+        by_height(max_height)
+    } else if under_h {
+        by_height(min_height)
+    } else {
+        (w, h)
+    }
+}
+fn lookup(request: &Request<'_>, b: &BoxNode) -> Option<IntrinsicSize> {
+    if b.kind != BoxKind::Image {
+        return None;
+    }
+    request.intrinsic.and_then(|s| s.intrinsic(b.node, b.style))
 }
 fn collapse(a: f64, b: f64) -> f64 {
     a.max(b).max(0.0) + a.min(b).min(0.0)
@@ -906,6 +1104,629 @@ mod tests {
             assert_eq!(image.x, 8.0);
             assert_eq!(doc.node(image.node).unwrap().element().unwrap().name, "img");
         }
+    }
+    const PX: u32 = 64;
+    /// The first image's size at a 500 px width: an inline image's border
+    /// box, a block image's content box.
+    fn image_size(
+        html: &str,
+        css: &str,
+        sizes: Option<&(dyn IntrinsicSizes + Sync)>,
+    ) -> (f64, f64) {
+        let doc = td_html::document::parse(html).unwrap();
+        let styled =
+            StyledDocument::new(&doc, &sheets(css), html.len(), Limits::default()).unwrap();
+        let request = Request {
+            intrinsic: sizes,
+            ..Request::new(500.0, 300.0)
+        };
+        let out = layout(&styled, &mut Metrics, &request).unwrap();
+        if let Some(image) = out.lines.iter().find_map(|l| l.replaced.first()) {
+            return (image.width, image.height);
+        }
+        let image = out.boxes.iter().find(|g| g.replaced).unwrap();
+        (image.content.width, image.content.height)
+    }
+    fn every(size: IntrinsicSize) -> impl Fn(NodeId, StyleId) -> Option<IntrinsicSize> {
+        move |_, _| Some(size)
+    }
+    #[test]
+    fn intrinsic_sizes_follow_css_2_2_replaced_sizing() {
+        let picture = every(IntrinsicSize::picture(40 * PX, 20 * PX));
+        let width = every(IntrinsicSize {
+            width: Some(40 * PX),
+            ..IntrinsicSize::default()
+        });
+        let height = every(IntrinsicSize {
+            height: Some(20 * PX),
+            ratio: Some((2, 1)),
+            ..IntrinsicSize::default()
+        });
+        let ratio = every(IntrinsicSize {
+            ratio: Some((4, 1)),
+            ..IntrinsicSize::default()
+        });
+        let text = every(IntrinsicSize {
+            width: Some(40 * PX),
+            height: Some(20 * PX),
+            ratio: None,
+        });
+        for (sizes, attributes, css, want) in [
+            // Auto width and height take the intrinsic size.
+            (&picture, "", "", (40.0, 20.0)),
+            (&picture, "", "img{display:block}", (40.0, 20.0)),
+            (&width, "", "", (40.0, 150.0)),
+            (&height, "", "", (40.0, 20.0)),
+            // A ratio alone stretches to the containing width (§10.3.2).
+            (&ratio, "", "img{display:block}", (500.0, 125.0)),
+            (
+                &ratio,
+                "",
+                "p{margin:0 20px}img{display:block;padding:5px}",
+                (450.0, 112.5),
+            ),
+            // One CSS dimension: the ratio gives the other.
+            (&picture, "", "img{width:80px}", (80.0, 40.0)),
+            (&picture, "", "img{height:10px}", (20.0, 10.0)),
+            (&ratio, "", "img{height:10px}", (40.0, 10.0)),
+            (&text, "", "img{width:80px}", (80.0, 20.0)),
+            // A natural ratio comes before the attributes' (HTML's
+            // `aspect-ratio: auto w / h`).
+            (
+                &picture,
+                "width=30 height=30",
+                "img{width:80px}",
+                (80.0, 40.0),
+            ),
+            // Attributes are dimensions over the intrinsic size,
+            (&picture, "width=30 height=30", "", (30.0, 30.0)),
+            (&picture, "width=30", "", (30.0, 15.0)),
+            (&picture, "height=30", "", (60.0, 30.0)),
+            (&width, "height=30", "", (40.0, 30.0)),
+            (&text, "width=30", "", (30.0, 20.0)),
+            // and CSS over attributes.
+            (
+                &picture,
+                "width=30 height=30",
+                "img{width:8px;height:9px}",
+                (8.0, 9.0),
+            ),
+        ] {
+            let html = format!("<p>a<img {attributes}>b");
+            assert_eq!(
+                image_size(&html, css, Some(sizes)),
+                want,
+                "{attributes} {css}"
+            );
+        }
+    }
+    #[test]
+    fn intrinsic_ratios_hold_through_min_and_max_sizes() {
+        let picture = every(IntrinsicSize::picture(400 * PX, 200 * PX));
+        for (css, want) in [
+            ("img{max-width:100px}", (100.0, 50.0)),
+            ("img{max-height:100px}", (200.0, 100.0)),
+            ("img{min-width:800px}", (800.0, 400.0)),
+            ("img{min-height:300px}", (600.0, 300.0)),
+            ("img{min-width:600px;max-height:250px}", (600.0, 250.0)),
+            ("img{max-width:100px;min-height:300px}", (100.0, 300.0)),
+            ("img{max-width:200px;max-height:50px}", (100.0, 50.0)),
+            ("img{max-width:100px;max-height:150px}", (100.0, 50.0)),
+            ("img{min-width:800px;min-height:500px}", (1000.0, 500.0)),
+            ("img{min-width:1200px;min-height:500px}", (1200.0, 600.0)),
+            ("img{max-width:100px;min-height:60px}", (100.0, 60.0)),
+            // A minimum beats a smaller maximum.
+            ("img{min-width:150px;max-width:100px}", (150.0, 75.0)),
+            // A percentage of the containing width, as responsive pages set.
+            ("img{max-width:50%}", (250.0, 125.0)),
+            // With one dimension set, the other follows its used value.
+            ("img{width:100px;max-height:20px}", (100.0, 20.0)),
+            ("img{height:100px;max-width:120px}", (120.0, 100.0)),
+            ("img{width:300px;max-width:100px}", (100.0, 50.0)),
+            (
+                "img{display:block;box-sizing:border-box;padding:10px;max-width:120px}",
+                (100.0, 50.0),
+            ),
+            // Each row of §10.4's table, and the bound on the side a row
+            // derives.
+            ("img{min-width:600px;max-height:100px}", (600.0, 100.0)),
+            (
+                "img{max-width:100px;max-height:150px;min-height:120px}",
+                (100.0, 120.0),
+            ),
+            (
+                "img{max-width:500px;max-height:50px;min-width:150px}",
+                (150.0, 50.0),
+            ),
+            (
+                "img{min-width:800px;min-height:500px;max-width:900px}",
+                (900.0, 500.0),
+            ),
+            (
+                "img{min-width:1200px;min-height:500px;max-height:550px}",
+                (1200.0, 550.0),
+            ),
+            ("img{max-height:50px;min-width:150px}", (150.0, 50.0)),
+            ("img{min-height:300px;max-width:500px}", (500.0, 300.0)),
+            ("img{max-width:100px;min-height:30px}", (100.0, 50.0)),
+            ("img{min-width:800px;max-height:300px}", (800.0, 300.0)),
+        ] {
+            assert_eq!(image_size("<p><img>", css, Some(&picture)), want, "{css}");
+        }
+        // The attributes' ratio, without a natural one, holds as well.
+        assert_eq!(
+            image_size(
+                "<p><img width=1200 height=800>",
+                "img{max-width:100%}",
+                None
+            ),
+            (500.0, 1000.0 / 3.0)
+        );
+        // A stand-in without a ratio is clamped a dimension at a time.
+        let text = every(IntrinsicSize {
+            width: Some(400 * PX),
+            height: Some(200 * PX),
+            ratio: None,
+        });
+        assert_eq!(
+            image_size("<p><img>", "img{max-width:100px}", Some(&text)),
+            (100.0, 200.0)
+        );
+    }
+    #[test]
+    fn hostile_intrinsic_sizes_are_clamped() {
+        let huge = every(IntrinsicSize::picture(u32::MAX, u32::MAX));
+        assert_eq!(
+            image_size("<img>", "img{display:block}", Some(&huge)),
+            (MAX_VIEWPORT, MAX_VIEWPORT)
+        );
+        let tall = every(IntrinsicSize {
+            width: Some(PX),
+            ratio: Some((1, u32::MAX)),
+            ..IntrinsicSize::default()
+        });
+        assert_eq!(
+            image_size("<img>", "img{display:block}", Some(&tall)),
+            (1.0, MAX_VIEWPORT)
+        );
+        let wide = every(IntrinsicSize {
+            ratio: Some((u32::MAX, 1)),
+            ..IntrinsicSize::default()
+        });
+        for css in ["img{height:1000px}", "img{min-height:1000px}"] {
+            assert_eq!(
+                image_size("<p><img>", css, Some(&wide)),
+                (MAX_VIEWPORT, 1000.0),
+                "{css}"
+            );
+        }
+        // Nothing, as td-web sizes an image without alt text.
+        let nothing = every(IntrinsicSize::picture(0, 0));
+        assert_eq!(image_size("<p><img>", "", Some(&nothing)), (0.0, 0.0));
+        assert_eq!(
+            image_size("<p><img>", "img{min-width:10px}", Some(&nothing)),
+            (10.0, 0.0)
+        );
+        // A ratio with a zero term is none.
+        for zero in [(0, 5), (5, 0)] {
+            let degenerate = every(IntrinsicSize {
+                ratio: Some(zero),
+                ..IntrinsicSize::default()
+            });
+            assert_eq!(
+                image_size("<p><img>", "img{width:80px}", Some(&degenerate)),
+                (80.0, 150.0)
+            );
+        }
+        let flat = every(IntrinsicSize {
+            width: Some(0),
+            ratio: Some((2, 1)),
+            ..IntrinsicSize::default()
+        });
+        assert_eq!(
+            image_size(
+                "<p><img>",
+                "img{min-width:10px;min-height:10px}",
+                Some(&flat)
+            ),
+            (20.0, 10.0)
+        );
+    }
+    #[test]
+    fn tentative_sizes_off_the_ratio_or_zero_still_meet_their_bounds() {
+        let cases: &[(&str, &str, IntrinsicSize, (f64, f64))] = &[
+            // Two attributes off a picture's ratio, under two bounds,
+            // keep the attributes' proportions, continuous and monotone
+            // as a bound tightens.
+            (
+                "<p><img width=300 height=300>",
+                "img{max-width:100%;max-height:300px}",
+                IntrinsicSize::picture_px(1600, 400),
+                (300.0, 300.0),
+            ),
+            (
+                "<p><img width=300 height=300>",
+                "img{max-width:100%;max-height:299px}",
+                IntrinsicSize::picture_px(1600, 400),
+                (299.0, 299.0),
+            ),
+            (
+                "<p><img width=300 height=300>",
+                "img{max-width:100%;max-height:200px}",
+                IntrinsicSize::picture_px(1600, 400),
+                (200.0, 200.0),
+            ),
+            (
+                "<p><img width=30 height=30>",
+                "img{min-width:40px;min-height:50px}",
+                IntrinsicSize::picture_px(40, 80),
+                (50.0, 50.0),
+            ),
+            // One attribute takes the picture's ratio.
+            (
+                "<p><img width=300>",
+                "img{max-width:100%;max-height:50px}",
+                IntrinsicSize::picture_px(1600, 400),
+                (200.0, 50.0),
+            ),
+            (
+                "<p><img width=300 height=10>",
+                "img{max-width:200px;min-height:20px}",
+                IntrinsicSize::picture_px(1, 1),
+                (200.0, 20.0),
+            ),
+            (
+                "<p><img width=10 height=300>",
+                "img{min-width:200px;max-height:50px}",
+                IntrinsicSize::picture_px(1000, 100),
+                (200.0, 50.0),
+            ),
+            // A zero side, in both orientations, and the rows crossing a
+            // minimum and a maximum, which a zero side alone reaches
+            // beyond the final clamp.
+            (
+                "<p><img width=0>",
+                "img{min-width:10px;min-height:10px}",
+                IntrinsicSize::picture_px(40, 80),
+                (10.0, 20.0),
+            ),
+            (
+                "<p><img height=0>",
+                "img{min-width:10px;min-height:10px}",
+                IntrinsicSize::picture_px(80, 40),
+                (20.0, 10.0),
+            ),
+            (
+                "<p><img width=0 height=300>",
+                "img{min-width:200px;max-height:50px}",
+                IntrinsicSize::picture_px(1000, 100),
+                (200.0, 50.0),
+            ),
+            (
+                "<p><img width=300 height=0>",
+                "img{max-width:200px;min-height:50px}",
+                IntrinsicSize::picture_px(100, 1000),
+                (200.0, 50.0),
+            ),
+            // A ratio alone with nothing to stretch over.
+            (
+                "<img>",
+                "img{display:block;margin-left:500px;min-width:333px;min-height:5px}",
+                IntrinsicSize {
+                    ratio: Some((2, 9)),
+                    ..IntrinsicSize::default()
+                },
+                (333.0, 1498.5),
+            ),
+            // A tentative size past MAX_VIEWPORT picks its row unclamped.
+            (
+                "<p><img height=900000>",
+                "img{max-width:600px;max-height:500px}",
+                IntrinsicSize {
+                    ratio: Some((2, 1)),
+                    ..IntrinsicSize::default()
+                },
+                (600.0, 300.0),
+            ),
+        ];
+        for (html, css, size, want) in cases {
+            let sizes = every(*size);
+            assert_eq!(image_size(html, css, Some(&sizes)), *want, "{html} {css}");
+        }
+    }
+    #[test]
+    fn hostile_attribute_ratios_cost_only_their_box() {
+        for (attributes, css, want) in [
+            (
+                "width=1000000 height=0.000001",
+                "img{height:1000px}",
+                (MAX_VIEWPORT, 1000.0),
+            ),
+            (
+                "width=1000000 height=0.000001",
+                "img{max-width:10px}",
+                (10.0, 0.00000000001),
+            ),
+            ("width=1 height=1e-310", "img{height:1000px}", (1.0, 1000.0)),
+            (
+                "width=1e-310 height=1",
+                "img{width:1000px}",
+                (1000.0, MAX_VIEWPORT),
+            ),
+            ("width=1e-310 height=1", "img{height:1000px}", (0.0, 1000.0)),
+        ] {
+            let html = format!("<p><img {attributes}>x");
+            let (w, h) = image_size(&html, css, None);
+            assert!(w.is_finite() && h.is_finite(), "{attributes} {css}");
+            assert!(
+                (w - want.0).abs() < 1e-9 && (h - want.1).abs() < 1e-9,
+                "{attributes} {css}: {w} {h}"
+            );
+        }
+    }
+    #[test]
+    fn without_intrinsic_sizes_the_placeholder_rule_is_unchanged() {
+        // The rule before intrinsic sizes, kept as the oracle where the
+        // attributes give no ratio or no bound applies.
+        let placeholder = |(cw, ch): (Option<f64>, Option<f64>),
+                           (aw, ah): (Option<f64>, Option<f64>),
+                           b: Bounds| {
+            let ratio = aw.zip(ah).filter(|(w, h)| *w > 0.0 && *h > 0.0);
+            let ratio = ratio.map(|(w, h)| w / h);
+            let w = cw.unwrap_or_else(|| ch.zip(ratio).map_or(aw.unwrap_or(300.0), |(h, r)| h * r));
+            let h = ch.unwrap_or_else(|| cw.zip(ratio).map_or(ah.unwrap_or(150.0), |(w, r)| w / r));
+            (
+                w.min(b.max_width).max(b.min_width),
+                h.min(b.max_height).max(b.min_height),
+            )
+        };
+        let bounds = |min_width, max_width, min_height, max_height| Bounds {
+            min_width,
+            max_width,
+            min_height,
+            max_height,
+        };
+        let unbounded = f64::INFINITY;
+        let bounded = |b: Bounds| {
+            b.min_width > 0.0
+                || b.max_width.is_finite()
+                || b.min_height > 0.0
+                || b.max_height.is_finite()
+        };
+        // Expected values worked by hand: the attributes' ratio through
+        // §10.4's rows, or through the one CSS dimension set.
+        let some = Some;
+        for (css, attributes, b, want) in [
+            (
+                (None, None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, 30.0, 0.0, unbounded),
+                (30.0, 15.0),
+            ),
+            (
+                (None, None),
+                (some(80.0), some(40.0)),
+                bounds(100.0, unbounded, 0.0, unbounded),
+                (100.0, 50.0),
+            ),
+            (
+                (None, None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, unbounded, 0.0, 10.0),
+                (20.0, 10.0),
+            ),
+            (
+                (None, None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, unbounded, 200.0, unbounded),
+                (400.0, 200.0),
+            ),
+            (
+                (None, None),
+                (some(8.5), some(80.0)),
+                bounds(10.0, 35.0, 12.0, 18.0),
+                (10.0, 18.0),
+            ),
+            (
+                (None, None),
+                (some(80.0), some(8.5)),
+                bounds(10.0, 35.0, 12.0, 18.0),
+                (35.0, 12.0),
+            ),
+            (
+                (None, None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, 50.0, 0.0, 20.0),
+                (40.0, 20.0),
+            ),
+            (
+                (some(8.5), None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, unbounded, 0.0, 3.0),
+                (8.5, 3.0),
+            ),
+            (
+                (None, some(80.0)),
+                (some(80.0), some(40.0)),
+                bounds(0.0, 100.0, 0.0, unbounded),
+                (100.0, 80.0),
+            ),
+            (
+                (some(80.0), None),
+                (some(80.0), some(40.0)),
+                bounds(0.0, 30.0, 0.0, unbounded),
+                (30.0, 15.0),
+            ),
+        ] {
+            assert_eq!(
+                replaced(css, attributes, None, 400.0, b),
+                want,
+                "{css:?} {attributes:?}"
+            );
+        }
+        let all = [
+            bounds(0.0, unbounded, 0.0, unbounded),
+            bounds(0.0, 30.0, 0.0, unbounded),
+            bounds(30.0, unbounded, 0.0, unbounded),
+            bounds(0.0, unbounded, 200.0, unbounded),
+            bounds(0.0, unbounded, 0.0, 6.0),
+            bounds(100.0, 50.0, 0.0, 5.0),
+            bounds(10.0, 35.0, 12.0, 18.0),
+        ];
+        let lengths = [None, Some(0.0), Some(8.5), Some(80.0)];
+        for cw in lengths {
+            for ch in lengths {
+                for aw in lengths {
+                    for ah in lengths {
+                        let ratio = aw.zip(ah).filter(|(w, h)| *w > 0.0 && *h > 0.0);
+                        for b in all {
+                            // With a ratio and a bound, the attributes
+                            // lay out as a picture of their size would.
+                            let want = match ratio {
+                                Some((w, h)) if bounded(b) => {
+                                    let picture = IntrinsicSize::picture(
+                                        (w * 64.0) as u32,
+                                        (h * 64.0) as u32,
+                                    );
+                                    replaced((cw, ch), (None, None), Some(picture), 400.0, b)
+                                }
+                                _ => placeholder((cw, ch), (aw, ah), b),
+                            };
+                            for none in [None, Some(IntrinsicSize::default())] {
+                                assert_eq!(
+                                    replaced((cw, ch), (aw, ah), none, 400.0, b),
+                                    want,
+                                    "{cw:?} {ch:?} {aw:?} {ah:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn the_lookup_is_given_the_image_and_its_own_style() {
+        let html = "<p>a<img id=x style='font-size:30px'>b";
+        let doc = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&doc, &sheets(""), html.len(), Limits::default()).unwrap();
+        let image = styled
+            .boxes()
+            .iter()
+            .find(|b| b.kind == crate::BoxKind::Image)
+            .unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let sizes = |node: NodeId, style: StyleId| {
+            *seen.lock().unwrap() = Some((node, style));
+            let size = styled.style(style)?.font_size() as u32 * PX;
+            Some(IntrinsicSize {
+                width: Some(size),
+                height: Some(size),
+                ratio: None,
+            })
+        };
+        let request = Request {
+            intrinsic: Some(&sizes),
+            ..Request::new(500.0, 300.0)
+        };
+        let out = layout(&styled, &mut Metrics, &request).unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some((image.node, image.style)));
+        let fragment = &out.lines[0].replaced[0];
+        assert_eq!((fragment.width, fragment.height), (30.0, 30.0));
+        fn shareable<T: Send + Sync>(_: &T) {}
+        shareable(&request);
+    }
+    #[test]
+    fn none_supplied_lays_out_as_without_sizes() {
+        let none = |_: NodeId, _: StyleId| None::<IntrinsicSize>;
+        for (html, css) in [
+            ("<p>a<img>b<img width=40 height=20> c", ""),
+            ("<p>a<img width=40>b<img height=7>", "img{max-width:20px}"),
+            (
+                "<img width=40 height=20><p>x",
+                "img{display:block;height:10px}",
+            ),
+            (
+                "<p><img width=400 height=200>",
+                "img{min-width:600px;max-height:50px}",
+            ),
+            ("<p><img width=4 height=2 style='width:9px'>", ""),
+        ] {
+            let doc = td_html::document::parse(html).unwrap();
+            let styled =
+                StyledDocument::new(&doc, &sheets(css), html.len(), Limits::default()).unwrap();
+            let without = layout(&styled, &mut Metrics, &Request::new(300.0, 200.0)).unwrap();
+            let request = Request {
+                intrinsic: Some(&none),
+                ..Request::new(300.0, 200.0)
+            };
+            let with = layout(&styled, &mut Metrics, &request).unwrap();
+            assert_eq!(with.boxes, without.boxes, "{html}");
+            assert_eq!(
+                with.lines.iter().collect::<Vec<_>>(),
+                without.lines.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(with.charged_bytes, without.charged_bytes);
+        }
+    }
+    #[test]
+    fn a_changed_intrinsic_size_needs_only_a_relayout() {
+        let html = "<p>alpha <img id=a> beta <img id=b width=10> gamma\
+                    <img id=c style='display:block'>";
+        let doc = td_html::document::parse(html).unwrap();
+        let css = sheets("img{max-width:100%}");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let by_id = |sizes: [IntrinsicSize; 3]| {
+            let (doc, asked) = (&doc, &asked);
+            move |node: NodeId, _: StyleId| {
+                asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let id = doc.node(node)?.element()?.attribute("id")?;
+                let at = ["a", "b", "c"].iter().position(|n| *n == id)?;
+                sizes.get(at).copied()
+            }
+        };
+        let first = by_id([
+            IntrinsicSize::default(),
+            IntrinsicSize::picture(20 * PX, 40 * PX),
+            IntrinsicSize::picture(400 * PX, 100 * PX),
+        ]);
+        let second = by_id([
+            IntrinsicSize::picture(30 * PX, 10 * PX),
+            IntrinsicSize::default(),
+            IntrinsicSize::picture(800 * PX, 100 * PX),
+        ]);
+        let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
+        let before = Request {
+            intrinsic: Some(&first),
+            ..Request::new(120.0, 300.0)
+        };
+        let before = layout(&styled, &mut Metrics, &before).unwrap();
+        // Each image's size is asked once a layout, and nothing else's.
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let after = Request {
+            intrinsic: Some(&second),
+            ..Request::new(120.0, 300.0)
+        };
+        let relaid = layout(&styled, &mut Metrics, &after).unwrap();
+        let again = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
+        let fresh = layout(&again, &mut Metrics, &after).unwrap();
+        assert_eq!(relaid.boxes, fresh.boxes);
+        assert_eq!(
+            relaid.lines.iter().collect::<Vec<_>>(),
+            fresh.lines.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(relaid.height, fresh.height);
+        assert_eq!(relaid.overflow, fresh.overflow);
+        assert_ne!(
+            relaid.lines.iter().collect::<Vec<_>>(),
+            before.lines.iter().collect::<Vec<_>>()
+        );
+        let block = |out: &Layout| {
+            let c = find(&doc, out, "c").content;
+            (c.width, c.height)
+        };
+        assert_eq!(block(&before), (120.0, 30.0));
+        assert_eq!(block(&relaid), (120.0, 15.0));
     }
     #[test]
     fn float_fallback_inline_block_splits_and_alignment() {
@@ -1126,15 +1947,20 @@ mod tests {
 
     #[test]
     fn aggregate_overflow_extent_has_an_exact_limit() {
-        let html = "<img width=1000000 height=1><div>x</div>";
-        let doc = td_html::document::parse(html).unwrap();
-        for (left, ok) in [(0, true), (-1, false)] {
-            let css=sheets(&format!("img{{display:block;height:1000px}}div{{width:1px;position:relative;left:{left}px}}"));
+        // A thousand images of MAX_VIEWPORT reach MAX_COORDINATE.
+        let html = format!("<div></div>{}", "<img width=1 height=1000000>".repeat(1000));
+        let doc = td_html::document::parse(&html).unwrap();
+        for (top, ok) in [(0, true), (-1, false)] {
+            let css = sheets(&format!(
+                "img{{display:block}}div{{height:0;position:relative;top:{top}px}}"
+            ));
             let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
-            assert_eq!(
-                layout(&styled, &mut Metrics, &Request::new(100.0, 100.0)).is_ok(),
-                ok
-            );
+            let result = layout(&styled, &mut Metrics, &Request::new(100.0, 100.0));
+            if ok {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(Error::Limit("MAX_COORDINATE"))));
+            }
         }
     }
     #[test]
@@ -1182,22 +2008,24 @@ mod tests {
     }
     #[test]
     fn final_margin_is_in_the_coordinate_admission() {
-        let html = "<img width=1 height=1000000>";
-        let doc = td_html::document::parse(html).unwrap();
+        let html = "<img width=1 height=1000000>".repeat(1000);
+        let doc = td_html::document::parse(&html).unwrap();
         for (margin, ok) in [(0, true), (1, false)] {
             let styled = StyledDocument::new(
                 &doc,
                 &sheets(&format!(
-                    "img{{display:block;width:1000px}}html{{margin-bottom:{margin}px}}"
+                    "img{{display:block}}html{{margin-bottom:{margin}px}}"
                 )),
                 html.len(),
                 Limits::default(),
             )
             .unwrap();
-            assert_eq!(
-                layout(&styled, &mut Metrics, &Request::new(100.0, 100.0)).is_ok(),
-                ok
-            );
+            let result = layout(&styled, &mut Metrics, &Request::new(100.0, 100.0));
+            if ok {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(Error::Limit("MAX_COORDINATE"))));
+            }
         }
     }
 

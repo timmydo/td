@@ -1040,6 +1040,9 @@ charges anything for the new one.
 **Relayout.** What changed decides what is done again:
 
 - `F8` changes the body family (below, "Faces"): a layout only.
+- A picture arriving (below, "Subresources") changes its image's
+  intrinsic size, which td-layout takes with each layout request: a
+  layout only.
 - A width or a scale changes the environment: the set is compiled
   again from the sheets' text, the page cascaded again, then laid
   out. MDN's cascade takes 0.6 s (td-css/DESIGN.md §8) and its parse,
@@ -1622,14 +1625,23 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      owned tree, DOM and CSS storage (above, "Memory"); a styled document
      holding its document by shared
      ownership, so a page passes between threads, as td-web, which
-     forbids `unsafe`, cannot hold a borrowed one beside its owner; a
-     replaced element's intrinsic size from the caller, in place of its
-     300 by 150 placeholder: its `alt` text's line, or nothing, until
-     increment 9, its picture's after; list markers as a fragment kind
-     of their own (td-layout/DESIGN.md §3); a basic automatic table
+     forbids `unsafe`, cannot hold a borrowed one beside its owner;
+     list markers as a fragment kind of their own (td-layout/DESIGN.md
+     §3); a basic automatic table
      layout, rows and cells with `colspan` and `rowspan` within bounds,
      so a page's tables line up as §5's do rather than stacking as
-     blocks. Available: a page-wide cascade work ceiling in its
+     blocks. Available: a replaced element's intrinsic size from the
+     caller (`Request::intrinsic`: a width, a height and a ratio, each
+     optional), used after its `width` and `height` attributes in place
+     of its 300 by 150 placeholder. td-web gives as that intrinsic size
+     its `alt` text's line, measured in the image's own font from the
+     style the lookup is asked with, before the layout or with its own
+     metrics since layout holds its metrics meanwhile, or nothing (0 by
+     0), until increment 9, and its picture's after. A ratio, the
+     picture's or the attributes' (their own proportions where both are
+     given), is kept through `min-` and `max-` sizes, and a changed size needs a layout and no cascade
+     (td-layout/DESIGN.md §5, "Intrinsic sizes"); a page-wide cascade
+     work ceiling in its
      `Limits` (`MAX_CASCADE_WORK`), summing each element's weighted
      match steps, declarations, custom names, inherited custom copies
      and substitution charges, refused by name; a cancel flag (`Limits::cancel`,
