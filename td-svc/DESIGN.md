@@ -2180,6 +2180,98 @@ hand-writes a record naming a live process, starts td-svc on a table holding
 that unit, and requires both that the process is gone and that the unit then
 ran — the second half being what separates evicting from refusing everything.
 
+## 12. Early OOM
+
+`td-svc oom-watch` is the desktop's early OOM killer, run by the desktop
+table's `oom-watch` daemon unit (`restart=always`, a leaf under
+`/system`); the server has none. It is the same binary as the supervisor
+but its own process, and reads no table. It sets its own `oom_score_adj`
+to -1000 so the kernel's killer does not take it first.
+
+The kernel's OOM killer acts only when an allocation cannot be met. With
+compressed swap on (`zram`, UNSAFE.md §3) that comes long after the desktop
+stopped answering, because pages leave for zram and return at once while
+every task waits. So the watcher reads `/proc/meminfo` and
+`/proc/pressure/memory` once a second and acts on either of two signs:
+
+- **Pressure:** `full avg10`, a moving average over about ten seconds of
+  the time every non-idle task was stalled on memory at once, at or above
+  50% for 20 seconds by the clock while `MemAvailable` is under 20% of
+  `MemTotal`. The system-wide figure also counts an application stalled
+  at its own `memory.high` (APPLICATIONS.md §P), which is that throttle
+  working, not the machine thrashing; on a machine with memory to spare
+  it never triggers. One reading that is not both starts the clock again.
+- **Floor:** `MemAvailable` under 5% of `MemTotal` and `SwapFree` under 5%
+  of `SwapTotal` (or no swap at all), earlyoom's rule, for a spike that
+  pressure has not yet caught. It acts at once.
+
+A kernel without PSI (`/proc/pressure/memory` absent) is said once in the
+log and leaves the floor alone in force; a failed read of `/proc/meminfo`
+is said once and retried at the next poll, never fatal.
+
+Either sign gathers every populated leaf (by `cgroup.events`) under a
+workload delegation (`td-user-*`, `td-app-*`, `td-workload-*`,
+`td-runtimes`) and ranks what one kill would end by what it holds:
+
+- an instance leaf, which td-jail creates per application or workspace
+  instance, by `anon` plus `shmem` from `memory.stat` plus
+  `memory.swap.current` (absent on a kernel without swap, and then
+  zero). Page cache the kernel can drop by itself is left out. It is
+  killed whole by writing `1` to its `cgroup.kill`, as its
+  `memory.oom.group` already asks of the kernel; td-jail's cleanup
+  watcher, in the account's session leaf, then drains and removes it;
+- a leaf named `session`, any account's, never whole: it holds the
+  human's terminal and every `cgroup=session` unit (`terminal`, `fetchd`,
+  `egressd`, `vm-guest`, `media-watch` for the human; an application
+  account's `mail-fetch`, `news-fetch`, `web-fetch`) and td-jail's stage
+  1 and cleanup watcher. Its candidate is its largest process alone,
+  ranked by that process's `RssAnon`, `RssShmem` and `VmSwap`, since that
+  is all its kill frees, and sent `SIGKILL` through `send_signal`. The
+  process's start time is read first, then its `/proc/PID/cgroup` must
+  name the leaf, then its figures, then its start time again, and again
+  just before the signal: a listed pid that exited and was reused
+  elsewhere is not judged as the session's. pid 1 and below are refused.
+  A process with an `oom_score_adj` of -1000 is passed over, though
+  nothing in td sets one there today.
+
+The largest goes first. No victim holding under 1% of `MemTotal` is
+killed: memory held where the watcher does not look must not cost every
+small workload in turn. A kill that fails moves on to the next candidate.
+A victim that exited before its signal ends the action, since its
+memory is already free. After each action it waits 15 seconds for what
+was freed to show. Only a calm reading, `MemAvailable` back at 20% of
+`MemTotal` or more, forgives: memory still scarce, pressured or not,
+does not, so after three actions with no calm reading between them it
+says so once and doubles the wait each time, up to four minutes.
+"Nothing it may kill" is said once until a calm reading.
+
+Never scanned: `/system`, where td-svc's own services run, the compositor,
+td-authd, the bus, audio and the watcher among them, and
+`/system/td-admin/build`, the administrator's source build
+(`td-update/ADMIN.md`): a desktop short of memory during that build
+loses workloads, not the build, and the floor on victim size and the
+slowing above bound how many; and the hierarchy root, where PID 1 and
+td-svc are. A cgroup the scan cannot read, most often one that went
+away while it ran, or deeper than four levels under its delegation, is
+passed over and counted in the log. The verdict, what was killed and
+why, goes to the unit's log and the console.
+
+Restart policies still apply to what it kills. A `restart=always`
+session unit comes back on td-svc's backoff (§6), and `[firefox]`'s
+`restart=on-failure` relaunches the browser, whose leaf the next action
+may kill again if it is again the largest.
+
+Known limits: the watcher is not locked in memory and allocates on its
+kill path, so under the hardest thrash its own reads can stall; `mlockall`
+would be a new syscall (UNSAFE.md §5). Tmpfs charged to an instance leaf
+counts toward it, though a file another cgroup holds open outlives its
+kill; a session process counts only the shared memory it maps, so tmpfs
+a session filled and unmapped is counted by no candidate.
+
+The thresholds are fixed in `oom.rs`, not read from the table: they are
+the user's chosen policy for every desktop, and a key the table carried
+would be one more thing a machine could get wrong.
+
 ## Trusted-main administrator
 
 The installed system runs `/bin/td-admin serve` as a root `stop=leaf` daemon

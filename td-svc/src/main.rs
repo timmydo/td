@@ -24,6 +24,7 @@ mod cgroup;
 mod control;
 mod evict;
 mod logs;
+mod oom;
 mod order;
 mod pair;
 mod procfs;
@@ -59,7 +60,8 @@ fn usage() -> String {
     format!(
         "usage: td-svc <check|run> [-f FILE]\n       \
          td-svc <status|start|stop|restart> [NAME]\n       \
-         td-svc <reload|reboot|poweroff|halt>\n  \
+         td-svc <reload|reboot|poweroff|halt>\n       \
+         td-svc oom-watch\n  \
          check     validate FILE and print the start order (exit 1 on any complaint)\n  \
          run       supervise the services in FILE\n  \
          status    what the running supervisor is doing (all units, or NAME)\n  \
@@ -69,7 +71,8 @@ fn usage() -> String {
          reload    re-read FILE; on any complaint the running table is kept\n  \
          reboot    stop every service, run /etc/shutdown, then reset\n  \
          poweroff  the same, then power off\n  \
-         halt      the same, then halt\n\
+         halt      the same, then halt\n  \
+         oom-watch kill the largest workload when memory runs out or thrashes\n\
          FILE defaults to {DEFAULT_PATH}; everything but check/run talks to {socket}\n\
          ({sentinel} is internal: `run` spawns it to catch Ctrl-Alt-Del, and it \
          blocks on stdin until its parent lets go)\n\
@@ -93,6 +96,8 @@ enum Route {
     /// The Ctrl-Alt-Del sentinel: block until our parent lets go. Not a control
     /// verb — it addresses no supervisor and reads no table.
     CadSentinel,
+    /// The early OOM killer (`oom.rs`): its own process, under its own unit.
+    OomWatch,
     PairRun {
         left: Vec<String>,
         right: Vec<String>,
@@ -139,6 +144,12 @@ fn route(args: &[String]) -> Route {
             return Route::Usage(format!("{verb}: takes no argument (got {extra:?})"));
         }
         return Route::CadSentinel;
+    }
+    if verb == oom::VERB {
+        if let Some(extra) = args.get(1) {
+            return Route::Usage(format!("{verb}: takes no argument (got {extra:?})"));
+        }
+        return Route::OomWatch;
     }
     if CTL_VERBS.contains(&verb.as_str()) {
         // `-f` is not accepted here: it names a TABLE, and these verbs do not
@@ -243,6 +254,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        Route::OomWatch => match oom::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                emit_err(&format!("td-svc {}: {e}\n", oom::VERB));
+                ExitCode::FAILURE
+            }
+        },
         Route::CadSentinel => match cad::sentinel() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -439,6 +457,18 @@ mod tests {
         );
     }
 
+    /// The desktop table's `exec=/bin/td-svc oom-watch` reaches the watcher,
+    /// and nothing after the verb is taken silently.
+    #[test]
+    fn the_oom_watch_verb_routes_to_the_watcher_and_takes_nothing() {
+        assert_eq!(route(&argv(&[oom::VERB])), Route::OomWatch);
+        assert!(matches!(
+            route(&argv(&[oom::VERB, "-f"])),
+            Route::Usage(why) if why.contains("takes no argument")
+        ));
+        assert!(!CTL_VERBS.contains(&oom::VERB));
+    }
+
     /// `-f` names a TABLE, and a control verb does not read one. Accepting and
     /// ignoring it would make `td-svc stop -f other.conf` look like it
     /// addressed a different supervisor when it addressed the only one there is.
@@ -570,8 +600,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            12,
-            "expected twelve modules beside the crate root"
+            13,
+            "expected thirteen modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -583,7 +613,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these thirteen files and nothing else.
+    /// `src/` holds these fourteen files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -594,7 +624,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_thirteen_scanned_modules() {
+    fn src_holds_exactly_the_fourteen_scanned_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -607,6 +637,7 @@ mod confinement {
                 "evict.rs",
                 "logs.rs",
                 "main.rs",
+                "oom.rs",
                 "order.rs",
                 "pair.rs",
                 "procfs.rs",
@@ -1094,5 +1125,41 @@ mod confinement {
             "the kill(2) call must live in send_signal, not in {}",
             owner.lines().next().unwrap_or_default()
         );
+    }
+
+    /// `send_signal` is the supervisor's, and the early OOM killer's one
+    /// borrowing of it is a `SIGKILL` to a single pid above 1 whose start
+    /// time it has just read back (DESIGN.md §12, UNSAFE.md §5). Any other
+    /// module naming it, or oom.rs naming it again or with another target
+    /// or signal, is a new caller that review has not seen.
+    #[test]
+    fn send_signal_has_one_borrower_and_it_kills_a_checked_pid() {
+        let needle = concat!("send_", "signal");
+        // The production half of each file: main.rs's own tests quote it.
+        let production = |text: &str| {
+            let code = squeeze(&scan::strip_comments(text));
+            match code.match_indices(concat!("#[cfg(", "test)]")).next() {
+                Some((at, _)) => code.get(..at).unwrap_or(&code).to_string(),
+                None => code,
+            }
+        };
+        for (name, text) in sources() {
+            let mentions = production(&text).matches(needle).count();
+            match name.as_str() {
+                "supervise.rs" => {}
+                "oom.rs" => assert_eq!(mentions, 1, "oom.rs names {needle} {mentions} times"),
+                _ => assert_eq!(mentions, 0, "{name} names {needle}"),
+            }
+        }
+        let oom = production(&source("oom.rs"));
+        for pinned in [
+            "ifprocess.pid<=1{returnErr(\"refusingpid1orbelow\".into());}",
+            concat!(
+                "matchprocfs::is_same_process(process.pid,process.starttime){Ok(true)=>crate::supervise::send_",
+                "signal(process.pid,crate::sys::SIGKILL),"
+            ),
+        ] {
+            assert_eq!(oom.matches(pinned).count(), 1, "oom.rs's kill changed: {pinned}");
+        }
     }
 }

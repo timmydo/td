@@ -10147,6 +10147,12 @@ deferring them. The shape:
 - Read `memory.events`, `memory.peak`, and the bandwidth rows from `cpu.stat`
   back for diagnostics: an app killed for memory or throttled for CPU should
   say so rather than looking like an unexplained failure or slowdown.
+- On the desktop, td-svc's early OOM killer (`td-svc/DESIGN.md` §12) may
+  end an instance whole through its leaf's `cgroup.kill` when the machine,
+  not the app, runs short. `memory.events` does not record that kill; the
+  watcher's log (`/var/log/svc/oom-watch.log`) and the console do. An app
+  throttled at its own `memory.high` on a machine with memory to spare is
+  not a trigger, so "slow, not dead" still holds for the app alone.
 
 The landed hierarchy leaves PID 1 and system services at the hierarchy
 root, which cgroup v2 explicitly exempts from the no-internal-process

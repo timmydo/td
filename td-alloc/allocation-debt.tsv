@@ -3871,8 +3871,12 @@ td-svc/src/logs.rs	allocation-macro	10
 td-svc/src/logs.rs	heap-owner	1
 td-svc/src/logs.rs	unchecked-growth-or-clone	11
 td-svc/src/main.rs	allocating-conversion	3
-td-svc/src/main.rs	allocation-macro	24
+td-svc/src/main.rs	allocation-macro	26
 td-svc/src/main.rs	unchecked-growth-or-clone	5
+td-svc/src/oom.rs	allocating-constructor	4
+td-svc/src/oom.rs	allocating-conversion	10
+td-svc/src/oom.rs	allocation-macro	23
+td-svc/src/oom.rs	unchecked-growth-or-clone	4
 td-svc/src/order.rs	allocating-conversion	4
 td-svc/src/order.rs	allocation-macro	11
 td-svc/src/order.rs	heap-owner	1

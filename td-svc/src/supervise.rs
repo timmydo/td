@@ -1010,7 +1010,7 @@ struct Attached {
 /// signal that could not be sent at all (EPERM, EINVAL): that means td-svc
 /// cannot signal, and every "killing it" line above it would describe an
 /// action that never happened.
-fn send_signal(target: i32, signal: i32) -> Result<(), String> {
+pub(crate) fn send_signal(target: i32, signal: i32) -> Result<(), String> {
     // Two targets `kill(2)` accepts and td-svc never means. Neither is a
     // process or a group: `0` is the CALLER's process group — td-svc and every
     // service sharing it — and `-1` is a broadcast to every process this

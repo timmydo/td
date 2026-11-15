@@ -783,6 +783,12 @@ PID 1 mounts the hierarchy through the existing audited mount applet, while
 td-svc creates cgroups, enables controllers at the root exception, and
 changes ownership through safe filesystem APIs. This includes the `cpu`,
 `memory`, and `pids` controllers; no controller operation adds an unsafe call.
+The early OOM killer (`td-svc oom-watch`, `oom.rs`) adds no call either: it
+kills a whole instance leaf by writing `1` to its `cgroup.kill`, and one
+process of a `session` leaf through the same `send_signal`, with
+`SIGKILL`, to a pid above 1 whose start time it has just read back.
+`send_signal_has_one_borrower_and_it_kills_a_checked_pid` holds oom.rs to
+that one call and every other module but supervise.rs to none.
 `td-svc/DESIGN.md` is its normative
 specification, recording both that and the invariants no compiler checks
 (no `pre_exec`, liveness read from `/proc` rather than inferred from an

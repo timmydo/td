@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{chown, MetadataExt};
 use std::path::{Path, PathBuf};
 
-const ROOT: &str = "/sys/fs/cgroup";
+pub(crate) const ROOT: &str = "/sys/fs/cgroup";
 const DELEGATE: &str = "/sys/fs/cgroup/td-user-1000";
 const SESSION: &str = "/sys/fs/cgroup/td-user-1000/session";
 /// Parent of the per-service leaves. Unlike the hierarchy root it is NOT exempt
@@ -514,7 +514,7 @@ fn require_words(text: &str, required: &[&str], name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_control(path: &Path, value: &str) -> io::Result<()> {
+pub(crate) fn write_control(path: &Path, value: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).open(path).map_err(|error| {
         io::Error::new(error.kind(), format!("open {}: {error}", path.display()))
     })?;
@@ -556,7 +556,7 @@ fn read_control(path: &Path) -> io::Result<String> {
     Ok(read_bounded(path, MAX_CONTROL_BYTES)?.trim().to_string())
 }
 
-fn read_bounded(path: &Path, limit: u64) -> io::Result<String> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> io::Result<String> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(limit + 1)

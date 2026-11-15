@@ -209,6 +209,8 @@ const CONFIG: &[&str] = &[
     "CONFIG_ZRAM=y",
     "CONFIG_ZRAM_BACKEND_ZSTD=y",
     "CONFIG_ZRAM_DEF_COMP_ZSTD=y",
+    // Memory pressure for the desktop's early OOM killer (`td-svc oom-watch`).
+    "CONFIG_PSI=y",
     "CONFIG_SOUND=y",
     "CONFIG_SND=y",
     "CONFIG_SND_PCM=y",
@@ -1474,6 +1476,7 @@ mod tests {
         ("CONFIG_CGROUP_PIDS=y", "CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail"),
         ("CONFIG_SWAP=y", "SWAP off — swapon(2) is ENOSYS, so td-init's zram-swap has nothing to enable, and memory.swap.max does not exist, so every td-jail launch and every td-svc service leaf fails to write its swap bound, on every profile"),
         ("CONFIG_ZRAM=y", "ZRAM off — /sys/block/zram0 does not exist, so the desktop has no compressed swap"),
+        ("CONFIG_PSI=y", "PSI off — /proc/pressure/memory does not exist, so td-svc oom-watch acts only at its memory floor, after thrashing has begun"),
         ("CONFIG_ZRAM_DEF_COMP_ZSTD=y", "ZRAM_DEF_COMP_ZSTD off — zram0 would compress with another algorithm than the zstd zram-swap asks for"),
         ("CONFIG_SND_PCM=y", "SND_PCM off — /dev/snd/pcmC*D*p would not exist, so td-audio has no device to open (APPLICATIONS.md K.4)"),
         ("CONFIG_SND_HDA_INTEL=y", "SND_HDA_INTEL off — QEMU -device intel-hda and ordinary desktop codecs both go through it, so /proc/asound/pcm would be empty"),

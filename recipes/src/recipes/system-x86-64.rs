@@ -1573,6 +1573,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "zram",
     "td-firstboot",
     "time",
+    "oom-watch",
     "volumes",
     "media",
     "sandbox-default",
@@ -1993,6 +1994,17 @@ fn build_desktop_td_svc_conf() -> String {
          requires=td-firstboot\n\
          restart=on-failure\n\
          log=/var/log/svc/time.log\n\
+         \n\
+         # The early OOM killer (td-svc/DESIGN.md, \"Early OOM\"): kills the\n\
+         # largest workload when memory pressure lasts while memory is scarce,\n\
+         # or memory and swap run out. It never scans /system or the root.\n\
+         [oom-watch]\n\
+         type=daemon\n\
+         exec=/bin/td-svc oom-watch\n\
+         after=td-firstboot\n\
+         restart=always\n\
+         log=/var/log/svc/oom-watch.log\n\
+         console=yes\n\
          \n\
          # Extra volumes (td-disks/DESIGN.md): never waits for a disk, and\n\
          # nothing requires it, so an absent volume costs the boot nothing.\n\
@@ -17631,6 +17643,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         assert!(!build_bootsuccess(&SERVER).contains("/dev/zram0"));
         assert!(build_desktop_td_svc_conf().contains("[zram]\ntype=oneshot\nexec=/bin/zram-swap\n"));
+        assert!(build_desktop_td_svc_conf().contains(
+            "[oom-watch]\ntype=daemon\nexec=/bin/td-svc oom-watch\nafter=td-firstboot\n\
+             restart=always\nlog=/var/log/svc/oom-watch.log\nconsole=yes\n\n"
+        ));
+        assert!(!build_server_td_svc_conf().contains("oom-watch"));
     }
 
     /// Every script that decides to end the boot must go through td-svc.
