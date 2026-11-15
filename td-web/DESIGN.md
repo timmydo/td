@@ -1742,10 +1742,9 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    over, each rung of the cuts by a lowered limit, a cancelled job, and
    each step's charge refused and shrunk; td-web run under a headless
    td-compositor with the pinned faces at 1920x1200 and 3840x2160 over
-   the eight corpus pages (td-dom/DESIGN.md's URLs; The Guardian's
-   front page is refused today by td-css's style pool,
-   td-layout/DESIGN.md §6, and must be admitted), the real pages §5
-   rests on (the WHATWG HTML and ECMAScript specifications cut to 2
+   the eight corpus pages (td-dom/DESIGN.md's URLs; td-css's style
+   pool admits The Guardian's front page, td-layout/DESIGN.md §6), the
+   real pages §5 rests on (the WHATWG HTML and ECMAScript specifications cut to 2
    MiB, SANE's list of backends, long Wikipedia articles), td-layout's
    2 MiB shapes, td-html's hostile ones (one-letter paragraphs in 62
    quotes, list items in 62, a 2 MiB word), hostile sheets for time and

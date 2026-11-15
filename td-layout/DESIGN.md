@@ -985,8 +985,9 @@ print 1280x720; and desktop interaction with the first link focused and
 hovered through its ancestors, plus checked/selected state from attributes.
 All 32 page/configuration combinations of that capture complete with zero
 refusals in all three trials, including full layout, resize and window
-retention. The Guardian's front page fetched again on 2026-11-14 is
-refused by `MAX_POOL_WORK` (below, "Style-pool work on The Guardian"). This
+retention. The Guardian's front page fetched on 2026-11-15 styles and
+lays out within the default limits (below, "Style-pool work on The
+Guardian"). This
 is a workload check, not a visual browser-equivalence claim. Unsupported
 CSS and the fallback formatting in §5 still apply.
 
@@ -1081,10 +1082,12 @@ MAX_PAGE_BYTES: 4 MiB of markup within MAX_NODES can lay out denser than
 any 2 MiB shape, and MAX_PAGE_BYTES then refuses it by name (below).
 
 `Limits::styles` is td-css's PoolLimits, passed to the style pool:
-its `seed`, None by default, keys the pool's style fingerprints, which
-without one td-css takes from addresses ASLR places, with no system call
-(td-css/DESIGN.md, "Computed-style sharing"). A caller with entropy of
-its own passes it there; td-layout adds none.
+its `seed`, None by default, keys the pool's style and custom-map
+fingerprints and the slots of its index tables, which without one td-css
+takes from addresses ASLR places, with no system call (td-css/DESIGN.md,
+"Computed-style sharing"). A caller with entropy of its own passes it
+there; td-layout adds none. The pool's work, and so whether a page meets
+MAX_POOL_WORK, does not depend on it.
 
 `Limits::style_attributes`, true by default, cascades every element as
 if it had no `style` attribute when false: the attribute is not looked
@@ -1402,10 +1405,9 @@ WHATWG's 53.8 million units under mobile, 2.4 times under it. A
 Tailwind-style sheet declaring 40 custom names on `*` costs 2,116 units
 (22 µs) an element, so the ceiling refuses such a page past about
 60,000 elements, in 1.3 s measured. The Guardian's front page is not in
-the table: `MAX_POOL_WORK` refuses it with or without this ceiling
-(below). The ceiling, the flag reads and td-css's new charges cost
-nothing measurable: the corpus cascades above agree within run-to-run
-noise, and when the ceiling was first measured the 2 MiB blocks shape
+the table; its cascade is measured below. The ceiling, the flag reads
+and td-css's new charges cost nothing measurable: the corpus cascades
+above agree within run-to-run noise, and when the ceiling was first measured the 2 MiB blocks shape
 cascaded in 390 then 395 ms (medians of six interleaved rounds) and the
 2 MiB shapes' layouts agreed within 1% with no flag and with an unset
 one. Making td-dom's attribute counts inlinable keeps the `:link`
@@ -1437,28 +1439,23 @@ GitHub's, to a page's costliest element.
 
 ### Style-pool work on The Guardian
 
-The Guardian's international front page fetched on 2026-11-14 (1,404,591
-bytes, HTML SHA-256 `9e295b8cbef09d6f5b6f490febc4582902bbafb7d521d3f5e58e226de2835278`;
-its 20 inline and linked sheets concatenated in source order without media
-wrappers, `8f3ffe4ea4dda34b6c2dd4313564ad1fae15ce9d2fd69f714c353cf6e4a62eef`)
-is refused `Css(Limit("MAX_POOL_WORK"))` in the desktop environment, with
-or without the cascade ceiling, as was an earlier fetch that day. Its
-cascade is not costly: with the pool's work counter unbounded, in scratch
-instrumentation only, the styled document completes in 264 ms with 804
-styles and 8,856,857 cascade units. The pool's work comes to 123,125,413
-visits, 1.83 times MAX_POOL_WORK, and 102,452,455 of them are its
-token-identity index. The pool records each distinct custom-token
-allocation by address and charges each insertion the index's current
-length, the linear shift of its sorted map, so the page's 14,314 distinct
-allocations cost about 14,314²/2. They come from the 78 custom maps the
-pool retains of the 543 that were new by address (465 equalled one already
-kept), about 183 fresh allocations each: an element that declares custom
-properties itself (88,322 local names over 4,176 elements) gets new token
-arrays even where their tokens equal an earlier element's, since identity
-is by address. Traversing those maps (10.7 million visits) and comparing
-them with equal-hash maps (9.1 million) make most of the rest. A page
-reaches the bound at about 10,000 such allocations; the 2026-11-11 capture
-stayed under it.
+The Guardian's international front page fetched on 2026-11-15
+(1,374,527 bytes, HTML SHA-256
+`bab3d56cafd93b35c558e00dde7e2472140c4af33b6e1862918f56d25c837028`;
+its 20 inline and linked sheets in source order, media-wrapped,
+`eceef6f4f780023bd067700bff9e0b498d9e101b8aa413c01163035d54bbdccc`)
+styles in 159 to 165 ms with 734 styles and 21,441,319 pool visits, 32%
+of MAX_POOL_WORK, the same in every process and with fixed keys, and
+lays out at 1280 px in 1.0 ms, 517 lines, 110,955 px tall, under §6's
+deterministic metrics. Its elements declare their own custom
+properties, so each such element brings a new map with new token arrays
+even where its tokens equal an earlier element's: the pool keeps 70
+maps and indexes 13,169 token arrays by address, each lookup and
+insertion a fixed two visits (td-css/DESIGN.md, "Computed-style
+sharing"). Most of the pool's work is traversing those maps and
+comparing them with equal ones, linear in their size; a page reaches
+MAX_POOL_WORK that way, or MAX_POOL_BYTES first, at some 5,000
+distinct maps.
 
 ## 7. Independently landable increments
 
@@ -1482,9 +1479,8 @@ above the window cannot be dropped before the row's height is known. No existing
 consumer switches to this
 library as part of these increments. td-web's integration
 (td-web/DESIGN.md §10, increment 6) needs a style pool
-that admits The Guardian's front page, whose token-identity index
-charges each insertion its length (§6, "Style-pool work on The
-Guardian"). Basic table layout, the automatic and fixed algorithms,
+that admits The Guardian's front page, as td-css's does (§6,
+"Style-pool work on The Guardian"). Basic table layout, the automatic and fixed algorithms,
 `colspan` and `rowspan` within HTML's bounds and MAX_TABLE_COLUMNS,
 separated borders with collapse approximated, vertical alignment and
 captions, is §5's "Tables". List markers as a fragment kind of their own, outside and

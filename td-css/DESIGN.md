@@ -1032,13 +1032,15 @@ canonical value. Equal values with equal custom properties share an ID,
 including separately computed siblings. Custom maps are canonicalized
 independently, and inherited token allocations retain their BudgetShared sharing.
 A fingerprint only selects an equality bucket. Signed zero hashes alike.
-No global cache or tree dependency is introduced. Custom maps, keys of
-arbitrary page strings, keep the standard library's SipHash. A complete
+No global cache or tree dependency is introduced. A custom map is keyed
+by the same fingerprint over its names and tokens. A complete
 style's fingerprint takes about 230 writes, some 1 KiB, which SipHash-1-3
 would run a round per 8-byte block over and buffer write by write; it is
 instead a fold of 64-bit words, each with the state and the pool's own
 key multiplied out to 128 bits and the halves combined (wyhash's mum
-step). No input difference survives that step with certainty, as one
+step). A string is its 8-byte words, its tail zero-padded to one, and
+then its length, so two strings make one word sequence only if equal.
+No input difference survives the mixing step with certainty, as one
 did a multiply-rotate fold's (a sign and an ulp, `calc(3px + 50%)`
 against `calc(-3px + 50.000000000000114%)`, always shared its key, so
 eleven such properties made 2,048 styles one bucket), and a page cannot
@@ -1068,9 +1070,52 @@ cascade before these:
 | Bootstrap 5.3 examples index (65,263 bytes) | 120 / 113 | 58 / 53 |
 
 The blocks cascade's wall time is 398 to 402 ms against 435 to 449
-(fastest of five, three processes each). The Guardian's front page is
-refused MAX_POOL_WORK either way (td-layout/DESIGN.md §6, "Style-pool
-work on The Guardian").
+(fastest of five, three processes each).
+
+The pool's four indexes (style buckets by fingerprint, custom-map
+buckets by fingerprint, canonical custom maps by address and their
+token arrays by address) are open-addressed tables of td-alloc storage,
+at most half full, their slots chosen by the key mixed twice with the
+pool's key, which enters each round, so a slot is no fixed function of
+the key XOR the pool's key. A lookup or an insertion is charged two
+visits whatever it probes, so a new key costs four (a lookup, then an
+insertion), and a table that would pass half full doubles, charged its
+new size, the slots it initialises, before anything is allocated or
+moved, so a refusal leaves it whole. The pool's work is therefore a function of the page
+alone, not of its key or the addresses ASLR gives it. Probes, which do
+depend on those, are counted apart: a table refuses `MAX_POOL_WORK`
+before the probe that would take it past eight an operation and 4,096
+more, and a growth's move, which cannot stop halfway, counts its probes
+after it, so the next probe refuses if they passed the cap; clustering
+cannot cost more than a bounded multiple of the work charged. Bucket order, and so every StyleId and every shared map,
+does not depend on the key either. Measured 2026-11-15, release, pinned
+(fastest of five cascades, three processes; pool work identical in
+every process and with fixed keys):
+
+| Page | Cascade ms | Pool work |
+| --- | ---: | ---: |
+| The Guardian, front page (1,374,527 bytes, its 20 sheets) | 159 to 165 | 21,441,319 (32% of MAX_POOL_WORK), 734 styles |
+| Wikipedia, *Cascading Style Sheets* | 132 to 133 | 858,460 |
+| Bootstrap 5.3 examples index | 10.2 to 10.4 | 955,481 |
+| 2 MiB blocks | 388 to 404 | 12,035,902 |
+| 1,000 / 2,000 / 4,000 elements, each its own one-property map | 6.0 to 6.2, 12.4 to 13.4, 25.8 to 27.0 | 112,364, 225,748, 452,516 |
+| 6,000 such elements | `MAX_POOL_BYTES` at 41 | the pool's 2 KiB a map and a style's charge bind first |
+| 4,000 elements, each its own 21-property map | `MAX_POOL_BYTES` at 95 | |
+| 10,000 elements declaring one equal 20-property map | 330 to 334 | 7,540,032 |
+| 5,000 elements reading a 60-deep `var()` chain | 72 to 74 | 6,650,828 |
+| an 8,000-property map and 2,000 children adding one each | `MAX_POOL_BYTES` at 100 | |
+
+A lookup or an insertion on these pages probes 1.0 to 1.9 slots on
+average, growth's moves aside (The Guardian's 13,169 token addresses
+1.25, its longest run of occupied slots 18 of 32,768). For 14,000
+addresses at strides of 8 to 4,096 bytes under three keys, moves
+included: 1.54 to 1.58 probes an operation over their insertions (two
+operations each), 1.35 to 1.40 a lookup that finds one, 1.97 to 2.08
+one of 14,000 absent addresses, and a longest run of 19 to 31 of 32,768
+slots. Custom maps that collide under every key cannot be written, since
+a string's length follows its bytes; maps equal by value and new by
+address, the case that does reach a bucket, are traversed and compared
+once each, linearly.
 
 Table layout's three longhands (border-collapse, border-spacing,
 table-layout) and the sheet's table rules cost some of that back,
@@ -1089,7 +1134,9 @@ every longhand (a rare-property group, shared until a rule sets one),
 which td-css does not have.
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
-MAX_POOL_WORK (67,108,864 field/component and string-byte visits), and
+MAX_POOL_WORK (67,108,864 visits: fields, components and string bytes
+traversed, two an index lookup or insertion, and each slot an index's
+growth initialises), and
 MAX_STYLE_COMPARISONS (1,048,576 equality probes). These caller-adjustable
 pool limits are separate from the fixed parser/cascade limits in §5.
 Storage charges precede pool retention and include conservative map/node
