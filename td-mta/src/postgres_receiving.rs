@@ -25,6 +25,8 @@ pub use fanout::{
 };
 pub use input::Message;
 pub const MAX_RECEIPTS: i64 = 16_384;
+/// Every inspection or retry of an operation ends within this, then it expires.
+pub const RECEIPT_RETENTION_MS: i64 = 3_600_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -462,6 +464,27 @@ async fn write_delivery(
             crate::postgres_sequence::Error::Integrity => Error::Integrity,
             crate::postgres_sequence::Error::Database => Error::Database,
         })?;
+    // One sample stamps this receipt and sets the expiry cutoff.
+    let created_at: i64 = client
+        .query_one(
+            "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            &[],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Integrity)?;
+    let cutoff = created_at
+        .checked_sub(RECEIPT_RETENTION_MS)
+        .ok_or(Error::Integrity)?;
+    // Under the account write lock, so no owner inspects a row while it expires.
+    client
+        .execute(
+            "DELETE FROM td_mta.receiving_receipts WHERE account=$1 AND created_at<$2",
+            &[&account, &cutoff],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
     let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 LIMIT $2) bounded", &[&account,&MAX_RECEIPTS]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
     if count >= MAX_RECEIPTS {
         return Err(Error::Capacity);
@@ -497,15 +520,6 @@ async fn write_delivery(
     )
     .await
     .map_err(publication_error)?;
-    let created_at: i64 = client
-        .query_one(
-            "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
-            &[],
-        )
-        .await
-        .map_err(|_| Error::Database)?
-        .try_get(0)
-        .map_err(|_| Error::Integrity)?;
     publication::write_blob(
         client,
         publication::Blob {

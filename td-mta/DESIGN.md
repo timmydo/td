@@ -1935,10 +1935,11 @@ names remain envelope metadata. Provision exactly one Inbox before receipt
 and forbid its deletion or role reassignment while receiving is enabled.
 Final DATA success requires one PostgreSQL transaction covering every distinct
 accepted recipient account. Account-scoped receiving receipts share an operation
-and a digest of the complete target set and private provenance; inspection must
-find all matching receipts or none. Independent partial writes cannot masquerade
-as success. Each account's stored receipt contains only its accepted envelope
-recipients, preserving recipient privacy across accounts.
+and a digest of the complete target set and private provenance; inspection
+within the receipt retention (POSTGRES.md section 46) must find all matching
+receipts or none. Independent partial writes cannot masquerade as success.
+Each account's stored receipt contains only its accepted envelope recipients,
+preserving recipient privacy across accounts.
 
 Parse command/data boundaries across arbitrary network chunks. Strict CRLF,
 dot-stuffing and termination rules prevent SMTP smuggling. Never interpret DATA

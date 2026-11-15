@@ -1963,14 +1963,32 @@ anchor lookup, and publishes body chunks, SMTP provenance and ordered envelope
 recipients, one unread/unstarred Email, membership, anchor, history, shared
 quota effects and the operation receipt in one synchronous transaction.
 Each delivery advances account state once; repeated envelope recipients still
-produce one Email. Body and blob quotas are charged once. Retained receipts
-are capped at 16,384 per account and survive deletion of the delivered Email.
+produce one Email. Body and blob quotas are charged once. Receipts survive
+deletion of the delivered Email and are kept for at least one hour, measured
+by the database clock that stamped them. Each publication samples that clock
+once, stamps its receipt with it and, under its account write lock, first
+deletes only that account's receipts older than one hour before the sample.
+It then refuses with Capacity only while 16,384 younger receipts remain, so a
+full ledger is an hour-long flood bound, never a lifetime one. An idle
+account keeps expired receipts until its next publication; capacity
+inspection counts only unexpired ones. Receipts stamped while the clock ran
+ahead expire once it catches up. No operator procedure is needed for receipts
+left by an older binary.
 
 Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
 account publisher and uses the retained operation/digest; known success stays
 success after policy replacement. This is internal delivery recovery, not
-cross-session SMTP deduplication. Runtime connection/gateway authorization,
-ingress reservations, retention/reclamation and activation remain runtime integration work.
+cross-session SMTP deduplication. Every inspection, settlement or retry of an
+operation, in process or after restart, must finish within one hour of its
+publication attempt. Today publish inspects and writes within its own
+deadline, an indeterminate commit stops the receiving service, and no
+durable custody carries an operation across restart; later in-process
+settlement or restart custody must keep the same bound. After expiry an
+operation is not replayable: a single delivery inspects as absent and a
+republication refuses with Conflict on its retained Email identity, while a
+fanout may inspect as Integrity because each account expires lazily.
+Runtime connection/gateway authorization, ingress reservations and
+activation remain runtime integration work.
 
 ## 47. Verified submission input preparation
 
