@@ -2,7 +2,10 @@ use crate::application::ApplicationDeclaration;
 use crate::types::{Recipe, Step};
 use td_engine::application_spec::dynamic_application_policy;
 use td_engine::launcher::LauncherDeclaration;
-use td_engine::permissions::{BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket};
+use td_engine::permissions::{
+    BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket, DEFAULT_MEMORY_HIGH_BYTES,
+    DEFAULT_PIDS_MAX,
+};
 
 /// The runtime policy the declaration names; td-app holds the fetched
 /// runtime to it at admission.
@@ -48,6 +51,11 @@ pub fn recipe() -> Recipe {
         // The remote-control name appends an encoding of the profile; the
         // portal's OpenURI hands links to it (APPLICATIONS.md §E).
         .and_then(|value| value.with_session_bus("org.mozilla.firefox.*", BusAccess::Own))
+        // memory-max is also each process's RLIMIT_DATA; why 1.75 GiB is in
+        // APPLICATIONS.md §B.3.1.
+        .and_then(|value| value.with_memory_high(DEFAULT_MEMORY_HIGH_BYTES))
+        .and_then(|value| value.with_memory_max(1792 * 1024 * 1024))
+        .and_then(|value| value.with_pids_max(DEFAULT_PIDS_MAX))
     else {
         return invalid_recipe("permissions");
     };
@@ -98,14 +106,14 @@ mod tests {
     }
 
     #[test]
-    fn first_policy_is_wayland_pulse_network_handoff_and_the_firefox_bus_names() {
+    fn policy_is_wayland_pulse_network_handoff_bus_names_and_a_1_75_gib_ceiling() {
         let policy = recipe()
             .application_permissions
             .expect("permission policy")
             .to_keyfile();
         assert_eq!(
             policy,
-            "format=1\n\n[Context]\nshared=network\nsockets=wayland;pulseaudio\n\n[Filesystem]\n~/Opened=ro\n\n[Session Bus Policy]\norg.mozilla.firefox=own\norg.mozilla.firefox.*=own\n"
+            "format=1\n\n[Context]\nshared=network\nsockets=wayland;pulseaudio\n\n[Filesystem]\n~/Opened=ro\n\n[Session Bus Policy]\norg.mozilla.firefox=own\norg.mozilla.firefox.*=own\n\n[Resources]\nmemory-high=1073741824\nmemory-max=1879048192\npids-max=1024\n"
         );
     }
 }

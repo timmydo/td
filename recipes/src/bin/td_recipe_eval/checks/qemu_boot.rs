@@ -385,9 +385,10 @@ const KEXEC_STAGE2_MARKER: &str = td_recipe::shared::KEXEC_STAGE2_MARKER;
 /// side can assert it outlasts the loop it is waiting for; see there.
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::shared::DEFAULT_BOOT_TIMEOUT_SECS;
 const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::shared::QEMU_GUEST_WAIT_MARGIN_SECS;
-// The dynamic Firefox jail may use 1.25 GiB while the compositor, terminal and
+// The dynamic Firefox jail may use 1.75 GiB while the compositor, terminal and
 // next kexec kernel remain live. Keep the guest above that enforced application
-// ceiling rather than making host memory pressure look like a browser failure.
+// ceiling rather than making host memory pressure look like a browser failure;
+// its 1 GiB memory-high throttles it well before the narrower margin matters.
 pub(crate) const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
 pub(crate) const QEMU_USER_NETDEV: &str = "user,id=net0";
 pub(crate) const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";

@@ -1587,9 +1587,23 @@ process exit as the end of the instance and reaps that survivor, so the
 replacement cannot become the supervised application. Disabling only that
 automatic restart keeps the direct process as lifecycle authority; an explicit
 safe-mode launch remains available. The repeated-volume QEMU sequence below is
-the regression. Firefox's omitted resource section deliberately selects the
-reviewed 1 GiB high, 1.25 GiB max, 1,024-task and one-CPU baseline above for
-first-window bring-up; later tuning requires measured jailed-browser evidence
+the regression. Firefox's resource section keeps the baseline's 1 GiB high,
+1,024 tasks and one CPU, and raises max to 1.75 GiB on measured jailed-browser
+evidence. td-jail sets each process's `RLIMIT_DATA` to `memory-max` (§P).
+After Flathub's `stable` Firefox moved from commit `df51b800` to `6e1de891`
+on an unchanged runtime, the system boot's navigation soak failed twice the
+same way: a mapping by one Firefox process's DOM Worker thread was refused
+at 1,439,047,680 and then 1,441,292,288 bytes of private writable mappings,
+over the baseline's 1.25 GiB, and Firefox then exited. Those figures are
+what the refused requests would have reached, a floor on that process's
+demand rather than its peak. The cgroup charge in the same boots, read before
+the soak, was under 0.5 GiB, and their consoles report no OOM kill around the
+failure, so the max is raised for the per-process reservation ceiling, not
+for a larger working set, though the cgroup's hard ceiling rises with it;
+reclaim pressure still starts at the 1 GiB high. With 1.75 GiB the same
+Firefox commit passes the soak. The 1.75 GiB max stays below the 2 GiB system
+test and stock VM guests, so the hard cap there still bounds the browser
+below the guest's RAM. Further tuning likewise requires measured evidence
 rather than an unreviewed package guess.
 
 The dynamic validator, a recipe's terminal `validateDynamicApplication`
