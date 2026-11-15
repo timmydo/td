@@ -99,7 +99,14 @@ including through negation or logical functions.
 `Element: Copy` is a cheap handle into the caller's stable tree. It
 exposes `tag_name`, `attribute`, `parent`, `previous_sibling`,
 `next_sibling`, `first_child`, `has_text`, and `is_link`. Attributes are
-queried by ASCII-lowercase name, including `id` and `class`. The caller
+queried by ASCII-lowercase name, including `id` and `class`.
+`attribute_count`, zero by default, tells td-css how many attributes an
+`attribute` lookup may compare, and `link_attribute_count`, also zero
+by default, how many an `is_link` call may; each such lookup, the
+index's `id` and `class` reads included, costs a match step for every
+four of them. td-dom reports the element's attribute count, since
+td-html's lookup scans them in turn, and for `is_link` only on `a` and
+`area`, the elements it looks for `href` on. The caller
 ignores comments in `has_text`, supplies element-only sibling/child
 links, and keeps these observations stable for one operation. It owns
 HTML link semantics and `state(State::{Hover, Focus, Checked})`, whose
@@ -107,7 +114,8 @@ default is false. The caller supplies hover propagation, focus and
 checked/selected host-language semantics; td-css does not infer these
 from attributes. There is no visited State variant. No references or handles escape a matching call.
 Callbacks must return promptly; td-css cannot bound time spent inside a
-caller callback. Traversal is budgeted even if a faulty tree cycles.
+caller callback beyond what `attribute_count` and `link_attribute_count`
+report. Traversal is budgeted even if a faulty tree cycles.
 
 ## 3. Cascade
 
@@ -180,7 +188,16 @@ the cascade. Supports accepts valid custom declarations and syntactically
 valid var() on implemented properties without requiring a variable value.
 
 Computed custom maps share immutable parent data when there are no local
-changes; changed maps share token arrays. Invalid entries count toward
+changes; changed maps share token arrays, built by one ordered merge of
+the parent's entries with the element's resolved ones, and count each
+parent entry they copy. Each entry keeps its stored bytes beside it, so
+an override subtracts the replaced value's bytes without walking it.
+The element's own custom declarations are collected, sorted by name and
+priority once, and each name's last kept; each declaration's references
+are collected, sorted and deduplicated once; and the dependency graph,
+cycle detection and resolution are indexed by a name's position among
+the element's sorted names. So the order names are declared, referenced
+or visited in costs nothing more. Invalid entries count toward
 the map limit so repeated invalid names cannot accumulate without bound.
 Graph visits, reference names and copied components share one substitution
 budget per compute call, including pending shorthand reparsing. Payload
@@ -546,7 +563,7 @@ MAX_STYLE_BYTES.
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
 | MAX_SELECTOR_DEPTH | 8 nested logical functions |
 | MAX_COMPOUNDS | 64 compounds per complex selector |
-| MAX_MATCH_STEPS | 150,000 selector tests, tree hops, inspected string bytes, index lookups and gathered bucket entries per public match or compute call |
+| MAX_MATCH_STEPS | 150,000 selector tests, tree hops, inspected string bytes, index lookups, gathered bucket entries, every four attributes a lookup may compare and every four bytes a case-insensitive substring test searches, per public match or compute call |
 | MAX_INDEX_ENTRIES | 262,144 rule-to-bucket entries per style set |
 | MAX_ELEMENT_BYTES | 65,536 bytes per observed tag or attribute string |
 | MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
@@ -627,8 +644,15 @@ an element, optional parent `ComputedStyle`, root font size and inline
 style text. `ComputedStyle` exposes typed read-only property values.
 `compute_with_stats` has the same arguments plus a mutable `ComputeStats`.
 It resets and returns candidate-rule, matched-rule and consumed match-step
-counts, plus substitution component and byte charges, even on refusal. Candidate count is zero if gathering fails before
-completion; consumed steps exclude the charge that refused. `compute`
+counts, the inspected string bytes among those steps, the declarations of
+matched rules and inline style taken into the cascade (custom ones
+included) and the custom ones among them, the distinct custom names
+declared on the element itself, the parent entries its changed custom
+map copied, and substitution component and byte charges, even on
+refusal. Candidate
+count is zero if gathering fails before completion; consumed steps
+exclude the charge that refused. td-layout sums them into its page-wide
+cascade ceiling (td-layout/DESIGN.md §6). `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
 td-web's styled pages (td-web/DESIGN.md §10) will compile through

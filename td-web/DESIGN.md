@@ -1000,7 +1000,11 @@ between elements as it cascades and as it lays out (increment 6); so
 `Escape` stops the cascade and the layout, not only the waiting for
 them, and the render thread takes the next job. Decoding, parsing and
 compiling are bounded by their limits but not cancelled: a stopped job
-finishes the one it is in and then sees its flag.
+finishes the one it is in and then sees its flag. td-layout tests its
+limits before the flag, and a flag set during the last element or after
+layout's last read can still return the result, so td-web tests its own
+flag after each step, before taking a result or stepping down on a
+refusal.
 
 The viewport, in CSS pixels, is the page pane less a cell's inset each
 side, divided by the scale, and never narrower than `MIN_WRAP_EMS` ems;
@@ -1550,13 +1554,16 @@ measured 1.3 to 6 ms an element against 2,000 to 10,000 universal
 element where every element takes a `var()` of 30,000 to 40,000
 tokens, 33.7 s for 20,000 paragraphs: minutes at 2 MiB or at
 `MAX_NODES`, again at every resize. td-layout's page-wide cascade work
-ceiling (increment 6) sums both, each element's match steps and its
-substitution charges as td-css's `ComputeStats` reports them, and with
-its layout work ceiling
-(`MAX_LAYOUT_WORK`) is sized so a page costs the render thread a few
-seconds at most on the development host, measured at the cutover; a
-page past it steps down (above, "Cuts") rather than being endured, and
-the cancel flag ends superseded or stopped work between elements.
+ceiling (`MAX_CASCADE_WORK`) sums both, with the declarations, custom
+names, inherited custom entries copied and attribute scans each element
+costs, as td-css's `ComputeStats` reports them; the costliest page it
+accepts cascades in about 3.5 s on the development host, and its
+costliest element, which bounds how late a cancel flag is seen, takes
+17 to 21 ms (td-layout/DESIGN.md §3 and §6). With its layout work ceiling
+(`MAX_LAYOUT_WORK`) it is sized so a page costs the render thread a few
+seconds at most, measured again at the cutover; a page past it steps
+down (above, "Cuts") rather than being endured, and the cancel flag ends
+superseded or stopped work between elements.
 
 No new syscall: td-css, td-dom and td-layout are std-only computation
 in td-web's process, so its allowlist (§3) is derived as before and
@@ -1590,14 +1597,17 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      so a page's tables line up as §5's do rather than stacking as
      blocks; an input limit a caller sets, up to 4 MiB for a text
      page's single text node, beside its 2 MiB `MAX_PAGE_INPUT` for
-     markup; a page-wide cascade work ceiling in its `Limits`, summing
-     each element's match steps and substitution charges, refused by
-     name; a cancel flag checked between elements as it cascades and
-     as it lays out; a line past `MAX_LINE_SCALARS` cut and marked
-     rather than refused; tab stops every eight columns where white
-     space is preserved; a cascade without `style` attributes; and a
-     byte limit for each layout request, where today it is fixed when
-     the page is cascaded.
+     markup; a line past `MAX_LINE_SCALARS` cut and marked rather than
+     refused; tab stops every eight columns where white space is
+     preserved; a cascade without `style` attributes; and a byte limit
+     for each layout request, where today it is fixed when the page is
+     cascaded. Available: a page-wide cascade work ceiling in its
+     `Limits` (`MAX_CASCADE_WORK`), summing each element's weighted
+     match steps, declarations, custom names, inherited custom copies
+     and substitution charges, refused by name; and a cancel flag (`Limits::cancel`,
+     `Request::cancel`) read between elements as it cascades and every
+     4,096 work units as it lays out, refusing with `Cancelled`
+     (td-layout/DESIGN.md §3 and §6).
    - **td-css** (available): the owned-budget API supplies compilation
      admission; `rgb()`, `hsl()`, CSS Color 4's named colours and the
      `background` shorthand's colour; and `StyleSet::from_sheets`, media
@@ -1634,7 +1644,9 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    over, each rung of the cuts by a lowered limit, a cancelled job, and
    each step's charge refused and shrunk; td-web run under a headless
    td-compositor with the pinned faces at 1920x1200 and 3840x2160 over
-   the eight corpus pages (td-dom/DESIGN.md's URLs), the real pages §5
+   the eight corpus pages (td-dom/DESIGN.md's URLs; The Guardian's
+   front page is refused today by td-css's style pool,
+   td-layout/DESIGN.md §6, and must be admitted), the real pages §5
    rests on (the WHATWG HTML and ECMAScript specifications cut to 2
    MiB, SANE's list of backends, long Wikipedia articles), td-layout's
    2 MiB shapes, td-html's hostile ones (one-letter paragraphs in 62

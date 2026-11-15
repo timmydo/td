@@ -1363,3 +1363,26 @@ fn shared_root_exhaustion_refuses_scratch_without_disturbing_retained_styles() {
     drop(computation);
     assert_eq!(root.used(), Budget::metadata_bytes());
 }
+
+#[test]
+fn stats_count_declarations_local_custom_names_and_inspected_bytes() {
+    let nodes = tree();
+    let element = Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let set =
+        StyleSet::new(&[(Origin::Author, "p{color:red;width:1px;--a:1;--b:2;--a:3}")]).unwrap();
+    let mut stats = ComputeStats::default();
+    set.compute_with_stats(&element, None, 16.0, "--c:1;height:2px", &mut stats)
+        .unwrap();
+    assert_eq!(stats.declarations, 7);
+    assert_eq!(stats.local_custom_properties, 3);
+    // Only the attribute test reads strings: its value and the element's.
+    let set = StyleSet::new(&[(Origin::Author, "*[data-x=zz]{color:blue}")]).unwrap();
+    set.compute_with_stats(&element, None, 16.0, "", &mut stats)
+        .unwrap();
+    assert_eq!(stats.match_bytes, 2 + "Alpha Beta".len());
+    assert!(stats.match_steps > stats.match_bytes);
+    assert_eq!((stats.declarations, stats.local_custom_properties), (0, 0));
+}

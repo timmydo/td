@@ -2,11 +2,10 @@
 use crate::conditions::{self, Environment};
 use crate::selectors::{Element, MatchBudget, SelectorList, Specificity};
 use crate::syntax;
-use crate::syntax::Text;
 use crate::values::{
     self, ComputedStyle, Property, Specified, ValueDeclaration, MAX_ABSOLUTE_VALUE,
 };
-use crate::variables::{self, CustomDeclaration, CustomSpecified};
+use crate::variables::{self, CustomDeclaration};
 use crate::{Error, MAX_DECLARATIONS};
 use td_alloc::{Budget, BudgetMap, BudgetVec};
 
@@ -141,8 +140,20 @@ pub struct ComputeStats {
     pub candidate_rules: usize,
     pub matched_rules: usize,
     pub match_steps: usize,
+    /// The part of match_steps that charged inspected string bytes.
+    pub match_bytes: usize,
     pub substitution_components: usize,
     pub substitution_bytes: usize,
+    /// Declarations of matched rules and inline style taken into the
+    /// cascade, custom properties included.
+    pub declarations: usize,
+    /// The custom ones among declarations.
+    pub custom_declarations: usize,
+    /// Distinct custom names declared on the element itself, each of which
+    /// its computation resolves.
+    pub local_custom_properties: usize,
+    /// Inherited custom properties copied into the element's changed map.
+    pub custom_copies: usize,
 }
 
 struct Work {
@@ -342,8 +353,10 @@ impl StyleSet {
         let mut work = Work::new(memory)?;
         let result = self.compute_inner(element, parent, root_font_size, inline, &mut work);
         work.stats.match_steps = work.budget.used();
+        work.stats.match_bytes = work.budget.bytes();
         work.stats.substitution_components = work.substitution.components;
         work.stats.substitution_bytes = work.substitution.bytes;
+        work.stats.custom_copies = work.substitution.copies;
         *stats = work.stats;
         result
     }
@@ -361,7 +374,10 @@ impl StyleSet {
         }
         let memory = work.substitution.memory.try_clone()?;
         let mut winners = BudgetMap::new(&memory)?;
-        let mut custom_winners = BudgetMap::new(&memory)?;
+        // Custom declarations are sorted once rather than inserted one by
+        // one: a map's shifting insertion is quadratic in descending names.
+        let mut inline_custom = td_alloc::BudgetVec::new(&memory)?;
+        let mut custom_candidates = td_alloc::BudgetVec::new(&memory)?;
         #[cfg(not(test))]
         let candidates = self.index.candidates(element, &mut work.budget, &memory)?;
         #[cfg(test)]
@@ -385,6 +401,11 @@ impl StyleSet {
             let specificity = rule.selectors.matches_with(element, &mut work.budget)?;
             if let Some(specificity) = specificity {
                 work.stats.matched_rules += 1;
+                work.stats.declarations = work
+                    .stats
+                    .declarations
+                    .saturating_add(rule.declarations.len())
+                    .saturating_add(rule.custom.len());
                 for declaration in &rule.declarations {
                     choose(
                         &mut winners,
@@ -399,8 +420,7 @@ impl StyleSet {
                     order += 1;
                 }
                 for declaration in &rule.custom {
-                    choose_custom(
-                        &mut custom_winners,
+                    custom_candidates.try_push((
                         declaration,
                         Priority {
                             rank: rule.origin.rank(declaration.important),
@@ -408,7 +428,7 @@ impl StyleSet {
                             specificity,
                             order,
                         },
-                    )?;
+                    ))?;
                     order += 1;
                 }
             }
@@ -421,16 +441,14 @@ impl StyleSet {
                     return Err(Error::Limit("MAX_DECLARATIONS"));
                 }
                 count += 1;
-                choose_custom(
-                    &mut custom_winners,
-                    &custom,
-                    Priority {
-                        rank: Origin::Author.rank(custom.important),
-                        inline: true,
-                        specificity: Specificity::default(),
-                        order,
-                    },
-                )?;
+                work.stats.declarations = work.stats.declarations.saturating_add(1);
+                let priority = Priority {
+                    rank: Origin::Author.rank(custom.important),
+                    inline: true,
+                    specificity: Specificity::default(),
+                    order,
+                };
+                inline_custom.try_push((custom, priority))?;
                 order += 1;
                 continue;
             }
@@ -439,6 +457,7 @@ impl StyleSet {
                     return Err(Error::Limit("MAX_DECLARATIONS"));
                 }
                 count += 1;
+                work.stats.declarations = work.stats.declarations.saturating_add(1);
                 choose(
                     &mut winners,
                     &value,
@@ -452,10 +471,30 @@ impl StyleSet {
                 order += 1;
             }
         }
-        let mut custom_local = BudgetMap::new(&memory)?;
-        for (name, winner) in custom_winners {
-            custom_local.try_insert(name, winner.value)?;
+        for (declaration, priority) in inline_custom.iter() {
+            custom_candidates.try_push((declaration, *priority))?;
         }
+        work.stats.custom_declarations = custom_candidates.len();
+        custom_candidates.sort_unstable_by(|(a, x), (b, y)| a.name.cmp(&b.name).then(x.cmp(y)));
+        // Each name's last candidate has the highest priority and wins.
+        let mut custom_local = BudgetMap::new(&memory)?;
+        let mut winners_of = custom_candidates.iter().peekable();
+        while let Some((declaration, _)) = winners_of.next() {
+            if winners_of
+                .peek()
+                .is_some_and(|(next, _)| next.name == declaration.name)
+            {
+                continue;
+            }
+            if custom_local.len() == variables::MAX_CUSTOM_PROPERTIES {
+                return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
+            }
+            custom_local.try_insert(
+                declaration.name.try_clone()?,
+                declaration.value.try_clone()?,
+            )?;
+        }
+        work.stats.local_custom_properties = custom_local.len();
         let custom = variables::compute(
             custom_local,
             parent.map(|p| &p.custom),
@@ -706,32 +745,108 @@ fn choose(
     Ok(())
 }
 
-struct CustomWinner {
-    priority: Priority,
-    value: CustomSpecified,
-}
-fn choose_custom(
-    winners: &mut BudgetMap<Text, CustomWinner>,
-    declaration: &CustomDeclaration,
-    priority: Priority,
-) -> Result<(), Error> {
-    let old = winners.get(&declaration.name);
-    if old.is_none() && winners.len() == variables::MAX_CUSTOM_PROPERTIES {
-        return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
-    }
-    if old.is_none_or(|winner| priority >= winner.priority) {
-        winners.try_insert(
-            declaration.name.try_clone()?,
-            CustomWinner {
-                priority,
-                value: declaration.value.try_clone()?,
-            },
-        )?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod sheet_tests;
 #[cfg(test)]
 mod tests;
+// Inline so its generated fixtures stay outside the scanned test file.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod winner_tests {
+    use super::*;
+    use crate::test_tree::{tree, Handle};
+    #[test]
+    fn custom_winners_are_sorted_once_and_attribute_scans_are_charged() {
+        let nodes = tree();
+        let element = Handle {
+            nodes: &nodes,
+            index: 3,
+        };
+        // Descending names, repeated: each name's highest-priority one wins.
+        let css = "p{--c:red;--b:red;--a:red}p{--c:blue;--a:lime}p{--c:navy!important}";
+        let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
+        let mut stats = ComputeStats::default();
+        let style = set
+            .compute_with_stats(&element, None, 16.0, "--b:teal;--c:aqua", &mut stats)
+            .unwrap();
+        assert_eq!(stats.custom_declarations, 8);
+        assert_eq!(stats.local_custom_properties, 3);
+        for (name, value) in [("--a", "lime"), ("--b", "teal"), ("--c", "navy")] {
+            let tokens = style.custom_property(name).unwrap();
+            assert_eq!(
+                syntax::trim(tokens).first().and_then(|c| c.ident()),
+                Some(value)
+            );
+        }
+        // A lookup pays for the attributes it compares, a step for every four.
+        let steps = |attrs: Vec<(&'static str, String)>, css: &str| {
+            let mut nodes = tree();
+            nodes[3].attrs = attrs;
+            let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
+            let mut stats = ComputeStats::default();
+            set.compute_with_stats(
+                &Handle {
+                    nodes: &nodes,
+                    index: 3,
+                },
+                None,
+                16.0,
+                "",
+                &mut stats,
+            )
+            .unwrap();
+            stats.match_steps
+        };
+        let many: Vec<_> = (0..256)
+            .map(|i| {
+                (
+                    &*Box::leak(format!("x{i:03}").into_boxed_str()),
+                    String::new(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            steps(many, "[x255]{color:red}")
+                - steps(vec![("x255", String::new())], "[x255]{color:red}"),
+            64
+        );
+        // A case-folded substring search pays for its bytes again.
+        let long = || vec![("t", "a".repeat(100))];
+        assert_eq!(
+            steps(long(), "[t*=zz i]{color:red}") - steps(long(), "[t*=zz]{color:red}"),
+            25
+        );
+        // `:link` pays only where the caller compares attributes for it.
+        let link = |tag: &'static str, attrs: Vec<(&'static str, String)>| {
+            let mut nodes = tree();
+            nodes[3].tag = tag;
+            nodes[3].attrs = attrs;
+            let set = StyleSet::new(&[(Origin::Author, ":link{color:red}")]).unwrap();
+            let mut stats = ComputeStats::default();
+            set.compute_with_stats(
+                &Handle {
+                    nodes: &nodes,
+                    index: 3,
+                },
+                None,
+                16.0,
+                "",
+                &mut stats,
+            )
+            .unwrap();
+            stats.match_steps
+        };
+        let wide = || {
+            (0..256)
+                .map(|i| {
+                    (
+                        &*Box::leak(format!("y{i:03}").into_boxed_str()),
+                        String::new(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(link("p", wide()), link("p", Vec::new()));
+        assert_eq!(link("a", wide()) - link("a", Vec::new()), 64);
+    }
+}

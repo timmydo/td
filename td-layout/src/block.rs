@@ -4,6 +4,7 @@ use crate::inline::{
 };
 use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument};
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
@@ -41,20 +42,23 @@ impl Edges {
     }
 }
 #[derive(Clone, Debug)]
-pub struct Request {
+pub struct Request<'c> {
     pub width: f64,
     pub height: f64,
     pub window: Option<Range<f64>>,
     /// Old layout output kept alive during this call, excluding shared input.
     pub retained_output_bytes: usize,
+    /// Read every CANCEL_INTERVAL work units; another thread may set it.
+    pub cancel: Option<&'c AtomicBool>,
 }
-impl Request {
+impl Request<'_> {
     pub fn new(width: f64, height: f64) -> Self {
         Self {
             width,
             height,
             window: None,
             retained_output_bytes: 0,
+            cancel: None,
         }
     }
 }
@@ -82,7 +86,7 @@ pub struct Layout {
 pub fn layout(
     styled: &StyledDocument<'_>,
     metrics: &mut impl FontMetrics,
-    request: &Request,
+    request: &Request<'_>,
 ) -> Result<Layout, Error> {
     layout_with_budget(styled, metrics, request, styled.budget())
 }
@@ -90,7 +94,7 @@ pub fn layout(
 pub fn layout_with_budget(
     styled: &StyledDocument<'_>,
     metrics: &mut impl FontMetrics,
-    request: &Request,
+    request: &Request<'_>,
     memory: &Budget,
 ) -> Result<Layout, Error> {
     for n in [request.width, request.height] {
@@ -105,7 +109,9 @@ pub fn layout_with_budget(
     {
         return Err(Error::Invalid);
     }
-    let mut counters = Counters::new(styled);
+    let mut counters = Counters::new(styled, request.cancel);
+    // The first tick reads the flag before anything is allocated.
+    counters.step(0)?;
     counters.charge(request.retained_output_bytes)?;
     let initial = counters.bytes;
     // Every ordinary block and block-level image emits one geometry record,
@@ -174,8 +180,8 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     styled: &'s StyledDocument<'d>,
     memory: &'s Budget,
     metrics: &'m mut M,
-    counters: Counters,
-    request: &'r Request,
+    counters: Counters<'r>,
+    request: &'r Request<'r>,
     boxes: BudgetVec<BoxGeometry>,
     lines: BudgetVec<Line>,
     pending: BudgetVec<Pending>,

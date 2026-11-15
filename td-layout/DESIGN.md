@@ -110,13 +110,43 @@ StyledDocument::new(document, sheets, input_bytes, limits) constructs shared sty
 box records. NodeId always belongs to the retained or borrowed document. StyleId is
 local to this styled document; accessors return Option for invalid IDs.
 `block::layout` takes the styled document, mutable FontMetrics and a
-Request with viewport dimensions, an optional vertical window and the
-charged bytes of any previous layout output retained during the call. Its Result owns
+Request with viewport dimensions, an optional vertical window, the
+charged bytes of any previous layout output retained during the call and
+an optional cancel flag (below). Its Result owns
 geometry and emitted lines, with resource usage and work counters.
 BoxGeometry records are in postorder and name DOM elements; this is not
 a paint-order API. `output_bytes` excludes the shared styled document,
 so it can be passed as `retained_output_bytes` on a resize request. Refusal
 is an error, never successful partial output. There is no implicit I/O.
+`cascade_work()` reports what the cascade spent (§6, "Cascade work").
+
+**Cancellation.** `Limits::cancel` and `Request::cancel` each take an
+optional `&AtomicBool`, which another thread may set while the call runs.
+Construction reads it before it starts, before each element's cascade and
+every `CANCEL_INTERVAL` (4,096) nodes of box generation; layout reads it at
+its first work tick and then once every 4,096 units of `MAX_LAYOUT_WORK`,
+which every box, line and scalar visit charges. A set flag returns
+`Error::Cancelled`, distinct from every limit. As with any refusal, the call
+drops all it built, so its budget's use returns to what it was before the
+call. A cascade stops once the element it is computing is done, so it sees
+the flag at most one element's work late. td-css's caps for one compute
+call bound that work, not a time. The costliest elements measured within
+them (§6, "Cascade work") take 17 to 21 ms on the measured host, varying
+with its load: 2,400 custom names each substituting a 50-word value,
+just under MAX_SUBSTITUTION_COMPONENTS, and 2,000 such names with 5,000
+inherited ones and 15,000 universal `:not()` rules. Interning an
+element's style, bounded by `MAX_POOL_WORK`, adds less: an element whose
+8,000-name custom map the pool interns beside another's costs about 8 ms
+in all, and the next such element is refused. Layout sees
+it within 4,096 units, well under a millisecond. Limits are tested before
+the flag, so a call past a limit refuses by name even when cancelled; and
+a flag set while the last element cascades, or after layout's last read,
+can still return Ok. A caller that must not use superseded work tests its
+own flag after the call. td-dom's projection, which
+construction builds before the cascade, and `inline::wrap_text`, which has
+no request, read no flag. The flag is loaded with relaxed ordering: it
+publishes nothing else. A styled document keeps no flag, as `limits()`
+shows: each layout names its own.
 
 Every TextFragment carries a DOM **text NodeId and UTF-8 byte range** into
 that node, its StyleId, position and extent. Offsets are into decoded DOM
@@ -267,6 +297,7 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_STYLE_COMPARISONS | 1,048,576 | pool equality probes |
 | MAX_DEPTH | 256 | layout ancestor stack |
 | MAX_LAYOUT_WORK | 64,000,000 | visited records/scalars per layout |
+| MAX_CASCADE_WORK | 128,000,000 | weighted cascade units per styled document |
 | MAX_LINE_SCALARS | 65,536 | pending single-line scratch |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
 | MAX_FRAGMENTS | 1,048,576 | emitted text/replaced fragments |
@@ -290,8 +321,8 @@ synthetic font metrics; individual runs ranged from **82 to 226 ms** on
 the measured host. These figures exclude HTML parsing, cascade and the
 release of the previous output. A full recascade is much more expensive
 for many-element pages. This is synchronous O(page) work, not a guarantee
-of an interactive frame time; cancellation and scheduling belong to the
-future consumer.
+of an interactive frame time; the caller's flag (§3) can stop it, and
+scheduling belongs to the consumer.
 
 Line boxes can be emitted lazily for a half-open vertical window: measure
 the whole flow, retain block geometry, emit only intersecting logical line
@@ -343,8 +374,10 @@ source order, with link/style media attributes wrapped as @media. No
 that earlier experiment: screen 1280x720 light; screen 390x844 dark;
 print 1280x720; and desktop interaction with the first link focused and
 hovered through its ancestors, plus checked/selected state from attributes.
-All 32 page/configuration combinations complete with zero refusals in all
-three trials, including full layout, resize and window retention. This
+All 32 page/configuration combinations of that capture complete with zero
+refusals in all three trials, including full layout, resize and window
+retention. The Guardian's front page fetched again on 2026-11-14 is
+refused by `MAX_POOL_WORK` (below, "Style-pool work on The Guardian"). This
 is a workload check, not a visual browser-equivalence claim. Unsupported
 CSS and the fallback formatting in §5 still apply.
 
@@ -417,6 +450,208 @@ block shape that refuses overlapping output under a lowered page budget,
 and repeated global custom properties shared by differently colored
 siblings. Timing and RSS are deliberately not assertions in the gate.
 
+### Cascade work
+
+td-css bounds each compute call, not a page (td-css/DESIGN.md §5), so a
+cascade could cost its elements times td-css's bound for one. A styled
+document therefore sums each element's `ComputeStats` into `CascadeWork`,
+which `cascade_work()` reports, and refuses `Limit("MAX_CASCADE_WORK")`
+once the weighted total passes `Limits::cascade_work`, whose default and
+maximum is MAX_CASCADE_WORK. It is checked after each element, so the
+total overshoots by at most one element's work. An element costs 64
+units, plus:
+
+- one for each match step that is not an inspected string byte (selector
+  tests, tree hops, index lookups, gathered bucket entries, and the step
+  td-css charges for every four attributes a lookup may compare and every
+  four bytes a case-insensitive substring test searches), each candidate
+  rule and each declaration taken into the cascade, custom ones included;
+- one more for each candidate rule for every 2,048 the element gathers,
+  since ordering them costs more as there are more;
+- six more for each custom declaration and for each inherited custom
+  entry copied into a changed map;
+- one for every 16 inspected string bytes and every 64 substitution
+  payload bytes;
+- five for each substitution component, graph visit or reference;
+- for each custom name the element declares itself, 6 times the bit
+  length of their number less 12, at least 8, since a name costs more as
+  the element's own map grows.
+
+Review of the first ceiling found four costs td-css did not count: an
+element that changed one custom name copied its whole inherited map
+entry by entry, an override walked the replaced value's tokens to
+subtract its bytes, an attribute lookup scanned the element's
+attributes for one step, and custom winners were inserted one by one
+into a sorted map, quadratic in names arriving in descending order.
+td-css now merges the inherited map once and counts its copies, keeps
+each entry's bytes beside it, charges the scan through
+`attribute_count`, and sorts the custom declarations once
+(td-css/DESIGN.md §2, §3 and §5). Elements with `display: none` are
+still cascaded, since their descendants inherit from them, and are
+charged like any other. A second review found the same pattern twice
+more: a declaration's references were inserted one by one, in token
+order, into a sorted map, and resolution and cycle detection filled
+sorted maps in visiting order, so `p{--x:var(--z043000)…var(--z000001)}`
+took 206 ms an element at 234 ns a unit. td-css now sorts and dedups each
+declaration's references once and indexes the graph, cycle detection
+and resolution by a name's position among the element's sorted names.
+
+Every order-dependent structure reachable from one element's cascade,
+its style's interning, or td-layout's per-element path, after that
+audit:
+
+| Site | Worst order cost | Now |
+| --- | --- | --- |
+| a declaration's `var()` references (td-css `dependencies`) | quadratic in references | collected, sorted, deduplicated |
+| dependency graph, cycle detection, resolved values (`variables::compute`, `cycles`) | quadratic in names, by visiting order | indexed by position |
+| the element's custom winners (`compute_inner`) | quadratic in names, descending | collected, sorted, last per name |
+| the element's custom map, merged with the parent's | linear, appends | one ordered merge, copies charged |
+| winning declarations, computed values, `font` prefix | by property | bounded by the 55-longhand roster |
+| candidate rules (`RuleIndex::candidates`) | none: sorted and deduplicated once | charged per candidate, more past 2,048 |
+| style pool buckets, custom buckets, map and token identities | a shift of the index's length per new key | charged that length against `MAX_POOL_WORK` |
+
+td-layout's own per-element path and td-dom's projection keep no sorted
+structure: they append. The rule index is built when a set compiles,
+under compilation's bounds.
+
+The weights are fitted so that no measured shape costs much more than
+25 ns a unit; the corpus pages below cost 9 to 23 ns, counting td-dom's
+projection and box generation, more for the smallest, whose fixed costs
+dominate. Measured as above (release, the same AMD Ryzen 7 5700G host,
+2026-11-14, under a load average of 3 to 4 from other work), each
+hostile row times one element computed repeatedly against its sheet,
+then a page of 20,000 such paragraphs, or the elements the row names,
+built to its result: "before" with the first ceiling (with the second
+for the four reference and resolution rows, which shared their cost),
+"after" with these fixes; the rows the second review's fixes changed were measured again
+under a load average of 5 to 8. Where td-css's own caps now refuse a shape outright, the row
+after it is its largest variant they accept.
+
+| Shape, every element | µs an element | Units an element | ns a unit | Before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2,000 universal `:not()` rules | 144 | 16,150 | 8.9 | 1.1 s | 1.2 s |
+| 10,000 universal `:not()` rules | 3,198 | 120,158 | 26.6 | 2.5 s | 3.1 s |
+| `var()` of 30,000 tokens | 6,564 | 301,571 | 21.8 | 2.6 s | 2.7 s |
+| `var()` of 40,000 tokens | 9,743 | 402,040 | 24.2 | 2.8 s | 2.7 s |
+| 30,000 declarations in one rule | 715 | 30,154 | 23.7 | 3.2 s | 3.2 s |
+| 4,000 custom names on `*` | 3,006 | 349,158 | 8.6 | 3.5 s | 1.2 s |
+| 8,000 custom names on `*` | 6,474 | 746,283 | 8.7 | 3.3 s | 1.2 s |
+| 8,000 descending custom names on `*` | 6,042 | 746,568 | 8.1 | 6.8 s | 1.2 s |
+| 100 custom names declared 320 times each | 4,877 | 229,175 | 21.3 | 13.0 s | 2.6 s |
+| 2,400 custom names each a `var()` of a 50-word value | 17,295 | 1,451,813 | 11.9 | — | 1.9 s |
+| 2,000 of those, 5,000 inherited names, 15,000 `:not()` rules | 17,688 | 1,422,864 | 12.4 | — | 1.8 s |
+| 43,000 descending `var()` references, 140 `<p>` | 1,834 | 882,276 | 2.1 | 27.1 s accepted | 0.25 s accepted |
+| the same ascending, 140 `<p>` | 2,080 | 882,276 | 2.4 | 0.96 s accepted | 0.25 s accepted |
+| a first name referring to 4,095 later ones, 4,094 between | 6,808 | 910,491 | 7.5 | 4.5 s | 1.0 s |
+| the same, the referring name sorting last | 7,747 | 910,491 | 8.5 | 2.5 s | 1.1 s |
+| 8,000 inherited names, one changed, 262,000 `<p>` | 1,128 | 48,199 | 23.4 | 242 s accepted | 3.0 s |
+| an inherited 130,000-token value overridden, 262,000 `<p>` | 5.2 | 194 | 26.8 | 95 s accepted | 1.6 s accepted |
+| 140 rules of 1,000 `[x255]`, 900 256-attribute `<p>` | — | — | — | 113 s accepted | refused at once |
+| 500 rules of four `[x255]`, the same 900 `<p>` | 2,050 | 132,150 | 15.5 | — | 1.8 s accepted |
+| 1,380 `[t*=aaab i]` against a 100-byte value | — | — | — | 5.6 s | refused at once |
+| 1,000 such rules | 468 | 35,650 | 13.1 | — | 1.6 s |
+| 470 such rules against 300 bytes, 13,490 nodes | — | — | — | 4.2 s accepted | refused at once |
+| 100 `:is()` of 64 attribute tests, 900 256-attribute `<p>` | — | — | — | 1.1 s accepted | refused at once |
+| 30 such rules | 402 | 126,990 | 3.2 | — | 0.3 s accepted |
+| 2,000 `:not()` rules, 900 256-attribute `<p>` | 469 | 144,150 | 3.3 | 0.4 s accepted | 0.4 s |
+
+"Refused at once" is td-css's `MAX_MATCH_STEPS` on the first element,
+in about 2 ms; rows not marked accepted are refused by the ceiling. So
+the worst accepted cascade is about 3.5 s on this host, beside what
+parsing, td-dom's projection and `MAX_POOL_WORK` cost: the costliest
+shapes per unit reach the ceiling in 3.0 to 3.4 s, and loaded runs vary
+by a fifth. A lookup is charged for every attribute its element has,
+so the 256-attribute shapes are charged more than they cost, at 3 to
+15 ns a unit, and a real page's elements, with a handful, about one
+step more a lookup. The pages, fetched again with their stylesheets and
+cut at MAX_PAGE_INPUT where longer, under the desktop environment of §6:
+
+| Page | Elements cascaded | Units before / after | Cascade ms before / after |
+| --- | ---: | ---: | ---: |
+| WHATWG HTML, cut | 39,890 | 49,593,658 / 49,593,538 | 657 / 649 |
+| Wikipedia, World War II, cut | 16,287 | 36,092,394 / same | 420 / 423 |
+| MDN | 5,041 | 31,941,580 / same | 491 / 283 |
+| Wikipedia, Asha Bhosle's Hindi songs | 24,629 | 30,565,162 / same | 401 / 397 |
+| Wikipedia, Donald Trump, cut | 14,634 | 25,862,994 / same | 317 / 316 |
+| Wikipedia, Cascading Style Sheets | 5,834 | 11,195,997 / same | 138 / 136 |
+| ECMAScript, cut | 35,164 | 9,609,835 / same | 216 / 216 |
+| GitHub | 1,576 | 6,579,517 / same | 75 / 73 |
+| Bootstrap | 1,053 | 1,451,233 / same | 31 / 29 |
+| Debian, kernel.org, Rust Book | 298 at most | 47,666 at most | 1.3 at most |
+
+These were fetched again for the second review and measured before and
+after its fixes; MDN's 5,041 elements declare 229,820 custom names
+between them, which position indexing makes cheaper.
+The heaviest, the WHATWG specification, stays 2.6 times under the
+ceiling, the longest Wikipedia article 3.5 times and MDN 4.0 times. MDN
+is the densest, at 6,336 units an element and 98 a byte: at that
+density the ceiling is reached at about 20,000 elements or 1.3 MB of
+page, and half of it at about 10,000 elements or 650 KB, so a longer
+MDN-shaped page has less than twice the margin and a much longer one
+steps down. The mobile (390 by 844 px, dark) and print environments
+raise no page by more than a fifth, and none nearer the ceiling than
+WHATWG's 53.8 million units under mobile, 2.4 times under it. A
+Tailwind-style sheet declaring 40 custom names on `*` costs 2,116 units
+(22 µs) an element, so the ceiling refuses such a page past about
+60,000 elements, in 1.3 s measured. The Guardian's front page is not in
+the table: `MAX_POOL_WORK` refuses it with or without this ceiling
+(below). The ceiling, the flag reads and td-css's new charges cost
+nothing measurable: the corpus cascades above agree within run-to-run
+noise, and when the ceiling was first measured the 2 MiB blocks shape
+cascaded in 390 then 395 ms (medians of six interleaved rounds) and the
+2 MiB shapes' layouts agreed within 1% with no flag and with an unset
+one. Making td-dom's attribute counts inlinable keeps the `:link`
+charge off the Wikipedia pages' time, which a call for it raised by a
+tenth.
+
+The attribute charge raises td-css's per-element match steps, which
+`MAX_MATCH_STEPS` (150,000) bounds for each element, by the attributes
+an element carries, which on these pages is 4 to 14 at most. Each
+page's costliest element, without the charge and with it (every
+element computed against the page's set):
+
+| Page | Most match steps of one element | Under `MAX_MATCH_STEPS` |
+| --- | ---: | ---: |
+| Wikipedia, World War II, cut | 47,125 → 47,183 | 3.2 times |
+| Wikipedia, Asha Bhosle's Hindi songs | 44,953 → 45,011 | 3.3 times |
+| GitHub | 44,449 → 44,743 | 3.4 times |
+| ECMAScript, cut | 44,212 → 44,212 | 3.4 times |
+| Wikipedia, Donald Trump, cut | 43,973 → 44,033 | 3.4 times |
+| Wikipedia, Cascading Style Sheets | 43,787 → 43,847 | 3.4 times |
+| WHATWG HTML, cut | 15,521 → 15,521 | 9.7 times |
+| MDN | 9,174 → 9,186 | 16 times |
+| Bootstrap | 8,752 → 8,830 | 17 times |
+| The Guardian | 4,042 → 4,094 | 37 times |
+| Debian, kernel.org, Rust Book | 1,412 at most | 106 times or more |
+
+No page comes within twice the bound: the charge adds at most 0.7%,
+GitHub's, to a page's costliest element.
+
+### Style-pool work on The Guardian
+
+The Guardian's international front page fetched on 2026-11-14 (1,404,591
+bytes, HTML SHA-256 `9e295b8cbef09d6f5b6f490febc4582902bbafb7d521d3f5e58e226de2835278`;
+its 20 inline and linked sheets concatenated in source order without media
+wrappers, `8f3ffe4ea4dda34b6c2dd4313564ad1fae15ce9d2fd69f714c353cf6e4a62eef`)
+is refused `Css(Limit("MAX_POOL_WORK"))` in the desktop environment, with
+or without the cascade ceiling, as was an earlier fetch that day. Its
+cascade is not costly: with the pool's work counter unbounded, in scratch
+instrumentation only, the styled document completes in 264 ms with 804
+styles and 8,856,857 cascade units. The pool's work comes to 123,125,413
+visits, 1.83 times MAX_POOL_WORK, and 102,452,455 of them are its
+token-identity index. The pool records each distinct custom-token
+allocation by address and charges each insertion the index's current
+length, the linear shift of its sorted map, so the page's 14,314 distinct
+allocations cost about 14,314²/2. They come from the 78 custom maps the
+pool retains of the 543 that were new by address (465 equalled one already
+kept), about 183 fresh allocations each: an element that declares custom
+properties itself (88,322 local names over 4,176 elements) gets new token
+arrays even where their tokens equal an earlier element's, since identity
+is by address. Traversing those maps (10.7 million visits) and comparing
+them with equal-hash maps (9.1 million) make most of the rest. A page
+reaches the bound at about 10,000 such allocations; the 2026-11-11 capture
+stayed under it.
+
 ## 7. Independently landable increments
 
 1. Design and AGENTS route, documentation only.
@@ -433,8 +668,8 @@ library as part of these increments. td-web's integration
 elements supplied by the caller, list markers as a fragment kind, a
 basic automatic table layout (rows and cells, colspan and rowspan
 within bounds), an input limit the caller sets (up to 4 MiB for a text
-page), a page-wide cascade work ceiling summing each element's match
-steps and var() substitution charges, a cancel flag checked between
-elements, a line past MAX_LINE_SCALARS cut and marked rather than
+page), a style pool that admits The Guardian's front page, whose
+token-identity index charges each insertion its length (§6, "Style-pool
+work on The Guardian"), a line past MAX_LINE_SCALARS cut and marked rather than
 refused, eight-column tab stops where white space is preserved, a
 cascade without style attributes, and a byte limit per layout request.

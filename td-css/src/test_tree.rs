@@ -88,6 +88,16 @@ impl Element for Handle<'_> {
     fn tag_name(&self) -> &str {
         self.nodes[self.index].tag
     }
+    fn attribute_count(&self) -> usize {
+        self.nodes[self.index].attrs.len()
+    }
+    fn link_attribute_count(&self) -> usize {
+        if self.tag_name() == "a" {
+            self.attribute_count()
+        } else {
+            0
+        }
+    }
     fn attribute(&self, name: &str) -> Option<&str> {
         self.nodes[self.index]
             .attrs

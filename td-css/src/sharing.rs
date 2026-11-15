@@ -164,10 +164,10 @@ impl StylePool {
         // owned layouts, including both interning indexes.
         let mut charge = 2048;
         let work_before = self.work;
-        for (name, value) in custom.entries.iter() {
+        for (name, entry) in custom.entries.iter() {
             self.visit(name.len() + 1)?;
             charge += 160 + 2 * name.heap_capacity();
-            if let Some(tokens) = value {
+            if let Some(tokens) = &entry.value {
                 let token_id = tokens.as_ptr() as usize;
                 // Count traversal even for shared tokens: hashing sees them.
                 let token_charge = components_charge(tokens, &mut self.work, self.limits.work)?;
@@ -205,7 +205,7 @@ impl StylePool {
             .try_push(custom.try_clone()?)?;
         self.visit(self.maps.len().saturating_add(1))?;
         self.maps.try_insert(identity, ())?;
-        for tokens in custom.entries.values().flatten() {
+        for tokens in custom.entries.values().filter_map(|e| e.value.as_ref()) {
             let identity = tokens.as_ptr() as usize;
             if !self.tokens.contains_key(&identity) {
                 self.visit(self.tokens.len().saturating_add(1))?;
@@ -362,7 +362,7 @@ mod tests {
                 assert!(pool.custom.values().flatten().any(|v| v
                     .entries
                     .values()
-                    .flatten()
+                    .filter_map(|e| e.value.as_ref())
                     .any(|t| t.as_ptr() as usize == *identity)));
             }
             for id in pool.buckets.values().flatten() {

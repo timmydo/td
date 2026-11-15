@@ -1,7 +1,10 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
-use crate::{keyword, Error, Limits, StyleId, StyledDocument, MAX_COORDINATE};
+use crate::{
+    cancelled, keyword, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL, MAX_COORDINATE,
+};
 use std::mem::size_of;
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
@@ -154,29 +157,41 @@ pub(crate) struct Pending {
     space: bool,
     image: Option<(f64, f64, [f64; 4])>,
 }
-pub(crate) struct Counters {
+pub(crate) struct Counters<'c> {
     pub bytes: usize,
     pub work: usize,
     pub lines: usize,
     pub fragments: usize,
-    pub limits: Limits,
+    pub limits: Limits<'static>,
+    cancel: Option<&'c AtomicBool>,
+    next_check: usize,
 }
-impl Counters {
-    pub fn new(styled: &StyledDocument<'_>) -> Self {
+impl<'c> Counters<'c> {
+    pub fn new(styled: &StyledDocument<'_>, cancel: Option<&'c AtomicBool>) -> Self {
         Self {
             bytes: styled.charged_bytes(),
             work: 0,
             lines: 0,
             fragments: 0,
             limits: styled.limits(),
+            cancel,
+            next_check: 0,
         }
     }
+    /// Every visit ticks here, so the flag is read once per CANCEL_INTERVAL
+    /// units and at the first.
     pub fn step(&mut self, count: usize) -> Result<(), Error> {
         self.work = self
             .work
             .checked_add(count)
             .filter(|n| *n <= self.limits.work)
             .ok_or(Error::Limit("MAX_LAYOUT_WORK"))?;
+        if self.work >= self.next_check {
+            self.next_check = self.work.saturating_add(CANCEL_INTERVAL);
+            if cancelled(self.cancel) {
+                return Err(Error::Cancelled);
+            }
+        }
         Ok(())
     }
     pub fn admit_growth<T>(&mut self, values: &mut BudgetVec<T>) -> Result<(), Error> {
@@ -249,7 +264,7 @@ pub fn wrap_text_with_budget(
     strut: StyleId,
     memory: &Budget,
 ) -> Result<WrappedText, Error> {
-    let mut counters = Counters::new(styled);
+    let mut counters = Counters::new(styled, None);
     counters.step(runs.len())?;
     let mut sink = AllLines(BudgetVec::new(memory)?);
     let mut pending = BudgetVec::new(memory)?;

@@ -25,6 +25,16 @@ pub enum State {
 pub trait Element: Copy {
     fn tag_name(&self) -> &str;
     fn attribute(&self, name: &str) -> Option<&str>;
+    /// How many attributes one `attribute` lookup may compare; every lookup
+    /// is charged for them, a step per `ATTRIBUTES_PER_STEP`.
+    fn attribute_count(&self) -> usize {
+        0
+    }
+    /// How many attributes one `is_link` call may compare, charged the same
+    /// way; zero where it compares none.
+    fn link_attribute_count(&self) -> usize {
+        0
+    }
     fn parent(&self) -> Option<Self>;
     fn previous_sibling(&self) -> Option<Self>;
     fn next_sibling(&self) -> Option<Self>;
@@ -184,14 +194,22 @@ impl CompileBudget {
     }
 }
 
+/// Attribute-name comparisons one match step pays for.
+pub(crate) const ATTRIBUTES_PER_STEP: usize = 4;
+/// Case-insensitive substring search bytes one match step pays for, beside
+/// the byte charge every inspected string takes.
+pub(crate) const FOLDED_SEARCH_BYTES_PER_STEP: usize = 4;
+
 pub(crate) struct MatchBudget {
     remaining: usize,
+    bytes: usize,
 }
 
 impl MatchBudget {
     pub(crate) fn new() -> Self {
         Self {
             remaining: MAX_MATCH_STEPS,
+            bytes: 0,
         }
     }
 
@@ -207,8 +225,19 @@ impl MatchBudget {
         Ok(())
     }
 
+    /// Inspected string bytes, charged as steps and counted apart.
+    fn charge_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        self.charge(amount)?;
+        self.bytes += amount;
+        Ok(())
+    }
+
     pub(crate) fn used(&self) -> usize {
         MAX_MATCH_STEPS - self.remaining
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -720,15 +749,16 @@ pub(crate) fn checked<'a>(text: &'a str, budget: &mut MatchBudget) -> Result<&'a
     if text.len() > MAX_ELEMENT_BYTES {
         return Err(Error::Limit("MAX_ELEMENT_BYTES"));
     }
-    budget.charge(text.len())?;
+    budget.charge_bytes(text.len())?;
     Ok(text)
 }
 
-fn attribute<'a, E: Element>(
+pub(crate) fn attribute<'a, E: Element>(
     element: &'a E,
     name: &str,
     budget: &mut MatchBudget,
 ) -> Result<Option<&'a str>, Error> {
+    budget.charge(element.attribute_count() / ATTRIBUTES_PER_STEP)?;
     element
         .attribute(name)
         .map(|s| checked(s, budget))
@@ -917,8 +947,16 @@ fn matches_simple<E: Element>(
         Simple::Class(name) => attribute(element, "class", budget)?
             .is_some_and(|s| s.split(html_space).any(|c| c == name.as_str())),
         Simple::Attribute(test) => {
-            budget.charge(test.value.len())?;
-            attribute(element, &test.name, budget)?.is_some_and(|value| test.matches(value))
+            budget.charge_bytes(test.value.len())?;
+            match attribute(element, &test.name, budget)? {
+                Some(value) => {
+                    if test.prefix.is_some() {
+                        budget.charge(value.len() / FOLDED_SEARCH_BYTES_PER_STEP)?;
+                    }
+                    test.matches(value)
+                }
+                None => false,
+            }
         }
         Simple::Root => {
             budget.step()?;
@@ -928,7 +966,10 @@ fn matches_simple<E: Element>(
             budget.step()?;
             element.first_child().is_none() && !element.has_text()
         }
-        Simple::Link => element.is_link(),
+        Simple::Link => {
+            budget.charge(element.link_attribute_count() / ATTRIBUTES_PER_STEP)?;
+            element.is_link()
+        }
         Simple::Visited => false,
         Simple::State(state) => element.state(*state),
         Simple::Logical { kind, list } => {

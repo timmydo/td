@@ -225,6 +225,18 @@ impl<'t, 'd> Element for ElementRef<'t, 'd> {
     fn attribute(&self, name: &str) -> Option<&str> {
         self.element.attribute(name)
     }
+    #[inline]
+    fn attribute_count(&self) -> usize {
+        self.element.attributes.len()
+    }
+    #[inline]
+    fn link_attribute_count(&self) -> usize {
+        if link_element(self.element) {
+            self.element.attributes.len()
+        } else {
+            0
+        }
+    }
     fn parent(&self) -> Option<Self> {
         self.tree
             .element(self.tree.links.get(self.id.index())?.parent?)
@@ -245,12 +257,16 @@ impl<'t, 'd> Element for ElementRef<'t, 'd> {
         self.tree.links.get(self.id.index()).is_some_and(|l| l.text)
     }
     fn is_link(&self) -> bool {
-        matches!(self.element.name.as_str(), "a" | "area")
-            && self.element.attribute("href").is_some()
+        link_element(self.element) && self.element.attribute("href").is_some()
     }
     fn state(&self, state: State) -> bool {
         self.tree.state.state(self.id, state)
     }
+}
+/// Only these look for `href`.
+#[inline]
+fn link_element(element: &td_html::document::Element) -> bool {
+    matches!(element.name.as_str(), "a" | "area")
 }
 #[cfg(test)]
 mod tests;

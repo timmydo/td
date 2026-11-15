@@ -1,4 +1,6 @@
-use crate::selectors::{checked, html_space, Element, IndexKey, MatchBudget, SelectorList};
+use crate::selectors::{
+    attribute, checked, html_space, Element, IndexKey, MatchBudget, SelectorList,
+};
 use crate::syntax::Text;
 use crate::Error;
 use td_alloc::{Budget, BudgetVec};
@@ -102,16 +104,13 @@ impl RuleIndex {
             }
         }
         if !self.ids.is_empty() {
-            if let Some(id) = element.attribute("id") {
-                lookup(&mut output, &self.ids, checked(id, budget)?, budget)?;
+            if let Some(id) = attribute(element, "id", budget)? {
+                lookup(&mut output, &self.ids, id, budget)?;
             }
         }
         if !self.classes.is_empty() {
-            if let Some(classes) = element.attribute("class") {
-                for class in checked(classes, budget)?
-                    .split(html_space)
-                    .filter(|s| !s.is_empty())
-                {
+            if let Some(classes) = attribute(element, "class", budget)? {
+                for class in classes.split(html_space).filter(|s| !s.is_empty()) {
                     lookup(&mut output, &self.classes, class, budget)?;
                 }
             }

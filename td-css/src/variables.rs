@@ -12,9 +12,32 @@ pub const MAX_SUBSTITUTION_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) type Tokens = BudgetShared<BudgetVec<Component>>;
 type CustomValue = Option<Tokens>;
+/// One computed custom property. Its stored bytes are kept beside it, so an
+/// override need not walk the value it replaces.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Entry {
+    pub(crate) value: CustomValue,
+    bytes: usize,
+}
+impl Entry {
+    const INVALID: Self = Self {
+        value: None,
+        bytes: 0,
+    };
+    fn new(value: CustomValue) -> Self {
+        let bytes = value.as_ref().map_or(0, |tokens| stored_bytes(tokens));
+        Self { value, bytes }
+    }
+    fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            value: copy_value(Some(&self.value))?,
+            bytes: self.bytes,
+        })
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CustomProperties {
-    pub(crate) entries: BudgetShared<BudgetMap<Text, CustomValue>>,
+    pub(crate) entries: BudgetShared<BudgetMap<Text, Entry>>,
     bytes: usize,
 }
 impl CustomProperties {
@@ -33,7 +56,7 @@ impl CustomProperties {
     pub(crate) fn get(&self, name: &str) -> Option<&[Component]> {
         self.entries
             .get(name)
-            .and_then(|value| value.as_ref().map(|tokens| &***tokens))
+            .and_then(|entry| entry.value.as_ref().map(|tokens| &***tokens))
     }
 }
 #[derive(Debug)]
@@ -57,6 +80,8 @@ pub(crate) struct Budget {
     pub(crate) memory: td_alloc::Budget,
     pub components: usize,
     pub bytes: usize,
+    /// Inherited entries copied into a changed map, outside the charges.
+    pub copies: usize,
 }
 impl Budget {
     pub(crate) fn new(memory: &td_alloc::Budget) -> Result<Self, Error> {
@@ -64,6 +89,7 @@ impl Budget {
             memory: memory.try_clone()?,
             components: 0,
             bytes: 0,
+            copies: 0,
         })
     }
     fn charge(&mut self, bytes: usize) -> Result<(), Error> {
@@ -206,9 +232,29 @@ fn stored_bytes(values: &[Component]) -> usize {
         })
         .sum()
 }
+/// A dependency: its name's length, charged on each visit, and its position
+/// among the element's own names, if it is one.
+type Edge = (usize, Option<usize>);
+/// Each local name's dependencies, by position, in name order.
+type Graph = BudgetVec<BudgetVec<Edge>>;
+/// A name's position in a sorted map, by binary search.
+fn position<V>(map: &BudgetMap<Text, V>, key: &str) -> Option<usize> {
+    let (mut low, mut high) = (0, map.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match map.get_index(middle)?.0.as_str().cmp(key) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return Some(middle),
+        }
+    }
+    None
+}
+/// References in token order; the caller sorts and dedups them once, so the
+/// order they arrive in costs nothing more.
 fn dependencies(
     values: &[Component],
-    out: &mut BudgetMap<Text, ()>,
+    out: &mut BudgetVec<Text>,
     budget: &mut Budget,
 ) -> Result<(), Error> {
     for c in values {
@@ -217,7 +263,7 @@ fn dependencies(
             Component::Function { name, values } => {
                 if name.eq_ignore_ascii_case("var") {
                     if let Some((name, _)) = args(values) {
-                        out.try_insert(syntax::text(&budget.memory, name)?, ())?;
+                        out.try_push(syntax::text(&budget.memory, name)?)?;
                     }
                 }
                 dependencies(values, out, budget)?;
@@ -250,63 +296,83 @@ pub(crate) fn compute(
     if count > MAX_CUSTOM_PROPERTIES {
         return Err(Error::Limit("MAX_CUSTOM_PROPERTIES"));
     }
-    let mut graph = BudgetMap::new(&memory)?;
-    for (name, value) in &local {
-        let mut edges = BudgetMap::new(&memory)?;
+    // Everything below is indexed by a name's position in `local`, so the
+    // order names are declared, referenced or visited in costs nothing more.
+    let mut graph = td_alloc::BudgetVec::with_capacity(&memory, local.len())?;
+    for value in local.values() {
+        let mut names = BudgetVec::new(&memory)?;
         if let CustomSpecified::Tokens(tokens) = value {
-            dependencies(tokens, &mut edges, budget)?;
+            dependencies(tokens, &mut names, budget)?;
         }
-        graph.try_insert(name.try_clone()?, edges)?;
+        names.sort_unstable();
+        names.dedup();
+        let mut edges = td_alloc::BudgetVec::with_capacity(&memory, names.len())?;
+        for name in names.iter() {
+            edges.try_push((name.len(), position(&local, name)))?;
+        }
+        graph.try_push(edges)?;
     }
-    let cycles = cycles(&graph, budget)?;
+    let cycles = cycles(&local, &graph, budget)?;
+    let mut slots = td_alloc::BudgetVec::with_capacity(&memory, local.len())?;
+    for _ in 0..local.len() {
+        slots.try_push(None)?;
+    }
     let mut resolver = Resolver {
         local: &local,
         graph: &graph,
         inherited: &inherited,
-        resolved: BudgetMap::new(&memory)?,
-        stack: BudgetVec::new(&memory)?,
+        resolved: slots,
+        depth: 0,
         cycles,
         budget,
     };
-    for name in local.keys() {
-        let _ = resolver.resolve(name)?;
+    for index in 0..local.len() {
+        resolver.resolve(index)?;
+    }
+    // In name order, so each insertion appends.
+    let mut resolved = td_alloc::BudgetMap::with_capacity(&memory, local.len())?;
+    for (name, entry) in local.keys().zip(resolver.resolved) {
+        resolved.try_insert(name.try_clone()?, entry.ok_or(Error::InvalidContext)?)?;
     }
     let mut bytes = inherited.bytes;
-    for name in resolver.resolved.keys() {
+    for name in resolved.keys() {
         if let Some(old) = inherited.entries.get(name) {
             bytes = bytes
-                .checked_sub(
-                    name.len() + old.as_ref().map(|tokens| stored_bytes(tokens)).unwrap_or(0),
-                )
+                .checked_sub(name.len() + old.bytes)
                 .ok_or(Error::InvalidContext)?;
         }
     }
-    for (name, value) in &resolver.resolved {
+    for (name, entry) in &resolved {
         bytes = bytes
-            .checked_add(
-                name.len()
-                    + value
-                        .as_ref()
-                        .map(|tokens| stored_bytes(tokens))
-                        .unwrap_or(0),
-            )
+            .checked_add(name.len() + entry.bytes)
             .filter(|n| *n <= MAX_CUSTOM_BYTES)
             .ok_or(Error::Limit("MAX_CUSTOM_BYTES"))?;
     }
-    if resolver
-        .resolved
+    if resolved
         .iter()
-        .all(|(name, value)| inherited.entries.get(name) == Some(value))
+        .all(|(name, entry)| inherited.entries.get(name) == Some(entry))
     {
         return Ok(inherited);
     }
-    let mut entries = BudgetMap::new(&memory)?;
-    for (name, value) in inherited.entries.iter() {
-        entries.try_insert(name.try_clone()?, copy_value(Some(value))?)?;
+    // Merge the two sorted maps, so each entry lands at the end.
+    let mut entries = td_alloc::BudgetMap::with_capacity(&memory, count)?;
+    let mut fresh = resolved.into_iter().peekable();
+    let mut copies = 0usize;
+    for (name, old) in inherited.entries.iter() {
+        while let Some((key, entry)) = fresh.next_if(|(key, _)| key < name) {
+            entries.try_insert(key, entry)?;
+        }
+        if let Some((key, entry)) = fresh.next_if(|(key, _)| key == name) {
+            entries.try_insert(key, entry)?;
+            continue;
+        }
+        entries.try_insert(name.try_clone()?, old.try_clone()?)?;
+        copies += 1;
     }
-    for (name, value) in resolver.resolved {
-        entries.try_insert(name, value)?;
+    for (key, entry) in fresh {
+        entries.try_insert(key, entry)?;
     }
+    budget.copies = budget.copies.saturating_add(copies);
     Ok(CustomProperties {
         entries: BudgetShared::new(&memory, entries)?,
         bytes,
@@ -314,49 +380,74 @@ pub(crate) fn compute(
 }
 struct Resolver<'a> {
     local: &'a BudgetMap<Text, CustomSpecified>,
-    graph: &'a BudgetMap<Text, BudgetMap<Text, ()>>,
+    graph: &'a Graph,
     inherited: &'a CustomProperties,
-    resolved: BudgetMap<Text, CustomValue>,
-    stack: BudgetVec<Text>,
-    cycles: BudgetMap<Text, ()>,
+    /// By position in `local`.
+    resolved: BudgetVec<Option<Entry>>,
+    depth: usize,
+    cycles: BudgetVec<bool>,
     budget: &'a mut Budget,
 }
-impl Resolver<'_> {
-    fn resolve(&mut self, name: &Text) -> Result<CustomValue, Error> {
+impl<'a> Resolver<'a> {
+    fn inherited(&self, name: &str) -> Result<Entry, Error> {
+        self.inherited
+            .entries
+            .get(name)
+            .map_or(Ok(Entry::INVALID), Entry::try_clone)
+    }
+    fn resolve(&mut self, index: usize) -> Result<(), Error> {
+        let local = self.local;
+        let (name, raw) = local.get_index(index).ok_or(Error::InvalidContext)?;
         self.budget.charge(name.len())?;
-        if let Some(value) = self.resolved.get(name) {
-            return copy_value(Some(value));
+        if self
+            .resolved
+            .get(index)
+            .ok_or(Error::InvalidContext)?
+            .is_some()
+        {
+            return Ok(());
         }
-        if self.cycles.contains_key(name) {
-            self.resolved.try_insert(name.try_clone()?, None)?;
-            return Ok(None);
-        }
-        let Some(raw) = self.local.get(name) else {
-            return copy_value(self.inherited.entries.get(name));
+        let entry = if self.cycles.get(index).copied().unwrap_or(false) {
+            Entry::INVALID
+        } else {
+            self.compute(index, name, raw)?
         };
-        let value = match raw {
-            CustomSpecified::Invalid => None,
-            CustomSpecified::Inherit => copy_value(self.inherited.entries.get(name))?,
+        *self.resolved.get_mut(index).ok_or(Error::InvalidContext)? = Some(entry);
+        Ok(())
+    }
+    fn compute(
+        &mut self,
+        index: usize,
+        name: &'a Text,
+        raw: &'a CustomSpecified,
+    ) -> Result<Entry, Error> {
+        let entry = match raw {
+            CustomSpecified::Invalid => Entry::INVALID,
+            CustomSpecified::Inherit => self.inherited(name)?,
             CustomSpecified::Tokens(tokens) => {
-                if self.stack.len() == MAX_VARIABLE_DEPTH {
+                if self.depth == MAX_VARIABLE_DEPTH {
                     return Err(Error::Limit("MAX_VARIABLE_DEPTH"));
                 }
-                self.stack.try_push(name.try_clone()?)?;
-                if let Some(deps) = self.graph.get(name) {
-                    for dep in deps.keys() {
-                        let _ = self.resolve(dep)?;
+                self.depth += 1;
+                let graph = self.graph;
+                for &(bytes, target) in graph.get(index).ok_or(Error::InvalidContext)?.iter() {
+                    match target {
+                        Some(target) => self.resolve(target)?,
+                        None => self.budget.charge(bytes)?,
                     }
                 }
                 let resolved = &self.resolved;
                 let inherited = &self.inherited.entries;
+                let local = self.local;
                 let expanded = expand(tokens, 0, self.budget, &|key| {
-                    resolved
-                        .get(key)
+                    position(local, key)
+                        .and_then(|at| resolved.get(at))
+                        .and_then(Option::as_ref)
                         .or_else(|| inherited.get(key))
-                        .and_then(|value| value.as_ref().map(|tokens| &***tokens))
+                        .and_then(|entry| entry.value.as_ref().map(|tokens| &***tokens))
                 })?;
                 let result = match expanded {
-                    None => None,
+                    None => Entry::INVALID,
                     Some(tokens) => {
                         let wide = match syntax::trim(&tokens) {
                             [c] => c.ident(),
@@ -368,19 +459,19 @@ impl Resolver<'_> {
                                 &["initial", "revert", "revert-layer", "inherit", "unset"],
                             )
                         }) {
-                            Some("initial" | "revert" | "revert-layer") => None,
-                            Some("inherit" | "unset") => copy_value(inherited.get(name))?,
-                            _ => Some(BudgetShared::new(&self.budget.memory, tokens)?),
+                            Some("initial" | "revert" | "revert-layer") => Entry::INVALID,
+                            Some("inherit" | "unset") => inherited
+                                .get(name)
+                                .map_or(Ok(Entry::INVALID), Entry::try_clone)?,
+                            _ => Entry::new(Some(BudgetShared::new(&self.budget.memory, tokens)?)),
                         }
                     }
                 };
-                let _ = self.stack.pop();
+                self.depth -= 1;
                 result
             }
         };
-        self.resolved
-            .try_insert(name.try_clone()?, copy_value(Some(&value))?)?;
-        Ok(value)
+        Ok(entry)
     }
 }
 
@@ -393,7 +484,7 @@ pub(crate) fn substitute(
         custom
             .entries
             .get(key)
-            .and_then(|value| value.as_ref().map(|tokens| &***tokens))
+            .and_then(|entry| entry.value.as_ref().map(|tokens| &***tokens))
     })
 }
 fn copy_values(
@@ -492,34 +583,45 @@ fn expand<'a, F: Fn(&str) -> Option<&'a [Component]>>(
     Ok(Some(out))
 }
 
+const UNVISITED: usize = usize::MAX;
 struct Scc {
-    indices: BudgetMap<Text, usize>,
-    low: BudgetMap<Text, usize>,
-    stack: BudgetVec<Text>,
-    on_stack: BudgetMap<Text, ()>,
-    cyclic: BudgetMap<Text, ()>,
+    indices: BudgetVec<usize>,
+    low: BudgetVec<usize>,
+    next: usize,
+    stack: BudgetVec<usize>,
+    on_stack: BudgetVec<bool>,
+    cyclic: BudgetVec<bool>,
 }
+/// Which local names lie on a reference cycle, by position.
 fn cycles(
-    graph: &BudgetMap<Text, BudgetMap<Text, ()>>,
+    local: &BudgetMap<Text, CustomSpecified>,
+    graph: &Graph,
     budget: &mut Budget,
-) -> Result<BudgetMap<Text, ()>, Error> {
+) -> Result<BudgetVec<bool>, Error> {
+    let count = local.len();
     let mut state = Scc {
-        indices: BudgetMap::new(&budget.memory)?,
-        low: BudgetMap::new(&budget.memory)?,
+        indices: BudgetVec::filled(&budget.memory, count, UNVISITED)?,
+        low: BudgetVec::filled(&budget.memory, count, UNVISITED)?,
+        next: 0,
         stack: BudgetVec::new(&budget.memory)?,
-        on_stack: BudgetMap::new(&budget.memory)?,
-        cyclic: BudgetMap::new(&budget.memory)?,
+        on_stack: BudgetVec::filled(&budget.memory, count, false)?,
+        cyclic: BudgetVec::filled(&budget.memory, count, false)?,
     };
-    for name in graph.keys() {
-        if !state.indices.contains_key(name) {
-            visit(name, graph, &mut state, budget, 0)?;
+    for node in 0..count {
+        if state.indices.get(node) == Some(&UNVISITED) {
+            visit(node, local, graph, &mut state, budget, 0)?;
         }
     }
     Ok(state.cyclic)
 }
+fn set<T>(values: &mut BudgetVec<T>, at: usize, value: T) -> Result<(), Error> {
+    *values.get_mut(at).ok_or(Error::InvalidContext)? = value;
+    Ok(())
+}
 fn visit(
-    name: &Text,
-    graph: &BudgetMap<Text, BudgetMap<Text, ()>>,
+    node: usize,
+    local: &BudgetMap<Text, CustomSpecified>,
+    graph: &Graph,
     state: &mut Scc,
     budget: &mut Budget,
     depth: usize,
@@ -527,50 +629,43 @@ fn visit(
     if depth == MAX_VARIABLE_DEPTH {
         return Err(Error::Limit("MAX_VARIABLE_DEPTH"));
     }
+    let (name, _) = local.get_index(node).ok_or(Error::InvalidContext)?;
     budget.charge(name.len())?;
-    let index = state.indices.len();
+    let index = state.next;
+    state.next += 1;
     let mut low = index;
-    state.indices.try_insert(name.try_clone()?, index)?;
-    state.stack.try_push(name.try_clone()?)?;
-    state.on_stack.try_insert(name.try_clone()?, ())?;
-    if let Some(edges) = graph.get(name) {
-        for dep in edges.keys() {
-            budget.charge(dep.len())?;
-            if !graph.contains_key(dep) {
-                continue;
-            }
-            if !state.indices.contains_key(dep) {
-                visit(dep, graph, state, budget, depth + 1)?;
-                low = low.min(state.low.get(dep).copied().ok_or(Error::InvalidContext)?);
-            } else if state.on_stack.contains_key(dep) {
-                low = low.min(
-                    state
-                        .indices
-                        .get(dep)
-                        .copied()
-                        .ok_or(Error::InvalidContext)?,
-                );
-            }
+    set(&mut state.indices, node, index)?;
+    state.stack.try_push(node)?;
+    set(&mut state.on_stack, node, true)?;
+    let edges = graph.get(node).ok_or(Error::InvalidContext)?;
+    for &(bytes, target) in edges.iter() {
+        budget.charge(bytes)?;
+        let Some(dep) = target else {
+            continue;
+        };
+        let seen = *state.indices.get(dep).ok_or(Error::InvalidContext)?;
+        if seen == UNVISITED {
+            visit(dep, local, graph, state, budget, depth + 1)?;
+            low = low.min(*state.low.get(dep).ok_or(Error::InvalidContext)?);
+        } else if state.on_stack.get(dep) == Some(&true) {
+            low = low.min(seen);
         }
     }
-    state.low.try_insert(name.try_clone()?, low)?;
+    set(&mut state.low, node, low)?;
     if low == index {
-        let mut members = BudgetVec::new(&budget.memory)?;
-        while let Some(member) = state.stack.pop() {
-            state.on_stack.remove(&member);
-            let done = member == *name;
-            members.try_push(member)?;
-            if done {
-                break;
-            }
-        }
-        if members.len() > 1
-            || graph
-                .get(name)
-                .is_some_and(|edges| edges.contains_key(name))
-        {
-            for member in members {
-                state.cyclic.try_insert(member, ())?;
+        // The component is the top of the stack, down to this node.
+        let start = state
+            .stack
+            .iter()
+            .rposition(|member| *member == node)
+            .ok_or(Error::InvalidContext)?;
+        let cyclic =
+            state.stack.len() - start > 1 || edges.iter().any(|&(_, target)| target == Some(node));
+        while state.stack.len() > start {
+            let member = state.stack.pop().ok_or(Error::InvalidContext)?;
+            set(&mut state.on_stack, member, false)?;
+            if cyclic {
+                set(&mut state.cyclic, member, true)?;
             }
         }
     }
@@ -579,3 +674,53 @@ fn visit(
 
 #[cfg(test)]
 mod tests;
+// Inline so its generated fixtures stay outside the scanned test file.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod entry_tests {
+    use crate::test_tree::{tree, Handle};
+    use crate::{ComputeStats, Origin, StyleSet};
+    #[test]
+    fn overrides_keep_entry_bytes_and_changed_maps_count_their_copies() {
+        let nodes = tree();
+        let element = |index| Handle {
+            nodes: &nodes,
+            index,
+        };
+        let set = StyleSet::new(&[(
+            Origin::Author,
+            &format!(
+                "div{{--a:{};--b:2;--c:3}}p{{--a:1;--d:4}}",
+                "x ".repeat(500)
+            ),
+        )])
+        .unwrap();
+        let parent = set.compute(&element(2), None, 16.0, "").unwrap();
+        let mut stats = ComputeStats::default();
+        let child = set
+            .compute_with_stats(&element(3), Some(&parent), 16.0, "", &mut stats)
+            .unwrap();
+        // The override replaces the inherited value's bytes; only --b and --c
+        // are copied from the parent.
+        assert_eq!(stats.custom_copies, 2);
+        let small = "--a".len() + 2 + 2 * ("--b".len() + 2);
+        assert_eq!(child.custom.bytes, small + "--d".len() + 2);
+        assert_eq!(
+            child
+                .custom
+                .entries
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>(),
+            ["--a", "--b", "--c", "--d"]
+        );
+        let unchanged = set
+            .compute_with_stats(&element(4), Some(&parent), 16.0, "", &mut stats)
+            .unwrap();
+        assert_eq!(stats.custom_copies, 0);
+        assert!(std::ptr::eq(
+            &*unchanged.custom.entries,
+            &*parent.custom.entries
+        ));
+    }
+}
