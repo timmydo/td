@@ -333,14 +333,18 @@ unit never runs and settles `Ready`, which satisfies `after=` and
 later restart, or an operator's `start`, runs the unit. The decision is the
 running supervisor's: a td-svc that PID 1 respawns asks afresh. The shipped
 table uses it for a live boot, whose initramfs alone mounts the install
-medium at `/run/td-media`: the stock session's window units name that path,
+medium at `/run/td-media`: window-evidence and media units name that path,
 so the live session opens only the installer (td-install/INSTALLER.md "Live
 startup") while boot health, which requires the terminal, still runs.
-Firefox, mail, news and web with the workspace switches around them, and the
-oracles' install and request-path evidence name
+The terminal, Firefox, mail, news and web with the workspace switches around
+them, and the oracles' install and request-path evidence name
 `/run/td-applications-on-demand` instead, which the init creates on every
 boot without the autotest token and on every live one, so they run at boot
-only on an oracle's (APPLICATIONS.md §W.9).
+only on an oracle's (APPLICATIONS.md §W.9). An ordinary desktop opens no
+terminal; the launcher starts terminals on request. Skipping the terminal
+satisfies its boot-health dependency without a client readiness probe, but
+only after its strict compositor dependency succeeds; seat-access evidence
+also strictly requires the compositor.
 Exiting 0 from a gated `exec=` would not do: a `restart=always` daemon that
 exits is restarted into the capped hold, and its strict dependents are
 skipped. Per **I5** a `tty=` unit may not declare it.

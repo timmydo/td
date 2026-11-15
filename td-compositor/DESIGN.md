@@ -4682,22 +4682,24 @@ order.
 
 ## 5. Boot and recovery
 
-This section records the boot profile. The td-term cutover
-([td-term/DESIGN.md](../td-term/DESIGN.md) §4 and §6) has landed: it replaced
-the demo SERVICE and the oracle's marker, and the devpts setup is in the early
-mount sequence. The Firefox image cutover then removed the demo's final-image
-`/bin` symlink and assigned the application launcher entry to Firefox;
-`td-ui-demo` remains a protocol fixture inside the copied compositor store
-output and its own recipe. The compositor ordering, readiness, restart, and
-serial-recovery guarantees remain in force.
+An ordinary installed desktop starts the compositor with no terminal window.
+The person opens `td-term` or `td-term (sandbox)` from the launcher. These
+terminals are tracked by the private terminal authority and are not respawned
+when closed. A live session opens only the installer initially
+(td-install/INSTALLER.md, "Live startup").
 
-PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
-`td-svc` starts `td-seatd` after root checking, then starts
-`td-compositor` and `td-term`, in that order, through td-login's credential
-switch. Both long-running processes are restartable with backoff. Client
-readiness is probed through its private socket, so deployment health cannot
-race ahead of the first committed frame. Graphical failure never suppresses
-or owns the serial `ttyS0` greeter; that remains the recovery console.
+PID 1 mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
+`td-svc` starts `td-seatd` after root checking, then the paired compositor
+and terminal authority. The `terminal` unit names
+`/run/td-applications-on-demand` in `unless-exists=`: the init creates that
+path on ordinary and live boots, so the unit settles ready without starting
+or probing a terminal. The strict compositor and seat-access dependencies
+still gate deployment health. On an automated non-live boot the path is
+absent, so the terminal starts after the compositor and its private socket
+proves a presented frame and a started shell before deployment health runs.
+That test terminal and the compositor are restartable with backoff.
+Graphical failure never suppresses or owns the serial `ttyS0` greeter;
+that remains the recovery console.
 
 The serial greeter remains independent of graphical readiness and can recover
 when the graphical daemon fails. The automated deployment-success transaction

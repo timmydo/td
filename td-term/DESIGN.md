@@ -1483,9 +1483,12 @@ absolute four-second deadline -- inside td-svc's five seconds per probe, so the
 probe reports its own timeout -- and prints the terminal's line unaltered.
 The probe requires a ready state and nonzero, internally consistent rows and
 columns; its output and the matching `TD-TERM-READY` diagnostic are compared
-in tests. The stock image's `[terminal]` unit runs `td-term run` as the
-graphical user through `/bin/td-login exec-primary`, with
-`TD_CONTROL_SOCKET` in its environment, `--socket` naming the compositor's
+in tests. The stock image's `[terminal]` unit runs only on automated non-live
+boots: `unless-exists=/run/td-applications-on-demand` skips it on ordinary
+and live boots. Ordinary sessions open terminals from the compositor's
+launcher, without service respawning when they close. The automated boot's
+unit runs `td-term run` as the graphical user through
+`/bin/td-login exec-primary`, with `TD_CONTROL_SOCKET` in its environment, `--socket` naming the compositor's
 display and `--ready-socket /run/user/UID/td-term-ready`; its `ready=`
 command runs `/bin/td-term probe` on the same path the same way. The
 compositor's terminal authority runs the same probe for the terminals it
@@ -1837,9 +1840,10 @@ terminal, and td-term's prove the program:
 - the image creates the devpts mountpoint after devtmpfs, replaces its
   `/dev/ptmx` node with the specified symlink, mounts devpts with the
   specified options, links `/bin/td-term` into the staged `td-term` output,
-  packs the terminfo entry at mode 0444 behind `/etc/terminfo`, starts
-  td-term as uid 1000, passes the readiness-socket probe, and observes the
-  matching `TD-TERM-READY` diagnostic; and
+  packs the terminfo entry at mode 0444 behind `/etc/terminfo`, and on an
+  automated non-live boot starts td-term as uid 1000, passes the
+  readiness-socket probe, and observes the matching `TD-TERM-READY`
+  diagnostic; and
 - graphical failure leaves the serial recovery path and existing compositor
   readiness proof intact.
 

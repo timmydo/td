@@ -1510,10 +1510,10 @@ const SETUP_INTAKE_SOCKET: &str = "/run/td-authd/1000/setup";
 const LIVE_MEDIUM: &str = "/run/td-media";
 /// Present on every boot whose Flathub applications start only when asked
 /// (APPLICATIONS.md §W.9): the deployment init creates it unless the line
-/// carries the autotest token, and on every live boot. Firefox and the
-/// oracles' first fetches name it in `unless-exists=`, so an ordinary boot
-/// neither opens Firefox nor downloads anything, and an oracle's boot does
-/// both.
+/// carries the autotest token, and on every live boot. The terminal,
+/// applications and oracles' first fetches name it in `unless-exists=`, so
+/// an ordinary boot opens no windows and downloads nothing. An automated
+/// non-live boot retains the terminal and application readiness evidence.
 const APPLICATIONS_ON_DEMAND: &str = "/run/td-applications-on-demand";
 /// Where td-app finds a feed the kernel command line named (APPLICATIONS.md
 /// §W.9): td-net reads it, root-owned, when no VM bridge gave one.
@@ -2334,19 +2334,15 @@ fn build_desktop_td_svc_conf() -> String {
          requires=wayland\n\
          timeout=30\n\
          \n\
-         # The first td-native client stays mapped, and it is the TERMINAL: the\n\
-         # machine boots to a shell prompt rather than to a demo. Its readiness\n\
-         # probe is exposed only after a frame presented at a size the compositor\n\
-         # CHOSE, a PTY the kernel agrees is that grid, and a started child --\n\
-         # more than the demo's probe proved, except that the demo also required\n\
-         # a seat advertising a POINTER and this needs only a keyboard.\n\
-         # A live boot skips it and every window unit below but the wizard's:\n\
-         # unless-exists= settles them ready unstarted, so what requires them\n\
-         # still runs.\n\
+         # Only an automated boot starts a terminal. Ordinary sessions open one\n\
+         # from the launcher; live sessions start only the installer. Skipping\n\
+         # settles the unit ready without spawning or probing it, so boot health\n\
+         # still runs after the compositor and seat-access checks. The oracle's\n\
+         # terminal proves a presented frame, matching PTY grid and started child.\n\
          [terminal]\n\
          type=daemon\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/td-login exec-primary -- /bin/env TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-term-ready\n\
          after=wayland\n\
          requires=wayland\n\
@@ -7798,14 +7794,14 @@ mod tests {
         }
     }
 
-    /// The terminal is deployment health; the packaged application is separate evidence.
+    /// Automated boots require terminal readiness; ordinary boots skip its unit.
     ///
     /// The two live in different files — the unit table here, the oracle in
     /// `td-recipe-eval` — and nothing but this ties them. Point the unit back
     /// at the demo and the oracle waits for a line nothing prints: a boot that
     /// runs to its timeout with no cause on the console.
     #[test]
-    fn the_boot_starts_the_terminal_and_the_oracle_waits_for_its_marker() {
+    fn the_automated_boot_starts_the_terminal_and_waits_for_its_marker() {
         let exec = unit_key("terminal", "exec").unwrap_or_default();
         assert!(exec.contains("/bin/td-term run "), "{exec}");
         let ready = unit_key("terminal", "ready").unwrap_or_default();
@@ -7839,9 +7835,17 @@ mod tests {
             )),
             "the terminal's shell is not told where the control socket is: {exec}"
         );
-        // bootsuccess turns on it, so a boot that reaches no terminal is not a
-        // success — which is what makes the oracle's wait a proof and not a
-        // hopeful grep.
+        // Only automated boots start this unit. The skip satisfies boot health
+        // on ordinary and live boots; a failed compositor still fails the
+        // terminal's strict dependency before the skip can be considered.
+        assert_eq!(
+            unit_key("terminal", "unless-exists").as_deref(),
+            Some(APPLICATIONS_ON_DEMAND)
+        );
+        assert_eq!(
+            unit_key("seat-access-evidence", "requires").as_deref(),
+            Some("wayland")
+        );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
             Some("terminal,seat-access-evidence,hostname")
@@ -9675,7 +9679,8 @@ mod tests {
                         if path.as_str() == APPLICATIONS_ON_DEMAND
                             && matches!(
                                 name.as_str(),
-                                "firefox"
+                                "terminal"
+                                    | "firefox"
                                     | "firefox-fetch"
                                     | "software-evidence"
                                     | "grant-request"
@@ -10775,7 +10780,7 @@ mod tests {
         );
         assert!(
             unit_after("bootsuccess").contains(&"terminal".to_string()),
-            "bootsuccess must wait for the first client frame"
+            "bootsuccess must wait for the oracle terminal readiness or ordinary boot skip"
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
@@ -13904,7 +13909,7 @@ mod tests {
         assert_eq!(init.matches(BOOT_FEED).count(), 2);
     }
 
-    /// An ordinary boot starts no Flathub application and installs nothing:
+    /// An ordinary boot starts no terminal or application and installs nothing:
     /// the init marks every boot without the autotest token, and every live
     /// one, as on demand, and Firefox and the oracles' installs name that
     /// mark. An oracle's boot installs through root's application-cache
@@ -13951,12 +13956,12 @@ mod tests {
             Some(APPLICATIONS_ON_DEMAND)
         );
         assert!(unit_after("firefox").contains(&"firefox-fetch".to_string()));
-        // Mail, news and web, and the workspace switches around them, run
-        // at boot only on an oracle's: an ordinary session starts mail and
-        // news from the terminal and web from its launcher card. Their
-        // evidence keeps the live gate and exits 0 without the autotest
-        // token, so a skipped window settles it.
+        // The terminal, applications and workspace switches run at boot only
+        // on an oracle's. Ordinary sessions open windows from the launcher.
+        // Evidence keeps the live gate and exits 0 without the autotest token,
+        // so a skipped window settles it.
         for unit in [
+            "terminal",
             "applications-workspace",
             "mail",
             "news",
