@@ -78,6 +78,42 @@ mod tests {
     }
 
     #[test]
+    fn two_hundred_thousand_list_items_lay_out_within_the_limits() {
+        // td-html's MAX_NODES leaves no room for a text node each, so the
+        // items are empty: each marker stands alone at its item's top.
+        let count = 200_000;
+        let html = format!("<ol start=-3>{}", "<li>".repeat(count));
+        let doc = td_html::document::parse(&html).unwrap();
+        for (css, laid) in [
+            ("", true),
+            // Inside, each marker lays a line, and the lines' 68 MiB step
+            // passes the page's bytes.
+            ("li{list-style-position:inside}", false),
+        ] {
+            let styled =
+                StyledDocument::new(&doc, &sheets(css), html.len(), Limits::default()).unwrap();
+            assert_eq!(styled.list_item_count(), count);
+            assert_eq!(styled.marker_count(), count);
+            let result = layout(&styled, &mut Metrics, &Request::new(1280.0, 720.0));
+            if !laid {
+                assert!(matches!(result, Err(Error::Limit("MAX_PAGE_BYTES"))));
+                continue;
+            }
+            let out = result.unwrap();
+            assert_eq!(out.markers.len(), count);
+            assert!(out.lines.is_empty());
+            assert!(out.charged_bytes <= MAX_PAGE_BYTES);
+            assert!(out.work < crate::MAX_LAYOUT_WORK / 16);
+            let last = out.markers.last().unwrap();
+            assert_eq!(last.ordinal, count as i32 - 4);
+            assert_eq!(last.line, None);
+            assert_eq!(last.text().as_str(), "199996. ");
+            // In order: each marker below the last.
+            assert!(out.markers.windows(2).all(|w| w[0].y < w[1].y));
+        }
+    }
+
+    #[test]
     fn four_mib_text_page_lays_out_under_a_raised_input_limit() {
         let mut html = String::from("<!doctype html><plaintext>");
         let line = "a line of plain text, as a text page holds it\n";

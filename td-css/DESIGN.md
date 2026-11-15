@@ -312,7 +312,7 @@ as bare values; calc() clamps its result to the property range.
 | padding-{top,right,bottom,left} | lengths, percentages | 0; no |
 | border-{top,right,bottom,left}-width | lengths, thin, medium, thick | medium (3px), computed zero for none/hidden style; no |
 | width, height | lengths, percentages, auto | auto; no |
-| list-style-type | none, disc, circle, square, decimal, decimal-leading-zero, lower-roman, upper-roman, lower-alpha, upper-alpha | disc; yes |
+| list-style-type | none, disc, circle, square, decimal, decimal-leading-zero, lower-roman, upper-roman, lower-alpha, upper-alpha, lower-latin, upper-latin | disc; yes |
 | text-align | start, end, left, right, center, justify | start; yes |
 
 `margin`, `padding`, `border-width`, `border-style` and `border-color`
@@ -324,8 +324,9 @@ accepts optional style, variant and weight (each at most once, with normal
 filling omitted slots), a required size, optional slash line-height, and
 a required family list. It resets all six implemented font longhands;
 system-font keywords, stretch and other font extension/reset properties
-are unsupported. `background` sets the colour of its final layer (below).
-Other shorthands remain unsupported. `text-decoration`
+are unsupported. `background` sets the colour of its final layer and
+`list-style` its type and position (both below). Other shorthands remain
+unsupported. `text-decoration`
 here is the line-set subset, without style, color or thickness. Its propagation to
 descendants is a layout/painting concern, not inheritance. Border widths
 compute to zero for none/hidden styles. Border colors default to the
@@ -429,6 +430,7 @@ and opacity's number/percentage range from
 | max-width, max-height | nonnegative length/percentage, none | none; no |
 | letter-spacing | normal, signed length (no percentage) | normal; yes |
 | opacity | number or percentage, clamped to [0,1] | 1; no |
+| list-style-position | outside, inside | outside; yes |
 
 Line-height numbers stay numbers through inheritance; lengths and
 percentages compute against the declaring element's font size and then
@@ -441,6 +443,24 @@ block, resolving opposing offsets and applying position are layout work.
 Text-transform is a keyword, not an operation on strings. Visibility,
 overflow, float, clear, box-sizing and opacity likewise compute values
 without painting, formatting, clipping or compositing.
+
+The `list-style` shorthand follows
+[CSS Lists 3 §3.4](https://www.w3.org/TR/2020/WD-css-lists-3-20201117/#list-style-property):
+a position, an image and a type, each at most once and in any order,
+resetting `list-style-type` and `list-style-position` to their initials
+where omitted. No `list-style-image` is computed, so its slot takes
+`none`, a URL token or any CSS Images 4 `<image>` function (url(),
+src(), image(), image-set(), cross-fade(), element() and the six
+gradients), checked by name only, and stores nothing; td-css fetches
+nothing. The type's keywords are the longhand's, from one list;
+lower-latin and upper-latin are Counter Styles 3's aliases of the alphas
+and compute as written.
+`none` fills an empty slot, the type's first: `list-style: none` sets
+the type to none, `none none` the type and image, and `none circle`
+the image, keeping circle; a `none` with no slot left, a repeated slot
+or any other component invalidates the declaration. td-layout draws
+markers from the two longhands (td-layout/DESIGN.md §5, "List
+markers").
 
 The length calc() grammar follows [CSS Values Level 3 §8.1](https://www.w3.org/TR/2024/CRD-css-values-3-20240322/#calc-notation):
 parentheses and nested calc(), left-associative + and -, and higher-priority
@@ -487,7 +507,15 @@ and script/style, body inset, paragraphs/headings/lists, monospace code
 and pre, emphasis, links and table display roles. It is an ordinary UA
 sheet parsed through the same engine, explicitly supplied by the caller;
 no hidden rules are injected. It does not replace HTML semantics or claim
-the complete HTML rendering stylesheet.
+the complete HTML rendering stylesheet. Its lists follow HTML §15.3.7:
+dir and menu are block lists like ol and ul, with their 1em block
+margins, 40px start padding and disc; a dir, dl, menu, ol or ul inside
+another has no block margins (written as margin-top and margin-bottom,
+since td-css has no logical margins); and nested lists' bullets are its
+two `:is()` rules, circle and then square. Physical left stands for
+inline-start, and `counter-reset` and `text-align: match-parent` are
+absent: td-layout numbers by HTML's list owners itself.
+Presentational hints such as a list's `type` attribute are not mapped.
 
 ## 5. Bounds and failure
 
@@ -664,7 +692,7 @@ rules apply (td-web/DESIGN.md §11), which td-css does not give yet.
 `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed 55-longhand roster. `initial` supplies context-free seeds; border
+the fixed 56-longhand roster. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
 computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
 borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`

@@ -104,6 +104,11 @@ fn each_added_longhand_has_a_typed_value() {
         (Right, "-3px", ComputedValue::Length(Length::Px(-3.0))),
         (Bottom, "25%", ComputedValue::Length(Length::Percent(25.0))),
         (Left, "2em", ComputedValue::Length(Length::Px(32.0))),
+        (
+            ListStylePosition,
+            "inside",
+            ComputedValue::Keyword("inside"),
+        ),
     ];
     assert_eq!(cases.len() + 25, Property::ALL.len());
     for (p, value, want) in cases {
@@ -265,6 +270,93 @@ fn overflow_pair_computation_and_display_blockification() {
         style("", None).get(Display),
         Some(&ComputedValue::Keyword("block"))
     );
+}
+#[test]
+fn list_style_shorthand_sets_type_and_position_and_drops_an_image() {
+    let parent = child("list-style-type:square;list-style-position:inside");
+    let word = |p| ComputedValue::Keyword(p);
+    for (input, kind, position) in [
+        ("list-style:none", "none", "outside"),
+        ("list-style:inside", "disc", "inside"),
+        ("list-style:upper-roman inside", "upper-roman", "inside"),
+        ("list-style:inside none", "none", "inside"),
+        ("list-style:none url(a.png)", "none", "outside"),
+        (
+            "list-style:url(a.png) lower-alpha",
+            "lower-alpha",
+            "outside",
+        ),
+        ("list-style:lower-latin inside", "lower-latin", "inside"),
+        ("list-style:UPPER-LATIN", "upper-latin", "outside"),
+        (
+            "list-style:linear-gradient(red, blue) square",
+            "square",
+            "outside",
+        ),
+        (
+            "list-style:inside image-set(\"a.png\" 1x)",
+            "disc",
+            "inside",
+        ),
+        (
+            "list-style:repeating-conic-gradient(red, blue) none",
+            "none",
+            "outside",
+        ),
+        ("list-style:none none", "none", "outside"),
+        ("list-style:none circle", "circle", "outside"),
+        (
+            "list-style:inside;list-style-type:decimal",
+            "decimal",
+            "inside",
+        ),
+        (
+            "--l:inside decimal;list-style:var(--l)",
+            "decimal",
+            "inside",
+        ),
+        // Invalid: the declaration is dropped and the initials stay.
+        ("list-style:none none disc", "disc", "outside"),
+        ("list-style:inside outside", "disc", "outside"),
+        ("list-style:square circle", "disc", "outside"),
+        ("list-style:url(a) url(b)", "disc", "outside"),
+        ("list-style:bogus", "disc", "outside"),
+        ("list-style:inside calc(1px)", "disc", "outside"),
+        (
+            "list-style:url(a) linear-gradient(red, blue)",
+            "disc",
+            "outside",
+        ),
+        ("list-style-position:middle", "disc", "outside"),
+    ] {
+        let s = child(input);
+        assert_eq!(s.get(ListStyleType), Some(&word(kind)), "{input}");
+        assert_eq!(s.get(ListStylePosition), Some(&word(position)), "{input}");
+    }
+    // The longhand takes the shorthand's keywords, none included.
+    for (input, kind) in [
+        ("list-style-type:none", "none"),
+        ("list-style-type:lower-latin", "lower-latin"),
+        ("list-style-type:upper-latin", "upper-latin"),
+        (
+            "list-style-type:decimal-leading-zero",
+            "decimal-leading-zero",
+        ),
+    ] {
+        assert_eq!(
+            child(input).get(ListStyleType),
+            Some(&word(kind)),
+            "{input}"
+        );
+    }
+    assert_eq!(
+        child("list-style-type:linear-gradient(red, blue)").get(ListStyleType),
+        Some(&word("disc"))
+    );
+    // Both inherit.
+    let s = style("", Some(&parent));
+    assert_eq!(s.get(ListStyleType), Some(&word("square")));
+    assert_eq!(s.get(ListStylePosition), Some(&word("inside")));
 }
 #[test]
 fn extra_grammars_reject_unsupported_values_and_clamp_numeric_ranges() {

@@ -34,6 +34,41 @@ const FONT: &[Property] = &[
     LineHeight,
     FontFamily,
 ];
+const LIST_STYLE: &[Property] = &[ListStyleType, ListStylePosition];
+/// `list-style-type`'s keywords, for the longhand and the shorthand alike;
+/// lower-latin and upper-latin are Counter Styles 3's aliases of the
+/// alphas, kept as written and mapped by layout.
+const LIST_STYLE_TYPES: &[&str] = &[
+    "none",
+    "disc",
+    "circle",
+    "square",
+    "decimal",
+    "decimal-leading-zero",
+    "lower-roman",
+    "upper-roman",
+    "lower-alpha",
+    "upper-alpha",
+    "lower-latin",
+    "upper-latin",
+];
+/// CSS Images 4's `<image>` functions; `list-style` drops its image, so
+/// only the name is checked.
+const IMAGE_FUNCTIONS: &[&str] = &[
+    "url",
+    "src",
+    "image",
+    "image-set",
+    "cross-fade",
+    "element",
+    "linear-gradient",
+    "radial-gradient",
+    "conic-gradient",
+    "repeating-linear-gradient",
+    "repeating-radial-gradient",
+    "repeating-conic-gradient",
+];
+const LIST_STYLE_POSITIONS: &[&str] = &["outside", "inside"];
 const STYLES: &[&str] = &[
     "none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset",
 ];
@@ -48,6 +83,7 @@ pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
         "font" => Some(FONT),
         "overflow" => Some(&[OverflowX, OverflowY]),
         "background" => Some(&[BackgroundColor]),
+        "list-style" => Some(LIST_STYLE),
         _ => None,
     }
 }
@@ -80,6 +116,8 @@ pub(super) fn extra(p: Property) -> bool {
             | Right
             | Bottom
             | Left
+            | ListStyleType
+            | ListStylePosition
     )
 }
 pub(super) fn parse(p: Property, v: &[Component]) -> Result<Option<Specified>, Error> {
@@ -95,6 +133,8 @@ pub(super) fn parse(p: Property, v: &[Component]) -> Result<Option<Specified>, E
         Clear => keyword(v, &["none", "left", "right", "both"]),
         Position => keyword(v, &["static", "relative"]),
         BoxSizing => keyword(v, &["content-box", "border-box"]),
+        ListStyleType => keyword(v, LIST_STYLE_TYPES),
+        ListStylePosition => keyword(v, LIST_STYLE_POSITIONS),
         LineHeight => {
             if let Some(v) = keyword(v, &["normal"]) {
                 Some(v)
@@ -169,6 +209,7 @@ pub(super) fn shorthand(
     let parsed = match name {
         "font" => font(v, memory)?,
         "overflow" => overflow(v, memory)?,
+        "list-style" => list_style(v, memory)?,
         _ => border(v, targets, memory)?,
     };
     if let Some(parsed) = parsed {
@@ -203,6 +244,54 @@ fn overflow(
     let mut output = td_alloc::BudgetVec::with_capacity(memory, 2)?;
     output.try_push((OverflowX, a))?;
     output.try_push((OverflowY, b))?;
+    Ok(Some(output))
+}
+
+/// `list-style`: a position, an image and a type, each at most once, in
+/// any order. No image is computed, so `none`, a URL or another `<image>`
+/// function in its slot is accepted and dropped; a lone `none` sets the type, two set both.
+fn list_style(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let mut position = None;
+    let mut kind = None;
+    let mut image = false;
+    let mut nones = 0usize;
+    for c in v.iter().filter(|c| !c.whitespace()) {
+        let one = std::slice::from_ref(c);
+        if c.ident().is_some_and(|n| n.eq_ignore_ascii_case("none")) {
+            nones += 1;
+        } else if let Some(value) = keyword(one, LIST_STYLE_POSITIONS) {
+            if Option::replace(&mut position, value).is_some() {
+                return Ok(None);
+            }
+        } else if let Some(value) = keyword(one, LIST_STYLE_TYPES) {
+            if Option::replace(&mut kind, value).is_some() {
+                return Ok(None);
+            }
+        } else if matches!(c, Component::Token(Token::Url(_)))
+            || matches!(c, Component::Function { name, .. }
+                if IMAGE_FUNCTIONS.iter().any(|f| name.eq_ignore_ascii_case(f)))
+        {
+            if std::mem::replace(&mut image, true) {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    // Each none fills an empty image or type slot, the type first.
+    let free = usize::from(kind.is_none()) + usize::from(!image);
+    if nones > free || (position.is_none() && kind.is_none() && !image && nones == 0) {
+        return Ok(None);
+    }
+    if nones > 0 && kind.is_none() {
+        kind = Some(Specified::Ready(ComputedValue::Keyword("none")));
+    }
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, LIST_STYLE.len())?;
+    output.try_push((ListStyleType, kind.unwrap_or(Specified::Initial)))?;
+    output.try_push((ListStylePosition, position.unwrap_or(Specified::Initial)))?;
     Ok(Some(output))
 }
 

@@ -1371,7 +1371,8 @@ image's `alt` text in its place, in tree order and
 not past a paragraph, ignoring case, each character looked at once
 (Knuth, Morris and Pratt) as now, at most `MAX_HITS` matches. Text with
 no fragment (`display: none`) or not painted (`visibility: hidden`) is
-not found. Matches are places, so they outlive a relayout; showing one
+not found, nor is a list marker, which is no fragment's text. Matches
+are places, so they outlive a relayout; showing one
 scrolls its line into the pane, and each is marked by the pixels its
 glyphs span, the advances replayed through the layout's metrics, since
 td-layout keeps no glyphs.
@@ -1398,10 +1399,18 @@ is shown: fragments' displayed text, the space a wrap drops copied
 (td-layout keeps its source bytes), a preserved newline a newline,
 paragraphs joined by a newline, a replaced element its `alt` text when
 the selection holds it whole; at most `MAX_COPY`, measured before it is
-gathered, as now. A list item's marker is copied at its first
-paragraph's start, as td-layout's marker kind sets it apart, and is
-not found. What §5 copies and td-web no longer does: a quote's marks,
-which nothing draws now; and a table's row, which copies a cell a line.
+gathered, as now. A list item's marker, td-layout's `MarkerFragment`
+(generated text naming its item and no byte, td-layout/DESIGN.md §5,
+"List markers"), is copied as its `text()` shows it at the start of the
+paragraph its line begins, when the selection holds that start, an
+outer item's before an inner one's where they share a line; one whose
+item laid no line, an empty item, is copied as a paragraph of its own
+where its item begins. A marker is no place: a point on an outside
+marker, left of its line, falls on the line's start, and one on an
+inside marker, before the line's first fragment, on the same start,
+and the keys step over it. What §5 copies and td-web no longer does:
+a quote's marks, which nothing draws now; and a table's row, which
+copies a cell a line.
 
 **Links** are `a` and `area` elements with an `href` (td-dom's rule),
 joined against the page's base: the first `<base href>` in tree order,
@@ -1542,12 +1551,16 @@ theme's map. td-web decides what is drawn, in this order:
    underlines, overlines and line-throughs it takes from itself and its
    ancestors, as CSS propagates them, as fills across the fragment, a
    pixel thick at scale one; a replaced element's picture fitted to its
-   box, else a frame in `BORDER` holding its `alt` text, clipped to it.
+   box, else a frame in `BORDER` holding its `alt` text, clipped to it;
+   and the list markers on the line, their text in their item's colour,
+   face and size at their baseline, those without a line with their
+   item's box.
 4. Over the page, as §8 paints them by the glyphs' extents: find's
    matches on `INACTIVE_SELECTION`, the selection and the focused link
    on `SELECTED` in paper ink.
 
-`visibility: hidden` paints nothing of its box. `opacity` is not
+`visibility: hidden` paints nothing of its box, and a hidden item's
+marker, drawn in its item's style, is not painted. `opacity` is not
 applied. td-ui's fills are opaque, so a colour with alpha is blended by
 td-web before it is drawn, over the colour of the nearest ancestor
 with an opaque background, else the canvas's, which the paint knows in
@@ -1626,11 +1639,18 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      holding its document by shared
      ownership, so a page passes between threads, as td-web, which
      forbids `unsafe`, cannot hold a borrowed one beside its owner;
-     list markers as a fragment kind of their own (td-layout/DESIGN.md
-     §3); a basic automatic table
+     a basic automatic table
      layout, rows and cells with `colspan` and `rowspan` within bounds,
      so a page's tables line up as §5's do rather than stacking as
-     blocks. Available: a replaced element's intrinsic size from the
+     blocks. Available: list markers as a fragment kind of their own
+     (`Layout::markers`, each a `MarkerFragment` naming its item, its
+     ordinal and type, its line and its box, and no DOM byte), outside
+     and inside, the ordinals HTML gives `ol`, `ul` and `menu` items
+     (`start`, `reversed` and `value`, clamped to `i32`), in disc,
+     circle, square, decimal, decimal with a leading zero, roman and
+     alphabetic, roman and alphabetic falling back to decimal outside
+     their ranges (td-layout/DESIGN.md §5, "List markers"); a replaced
+     element's intrinsic size from the
      caller (`Request::intrinsic`: a width, a height and a ratio, each
      optional), used after its `width` and `height` attributes in place
      of its 300 by 150 placeholder. td-web gives as that intrinsic size
@@ -1662,10 +1682,11 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      refused (td-layout/DESIGN.md §4, "Tab stops" and "Long lines").
    - **td-css** (available): the owned-budget API supplies compilation
      admission; `rgb()`, `hsl()`, CSS Color 4's named colours and the
-     `background` shorthand's colour; and `StyleSet::from_sheets`, media
+     `background` shorthand's colour; `list-style-position` and the
+     `list-style` shorthand; and `StyleSet::from_sheets`, media
      conditions for each sheet given to a set, and one compilation that
      leaves out each sheet a per-sheet bound refuses and names it
-     (td-css/DESIGN.md §3 and §5). Nothing of td-css remains before the
+     (td-css/DESIGN.md §3, §4 and §5). Nothing of td-css remains before the
      cutover; whether a changed environment changes which rules apply is
      §11's.
    - **td-alloc** (available): `Charge::shrink_to`, which returns the difference

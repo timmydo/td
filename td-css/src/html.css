@@ -1,17 +1,20 @@
 /* Common HTML defaults, deliberately independent of layout and painting. */
-html, body, address, article, aside, blockquote, div, dl, dt, dd, fieldset,
-figcaption, figure, footer, form, h1, h2, h3, h4, h5, h6, header, hr, main,
-nav, ol, p, pre, section, ul { display: block }
+html, body, address, article, aside, blockquote, dir, div, dl, dt, dd,
+fieldset, figcaption, figure, footer, form, h1, h2, h3, h4, h5, h6, header,
+hr, main, menu, nav, ol, p, pre, section, ul { display: block }
 head, title, base, link, meta, script, style, template { display: none }
 body { margin: 8px }
-p, dl, ol, ul, pre, blockquote, figure { margin: 1em 0 }
+p, dir, dl, menu, ol, ul, pre, blockquote, figure { margin: 1em 0 }
 blockquote, figure { margin-left: 40px; margin-right: 40px }
 dd { margin-left: 40px }
-ul, ol { padding-left: 40px }
+/* HTML §15.3.7, Lists. */
+:is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) {
+  margin-top: 0; margin-bottom: 0 }
+dir, menu, ol, ul { padding-left: 40px }
 ol { list-style-type: decimal }
-ul { list-style-type: disc }
-ul ul { list-style-type: circle }
-ul ul ul { list-style-type: square }
+dir, menu, ul { list-style-type: disc }
+:is(dir, menu, ol, ul) :is(dir, menu, ul) { list-style-type: circle }
+:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) :is(dir, menu, ul) { list-style-type: square }
 li { display: list-item }
 h1 { font-size: 2em; margin: .67em 0 }
 h2 { font-size: 1.5em; margin: .83em 0 }

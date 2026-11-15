@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod block;
 pub mod inline;
+pub mod list;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use td_alloc::{Budget, BudgetShared, BudgetVec};
@@ -231,6 +232,10 @@ pub struct StyledDocument<'d> {
     charged: usize,
     limits: Limits<'static>,
     cascade: CascadeWork,
+    /// Each list-item box's ordinal value, in box order.
+    list_items: BudgetVec<list::ListItem>,
+    /// List items with a marker: list-style-type is not none.
+    marker_count: usize,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -380,7 +385,12 @@ impl<'d> StyledDocument<'d> {
                 ..limits
             },
             cascade,
+            list_items: BudgetVec::new(memory)?,
+            marker_count: 0,
         };
+        let mut numbering = list::Numbering::new(memory)?;
+        let list_base = out.charged;
+        let mut list_bytes = 0usize;
         let mut last = BudgetVec::filled(memory, document.len(), None)?;
         let mut parents = BudgetVec::filled(memory, document.len(), None)?;
         let mut depths = BudgetVec::filled(memory, document.len(), 0usize)?;
@@ -445,6 +455,24 @@ impl<'d> StyledDocument<'d> {
                     first_child: None,
                     next_sibling: None,
                 })?;
+                if let Some(element) = node.element() {
+                    if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
+                    {
+                        if keyword(computed, Property::ListStyleType) != "none" {
+                            out.marker_count =
+                                out.marker_count.checked_add(1).ok_or(Error::Invalid)?;
+                        }
+                        let limit = limits.bytes;
+                        numbering.item(id, node.parent(), element, &mut |bytes| {
+                            list_bytes = list_bytes
+                                .checked_add(bytes)
+                                .filter(|n| n.checked_add(list_base).is_some_and(|t| t <= limit))
+                                .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
+                            Ok(())
+                        })?;
+                    }
+                    numbering.enter(node_id, element)?;
+                }
                 *parents.get_mut(node_id.index()).ok_or(Error::Invalid)? = Some(id);
                 *depths.get_mut(node_id.index()).ok_or(Error::Invalid)? = depth;
                 let previous = match parent {
@@ -477,6 +505,7 @@ impl<'d> StyledDocument<'d> {
             }
             let mut cursor = node_id;
             loop {
+                numbering.leave(cursor)?;
                 let node = document.node(cursor).ok_or(Error::Invalid)?;
                 if let Some(sibling) = node.next_sibling() {
                     next = Some(sibling);
@@ -491,6 +520,8 @@ impl<'d> StyledDocument<'d> {
                 }
             }
         }
+        out.list_items = numbering.finish()?;
+        out.charged = out.charged.checked_add(list_bytes).ok_or(Error::Invalid)?;
         Ok(out)
     }
     pub fn document(&self) -> &Document {
@@ -530,6 +561,26 @@ impl<'d> StyledDocument<'d> {
     pub fn cascade_work(&self) -> CascadeWork {
         self.cascade
     }
+    /// A list-item box's ordinal value (HTML §4.4.8), clamped to i32; None
+    /// for any other box.
+    pub fn ordinal(&self, id: BoxId) -> Option<i32> {
+        self.list_items
+            .binary_search_by_key(&id.0, |item| item.id.0)
+            .ok()
+            .and_then(|at| self.list_items.get(at))
+            .map(|item| item.ordinal)
+    }
+    /// The number of list-item boxes.
+    pub fn list_item_count(&self) -> usize {
+        self.list_items.len()
+    }
+    /// The list items with a marker, which a whole layout keeps each one of.
+    pub fn marker_count(&self) -> usize {
+        self.marker_count
+    }
+    pub(crate) fn list_items(&self) -> &[list::ListItem] {
+        &self.list_items
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -549,6 +600,8 @@ impl StyledDocument<'static> {
             charged,
             limits,
             cascade,
+            list_items,
+            marker_count,
             ..
         } = built;
         Ok(Self {
@@ -560,6 +613,8 @@ impl StyledDocument<'static> {
             charged,
             limits,
             cascade,
+            list_items,
+            marker_count,
         })
     }
 }

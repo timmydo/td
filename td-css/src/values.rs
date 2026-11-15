@@ -67,6 +67,7 @@ pub enum Property {
     Right,
     Bottom,
     Left,
+    ListStylePosition,
 }
 
 impl Property {
@@ -126,6 +127,7 @@ impl Property {
         Self::Right,
         Self::Bottom,
         Self::Left,
+        Self::ListStylePosition,
     ];
 
     pub fn name(self) -> &'static str {
@@ -185,6 +187,7 @@ impl Property {
             Self::Right => "right",
             Self::Bottom => "bottom",
             Self::Left => "left",
+            Self::ListStylePosition => "list-style-position",
         }
     }
 
@@ -198,6 +201,7 @@ impl Property {
                 | Self::FontStyle
                 | Self::WhiteSpace
                 | Self::ListStyleType
+                | Self::ListStylePosition
                 | Self::TextAlign
                 | Self::LineHeight
                 | Self::FontVariant
@@ -264,6 +268,7 @@ impl Property {
             Self::TextDecoration => ComputedValue::Decoration(Decoration::default()),
             Self::Width | Self::Height => ComputedValue::Length(Length::Auto),
             Self::ListStyleType => ComputedValue::Keyword("disc"),
+            Self::ListStylePosition => ComputedValue::Keyword("outside"),
             Self::TextAlign => ComputedValue::Keyword("start"),
             Self::LineHeight | Self::FontVariant | Self::LetterSpacing => {
                 ComputedValue::Keyword("normal")
@@ -828,21 +833,6 @@ fn parse_value(
         TextAlign => keyword(
             values,
             &["start", "end", "left", "right", "center", "justify"],
-        ),
-        ListStyleType => keyword(
-            values,
-            &[
-                "none",
-                "disc",
-                "circle",
-                "square",
-                "decimal",
-                "decimal-leading-zero",
-                "lower-roman",
-                "upper-roman",
-                "lower-alpha",
-                "upper-alpha",
-            ],
         ),
         TextDecoration => {
             decoration(values).map(|v| Specified::Ready(ComputedValue::Decoration(v)))

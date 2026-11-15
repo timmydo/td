@@ -1,4 +1,5 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
+use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
     cancelled, keyword, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL, MAX_COORDINATE,
 };
@@ -190,7 +191,87 @@ pub(crate) struct Pending {
     space: bool,
     /// A preserved tab: its advance is its stop interval until queued.
     tab: bool,
-    image: Option<(f64, f64, [f64; 4])>,
+    atomic: Option<Atomic>,
+}
+/// An item laid whole: an image, or an inside list marker.
+#[derive(Clone, Copy)]
+enum Atomic {
+    Image(f64, f64, [f64; 4]),
+    Marker(MarkerKind, i32),
+}
+/// A list item's marker, measured: its item, style, text and line metrics,
+/// all in 1/64 CSS px.
+#[derive(Clone, Copy)]
+pub(crate) struct Marker {
+    pub item: NodeId,
+    pub style: StyleId,
+    pub kind: MarkerKind,
+    pub ordinal: i32,
+    pub advance: i64,
+    pub above: i64,
+    pub below: i64,
+    /// Its text's scalars, the work measuring it costs.
+    pub scalars: usize,
+}
+impl Marker {
+    /// Measures `kind`'s text for `ordinal` in the item's style, a work
+    /// unit a scalar (at most MAX_MARKER_BYTES); `known` is the style's
+    /// line metrics when already measured.
+    pub fn new(
+        styled: &StyledDocument<'_>,
+        metrics: &mut impl FontMetrics,
+        (item, style): (NodeId, StyleId),
+        (kind, ordinal): (MarkerKind, i32),
+        known: Option<(i64, i64)>,
+        counters: &mut Counters,
+    ) -> Result<Self, Error> {
+        let computed = styled.style(style).ok_or(Error::Invalid)?;
+        let spacing = letter_spacing(computed);
+        let text = kind.text(ordinal);
+        let mut width: i64 = 0;
+        let mut scalars = 0;
+        for scalar in text.as_str().chars() {
+            counters.step(1)?;
+            scalars += 1;
+            width = width
+                .checked_add(advance(metrics, computed, scalar, spacing))
+                .ok_or(Error::Invalid)?;
+        }
+        if !coordinate(width as f64 / 64.0) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        let (above, below) = match known {
+            Some(known) => known,
+            None => vertical(metrics, computed)?,
+        };
+        Ok(Self {
+            item,
+            style,
+            kind,
+            ordinal,
+            advance: width,
+            above,
+            below,
+            scalars,
+        })
+    }
+    /// Placed with its end at `end` and its baseline at `baseline`.
+    pub fn fragment(&self, end: f64, baseline: f64, inside: bool) -> MarkerFragment {
+        let width = self.advance as f64 / 64.0;
+        MarkerFragment {
+            item: self.item,
+            ordinal: self.ordinal,
+            kind: self.kind,
+            inside,
+            style: self.style,
+            line: None,
+            x: end - width,
+            y: baseline - self.above as f64 / 64.0,
+            width,
+            height: (self.above + self.below).max(0) as f64 / 64.0,
+            baseline,
+        }
+    }
 }
 pub(crate) struct Counters<'c> {
     pub bytes: usize,
@@ -264,20 +345,36 @@ pub(crate) struct LineBounds {
     pub right: f64,
     pub bottom: f64,
     pub advance: f64,
+    /// The line box's own top, height and baseline from its top.
+    pub y: f64,
+    pub height: f64,
+    pub baseline: f64,
 }
 pub(crate) trait LineSink {
-    fn measure(&mut self, _bounds: LineBounds) -> Result<(), Error> {
+    /// Every line, retained or not.
+    fn measure(&mut self, _bounds: LineBounds, _counters: &mut Counters) -> Result<(), Error> {
         Ok(())
     }
     fn wants(&self, y: f64, height: f64) -> bool;
-    fn line(&mut self, line: Line, counters: &mut Counters) -> Result<(), Error>;
+    /// A retained line, with the inside marker it starts with, if any.
+    fn line(
+        &mut self,
+        line: Line,
+        marker: Option<MarkerFragment>,
+        counters: &mut Counters,
+    ) -> Result<(), Error>;
 }
 struct AllLines(BudgetVec<Line>);
 impl LineSink for AllLines {
     fn wants(&self, _: f64, _: f64) -> bool {
         true
     }
-    fn line(&mut self, line: Line, counters: &mut Counters) -> Result<(), Error> {
+    fn line(
+        &mut self,
+        line: Line,
+        _: Option<MarkerFragment>,
+        counters: &mut Counters,
+    ) -> Result<(), Error> {
         counters.admit_growth(&mut self.0)?;
         self.0.try_push(line)?;
         Ok(())
@@ -444,7 +541,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 below,
                 space,
                 tab,
-                image: None,
+                atomic: None,
             };
             self.queue(item, soft, counters, sink)?;
         }
@@ -495,7 +592,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 below: 0,
                 space: false,
                 tab: false,
-                image: Some((width, height, margin)),
+                atomic: Some(Atomic::Image(width, height, margin)),
             },
             // Its soft break was taken above; with the pending line
             // emptied or within the width, queue breaks no further.
@@ -507,6 +604,44 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.after_space = Some(self.pending.len());
         }
         self.last_space = false;
+        self.previous_cr = false;
+        Ok(())
+    }
+    /// An inside marker, the first item of its item's first line: laid
+    /// whole, a break opportunity after it where the item wraps, as after
+    /// the space its text ends with, and collapsible spaces after it
+    /// dropped as at a line's start.
+    pub fn marker(
+        &mut self,
+        marker: &Marker,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+    ) -> Result<(), Error> {
+        counters.step(1)?;
+        let style = self.styled.style(marker.style).ok_or(Error::Invalid)?;
+        let soft = white_space(style).2;
+        self.queue(
+            Pending {
+                node: marker.item,
+                range: 0..0,
+                style: marker.style,
+                display: DisplayText::Source,
+                pen: 0,
+                advance: marker.advance,
+                above: marker.above,
+                below: marker.below,
+                space: false,
+                tab: false,
+                atomic: Some(Atomic::Marker(marker.kind, marker.ordinal)),
+            },
+            soft,
+            counters,
+            sink,
+        )?;
+        if soft {
+            self.after_space = Some(self.pending.len());
+        }
+        self.last_space = true;
         self.previous_cr = false;
         Ok(())
     }
@@ -750,6 +885,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             right: 0.0,
             bottom: next_y,
             advance: width,
+            y: self.y,
+            height,
+            baseline: above as f64 / 64.0,
         };
         counters.step(pending.len())?;
         for p in pending {
@@ -757,7 +895,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             let end = (p.pen + p.advance) as f64 / 64.0;
             bounds.left = bounds.left.min(x).min(end);
             bounds.right = bounds.right.max(x).max(end);
-            if let Some((width, height, margin)) = p.image {
+            if let Some(Atomic::Image(width, height, margin)) = p.atomic {
                 let [_, _, bottom, left] = margin;
                 let image_x = x + left;
                 let image_y = self.y + (above as f64 / 64.0 - height - bottom);
@@ -779,12 +917,32 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
         }
-        sink.measure(bounds)?;
+        sink.measure(bounds, counters)?;
         if sink.wants(self.y, height) {
             let mut fragments: Fragments<TextFragment> = Fragments::new();
             let mut replaced = Fragments::new();
+            let mut marker = None;
             for p in pending {
-                if let Some((width, height, margin)) = p.image {
+                if let Some(Atomic::Marker(kind, ordinal)) = p.atomic {
+                    if counters.fragments >= counters.limits.fragments {
+                        return Err(Error::Limit("MAX_FRAGMENTS"));
+                    }
+                    counters.fragments += 1;
+                    let measured = Marker {
+                        item: p.node,
+                        style: p.style,
+                        kind,
+                        ordinal,
+                        advance: p.advance,
+                        above: p.above,
+                        below: p.below,
+                        scalars: 0,
+                    };
+                    let end = (p.pen + p.advance) as f64 / 64.0;
+                    marker = Some(measured.fragment(end, self.y + above as f64 / 64.0, true));
+                    continue;
+                }
+                if let Some(Atomic::Image(width, height, margin)) = p.atomic {
                     if counters.fragments >= counters.limits.fragments {
                         return Err(Error::Limit("MAX_FRAGMENTS"));
                     }
@@ -841,6 +999,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                     fragments,
                     replaced,
                 },
+                marker,
                 counters,
             )?;
         }

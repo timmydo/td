@@ -55,7 +55,8 @@ account for the old representation before admitting a replacement.
 
 MAX_PAGE_BYTES is 224 MiB of charged retained storage. Admission includes
 the document's conservative charged_bytes, td-dom's navigation arrays,
-style-pool allocations, node/style/box arrays, line records and fragments.
+style-pool allocations, node/style/box arrays, list items' ordinals,
+line records and fragments, markers included.
 The original input, up to the input limit, is charged too while retained
 by the caller.
 An additional 64 MiB working allowance brings the target to 288 MiB
@@ -127,7 +128,8 @@ optional byte limit of its own (§6, "Caller-set limits"), an optional
 lookup of replaced elements' intrinsic sizes (§5, "Intrinsic sizes") and
 an optional cancel flag (below). Its Result owns
 geometry and emitted lines, with resource usage, work counters and the
-lines cut at MAX_LINE_SCALARS (`cuts`, §4, "Long lines").
+lines cut at MAX_LINE_SCALARS (`cuts`, §4, "Long lines") and its list
+markers (`markers`, §5, "List markers").
 BoxGeometry records are in postorder and name DOM elements; this is not
 a paint-order API. `output_bytes` excludes the shared styled document,
 so it can be passed as `retained_output_bytes` on a resize request. Refusal
@@ -177,7 +179,9 @@ so a line's fragment count does not depend on its tabs (§4, "Tab
 stops"). Suppressed whitespace, and what a cut line does not lay (§4,
 "Long lines"), has no fragment. Generated markers, line breaks and
 replaced-element records are distinct kinds and never pretend to be DOM
-text. Selection/find can traverse the DOM independently of the viewport;
+text: a marker is a `MarkerFragment` in `Layout::markers`, naming its
+list item and no text node or byte (§5, "List markers"). Selection/find
+can traverse the DOM independently of the viewport;
 link focus can walk the fragment's ancestors. History keeps a node/range
 place within this document, rather than a fragile wrapped-line number.
 Reparsing creates new identities; cross-navigation place restoration is a
@@ -284,7 +288,8 @@ scalars were: a caller that must not act on a refused fragment gathers
 them first.
 
 **Long lines.** `Limits::line_scalars` (`MAX_LINE_SCALARS`, clamped to
-at least 1) bounds the scalars and replaced elements one line holds
+at least 1) bounds the scalars, replaced elements and inside list
+marker (§5, "List markers"), which takes one slot, one line holds
 pending. A line that reaches it is not refused. If the line holds a
 wrap opportunity it breaks at the last one, as a word that does not fit
 moves, losing nothing, unless the item that would pass the bound is a
@@ -352,9 +357,10 @@ align to the baseline. Initial text-align supports left/start, right/end
 and center; justify uses left. Vertical-align other than baseline is
 deferred. Letter spacing contributes to scalar advances, clamped so an
 advance cannot be negative. Inline non-replaced margins, borders and
-padding, inline relative offsets, generated content and list markers are
-deferred. An HTML br uses the explicit-newline rule, including its own
-metrics and the following empty line.
+padding, inline relative offsets and generated content other than list
+markers (§5, "List markers") are deferred. An HTML br uses the
+explicit-newline rule, including its own metrics and the following
+empty line.
 
 ## 5. Block flow and replaced elements
 
@@ -376,7 +382,7 @@ scroll containers and stacking contexts are consumer/future work.
 
 Tables, flex and inline-block formatting are not implemented: those
 containers use ordinary block flow and their descendants remain visible.
-List items use block flow without synthetic markers. visibility:hidden
+List items use block flow, with the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
 Floats use their computed blockified display in ordinary flow with **no
 exclusion region**; clear has no effect. Float placement is a later
@@ -485,6 +491,161 @@ before or after them. No image decode or load can change geometry inside
 a layout call. SVG/MathML remain excluded with the td-dom projection;
 object/embed/canvas have no content-specific renderer.
 
+### List markers
+
+A box whose computed display is `list-item` and that is not replaced
+generates a marker, unless its `list-style-type` is `none`, from the two
+longhands td-css computes, `list-style-type` and `list-style-position`
+(td-css/DESIGN.md §4, with the `list-style` shorthand). There is no
+`::marker` rule, no `list-style-image`, no `counter-reset`,
+`counter-increment` or `counter-set`, and no `marker-side`: the marker
+is drawn in its item's style, from its item's ordinal and type. A
+replaced element with `display: list-item`, as an `img` may have, is
+neither owned nor numbered and draws no marker. HTML_UA_CSS lays out
+lists as HTML §15.3.7 (Lists) does (td-css/DESIGN.md §4): `dir` and
+`menu` like `ul`, a list inside another list without block margins,
+`ol` decimal, `ul`, `menu` and `dir` disc, and nested lists' bullets: a
+`ul`, `menu` or `dir` inside any list is circle, inside two square, an
+`ol` decimal at any depth. The `type`
+attribute of `ol`, `ul` and `li` is a presentational hint, which td does
+not map (td-web/DESIGN.md §10, "Out"), so `<ol type=a>` counts in
+decimal.
+
+**Numbering.** The ordinal is HTML's ordinal value of an owned list
+item ([HTML §4.4.8](https://html.spec.whatwg.org/multipage/grouping-content.html#the-li-element)),
+the implicit `list-item` counter of
+[CSS Lists 3 §4.6](https://www.w3.org/TR/2020/WD-css-lists-3-20201117/).
+An item's list owner is its closest `ol`, `ul` or `menu` ancestor, at
+any depth, else its parent; an item in `display: none` is not owned, an
+item whose type is `none` is and takes its number. An `ol`'s starting
+value is its `start` attribute, else, when `reversed`, its count of
+owned `li` elements, else 1; any other owner starts at 1. In tree order
+each owned item takes the owner's next number, an `li`'s `value`
+attribute resetting it first, and the next number is one more, or one
+less in an `ol` with `reversed` (CSS maps only `ol[reversed]` to a
+reversed counter, so `reversed` on a `ul` does nothing). Integers are
+parsed by HTML's rules for parsing integers (whitespace, a sign, the
+digits to the first non-digit) and, like every step, clamped to `i32`:
+CSS Lists 3 §4 clamps a counter at the range its UA keeps rather than
+letting it overflow, so `start=99999999999` numbers every item
+2147483647. Nested lists number independently, each its own owner;
+an item nested in another item without a list between them belongs to
+the outer list.
+
+HTML's ordinal value is not CSS Lists 3's implicit counter in every
+corner, and td follows HTML. A reversed `ol` without a start counts its
+owned `li` only, where CSS counts every list item:
+`<ol reversed><li>a<div style=display:list-item>b</div><li>c</ol>`
+numbers 2, 1, 0, CSS 3, 2, 1. A `value` in a reversed `ol` leaves the
+start at the count, where CSS §4.4.2 counts down to the first one set:
+`<ol reversed><li>a<li value=7>b<li>c</ol>` numbers 3, 7, 6, CSS 8,
+7, 6. And an item outside any list is its parent's, where CSS's
+counter runs on through its following siblings' subtrees:
+`<div><li>a</li><section><li>b</section><li>c</div>` numbers 1, 1, 2,
+CSS 1, 2, 3.
+
+The styled document numbers its items once, during box generation, so a
+relayout does not: owners are a stack opened at an owner's box and
+closed when its subtree is done, and a reversed `ol` without a start
+fixes its items' numbers when it closes and knows its count, through a
+scratch list of those items. The owner stack, at most one owner an
+ancestor and so bounded by the tree's depth, and that scratch list, at
+most an entry a list item and so bounded by `MAX_BOXES`, are transient
+scratch charged to no limit, as layout's waiting outside markers are
+(at most one an open item, bounded by `MAX_DEPTH`); all three fall
+within `WORKING_BYTES`. Each list-item box keeps a 16-byte record,
+its box and ordinal, charged to the styled document in the doubling
+steps a layout's arrays are (§6, "Text pages"), against `Limits::bytes`
+(`MAX_PAGE_BYTES` by name); `StyledDocument::ordinal(BoxId)` reads it,
+`list_item_count()` and `marker_count()` count them. A page without list
+items keeps none.
+
+**Text.** `MarkerKind` is the type, `MarkerKind::text(ordinal)` the
+marker string of CSS Lists 3 §3.2, the predefined counter style's
+representation and its suffix, in a `SmallText` of at most
+`MAX_MARKER_BYTES` (17), with no allocation:
+[CSS Counter Styles 3 §6](https://www.w3.org/TR/2021/CR-css-counter-styles-3-20210727/)'s
+`disc` (U+2022), `circle` (U+25E6) and `square` (U+25AA) and a space;
+`decimal`, and `decimal-leading-zero` padded to two symbols with the
+negative sign counting toward the pad, then `. `; `lower-roman` and
+`upper-roman` from 1 to 3999, their range, and `lower-alpha` and
+`upper-alpha` (or their aliases `lower-latin` and `upper-latin`) from
+1, bijective base 26, each falling back to decimal outside its range,
+as each style's fallback is decimal. The longest is `MMMDCCCLXXXVIII. `
+(3888); decimal's is `-2147483648. `, alphabetic's seven letters
+(`fxshrxw. `, 2147483647). Text is measured in its item's
+style, letter-spacing included, a work unit a scalar; a bullet of the
+style and type measured last, or the same number, is not measured again
+but charged as if it were.
+
+**Outside**, the initial position, the marker hangs: its end abuts its
+item's border-box start edge (with the item's relative offset), and its
+baseline is the baseline of the first line laid within the item at any
+depth, a nested block's first line included. It takes no line width,
+adds no line height and stays where text-align moves the line: the
+line's fragments are exactly those of the same item with no marker.
+Items whose first lines coincide share the line, outermost first,
+as `<ul><li><ul><li>x` draws two bullets beside `x`. An item that lays
+no line (empty, only collapsible spaces, only blocks without lines)
+puts its marker at the top of its content box, with no line, and its
+content box is at least the marker's line height tall, as Chromium does;
+a block image in the item keeps its own height. A marker counts toward
+the layout's overflow, so one hanging past the page's start widens it,
+with a line or without. Its baseline is its line's, so a relatively
+positioned child holding that line moves the marker by its top offset
+but not its left one, whose end stays at the item's edge; Chromium
+places the marker at the child's static position, unmoved by either.
+CSS Lists 3 §3.5 leaves the position undefined.
+
+**Inside**, the marker is an atomic inline leading its item's first
+inline content, as CSS Lists 3 §3.5 places it before the item's
+contents: it takes its width on the first line, sets that line's
+height with its item's metrics, moves with text-align, and is followed
+by a wrap opportunity where its item's white space wraps, as its text
+ends in a space. A word that does not fit beside it moves whole to the
+next line, and later lines start at the content edge, not under the
+text. Collapsible spaces after it are dropped as at a line's start, a
+deviation from strict CSS, which keeps one since the marker's own space
+is preserved and so does not collapse what follows it. An item
+whose first child is a block, or that has no inline content, lays the
+marker as a line of its own before the block, as browsers do. It
+shares the scratch slot of an image, so a pending item is no larger,
+and takes one of the line's `line_scalars` slots (§4, "Long lines").
+
+**Fragments.** A `MarkerFragment` names its item (the element, never a
+text node), its `ordinal`, `kind`, `inside` and `style`, its line's
+index in `Layout::lines` (`line`, None for an item that laid none), and
+its own box: `x`, `y`, `width` and `height` from its style's line
+metrics, and its absolute `baseline`, which is its line's. Its text is
+`text()`. It has no byte range: `inline::replay` takes only a
+`TextFragment`, no fragment holds marker text, and a marker's place in
+copied or found text is the consumer's (td-web/DESIGN.md §10, "Places,
+find, selection and links"). Markers live in `Layout::markers`, not in
+a line, so a line stays 136 bytes and a page without list items pays
+nothing; those with a line are in line order, outermost first, and one
+without is added when its item ends. A layout without a window admits
+`marker_count()` markers at once, as it does its geometry, at 72 bytes
+each charged twice; a windowed one keeps a marker where it keeps its
+line, or where the window meets a marker with no line, and grows its
+array as lines do. Each marker counts toward `MAX_FRAGMENTS`.
+
+**Measured.** Release, the host of §6, deterministic metrics, pinned to
+one CPU, 2026-11-15. Pages without list items do not slow: interleaved
+with a build of the crate without markers, medians of nine rounds of
+nine layouts, 2 MiB prose 45.6 ms without and 45.5 with, one word 44.4
+and 44.1, blocks 62.9 and 62.6; styling is §6's. With list items the
+markers cost their measurement: `<ol>` and 100,000 `<li>item text`
+lay out in 44.3 ms without markers and 57.2 with, and style in 380 and
+395 ms. 200,000
+empty items, within td-html's `MAX_NODES` (262,144) only without a text
+node each, style in about 790 ms to 74.4 MiB and lay out decimal
+markers in 49 ms (bullets 33 ms, none 28 ms), charging 177.0 MiB with
+the styled document (149.6 MiB with `list-style-type: none`), 3% of
+`MAX_LAYOUT_WORK`. Inside, each of those markers lays a line, and the
+lines' 68 MiB step refuses the layout `Limit("MAX_PAGE_BYTES")`; 131,000
+items of one letter, which lay a line each anyway, charge 189.6 MiB
+with markers either way and 171.6 without.
+
 ## 6. Work bounds, resize and validation
 
 All limits are named constants and tested at and beyond their edges.
@@ -506,7 +667,8 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_CASCADE_WORK | 128,000,000 | weighted cascade units per styled document |
 | MAX_LINE_SCALARS | 65,536 | pending single-line scratch; a line past it breaks or is cut (§4) |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
-| MAX_FRAGMENTS | 1,048,576 | emitted text/replaced fragments |
+| MAX_FRAGMENTS | 1,048,576 | emitted text, replaced and marker fragments |
+| MAX_MARKER_BYTES | 17 | one list marker's text (§5, "List markers") |
 | MAX_VIEWPORT | 1,000,000 px | viewport width and height |
 | MAX_COORDINATE | 1,000,000,000 px | absolute geometry extent |
 
@@ -826,6 +988,19 @@ ms without and 51.1 with, one word 50.5 and 50.6, blocks 69.2 and
 now sized through its attributes' ratio) takes 22.6 and 23.5, or 23.6
 with a lookup answering every image.
 
+List markers (§5) do not slow a page's layout, and styling a page
+without list items takes about 3% longer, which is accepted: medians of
+nine rounds, as in §5, "List markers", 2 MiB prose laid out in 45.6 ms
+without them and 45.5 with, one word 44.4 and 44.1, blocks 62.9 and
+62.6; the blocks shape styled in 406 ms without and 417 to 420 with.
+None of that is the new `list-style-position` longhand (the blocks
+shape styled in 402.7 ms with td-css's change alone against 403.8
+without it), and the box walk's numbering adds at most 0.3 ms. Built
+with `codegen-units=1`, the parent commit, this change and this change
+with its numbering removed style the blocks shape alike, in 363.4,
+363.9 and 361.9 ms: the difference is where the default build's code
+units place the code, not work the change does.
+
 ### Cascade work
 
 td-css bounds each compute call, not a page (td-css/DESIGN.md §5), so a
@@ -882,7 +1057,7 @@ audit:
 | dependency graph, cycle detection, resolved values (`variables::compute`, `cycles`) | quadratic in names, by visiting order | indexed by position |
 | the element's custom winners (`compute_inner`) | quadratic in names, descending | collected, sorted, last per name |
 | the element's custom map, merged with the parent's | linear, appends | one ordered merge, copies charged |
-| winning declarations, computed values, `font` prefix | by property | bounded by the 55-longhand roster |
+| winning declarations, computed values, `font` prefix | by property | bounded by the 56-longhand roster |
 | candidate rules (`RuleIndex::candidates`) | none: sorted and deduplicated once | charged per candidate, more past 2,048 |
 | style pool buckets, custom buckets, map and token identities | a shift of the index's length per new key | charged that length against `MAX_POOL_WORK` |
 
@@ -1049,13 +1224,15 @@ stayed under it.
 Tables, flexbox, float exclusion, advanced text, painting and td-web
 integration need subsequent designs. No existing consumer switches to this
 library as part of these increments. td-web's integration
-(td-web/DESIGN.md §10, increment 6) needs list markers as a fragment
-kind, a basic automatic table layout (rows and cells, colspan and
-rowspan within bounds), a style pool that admits The Guardian's front
-page, whose token-identity index charges each insertion its length (§6,
-"Style-pool work on The Guardian"). Intrinsic sizes for replaced
-elements supplied by the caller, a change needing a layout and no
-cascade, are §5's "Intrinsic sizes". The input limit a caller sets, the
+(td-web/DESIGN.md §10, increment 6) needs a basic automatic table
+layout (rows and cells, colspan and rowspan within bounds), a style pool
+that admits The Guardian's front page, whose token-identity index
+charges each insertion its length (§6, "Style-pool work on The
+Guardian"). List markers as a fragment kind of their own, outside and
+inside, numbered as HTML numbers list items, are §5's "List markers".
+Intrinsic sizes for replaced elements supplied by the caller, a change
+needing a layout and no cascade, are §5's "Intrinsic sizes". The input
+limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
 are §6's "Caller-set limits"; eight-column tab stops where white space
 is preserved, a tab costing no fragment, and a line past

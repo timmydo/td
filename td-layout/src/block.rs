@@ -1,8 +1,9 @@
 //! Normal-flow geometry and windowed line retention.
 use crate::inline::{
-    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Pending,
-    TextRun,
+    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Marker,
+    Pending, TextRun,
 };
+use crate::list::{MarkerFragment, MarkerKind};
 use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, MAX_PAGE_BYTES};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
@@ -136,6 +137,10 @@ pub struct BoxGeometry {
 pub struct Layout {
     pub boxes: BudgetVec<BoxGeometry>,
     pub lines: BudgetVec<Line>,
+    /// List markers, generated text with no DOM bytes (DESIGN.md §5, "List
+    /// markers"), retained as their lines are: those with a line in line
+    /// order, outer item first; one whose item laid none as its item ends.
+    pub markers: BudgetVec<MarkerFragment>,
     pub height: f64,
     pub overflow: Rect,
     pub line_count: usize,
@@ -189,10 +194,27 @@ pub fn layout_with_budget(
                 .ok_or(Error::Limit("MAX_PAGE_BYTES"))?,
         )?;
     }
+    // A whole layout keeps at most a marker an item: admitted once, at that
+    // capacity, as the geometry is. A window's grow as they are kept.
+    let marker_capacity = if request.window.is_none() {
+        styled.marker_count()
+    } else {
+        0
+    };
+    if marker_capacity != 0 {
+        counters.charge(
+            marker_capacity
+                .checked_mul(std::mem::size_of::<MarkerFragment>())
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(32))
+                .ok_or(Error::Limit("MAX_PAGE_BYTES"))?,
+        )?;
+    }
     // The first tick reads the flag after the up-front limits and before
     // anything is allocated.
     counters.step(0)?;
     let boxes = td_alloc::BudgetVec::with_capacity(memory, capacity)?;
+    let markers = td_alloc::BudgetVec::with_capacity(memory, marker_capacity)?;
     let mut engine = Engine {
         styled,
         memory,
@@ -201,8 +223,12 @@ pub fn layout_with_budget(
         request,
         boxes,
         lines: BudgetVec::new(memory)?,
+        markers,
+        waiting: BudgetVec::new(memory)?,
         pending: BudgetVec::new(memory)?,
         last_dimensions: None,
+        last_marker: None,
+        list_cursor: 0,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -212,16 +238,19 @@ pub fn layout_with_budget(
         let strut = styled.box_node(first).ok_or(Error::Invalid)?.style;
         engine.children(
             Some(first),
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                width: request.width,
-                height: request.height,
+            Place {
+                container: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: request.width,
+                    height: request.height,
+                },
+                definite: Some(request.height),
+                offset: (0.0, 0.0),
+                strut,
             },
-            Some(request.height),
-            (0.0, 0.0),
             0,
-            strut,
+            None,
         )?
     } else {
         0.0
@@ -229,6 +258,7 @@ pub fn layout_with_budget(
     Ok(Layout {
         boxes: engine.boxes,
         lines: engine.lines,
+        markers: engine.markers,
         height: height.max(engine.bottom),
         overflow: Rect {
             x: engine.left,
@@ -251,12 +281,27 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     request: &'r Request<'r>,
     boxes: BudgetVec<BoxGeometry>,
     lines: BudgetVec<Line>,
+    markers: BudgetVec<MarkerFragment>,
+    /// Outside markers of open list items not yet on a line, outermost
+    /// first; the next line laid takes them all.
+    waiting: BudgetVec<Waiting>,
     pending: BudgetVec<Pending>,
     last_dimensions: Option<(StyleId, f64, Option<f64>, Dimensions)>,
+    /// The last marker measured: a bullet of the same style and kind, or
+    /// the same number, measures the same.
+    last_marker: Option<Marker>,
+    /// Layout meets list items in box order: the next one's index.
+    list_cursor: usize,
     left: f64,
     top: f64,
     right: f64,
     bottom: f64,
+}
+/// An outside marker and the x its end abuts: its item's border edge.
+#[derive(Clone, Copy)]
+struct Waiting {
+    marker: Marker,
+    end: f64,
 }
 #[derive(Clone, Copy)]
 enum Event {
@@ -387,30 +432,40 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn children(
         &mut self,
         first: Option<BoxId>,
-        container: Rect,
-        definite: Option<f64>,
-        offset: (f64, f64),
+        place: Place,
         depth: usize,
-        strut: StyleId,
+        mut inside: Option<Marker>,
     ) -> Result<f64, Error> {
+        let Place {
+            container,
+            definite,
+            offset,
+            ..
+        } = place;
         if depth > self.counters.limits.depth {
             return Err(Error::Limit("MAX_DEPTH"));
         }
         let events = self.events(first)?;
         let mut at = 0;
-        let mut y = container.y;
-        let mut previous_margin: Option<f64> = None;
+        let mut run = Run {
+            y: container.y,
+            previous_margin: None,
+        };
         while let Some(event) = events.get(at).copied() {
             match event {
                 Event::Block(id) => {
+                    // An inside marker before a block is a line of its own.
+                    if let Some(marker) = inside.take() {
+                        self.inline_run(&events, at..at, &place, &mut run, Some(marker))?;
+                    }
                     let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
                     let dims = self.block_dimensions(&b, container.width, definite)?;
-                    let gap = previous_margin.map_or(dims.margin.top, |previous| {
+                    let gap = run.previous_margin.map_or(dims.margin.top, |previous| {
                         collapse(previous, dims.margin.top)
                     });
-                    y += gap;
-                    y += self.block(b, dims, container.x, y, offset, depth + 1)?;
-                    previous_margin = Some(dims.margin.bottom);
+                    run.y += gap;
+                    run.y += self.block(id, b, dims, (container.x, run.y), offset, depth + 1)?;
+                    run.previous_margin = Some(dims.margin.bottom);
                     at += 1;
                 }
                 Event::Inline(_) => {
@@ -418,114 +473,194 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     while matches!(events.get(at), Some(Event::Inline(_))) {
                         at += 1;
                     }
-                    let run_y = y + previous_margin.unwrap_or(0.0);
-                    let before = self.counters.lines;
-                    let style = self.styled.style(strut).ok_or(Error::Invalid)?;
-                    let align = keyword(style, Property::TextAlign);
-                    let mut sink = Positioned {
-                        lines: &mut self.lines,
-                        window: self.request.window.as_ref(),
-                        x: container.x + offset.0,
-                        dy: offset.1,
-                        width: container.width,
-                        align,
-                        left: &mut self.left,
-                        top: &mut self.top,
-                        right: &mut self.right,
-                        bottom: &mut self.bottom,
-                    };
-                    let mut flow = Flow::new(
-                        self.styled,
-                        self.metrics,
-                        container.width.floor() as u32,
-                        strut,
-                        run_y,
-                        self.memory,
-                        &mut self.pending,
-                    )?;
-                    for index in start..at {
-                        let event = events.get(index).ok_or(Error::Invalid)?;
-                        let Event::Inline(id) = event else {
-                            return Err(Error::Invalid);
-                        };
-                        let b = self.styled.box_node(*id).ok_or(Error::Invalid)?;
-                        match b.kind {
-                            BoxKind::Text => {
-                                let text = self
-                                    .styled
-                                    .document()
-                                    .node(b.node)
-                                    .and_then(|n| n.text())
-                                    .ok_or(Error::Invalid)?;
-                                flow.text(
-                                    &TextRun {
-                                        node: b.node,
-                                        style: b.style,
-                                        range: 0..text.len(),
-                                    },
-                                    &mut self.counters,
-                                    &mut sink,
-                                )?;
-                            }
-                            BoxKind::Break => {
-                                flow.hard_break(b.style, &mut self.counters, &mut sink)?
-                            }
-                            BoxKind::Image => {
-                                let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-                                let dims = dimensions(
-                                    self.styled,
-                                    b,
-                                    style,
-                                    container.width,
-                                    definite,
-                                    lookup(self.request, b),
-                                )?;
-                                let decor = dims.decoration();
-                                flow.image(
-                                    ImageRun {
-                                        node: b.node,
-                                        style: b.style,
-                                        width: dims.width + decor.horizontal(),
-                                        height: dims.height.unwrap_or(0.0) + decor.vertical(),
-                                        margin: [
-                                            dims.margin.top,
-                                            dims.margin.right,
-                                            dims.margin.bottom,
-                                            dims.margin.left,
-                                        ],
-                                    },
-                                    &mut self.counters,
-                                    &mut sink,
-                                )?;
-                            }
-                            _ => return Err(Error::Invalid),
-                        }
-                    }
-                    flow.finish(&mut self.counters, &mut sink)?;
-                    let end_y = flow.y;
-                    if self.counters.lines != before {
-                        y = end_y;
-                        previous_margin = None;
-                    }
+                    self.inline_run(&events, start..at, &place, &mut run, inside.take())?;
                 }
             }
-            if !coordinate(y) {
+            if !coordinate(run.y) {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
         }
-        let end = y + previous_margin.unwrap_or(0.0);
+        // An item with nothing inline still lays its inside marker.
+        if let Some(marker) = inside.take() {
+            self.inline_run(&events, at..at, &place, &mut run, Some(marker))?;
+        }
+        let end = run.y + run.previous_margin.unwrap_or(0.0);
         let height = (end - container.y).max(0.0);
         if !coordinate(end) || !coordinate(height) {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
         Ok(height)
     }
+    /// One inline sequence, the `range` of `events`, led by an inside
+    /// marker when it is its list item's first.
+    fn inline_run(
+        &mut self,
+        events: &Events,
+        range: Range<usize>,
+        place: &Place,
+        run: &mut Run,
+        marker: Option<Marker>,
+    ) -> Result<(), Error> {
+        let Place {
+            container,
+            definite,
+            offset,
+            strut,
+        } = *place;
+        let run_y = run.y + run.previous_margin.unwrap_or(0.0);
+        let before = self.counters.lines;
+        let style = self.styled.style(strut).ok_or(Error::Invalid)?;
+        let align = keyword(style, Property::TextAlign);
+        let mut sink = Positioned {
+            lines: &mut self.lines,
+            markers: &mut self.markers,
+            waiting: &mut self.waiting,
+            window: self.request.window.as_ref(),
+            x: container.x + offset.0,
+            dy: offset.1,
+            width: container.width,
+            align,
+            left: &mut self.left,
+            top: &mut self.top,
+            right: &mut self.right,
+            bottom: &mut self.bottom,
+        };
+        let mut flow = Flow::new(
+            self.styled,
+            self.metrics,
+            container.width.floor() as u32,
+            strut,
+            run_y,
+            self.memory,
+            &mut self.pending,
+        )?;
+        if let Some(marker) = marker {
+            flow.marker(&marker, &mut self.counters, &mut sink)?;
+        }
+        for index in range {
+            let event = events.get(index).ok_or(Error::Invalid)?;
+            let Event::Inline(id) = event else {
+                return Err(Error::Invalid);
+            };
+            let b = self.styled.box_node(*id).ok_or(Error::Invalid)?;
+            match b.kind {
+                BoxKind::Text => {
+                    let text = self
+                        .styled
+                        .document()
+                        .node(b.node)
+                        .and_then(|n| n.text())
+                        .ok_or(Error::Invalid)?;
+                    flow.text(
+                        &TextRun {
+                            node: b.node,
+                            style: b.style,
+                            range: 0..text.len(),
+                        },
+                        &mut self.counters,
+                        &mut sink,
+                    )?;
+                }
+                BoxKind::Break => flow.hard_break(b.style, &mut self.counters, &mut sink)?,
+                BoxKind::Image => {
+                    let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+                    let dims = dimensions(
+                        self.styled,
+                        b,
+                        style,
+                        container.width,
+                        definite,
+                        lookup(self.request, b),
+                    )?;
+                    let decor = dims.decoration();
+                    flow.image(
+                        ImageRun {
+                            node: b.node,
+                            style: b.style,
+                            width: dims.width + decor.horizontal(),
+                            height: dims.height.unwrap_or(0.0) + decor.vertical(),
+                            margin: [
+                                dims.margin.top,
+                                dims.margin.right,
+                                dims.margin.bottom,
+                                dims.margin.left,
+                            ],
+                        },
+                        &mut self.counters,
+                        &mut sink,
+                    )?;
+                }
+                _ => return Err(Error::Invalid),
+            }
+        }
+        flow.finish(&mut self.counters, &mut sink)?;
+        let end_y = flow.y;
+        if self.counters.lines != before {
+            run.y = end_y;
+            run.previous_margin = None;
+        }
+        Ok(())
+    }
+    /// A list item's marker, measured, and whether it is inside; None for
+    /// any other box and for `list-style-type: none`.
+    fn marker(&mut self, id: BoxId, b: &BoxNode) -> Result<Option<(Marker, bool)>, Error> {
+        if b.kind != BoxKind::Block {
+            return Ok(None);
+        }
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        if keyword(style, Property::Display) != "list-item" {
+            return Ok(None);
+        }
+        let Some(kind) = MarkerKind::from_keyword(keyword(style, Property::ListStyleType)) else {
+            return Ok(None);
+        };
+        let inside = keyword(style, Property::ListStylePosition) == "inside";
+        let ordinal = self.ordinal(id)?;
+        if let Some(last) = self.last_marker.filter(|m| {
+            m.style == b.style && m.kind == kind && (kind.bullet() || m.ordinal == ordinal)
+        }) {
+            // Charged as if measured again.
+            self.counters.step(last.scalars)?;
+            let marker = Marker {
+                item: b.node,
+                ordinal,
+                ..last
+            };
+            return Ok(Some((marker, inside)));
+        }
+        let known = self
+            .last_marker
+            .filter(|m| m.style == b.style)
+            .map(|m| (m.above, m.below));
+        let marker = Marker::new(
+            self.styled,
+            self.metrics,
+            (b.node, b.style),
+            (kind, ordinal),
+            known,
+            &mut self.counters,
+        )?;
+        self.last_marker = Some(marker);
+        Ok(Some((marker, inside)))
+    }
+    /// A list item's ordinal, by a cursor through the styled document's
+    /// items, which layout meets in order, else by search.
+    fn ordinal(&mut self, id: BoxId) -> Result<i32, Error> {
+        let items = self.styled.list_items();
+        while items.get(self.list_cursor).is_some_and(|i| i.id.0 < id.0) {
+            self.list_cursor += 1;
+        }
+        match items.get(self.list_cursor) {
+            Some(item) if item.id == id => Ok(item.ordinal),
+            _ => self.styled.ordinal(id).ok_or(Error::Invalid),
+        }
+    }
     fn block(
         &mut self,
+        id: BoxId,
         b: BoxNode,
         dims: Dimensions,
-        x: f64,
-        y: f64,
+        (x, y): (f64, f64),
         offset: (f64, f64),
         depth: usize,
     ) -> Result<f64, Error> {
@@ -537,23 +672,51 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let mut offset = offset;
         offset.0 += dims.relative.0;
         offset.1 += dims.relative.1;
-        let natural = if b.kind == BoxKind::Image {
+        let mut inside = None;
+        if let Some((marker, is_inside)) = self.marker(id, &b)? {
+            if is_inside {
+                inside = Some(marker);
+            } else {
+                // Hangs outside: its end abuts the item's border edge.
+                self.waiting.try_push(Waiting {
+                    marker,
+                    end: x + offset.0,
+                })?;
+            }
+        }
+        let mut natural = if b.kind == BoxKind::Image {
             dims.height.unwrap_or(0.0)
         } else {
             self.children(
                 b.first_child,
-                Rect {
-                    x: content_x,
-                    y: content_y,
-                    width: dims.width,
-                    height: dims.height.unwrap_or(0.0),
+                Place {
+                    container: Rect {
+                        x: content_x,
+                        y: content_y,
+                        width: dims.width,
+                        height: dims.height.unwrap_or(0.0),
+                    },
+                    definite: dims.height,
+                    offset,
+                    strut: b.style,
                 },
-                dims.height,
-                offset,
                 depth,
-                b.style,
+                inside,
             )?
         };
+        if self.waiting.last().is_some_and(|w| w.marker.item == b.node) {
+            // The item laid no line: its marker stands at its content top,
+            // which it holds open.
+            let waiting = self.waiting.pop().ok_or(Error::Invalid)?;
+            let top = content_y + offset.1;
+            let fragment = waiting.marker.fragment(
+                waiting.end,
+                top + waiting.marker.above as f64 / 64.0,
+                false,
+            );
+            natural = natural.max(fragment.height);
+            self.lineless(fragment)?;
+        }
         let height = dims
             .height
             .unwrap_or(natural)
@@ -584,9 +747,51 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         self.boxes.try_push(geometry)?;
         Ok(height + decor.vertical())
     }
+    /// A marker with no line: within the bounds, and kept where the window
+    /// meets it.
+    fn lineless(&mut self, fragment: MarkerFragment) -> Result<(), Error> {
+        self.counters.step(1)?;
+        self.bounds(Rect {
+            x: fragment.x,
+            y: fragment.y,
+            width: fragment.width,
+            height: fragment.height,
+        })?;
+        if self.request.window.as_ref().is_none_or(|w| {
+            w.start < w.end && fragment.y + fragment.height > w.start && fragment.y < w.end
+        }) {
+            fragment_count(&mut self.counters)?;
+            self.counters.admit_growth(&mut self.markers)?;
+            self.markers.try_push(fragment)?;
+        }
+        Ok(())
+    }
+}
+/// What an inline sequence continues in its block: the pen's y and the
+/// margin a block before it left.
+struct Run {
+    y: f64,
+    previous_margin: Option<f64>,
+}
+/// A block's content: its box, definite height, offset and strut.
+#[derive(Clone, Copy)]
+struct Place {
+    container: Rect,
+    definite: Option<f64>,
+    offset: (f64, f64),
+    strut: StyleId,
+}
+fn fragment_count(counters: &mut Counters) -> Result<(), Error> {
+    if counters.fragments >= counters.limits.fragments {
+        return Err(Error::Limit("MAX_FRAGMENTS"));
+    }
+    counters.fragments += 1;
+    Ok(())
 }
 struct Positioned<'a> {
     lines: &'a mut BudgetVec<Line>,
+    markers: &'a mut BudgetVec<MarkerFragment>,
+    waiting: &'a mut BudgetVec<Waiting>,
     window: Option<&'a Range<f64>>,
     x: f64,
     dy: f64,
@@ -598,7 +803,10 @@ struct Positioned<'a> {
     bottom: &'a mut f64,
 }
 impl LineSink for Positioned<'_> {
-    fn measure(&mut self, bounds: LineBounds) -> Result<(), Error> {
+    fn measure(&mut self, bounds: LineBounds, counters: &mut Counters) -> Result<(), Error> {
+        if !self.waiting.is_empty() {
+            self.hang(&bounds, counters)?;
+        }
         let shift = self.x + alignment(self.align, self.width - bounds.advance);
         include_bounds(
             self.left,
@@ -618,8 +826,24 @@ impl LineSink for Positioned<'_> {
             w.start < w.end && y + self.dy + height > w.start && y + self.dy < w.end
         })
     }
-    fn line(&mut self, mut line: Line, counters: &mut Counters) -> Result<(), Error> {
+    fn line(
+        &mut self,
+        mut line: Line,
+        marker: Option<MarkerFragment>,
+        counters: &mut Counters,
+    ) -> Result<(), Error> {
         let shift = self.x + alignment(self.align, self.width - line.width);
+        if let Some(mut marker) = marker {
+            marker.x += shift;
+            marker.y += self.dy;
+            marker.baseline += self.dy;
+            marker.line = Some(u32::try_from(self.lines.len()).map_err(|_| Error::Invalid)?);
+            if !coordinate(marker.x + marker.width) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+            counters.admit_growth(self.markers)?;
+            self.markers.try_push(marker)?;
+        }
         let local_y = line.y;
         line.y += self.dy;
         for f in &mut line.fragments {
@@ -637,6 +861,41 @@ impl LineSink for Positioned<'_> {
         }
         counters.admit_growth(self.lines)?;
         self.lines.try_push(line)?;
+        Ok(())
+    }
+}
+impl Positioned<'_> {
+    /// The open items' outside markers take this line, their baselines on
+    /// its baseline, and are kept as it is.
+    #[cold]
+    #[inline(never)]
+    fn hang(&mut self, bounds: &LineBounds, counters: &mut Counters) -> Result<(), Error> {
+        let wanted = self.wants(bounds.y, bounds.height);
+        let line = u32::try_from(self.lines.len()).map_err(|_| Error::Invalid)?;
+        let baseline = self.dy + bounds.y + bounds.baseline;
+        for waiting in self.waiting.iter() {
+            counters.step(1)?;
+            let mut fragment = waiting.marker.fragment(waiting.end, baseline, false);
+            include_bounds(
+                self.left,
+                self.top,
+                self.right,
+                self.bottom,
+                Rect {
+                    x: fragment.x,
+                    y: fragment.y,
+                    width: fragment.width,
+                    height: fragment.height,
+                },
+            )?;
+            if wanted {
+                fragment_count(counters)?;
+                fragment.line = Some(line);
+                counters.admit_growth(self.markers)?;
+                self.markers.try_push(fragment)?;
+            }
+        }
+        self.waiting.clear();
         Ok(())
     }
 }
