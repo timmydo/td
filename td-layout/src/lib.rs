@@ -119,7 +119,8 @@ impl<'c> Limits<'c> {
             boxes: self.boxes.min(MAX_BOXES),
             depth: self.depth.min(MAX_DEPTH),
             work: self.work.min(MAX_LAYOUT_WORK),
-            line_scalars: self.line_scalars.min(MAX_LINE_SCALARS),
+            // A line holds at least one item, so every line makes progress.
+            line_scalars: self.line_scalars.clamp(1, MAX_LINE_SCALARS),
             lines: self.lines.min(MAX_LINES),
             fragments: self.fragments.min(MAX_FRAGMENTS),
             styles: self.styles,

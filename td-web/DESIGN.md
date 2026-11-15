@@ -1376,7 +1376,14 @@ td-layout keeps no glyphs.
 **Selection** is two places, kept unchanged by scrolling, a relayout,
 `F8` and a resize. A point of the pane falls on a line by its height
 (an index of the layout's lines by height), on a fragment by its x,
-and between scalars by the halves of their advances, replayed; left of
+and between scalars by the halves of their advances, replayed through
+td-layout's `inline::replay` with the layout's metrics and the style of
+the block that laid the line (the nearest block box enclosing it,
+td-layout §4), which sets the tab stops: it gives a tab
+the advance to its stop and its own byte, and refuses a fragment whose
+advances do not sum to its width, an untabbed one only after reporting
+its scalars, so the window thread gathers a fragment's scalars before
+it acts on them; left of
 a line is its start and right of it its end, above the page the first
 line's start and below it the last's end, as §8 says of wrapped lines.
 §8's keys keep their meaning, a paragraph standing for a logical line,
@@ -1418,9 +1425,10 @@ it turns; and, when the page is wider than the pane, `Left`, `Right`
 and the wheel with `Shift` across it. Unwrapped lines are laid whole,
 within td-layout's bounds, and scrolled to: `MAX_PRE_CHARS` goes. A
 line that does not wrap (`pre`, `nowrap`) past td-layout's
-`MAX_LINE_SCALARS` is cut there, td-layout marking the cut (increment
-6), and the status row says so; `pre-wrap` wraps, so a text page's
-lines never reach it.
+`MAX_LINE_SCALARS` is cut there, the rest of it to its end not laid,
+td-layout counting the cut lines and placing the first (`Layout::cuts`,
+td-layout/DESIGN.md §4, "Long lines"), and the status row says so;
+`pre-wrap` breaks there instead, so a text page is never cut.
 
 **The top's place.** What the reader sees is kept as an anchor: the
 place where the first line reaching below the pane's top begins, and
@@ -1497,15 +1505,21 @@ paints the static notice.
 
 **Open: a text page that does not fit.** A cut text page must fit one
 layout at td-web's narrowest pane and with its tabs, and today need
-not. A full 4 MiB page laid at 11 columns (td-ui's 0.6 em monospace
-face in a 128 px pane) can exceed td-layout's 524,288 laid lines with
-no tab at all, and is refused on one layout (td-layout §6, "Text
-pages"). td-layout lays a tab as a fragment of its own, so one tab a
-line costs some 580 bytes a laid line, which two layouts no longer
-fit, two tabs some 805, and four tabs, or short tab-separated lines,
-are refused on one layout. Either leaves rung 3 nothing to show. td-layout's tab-stop
-increment and td-web's text cut (`MAX_TEXT_LINES`, `MAX_TEXT` or a text
-page's least width) settle it before the cutover (increment 7).
+not. td-layout's tab stops cost no fragment (td-layout/DESIGN.md §4,
+"Tab stops"), so a tabbed line costs what an untabbed one of its laid
+lines does: 199,999 lines with up to four tabs and 4 MiB of
+tab-separated lines lay out at ordinary widths in 81 to 88 MiB, two
+layouts fitting. What remains is the count of laid lines, past
+td-layout's 524,288 when each source line lays as several: a full 4
+MiB page at 11 columns (td-ui's 0.6 em monospace face in a 128 px
+pane) with no tab at all, and 200,000 short tab-separated lines that
+wrap into three at 128 px (`aa\tbb\tcc\tdd\tee`, 34 columns
+expanded), or at 320 px with 0.6 em (`a\tb\t…\tj`, 73), are refused on
+one layout (td-layout §6, "Text pages"). Either leaves rung 3 nothing
+to show. td-web's text cut settles it before the cutover (increment
+7): `MAX_TEXT_LINES`, `MAX_TEXT` or a text page's least width, or a cut
+by the lines a page lays at its least width, counting a tab to its stop,
+rather than by its source lines.
 
 ### Painting
 
@@ -1615,9 +1629,7 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      of their own (td-layout/DESIGN.md §3); a basic automatic table
      layout, rows and cells with `colspan` and `rowspan` within bounds,
      so a page's tables line up as §5's do rather than stacking as
-     blocks; a line past `MAX_LINE_SCALARS` cut and marked rather than
-     refused; and tab stops every eight columns where white space is
-     preserved. Available: a page-wide cascade work ceiling in its
+     blocks. Available: a page-wide cascade work ceiling in its
      `Limits` (`MAX_CASCADE_WORK`), summing each element's weighted
      match steps, declarations, custom names, inherited custom copies
      and substitution charges, refused by name; a cancel flag (`Limits::cancel`,
@@ -1626,9 +1638,16 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      input limit a caller sets (`Limits::input`), up to `MAX_INPUT`
      (4 MiB) for a text page's single text node, beside its 2 MiB
      `MAX_PAGE_INPUT` for markup; a cascade without `style` attributes
-     (`Limits::style_attributes`); and a byte limit for each layout
+     (`Limits::style_attributes`); a byte limit for each layout
      request (`Request::bytes`), in place of the one fixed when the
-     page was cascaded (td-layout/DESIGN.md §3 and §6).
+     page was cascaded (td-layout/DESIGN.md §3 and §6); tab stops
+     every eight columns where white space is preserved (`pre`,
+     `pre-wrap`, `break-spaces`), a tab coalescing with its text so it
+     costs no fragment, its advance and byte replayed by
+     `inline::replay`; and a line past `MAX_LINE_SCALARS` cut and
+     marked (`Layout::cuts`: the lines cut and the first one's place)
+     where it does not wrap, broken there where it does, rather than
+     refused (td-layout/DESIGN.md §4, "Tab stops" and "Long lines").
    - **td-css** (available): the owned-budget API supplies compilation
      admission; `rgb()`, `hsl()`, CSS Color 4's named colours and the
      `background` shorthand's colour; and `StyleSet::from_sheets`, media

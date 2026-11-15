@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::block::{layout, Request};
-    use crate::inline::{DisplayText, FontLine, FontMetrics};
+    use crate::inline::{replay, DisplayText, FontLine, FontMetrics};
     use crate::{
         BoxKind, Error, Limits, StyledDocument, MAX_INPUT, MAX_PAGE_BYTES, MAX_PAGE_INPUT,
         WORKING_BYTES,
@@ -112,6 +112,151 @@ mod tests {
         assert!(full.charged_bytes <= MAX_PAGE_BYTES);
         let last = full.lines.last().unwrap().fragments.last().unwrap();
         assert_eq!(last.range.end, source.len());
+    }
+
+    fn text_page(lines: &[&str], bytes: usize) -> String {
+        let mut html = String::from("<!doctype html><plaintext>");
+        let mut at = 0;
+        while html.len() + lines[at % lines.len()].len() <= bytes {
+            html.push_str(lines[at % lines.len()]);
+            at += 1;
+        }
+        html
+    }
+    const TEXT_CSS: &str = "plaintext{display:block;white-space:pre-wrap;font-family:monospace}";
+
+    #[test]
+    fn four_mib_of_tab_separated_lines_lays_out_a_fragment_a_line() {
+        let html = text_page(
+            &[
+                "name\tvalue\tthird\tx\ty\n",
+                "a\tb\tc\td\te\tf\tg\th\ti\tj\n",
+            ],
+            MAX_INPUT,
+        );
+        assert!(html.len() > MAX_INPUT - 32);
+        let doc = td_html::document::parse(&html).unwrap();
+        let limits = Limits {
+            input: MAX_INPUT,
+            ..Limits::default()
+        };
+        let styled = StyledDocument::new(&doc, &sheets(TEXT_CSS), html.len(), limits).unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(1280.0, 720.0)).unwrap();
+        let source = doc
+            .node(full.lines[0].fragments[0].node)
+            .unwrap()
+            .text()
+            .unwrap();
+        assert_eq!(full.line_count, source.matches('\n').count() + 1);
+        assert!(full.line_count > 200_000);
+        // Every line one fragment: the tabs cost none.
+        assert!(full.lines.iter().all(|l| l.fragments.len() <= 1));
+        // Within the 68 MiB capacity step of the line array, not past it.
+        assert!(
+            full.output_bytes < 72 * 1024 * 1024,
+            "{}",
+            full.output_bytes
+        );
+        // The 8 px space of 16 px monospace: stops every 64 px.
+        let second = &full.lines[1].fragments[0];
+        assert_eq!(second.width, 9.0 * 64.0 + 8.0);
+        let first = &full.lines[0].fragments[0];
+        assert_eq!(first.width, 4.0 * 64.0 + 8.0);
+    }
+
+    #[test]
+    fn tab_stops_and_cuts_through_block_layout_and_windows() {
+        let html = "<pre>界\tx\n<span>ab</span>\tc</pre><p>aaaaaaa<img>b</p><p>cc";
+        let doc = td_html::document::parse(html).unwrap();
+        let css = sheets("p{white-space:nowrap}pre{text-align:center}");
+        let limits = Limits {
+            line_scalars: 6,
+            ..Limits::default()
+        };
+        let styled = StyledDocument::new(&doc, &css, html.len(), limits).unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(400.0, 720.0)).unwrap();
+        // The wide glyph is 16 px; the tab runs to 64 px from the line's
+        // start, before the line is centred.
+        let line = &full.lines[0];
+        assert_eq!(line.fragments.len(), 1);
+        assert_eq!(line.width, 72.0);
+        let centred = 8.0 + (384.0 - 72.0) / 2.0;
+        assert_eq!(line.fragments[0].x, centred);
+        // A run's tab meets the stop the line sets, not the run's start.
+        let line = &full.lines[1];
+        assert_eq!(line.fragments.len(), 2);
+        assert_eq!(line.fragments[1].width, 48.0 + 8.0);
+        // The nowrap paragraph is cut at six scalars: the image and what
+        // follows on its line are not laid.
+        assert_eq!(full.cuts.lines, 1);
+        let cut = full.cuts.first.unwrap();
+        let text = doc.node(cut.node).unwrap().text().unwrap();
+        assert_eq!((text, cut.offset), ("aaaaaaa", 6));
+        assert!(full.lines.iter().all(|l| l.replaced.is_empty()));
+        assert_eq!(full.lines.len(), 4);
+        let mut request = Request::new(400.0, 720.0);
+        request.window = Some(full.lines[0].y..full.lines[0].y + 1.0);
+        let window = layout(&styled, &mut Metrics, &request).unwrap();
+        assert_eq!(window.cuts, full.cuts);
+        assert_eq!(window.lines.len(), 1);
+        // An image is a place of its own when it is the first not laid.
+        let html = "<p>aaaaaa<img>b";
+        let doc = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&doc, &css, html.len(), limits).unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(400.0, 720.0)).unwrap();
+        let cut = full.cuts.first.unwrap();
+        assert_eq!(cut.offset, 0);
+        assert_eq!(
+            doc.node(cut.node)
+                .unwrap()
+                .element()
+                .map(|e| e.name.as_str()),
+            Some("img")
+        );
+        // Where it wraps, an image at the bound breaks the line instead.
+        let html = "<p>aaaa<img width=1 height=1>b";
+        let doc = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(
+            &doc,
+            &sheets(""),
+            html.len(),
+            Limits {
+                line_scalars: 4,
+                ..limits
+            },
+        )
+        .unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(400.0, 720.0)).unwrap();
+        assert_eq!(full.cuts, Default::default());
+        assert_eq!(full.lines.len(), 2);
+        assert_eq!(full.lines[1].replaced.len(), 1);
+        assert_eq!(full.lines[1].fragments.len(), 1);
+    }
+
+    #[test]
+    fn a_smaller_run_meets_the_stops_its_block_sets() {
+        let html = "<pre>a\tb\n<small>a\tb</small></pre>";
+        let doc = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&doc, &sheets(""), html.len(), Limits::default()).unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(400.0, 720.0)).unwrap();
+        let pre = styled
+            .boxes()
+            .iter()
+            .find(|b| doc.node(b.node).unwrap().element().map(|e| e.name.as_str()) == Some("pre"))
+            .unwrap()
+            .style;
+        // The pre's 8 px space sets stops every 64 px for both lines.
+        let mut starts = Vec::new();
+        for line in &full.lines {
+            let f = line.fragments.last().unwrap();
+            replay(&styled, &mut Metrics, f, pre, |s| {
+                if s.shown == 'b' {
+                    starts.push(s.pen as f64 / 64.0 + f.x - line.fragments[0].x);
+                }
+            })
+            .unwrap();
+        }
+        assert_eq!(starts, [64.0, 64.0]);
     }
 
     #[test]

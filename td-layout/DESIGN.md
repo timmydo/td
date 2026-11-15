@@ -125,7 +125,8 @@ Request with viewport dimensions, an optional vertical window, the
 charged bytes of any previous layout output retained during the call, an
 optional byte limit of its own (§6, "Caller-set limits") and an optional
 cancel flag (below). Its Result owns
-geometry and emitted lines, with resource usage and work counters.
+geometry and emitted lines, with resource usage, work counters and the
+lines cut at MAX_LINE_SCALARS (`cuts`, §4, "Long lines").
 BoxGeometry records are in postorder and name DOM elements; this is not
 a paint-order API. `output_bytes` excludes the shared styled document,
 so it can be passed as `retained_output_bytes` on a resize request. Refusal
@@ -170,7 +171,10 @@ that node, its StyleId, position and extent. Offsets are into decoded DOM
 text, not source HTML bytes. A fragment cannot cross text nodes. Contiguous
 unaltered source may coalesce; a collapsed space or replacement scalar
 retains the original byte range and an explicit display transformation.
-Suppressed whitespace has no fragment. Generated markers, line breaks and
+A preserved tab is unaltered source: it coalesces with its neighbours,
+so a line's fragment count does not depend on its tabs (§4, "Tab
+stops"). Suppressed whitespace, and what a cut line does not lay (§4,
+"Long lines"), has no fragment. Generated markers, line breaks and
 replaced-element records are distinct kinds and never pretend to be DOM
 text. Selection/find can traverse the DOM independently of the viewport;
 link focus can walk the fragment's ancestors. History keeps a node/range
@@ -179,8 +183,12 @@ Reparsing creates new identities; cross-navigation place restoration is a
 consumer policy. Layout does not implement td-web's selection or history.
 
 Geometry uses CSS pixels with subpixel precision and finite checked bounds.
-There is no per-glyph retained page array. A future painter can replay a
-fragment through the same metrics/whitespace policy. Box geometry names
+There is no per-glyph retained page array. `inline::replay` replays a
+text fragment's scalars through the layout's metrics and white-space
+policy, each with its byte range, the scalar as shown, its pen from the
+fragment's x and its advance, so a painter, hit-testing and selection
+place a point on a scalar, a tab included, as layout laid it (§4, "Tab
+stops"). Box geometry names
 the originating element and its style, including backgrounds and borders
 for a future painter; no display list or pixel buffer is allocated here.
 
@@ -216,21 +224,109 @@ is claimed. NBSP is not an ordinary breakable space.
 The intentional preprocessing differences are CSS white-space: normal and
 nowrap collapse HTML ASCII whitespace across inline nodes and drop an
 initial collapsed space; pre-line also drops collapsed spaces after a
-newline, preserves newlines and collapses other spaces; pre and pre-wrap preserve spaces
-and newlines. nowrap and pre suppress soft wrapping. Tabs use one space,
-as prose does, not CSS tab stops. In preserving modes, CR and CRLF in
+newline, preserves newlines and collapses other spaces; pre, pre-wrap
+and break-spaces preserve spaces and newlines, break-spaces laid as
+pre-wrap (its spaces hang and are dropped at a line's end, as below).
+nowrap and pre suppress soft wrapping. Where white space collapses, a tab
+is a collapsed space, as prose lays it; where it is preserved, a tab
+advances to the next stop (below). In preserving modes, CR and CRLF in
 DOM text become one newline; prose instead displays a literal CR as
 U+FFFD. Other control scalars display U+FFFD.
-Preformatted trailing spaces are still dropped to preserve the prose
-contract: this differs from CSS pre/pre-wrap. A bare empty inline sequence
-does not generate a line; an explicit newline does, and preserves the
-following empty line. This differs from prose's empty-input one-line rule.
+Preformatted trailing spaces and tabs are still dropped to preserve the
+prose contract: this differs from CSS pre/pre-wrap. A bare empty inline
+sequence does not generate a line; an explicit newline does, and
+preserves the following empty line. This differs from prose's
+empty-input one-line rule.
 Text-transform and text-indent are retained in the style but initially
 not applied. Block content widths are floored to whole pixels for the
 prose-compatible break test; output positions retain subpixel precision.
 
+**Tab stops.** Where white space is preserved, a tab advances to the
+next multiple of the tab interval measured from its line's start pen,
+the block container's starting content edge, before text-align shifts
+the line. The interval is `TAB_SPACES` (8, CSS tab-size's initial
+value) times the advance of a space in the block container's style,
+its letter-spacing included, in 1/64 px (CSS Text 3 §4.2): the strut
+style an inline sequence is laid with, looked up once a sequence, so a
+smaller or spaced run inside the block meets the block's stops. td-css
+has neither `tab-size` nor `word-spacing`, so the interval is fixed. A
+tab on a stop advances a whole interval, and a tab always advances
+unless the interval is zero (a space of no advance), when tabs have
+none. CSS's rule that a tab nearer its stop than 0.5ch takes the next
+is not applied: in a proportional face a tab can advance a sliver. A
+tab is a preserved space:
+pre-wrap and break-spaces may break after it, it hangs at a line's end
+and is dropped there with trailing spaces, and an all-space prefix
+before a word that moves includes it; pre and nowrap never break at it.
+Its advance follows its pen, so it is set when the tab is queued, and
+again from the new line's start for a tab in a word tail a break moves
+(only a run that does not wrap holds a tab there).
+
+A preserved tab is shown as itself, `DisplayText::Source`, and coalesces
+with the source text around it in one fragment, so `name\tvalue\tthird`
+in one text node is one fragment whatever its tabs, and a copy of the
+fragment's bytes keeps them. A fragment keeps no pen of its line, so
+`inline::replay`, given the style of the block that laid the line (the
+nearest `BoxKind::Block` box enclosing the fragment's line, or the
+first box at the top; with another style a mixed-size fragment can be
+refused), recovers its tabs from its width: the first tab takes what the other
+scalars leave, which ends on a stop, and each later tab meets the next
+stop from there. Each replayed scalar, a tab included, names its own
+byte range, so a point over a tab maps to the tab's byte. Replay must
+be given the layout's metrics. It refuses (`Invalid`) a fragment whose
+advances cannot sum to its width, or whose first tab would advance
+nothing or more than an interval; within that, metrics that differ
+from the layout's are not detected for a fragment with a tab, whose
+first tab absorbs the difference. A tabbed fragment is checked before
+any scalar is reported, an untabbed one only at its end, after its
+scalars were: a caller that must not act on a refused fragment gathers
+them first.
+
+**Long lines.** `Limits::line_scalars` (`MAX_LINE_SCALARS`, clamped to
+at least 1) bounds the scalars and replaced elements one line holds
+pending. A line that reaches it is not refused. If the line holds a
+wrap opportunity it breaks at the last one, as a word that does not fit
+moves, losing nothing, unless the item that would pass the bound is a
+space just after that opportunity, which hangs. Else, where that item
+can wrap itself (a non-space in pre-wrap, break-spaces, normal or
+pre-line, or an image there), the line breaks before it, as a word
+wider than the line is split, and nothing is lost. Otherwise (pre,
+nowrap, or a preserved space) the line is **cut**: that item and every
+one after it on the line are visited and charged work but not laid,
+and have no fragment; only that first item is measured, and an
+image's size is always found. Only a space is an opportunity within a
+line, so a soft letter before a run that does not wrap (a
+65,536-scalar word of it) is no break point for that run, which is
+cut, as CSS too gives no opportunity there. A cut line ends at its next
+preserved newline or `<br>`, at the end of its inline sequence, or
+before the next non-space that could start a line there: one that
+wraps itself, or one that a space dropped where the line could wrap
+precedes, with no non-space dropped between. That non-space starts a
+new line, so a run that does not wrap after such a space is laid, not
+lost. A line is counted
+cut only once a non-space or replaced element is dropped: preserved
+spaces alone past the bound would have hung, so a pre-wrap line of
+spaces is laid as the line it would have been. `Layout::cuts` and
+`WrappedText::cuts` report the number of cut lines, whether retained in
+a window or not, and the first cut's place: the text node and byte
+offset of the first item that line dropped, or a replaced element and 0
+when that comes first. What is laid keeps its exact byte ranges; from
+that place to the line's end there is no fragment, and before it
+trailing spaces can lack one too. A run that wraps is never counted
+cut. Breaks and cuts at the bound fall between scalars, not graphemes:
+a combining mark can start a line, or be dropped from its base. A
+text page, pre-wrap, is never cut; a 4 MiB single `pre` line lays its
+first 65,536 scalars, one line charging 20.0 MiB in 23 ms, and 4 MiB of
+pre-wrap spaces lays one empty line in 16 ms (release, the host of §6,
+2026-11-15, medians of three). The breaks the bound adds differ from
+an unbounded layout's only where a line holds more items than
+`line_scalars` before its last wrap opportunity or the pane's width,
+which needs a run of that many spaces, or of items that do not wrap,
+or advances near zero.
+
 `inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
-StyleId for the line strut. It returns bounded lines and byte/work charges.
+StyleId for the line strut, which also sets the tab interval. It returns
+bounded lines, byte/work charges and cuts.
 The same internal flow can measure without retaining lines. BudgetVec growth
 is admitted before allocation, including the old and replacement buffers
 while they overlap. The byte model also counts conservative capacity and
@@ -316,7 +412,7 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_DEPTH | 256 | layout ancestor stack |
 | MAX_LAYOUT_WORK | 64,000,000 | visited records/scalars per layout |
 | MAX_CASCADE_WORK | 128,000,000 | weighted cascade units per styled document |
-| MAX_LINE_SCALARS | 65,536 | pending single-line scratch |
+| MAX_LINE_SCALARS | 65,536 | pending single-line scratch; a line past it breaks or is cut (§4) |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
 | MAX_FRAGMENTS | 1,048,576 | emitted text/replaced fragments |
 | MAX_VIEWPORT | 1,000,000 px | viewport width and height |
@@ -549,40 +645,67 @@ to 524,288 136 MiB, and past 524,288 lines a layout is always refused.
 A per-line figure is therefore an artefact of where the count falls: 356
 bytes a line at 199,999 lines is the 68 MiB step. A line holding more
 than one fragment adds its fragment array, in the same steps: 224 bytes
-for two fragments, 448 for three or four, 864 for five to eight. Only
-source text coalesces, so each tab, shown as a space (§4), is a fragment
-of its own between its neighbours'. Measured once each on 2026-11-15,
-one layout's charge in MiB with its lines where they differ from the
-source's, and whether two layouts fit together:
+for two fragments, 448 for three or four, 864 for five to eight. A
+preserved tab coalesces with the source text around it (§4, "Tab
+stops"), so a line of one text node is one fragment whatever its tabs,
+and a tabbed page costs what an untabbed one of its laid lines does,
+plus its bytes in the styled document's charge (about 1 MiB a tab a
+line at 199,999 lines). Measured on 2026-11-15 with the deterministic
+metrics: one layout's charge in MiB, with its lines where they differ
+from the source's (a page's lines end in a newline, so its last line
+is empty and 199,999 lines lay 200,000), and whether a second layout
+fits beside it (`retained_output_bytes`), else one, or refused
+(`MAX_PAGE_BYTES`):
 
-| Text page | 1280 px | 320 px | 128 px | 104 px |
+| Text page, 0.5 em (8 px) | 1280 px | 320 px | 128 px | 104 px |
 | --- | ---: | ---: | ---: | ---: |
-| 199,999 lines of 12 letters | 80.4, two fit | 80.4, two fit | 80.4, two fit | 148.4 (399,998), one |
-| 199,999 lines of 19 letters | 87.1, two fit | 87.1, two fit | 155.1 (399,998), one | 155.1, one |
-| 46-byte lines, 4 MiB | 54.0 (91,180), two fit | 88.0 (182,360), two fit | 156.0 (364,720), one | 156.0 (455,899), one |
-| a tab and 12 letters a line | 124.1, one | — | 124.1, one | — |
-| two tabs and 12 letters | 167.8, one | — | 167.8, one | — |
-| four tabs and 12 letters | refused | — | 84.2, two fit | — |
-| `aa\tbb\tcc\tdd\tee` a line | refused | — | refused | — |
+| 199,999 lines of 12 letters | 80.4, two | 80.4, two | 80.4, two | 148.4 (399,999), one |
+| 199,999 lines of 19 letters | 87.1, two | 87.1, two | 155.1 (399,999), one | 155.1 (399,999), one |
+| 46-byte lines, 4 MiB | 54.0 (91,180), two | 88.0 (182,360), two | 156.0 (364,720), one | 156.0 (455,899), one |
+| a tab and 12 letters | 81.4, two | 81.4, two | 81.4, two | 149.4 (399,999), one |
+| two tabs and 12 letters | 82.3, two | 82.3, two | 82.3, two | 150.3 (399,999), one |
+| four tabs and 12 letters | 84.2, two | 84.2, two | 84.2, two | 152.2 (399,999), one |
+| `aa\tbb\tcc\tdd\tee`, 199,999 | 82.3, two | 82.3, two | refused | refused |
+| `name\tvalue\tthird\tx\ty`, 4 MiB (199,727) | 88.0, two | 88.0, two | refused | refused |
+| `a\tb\t…\tj`, 199,999 | 87.1, two | 155.1 (399,999), one | refused | refused |
+| 199,999 lines of 12 and one to 4 MiB | 88.0 (210,090), two | 88.0 (241,955), two | 156.0 (313,877), one | refused |
 
-At 128 px the four tabs fit only because, at that width, the all-space
-prefix before a word that moves is dropped (§4). With a 0.6 em
-monospace advance (9.6 px, td-ui's monospace face) at 128 px, 199,999
-lines of 12 or 19 letters lay out as 399,998 lines, 148.4 and 155.1
-MiB, and 174,700 lines of 23 letters as 524,100, 156.0 MiB: one layout
-fits and two do not. Those are not the most laid lines a cut page can
-make: with n source lines, B bytes of text and c columns a layout
-holds up to (B + (c - 2) n) / c lines, 471,019 at 128 px with a 0.5 em
-advance (14 columns; measured, 156.0 MiB) but about 563,000 with 0.6
-em (11 columns), past 524,288. So 199,999 lines of 12 letters and one
-long line to 4 MiB, or 55,066 lines of 12 letters and 144,934 of 23
-(4 MiB), are refused on one layout at 128 px with 0.6 em (and the
-first at 104 px with 0.5 em), with no tab. At td-web's narrowest pane
-a text page with lines longer than the pane therefore needs the old
-layout let go before a relayout, and a full 4 MiB page, or one with
-tabs within a line, can be refused on one layout, leaving td-web's
-text rung nothing to show; td-web's text cut and the tab-stop work
-(§7) settle that before its cutover.
+| Text page, 0.6 em (9.6 px) | 1280 px | 320 px | 128 px | 104 px |
+| --- | ---: | ---: | ---: | ---: |
+| 199,999 lines of 12 letters | 80.4, two | 80.4, two | 148.4 (399,999), one | 148.4 (399,999), one |
+| 199,999 lines of 19 letters | 87.1, two | 87.1, two | 155.1 (399,999), one | refused |
+| 46-byte lines, 4 MiB | 54.0 (91,180), two | 88.0 (182,360), two | 156.0 (455,899), one | refused |
+| a tab and 12 letters | 81.4, two | 81.4, two | 149.4 (399,999), one | 149.4 (399,999), one |
+| two tabs and 12 letters | 82.3, two | 82.3, two | 150.3 (399,999), one | 150.3 (399,999), one |
+| four tabs and 12 letters | 84.2, two | 84.2, two | 152.2 (399,999), one | 152.2 (399,999), one |
+| `aa\tbb\tcc\tdd\tee`, 199,999 | 82.3, two | 150.3 (399,999), one | refused | refused |
+| `name\tvalue\tthird\tx\ty`, 4 MiB (199,727) | 88.0, two | 156.0 (399,455), one | refused | refused |
+| `a\tb\t…\tj`, 199,999 | 87.1, two | refused | refused | refused |
+| 199,999 lines of 12 and one to 4 MiB | 88.0 (212,170), two | 88.0 (251,428), two | refused | refused |
+
+0.6 em is td-ui's monospace face (9.6 px; 9.59375 in 1/64 px). The
+leading-tab rows fit at narrow widths because the all-space prefix
+before a word that moves is dropped (§4). Each layout took 90 to 190
+ms (medians of three), a tabbed page about as long as an untabbed one
+(the TSV page at 1280 px 125 ms). Refused, at td-web's narrowest pane
+(128 px, 14 columns at 0.5 em and 11 at 0.6 em), and at 320 px with
+0.6 em (31 columns), are only pages whose source lines each lay as
+several lines: no layout holds more than 524,288 laid lines, and the
+count is not the source's. With n source lines, B bytes of
+text and c columns an untabbed page lays up to (B + (c - 2) n) / c
+lines (471,019 at 14 columns, about 563,000 at 11); a tab can stand
+for up to eight columns of one byte, so a tabbed line lays up to its
+expanded width over c, and short tab-separated lines wrapping into
+three (`aa\tbb\tcc\tdd\tee` is 34 columns, `name\tvalue\tthird\tx\ty`
+33, `a\tb\t…\tj` 73) pass 524,288 at 200,000 lines. So a full 4 MiB
+untabbed page (199,999 lines of 12 letters and one long line to 4
+MiB, or 55,066 of 12 letters and 144,934 of 23) is refused on one
+layout at 128 px with 0.6 em and at 104 px with 0.5 em, and so is a
+page of short tab-separated lines at 128 px. Two layouts
+of any page past 262,144 laid lines do not fit, so a relayout there
+lets the old one go first. What remains is td-web's text cut (§7):
+bounding a text page by the lines it lays at its least width rather
+than by its source lines.
 
 None of the three limits slows a page: interleaved and pinned to one
 CPU, the 2 MiB shapes cascade within 2% of two identical builds of the
@@ -590,6 +713,17 @@ crate without them, which differ by 1% between themselves, and lay out
 within 1% (2026-11-14). A 2 MiB page of 43,690 paragraphs, each with a
 two-declaration `style` attribute, cascades in about 255 ms with them
 and 200 ms without.
+
+Tab stops and the line bound do not slow a page either. Pinned to one
+CPU and interleaved with a build of the crate without them, medians of
+27 layouts each at 1280 px under a load average of 1 to 2
+(2026-11-15): 2 MiB prose 52.8 ms without and 51.3 with, one word 51.9
+and 50.9, blocks 68.8 and 67.5, and 2 MiB of 46-byte text-page lines
+54.3 and 53.2. Letter-spacing is read once a run, not once a scalar.
+The queue keeps the bound's handling and a line's break out of line
+(`#[cold]`, `#[inline(never)]`) and a pending tab's interval in its
+advance until it is queued: inlining either, or a pending scalar 16
+bytes wider, measured 1 to 40% slower.
 
 ### Cascade work
 
@@ -819,11 +953,14 @@ elements supplied by the caller, list markers as a fragment kind, a
 basic automatic table layout (rows and cells, colspan and rowspan
 within bounds), a style pool that admits The Guardian's front page,
 whose token-identity index charges each insertion its length (§6,
-"Style-pool work on The Guardian"), a line past MAX_LINE_SCALARS cut and
-marked rather than refused, and eight-column tab stops where white space
-is preserved. The tab-stop increment also settles, with td-web's text
-cut, that a text page td-web admits fits one layout at td-web's narrowest
-pane with its tabs: today a tab is a fragment of its own, and a page of
-short tab-separated lines is refused on one layout (§6, "Text pages").
-The input limit a caller sets, the cascade without style attributes and
-the byte limit per layout request are §6's "Caller-set limits".
+"Style-pool work on The Guardian"). The input limit a caller sets, the
+cascade without style attributes and the byte limit per layout request
+are §6's "Caller-set limits"; eight-column tab stops where white space
+is preserved, a tab costing no fragment, and a line past
+MAX_LINE_SCALARS cut and marked, or broken where it wraps, rather than
+refused, are §4's "Tab stops" and "Long lines". A tabbed text page
+costs what an untabbed one of its laid lines does. What remains of a
+text page td-web admits fitting one layout at its narrowest pane is
+td-web's text cut: a page whose source lines each lay as several there,
+short tab-separated lines or a full 4 MiB page at 11 columns, still
+passes 524,288 laid lines (§6, "Text pages").

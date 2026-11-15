@@ -1,6 +1,7 @@
 //! Normal-flow geometry and windowed line retention.
 use crate::inline::{
-    coordinate, Counters, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Pending, TextRun,
+    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Pending,
+    TextRun,
 };
 use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, MAX_PAGE_BYTES};
 use std::ops::Range;
@@ -86,6 +87,8 @@ pub struct Layout {
     pub height: f64,
     pub overflow: Rect,
     pub line_count: usize,
+    /// Lines cut at Limits::line_scalars, whether retained or not.
+    pub cuts: Cuts,
     pub work: usize,
     pub charged_bytes: usize,
     pub output_bytes: usize,
@@ -182,6 +185,7 @@ pub fn layout_with_budget(
             height: engine.bottom - engine.top,
         },
         line_count: engine.counters.lines,
+        cuts: engine.counters.cuts,
         work: engine.counters.work,
         charged_bytes: engine.counters.bytes,
         output_bytes: engine.counters.bytes - initial,

@@ -11,6 +11,9 @@ use td_css::{ComputedStyle, ComputedValue, Property};
 use td_html::document::NodeId;
 
 pub const UNIT: u32 = 64;
+/// Where white space is preserved, a tab advances to the next multiple of
+/// this many spaces' advance from the line's start (CSS tab-size: 8).
+pub const TAB_SPACES: i64 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FontLine {
     pub height: u32,
@@ -143,6 +146,36 @@ pub struct WrappedText {
     pub lines: BudgetVec<Line>,
     pub charged_bytes: usize,
     pub work: usize,
+    pub cuts: Cuts,
+}
+/// Lines that do not wrap, cut at Limits::line_scalars: what follows a
+/// cut, to its line's end, is not laid and has no fragment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cuts {
+    /// Lines cut, counted whether emitted or not.
+    pub lines: usize,
+    /// The first item, scalar or replaced element, the first cut line
+    /// dropped at the bound. Scalars before it can lack fragments too,
+    /// as trailing spaces do.
+    pub first: Option<Cut>,
+}
+/// A text node and a byte offset in it, or a replaced element and 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub node: NodeId,
+    pub offset: usize,
+}
+/// One scalar of a laid text fragment, replayed through the metrics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replayed {
+    /// Its bytes in the fragment's text node.
+    pub range: Range<usize>,
+    /// As shown: ' ' for a collapsed space, U+FFFD for a replaced scalar,
+    /// '\t' for a preserved tab, which draws nothing.
+    pub shown: char,
+    /// From the fragment's x, in 1/64 CSS px.
+    pub pen: i64,
+    pub advance: i64,
 }
 #[derive(Clone)]
 pub(crate) struct Pending {
@@ -155,6 +188,8 @@ pub(crate) struct Pending {
     above: i64,
     below: i64,
     space: bool,
+    /// A preserved tab: its advance is its stop interval until queued.
+    tab: bool,
     image: Option<(f64, f64, [f64; 4])>,
 }
 pub(crate) struct Counters<'c> {
@@ -162,6 +197,7 @@ pub(crate) struct Counters<'c> {
     pub work: usize,
     pub lines: usize,
     pub fragments: usize,
+    pub cuts: Cuts,
     pub limits: Limits<'static>,
     cancel: Option<&'c AtomicBool>,
     next_check: usize,
@@ -173,6 +209,7 @@ impl<'c> Counters<'c> {
             work: 0,
             lines: 0,
             fragments: 0,
+            cuts: Cuts::default(),
             limits: styled.limits(),
             cancel,
             next_check: 0,
@@ -277,6 +314,7 @@ pub fn wrap_text_with_budget(
         lines: sink.0,
         charged_bytes: counters.bytes,
         work: counters.work,
+        cuts: counters.cuts,
     })
 }
 pub(crate) struct ImageRun {
@@ -297,6 +335,15 @@ pub(crate) struct Flow<'s, 'd, 'm, M> {
     last_space: bool,
     after_newline: bool,
     previous_cr: bool,
+    /// The first place this line dropped at Limits::line_scalars, and
+    /// whether it dropped more than spaces, which counts the line cut.
+    cut: Option<Cut>,
+    cut_counted: bool,
+    /// While cut: a wrap opportunity was dropped since the last non-space.
+    cut_opportunity: bool,
+    /// The block's style, whose space sets the tab interval, found once.
+    strut: StyleId,
+    stops: Option<i64>,
     above: i64,
     below: i64,
     pub y: f64,
@@ -328,6 +375,11 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             last_space: true,
             after_newline: false,
             previous_cr: false,
+            cut: None,
+            cut_counted: false,
+            cut_opportunity: false,
+            strut,
+            stops: None,
             above,
             below,
             y,
@@ -347,11 +399,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             .and_then(|s| s.get(run.range.start..run.range.end))
             .ok_or(Error::Invalid)?;
         let style = self.styled.style(run.style).ok_or(Error::Invalid)?;
-        let whitespace = keyword(style, Property::WhiteSpace);
-        let preserve = matches!(whitespace, "pre" | "pre-wrap");
-        let newline = preserve || whitespace == "pre-line";
-        let soft = !matches!(whitespace, "pre" | "nowrap");
+        let (preserve, newline, soft) = white_space(style);
         let (above, below) = vertical(self.metrics, style)?;
+        let spacing = letter_spacing(style);
         for (at, scalar) in text.char_indices() {
             counters.step(1)?;
             if self.previous_cr && scalar == '\n' && newline {
@@ -368,36 +418,32 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             if !preserve && ascii_space && self.last_space {
                 continue;
             }
-            let (shown, display) = if (!preserve && ascii_space) || scalar == '\t' {
-                (
-                    ' ',
-                    if scalar == ' ' {
-                        DisplayText::Source
-                    } else {
-                        DisplayText::Space
-                    },
-                )
-            } else if scalar.is_control() {
-                ('\u{fffd}', DisplayText::Replacement)
-            } else {
-                (scalar, DisplayText::Source)
-            };
+            let (shown, display) = shown(scalar, preserve);
             self.last_space = !preserve && ascii_space;
-            let spacing = match style.get(Property::LetterSpacing) {
-                Some(ComputedValue::Length(Length::Px(n))) => (*n * f64::from(UNIT)).round(),
-                _ => 0.0,
+            let space = matches!(shown, ' ' | '\t');
+            let offset = run.range.start + at;
+            // A cut line drops it unmeasured; its work is charged above.
+            if self.cut.is_some() && self.drops(space, soft) {
+                self.drop_item(run.node, offset, space, soft, counters)?;
+                continue;
+            }
+            let (advance, tab) = if shown == '\t' {
+                // The interval: queue lays it from the pen it then has.
+                (self.stops()?, true)
+            } else {
+                (advance(self.metrics, style, shown, spacing), false)
             };
-            let advance = (f64::from(self.metrics.advance(style, shown)) + spacing).max(0.0) as i64;
             let item = Pending {
                 node: run.node,
-                range: run.range.start + at..run.range.start + at + scalar.len_utf8(),
+                range: offset..offset + scalar.len_utf8(),
                 style: run.style,
                 display,
                 pen: 0,
                 advance,
                 above,
                 below,
-                space: shown == ' ',
+                space,
+                tab,
                 image: None,
             };
             self.queue(item, soft, counters, sink)?;
@@ -434,9 +480,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             if self.pending.iter().any(|p| !p.space) {
                 self.emit(counters, sink, None)?;
             }
-            self.pending.clear();
-            self.pen = 0;
-            self.after_space = None;
+            self.restart();
         }
         let above = ((height + top + bottom) * 64.0).round() as i64;
         self.queue(
@@ -450,9 +494,12 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 above,
                 below: 0,
                 space: false,
+                tab: false,
                 image: Some((width, height, margin)),
             },
-            false,
+            // Its soft break was taken above; with the pending line
+            // emptied or within the width, queue breaks no further.
+            soft,
             counters,
             sink,
         )?;
@@ -474,9 +521,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.styled.style(style).ok_or(Error::Invalid)?,
         )?;
         self.emit(counters, sink, Some(metrics))?;
-        self.pending.clear();
-        self.pen = 0;
-        self.after_space = None;
+        self.restart();
         self.last_space = true;
         self.after_newline = true;
         self.previous_cr = false;
@@ -496,41 +541,20 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             && !self.pending.is_empty()
             && (soft || self.after_space.is_some())
         {
-            let keep = self
-                .after_space
-                .take()
-                .unwrap_or(self.pending.len())
-                .min(self.pending.len());
-            if self
-                .pending
-                .get(..keep)
-                .ok_or(Error::Invalid)?
-                .iter()
-                .any(|p| !p.space)
-            {
-                self.emit_prefix(counters, sink, None, keep)?;
-            }
-            let shift = self.pending.get(keep).map_or(self.pen, |p| p.pen);
-            let remaining = self.pending.len() - keep;
-            // Both positions are below the original length: keep <= len,
-            // and at < len - keep. Move only the unbroken word's tail.
-            for at in 0..remaining {
-                self.pending.swap(at, keep + at);
-            }
-            self.pending.truncate(remaining);
-            counters.step(self.pending.len())?;
-            for p in self.pending.iter_mut() {
-                p.pen = p.pen.checked_sub(shift).ok_or(Error::Invalid)?;
-            }
-            self.pen = self.pen.checked_sub(shift).ok_or(Error::Invalid)?;
+            let keep = self.after_space.unwrap_or(self.pending.len());
+            self.break_at(keep, counters, sink)?;
             if soft && over(self.pen) && !self.pending.is_empty() {
                 self.emit(counters, sink, None)?;
-                self.pending.clear();
-                self.pen = 0;
+                self.restart();
             }
         }
-        if self.pending.len() >= counters.limits.line_scalars {
-            return Err(Error::Limit("MAX_LINE_SCALARS"));
+        if (self.cut.is_some() || self.pending.len() >= counters.limits.line_scalars)
+            && !self.full(&item, soft, counters, sink)?
+        {
+            return Ok(());
+        }
+        if item.tab {
+            item.advance = tab_advance(self.pen, item.advance);
         }
         item.pen = self.pen;
         self.pen = self.pen.checked_add(item.advance).ok_or(Error::Invalid)?;
@@ -553,10 +577,136 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         if !self.pending.is_empty() || self.after_newline {
             self.emit(counters, sink, None)?;
         }
-        self.pending.clear();
-        self.pen = 0;
+        self.restart();
         self.after_newline = false;
         Ok(())
+    }
+    /// At Limits::line_scalars, or past a cut: whether to lay `item`.
+    #[cold]
+    #[inline(never)]
+    fn full(
+        &mut self,
+        item: &Pending,
+        soft: bool,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+    ) -> Result<bool, Error> {
+        let len = self.pending.len();
+        if self.cut.is_none() {
+            // A full line breaks at its last wrap opportunity, losing
+            // nothing: before a non-space, or before a space past it.
+            if let Some(keep) = self.after_space.filter(|k| (1..=len).contains(k)) {
+                if keep < len || !item.space {
+                    self.break_at(keep, counters, sink)?;
+                    return Ok(true);
+                }
+            }
+        }
+        if !self.drops(item.space, soft) {
+            // A wrap opportunity ends a cut line, or breaks a full one as a
+            // word wider than the line is split.
+            if self.pending.iter().any(|p| !p.space) {
+                self.emit(counters, sink, None)?;
+            }
+            self.restart();
+            return Ok(true);
+        }
+        self.drop_item(item.node, item.range.start, item.space, soft, counters)?;
+        Ok(false)
+    }
+    /// Whether a full or cut line drops an item rather than ending there:
+    /// a non-space ends it where it or a dropped space can wrap.
+    fn drops(&self, space: bool, soft: bool) -> bool {
+        space || !self.opportunity(soft)
+    }
+    /// A break may come before the next item: it wraps itself, or a space
+    /// before it, laid or dropped, does.
+    fn opportunity(&self, soft: bool) -> bool {
+        soft || if self.cut.is_some() {
+            self.cut_opportunity
+        } else {
+            self.after_space == Some(self.pending.len())
+        }
+    }
+    /// Cut: drop to the line's end. Spaces alone would hang, so only a
+    /// dropped non-space counts the line cut.
+    fn drop_item(
+        &mut self,
+        node: NodeId,
+        offset: usize,
+        space: bool,
+        soft: bool,
+        counters: &mut Counters,
+    ) -> Result<(), Error> {
+        self.cut_opportunity = space && self.opportunity(soft);
+        let place = self.cut.unwrap_or(Cut { node, offset });
+        self.cut = Some(place);
+        if !space && !self.cut_counted {
+            self.cut_counted = true;
+            counters.cuts.lines = counters.cuts.lines.checked_add(1).ok_or(Error::Invalid)?;
+            counters.cuts.first = counters.cuts.first.or(Some(place));
+        }
+        Ok(())
+    }
+    /// Ends the line after `keep` pending items and moves the rest, the
+    /// unbroken word's tail, to the next.
+    #[inline(never)]
+    fn break_at(
+        &mut self,
+        keep: usize,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+    ) -> Result<(), Error> {
+        self.after_space = None;
+        let keep = keep.min(self.pending.len());
+        if self
+            .pending
+            .get(..keep)
+            .ok_or(Error::Invalid)?
+            .iter()
+            .any(|p| !p.space)
+        {
+            self.emit_prefix(counters, sink, None, keep)?;
+        }
+        let remaining = self.pending.len() - keep;
+        // Both positions are below the original length: keep <= len,
+        // and at < len - keep. Move only the unbroken word's tail.
+        for at in 0..remaining {
+            self.pending.swap(at, keep + at);
+        }
+        self.pending.truncate(remaining);
+        counters.step(self.pending.len())?;
+        // From the new line's start: a tab the tail holds (one laid where
+        // its run does not wrap) meets its stop again.
+        let mut pen: i64 = 0;
+        for p in self.pending.iter_mut() {
+            p.pen = pen;
+            if p.tab {
+                p.advance = tab_advance(pen, self.stops.ok_or(Error::Invalid)?);
+            }
+            pen = pen.checked_add(p.advance).ok_or(Error::Invalid)?;
+        }
+        self.pen = pen;
+        Ok(())
+    }
+    /// The tab interval, from the block's space (CSS Text 3 §4.2).
+    fn stops(&mut self) -> Result<i64, Error> {
+        if let Some(stops) = self.stops {
+            return Ok(stops);
+        }
+        let style = self.styled.style(self.strut).ok_or(Error::Invalid)?;
+        let stops = tab_interval(self.metrics, style, letter_spacing(style))?;
+        self.stops = Some(stops);
+        Ok(stops)
+    }
+    /// A new line: nothing pending, no break opportunity, no cut.
+    fn restart(&mut self) {
+        self.pending.clear();
+        self.pen = 0;
+        self.after_space = None;
+        self.cut = None;
+        self.cut_counted = false;
+        self.cut_opportunity = false;
     }
     fn emit(
         &mut self,
@@ -701,6 +851,161 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
 pub(crate) fn coordinate(n: f64) -> bool {
     n.is_finite() && n.abs() <= MAX_COORDINATE
 }
+/// Replays a text fragment's scalars through `metrics`, which must be the
+/// layout's and measure as they did for it; `block` is the style of the
+/// block container that laid the fragment's line, whose space sets the tab
+/// interval. A tab's advance follows its line's pen, which a fragment does
+/// not keep: the fragment's first tab takes what its width leaves, ending
+/// on a stop, and each later tab meets the next stop from there.
+/// Err(Invalid) for a fragment of another document, or one whose advances
+/// do not sum to its width; an untabbed fragment finds that only at its
+/// end, after its scalars were reported.
+pub fn replay(
+    styled: &StyledDocument<'_>,
+    metrics: &mut impl FontMetrics,
+    fragment: &TextFragment,
+    block: StyleId,
+    mut each: impl FnMut(Replayed),
+) -> Result<(), Error> {
+    let text = styled
+        .document()
+        .node(fragment.node)
+        .and_then(|n| n.text())
+        .and_then(|s| s.get(fragment.range.start..fragment.range.end))
+        .ok_or(Error::Invalid)?;
+    let style = styled.style(fragment.style).ok_or(Error::Invalid)?;
+    let spacing = letter_spacing(style);
+    let units = fragment.width * f64::from(UNIT);
+    if !coordinate(fragment.width) || units.fract() != 0.0 {
+        return Err(Error::Invalid);
+    }
+    let width = units as i64;
+    let shown = |scalar: char| match fragment.display {
+        DisplayText::Source => scalar,
+        DisplayText::Space => ' ',
+        DisplayText::Replacement => '\u{fffd}',
+    };
+    let add = |a: i64, b: i64| a.checked_add(b).ok_or(Error::Invalid);
+    let mut interval = 0;
+    let mut first_tab = None;
+    if fragment.display == DisplayText::Source && text.contains('\t') {
+        let block = styled.style(block).ok_or(Error::Invalid)?;
+        interval = tab_interval(metrics, block, letter_spacing(block))?;
+        let mut before: i64 = 0;
+        let mut after: Option<i64> = None;
+        for scalar in text.chars() {
+            after = match (scalar, after) {
+                ('\t', None) => Some(0),
+                ('\t', Some(pen)) => Some(add(pen, tab_advance(pen, interval))?),
+                (c, None) => {
+                    before = add(before, advance(metrics, style, c, spacing))?;
+                    None
+                }
+                (c, Some(pen)) => Some(add(pen, advance(metrics, style, c, spacing))?),
+            };
+        }
+        let tab = width
+            .checked_sub(add(before, after.unwrap_or(0))?)
+            .ok_or(Error::Invalid)?;
+        if if interval > 0 {
+            !(1..=interval).contains(&tab)
+        } else {
+            tab != 0
+        } {
+            return Err(Error::Invalid);
+        }
+        first_tab = Some(tab);
+    }
+    let mut pen: i64 = 0;
+    let mut origin: i64 = 0;
+    for (at, scalar) in text.char_indices() {
+        let shown = shown(scalar);
+        let advance = if shown != '\t' {
+            advance(metrics, style, shown, spacing)
+        } else if let Some(tab) = first_tab.take() {
+            origin = add(pen, tab)?;
+            tab
+        } else {
+            tab_advance(pen.checked_sub(origin).ok_or(Error::Invalid)?, interval)
+        };
+        // Within the node's text, which `get` bounded above.
+        let start = fragment.range.start + at;
+        each(Replayed {
+            range: start..start + scalar.len_utf8(),
+            shown,
+            pen,
+            advance,
+        });
+        pen = add(pen, advance)?;
+    }
+    if pen != width {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+/// (preserve spaces, preserve newlines, soft wrap); break-spaces is laid
+/// as pre-wrap.
+fn white_space(style: &ComputedStyle) -> (bool, bool, bool) {
+    let mode = keyword(style, Property::WhiteSpace);
+    let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
+    (
+        preserve,
+        preserve || mode == "pre-line",
+        !matches!(mode, "pre" | "nowrap"),
+    )
+}
+fn shown(scalar: char, preserve: bool) -> (char, DisplayText) {
+    if preserve && scalar == '\t' {
+        ('\t', DisplayText::Source)
+    } else if !preserve && matches!(scalar, ' ' | '\t' | '\n' | '\r' | '\x0c') {
+        (
+            ' ',
+            if scalar == ' ' {
+                DisplayText::Source
+            } else {
+                DisplayText::Space
+            },
+        )
+    } else if scalar.is_control() {
+        ('\u{fffd}', DisplayText::Replacement)
+    } else {
+        (scalar, DisplayText::Source)
+    }
+}
+/// letter-spacing in 1/64 CSS px.
+fn letter_spacing(style: &ComputedStyle) -> f64 {
+    match style.get(Property::LetterSpacing) {
+        Some(ComputedValue::Length(Length::Px(n))) => (*n * f64::from(UNIT)).round(),
+        _ => 0.0,
+    }
+}
+fn advance(
+    metrics: &mut impl FontMetrics,
+    style: &ComputedStyle,
+    shown: char,
+    spacing: f64,
+) -> i64 {
+    (f64::from(metrics.advance(style, shown)) + spacing).max(0.0) as i64
+}
+/// TAB_SPACES spaces as this style lays a space, letter-spacing included.
+fn tab_interval(
+    metrics: &mut impl FontMetrics,
+    style: &ComputedStyle,
+    spacing: f64,
+) -> Result<i64, Error> {
+    advance(metrics, style, ' ', spacing)
+        .checked_mul(TAB_SPACES)
+        .ok_or(Error::Invalid)
+}
+/// To the next stop after `pen`, measured from the line's start; a zero
+/// interval lays a tab with no advance.
+fn tab_advance(pen: i64, interval: i64) -> i64 {
+    if interval > 0 {
+        interval - pen.rem_euclid(interval)
+    } else {
+        0
+    }
+}
 fn vertical(metrics: &mut impl FontMetrics, style: &ComputedStyle) -> Result<(i64, i64), Error> {
     let font = metrics.line(style);
     if font.baseline > font.height {
@@ -780,7 +1085,9 @@ mod tests {
             ("a   b", 3, vec!["a", "b"]),
             ("a\n", 3, vec!["a", ""]),
             ("\n\n", 3, vec!["", "", ""]),
-            ("a\tb", 3, vec!["a b"]),
+            // A tab is a preserved space to the next stop, eight columns.
+            ("a\tb", 3, vec!["a", "b"]),
+            ("a\tb", 9, vec!["a\tb"]),
             ("a\u{a0}b", 2, vec!["a\u{a0}", "b"]),
         ] {
             let html = format!("<div>{text}</div>");
@@ -892,7 +1199,8 @@ mod tests {
         let html = "<p>ab";
         let dom = td_html::document::parse(html).unwrap();
         let sheet = sheets("p{white-space:nowrap}");
-        for (limit, ok) in [(2, true), (1, false)] {
+        // A line that does not wrap is cut at the bound, not refused.
+        for (limit, laid, cut) in [(2, "ab", None), (1, "a", Some(1))] {
             let styled = StyledDocument::new(
                 &dom,
                 &sheet,
@@ -904,10 +1212,12 @@ mod tests {
             )
             .unwrap();
             let runs = runs(&styled);
-            assert_eq!(
-                wrap_text(&styled, &mut Metrics(64), &runs, 10, runs[0].style).is_ok(),
-                ok
-            );
+            let result = wrap_text(&styled, &mut Metrics(64), &runs, 10, runs[0].style).unwrap();
+            assert_eq!(shown(&styled, &result.lines[0]), laid);
+            assert_eq!(result.cuts.lines, usize::from(cut.is_some()));
+            assert_eq!(result.cuts.first.map(|c| (c.node, c.offset)), {
+                cut.map(|offset| (runs[0].node, offset))
+            });
         }
         let styled = StyledDocument::new(&dom, &sheet, html.len(), Limits::default()).unwrap();
         let runs = runs(&styled);
@@ -982,42 +1292,54 @@ mod tests {
         ));
     }
     // Whole-word lookahead oracle: unlike Flow it never moves a partial word.
+    // A column is a scalar; a tab runs to the next multiple of eight.
     fn reference(text: &str, width: usize) -> Vec<String> {
         let capacity = width.max(1);
         let mut output = Vec::new();
         for paragraph in text.split('\n') {
-            let chars: Vec<_> = paragraph
-                .chars()
-                .map(|c| if c == '\t' { ' ' } else { c })
-                .collect();
+            let chars: Vec<_> = paragraph.chars().collect();
             let mut line = String::new();
-            let mut spaces = 0;
+            let mut column = 0;
+            let mut gap = String::new();
+            let mut gap_end = 0;
             let mut at = 0;
             while at < chars.len() {
-                if chars[at] == ' ' {
-                    spaces += 1;
+                if matches!(chars[at], ' ' | '\t') {
+                    if gap.is_empty() {
+                        gap_end = column;
+                    }
+                    gap_end = if chars[at] == '\t' {
+                        (gap_end / 8 + 1) * 8
+                    } else {
+                        gap_end + 1
+                    };
+                    gap.push(chars[at]);
                     at += 1;
                     continue;
                 }
                 let begin = at;
-                while at < chars.len() && chars[at] != ' ' {
+                while at < chars.len() && !matches!(chars[at], ' ' | '\t') {
                     at += 1;
                 }
                 let word = &chars[begin..at];
-                let fitting = line.chars().count() + spaces + word.len() <= width;
-                if !fitting {
+                let start = if gap.is_empty() { column } else { gap_end };
+                if start + word.len() > width {
                     if !line.is_empty() {
                         output.push(std::mem::take(&mut line));
                     }
-                    spaces = 0;
+                    column = 0;
+                } else {
+                    line.push_str(&gap);
+                    column = start;
                 }
-                line.extend(std::iter::repeat_n(' ', spaces));
-                spaces = 0;
+                gap.clear();
                 for scalar in word {
-                    if line.chars().count() == capacity {
+                    if column == capacity {
                         output.push(std::mem::take(&mut line));
+                        column = 0;
                     }
                     line.push(*scalar);
+                    column += 1;
                 }
             }
             output.push(line);
@@ -1058,17 +1380,29 @@ mod tests {
     #[test]
     fn line_scratch_global_edge_and_invalid_utf8_ranges() {
         let sheet = sheets("p{white-space:nowrap}");
-        for (count, ok) in [
-            (crate::MAX_LINE_SCALARS, true),
-            (crate::MAX_LINE_SCALARS + 1, false),
+        // Past the bound a line that does not wrap is cut there, the rest
+        // of it not laid.
+        for (count, cut) in [
+            (crate::MAX_LINE_SCALARS, false),
+            (crate::MAX_LINE_SCALARS + 1, true),
+            (4 * crate::MAX_LINE_SCALARS, true),
         ] {
-            let html = format!("<p>{}", "a".repeat(count));
+            let html = format!("<p>{}", "é".repeat(count));
             let dom = td_html::document::parse(&html).unwrap();
             let styled = StyledDocument::new(&dom, &sheet, html.len(), Limits::default()).unwrap();
             let runs = runs(&styled);
+            let result = wrap_text(&styled, &mut Metrics(0), &runs, 0, runs[0].style).unwrap();
+            assert_eq!(result.lines.len(), 1);
+            let laid = 2 * crate::MAX_LINE_SCALARS;
+            assert_eq!(result.lines[0].fragments.len(), 1);
+            assert_eq!(result.lines[0].fragments[0].range, 0..laid);
+            assert_eq!(result.cuts.lines, usize::from(cut));
             assert_eq!(
-                wrap_text(&styled, &mut Metrics(0), &runs, 0, runs[0].style).is_ok(),
-                ok
+                result.cuts.first,
+                cut.then_some(Cut {
+                    node: runs[0].node,
+                    offset: laid
+                })
             );
         }
         let dom = td_html::document::parse("<p>é").unwrap();
@@ -1083,6 +1417,508 @@ mod tests {
         assert!(coordinate(-MAX_COORDINATE));
         assert!(!coordinate(MAX_COORDINATE + 1.0));
         assert!(!coordinate(f64::NAN));
+    }
+    /// Narrow and wide glyphs: a space 8 px, so stops every 64 px.
+    struct Widths;
+    impl FontMetrics for Widths {
+        fn advance(&mut self, _: &ComputedStyle, c: char) -> u32 {
+            match c {
+                'i' => 4 * UNIT,
+                'm' => 12 * UNIT,
+                c if u32::from(c) > 255 => 16 * UNIT,
+                _ => 8 * UNIT,
+            }
+        }
+        fn line(&mut self, _: &ComputedStyle) -> FontLine {
+            FontLine {
+                height: 20 * UNIT,
+                baseline: 15 * UNIT,
+            }
+        }
+    }
+    fn wrapped(
+        html: &str,
+        css: &str,
+        limits: Limits<'static>,
+        metrics: &mut impl FontMetrics,
+        width: u32,
+    ) -> (td_html::document::Document, WrappedText) {
+        let dom = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(css), html.len(), limits).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, metrics, &runs, width, runs[0].style).unwrap();
+        drop(styled);
+        (dom, result)
+    }
+    /// Each scalar a line lays: its bytes, as shown, x and advance in px.
+    fn replayed(
+        styled: &StyledDocument<'_>,
+        metrics: &mut impl FontMetrics,
+        line: &Line,
+        block: StyleId,
+    ) -> Vec<(Range<usize>, char, f64, f64)> {
+        let mut out = Vec::new();
+        for f in &line.fragments {
+            replay(styled, metrics, f, block, |s| {
+                out.push((
+                    s.range,
+                    s.shown,
+                    f.x + s.pen as f64 / 64.0,
+                    s.advance as f64 / 64.0,
+                ))
+            })
+            .unwrap();
+        }
+        out
+    }
+    fn lines_of(html: &str, css: &str, metrics: &mut impl FontMetrics, width: u32) -> Vec<String> {
+        let dom = td_html::document::parse(html).unwrap();
+        let styled =
+            StyledDocument::new(&dom, &sheets(css), html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, metrics, &runs, width, runs[0].style).unwrap();
+        result.lines.iter().map(|l| shown(&styled, l)).collect()
+    }
+    #[test]
+    fn tabs_advance_to_stops_from_the_line_start() {
+        for (text, x) in [
+            ("\tx", 64.0),
+            ("a\tx", 64.0),
+            ("abcdefg\tx", 64.0),
+            ("abcdefgh\tx", 128.0),
+            ("界界界\tx", 64.0),
+            ("界界界界\tx", 128.0),
+            ("\t\tx", 128.0),
+            ("a\t\tx", 128.0),
+            ("ab\tcd\tx", 128.0),
+            ("iii\tx", 64.0),
+            ("mmmmmm\tx", 128.0),
+            ("iiiiiiiiiiiiiiii\tx", 128.0),
+            ("mi界\tx", 64.0),
+        ] {
+            let html = format!("<pre>{text}</pre>");
+            let dom = td_html::document::parse(&html).unwrap();
+            for css in [
+                "",
+                "pre{white-space:pre-wrap}",
+                "pre{white-space:break-spaces}",
+            ] {
+                let styled =
+                    StyledDocument::new(&dom, &sheets(css), html.len(), Limits::default()).unwrap();
+                let runs = runs(&styled);
+                let result = wrap_text(&styled, &mut Widths, &runs, 1000, runs[0].style).unwrap();
+                let line = &result.lines[0];
+                // One source fragment, however many tabs.
+                assert_eq!(line.fragments.len(), 1, "{text:?}");
+                assert_eq!(line.fragments[0].display, DisplayText::Source);
+                assert_eq!(line.fragments[0].range, 0..text.len());
+                assert_eq!(line.width, x + 8.0, "{text:?} {css}");
+                let scalars = replayed(&styled, &mut Widths, line, runs[0].style);
+                assert_eq!(scalars.last().unwrap().2, x, "{text:?}");
+                for (range, shown, at, advance) in &scalars {
+                    assert_eq!(
+                        text.get(range.clone()).unwrap().chars().next(),
+                        Some(*shown)
+                    );
+                    if *shown == '\t' {
+                        assert!(*advance > 0.0 && *advance <= 64.0);
+                        assert_eq!((at + advance) % 64.0, 0.0, "{text:?}");
+                    }
+                }
+            }
+        }
+        // Trailing tabs, as trailing preserved spaces, are not laid.
+        let (_, result) = wrapped(
+            "<pre>ab\t\t</pre>",
+            "",
+            Limits::default(),
+            &mut Widths,
+            1000,
+        );
+        assert_eq!(result.lines[0].width, 16.0);
+        assert_eq!(result.lines[0].fragments[0].range, 0..2);
+    }
+    #[test]
+    fn tabs_wrap_as_preserved_spaces_only_where_lines_wrap() {
+        // A column a pixel, stops every eight.
+        for (css, text, width, want) in [
+            ("pre-wrap", "ab\tcd\tef", 10, vec!["ab\tcd", "ef"]),
+            ("break-spaces", "ab\tcd\tef", 10, vec!["ab\tcd", "ef"]),
+            ("pre", "ab\tcd\tef", 10, vec!["ab\tcd\tef"]),
+            ("pre-wrap", "\t\t\tab", 10, vec!["ab"]),
+            (
+                "pre-wrap",
+                "aaaaaaaaaaaa bb\tc",
+                10,
+                vec!["aaaaaaaaaa", "aa bb\tc"],
+            ),
+            ("pre-wrap", "a\tb\nc\td", 100, vec!["a\tb", "c\td"]),
+            // Where white space collapses a tab is a collapsed space.
+            ("normal", "a\t\tb", 100, vec!["a b"]),
+            ("pre-line", "a\t\tb\n\tc", 100, vec!["a b", "c"]),
+            ("nowrap", "a\tb", 1, vec!["a b"]),
+        ] {
+            let html = format!("<pre>{text}</pre>");
+            let css = format!("pre{{white-space:{css}}}");
+            assert_eq!(
+                lines_of(&html, &css, &mut Metrics(64), width),
+                want,
+                "{css} {text:?}"
+            );
+        }
+        // After a wrap the stops are measured from the new line's start.
+        let html = "<pre>aaaaaaaaaaaa bb\tc</pre>";
+        let dom = td_html::document::parse(html).unwrap();
+        let css = sheets("pre{white-space:pre-wrap}");
+        let styled = StyledDocument::new(&dom, &css, html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, &mut Metrics(64), &runs, 10, runs[0].style).unwrap();
+        let scalars = replayed(&styled, &mut Metrics(64), &result.lines[1], runs[0].style);
+        assert_eq!(scalars[5], (15..16, '\t', 5.0, 3.0));
+        assert_eq!(scalars[6], (16..17, 'c', 8.0, 1.0));
+        // A collapsed tab is a space fragment a space wide, as before.
+        let (dom, result) = wrapped("<p>a\tb", "", Limits::default(), &mut Metrics(64), 100);
+        let text = dom
+            .node(result.lines[0].fragments[1].node)
+            .unwrap()
+            .text()
+            .unwrap();
+        let fragment = &result.lines[0].fragments[1];
+        assert_eq!(fragment.display, DisplayText::Space);
+        assert_eq!(&text[fragment.range.clone()], "\t");
+        assert_eq!((fragment.x, fragment.width), (1.0, 1.0));
+        assert_eq!(result.lines[0].fragments.len(), 3);
+    }
+    #[test]
+    fn a_tab_a_run_that_does_not_wrap_moves_meets_its_stop_again() {
+        // The pre run's tab is laid from x 3 to 8; when the run moves to a
+        // new line it is laid from 1 to 8, so the line is 9 wide.
+        let lines = lines_of(
+            "<p>a <span>b\tc</span>d",
+            "span{white-space:pre}",
+            &mut Metrics(64),
+            9,
+        );
+        assert_eq!(lines, ["a", "b\tc", "d"]);
+        let (_, result) = wrapped(
+            "<p>a <span>b\tc</span>d",
+            "span{white-space:pre}",
+            Limits::default(),
+            &mut Metrics(64),
+            9,
+        );
+        assert_eq!(result.lines[1].width, 9.0);
+        assert_eq!(result.lines[1].fragments[0].width, 9.0);
+    }
+    #[test]
+    fn a_line_holds_one_fragment_however_many_tabs_and_each_maps_to_its_byte() {
+        let css = sheets("pre{white-space:pre-wrap}");
+        for tabs in [0, 1, 2, 4, 9, 40] {
+            let mut text = String::from("a");
+            for _ in 0..tabs {
+                text.push_str("\tb");
+            }
+            let html = format!("<pre>{text}\n{text}</pre>");
+            let dom = td_html::document::parse(&html).unwrap();
+            let styled = StyledDocument::new(&dom, &css, html.len(), Limits::default()).unwrap();
+            let runs = runs(&styled);
+            let source = dom.node(runs[0].node).unwrap().text().unwrap();
+            let result = wrap_text(&styled, &mut Widths, &runs, 100_000, runs[0].style).unwrap();
+            assert_eq!(result.lines.len(), 2);
+            for line in &result.lines {
+                assert_eq!(line.fragments.len(), 1, "{tabs} tabs");
+                let scalars = replayed(&styled, &mut Widths, line, runs[0].style);
+                assert_eq!(scalars.len(), 1 + 2 * tabs);
+                // Hit-testing: every x of the line falls on one scalar,
+                // a tab's on the tab's own byte.
+                let mut x = 0.0;
+                while x < line.width {
+                    let (range, shown, _, _) = scalars
+                        .iter()
+                        .find(|(_, _, at, advance)| *at <= x && x < at + advance)
+                        .unwrap();
+                    assert_eq!(source.as_bytes()[range.start] == b'\t', *shown == '\t');
+                    assert_eq!(range.len(), 1);
+                    x += 4.0;
+                }
+            }
+        }
+        // Another run, another fragment: one a node, not one a tab.
+        let (_, result) = wrapped(
+            "<pre>a\t<b>b\tb</b>\tc\td",
+            "",
+            Limits::default(),
+            &mut Widths,
+            1000,
+        );
+        assert_eq!(result.lines[0].fragments.len(), 3);
+    }
+    #[test]
+    fn replay_refuses_other_metrics_and_other_documents() {
+        let html = "<pre>ab\tc</pre>";
+        let dom = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(""), html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, &mut Metrics(64), &runs, 100, runs[0].style).unwrap();
+        let fragment = &result.lines[0].fragments[0];
+        assert_eq!(
+            replayed(&styled, &mut Metrics(64), &result.lines[0], runs[0].style),
+            [
+                (0..1, 'a', 0.0, 1.0),
+                (1..2, 'b', 1.0, 1.0),
+                (2..3, '\t', 2.0, 6.0),
+                (3..4, 'c', 8.0, 1.0)
+            ]
+        );
+        // Advances that cannot sum to the width are refused; a first tab
+        // takes up what it can, so a tab can hide wider ones.
+        assert!(matches!(
+            replay(&styled, &mut Metrics(32), fragment, runs[0].style, |_| {}),
+            Err(Error::Invalid)
+        ));
+        let (dom, plain) = wrapped("<pre>ab", "", Limits::default(), &mut Metrics(64), 100);
+        let plain_styled = StyledDocument::new(&dom, &sheets(""), 7, Limits::default()).unwrap();
+        assert!(matches!(
+            replay(
+                &plain_styled,
+                &mut Metrics(128),
+                &plain.lines[0].fragments[0],
+                plain.lines[0].fragments[0].style,
+                |_| {}
+            ),
+            Err(Error::Invalid)
+        ));
+        let mut other = fragment.clone();
+        other.range = 0..9;
+        assert!(matches!(
+            replay(&styled, &mut Metrics(64), &other, runs[0].style, |_| {}),
+            Err(Error::Invalid)
+        ));
+        // A width that leaves the first tab nothing, or more than an
+        // interval, is no layout's.
+        for width in [3.0, 12.0] {
+            let mut other = fragment.clone();
+            other.width = width;
+            assert!(matches!(
+                replay(&styled, &mut Metrics(64), &other, runs[0].style, |_| {}),
+                Err(Error::Invalid)
+            ));
+        }
+        let mut other = fragment.clone();
+        other.width = 11.0;
+        assert!(replay(&styled, &mut Metrics(64), &other, runs[0].style, |_| {}).is_ok());
+    }
+    #[test]
+    fn lines_past_the_scalar_bound_are_cut_or_broken_never_refused() {
+        let four = Limits {
+            line_scalars: 4,
+            ..Limits::default()
+        };
+        // (html, css, lines, cut lines, the first cut's byte)
+        for (html, css, want, cut, first) in [
+            // A line that does not wrap is cut to its end.
+            ("<pre>aaaaaa\nbb", "", vec!["aaaa", "bb"], 1, Some(4)),
+            ("<pre>a\taaaa\tb", "", vec!["a\taa"], 1, Some(4)),
+            (
+                "<p>aaaaaa bb",
+                "p{white-space:nowrap}",
+                vec!["aaaa"],
+                1,
+                Some(4),
+            ),
+            // Spaces alone would have hung: dropped, not counted a cut.
+            ("<pre>aaaa  \t\nb", "", vec!["aaaa", "b"], 0, None),
+            ("<pre>aaaa  b\nc", "", vec!["aaaa", "c"], 1, Some(4)),
+            // A line that wraps breaks at the bound instead.
+            (
+                "<pre>aaaaaaaaaa",
+                "pre{white-space:pre-wrap}",
+                vec!["aaaa", "aaaa", "aa"],
+                0,
+                None,
+            ),
+            ("<p>aaaaaaaaaa", "", vec!["aaaa", "aaaa", "aa"], 0, None),
+            (
+                "<pre>          x",
+                "pre{white-space:pre-wrap}",
+                vec!["x"],
+                0,
+                None,
+            ),
+            // A wrap opportunity ends a cut line.
+            (
+                "<p><span>aaaaaa</span> bb",
+                "span{white-space:nowrap}",
+                vec!["aaaa", "bb"],
+                1,
+                Some(4),
+            ),
+        ] {
+            let (dom, result) = wrapped(html, css, four, &mut Metrics(0), 100);
+            let styled = StyledDocument::new(&dom, &sheets(css), html.len(), four).unwrap();
+            let lines: Vec<_> = result.lines.iter().map(|l| shown(&styled, l)).collect();
+            assert_eq!(lines, want, "{html}");
+            assert_eq!(result.cuts.lines, cut, "{html}");
+            assert_eq!(result.cuts.first.map(|c| c.offset), first, "{html}");
+            if let Some(cut) = result.cuts.first {
+                let text = dom.node(cut.node).unwrap().text().unwrap();
+                // The cut's place is the first scalar no fragment holds.
+                assert!(text.is_char_boundary(cut.offset));
+                for line in &result.lines {
+                    for f in &line.fragments {
+                        assert!(f.node != cut.node || !f.range.contains(&cut.offset));
+                    }
+                }
+            }
+        }
+        // At the default bound: pre cuts both lines; pre-wrap wraps the
+        // first, and its run of spaces past the bound hangs, unrefused.
+        let html = format!("<pre>{}\n{}x", "a".repeat(70_000), " ".repeat(70_000));
+        for (css, cut, last) in [("", 2, ""), ("pre{white-space:pre-wrap}", 0, "x")] {
+            let (dom, result) = wrapped(&html, css, Limits::default(), &mut Metrics(64), 1000);
+            assert_eq!(result.cuts.lines, cut);
+            let styled =
+                StyledDocument::new(&dom, &sheets(css), html.len(), Limits::default()).unwrap();
+            let shown = shown(&styled, result.lines.last().unwrap());
+            assert_eq!(shown.trim_start_matches(' '), last);
+        }
+    }
+    /// One pixel a scalar, but `m`, three.
+    struct Glyphs;
+    impl FontMetrics for Glyphs {
+        fn advance(&mut self, _: &ComputedStyle, c: char) -> u32 {
+            if c == 'm' {
+                3 * UNIT
+            } else {
+                UNIT
+            }
+        }
+        fn line(&mut self, _: &ComputedStyle) -> FontLine {
+            FontLine {
+                height: 20 * UNIT,
+                baseline: 15 * UNIT,
+            }
+        }
+    }
+    #[test]
+    fn a_full_or_cut_line_ends_at_a_wrap_opportunity_rather_than_dropping() {
+        let four = Limits {
+            line_scalars: 4,
+            ..Limits::default()
+        };
+        // (html, css, width, lines, cut lines, the first cut's byte)
+        for (html, css, width, want, cut, first) in [
+            // A space dropped past a cut is a wrap opportunity: the runs
+            // that do not wrap after it start a new line, not lost.
+            (
+                "<p><i>aaaaaa</i> <i>bb</i> <i>cc</i> dd</p>",
+                "i{white-space:nowrap}",
+                400,
+                vec!["aaaa", "bb", "cc", "dd"],
+                1,
+                Some(4),
+            ),
+            // A full line's trailing preserved spaces hang; the run that
+            // does not wrap after them starts the next line, uncut.
+            (
+                "<div>a     <i>XYZ</i> end</div>",
+                "div{white-space:pre-wrap}i{white-space:nowrap}",
+                40,
+                vec!["a", "XYZ", "end"],
+                0,
+                None,
+            ),
+            // A full line breaks at its last opportunity, so the tail
+            // that moves keeps its room and is cut only when full again.
+            (
+                "<p>x <i>aaaam</i>",
+                "i{white-space:nowrap}",
+                5,
+                vec!["x", "aaaa"],
+                1,
+                Some(4),
+            ),
+            // The same before a space: the space follows the tail.
+            (
+                "<p>x <i>aa</i><b> a</b>",
+                "i{white-space:nowrap}b{white-space:pre}",
+                100,
+                vec!["x", "aa a"],
+                0,
+                None,
+            ),
+        ] {
+            let (dom, result) = wrapped(html, css, four, &mut Glyphs, width);
+            let styled = StyledDocument::new(&dom, &sheets(css), html.len(), four).unwrap();
+            let lines: Vec<_> = result.lines.iter().map(|l| shown(&styled, l)).collect();
+            assert_eq!(lines, want, "{html}");
+            assert_eq!(result.cuts.lines, cut, "{html}");
+            assert_eq!(result.cuts.first.map(|c| c.offset), first, "{html}");
+            // A counted cut names a place in a line it did not lay.
+            if let Some(cut) = result.cuts.first {
+                for line in &result.lines {
+                    for f in &line.fragments {
+                        assert!(f.node != cut.node || f.range.end <= cut.offset);
+                    }
+                }
+            }
+        }
+        // At the default bound, a preserved run of spaces past it, then a
+        // run that does not wrap.
+        let html = format!("<div>a{}<i>XYZ</i>", " ".repeat(65_540));
+        let css = "div{white-space:pre-wrap}i{white-space:nowrap}";
+        let (dom, result) = wrapped(&html, css, Limits::default(), &mut Glyphs, 1280);
+        let styled =
+            StyledDocument::new(&dom, &sheets(css), html.len(), Limits::default()).unwrap();
+        let lines: Vec<_> = result.lines.iter().map(|l| shown(&styled, l)).collect();
+        assert_eq!(lines, ["a", "XYZ"]);
+        assert_eq!(result.cuts, Cuts::default());
+        // A bound of zero is clamped to one: every line makes progress.
+        let zero = Limits {
+            line_scalars: 0,
+            ..Limits::default()
+        };
+        let (dom, result) = wrapped("<p>ab", "p{white-space:nowrap}", zero, &mut Glyphs, 10);
+        let styled = StyledDocument::new(&dom, &sheets(""), 5, zero).unwrap();
+        assert_eq!(styled.limits().line_scalars, 1);
+        assert_eq!(shown(&styled, &result.lines[0]), "a");
+        assert_eq!(result.cuts.lines, 1);
+    }
+    #[test]
+    fn the_block_sets_the_tab_interval_with_its_letter_spacing() {
+        // Each scalar 1 px and 1 px apart: a space 2 px, stops every 16.
+        let css = "pre{letter-spacing:1px}";
+        let (_, result) = wrapped("<pre>a\tb", css, Limits::default(), &mut Metrics(64), 100);
+        assert_eq!(result.lines[0].width, 18.0);
+        // The tab a moved tail holds meets the same stops again.
+        let css = "p{letter-spacing:1px}span{white-space:pre}";
+        let html = "<p>a <span>b\tc</span>d";
+        let (_, result) = wrapped(html, css, Limits::default(), &mut Metrics(64), 18);
+        assert_eq!(result.lines.len(), 3);
+        assert_eq!(result.lines[1].width, 18.0);
+    }
+    #[test]
+    fn replay_finds_a_stop_for_a_fragment_starting_off_one() {
+        let html = "<pre>a<b>b\tc\td</b></pre>";
+        let dom = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(""), html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, &mut Widths, &runs, 1000, runs[0].style).unwrap();
+        let line = &result.lines[0];
+        assert_eq!(line.fragments.len(), 2);
+        let scalars = replayed(&styled, &mut Widths, line, runs[0].style);
+        let at: Vec<_> = scalars.iter().map(|s| (s.1, s.2, s.3)).collect();
+        assert_eq!(
+            at,
+            [
+                ('a', 0.0, 8.0),
+                ('b', 8.0, 8.0),
+                ('\t', 16.0, 48.0),
+                ('c', 64.0, 8.0),
+                ('\t', 72.0, 56.0),
+                ('d', 128.0, 8.0)
+            ]
+        );
     }
     #[test]
     fn mixed_modes_preserve_break_eligibility_and_space_identity() {
