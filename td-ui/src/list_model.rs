@@ -6,7 +6,8 @@
 //! change, the consumer says which position its selected item now holds.
 
 use crate::chrome::{Item, List};
-use crate::raster::{Draw, Rect};
+use crate::driven::PointerPhase;
+use crate::raster::{Draw, Rect, Scrollbar};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +55,15 @@ pub struct ListModel {
     selected: Option<usize>,
     first: usize,
     margin: usize,
+    scrolling: Option<ScrollDrag>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScrollDrag {
+    list: List,
+    bar: Scrollbar,
+    origin: usize,
+    grab: i64,
 }
 
 impl ListModel {
@@ -99,6 +109,7 @@ impl ListModel {
     /// the selected item now holds, or `None` when it is gone. A position
     /// past the end selects nothing.
     pub fn set_items(&mut self, count: usize, selected: Option<usize>, list: List) -> Change {
+        self.cancel_scrollbar();
         let before = self.selected;
         self.count = count;
         self.selected = selected.filter(|&index| index < count);
@@ -108,6 +119,7 @@ impl ListModel {
     /// Selects `index`, or nothing, and shows it; an index past the end is
     /// refused and changes nothing.
     pub fn select(&mut self, index: Option<usize>, list: List) -> Change {
+        self.cancel_scrollbar();
         if index.is_some_and(|index| index >= self.count) {
             return Change::default();
         }
@@ -120,6 +132,7 @@ impl ListModel {
     /// already holds. With nothing selected `End` selects the last item and
     /// every other step the first.
     pub fn step(&mut self, step: Step, list: List) -> Change {
+        self.cancel_scrollbar();
         let Some(last) = self.count.checked_sub(1) else {
             return Change::default();
         };
@@ -141,6 +154,7 @@ impl ListModel {
     /// what that changed; `None` off the items. The consumer decides what
     /// a double press activates.
     pub fn press(&mut self, list: List, x: i64, y: i64) -> Option<(usize, Change)> {
+        self.cancel_scrollbar();
         let index = self.first.checked_add(list.hit(x, y)?)?;
         if index >= self.count {
             return None;
@@ -148,8 +162,71 @@ impl ListModel {
         Some((index, self.select(Some(index), list)))
     }
 
+    /// Routes a primary-button gesture to the scrollbar. A press anywhere
+    /// in the gutter grabs the thumb at that point, or jumps its centre to
+    /// the point when pressed outside the thumb. Motion and release keep
+    /// scrolling outside the list. `Some` consumes the event (including a
+    /// disabled bar); `None` leaves it to the consumer's item/field handling.
+    /// The selected item never changes. Cancel on lost input or an overlay.
+    pub fn scrollbar_pointer(
+        &mut self,
+        list: List,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Option<Change> {
+        if phase == PointerPhase::Press {
+            self.cancel_scrollbar();
+            let bar = list.scrollbar(self.count, self.first);
+            let gutter = Rect {
+                width: list.rect().width - list.body().width,
+                ..bar.track
+            };
+            if !gutter.contains(x, y) {
+                return None;
+            }
+            if !bar.enabled() {
+                return Some(Change::default());
+            }
+            let on_thumb = y >= bar.thumb.y && y < bar.thumb.y + i64::from(bar.thumb.height);
+            self.scrolling = Some(ScrollDrag {
+                list,
+                bar,
+                origin: self.first,
+                grab: if on_thumb {
+                    y - bar.thumb.y
+                } else {
+                    i64::from(bar.thumb.height / 2)
+                },
+            });
+        }
+        let drag = self.scrolling?;
+        if phase == PointerPhase::Release || drag.list != list {
+            self.cancel_scrollbar();
+        }
+        if drag.list != list {
+            return None;
+        }
+        // Always use the press's geometry and exact row, so quantizing the
+        // thumb to pixels neither jumps on a stationary click nor accumulates
+        // rounding error over a stream of one-pixel motions.
+        let first = drag.bar.position_at(y, drag.grab, drag.origin);
+        let window = first != self.first;
+        self.first = first;
+        Some(Change {
+            selection: false,
+            window,
+        })
+    }
+
+    /// Ends a held scrollbar without changing the window or selection.
+    pub fn cancel_scrollbar(&mut self) {
+        self.scrolling = None;
+    }
+
     /// Scrolls by `rows`, negative up, leaving the selection where it is.
     pub fn scroll(&mut self, rows: i64, list: List) -> Change {
+        self.cancel_scrollbar();
         let last_page = self.count.saturating_sub(list.rows());
         let magnitude = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
         let first = if rows < 0 {
@@ -168,6 +245,7 @@ impl ListModel {
 
     /// Keeps the selection shown after `list` changed size.
     pub fn relayout(&mut self, list: List) -> Change {
+        self.cancel_scrollbar();
         self.reveal(list, false)
     }
 
@@ -375,6 +453,145 @@ mod tests {
         assert_eq!(model.relayout(short), WINDOW);
         assert_eq!(model.first(), 6);
         assert_eq!(model.relayout(short), NOTHING);
+    }
+
+    #[test]
+    fn scrollbar_drag_keeps_selection_and_reaches_both_ends_at_every_scale() {
+        for scale in 1..=4 {
+            let surface = Surface::new(800, 800, Scale::new(scale).unwrap()).unwrap();
+            let list = List::new(
+                surface,
+                Rect {
+                    x: 32,
+                    y: 48,
+                    width: 100 * scale as u32,
+                    height: 96 * scale as u32,
+                },
+            )
+            .unwrap();
+            let mut model = filled(1000, list);
+            model.select(Some(7), list);
+            model.scroll(137, list);
+            let origin = model.first();
+            let bar = list.scrollbar(model.count(), origin);
+            let x = bar.track.x + 1;
+            let y = bar.thumb.y + i64::from(bar.thumb.height / 2);
+            assert_eq!(
+                model.scrollbar_pointer(list, PointerPhase::Press, x, y),
+                Some(NOTHING)
+            );
+            assert_eq!(
+                model.scrollbar_pointer(list, PointerPhase::Move, -100, y),
+                Some(NOTHING)
+            );
+            // Many tiny moves must equal one move from the original grab.
+            let mut direct = model;
+            for delta in 1..=13 {
+                model.scrollbar_pointer(list, PointerPhase::Move, -100, y + delta);
+            }
+            direct.scrollbar_pointer(list, PointerPhase::Move, x, y + 13);
+            assert_eq!(model.first(), direct.first());
+            model.scrollbar_pointer(list, PointerPhase::Move, i64::MIN, i64::MAX);
+            assert_eq!(model.first(), 996);
+            model.scrollbar_pointer(list, PointerPhase::Release, i64::MAX, i64::MIN);
+            assert_eq!(model.first(), 0);
+            assert_eq!(model.selected(), Some(7));
+            assert_eq!(
+                model.scrollbar_pointer(list, PointerPhase::Move, x, i64::MAX),
+                None
+            );
+            // The whole gutter, including the gap right of the drawn track.
+            assert_eq!(
+                model.scrollbar_pointer(
+                    list,
+                    PointerPhase::Press,
+                    list.rect().x + i64::from(list.rect().width) - 1,
+                    bar.track.y + i64::from(bar.track.height) - 1
+                ),
+                Some(WINDOW)
+            );
+            assert_eq!(model.first(), 996);
+            assert_eq!(model.selected(), Some(7));
+        }
+    }
+
+    #[test]
+    fn scrollbar_stationary_click_preserves_subpixel_origin_and_disabled_bars_consume() {
+        let list = list(4);
+        let mut model = filled(100_000, list);
+        model.scroll(1, list);
+        let bar = list.scrollbar(model.count(), model.first());
+        assert_eq!(bar.thumb.y, bar.track.y);
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            assert_eq!(
+                model.scrollbar_pointer(list, phase, bar.track.x, bar.thumb.y + 3),
+                Some(NOTHING)
+            );
+            assert_eq!(model.first(), 1);
+        }
+        for count in [0, 1, 4] {
+            let mut model = filled(count, list);
+            assert_eq!(
+                model.scrollbar_pointer(list, PointerPhase::Press, bar.track.x, 5),
+                Some(NOTHING)
+            );
+            assert_eq!(
+                model.scrollbar_pointer(list, PointerPhase::Move, bar.track.x, 90),
+                None
+            );
+            assert_eq!(model.first(), 0);
+        }
+        assert_eq!(
+            model.scrollbar_pointer(list, PointerPhase::Press, 5, 5),
+            None
+        );
+    }
+
+    #[test]
+    fn scrollbar_capture_ends_when_its_context_changes() {
+        let view = list(4);
+        let mut model = filled(100, view);
+        let bar = view.scrollbar(100, 0);
+        for cancel in 0..8 {
+            model.scrollbar_pointer(view, PointerPhase::Press, bar.track.x, 2);
+            match cancel {
+                0 => model.cancel_scrollbar(),
+                1 => {
+                    model.set_items(100, None, view);
+                }
+                2 => {
+                    model.select(None, view);
+                }
+                3 => {
+                    model.step(Step::Home, view);
+                }
+                4 => {
+                    model.press(view, -1, -1);
+                }
+                5 => {
+                    model.scroll(0, view);
+                }
+                6 => {
+                    model.relayout(view);
+                }
+                _ => {
+                    model.scrollbar_pointer(view, PointerPhase::Press, -1, -1);
+                }
+            }
+            assert_eq!(
+                model.scrollbar_pointer(view, PointerPhase::Move, bar.track.x, 90),
+                None
+            );
+        }
+        model.scrollbar_pointer(view, PointerPhase::Press, bar.track.x, 2);
+        assert_eq!(
+            model.scrollbar_pointer(list(3), PointerPhase::Move, bar.track.x, 70),
+            None
+        );
+        assert_eq!(
+            model.scrollbar_pointer(view, PointerPhase::Release, bar.track.x, 90),
+            None
+        );
     }
 
     #[test]

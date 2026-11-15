@@ -223,6 +223,15 @@ impl App {
 
     /// One input; whether the window should close is `quitting`.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        if !matches!(
+            input,
+            Input::Pointer {
+                phase: PointerPhase::Move | PointerPhase::Release,
+                ..
+            } | Input::Hover(_)
+        ) {
+            self.cancel_list_scrollbars();
+        }
         match input {
             Input::Resize(surface) => self.resize(surface),
             Input::Focus(focused) => {
@@ -1045,6 +1054,10 @@ impl App {
             let outcome = dialog.event(Some(self.dialog_revision), true, event);
             return self.dialog_outcome(outcome);
         }
+        if self.list_scrollbar_pointer(phase, x, y) {
+            self.drag = None;
+            return;
+        }
         match (phase, self.drag) {
             (PointerPhase::Press, _) => self.press(x, y, extend),
             (_, Some(Drag::Pane)) => {
@@ -1071,6 +1084,45 @@ impl App {
                 }
             }
             (PointerPhase::Release, _) => self.drag = None,
+            _ => {}
+        }
+    }
+
+    /// Lists keep their own scrollbar grab, including motion over other
+    /// widgets. Route it before item selection so scrolling never opens an
+    /// entry or marks an encryption key.
+    fn list_scrollbar_pointer(&mut self, phase: PointerPhase, x: i64, y: i64) -> bool {
+        let surface = self.surface;
+        let (model, view) = match &mut self.phase {
+            Phase::Locked { list, .. } => (list, layout::keys(surface)),
+            Phase::Importing { list, .. } => (list, layout::copy_keys(surface)),
+            Phase::Unlocked(notebook) if notebook.keys.showing => {
+                (&mut notebook.keys.list, layout::enrolled(surface))
+            }
+            Phase::Unlocked(notebook) => (
+                &mut notebook.list,
+                layout::panes(surface, notebook.finding).list,
+            ),
+            _ => return false,
+        };
+        let Some(view) = view else {
+            model.cancel_scrollbar();
+            return false;
+        };
+        let Some(change) = model.scrollbar_pointer(view, phase, x, y) else {
+            return false;
+        };
+        self.redraw |= change.any();
+        true
+    }
+
+    pub(super) fn cancel_list_scrollbars(&mut self) {
+        match &mut self.phase {
+            Phase::Locked { list, .. } | Phase::Importing { list, .. } => list.cancel_scrollbar(),
+            Phase::Unlocked(notebook) => {
+                notebook.list.cancel_scrollbar();
+                notebook.keys.list.cancel_scrollbar();
+            }
             _ => {}
         }
     }

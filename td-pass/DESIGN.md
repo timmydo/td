@@ -146,6 +146,11 @@ run standalone. No refusal falls back to another mode.
   already. It reaches the vault only through commands and replies, so its
   tests run without a token. Titles and bodies travel in clearing
   owners (`src/plain.rs`), and the window's title names no entry.
+  The title and key lists use td-ui's scrollbar gestures: drag the thumb
+  or press the gutter to jump and drag, keeping the selection and open
+  entry unchanged. A grab follows motion outside the list until release;
+  cancellation, focus changes, resize, other input and an overlaid prompt,
+  question or finder end it.
 - **Entries.** Every entry document is loaded through one function that
   refuses filling first; copy and cut take the selection alone. Save
   sends an edit, a creation or, for a title alone, a rename against the

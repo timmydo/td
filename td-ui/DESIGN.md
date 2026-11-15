@@ -630,7 +630,17 @@ of its own files may name each module.
   around the selection through `reveal_within`. `window` names the item
   range a consumer hands `emit`, which paints through `List::emit` with
   no row highlighted when nothing is selected. Activation, a double
-  press and filtering stay with the consumer.
+  press and filtering stay with the consumer. `scrollbar_pointer` takes
+  the primary button's press, move and release before item handling and
+  returns a `Change` when consumed, including an unchanged disabled bar,
+  or none off the gutter without a grab. A thumb press keeps the grab
+  offset; a press elsewhere in the gutter jumps the thumb's centre there.
+  Motion and release scroll outside the list too, clamped to the ends,
+  without selecting or activating an item. The press's geometry and exact
+  first row anchor rounding, so a stationary click does not jump and small
+  motions do not accumulate error. Release, changed geometry, item updates,
+  selection, steps, row presses, wheel scrolling and relayout end the grab;
+  the consumer calls `cancel_scrollbar` on lost input or an overlay.
 - `messages`: `Message` (built from `new` with `text`, `rich`,
   `picture`, `section`, `excerpt`, `status`, `verdict`, `action`,
   `source`, `collapsed`, `side` and `time`), `Side`, `Tone`, `Point`,

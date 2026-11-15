@@ -555,6 +555,7 @@ impl App {
                 pin.set_masked(true);
                 self.say(asking(&ask));
                 self.end_prompt();
+                self.cancel_list_scrollbars();
                 self.prompt = Some(Prompting { op, ask, pin });
                 // The prompt takes every input, so no question stays over
                 // it; what it was for is asked again when the operation
@@ -1318,6 +1319,7 @@ impl App {
     }
 
     fn sync_focus(&mut self) {
+        self.cancel_list_scrollbars();
         let focused = self.window_focused
             && self.focus == Focus::Editor
             && self.prompt.is_none()

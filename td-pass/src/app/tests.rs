@@ -3539,3 +3539,187 @@ fn mail_approval_is_discarded_by_lock_and_refuses_stale_entry() {
     app.bind_mail();
     assert!(app.take_out().is_empty());
 }
+
+#[cfg(test)]
+mod scrollbars {
+    use super::*;
+
+    #[test]
+    fn title_scrollbar_drags_without_opening_an_entry_and_cancels_cleanly() {
+        let mut board = Board::default();
+        let entries = (0..100)
+            .map(|i| item(i, &format!("entry {i:03}")))
+            .collect();
+        let mut app = unlocked(&mut board, entries);
+        app.take_out();
+        let list = layout::panes(app.surface, false).list.unwrap();
+        let bar = list.scrollbar(100, 0);
+        let x = bar.track.x + 1;
+        let y = bar.thumb.y + 3;
+        let pointer = |app: &mut App, board: &mut Board, phase, x, y| {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: true,
+                    follow: false,
+                },
+                board,
+            );
+        };
+        let selected = app.notebook().unwrap().list.selected();
+        pointer(&mut app, &mut board, PointerPhase::Press, x, y);
+        pointer(&mut app, &mut board, PointerPhase::Move, -50, 10_000);
+        let last = 100 - list.rows();
+        assert_eq!(app.notebook().unwrap().list.first(), last);
+        assert_eq!(app.notebook().unwrap().list.selected(), selected);
+        assert!(app.take_out().is_empty());
+        assert!(app.dialog.is_none());
+        pointer(&mut app, &mut board, PointerPhase::Release, x, -100);
+        assert_eq!(app.notebook().unwrap().list.first(), 0);
+        pointer(&mut app, &mut board, PointerPhase::Move, x, 10_000);
+        assert_eq!(app.notebook().unwrap().list.first(), 0);
+        // Keyboard navigation, loss of focus/input, overlays and resizing
+        // must not leave a grab that can resume on a later motion.
+        for cancel in 0..6 {
+            pointer(&mut app, &mut board, PointerPhase::Press, x, y);
+            match cancel {
+                0 => app.input(Input::CancelPointer, &mut board),
+                1 => app.input(Input::Focus(false), &mut board),
+                2 => app.input(Input::Resize(app.surface), &mut board),
+                3 => key(&mut app, &mut board, "F6"),
+                4 => {
+                    app.show_keys(true);
+                    app.show_keys(false);
+                }
+                _ => {
+                    app.refilter(None);
+                }
+            }
+            let first = app.notebook().unwrap().list.first();
+            pointer(&mut app, &mut board, PointerPhase::Move, x, 10_000);
+            assert_eq!(app.notebook().unwrap().list.first(), first);
+        }
+    }
+
+    #[test]
+    fn an_asynchronous_prompt_retires_a_held_scrollbar() {
+        let mut board = Board::default();
+        let entries = (0..100)
+            .map(|i| item(i, &format!("entry {i:03}")))
+            .collect();
+        let mut app = unlocked(&mut board, entries);
+        app.show_keys(true);
+        app.add_key();
+        let op = op_of(&app.take_out());
+        app.show_keys(false);
+        let list = layout::panes(app.surface, false).list.unwrap();
+        let bar = list.scrollbar(100, 0);
+        app.input(
+            Input::Pointer {
+                phase: PointerPhase::Press,
+                x: bar.track.x + 1,
+                y: bar.thumb.y + 3,
+                extend: false,
+                follow: false,
+            },
+            &mut board,
+        );
+        app.reply(Reply::Ask {
+            op,
+            ask: Ask {
+                operation: "add key",
+                role: Role::Backup,
+                key: None,
+                pin: None,
+            },
+        });
+        assert!(app.prompt.is_some());
+        // No input is needed for the backend to withdraw its prompt.
+        app.reply(Reply::TrustedAttention { op });
+        assert!(app.prompt.is_none());
+        app.input(
+            Input::Pointer {
+                phase: PointerPhase::Move,
+                x: bar.track.x + 1,
+                y: 10_000,
+                extend: false,
+                follow: false,
+            },
+            &mut board,
+        );
+        assert_eq!(app.notebook().unwrap().list.first(), 0);
+    }
+
+    #[test]
+    fn key_list_scrollbars_scroll_without_selecting_or_marking_keys() {
+        let mut board = Board::default();
+        let keys: Vec<_> = (0..100)
+            .map(|i| label(Role::Backup, &format!("key {i:03}")))
+            .collect();
+        for phase in 0..3 {
+            let mut app = if phase == 2 {
+                unlocked(&mut board, vec![])
+            } else {
+                watched()
+            };
+            let view = match phase {
+                0 => {
+                    app.reply(Reply::Opened {
+                        keys: Some(keys.clone()),
+                    });
+                    layout::keys(app.surface)
+                }
+                1 => {
+                    let mut list = ListModel::default();
+                    let view = layout::copy_keys(app.surface).unwrap();
+                    list.set_items(keys.len(), Some(0), view);
+                    app.phase = Phase::Importing {
+                        keys: keys.clone(),
+                        list,
+                    };
+                    Some(view)
+                }
+                _ => {
+                    app.show_keys(true);
+                    let view = layout::enrolled(app.surface).unwrap();
+                    let notebook = app.notebook().unwrap();
+                    notebook.keys.keys.labels = keys.clone();
+                    notebook.keys.marked = vec![false; keys.len()];
+                    notebook.keys.list.set_items(keys.len(), Some(0), view);
+                    Some(view)
+                }
+            }
+            .unwrap();
+            app.take_out();
+            let bar = view.scrollbar(keys.len(), 0);
+            for (phase, y) in [
+                (PointerPhase::Press, bar.thumb.y + 3),
+                (PointerPhase::Release, 10_000),
+            ] {
+                app.input(
+                    Input::Pointer {
+                        phase,
+                        x: bar.track.x + 1,
+                        y,
+                        extend: true,
+                        follow: false,
+                    },
+                    &mut board,
+                );
+            }
+            let list = match &app.phase {
+                Phase::Locked { list, .. } | Phase::Importing { list, .. } => list,
+                Phase::Unlocked(n) => {
+                    assert!(n.keys.marked.iter().all(|marked| !marked));
+                    &n.keys.list
+                }
+                _ => panic!("list vanished"),
+            };
+            assert_eq!(list.first(), 100 - view.rows());
+            assert_eq!(list.selected(), Some(0));
+            assert!(app.take_out().is_empty());
+        }
+    }
+}
