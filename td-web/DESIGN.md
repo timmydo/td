@@ -1065,8 +1065,9 @@ then has no old layout to keep, and the page steps down from rung 2
 (below, "Cuts").
 
 td-layout measures the whole flow on every layout (td-layout/DESIGN.md
-§6): a width change of 2 MiB of synthetic markup takes 105 to 194 ms
-(medians, synthetic metrics) and the eight corpus pages 0.4 to 8.5 ms,
+§6): a width change of 2 MiB of synthetic markup takes 54 to 67 ms
+(medians, synthetic metrics; 105 to 194 ms under a heavier load) and
+the eight corpus pages 0.4 to 8.5 ms,
 on top of the cascade above. So a relayout runs on the render thread,
 never the window's, and a resize no longer costs only the lines shown,
 as §5's wrap does. The window thread asks for one and goes on painting
@@ -1082,9 +1083,10 @@ window but measures the whole flow for it all the same (its windowed
 and full work are identical), so a window would cost a whole pass at
 every scroll past it. td-web keeps every line: scrolling is a paint,
 and its memory is the layout's output, which the page's budget counts:
-84.7 MiB for the costliest 2 MiB shape measured, sixteen-letter
-paragraphs, and at most 37.8 MiB for a whole corpus page, tree and
-styles included.
+68.6 MiB for the costliest 2 MiB shape measured, sixteen-letter
+paragraphs, 114.7 MiB for 4 MiB of 26-letter ones at the narrowest
+pane, and at most 37.8 MiB for a whole corpus page, tree and styles
+included.
 
 ### Memory
 
@@ -1128,9 +1130,10 @@ keep their charges until dropped; the temporary DOM index returns its
 actual admission when construction ends. Outputs retained across resize
 count against their common ancestor automatically.
 
-No external reservation covers these owned arrays. Limits::bytes and
-Request::retained_output_bytes still govern the conservative layout
-admission model, independently of the actual shared budget. The consumer
+No external reservation covers these owned arrays. Limits::bytes, or a
+layout request's own Request::bytes, and Request::retained_output_bytes
+still govern the conservative layout admission model, independently of
+the actual shared budget. The consumer
 must own its input and its additional tree-order and viewport indexes
 through td-alloc as well. Any refusal follows "Cuts" below.
 
@@ -1163,9 +1166,11 @@ relayout's output is charged beside the one it replaces (td-layout's
 `retained_output_bytes`, set from the old layout's `output_bytes`), or
 the old one is let go first, as "Relayout" decides. Measured
 (td-layout/DESIGN.md §6), a corpus page charges 1.1 to 37.8 MiB in all
-and the costliest 2 MiB shape 167.4 MiB, so any two corpus pages fit
+and the costliest 2 MiB shape 134.6 MiB, so any two corpus pages fit
 together, and a page is cut down (below, "Cuts") only when the page
-shown leaves it too little.
+shown leaves it too little or its own layout is past td-layout's
+`MAX_PAGE_BYTES`, which 4 MiB of markup can be (up to 212.8 MiB
+measured at the narrowest pane, denser layouts refused by name).
 
 **The jail.** What td-alloc does not hold is a fixed term:
 
@@ -1474,18 +1479,33 @@ tokenizer ends markup at, so the page is one text node laid `pre-wrap`
 in monospace, td-layout's tab stops every eight columns in place of
 td-web's expansion. Its bound stays `MAX_TEXT` (4 MiB), the prefix
 included, so it fits td-html's 4 MiB input, and td-layout takes it
-under an input limit of its own for a text page (increment 6). td-web
-cuts it before it is parsed at `MAX_TEXT_LINES` (200,000) lines of its
-source, as `MAX_LINES` cuts it now, with the status row's note. A laid
-line costs some 340 bytes of layout (measured in review), so at
-ordinary widths, a source line a laid line, two layouts of a cut page,
-the old beside the new, hold 136 MB beside its tree within the page
-term; a narrow pane lays a long source line as several, and when two
-layouts no longer fit, the old one is let go first (above,
+under a raised input limit (`Limits::input` at td-layout's `MAX_INPUT`,
+4 MiB). td-web cuts it before it is parsed at `MAX_TEXT_LINES`
+(200,000) lines of its source, as `MAX_LINES` cuts it now, with the
+status row's note. A layout's lines are charged in capacity steps
+(td-layout/DESIGN.md §6, "Text pages"): 68 MiB up to 262,144 laid
+lines, 136 MiB to 524,288, and refused past that. So at ordinary
+widths, a source line a laid line, two layouts of a cut page, the old
+beside the new, charge 136 MiB beside its styled document (148 to 155
+MiB measured) within the page term; a narrow pane lays a long source
+line as several, and past 262,144 laid lines one layout charges 136
+MiB, so two no longer fit and the old one is let go first (above,
 "Relayout"). Rung 3's text takes the same bounds. td-web's own pages,
 an error, the start page and the note for a type it does not show, are
 markup it writes with their text escaped; want of memory for one
 paints the static notice.
+
+**Open: a text page that does not fit.** A cut text page must fit one
+layout at td-web's narrowest pane and with its tabs, and today need
+not. A full 4 MiB page laid at 11 columns (td-ui's 0.6 em monospace
+face in a 128 px pane) can exceed td-layout's 524,288 laid lines with
+no tab at all, and is refused on one layout (td-layout §6, "Text
+pages"). td-layout lays a tab as a fragment of its own, so one tab a
+line costs some 580 bytes a laid line, which two layouts no longer
+fit, two tabs some 805, and four tabs, or short tab-separated lines,
+are refused on one layout. Either leaves rung 3 nothing to show. td-layout's tab-stop
+increment and td-web's text cut (`MAX_TEXT_LINES`, `MAX_TEXT` or a text
+page's least width) settle it before the cutover (increment 7).
 
 ### Painting
 
@@ -1595,19 +1615,20 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      of their own (td-layout/DESIGN.md §3); a basic automatic table
      layout, rows and cells with `colspan` and `rowspan` within bounds,
      so a page's tables line up as §5's do rather than stacking as
-     blocks; an input limit a caller sets, up to 4 MiB for a text
-     page's single text node, beside its 2 MiB `MAX_PAGE_INPUT` for
-     markup; a line past `MAX_LINE_SCALARS` cut and marked rather than
-     refused; tab stops every eight columns where white space is
-     preserved; a cascade without `style` attributes; and a byte limit
-     for each layout request, where today it is fixed when the page is
-     cascaded. Available: a page-wide cascade work ceiling in its
+     blocks; a line past `MAX_LINE_SCALARS` cut and marked rather than
+     refused; and tab stops every eight columns where white space is
+     preserved. Available: a page-wide cascade work ceiling in its
      `Limits` (`MAX_CASCADE_WORK`), summing each element's weighted
      match steps, declarations, custom names, inherited custom copies
-     and substitution charges, refused by name; and a cancel flag (`Limits::cancel`,
+     and substitution charges, refused by name; a cancel flag (`Limits::cancel`,
      `Request::cancel`) read between elements as it cascades and every
-     4,096 work units as it lays out, refusing with `Cancelled`
-     (td-layout/DESIGN.md §3 and §6).
+     4,096 work units as it lays out, refusing with `Cancelled`; an
+     input limit a caller sets (`Limits::input`), up to `MAX_INPUT`
+     (4 MiB) for a text page's single text node, beside its 2 MiB
+     `MAX_PAGE_INPUT` for markup; a cascade without `style` attributes
+     (`Limits::style_attributes`); and a byte limit for each layout
+     request (`Request::bytes`), in place of the one fixed when the
+     page was cascaded (td-layout/DESIGN.md §3 and §6).
    - **td-css** (available): the owned-budget API supplies compilation
      admission; `rgb()`, `hsl()`, CSS Color 4's named colours and the
      `background` shorthand's colour; and `StyleSet::from_sheets`, media
@@ -1639,7 +1660,10 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    as the stages took, which AGENTS.md's principle 4 forbids; what can
    land first without a second mechanism is the other crates' work in
    increment 6, which is why it is theirs. td-mail and td-news keep
-   td-html's renderer, which this does not change. Validation: tests
+   td-html's renderer, which this does not change. It lands only once
+   the text page that does not fit (above, "Cuts") is settled, a cut
+   text page fitting one layout at the narrowest pane with its tabs.
+   Validation: tests
    of each of the above in-process on the cell, §8's behaviours carried
    over, each rung of the cuts by a lowered limit, a cancelled job, and
    each step's charge refused and shrunk; td-web run under a headless

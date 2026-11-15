@@ -2,7 +2,7 @@
 use crate::inline::{
     coordinate, Counters, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Pending, TextRun,
 };
-use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument};
+use crate::{keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, MAX_PAGE_BYTES};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
@@ -48,6 +48,12 @@ pub struct Request<'c> {
     pub window: Option<Range<f64>>,
     /// Old layout output kept alive during this call, excluding shared input.
     pub retained_output_bytes: usize,
+    /// This call's ceiling on charged bytes, in place of the styled
+    /// document's Limits::bytes; clamped to MAX_PAGE_BYTES. A document
+    /// built by new() or with_state() owns a td-alloc budget sized from its
+    /// Limits::bytes, so a raise past that can still fail Error::Memory;
+    /// with_budget() and shared() callers size the budget themselves.
+    pub bytes: Option<usize>,
     /// Read every CANCEL_INTERVAL work units; another thread may set it.
     pub cancel: Option<&'c AtomicBool>,
 }
@@ -58,6 +64,7 @@ impl Request<'_> {
             height,
             window: None,
             retained_output_bytes: 0,
+            bytes: None,
             cancel: None,
         }
     }
@@ -110,8 +117,9 @@ pub fn layout_with_budget(
         return Err(Error::Invalid);
     }
     let mut counters = Counters::new(styled, request.cancel);
-    // The first tick reads the flag before anything is allocated.
-    counters.step(0)?;
+    if let Some(bytes) = request.bytes {
+        counters.limits.bytes = bytes.min(MAX_PAGE_BYTES);
+    }
     counters.charge(request.retained_output_bytes)?;
     let initial = counters.bytes;
     // Every ordinary block and block-level image emits one geometry record,
@@ -126,6 +134,9 @@ pub fn layout_with_budget(
                 .ok_or(Error::Limit("MAX_PAGE_BYTES"))?,
         )?;
     }
+    // The first tick reads the flag after the up-front limits and before
+    // anything is allocated.
+    counters.step(0)?;
     let boxes = td_alloc::BudgetVec::with_capacity(memory, capacity)?;
     let mut engine = Engine {
         styled,
@@ -940,6 +951,67 @@ mod tests {
         window.retained_output_bytes = crate::MAX_PAGE_BYTES;
         assert!(matches!(
             layout(&styled, &mut Metrics, &window),
+            Err(Error::Limit("MAX_PAGE_BYTES"))
+        ));
+    }
+    #[test]
+    fn a_request_sets_its_own_byte_ceiling() {
+        let html = format!("<p>{}", "hello world ".repeat(50));
+        let doc = td_html::document::parse(&html).unwrap();
+        let css = sheets("");
+        let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
+        let request = Request::new(100.0, 200.0);
+        assert_eq!(request.bytes, None);
+        let full = layout(&styled, &mut Metrics, &request).unwrap();
+        let at = |bytes| Request {
+            bytes: Some(bytes),
+            ..request.clone()
+        };
+        let exact = layout(&styled, &mut Metrics, &at(full.charged_bytes)).unwrap();
+        assert_eq!(exact.charged_bytes, full.charged_bytes);
+        assert_eq!(
+            exact.lines.iter().collect::<Vec<_>>(),
+            full.lines.iter().collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            layout(&styled, &mut Metrics, &at(full.charged_bytes - 1)),
+            Err(Error::Limit("MAX_PAGE_BYTES"))
+        ));
+        // Output kept from an earlier layout counts against it too.
+        let both = full.charged_bytes + full.output_bytes;
+        let mut kept = at(both);
+        kept.retained_output_bytes = full.output_bytes;
+        assert_eq!(
+            layout(&styled, &mut Metrics, &kept).unwrap().charged_bytes,
+            both
+        );
+        kept.bytes = Some(both - 1);
+        assert!(matches!(
+            layout(&styled, &mut Metrics, &kept),
+            Err(Error::Limit("MAX_PAGE_BYTES"))
+        ));
+        // It replaces the cascade's ceiling, above it as well as below.
+        let tight = StyledDocument::new(
+            &doc,
+            &css,
+            html.len(),
+            Limits {
+                bytes: styled.charged_bytes(),
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            layout(&tight, &mut Metrics, &request),
+            Err(Error::Limit("MAX_PAGE_BYTES"))
+        ));
+        let raised = layout(&tight, &mut Metrics, &at(full.charged_bytes)).unwrap();
+        assert_eq!(raised.charged_bytes, full.charged_bytes);
+        // Clamped to MAX_PAGE_BYTES.
+        let mut beyond = at(usize::MAX);
+        beyond.retained_output_bytes = crate::MAX_PAGE_BYTES - styled.charged_bytes() + 1;
+        assert!(matches!(
+            layout(&styled, &mut Metrics, &beyond),
             Err(Error::Limit("MAX_PAGE_BYTES"))
         ));
     }

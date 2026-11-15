@@ -12,7 +12,10 @@ use td_css::{ComputedStyle, ComputedValue, Property, StyleSet};
 use td_dom::{HtmlTree, StateProvider};
 use td_html::document::{Document, NodeId};
 
+/// Default input admission: a page's markup.
 pub const MAX_PAGE_INPUT: usize = 2 * 1024 * 1024;
+/// The largest Limits::input a caller may set: a text page's one text node.
+pub const MAX_INPUT: usize = td_html::html5::MAX_INPUT_BYTES;
 pub const MAX_PAGE_BYTES: usize = 224 * 1024 * 1024;
 pub const WORKING_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_BOXES: usize = 262_144;
@@ -73,6 +76,7 @@ impl From<td_dom::Error> for Error {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits<'c> {
+    /// Input bytes admitted; MAX_PAGE_INPUT by default, at most MAX_INPUT.
     pub input: usize,
     pub bytes: usize,
     pub boxes: usize,
@@ -84,6 +88,8 @@ pub struct Limits<'c> {
     pub styles: PoolLimits,
     /// Ceiling on the weighted sum of CascadeWork over the whole cascade.
     pub cascade_work: usize,
+    /// False ignores every element's `style` attribute without reading it.
+    pub style_attributes: bool,
     /// Read between elements while cascading; another thread may set it.
     pub cancel: Option<&'c AtomicBool>,
 }
@@ -100,6 +106,7 @@ impl Default for Limits<'_> {
             fragments: MAX_FRAGMENTS,
             styles: PoolLimits::default(),
             cascade_work: MAX_CASCADE_WORK,
+            style_attributes: true,
             cancel: None,
         }
     }
@@ -107,7 +114,7 @@ impl Default for Limits<'_> {
 impl<'c> Limits<'c> {
     fn clamped(self) -> Self {
         Self {
-            input: self.input.min(MAX_PAGE_INPUT),
+            input: self.input.min(MAX_INPUT),
             bytes: self.bytes.min(MAX_PAGE_BYTES),
             boxes: self.boxes.min(MAX_BOXES),
             depth: self.depth.min(MAX_DEPTH),
@@ -117,6 +124,7 @@ impl<'c> Limits<'c> {
             fragments: self.fragments.min(MAX_FRAGMENTS),
             styles: self.styles,
             cascade_work: self.cascade_work.min(MAX_CASCADE_WORK),
+            style_attributes: self.style_attributes,
             cancel: self.cancel,
         }
     }
@@ -288,9 +296,6 @@ impl<'d> StyledDocument<'d> {
     ) -> Result<Self, Error> {
         let limits = limits.clamped();
         let cancel = limits.cancel;
-        if cancelled(cancel) {
-            return Err(Error::Cancelled);
-        }
         if input_bytes > limits.input {
             return Err(Error::Limit("MAX_PAGE_INPUT"));
         }
@@ -308,6 +313,10 @@ impl<'d> StyledDocument<'d> {
             .and_then(|n| n.checked_add(input_bytes + 1024))
             .filter(|n| *n <= limits.bytes)
             .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
+        // Read after the up-front limits, so they refuse by name first.
+        if cancelled(cancel) {
+            return Err(Error::Cancelled);
+        }
         let tree = match state {
             Some(state) => HtmlTree::with_state_and_budget(document, state, memory)?,
             None => HtmlTree::with_budget(document, memory)?,
@@ -333,11 +342,16 @@ impl<'d> StyledDocument<'d> {
             if parent_id.is_some() && parent_style.is_none() {
                 continue;
             }
+            let inline = if limits.style_attributes {
+                element.attribute("style").unwrap_or("")
+            } else {
+                ""
+            };
             let computed = sheets.compute_with_stats_and_budget(
                 &element,
                 parent_style.and_then(|id| styles.get(id)),
                 root_size,
-                element.attribute("style").unwrap_or(""),
+                inline,
                 &mut stats,
                 memory,
             )?;
@@ -375,9 +389,6 @@ impl<'d> StyledDocument<'d> {
         let mut next = document.node(document.root()).and_then(|n| n.first_child());
         while let Some(node_id) = next {
             visited = visited.wrapping_add(1);
-            if visited.is_multiple_of(CANCEL_INTERVAL) && cancelled(cancel) {
-                return Err(Error::Cancelled);
-            }
             let node = document.node(node_id).ok_or(Error::Invalid)?;
             let parent = node
                 .parent()
@@ -452,6 +463,10 @@ impl<'d> StyledDocument<'d> {
                     previous_root = Some(id);
                 }
                 descend = !matches!(kind, BoxKind::Image | BoxKind::Break);
+            }
+            // After this node's depth and box tests, so they refuse by name.
+            if visited.is_multiple_of(CANCEL_INTERVAL) && cancelled(cancel) {
+                return Err(Error::Cancelled);
             }
             if descend {
                 if let Some(child) = node.first_child() {
@@ -687,6 +702,98 @@ mod tests {
             ),
             Err(Error::Limit("MAX_DEPTH"))
         ));
+    }
+    #[test]
+    fn input_limit_is_settable_up_to_four_mib() {
+        let dom = td_html::document::parse("<p>x").unwrap();
+        let sheet = sheets("");
+        let at = |input| Limits {
+            input,
+            ..Limits::default()
+        };
+        assert_eq!(Limits::default().input, MAX_PAGE_INPUT);
+        assert_eq!(MAX_INPUT, 4 * 1024 * 1024);
+        let raised = StyledDocument::new(&dom, &sheet, MAX_INPUT, at(usize::MAX)).unwrap();
+        assert_eq!(raised.limits().input, MAX_INPUT);
+        assert!(matches!(
+            StyledDocument::new(&dom, &sheet, MAX_INPUT + 1, at(usize::MAX)),
+            Err(Error::Limit("MAX_PAGE_INPUT"))
+        ));
+        let between = MAX_PAGE_INPUT + 1;
+        assert!(StyledDocument::new(&dom, &sheet, between, at(between)).is_ok());
+        assert!(matches!(
+            StyledDocument::new(&dom, &sheet, between + 1, at(between)),
+            Err(Error::Limit("MAX_PAGE_INPUT"))
+        ));
+        assert!(StyledDocument::new(&dom, &sheet, 10, at(10)).is_ok());
+        assert!(matches!(
+            StyledDocument::new(&dom, &sheet, 11, at(10)),
+            Err(Error::Limit("MAX_PAGE_INPUT"))
+        ));
+    }
+    /// Each box's node, kind and computed style, in box order.
+    fn computed<'a>(styled: &'a StyledDocument<'_>) -> Vec<(usize, BoxKind, &'a ComputedStyle)> {
+        styled
+            .boxes()
+            .iter()
+            .map(|b| (b.node.index(), b.kind, styled.style(b.style).unwrap()))
+            .collect()
+    }
+    #[test]
+    fn without_style_attributes_none_is_cascaded() {
+        let attributed = "<body style='--x:4px;color:red'>\
+            <p style='margin-left:var(--x);font-size:30px'>a<span style='display:none'>b</span>\
+            <p style='color:green !important'>c<i style=''>d</i><b style='--y:1;font-weight:100'>e";
+        let removed = "<body><p>a<span>b</span><p>c<i>d</i><b>e";
+        // Another attribute in its place keeps the attribute scans equal.
+        let renamed = attributed.replace(" style=", " data-s=");
+        let set = sheets("p{color:blue;margin-left:var(--x,1px)}span{font-weight:bold}");
+        let off = Limits {
+            style_attributes: false,
+            ..Limits::default()
+        };
+        let build = |html: &str, limits| {
+            let dom = td_html::document::parse(html).unwrap();
+            let styled = StyledDocument::new(&dom, &set, html.len(), limits).unwrap();
+            let styles: Vec<_> = computed(&styled)
+                .into_iter()
+                .map(|(node, kind, style)| (node, kind, style.try_clone().unwrap()))
+                .collect();
+            (styles, styled.cascade_work(), styled.style_count())
+        };
+        let (ignored, ignored_work, ignored_count) = build(attributed, off);
+        let (bare, bare_work, bare_count) = build(removed, Limits::default());
+        let (other, other_work, _) = build(&renamed, Limits::default());
+        let (applied, applied_work, _) = build(attributed, Limits::default());
+        assert!(!off.clamped().style_attributes);
+        assert_eq!(ignored.len(), bare.len());
+        for ((_, kind, style), (_, bare_kind, bare_style)) in ignored.iter().zip(&bare) {
+            assert_eq!((kind, style), (bare_kind, bare_style));
+        }
+        assert_eq!(ignored, other);
+        assert_eq!(ignored_count, bare_count);
+        assert_eq!(ignored_work, other_work);
+        assert_eq!(ignored_work.declarations, bare_work.declarations);
+        assert_eq!(
+            ignored_work.custom_declarations,
+            bare_work.custom_declarations
+        );
+        assert_eq!(
+            ignored_work.local_custom_properties,
+            bare_work.local_custom_properties
+        );
+        // Applied, they change styles, boxes and charges.
+        assert_ne!(ignored, applied);
+        assert!(applied_work.declarations > ignored_work.declarations);
+        // An attribute td-css would refuse is never parsed.
+        let hostile = format!("<p style='a:{}'>x", "(".repeat(64));
+        let dom = td_html::document::parse(&hostile).unwrap();
+        assert!(matches!(
+            StyledDocument::new(&dom, &set, hostile.len(), Limits::default()),
+            Err(Error::Css(_))
+        ));
+        let styled = StyledDocument::new(&dom, &set, hostile.len(), off).unwrap();
+        assert!(!styled.limits().style_attributes);
     }
     fn paragraphs(count: usize) -> String {
         format!("<body>{}", "<p>x</p>".repeat(count))
@@ -969,6 +1076,55 @@ mod tests {
         ));
         assert_eq!(metrics.0, 0);
         assert_eq!(memory.used(), retained);
+    }
+    #[test]
+    fn up_front_limits_refuse_by_name_before_a_set_flag() {
+        let html = paragraphs(4);
+        let dom = td_html::document::parse(&html).unwrap();
+        let set = sheets("");
+        let set_flag = AtomicBool::new(true);
+        let flagged = Limits {
+            cancel: Some(&set_flag),
+            ..Limits::default()
+        };
+        let styled = StyledDocument::new(&dom, &set, html.len(), Limits::default()).unwrap();
+        for (limits, input, name) in [
+            (flagged, MAX_PAGE_INPUT + 1, "MAX_PAGE_INPUT"),
+            (
+                // Under the fixed arrays' charge, made before the pool's.
+                Limits {
+                    bytes: 1024,
+                    ..flagged
+                },
+                html.len(),
+                "MAX_PAGE_BYTES",
+            ),
+        ] {
+            assert!(matches!(
+                StyledDocument::new(&dom, &set, input, limits),
+                Err(Error::Limit(n)) if n == name
+            ));
+        }
+        let mut request = block::Request {
+            cancel: Some(&set_flag),
+            ..block::Request::new(400.0, 300.0)
+        };
+        // The styled document's charge, then the geometry array's, then the
+        // retained output's.
+        for (bytes, retained) in [
+            (Some(styled.charged_bytes() - 1), 0),
+            (Some(styled.charged_bytes()), 0),
+            (None, MAX_PAGE_BYTES),
+        ] {
+            request.bytes = bytes;
+            request.retained_output_bytes = retained;
+            let mut metrics = Count(0);
+            assert!(matches!(
+                block::layout(&styled, &mut metrics, &request),
+                Err(Error::Limit("MAX_PAGE_BYTES"))
+            ));
+            assert_eq!(metrics.0, 0);
+        }
     }
     struct Count(usize);
     impl inline::FontMetrics for Count {

@@ -4,7 +4,10 @@
 mod tests {
     use crate::block::{layout, Request};
     use crate::inline::{DisplayText, FontLine, FontMetrics};
-    use crate::{Error, Limits, StyledDocument, MAX_PAGE_BYTES, MAX_PAGE_INPUT, WORKING_BYTES};
+    use crate::{
+        BoxKind, Error, Limits, StyledDocument, MAX_INPUT, MAX_PAGE_BYTES, MAX_PAGE_INPUT,
+        WORKING_BYTES,
+    };
     use td_css::{ComputedStyle, Origin, StyleSet, HTML_UA_CSS};
 
     struct Metrics;
@@ -72,6 +75,43 @@ mod tests {
                 assert!(window.output_bytes * 4 < full.output_bytes);
             }
         }
+    }
+
+    #[test]
+    fn four_mib_text_page_lays_out_under_a_raised_input_limit() {
+        let mut html = String::from("<!doctype html><plaintext>");
+        let line = "a line of plain text, as a text page holds it\n";
+        html.push_str(&line.repeat((MAX_INPUT - html.len()) / line.len()));
+        html.push_str(&"x".repeat(MAX_INPUT - html.len()));
+        assert_eq!(html.len(), MAX_INPUT);
+        let doc = td_html::document::parse(&html).unwrap();
+        let css = sheets("plaintext{display:block;white-space:pre-wrap;font-family:monospace}");
+        assert!(matches!(
+            StyledDocument::new(&doc, &css, html.len(), Limits::default()),
+            Err(Error::Limit("MAX_PAGE_INPUT"))
+        ));
+        let limits = Limits {
+            input: MAX_INPUT,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            StyledDocument::new(&doc, &css, html.len() + 1, limits),
+            Err(Error::Limit("MAX_PAGE_INPUT"))
+        ));
+        let styled = StyledDocument::new(&doc, &css, html.len(), limits).unwrap();
+        let text: Vec<_> = styled
+            .boxes()
+            .iter()
+            .filter(|b| b.kind == BoxKind::Text)
+            .collect();
+        assert_eq!(text.len(), 1);
+        let source = doc.node(text[0].node).unwrap().text().unwrap();
+        let full = layout(&styled, &mut Metrics, &Request::new(1280.0, 720.0)).unwrap();
+        assert_eq!(full.line_count, source.matches('\n').count() + 1);
+        assert_eq!(full.lines.len(), full.line_count);
+        assert!(full.charged_bytes <= MAX_PAGE_BYTES);
+        let last = full.lines.last().unwrap().fragments.last().unwrap();
+        assert_eq!(last.range.end, source.len());
     }
 
     #[test]
