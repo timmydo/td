@@ -85,7 +85,7 @@ pub(super) fn exercise(
         sql(fixture, "SELECT count(*) FROM td_mta.route_health"),
         "0"
     );
-    sql(fixture,"DROP TRIGGER reject_health ON td_mta.route_health_receipts; CREATE FUNCTION public.delay_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_health AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_health()");
+    sql(fixture,&format!("DROP TRIGGER reject_health ON td_mta.route_health_receipts; INSERT INTO td_mta.route_health_receipts SELECT account,decode(repeat('ef',16),'hex'),decode(repeat('00',32),'hex'),route_name,destination,3,decode('0000000000000001','hex'),decode('0000000000000002','hex'),0,0,NULL,NULL,NULL FROM td_mta.submission_attempts WHERE attempt_id=decode('{}','hex'); CREATE FUNCTION public.delay_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_health AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_health()", first.attempt));
     assert_eq!(
         health::publish(
             request,
@@ -97,6 +97,14 @@ pub(super) fn exercise(
     );
     thread::sleep(Duration::from_secs(4));
     let outcome = health::publish(request, trust, deadline(), &value).unwrap();
+    // The failure publication expired this route's settlement of a missing attempt.
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.route_health_receipts WHERE operation=decode(repeat('ef',16),'hex')"
+        ),
+        "0"
+    );
     assert_eq!(outcome.old_revision, 0);
     assert_eq!(outcome.state.revision, 1);
     assert_eq!(outcome.state.failure_count, 1);
@@ -189,9 +197,15 @@ pub(super) fn exercise(
         ),
         Err(attempts::Error::RouteHealth(health::Error::RepairRequired))
     );
+    // The next publication on the route expired the retired first attempt's
+    // settlement; the retired attempt still cannot count a second failure.
     assert_eq!(
         health::inspect(request, trust, deadline(), &value).unwrap(),
-        Some(outcome)
+        None
+    );
+    assert_eq!(
+        health::publish(request, trust, deadline(), &value),
+        Err(health::Error::Conflict)
     );
     assert_eq!(
         health::publish(request, trust, deadline(), &auth).unwrap(),

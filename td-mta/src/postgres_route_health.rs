@@ -189,6 +189,30 @@ pub(crate) async fn admit_locked(
     }
     Ok(())
 }
+/// Another route's retired settlement is kept this long after preparation.
+pub const RECEIPT_RETENTION_MS: i64 = 3_600_000;
+/// Older repair receipts each publication keeps per route destination;
+/// repairs are explicit and rare.
+pub(crate) const REPAIR_RECEIPTS: i64 = 4;
+/// Caller holds the account write lock and owns the route; `timestamp` is the
+/// locked database time. The owner settles each operation before publishing
+/// the next, so its own route's retired settlement is no longer needed; other
+/// routes keep theirs for the retention margin. Active attempts keep theirs.
+/// A superseded owner that lost a receipt must already be stopping: this
+/// relies on the relay stopping on any lease renewal error and renewing well
+/// inside `LEASE_MS` (POSTGRES.md section 123).
+pub(crate) async fn expire_receipts(
+    client: &Client,
+    claim: &Claim,
+    timestamp: i64,
+) -> Result<(), Error> {
+    let binding = claim.binding();
+    let cutoff = timestamp
+        .checked_sub(RECEIPT_RETENTION_MS)
+        .ok_or(Error::Clock)?;
+    client.execute("DELETE FROM td_mta.route_health_receipts r WHERE r.account=$1 AND ((r.action IN (1,3) AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=r.account AND a.attempt_id=r.operation AND (a.active OR (r.route_name<>$2 AND a.prepared_at>=$3)))) OR (r.action=2 AND r.operation NOT IN (SELECT k.operation FROM td_mta.route_health_receipts k WHERE k.account=r.account AND k.route_name=r.route_name AND k.destination=r.destination AND k.action=2 ORDER BY k.new_revision DESC LIMIT $4)))", &[&binding.account().as_bytes().as_slice(),&binding.route().name(),&cutoff,&REPAIR_RECEIPTS]).await.map_err(|_|Error::Database)?;
+    Ok(())
+}
 async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
     let binding = value.claim.binding();
     let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
@@ -240,7 +264,8 @@ pub fn inspect(
 }
 /// Call only after closing/fencing the failed attempt's transport. This stores
 /// route health before the attempt is retired; settle recipient responsibility
-/// afterward through the attempt API. Historical receipts still replay.
+/// afterward through the attempt API. A receipt replays while its attempt is
+/// active; after retirement it expires at the route's next publication.
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -303,6 +328,7 @@ pub fn publish(
                     return Err(Error::Conflict);
                 }
             }
+            expire_receipts(client, &value.claim, timestamp).await?;
             let limits=client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health WHERE account=$1 LIMIT 1024) h),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health_receipts WHERE account=$1 LIMIT 1024) r)", &[&account]).await.map_err(|_|Error::Database)?;
             let health_count: i64 = limits.try_get(0).map_err(|_| Error::Integrity)?;
             let receipts: i64 = limits.try_get(1).map_err(|_| Error::Integrity)?;

@@ -3746,7 +3746,10 @@ failure for a retained attempt of the exact current owner, route and destination
 The attempt ID is the operation key: preparing it again cannot double-count a
 failure or replace its classification. The request digest binds the claim,
 fence, route, attempt and failure. Historical settlement precedes current-owner
-checks and remains available after takeover or subsequent health changes.
+checks. It remains available after takeover or subsequent health changes while
+its attempt is active; once the attempt is retired, it lasts only until the
+route's next publication (on another route, up to an hour after the attempt
+was prepared; see below).
 
 Under the current configuration/account/route lock, publication checks attempt
 identity and time, requires the attempt to remain active, refuses reports
@@ -3761,6 +3764,36 @@ recipient settlement remains a separate fenced operation after transport closes.
 Publish a fresh route failure before that settlement retires the attempt. This
 prevents delayed reports for retired attempts from undoing a later success;
 the single active attempt per account/route keeps that ordering across new dispatch.
+
+Receipt retention is bounded, not a lifetime ledger. Every failure, success
+and repair publication, holding the account write lock and its route, first
+deletes from the account's receipts: the publishing route's failure and
+success receipts whose attempt is retired or gone; another route's whose
+attempt is gone, or retired and prepared more than one hour before the locked
+database time; and all but the four newest repair receipts of each route
+destination, before the publication adds its own. Active attempts keep their
+receipts. Only the route's current owner, holding an unexpired lease, sweeps
+it without margin, and that single-threaded owner settles each operation
+(Pending barrier, FailedPrepared continuation or the success and repair
+retry) before it publishes the next. An owner superseded on its route can
+lose a pending receipt. This relies on the relay stopping on any lease
+renewal error and renewing at least every five seconds with a ten-second
+deadline, well inside the thirty-second lease: a takeover can only follow
+renewal failures that already stopped it, and every settle loop then exits.
+A paused process can resume superseded without a failed renewal; until its
+next renewal fails Stale, within about fifteen seconds, `check_locked`
+refuses its publications, so it can only inspect. A change to that renewal
+policy must keep this property. Another relay
+process serving a different route keeps its settlement for the hour.
+Attempt rows must outlive that hour after preparation.
+
+Expiry cannot let an attempt change route health twice. Failure needs an
+active attempt of the current owner, so a retired attempt never records a
+failure again. Success needs a retired attempt with final acceptance and
+refuses one prepared before the latest route failure, so repeating an expired
+success only resets an already healthy route once more. The worker reports
+no failure for an accepted attempt; the database does not check that, but a
+later failure refuses success for every attempt prepared before it.
 
 Fresh and retry attempt publication now inspect durable route health under
 those same locks. Backward database time, an outstanding repair latch or a
@@ -3786,7 +3819,9 @@ health revision and clears only repair_generation. Failure count, reason,
 failure timestamp and next-attempt timestamp remain byte-for-byte unchanged.
 Dispatch therefore remains blocked until the existing shared minimum interval
 and the separate recipient/clock guards permit it. Receipt action 2 captures
-that repaired state atomically, with the shared 1024-receipt account limit.
+that repaired state atomically, with the shared 1024-receipt account limit;
+each publication first keeps only the four newest repair receipts of each
+destination (section 123).
 Backward UTC, stale ownership, overflow and write failure refuse publication;
 unknown COMMIT settles the retained operation without applying another repair.
 
@@ -3802,10 +3837,11 @@ The success publisher requires a retired attempt of the exact current owner,
 route and destination, plus its durable positive final-DATA acceptance receipt.
 A Prepared/Body/AcceptancePossible attempt or merely asserted transport
 success cannot reset health. The attempt ID is the shared operation key;
-failure and success classifications cannot both publish for one attempt.
+while its receipt is retained, one attempt publishes one classification.
 Fresh failure publication requires an active attempt, so a delayed unreported
-failure from an older retired attempt cannot undo this reset.
-Historical settlement remains available after owner release.
+failure from an older retired attempt cannot undo this reset. Once section 123
+expires the receipt, repeating this success at most resets a healthy route
+again. Historical settlement survives owner release only for that retention.
 
 Under current policy/account/route locks, success refuses a repair latch or
 an attempt prepared before the latest route failure. It increments the checked

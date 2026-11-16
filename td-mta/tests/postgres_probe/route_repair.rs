@@ -125,7 +125,7 @@ pub(super) fn exercise(
         ),
         "t"
     );
-    sql(fixture,"DROP TRIGGER reject_repair ON td_mta.route_health_receipts; CREATE FUNCTION public.delay_repair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=2 THEN PERFORM pg_sleep(3); END IF; RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_repair AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_repair()");
+    sql(fixture,"DROP TRIGGER reject_repair ON td_mta.route_health_receipts; INSERT INTO td_mta.route_health_receipts SELECT account,decode('c0000000'||lpad(to_hex(n),24,'0'),'hex'),decode(repeat('00',32),'hex'),route_name,destination,2,decode(lpad(to_hex(1000000+n),16,'0'),'hex'),decode(lpad(to_hex(1000001+n),16,'0'),'hex'),1,3,0,300000,NULL FROM td_mta.route_health CROSS JOIN generate_series(1,6) n WHERE repair_generation IS NOT NULL; CREATE FUNCTION public.delay_repair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=2 THEN PERFORM pg_sleep(3); END IF; RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_repair AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_repair()");
     assert_eq!(
         repair::publish(
             request,
@@ -137,6 +137,19 @@ pub(super) fn exercise(
     );
     thread::sleep(Duration::from_secs(4));
     let outcome = repair::publish(request, trust, deadline(), &value).unwrap();
+    // Six older repairs of this destination were seeded: the sweep keeps the
+    // newest four of them, and this repair adds its own.
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT string_agg(right(encode(operation,'hex'),2),',' ORDER BY operation) FILTER (WHERE encode(operation,'hex') LIKE 'c0000000%'),count(*) FILTER (WHERE operation=decode('{op}','hex')) FROM td_mta.route_health_receipts r WHERE action=2 AND (route_name,destination)=(SELECT route_name,destination FROM td_mta.route_health_receipts WHERE operation=decode('{op}','hex'))", op = value.operation())
+        ),
+        "03,04,05,06|1"
+    );
+    sql(
+        fixture,
+        "DELETE FROM td_mta.route_health_receipts WHERE encode(operation,'hex') LIKE 'c0000000%'",
+    );
     assert_eq!(outcome.state.revision, outcome.old_revision + 1);
     assert_eq!(outcome.state.failure_count, 2);
     assert_eq!(outcome.state.reason, 5);

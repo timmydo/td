@@ -162,6 +162,7 @@ pub fn publish(
                     return Err(Error::Conflict);
                 }
             }
+            health::expire_receipts(client, &value.claim, timestamp).await?;
             let limits=client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health WHERE account=$1 LIMIT 1024) h),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health_receipts WHERE account=$1 LIMIT 1024) r)", &[&account]).await.map_err(|_|Error::Database)?;
             let health_count: i64 = limits.try_get(0).map_err(|_| Error::Integrity)?;
             let receipts: i64 = limits.try_get(1).map_err(|_| Error::Integrity)?;
