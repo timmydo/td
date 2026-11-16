@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::atlas::{Atlas, Slot, Style};
-use crate::coverage::{Mask, Rasterizer};
+use crate::coverage::{Mask, Rasterizer, MAX_MASK_AXIS};
 use crate::font::stand_in;
 use crate::sfnt::{Error, Font, Outline};
 
@@ -39,6 +39,17 @@ pub struct Cell {
     pub pen: usize,
 }
 
+/// What covering a glyph uses between glyphs: the outline, the area
+/// accumulator and the mask, kept so a steady state allocates nothing.
+/// A face holds its own; faces covering in turn may share one
+/// (`Face::glyph_with`).
+#[derive(Clone, Debug, Default)]
+pub struct Scratch {
+    rasterizer: Rasterizer,
+    outline: Outline,
+    mask: Mask,
+}
+
 #[derive(Clone, Debug)]
 pub struct Face {
     /// Unique to each face made, and each `with_slant`, within the process;
@@ -55,9 +66,7 @@ pub struct Face {
     pixels_per_em: u16,
     cell: Cell,
     atlas: Atlas,
-    rasterizer: Rasterizer,
-    outline: Outline,
-    mask: Mask,
+    scratch: Scratch,
 }
 
 /// A face identity, unique within the process: at one a nanosecond, the
@@ -85,6 +94,27 @@ impl Face {
     /// `new` over shared style bytes at `size` pixels per em, which may be
     /// fractional: the cell is the size's rounded metrics, as `new`'s.
     pub fn sized(regular: Arc<[u8]>, bold: Option<Arc<[u8]>>, size: f32) -> Result<Self, Error> {
+        Self::sized_on(Atlas::new(), regular, bold, size)
+    }
+
+    /// `sized` covering into `atlas`, emptied first, rather than a new
+    /// one: a caller remaking faces in turn keeps their pages' storage.
+    pub fn sized_in(
+        mut atlas: Atlas,
+        regular: Arc<[u8]>,
+        bold: Option<Arc<[u8]>>,
+        size: f32,
+    ) -> Result<Self, Error> {
+        atlas.reset();
+        Self::sized_on(atlas, regular, bold, size)
+    }
+
+    fn sized_on(
+        atlas: Atlas,
+        regular: Arc<[u8]>,
+        bold: Option<Arc<[u8]>>,
+        size: f32,
+    ) -> Result<Self, Error> {
         let range = f32::from(MIN_PIXELS_PER_EM)..=f32::from(MAX_PIXELS_PER_EM);
         if !range.contains(&size) {
             return Err(Error::Limit("pixels per em"));
@@ -105,7 +135,7 @@ impl Face {
             baseline,
             pen: 0,
         };
-        Self::build(regular, bold, size, cell)
+        Self::build(regular, bold, size, cell, atlas)
     }
 
     /// `fit` or `sized`, as `sizing` asks.
@@ -168,7 +198,7 @@ impl Face {
             baseline: baseline as usize,
             pen: pen as usize,
         };
-        Self::build(regular, bold, pixels_per_em as f32, cell)
+        Self::build(regular, bold, pixels_per_em as f32, cell, Atlas::new())
     }
 
     fn build(
@@ -176,6 +206,7 @@ impl Face {
         bold: Option<Arc<[u8]>>,
         pixels_per_em: f32,
         cell: Cell,
+        atlas: Atlas,
     ) -> Result<Self, Error> {
         let range = f32::from(MIN_PIXELS_PER_EM)..=f32::from(MAX_PIXELS_PER_EM);
         if !range.contains(&pixels_per_em) {
@@ -196,11 +227,15 @@ impl Face {
             size: pixels_per_em,
             pixels_per_em: pixels_per_em.round() as u16,
             cell,
-            atlas: Atlas::new(),
-            rasterizer: Rasterizer::new(),
-            outline: Outline::new(),
-            mask: Mask::default(),
+            atlas,
+            scratch: Scratch::default(),
         })
+    }
+
+    /// The face's atlas, its page's storage for another face
+    /// (`sized_in`).
+    pub fn into_atlas(self) -> Atlas {
+        self.atlas
     }
 
     /// This face with italic and bold italic styles, covered at its size
@@ -293,6 +328,14 @@ impl Face {
     /// any later miss may cause: a caller holding entries across lookups
     /// compares `atlas().epoch()`.
     pub fn glyph(&mut self, style: Style, scalar: char) -> Slot {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let slot = self.glyph_with(&mut scratch, style, scalar);
+        self.scratch = scratch;
+        slot
+    }
+
+    /// `glyph`, covering in `scratch` rather than the face's own.
+    pub fn glyph_with(&mut self, scratch: &mut Scratch, style: Style, scalar: char) -> Slot {
         let bold = matches!(style, Style::Bold | Style::BoldItalic);
         let italic = matches!(style, Style::Italic | Style::BoldItalic);
         let style = self.style(bold, italic);
@@ -306,7 +349,11 @@ impl Face {
         let fonts = [styled.as_ref(), Some(&regular)].map(|source| {
             source.and_then(|(bytes, scale)| Font::parse(bytes).ok().map(|font| (font, *scale)))
         });
-        let (outline, rasterizer, mask) = (&mut self.outline, &mut self.rasterizer, &mut self.mask);
+        let Scratch {
+            rasterizer,
+            outline,
+            mask,
+        } = scratch;
         // The scalar from its style or regular before its stand-in.
         let covered = [Some(scalar), stand_in(scalar)]
             .into_iter()
@@ -316,19 +363,54 @@ impl Face {
                     font.glyph(wanted)
                         .and_then(|glyph| {
                             font.outline(glyph, outline).ok()?;
-                            rasterizer.rasterize(outline, *scale, mask).ok()
+                            rasterizer
+                                .rasterize(outline, fitted(outline, *scale), mask)
+                                .ok()
                         })
                         .is_some()
                 })
             });
         let covered = covered.then_some(());
         match covered {
-            Some(()) => self.atlas.place(style, scalar, &self.mask),
+            Some(()) => self.atlas.place(style, scalar, &scratch.mask),
             None => {
                 self.atlas.record(style, scalar, Slot::Missing);
                 Slot::Missing
             }
         }
+    }
+}
+
+/// `scale`, or for an outline whose mask at it would pass
+/// `MAX_MASK_AXIS` on an axis, the largest scale at which it fits: such a
+/// glyph is covered smaller, scaled about its pen, rather than refused,
+/// so its ink stays inside what its outline spans at full scale: inside
+/// its advance where the outline is, and inside `prose`'s reach.
+fn fitted(outline: &Outline, scale: f32) -> f32 {
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    for point in outline.points() {
+        let (x, y) = (point.x, point.y);
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((left, bottom, right, top)) => {
+                (left.min(x), bottom.min(y), right.max(x), top.max(y))
+            }
+        });
+    }
+    let Some((left, bottom, right, top)) = bounds else {
+        return scale;
+    };
+    let axis = MAX_MASK_AXIS as f32;
+    let pixels = |low: f32, high: f32| (high * scale).ceil() - (low * scale).floor();
+    if pixels(left, right) <= axis && pixels(bottom, top) <= axis {
+        return scale;
+    }
+    // Two pixels short of the axis, for the floor and the ceiling.
+    let extent = (right - left).max(top - bottom);
+    if extent > 0.0 && extent.is_finite() {
+        scale.min((axis - 2.0) / extent)
+    } else {
+        scale
     }
 }
 

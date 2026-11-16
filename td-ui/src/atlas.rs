@@ -13,7 +13,8 @@ use crate::coverage::Mask;
 pub const PAGE_WIDTH: usize = 1024;
 pub const PAGE_HEIGHT: usize = 1024;
 /// Keys held at once, placed and missing together: missing scalars take
-/// no page space, so they need a bound of their own.
+/// no page space, so they need a bound of their own. An atlas may hold
+/// fewer (`Atlas::with_keys`).
 pub const MAX_KEYS: usize = 8192;
 /// Blank pixels kept between neighbours, so a GPU sampler's filtering
 /// never reads into the next glyph.
@@ -66,6 +67,8 @@ pub struct Atlas {
     slots: BTreeMap<(Style, char), Slot>,
     epoch: u64,
     dirty: Option<(usize, usize)>,
+    /// Keys held before a reset: `MAX_KEYS` or fewer.
+    keys: usize,
 }
 
 impl Default for Atlas {
@@ -76,13 +79,25 @@ impl Default for Atlas {
 
 impl Atlas {
     pub fn new() -> Self {
+        Self::with_keys(MAX_KEYS)
+    }
+
+    /// An atlas holding at most `keys` keys, one to `MAX_KEYS`, before it
+    /// resets: its key map's memory bounded with its page's.
+    pub fn with_keys(keys: usize) -> Self {
         Self {
             page: vec![0; PAGE_WIDTH * PAGE_HEIGHT],
             shelves: Vec::new(),
             slots: BTreeMap::new(),
             epoch: 0,
             dirty: None,
+            keys: keys.clamp(1, MAX_KEYS),
         }
+    }
+
+    /// The keys it holds before it resets.
+    pub fn keys(&self) -> usize {
+        self.keys
     }
 
     /// The page, `PAGE_WIDTH` bytes a row.
@@ -125,7 +140,7 @@ impl Atlas {
     /// Records a slot that takes no page space, resetting first when the
     /// key budget is spent.
     pub fn record(&mut self, style: Style, scalar: char, slot: Slot) {
-        if self.slots.len() >= MAX_KEYS && !self.slots.contains_key(&(style, scalar)) {
+        if self.slots.len() >= self.keys && !self.slots.contains_key(&(style, scalar)) {
             self.reset();
         }
         self.slots.insert((style, scalar), slot);
@@ -151,7 +166,7 @@ impl Atlas {
             self.record(style, scalar, Slot::Missing);
             return Slot::Missing;
         }
-        if self.slots.len() >= MAX_KEYS {
+        if self.slots.len() >= self.keys {
             self.reset();
         }
         let (x, y) = match self.allocate(mask.width, mask.height) {

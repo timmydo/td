@@ -10,13 +10,16 @@
 //! fonts `fonts` encodes: the cell from the face's metrics, the face's
 //! refusals, atlas reuse and misses, and pixel oracles for the blend over
 //! the explicit background (never the buffer), the bitmap fallback
-//! centred in the cell, blank glyphs, the cell clip and the bold style.
+//! centred in the cell, blank glyphs, the cell clip and the bold style;
+//! faces covering in one shared scratch, a face made in another's atlas
+//! storage, and an outline past the mask's axis covered smaller.
 
 mod fonts;
 
 use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
-use td_ui::face::{Cell, Face, Sizing};
+use td_ui::coverage::MAX_MASK_AXIS;
+use td_ui::face::{Cell, Face, Scratch, Sizing};
 use td_ui::font::pinned;
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight};
 use td_ui::sfnt::Error;
@@ -808,4 +811,64 @@ fn the_fit_centres_exactly_and_keeps_a_tall_line_box_centred() {
     // the baseline, on the cell's: the baseline is row 19, below the cell.
     let face = Face::fit(font(500, 1500, -100).into(), None, 8, 16).unwrap();
     assert_eq!(face.cell().baseline, 19);
+}
+
+#[test]
+fn faces_covering_in_one_scratch_cover_as_each_with_its_own() {
+    let bytes = face_bytes(false);
+    let mut scratch = Scratch::default();
+    for size in [20, 33, 7] {
+        let mut own = Face::new(bytes.clone(), None, size).unwrap();
+        let mut shared = Face::new(bytes.clone(), None, size).unwrap();
+        for scalar in ['a', 'T', 'h', '0', ' ', 'Z'] {
+            assert_eq!(
+                shared.glyph_with(&mut scratch, Style::Regular, scalar),
+                own.glyph(Style::Regular, scalar),
+                "{scalar} at {size}"
+            );
+        }
+        assert_eq!(shared.atlas().page(), own.atlas().page(), "{size}");
+    }
+}
+
+#[test]
+fn a_face_made_in_another_face_storage_draws_as_one_made_fresh() {
+    let bytes: std::sync::Arc<[u8]> = face_bytes(false).into();
+    let mut first = Face::sized(bytes.clone(), None, 20.0).unwrap();
+    for scalar in ['a', 'T', 'h'] {
+        first.glyph(Style::Regular, scalar);
+    }
+    let epoch = first.atlas().epoch();
+    let mut again = Face::sized_in(first.into_atlas(), bytes.clone(), None, 33.0).unwrap();
+    assert!(again.atlas().is_empty());
+    assert_eq!(again.atlas().epoch(), epoch + 1);
+    let mut fresh = Face::sized(bytes, None, 33.0).unwrap();
+    let draws = [
+        glyph(0, 0, 'T', Weight::Regular),
+        glyph(40, 0, 'h', Weight::Regular),
+        glyph(80, 0, 'a', Weight::Regular),
+    ];
+    let surface = surface(140, 60, 1);
+    assert_eq!(
+        paint(&mut again, surface, &draws),
+        paint(&mut fresh, surface, &draws)
+    );
+}
+
+#[test]
+fn an_outline_past_the_mask_axis_is_covered_at_the_largest_scale_that_fits() {
+    // 3000 units by 500: 600 by 100 pixels at 200 px/em, past 512.
+    let mut face = Face::new(face_mapping(&[('W', 3000)]), None, 200).unwrap();
+    let Slot::Placed(entry) = face.glyph(Style::Regular, 'W') else {
+        panic!("covered, not refused");
+    };
+    // Smaller about the pen, inside the box it would have had.
+    assert!((500..=MAX_MASK_AXIS).contains(&entry.width), "{entry:?}");
+    assert!(entry.height <= 100 && entry.left >= 0 && entry.top <= 100);
+    // Below the axis a glyph is covered at the face's own scale.
+    let mut face = Face::new(face_mapping(&[('W', 2500)]), None, 200).unwrap();
+    let Slot::Placed(entry) = face.glyph(Style::Regular, 'W') else {
+        panic!("covered");
+    };
+    assert_eq!((entry.width, entry.height), (500, 100));
 }

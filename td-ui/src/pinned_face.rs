@@ -209,7 +209,7 @@ pub fn prose_from(sans: &Path, serif: &Path) -> Result<Faces, String> {
 /// monospace face; or a line on standard error naming `program`, why its
 /// prose draws on the cell instead and how to install the faces. A
 /// `setting` of `bitmap` reads and says nothing. A monospace face refused
-/// at the prose size is said too, and the faces keep without it.
+/// at a prose size is said too, and the faces keep without it.
 pub fn prose_or_note(
     program: &str,
     setting: Option<&OsStr>,
@@ -242,7 +242,7 @@ pub fn prose_in_or_note(
         Err(why) => {
             let _ = writeln!(
                 std::io::stderr(),
-                "{program}: monospace face refused at the prose size ({why}); \
+                "{program}: monospace face refused at a prose size ({why}); \
                  prose in it draws from the bitmap face"
             );
             Some(faces)

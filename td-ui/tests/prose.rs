@@ -12,7 +12,12 @@
 //! draws each scalar, pens summed without drift, the raster drawing a
 //! prose glyph at its pen and the line's baseline, clipped to its draw and
 //! not to a cell, and falling back to the monospace face and the bitmap
-//! face; the prose faces' loader over a directory the test writes; and,
+//! face; prose at a size: the bound, advances and lines scaled with it,
+//! ink inside the advance and an em, the prose size named drawing as the
+//! default, the bitmap face at the size's scale, wrapping by sized runs,
+//! the atlas pages' cap, eviction and remaking, a frame past the cap, and
+//! measuring and drawing faces made apart agreeing; the prose faces'
+//! loader over a directory the test writes; and,
 //! ignored unless asked for, the same oracles over the pinned faces
 //! where `./install-fonts` or the image puts them.
 
@@ -26,13 +31,14 @@ use std::ffi::OsStr;
 use std::fs;
 
 use fonts::{Builder, Glyph, Segment};
-use td_ui::atlas::Style;
+use td_ui::atlas::{Style, PAGE_HEIGHT, PAGE_WIDTH};
 use td_ui::driven;
 use td_ui::face_file::Family;
 use td_ui::font::pinned;
 use td_ui::pinned_face::{load_styled_in, prose_from, prose_in, prose_in_or_note};
 use td_ui::prose::{
-    draw, Faces, Line, LineBox, Metrics, Refused, Run, Source, CELL_BASELINE, OVERHANG, SIZE, UNIT,
+    draw, overhang, Faces, Line, LineBox, Metrics, Reach, Refused, Run, Size, Source, ATLAS,
+    CELL_BASELINE, MAX_SIZE, MIN_SIZE, OVERHANG, PAGES, PAGE_KEYS, SIZE, UNIT,
 };
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily,
@@ -80,6 +86,42 @@ fn rectangle(left: i32, bottom: i32, right: i32, top: i32) -> Vec<(i32, i32, boo
 
 /// A font mapping each scalar to its glyph, with each glyph's advance.
 fn encoded(glyphs: &[(char, Glyph, u16)], ascender: i16, descender: i16) -> Vec<u8> {
+    encoded_reaching(glyphs, ascender, descender, (descender, ascender))
+}
+
+/// `encoded` at `units_per_em`.
+fn encoded_per_em(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    units_per_em: u16,
+) -> Vec<u8> {
+    encoded_in(
+        glyphs,
+        ascender,
+        descender,
+        (descender, ascender),
+        units_per_em,
+    )
+}
+
+/// `encoded`, its `head` saying its glyphs reach from `low` to `high`.
+fn encoded_reaching(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    reach: (i16, i16),
+) -> Vec<u8> {
+    encoded_in(glyphs, ascender, descender, reach, 1000)
+}
+
+fn encoded_in(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    (low, high): (i16, i16),
+    units_per_em: u16,
+) -> Vec<u8> {
     let mut sorted: Vec<(char, u16)> = glyphs
         .iter()
         .enumerate()
@@ -103,6 +145,9 @@ fn encoded(glyphs: &[(char, Glyph, u16)], ascender: i16, descender: i16) -> Vec<
         .collect();
     builder.ascender = ascender;
     builder.descender = descender;
+    builder.y_min = low;
+    builder.y_max = high;
+    builder.units_per_em = units_per_em;
     builder.font()
 }
 
@@ -845,6 +890,786 @@ fn a_raster_measures_with_the_faces_it_draws_with() {
         assert!(!bare.metrics().proportional());
         assert_eq!(bare.metrics().scale(), surface.scale);
     }
+}
+
+// Prose at a size.
+
+/// `units` of a 1000-unit em at `pixels` per em, in `UNIT`s, rounded.
+fn at(units: i64, pixels: i64) -> u32 {
+    ((units * pixels * 64 * 2 + 1000) / 2000) as u32
+}
+
+/// Glyphs in the style of `family` at `size`.
+fn sized(family: TextFamily, size: Size) -> GlyphStyle {
+    style(family).with_size(size)
+}
+
+/// The columns and rows of the pixels a paint inked, inclusive.
+fn ink(pixels: &[u8], surface: Surface) -> Option<((usize, usize), (usize, usize))> {
+    let mut found: Option<((usize, usize), (usize, usize))> = None;
+    for y in 0..surface.height {
+        for x in 0..surface.width {
+            if !untouched(pixels, surface, (x, y)) {
+                found = Some(match found {
+                    None => ((x, x), (y, y)),
+                    Some(((l, r), (t, b))) => ((l.min(x), r.max(x)), (t.min(y), b.max(y))),
+                });
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_size_is_refused_or_clamped_to_its_bound_by_name() {
+    // Every size a face may be covered at, the prose size's at every
+    // scale among them.
+    const {
+        assert!(MIN_SIZE >= td_ui::face::MIN_PIXELS_PER_EM);
+        assert!(MAX_SIZE <= td_ui::face::MAX_PIXELS_PER_EM);
+        assert!(MIN_SIZE <= SIZE && SIZE * 4 <= MAX_SIZE);
+    }
+    for refused in [
+        0,
+        1,
+        u32::from(MIN_SIZE) - 1,
+        u32::from(MAX_SIZE) + 1,
+        u32::MAX,
+    ] {
+        assert_eq!(
+            Size::new(refused),
+            Err(Error::Limit("prose size")),
+            "{refused}"
+        );
+    }
+    for admitted in [MIN_SIZE, 17, MAX_SIZE] {
+        let size = Size::new(u32::from(admitted)).unwrap();
+        assert!(!size.is_default());
+        for value in 1..=4 {
+            assert_eq!(size.pixels(scale(value)), admitted);
+        }
+    }
+    assert_eq!(Size::clamped(0), Size::new(u32::from(MIN_SIZE)).unwrap());
+    assert_eq!(Size::clamped(17), Size::new(17).unwrap());
+    assert_eq!(
+        Size::clamped(u32::MAX),
+        Size::new(u32::from(MAX_SIZE)).unwrap()
+    );
+    // The default is the prose size at the scale, and every glyph's.
+    assert!(Size::DEFAULT.is_default());
+    assert_eq!(GlyphStyle::regular(INK, PAPER).size, Size::DEFAULT);
+    for value in 1..=4 {
+        assert_eq!(Size::DEFAULT.pixels(scale(value)), SIZE * u16::from(value));
+        assert_eq!(
+            overhang(Size::DEFAULT, scale(value)),
+            u32::from(SIZE) * u32::from(value)
+        );
+    }
+    // An em at each size; the constant is the default's at scale four.
+    assert_eq!(overhang(Size::DEFAULT, scale(4)), OVERHANG);
+    assert_eq!(overhang(Size::new(150).unwrap(), scale(1)), 150);
+}
+
+#[test]
+fn metrics_scale_each_advance_and_the_line_with_the_size() {
+    let loaded = faces_with_mono();
+    let (sans, serif, mono) = (TextFamily::Sans, TextFamily::Serif, TextFamily::Mono);
+    for value in 1..=3 {
+        let mut metrics = Metrics::new(Some(&loaded), scale(value));
+        for pixels in [MIN_SIZE, 10, 24, 33, 100, MAX_SIZE] {
+            let size = Size::new(u32::from(pixels)).unwrap();
+            let p = i64::from(pixels);
+            // Unhinted: each face's units at the size, rounded to a UNIT.
+            assert_eq!(
+                metrics.advance_at(size, sans, Style::Regular, 'i'),
+                at(200, p)
+            );
+            assert_eq!(
+                metrics.advance_at(size, sans, Style::Italic, 'm'),
+                at(800, p)
+            );
+            assert_eq!(
+                metrics.advance_at(size, serif, Style::Bold, 'i'),
+                at(300, p)
+            );
+            assert_eq!(
+                metrics.advance_at(size, sans, Style::Regular, '─'),
+                at(600, p)
+            );
+            assert_eq!(
+                metrics.advance_at(size, mono, Style::Regular, '0'),
+                at(600, p)
+            );
+            // The bitmap face at its whole scale nearest the size.
+            let bitmap = (usize::from(pixels) + 8) / 16;
+            assert_eq!(
+                metrics.advance_at(size, sans, Style::Regular, 'é'),
+                (8 * bitmap.max(1)) as u32 * UNIT
+            );
+            // A cell glyph is the cell's at every size.
+            assert_eq!(
+                metrics.advance_at(size, TextFamily::Cell, Style::Regular, 'i'),
+                8 * u32::from(value) * UNIT
+            );
+            // Which face draws a scalar does not move with the size.
+            assert_eq!(metrics.source(sans, Style::Regular, '─'), Source::Mono);
+            assert_eq!(
+                metrics.width_at(size, sans, Style::Regular, "mi"),
+                (at(800, p) + at(200, p) + 32) / 64
+            );
+            // Serif's 900 ascender over Sans's -300 descender, each in
+            // UNITs at the size, rounded once.
+            let (ascent, descent) = (at(900, p), at(300, p));
+            assert_eq!(
+                metrics.line_at(size),
+                LineBox {
+                    height: ((ascent + descent + 32) / 64).max(1),
+                    baseline: (ascent + 32) / 64,
+                }
+            );
+        }
+        // The prose size named is the default's measurement.
+        let named = Size::new(u32::from(SIZE) * u32::from(value)).unwrap();
+        assert_eq!(metrics.line_at(named), metrics.line());
+        assert_eq!(metrics.line_at(Size::DEFAULT), metrics.line());
+        for scalar in ['i', 'm', '─', 'é', '0'] {
+            for family in [sans, serif, mono] {
+                assert_eq!(
+                    metrics.advance_at(named, family, Style::Bold, scalar),
+                    metrics.advance(family, Style::Bold, scalar)
+                );
+            }
+        }
+    }
+    // Without faces every size is the cell at the scale.
+    let mut cell = Metrics::new(None, scale(2));
+    let size = Size::new(100).unwrap();
+    assert_eq!(cell.line_at(size), cell.line());
+    assert_eq!(cell.advance_at(size, sans, Style::Regular, 'm'), 16 * UNIT);
+}
+
+#[test]
+fn a_glyph_at_a_size_inks_inside_its_advance_and_an_em_of_overhang() {
+    let surface = Surface::new(420, 300, scale(1)).unwrap();
+    let mut faces = faces();
+    let mut metrics = Metrics::new(Some(&faces), surface.scale);
+    let pen = 200;
+    for pixels in [MIN_SIZE, 13, 40, 100, MAX_SIZE] {
+        let size = Size::new(u32::from(pixels)).unwrap();
+        let line = metrics.line_at(size);
+        let p = usize::from(pixels);
+        // 'T' is a full em from 200 units below the baseline to 800 above,
+        // its advance the em: its ink is exactly its advance wide.
+        let drawn = painted(
+            surface,
+            Some(&mut faces),
+            &[glyph(
+                surface.bounds(),
+                (pen, 4),
+                'T',
+                sized(TextFamily::Sans, size),
+            )],
+        );
+        let advance = metrics.advance_at(size, TextFamily::Sans, Style::Regular, 'T');
+        assert_eq!(advance, u32::from(pixels) * UNIT);
+        let ((left, right), (top, bottom)) = ink(&drawn, surface).unwrap();
+        assert_eq!(
+            (left, right),
+            (pen as usize, pen as usize + p - 1),
+            "{pixels}"
+        );
+        let baseline = 4 + line.baseline as usize;
+        assert!(
+            top >= baseline - (p * 8).div_ceil(10) && top >= 4,
+            "{pixels}"
+        );
+        assert!(bottom < 4 + line.height as usize, "{pixels}");
+        // 'j' hangs 300 units left of its pen: inside an em of overhang.
+        let drawn = painted(
+            surface,
+            Some(&mut faces),
+            &[glyph(
+                surface.bounds(),
+                (pen, 4),
+                'j',
+                sized(TextFamily::Sans, size),
+            )],
+        );
+        let ((left, right), _) = ink(&drawn, surface).unwrap();
+        let reach = overhang(size, surface.scale) as usize;
+        assert_eq!(left, pen as usize - (p * 3).div_ceil(10), "{pixels}");
+        assert!(left >= pen as usize - reach);
+        let advance = metrics.advance_at(size, TextFamily::Sans, Style::Regular, 'j');
+        assert!(
+            right < pen as usize + (advance as usize).div_ceil(64),
+            "{pixels}"
+        );
+    }
+}
+
+#[test]
+fn the_prose_size_named_draws_pixel_for_pixel_as_the_default() {
+    let text = "mi0Tj─é ";
+    for value in 1..=4 {
+        let surface = Surface::new(160, 60, scale(value)).unwrap();
+        let named = Size::new(u32::from(SIZE) * u32::from(value)).unwrap();
+        let draws = |size: Size| -> Vec<Draw> {
+            let mut out = Vec::new();
+            for (row, family) in [TextFamily::Sans, TextFamily::Serif, TextFamily::Mono]
+                .into_iter()
+                .enumerate()
+            {
+                for (column, scalar) in text.chars().enumerate() {
+                    let style = sized(family, size).bold();
+                    out.push(glyph(
+                        surface.bounds(),
+                        (column as i64 * 17, row as i64 * 19),
+                        scalar,
+                        style,
+                    ));
+                }
+            }
+            out
+        };
+        let mut faces = faces_with_mono();
+        let default = painted(surface, Some(&mut faces), &draws(Size::DEFAULT));
+        assert_eq!(faces.pages_held(), 0);
+        let mut faces = faces_with_mono();
+        assert_eq!(
+            painted(surface, Some(&mut faces), &draws(named)),
+            default,
+            "scale {value}"
+        );
+        // Drawn from the scale's own faces: no page of another size.
+        assert_eq!((faces.pages_held(), faces.pages_made()), (0, 0));
+    }
+}
+
+#[test]
+fn a_scalar_no_face_has_draws_the_bitmap_face_at_its_scale_for_the_size() {
+    let surface = Surface::new(260, 260, scale(1)).unwrap();
+    let clip = surface.bounds();
+    let mut faces = faces_with_mono();
+    let metrics = Metrics::new(Some(&faces), surface.scale);
+    for (pixels, bitmap) in [(MIN_SIZE, 1), (23, 1), (24, 2), (40, 3), (MAX_SIZE, 12)] {
+        let size = Size::new(u32::from(pixels)).unwrap();
+        let fallen = painted(
+            surface,
+            Some(&mut faces),
+            &[glyph(clip, (4, 6), 'é', sized(TextFamily::Serif, size))],
+        );
+        // The bitmap glyph at that whole scale, its baseline on the line's.
+        let baseline = i64::from(metrics.line_at(size).baseline);
+        let top = 6 + baseline - (CELL_BASELINE * bitmap) as i64;
+        let at_scale = if bitmap <= 4 {
+            Surface::new(260, 260, scale(bitmap as u8)).unwrap()
+        } else {
+            // Past `Scale`'s four, by the glyph's own extent instead.
+            let ((left, right), (top_row, bottom)) = ink(&fallen, surface).unwrap();
+            assert!(left >= 4 && right < 4 + 8 * bitmap);
+            assert!(top_row >= top as usize && bottom < top as usize + 16 * bitmap);
+            continue;
+        };
+        let expected = painted(
+            at_scale,
+            None,
+            &[glyph(clip, (4, top), 'é', style(TextFamily::Cell))],
+        );
+        assert_eq!(fallen, expected, "{pixels}");
+    }
+}
+
+#[test]
+fn wrap_measures_each_run_at_its_size_and_draw_reaches_its_largest_em() {
+    let faces = faces();
+    let mut metrics = Metrics::new(Some(&faces), scale(1));
+    let large = Size::new(32).unwrap();
+    let runs = [
+        Run {
+            text: "mm",
+            style: sized(TextFamily::Sans, large),
+            tag: 1,
+        },
+        run("ii", TextFamily::Sans, 2),
+    ];
+    let line = &wrap(&mut metrics, &runs, 1000)[0];
+    // 'm' at 32 px/em is 1638 UNITs, 'i' at 16 is 205.
+    let extents: Vec<(usize, u32, u32)> = line
+        .pieces
+        .iter()
+        .map(|p| (p.tag, p.left, p.right))
+        .collect();
+    assert_eq!(extents, [(1, 0, 51), (2, 51, 58)]);
+    assert_eq!(line.pieces[0].style.size, large);
+    // Breaking by the sized advances: two 'm's at 32 are 51 pixels.
+    let lines = wrap(&mut metrics, &runs[..1], 50);
+    assert_eq!(lines.len(), 2);
+    // A line at 150 px/em streams pens up to 150 past its clip, not 64.
+    let text = "i".repeat(60);
+    let runs = [Run {
+        text: &text,
+        style: sized(TextFamily::Sans, Size::new(150).unwrap()),
+        tag: 0,
+    }];
+    let line = &wrap(&mut metrics, &runs, u32::MAX)[0];
+    let bounds = Rect {
+        x: 0,
+        y: 0,
+        width: 20,
+        height: 200,
+    };
+    let mut draws = Vec::new();
+    draw(line, (0, 0), bounds, bounds, &mut |d| draws.push(d));
+    // 'i' is 30 pixels: pens 0 through 150 are before 20 + 150.
+    assert_eq!(draws.len(), 6);
+}
+
+/// A frame of each `(family, size)` drawn as five glyphs a row.
+fn frame(combos: &[(TextFamily, u16)]) -> Vec<Draw> {
+    let clip = Rect {
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 400,
+    };
+    let mut draws = Vec::new();
+    for (row, &(family, pixels)) in combos.iter().enumerate() {
+        let size = Size::new(u32::from(pixels)).unwrap();
+        for (column, scalar) in "mi0Tj".chars().enumerate() {
+            let style = if column % 2 == 0 {
+                sized(family, size)
+            } else {
+                sized(family, size).italic()
+            };
+            draws.push(glyph(
+                clip,
+                (column as i64 * 45 + 30, row as i64 * 31),
+                scalar,
+                style,
+            ));
+        }
+    }
+    draws
+}
+
+#[test]
+fn the_pages_hold_their_cap_over_many_sizes_and_families() {
+    let surface = Surface::new(400, 400, scale(1)).unwrap();
+    let mut faces = faces_with_mono();
+    let mut made = 0;
+    for pixels in 20..=40 {
+        for family in [TextFamily::Sans, TextFamily::Serif, TextFamily::Mono] {
+            painted(surface, Some(&mut faces), &frame(&[(family, pixels)]));
+            made += 1;
+            assert_eq!(faces.pages_made(), made);
+            assert_eq!(faces.pages_held(), (made as usize).min(PAGES));
+        }
+    }
+    // The scale's own size takes no page; a new scale starts afresh.
+    painted(surface, Some(&mut faces), &frame(&[(TextFamily::Sans, 16)]));
+    assert_eq!(faces.pages_made(), made);
+    let double = Surface::new(400, 400, scale(2)).unwrap();
+    painted(double, Some(&mut faces), &frame(&[(TextFamily::Sans, 16)]));
+    assert_eq!((faces.pages_held(), faces.pages_made()), (1, 1));
+}
+
+#[test]
+fn a_page_remade_after_eviction_draws_as_one_made_fresh() {
+    let surface = Surface::new(400, 400, scale(1)).unwrap();
+    let eldest = frame(&[(TextFamily::Serif, 30)]);
+    let mut fresh = faces();
+    let expected = painted(surface, Some(&mut fresh), &eldest);
+    let mut faces = faces();
+    assert_eq!(painted(surface, Some(&mut faces), &eldest), expected);
+    // Eight more sizes: the ninth page lets the eldest, 30, go.
+    for pixels in 31..=38 {
+        painted(
+            surface,
+            Some(&mut faces),
+            &frame(&[(TextFamily::Serif, pixels)]),
+        );
+    }
+    assert_eq!((faces.pages_made(), faces.pages_held()), (9, PAGES));
+    // 31 was drawn from longest ago now; 30 is made again, equal.
+    assert_eq!(painted(surface, Some(&mut faces), &eldest), expected);
+    assert_eq!(faces.pages_made(), 10);
+    // 38, drawn last before it, was kept: no page made for it.
+    painted(
+        surface,
+        Some(&mut faces),
+        &frame(&[(TextFamily::Serif, 38)]),
+    );
+    assert_eq!(faces.pages_made(), 10);
+}
+
+#[test]
+fn a_frame_needing_more_than_the_cap_draws_as_each_size_alone() {
+    let surface = Surface::new(400, 400, scale(1)).unwrap();
+    let mut combos = Vec::new();
+    for pixels in [12, 20, 24, 28, 36, 40] {
+        for family in [TextFamily::Sans, TextFamily::Serif] {
+            combos.push((family, pixels));
+        }
+    }
+    assert!(combos.len() > PAGES);
+    let draws = frame(&combos);
+    // Each draw with faces of its own, which never evict.
+    let font = pinned().unwrap();
+    let mut expected = vec![GARBAGE; 400 * 400 * 4];
+    for draw in &draws {
+        let mut own = faces();
+        Raster::new(&mut expected, &font, surface, 1600)
+            .unwrap()
+            .with_prose(Some(&mut own))
+            .draw(*draw);
+    }
+    let mut faces = faces();
+    for round in 1..=3 {
+        assert_eq!(
+            painted(surface, Some(&mut faces), &draws),
+            expected,
+            "frame {round}"
+        );
+        // Drawn in a cycle past the cap, every page is remade each frame.
+        assert_eq!(faces.pages_made(), 12 * round);
+        assert_eq!(faces.pages_held(), PAGES);
+    }
+}
+
+/// Prose lines at their tops, painted.
+struct Lines {
+    surface: Surface,
+    lines: Vec<(Line, i64)>,
+}
+
+impl Composition for Lines {
+    fn surface(&self) -> Surface {
+        self.surface
+    }
+    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        for (line, y) in &self.lines {
+            draw(line, (7, *y), self.surface.bounds(), damage, sink);
+        }
+    }
+}
+
+#[test]
+fn measuring_and_drawing_agree_across_independently_made_faces() {
+    let font = pinned().unwrap();
+    let text = "mi mT ij 0─ é mm ii";
+    for value in [1, 2] {
+        let surface = Surface::new(600, 500, scale(value)).unwrap();
+        // The measuring thread's faces and the drawing thread's, each
+        // made from the bytes on its own.
+        let mut measuring = faces_with_mono();
+        let mut drawing = faces_with_mono();
+        let mut metrics = Metrics::new(Some(&measuring), surface.scale);
+        let mut lines = Vec::new();
+        let mut top = 0;
+        for (index, pixels) in [0, MIN_SIZE, 21, 45, 100].into_iter().enumerate() {
+            let size = if pixels == 0 {
+                Size::DEFAULT
+            } else {
+                Size::new(u32::from(pixels)).unwrap()
+            };
+            let family = [TextFamily::Sans, TextFamily::Serif, TextFamily::Mono][index % 3];
+            let runs = [Run {
+                text,
+                style: sized(family, size).bold(),
+                tag: 0,
+            }];
+            let laid = wrap(&mut metrics, &runs, 280 * u32::from(value));
+            let mut buffer = vec![0; 600 * 500 * 4];
+            let mut raster = Raster::new(&mut buffer, &font, surface, 2400)
+                .unwrap()
+                .with_prose(Some(&mut drawing));
+            // The drawing side lays the same lines with its own metrics.
+            assert_eq!(wrap(raster.metrics(), &runs, 280 * u32::from(value)), laid);
+            for scalar in text.chars() {
+                for style in [Style::Regular, Style::BoldItalic] {
+                    assert_eq!(
+                        raster.metrics().advance_at(size, family, style, scalar),
+                        metrics.advance_at(size, family, style, scalar)
+                    );
+                }
+            }
+            assert_eq!(raster.metrics().line_at(size), metrics.line_at(size));
+            let height = i64::from(metrics.line_at(size).height);
+            for line in laid {
+                lines.push((line, top));
+                top += height;
+            }
+        }
+        let page = Lines { surface, lines };
+        let paint = |faces: &mut Faces| {
+            let mut pixels = vec![GARBAGE; 600 * 500 * 4];
+            Raster::new(&mut pixels, &font, surface, 2400)
+                .unwrap()
+                .with_prose(Some(faces))
+                .paint(&page, surface.bounds())
+                .unwrap();
+            pixels
+        };
+        let drawn = paint(&mut drawing);
+        assert!(drawn.chunks(4).any(|p| p != [GARBAGE; 4]));
+        assert_eq!(drawn, paint(&mut measuring), "scale {value}");
+    }
+}
+
+#[test]
+fn the_page_drawn_last_is_kept_and_the_eldest_let_go() {
+    let surface = Surface::new(400, 400, scale(1)).unwrap();
+    let mut faces = faces();
+    let draw_at = |faces: &mut Faces, pixels: u16| {
+        painted(surface, Some(faces), &frame(&[(TextFamily::Serif, pixels)]));
+    };
+    for pixels in 30..=37 {
+        draw_at(&mut faces, pixels);
+    }
+    assert_eq!((faces.pages_made(), faces.pages_held()), (8, PAGES));
+    // 30 drawn again is the newest: the ninth size lets 31 go instead.
+    draw_at(&mut faces, 30);
+    draw_at(&mut faces, 38);
+    assert_eq!(faces.pages_made(), 9);
+    draw_at(&mut faces, 30);
+    assert_eq!(faces.pages_made(), 9, "30 kept");
+    draw_at(&mut faces, 31);
+    assert_eq!(faces.pages_made(), 10, "31 let go");
+    // 31 took 32's place, the eldest then; 30 is still held.
+    draw_at(&mut faces, 30);
+    assert_eq!(faces.pages_made(), 10);
+    draw_at(&mut faces, 32);
+    assert_eq!(faces.pages_made(), 11);
+}
+
+#[test]
+fn a_page_of_another_size_resets_at_its_own_keys_made_and_remade() {
+    let surface = Surface::new(400, 400, scale(1)).unwrap();
+    let mut faces = faces();
+    assert_eq!(faces.page_keys(), None);
+    for pixels in 30..=40 {
+        painted(
+            surface,
+            Some(&mut faces),
+            &frame(&[(TextFamily::Sans, pixels)]),
+        );
+        assert_eq!(faces.page_keys(), Some(PAGE_KEYS), "{pixels}");
+    }
+    // Eleven sizes through eight places: three made again in another's.
+    assert_eq!(faces.pages_made(), 11);
+    const { assert!(PAGE_KEYS < td_ui::atlas::MAX_KEYS) };
+}
+
+#[test]
+fn a_style_at_its_own_units_per_em_scales_by_them_at_every_size() {
+    // Bold at 2000 units per em: its 'm' 0.6 em where Regular's is 0.8.
+    let bold = encoded_per_em(
+        &[
+            ('0', Glyph::Simple(vec![rectangle(0, 0, 1000, 1000)]), 1200),
+            ('m', Glyph::Simple(vec![rectangle(0, 0, 1000, 1000)]), 1200),
+        ],
+        1600,
+        -600,
+        2000,
+    );
+    let faces = Faces::new([sans(), bold, sans(), sans()], four(serif())).unwrap();
+    let mut metrics = Metrics::new(Some(&faces), scale(1));
+    for pixels in [MIN_SIZE, 16, 50, MAX_SIZE] {
+        let size = Size::new(u32::from(pixels)).unwrap();
+        assert_eq!(
+            metrics.advance_at(size, TextFamily::Sans, Style::Bold, 'm'),
+            at(600, i64::from(pixels)),
+            "{pixels}"
+        );
+        assert_eq!(
+            metrics.advance_at(size, TextFamily::Sans, Style::Regular, 'm'),
+            at(800, i64::from(pixels)),
+            "{pixels}"
+        );
+    }
+    // A scalar Bold lacks is measured from Regular, at Regular's units.
+    let size = Size::new(50).unwrap();
+    assert_eq!(
+        metrics.advance_at(size, TextFamily::Sans, Style::Bold, 'i'),
+        metrics.advance_at(size, TextFamily::Sans, Style::Regular, 'i')
+    );
+}
+
+#[test]
+fn faces_refuse_a_family_that_does_not_size_at_either_end_of_the_bound() {
+    // A line box 2.8 em high: 179 pixels at 64, 538 past a cell's 512 at
+    // 192.
+    let tall = encoded(
+        &[('0', Glyph::Simple(vec![rectangle(0, 0, 500, 500)]), 600)],
+        2000,
+        -800,
+    );
+    assert_eq!(
+        Faces::new(four(tall.clone()), four(serif())).unwrap_err(),
+        Refused {
+            family: TextFamily::Sans,
+            style: Style::Regular,
+            error: Error::Limit("cell"),
+        }
+    );
+    // A '0' 50 units wide: no pixel at 6 px/em, one at 16.
+    let narrow = encoded(
+        &[('0', Glyph::Simple(vec![rectangle(0, 0, 40, 500)]), 50)],
+        800,
+        -200,
+    );
+    assert_eq!(
+        Faces::new(four(sans()), four(narrow.clone())).unwrap_err(),
+        Refused {
+            family: TextFamily::Serif,
+            style: Style::Regular,
+            error: Error::Malformed("cell metrics"),
+        }
+    );
+    // The monospace face is held to the same ends.
+    for (bytes, error) in [
+        (tall, Error::Limit("cell")),
+        (narrow, Error::Malformed("cell metrics")),
+    ] {
+        let typeface = Typeface::new(bytes, None).unwrap();
+        assert_eq!(faces().with_mono(&typeface).unwrap_err(), error);
+    }
+}
+
+#[test]
+fn a_glyph_past_the_mask_axis_at_a_size_draws_from_its_family_inside_its_advance() {
+    // 'W' 3000 units wide: 576 pixels at 192, past a mask's 512.
+    let wide = encoded(
+        &[
+            ('0', Glyph::Simple(vec![rectangle(0, 0, 500, 500)]), 600),
+            ('W', Glyph::Simple(vec![rectangle(0, 0, 3000, 500)]), 3000),
+        ],
+        800,
+        -300,
+    );
+    let mut faces = Faces::new(four(wide), four(serif()))
+        .unwrap()
+        .with_mono(&mono())
+        .unwrap();
+    let surface = Surface::new(700, 300, scale(1)).unwrap();
+    let size = Size::new(u32::from(MAX_SIZE)).unwrap();
+    let mut metrics = Metrics::new(Some(&faces), surface.scale);
+    assert_eq!(
+        metrics.source(TextFamily::Sans, Style::Regular, 'W'),
+        Source::Family
+    );
+    assert_eq!(
+        metrics.advance_at(size, TextFamily::Sans, Style::Regular, 'W'),
+        576 * UNIT
+    );
+    let draws = [glyph(
+        surface.bounds(),
+        (20, 4),
+        'W',
+        sized(TextFamily::Sans, size),
+    )];
+    for _ in 0..3 {
+        let drawn = painted(surface, Some(&mut faces), &draws);
+        let ((left, right), _) = ink(&drawn, surface).unwrap();
+        assert!(left >= 20 && right < 20 + 576, "{left}..{right}");
+        assert!(right - left + 1 >= 500, "covered smaller, not Unifont");
+    }
+    // Its family's page alone, made once: no monospace page tried.
+    assert_eq!((faces.pages_made(), faces.pages_held()), (1, 1));
+}
+
+#[test]
+fn reach_bounds_the_ink_past_the_line_box_at_each_size() {
+    // Sans says, and draws, a 'g' reaching 600 units below its baseline,
+    // twice its descender.
+    let deep = encoded_reaching(
+        &[
+            ('0', Glyph::Simple(vec![rectangle(0, 0, 500, 500)]), 600),
+            ('g', Glyph::Simple(vec![rectangle(0, -600, 500, 500)]), 600),
+        ],
+        800,
+        -300,
+        (-600, 800),
+    );
+    let mut faces = Faces::new(four(deep), four(serif())).unwrap();
+    let surface = Surface::new(200, 300, scale(1)).unwrap();
+    let metrics = Metrics::new(Some(&faces), surface.scale);
+    for pixels in [MIN_SIZE, 20, 100] {
+        let size = Size::new(u32::from(pixels)).unwrap();
+        let line = metrics.line_at(size);
+        let reach = metrics.reach_at(size);
+        let top = 120;
+        for scalar in ['g', 'é'] {
+            let drawn = painted(
+                surface,
+                Some(&mut faces),
+                &[glyph(
+                    surface.bounds(),
+                    (10, top),
+                    scalar,
+                    sized(TextFamily::Sans, size),
+                )],
+            );
+            let (_, (high, low)) = ink(&drawn, surface).unwrap();
+            assert!(
+                high as i64 >= top - i64::from(reach.above),
+                "{scalar} {pixels}"
+            );
+            let bottom = top + i64::from(line.height) + i64::from(reach.below);
+            assert!((low as i64) < bottom, "{scalar} {pixels}");
+        }
+    }
+    // 'g' at 100: 60 pixels below the baseline, 30 past the line's 30.
+    let reach = metrics.reach_at(Size::new(100).unwrap());
+    assert_eq!(reach.below, 31);
+    // At 6 the bitmap face's cell rises 14 rows over a 5-pixel ascent.
+    assert_eq!(metrics.reach_at(Size::new(6).unwrap()).above, 9);
+    // On the cell nothing passes the line.
+    let cell = Metrics::new(None, scale(2));
+    assert_eq!(cell.reach_at(Size::new(100).unwrap()), Reach::default());
+}
+
+#[test]
+fn glyphs_of_several_sizes_share_a_baseline_at_their_tops() {
+    let mut faces = faces();
+    let surface = Surface::new(300, 200, scale(1)).unwrap();
+    let metrics = Metrics::new(Some(&faces), surface.scale);
+    let baseline = 150;
+    let mut draws = Vec::new();
+    for (column, pixels) in [12, 40, 100].into_iter().enumerate() {
+        let size = Size::new(pixels).unwrap();
+        let top = metrics.top_at(size, baseline);
+        assert_eq!(top + i64::from(metrics.line_at(size).baseline), baseline);
+        draws.push(glyph(
+            surface.bounds(),
+            (10 + column as i64 * 100, top),
+            '0',
+            sized(TextFamily::Sans, size),
+        ));
+    }
+    // Each '0' stands on the baseline: its last inked row is the one
+    // above it.
+    let drawn = painted(surface, Some(&mut faces), &draws);
+    for column in 0..3 {
+        let x = 12 + column * 100;
+        let lowest = (0..200)
+            .filter(|&y| !untouched(&drawn, surface, (x, y)))
+            .max()
+            .unwrap();
+        assert_eq!(lowest, baseline as usize - 1, "column {column}");
+    }
+}
+
+#[test]
+fn the_atlas_bound_counts_pages_key_maps_shelves_and_scratch() {
+    // A key map node: the ordered map's eleven keys and slots and twelve
+    // edges, which the bound takes as 768 bytes.
+    let pair = std::mem::size_of::<(Style, char)>() + std::mem::size_of::<td_ui::atlas::Slot>();
+    assert!(16 + 11 * pair + 12 * 8 <= 768, "{pair}");
+    let page = PAGE_WIDTH * PAGE_HEIGHT + (PAGE_KEYS / 4 + 2) * 768 + PAGE_HEIGHT * 48;
+    assert_eq!(ATLAS, PAGES * page + (3 << 20));
+    // td-web's jail term and td-ui's design state it.
+    assert_eq!(ATLAS, 13_512_704);
 }
 
 #[test]

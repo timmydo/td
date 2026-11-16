@@ -14,7 +14,7 @@ use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
 use crate::picture::Fitted;
-use crate::prose::{AtSize, Faces, Metrics, Source, CELL_BASELINE};
+use crate::prose::{bitmap_scale, AtSize, Faces, Metrics, Size, Source, CELL_BASELINE};
 use crate::theme::{Theme, SAND};
 use crate::typeface::Typeface;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
@@ -67,8 +67,8 @@ pub enum Weight {
 /// Which faces a glyph is drawn from. `Cell` is the grid every widget
 /// lays text out on; the others are prose (`prose`): drawn from the pen
 /// at the glyph's `x` with the prose line's baseline below its `y`, at the
-/// prose size, and clipped only by the draw's clip. A raster without the
-/// prose faces draws a prose glyph as a `Cell` one.
+/// glyph's `prose::Size`, and clipped only by the draw's clip. A raster
+/// without the prose faces draws a prose glyph as a `Cell` one.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TextFamily {
     #[default]
@@ -92,6 +92,10 @@ pub struct GlyphStyle {
     pub font_style: Style,
     /// The faces it draws from: `Cell` unless a prose consumer names one.
     pub family: TextFamily,
+    /// A prose glyph's size, the prose size unless a consumer names
+    /// another; a `Cell` glyph, and any without the prose faces, is the
+    /// cell's whatever it says.
+    pub size: Size,
 }
 
 impl GlyphStyle {
@@ -104,6 +108,7 @@ impl GlyphStyle {
             weight: Weight::Medium,
             font_style: Style::Regular,
             family: TextFamily::Cell,
+            size: Size::DEFAULT,
         }
     }
 
@@ -136,6 +141,11 @@ impl GlyphStyle {
     /// This style, drawn from `family`'s faces.
     pub fn with_family(self, family: TextFamily) -> Self {
         Self { family, ..self }
+    }
+
+    /// This style at `size`, when it is prose.
+    pub fn with_size(self, size: Size) -> Self {
+        Self { size, ..self }
     }
 
     fn fringe(self) -> u32 {
@@ -625,13 +635,18 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
     }
 
     /// Draws every prose glyph (a `GlyphStyle` whose family is not
-    /// `Cell`) from `faces` sized at this raster's scale: its pen at the
-    /// draw's `x`, the prose line's baseline (`prose::Metrics::line`) below
-    /// its `y`, clipped only by the draw's clip. Which face draws a scalar
-    /// is what `prose::Metrics::source` answers: the family in its style or
+    /// `Cell`) from `faces` at its size (`prose::Size`, the prose size at
+    /// this raster's scale unless it names another): its pen at the draw's
+    /// `x`, the prose line's baseline at that size
+    /// (`prose::Metrics::line_at`) below its `y`, clipped only by the
+    /// draw's clip. Which face draws a scalar is what
+    /// `prose::Metrics::source` answers: the family in its style or
     /// regular, then the monospace face (its stand-in included), then the
-    /// bitmap face with its baseline on the line's. Without faces, prose
-    /// glyphs draw as `Cell` glyphs do.
+    /// bitmap face at its whole scale for the size
+    /// (`prose::Metrics::advance_at`) with its baseline on the line's. A
+    /// size other than this scale's prose size draws from the faces'
+    /// pages of other sizes (`prose::ATLAS`). Without faces, prose glyphs
+    /// draw as `Cell` glyphs do.
     pub fn with_prose(mut self, faces: Option<&'font mut Faces>) -> Self {
         let scale = self.surface.scale;
         self.prose = faces.and_then(|faces| faces.at(scale));
@@ -794,7 +809,9 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         let Some(prose) = self.prose.as_deref_mut() else {
             return;
         };
-        let baseline = i64::from(prose.metrics.line().baseline);
+        let scale = self.surface.scale;
+        let pixels = style.size.pixels(scale);
+        let baseline = i64::from(prose.metrics.line_at(style.size).baseline);
         let origin = (x, y.saturating_add(baseline));
         let source = prose.metrics.source(style.family, style.font_style, scalar);
         let chain: &[Source] = match source {
@@ -803,31 +820,38 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
             Source::Bitmap | Source::Cell => &[],
         };
         for &source in chain {
-            let Some(face) = prose.face(source, style.family) else {
-                continue;
-            };
-            match face.glyph(style.font_style, scalar) {
-                Slot::Placed(entry) => {
-                    let page = face.atlas().page();
+            let face = (source, style.family);
+            match prose.glyph(face, pixels, style.font_style, scalar) {
+                Some((Slot::Placed(entry), atlas)) => {
+                    let page = atlas.page();
                     return blend(self.pixels, self.stride, page, entry, origin, clip, style);
                 }
-                Slot::Blank => return,
-                Slot::Missing => {}
+                Some((Slot::Blank, _)) => return,
+                Some((Slot::Missing, _)) | None => {}
             }
         }
-        // The bitmap face's baseline on the line's.
-        let top = (CELL_BASELINE * self.surface.scale.value()) as i64;
+        // The bitmap face at its scale for the size, as measured, its
+        // baseline on the line's; the cell's at the surface's scale.
+        let bitmap = match source {
+            Source::Cell => scale.value(),
+            _ => bitmap_scale(pixels),
+        };
+        let top = (CELL_BASELINE * bitmap) as i64;
         let primitive = Primitive::Glyph {
             x,
             y: origin.1.saturating_sub(top),
             scalar,
             style,
         };
-        self.shape(clip, primitive);
+        self.shape_at(clip, primitive, bitmap);
     }
 
     fn shape(&mut self, clip: Rect, primitive: Primitive) {
-        let scale = self.surface.scale.value();
+        self.shape_at(clip, primitive, self.surface.scale.value());
+    }
+
+    /// A fill, or a bitmap glyph or mark at a whole `scale`.
+    fn shape_at(&mut self, clip: Rect, primitive: Primitive, scale: usize) {
         let (rect, color, shape) = match primitive {
             Primitive::Fill { rect, color } => (rect, color, Shape::Solid),
             Primitive::Glyph {
@@ -870,9 +894,9 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         };
         let bytes = (color | 0xff000000).to_le_bytes();
         for y in area.y..area.y + i64::from(area.height) {
-            // Intersection with an at-most-32x64 shape makes these
-            // differences small even for hostile signed origins; a fill
-            // needs neither.
+            // Intersection with an at-most-96x192 shape (a bitmap glyph
+            // at `prose::MAX_SIZE`) makes these differences small even
+            // for hostile signed origins; a fill needs neither.
             let row = y.saturating_sub(rect.y) as usize / scale;
             let start = y as usize * self.stride;
             for x in area.x..area.x + i64::from(area.width) {

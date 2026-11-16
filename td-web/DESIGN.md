@@ -1194,8 +1194,11 @@ density).
 - the window, 145 MB at 3840x2160, the largest output td supports:
   §3's measured 144 MB (47 MB resident and td-ui's three 32 MB
   buffers) rounded up, as its test takes it;
-- `ATLAS`, td-ui's atlas pages for prose at sizes other than its own,
-  8 MiB in all (estimate; td-ui's cap, increment 6);
+- `ATLAS`, td-ui's pages for prose at sizes other than its own, 13.5
+  MB: at most td-ui's `prose::PAGES` (8) atlas pages of 1 MiB with
+  their key maps and shelves, and the coverage scratch they share
+  (td-ui's bound, increment 6; 7.1 MiB measured drawing every glyph of
+  the three families at the least and greatest sizes);
 - the navigations' bodies, 67 MB (`MAX_WORKERS` of `MAX_DOCUMENT`, a
   save's among them, §5), a page's decoded text standing in its body's
   place (§3);
@@ -1206,9 +1209,10 @@ density).
   for layout and an estimate for parsing and compiling, for the one
   step the render thread runs at a time.
 
-With `PAGES` that is 145 + 8.4 + 67.1 + 16.8 + 67.1 + 335.5 = 639.9
-MB, 31 MB under `memory-high` (671 MB); `memory-max` stays 768 MiB,
-and the jail's keyfile is unchanged. A test,
+With the root's `PAGES` (not td-ui's `prose::PAGES`) that is 145 +
+13.5 + 67.1 + 16.8 + 67.1 + 335.5 = 645.0 MB, 26 MB under
+`memory-high` (671 MB); `memory-max` stays 768 MiB, and the jail's
+keyfile is unchanged. A test,
 `the_page_budgets_fit_the_jail`, holds that sum at least 20 MB under
 `memory-high`, the term ceilings summing to `PAGES` and the root's
 limit at `PAGES` and its control blocks, its terms taken from the
@@ -1293,8 +1297,9 @@ again without cascading it; on text whose own family names a generic
 it changes nothing. A weight of 600 or more is bold; italic and
 oblique are italic; a size is its computed pixels times the scale,
 rounded to a whole device pixel and clamped to td-ui's prose size
-bound (increment 6), the same size in td-layout's measuring and in the
-paint. Small caps, `text-transform` and `text-indent` are not applied
+bound, `prose::MIN_SIZE` to `MAX_SIZE` (6 to 192, `Size::clamped`,
+increment 6), the same size in td-layout's measuring and in the paint.
+Small caps, `text-transform` and `text-indent` are not applied
 (td-layout keeps the last two unapplied); `letter-spacing` is, as
 td-layout lays it.
 
@@ -1612,9 +1617,18 @@ inside a page. A paint visits only the boxes and lines meeting the
 damage, through an index by height made with each layout and charged
 with it; td-web derives that index and the boxes' tree order from
 td-layout's postorder geometry. A line's glyphs are drawn up to one em
-of its largest size past the pane, td-ui's `OVERHANG` at that size
-(increment 6). A paint draws at most `MAX_PAINT` (estimate) fills and
-glyphs on the window thread; the rest is skipped and the status row
+of its largest size past the pane, td-ui's `prose::overhang` at that
+size (increment 6). Ink also passes a line's box vertically, by td-ui's
+`Metrics::reach_at` at its largest size above and below, so the index
+by height widens each line's box by that reach before culling. A
+line of several sizes puts each piece's glyphs on its baseline with
+`Metrics::top_at`; td-ui's `draw` alone top-aligns them. td-ui
+remakes a page of another size whenever more than `prose::PAGES`
+family and size pairs interleave, at up to 47 µs a glyph at the largest
+sizes, so a paint orders its glyphs by family and size, or `MAX_PAINT`
+is set with that worst case in mind. A paint draws at most `MAX_PAINT`
+(estimate) fills and glyphs on the window thread; the rest is skipped
+and the status row
 says so. Nothing animates: a paint is a function of the page, its
 layout, the view and the damage, and no timer asks for one.
 
@@ -1668,10 +1682,20 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
 6. **This design**, documentation only. Each prerequisite below is a
    landing of its own in its crate, with that crate's design and
    validation, before the cutover:
-   - **td-ui**: prose at a size: `Metrics` and drawing at any whole
-     device-pixel size within a named bound, `OVERHANG` an em at each
-     size, and atlas pages for sizes but its own capped at `ATLAS` in
-     all, the eldest remade when another is needed.
+   - **td-ui** (available): prose at a size (td-ui/DESIGN.md,
+     "Sizes"): a glyph's `prose::Size` (`GlyphStyle::with_size`,
+     `Size::clamped`), 6 to 192 device pixels per em
+     (`prose::MIN_SIZE`, `MAX_SIZE`); `Metrics::advance_at`, `width_at`
+     and `line_at`; `prose::overhang`, an em at a size; `reach_at`, ink
+     past a line box above and below, and `top_at`, a glyph's top for a
+     baseline; and at most `prose::PAGES` (8) pages of other sizes, a
+     new size covering into the storage of the one drawn from longest
+     ago, within `prose::ATLAS` (13.5 MB, pages, key maps and shared
+     scratch; 7.1 MiB measured drawing every glyph at the least and
+     greatest sizes). A frame interleaving more than eight family and
+     size pairs glyph by glyph remakes a page per glyph (4 µs each at
+     20 pixels per em, up to 47 µs at 192), so a paint orders its
+     glyphs by family and size.
    - **td-layout** (available): a declared-charge split excluding
      independently owned tree, DOM and CSS storage (above, "Memory";
      `StyledDocument::charges`, td-layout/DESIGN.md §2, "Whole-page
@@ -1786,8 +1810,8 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    reset every frame), all captured to scratch, never committed; its
    resident peak with a page shown and one made at their largest and
    its cascade, relayout and paint times recorded here in place of §3's
-   figures, with the estimates measured: `ATLAS`, the sheets term,
-   `WORKING` for parsing and compiling, the cascade ceiling's time,
+   figures, with the estimates measured: the sheets term, `WORKING`
+   for parsing and compiling, the cascade ceiling's time,
    `MAX_PAINT`, and whether sizes rounded to device pixels move a
    page's lines visibly against an unrounded layout; the allowlist
    derived again and unchanged; and main's system boot still printing
@@ -1810,8 +1834,8 @@ No request carries a cookie until a jar is designed (§11).
 
 ### Open questions
 
-The estimates above (`ATLAS`, the sheets and pictures terms, `WORKING`
-for parsing and compiling, `MAX_PAINT`, `STYLE_WAIT`,
+The estimates above (the sheets and pictures terms, `WORKING` for
+parsing and compiling, `MAX_PAINT`, `STYLE_WAIT`,
 `MAX_SHEET_FETCHES`, `MAX_PICTURES`, `PICTURE_SETTLE`) stand until the
 increments that introduce them measure them. So does the value of
 td-layout's cascade work ceiling, in match steps and substitution

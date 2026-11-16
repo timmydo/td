@@ -2,8 +2,12 @@
 //! allocation attempts; existing storage remains usable and answers stay exact.
 use super::{Source, Style, TextFamily, MAX_MEASURES};
 use td_alloc::{Budget, BudgetVec};
-type Key = (TextFamily, Style, char);
-type Value = (Source, u32);
+pub(super) type Key = (TextFamily, Style, char);
+/// The face that draws a scalar, from a family the style whose font
+/// measured it and its advance in that font's units, and its advance at
+/// the prose size: eight bytes, which keeps lookups as fast as when only
+/// the last was held.
+type Value = (Source, Style, u16, u32);
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     key: Key,
@@ -131,10 +135,10 @@ mod tests {
                     TextFamily::Serif
                 };
                 let key = (family, Style::Regular, scalar);
-                let value = (Source::Family, n + offset);
+                let value = (Source::Family, Style::Bold, (n + offset) as u16, n);
                 // Insert only on a miss, as Metrics does.
                 if let Some(found) = cache.get(key) {
-                    assert_eq!(found.1, n + offset);
+                    assert_eq!(found.2, (n + offset) as u16);
                 } else {
                     cache.insert(key, value);
                 }

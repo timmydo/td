@@ -45,6 +45,9 @@ pub struct Builder {
     pub short_offsets: bool,
     pub ascender: i16,
     pub descender: i16,
+    /// `head`'s lowest and highest reach of any glyph.
+    pub y_min: i16,
+    pub y_max: i16,
     /// Every glyph's advance; `None` gives glyph `i` 500 + `i`.
     pub advance: Option<u16>,
     /// Per-glyph advances by index, each in place of `advance`'s.
@@ -65,6 +68,8 @@ impl Builder {
             short_offsets: false,
             ascender: 800,
             descender: -200,
+            y_min: 0,
+            y_max: 0,
             advance: None,
             advances: vec![],
         }
@@ -81,6 +86,8 @@ impl Builder {
                 head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
                 head[12..16].copy_from_slice(&0x5f0f_3cf5u32.to_be_bytes());
                 head[18..20].copy_from_slice(&self.units_per_em.to_be_bytes());
+                head[38..40].copy_from_slice(&self.y_min.to_be_bytes());
+                head[42..44].copy_from_slice(&self.y_max.to_be_bytes());
                 head[50..52].copy_from_slice(&u16::from(!self.short_offsets).to_be_bytes());
                 head
             }

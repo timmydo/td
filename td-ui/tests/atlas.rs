@@ -9,7 +9,8 @@
 //! The atlas page over masks built by hand: placement without overlap and
 //! with its gutter zeroed, the copied coverage, the dirty band, blank and
 //! missing slots, idempotent placement, the reset on a full page and on a
-//! spent key budget, and the epoch that marks it.
+//! spent key budget, an atlas made for fewer keys, and the epoch that
+//! marks it.
 
 use td_ui::atlas::{Atlas, Entry, Slot, Style, MAX_KEYS, PAGE_HEIGHT, PAGE_WIDTH};
 use td_ui::coverage::Mask;
@@ -224,4 +225,26 @@ fn a_new_epoch_zeroes_each_entry_gutter_and_repeats_are_idempotent() {
         ..mask(4, 4, 0)
     };
     assert_eq!(atlas.place(Style::Regular, 's', &short), Slot::Missing);
+}
+
+#[test]
+fn an_atlas_holds_the_keys_it_was_made_for() {
+    assert_eq!(Atlas::new().keys(), MAX_KEYS);
+    assert_eq!(Atlas::with_keys(0).keys(), 1);
+    assert_eq!(Atlas::with_keys(usize::MAX).keys(), MAX_KEYS);
+    let mut atlas = Atlas::with_keys(3);
+    for scalar in ['a', 'b', 'c'] {
+        atlas.record(Style::Regular, scalar, Slot::Missing);
+    }
+    assert_eq!((atlas.len(), atlas.epoch()), (3, 0));
+    atlas.record(Style::Regular, 'd', Slot::Missing);
+    assert_eq!((atlas.len(), atlas.epoch()), (1, 1));
+    atlas.record(Style::Regular, 'e', Slot::Missing);
+    atlas.record(Style::Regular, 'f', Slot::Missing);
+    let placed = atlas.place(Style::Regular, 'g', &mask(3, 3, 0));
+    assert!(matches!(placed, Slot::Placed(_)));
+    assert_eq!((atlas.len(), atlas.epoch()), (1, 2));
+    // A reset keeps the bound.
+    atlas.reset();
+    assert_eq!(atlas.keys(), 3);
 }

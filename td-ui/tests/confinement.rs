@@ -59,6 +59,7 @@ const PURE: &[&str] = &[
     "prose.rs",
     "prose/cache.rs",
     "prose/items.rs",
+    "prose/pages.rs",
     "prose/wrap.rs",
     "raster.rs",
     "repeat.rs",

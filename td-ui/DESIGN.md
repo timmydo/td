@@ -343,10 +343,12 @@ of its own files may name each module.
   accepts; `PNG` and `JPEG`, the two picture MIMEs a paste may ask for;
   `OFFER_LIMIT`, `ANNOUNCEMENTS` and `MIME_BYTES`.
 - `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle` (its
-  ink, background, weight, `font_style`, an `atlas::Style`, and `family`,
-  a `TextFamily`; `medium` and `regular` over an ink and a background on
-  the cell, `bold` and `italic` the same style bold or italic,
-  `with_family` the same in another family), `TextFamily` (`Cell`, the
+  ink, background, weight, `font_style`, an `atlas::Style`, `family`,
+  a `TextFamily`, and `size`, a `prose::Size`; `medium` and `regular`
+  over an ink and a background on the cell at the default size, `bold`
+  and `italic` the same style bold or italic, `with_family` the same in
+  another family and `with_size` at another size), `TextFamily` (`Cell`,
+  the
   default, and the prose families `Sans`, `Serif` and `Mono`, under
   "Proportional faces"), `Primitive`
   (`Fill`, `Glyph`, `Mark`, a scalar of the hint face in one ink, and
@@ -369,7 +371,8 @@ of its own files may name each module.
   `Raster::with_typeface` lends it a `typeface::Typeface`'s face at the
   raster's scale, or leaves the bitmap face when it has none.
   `Raster::with_prose` lends it optional `prose::Faces`, sized at its
-  scale, through which it draws every prose glyph, and
+  scale and at each glyph's size, through which it draws every prose
+  glyph, and
   `Raster::metrics` lends the `prose::Metrics` it draws prose with, the
   cell's without faces.
   `Raster::with_theme` paints every draw's palette colours in a
@@ -380,8 +383,9 @@ of its own files may name each module.
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
 - `sfnt`: `Font` (`parse` over a caller's bytes, `units_per_em`,
-  `ascender`, `descender`, `line_gap`, `glyph_count`, `glyph` for a
-  scalar, `advance` and `outline`), `Outline` (`new`, `clear`,
+  `ascender`, `descender`, `line_gap`, `y_min` and `y_max` (the
+  `head` bounds of every glyph), `glyph_count`, `glyph` for a scalar,
+  `advance` and `outline`), `Outline` (`new`, `clear`,
   `is_empty`, `points`, `contours`, `push_contour`, and `overlap` with
   `set_overlap` for the font's overlap flags), `Point` in font
   units with its on-curve bit, `Error` (`Truncated`, `Missing`,
@@ -394,8 +398,9 @@ of its own files may name each module.
   and row-major `alpha`, with `clear` and a bounded `get`) and
   `MAX_MASK_AXIS` and `MAX_OVERSAMPLED_AXIS`; refusals are
   `sfnt::Error`.
-- `atlas`: `Atlas` (`new`, `page`, `epoch`, `len`, `is_empty`, `get`,
-  `record`, `place`, `reset` and `take_dirty`), `Style` (`Regular`,
+- `atlas`: `Atlas` (`new`, `with_keys` for an atlas resetting at fewer
+  keys, `keys`, `page`, `epoch`, `len`, `is_empty`, `get`, `record`,
+  `place`, `reset` and `take_dirty`), `Style` (`Regular`,
   `Bold`, `Italic`, `BoldItalic`), `Slot` (`Placed` with its `Entry`,
   `Blank`, `Missing`),
   `Entry` (its rectangle on the page and its bearing), `PAGE_WIDTH`,
@@ -411,9 +416,12 @@ of its own files may name each module.
   each `with_slant`, which a clone keeps; `cell`, `size` (unrounded),
   `pixels_per_em`, `atlas`, `take_dirty`, `style` (the style bold and
   italic ask for, as the face has it: bold italic falls to italic, then
-  bold, and any style to regular) and `glyph`), `Cell` (`width`, `height`,
-  `baseline`, `pen`), `MIN_PIXELS_PER_EM`, `MAX_PIXELS_PER_EM` and
-  `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
+  bold, and any style to regular), `glyph`, and `glyph_with` covering
+  in a caller's `Scratch`; `sized_in`, `sized` in another face's atlas
+  storage, reset, and `into_atlas`, which gives it back), `Scratch` (the
+  rasterizer, outline and mask a glyph is covered in), `Cell` (`width`,
+  `height`, `baseline`, `pen`), `MIN_PIXELS_PER_EM`,
+  `MAX_PIXELS_PER_EM` and `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
 - `typeface`: `Typeface` (`new` over the regular style's bytes and an
   optional bold style's, refused as a face fitted to the grid's cell at
   scale one is; `with_slant` over optional italic and bold italic
@@ -424,15 +432,22 @@ of its own files may name each module.
   each, refused as a `Refused` naming the family, style and
   `sfnt::Error`; `with_mono`, the monospace face's styles shared from a
   `Typeface`, refused with the `sfnt::Error` of a style or size it
-  fails at; `has_mono`; a clone shares the bytes and sizes its own
-  faces), `Metrics` (`new` over optional faces at a `Scale`, `scale`,
-  `proportional`, `line`, `advance`, `source` and `width`), `LineBox`
+  fails at; `has_mono`; `pages_held`, `pages_made` and `page_keys`,
+  the pages of other sizes held and made and the keys they reset at; a
+  clone shares the bytes and sizes its own
+  faces), `Size` (`DEFAULT`, `new` refusing a size outside the bound,
+  `clamped`, `is_default`, `pixels` at a `Scale`), `overhang`, an em at
+  a size, `Metrics` (`new` over optional faces at a `Scale`, `scale`,
+  `proportional`, `line`, `line_at`, `top_at`, `reach_at`, `advance`,
+  `advance_at`, `source`, `width` and `width_at`), `Reach` (`above`,
+  `below`), `LineBox`
   (`height`, `baseline`), `Source` (`Cell`, `Family`, `Mono`,
   `Bitmap`), `Run` (`text`, `style`, `tag`), `wrap`, `wrap_at_most`,
   `Line` (`width`, `pieces`, `glyphs`, and `hit`), `Piece` (`run`,
   `tag`, `style`, `text`, `left`, `right`, `glyphs`), `Placed` (`x`,
-  `scalar`), `draw`, `shown`, and `SIZE`, `CELL_BASELINE`, `UNIT`,
-  `OVERHANG` and `MAX_MEASURES`; pure,
+  `scalar`), `draw`, `shown`, and `SIZE`, `MIN_SIZE`, `MAX_SIZE`,
+  `PAGES`, `PAGE_KEYS`, `ATLAS`, `CELL_BASELINE`, `UNIT`, `OVERHANG` and
+  `MAX_MEASURES`; pure,
   under "Proportional faces".
 - `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
   data home) and the four styles' file names (`REGULAR`, `BOLD`,
@@ -1532,7 +1547,8 @@ not frames, and stays its own).
   that name a prose family alone: a prose consumer emits the positions
   `prose::wrap` measured, and `Raster::with_prose` draws them from the
   faces measured; every `Cell` glyph's draw is unchanged.
-- The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
+- The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys (fewer
+  when made `with_keys`), placed
   and missing together, with a pixel of gutter right of and below each
   entry, zeroed when it is placed and inside the dirty band; a full page
   or spent budget resets it whole under a new epoch, a held key keeps its
@@ -1540,8 +1556,17 @@ not frames, and stays its own).
   alpha is not its width by height, is recorded missing. An entry is valid
   in the epoch that placed it. A face is 6 through 256 pixels per em with
   a cell of at most 512 on an axis, each style covered at its own units
-  per em. The executor writes only inside the glyph's cell and the draw's
-  clip (a prose glyph, which has no cell, only inside the draw's clip),
+  per em. A prose size is 6 through 192 device pixels per em
+  (`prose::MIN_SIZE`, `MAX_SIZE`), refused or clamped by name, and the
+  prose faces' pages of sizes other than their scale's prose size are at
+  most `prose::PAGES`, one family at one size each, held with their
+  shared scratch in at most `prose::ATLAS` bytes: a new size takes the
+  place of the page drawn from longest ago and covers into its storage,
+  and a page let go is made again when its size is drawn. An outline
+  whose mask at a face's size would pass the axis is covered at the
+  largest scale that fits, so a glyph is never refused for its size. The
+  executor writes only inside the glyph's cell and the draw's clip (a
+  prose glyph, which has no cell, only inside the draw's clip),
   only pixels with coverage, each the style's background moved
   toward its ink by the coverage, and never reads the buffer; a scalar the
   face lacks or refuses draws the bitmap face's glyph centred in the cell,
@@ -1551,7 +1576,8 @@ not frames, and stays its own).
   range inside `glyf`, 8192 points and 1024 contours per outline with
   composites included, a composite depth of 8 and 256 components per
   glyph at every depth together, and a mask of at most 512 pixels on an
-  axis. A refused glyph leaves an empty outline, a refused mask the
+  axis, which a face keeps by covering a larger outline smaller. A
+  refused glyph leaves an empty outline, a refused mask the
   caller's mask as it was. Hinting bytecode is skipped, never run.
 - Every budget carries over from td-editor unchanged: 1 MiB keymaps, the
   parser's token, depth, keycode, type, virtual-modifier, level,
@@ -1641,7 +1667,8 @@ the encoder those fonts come from, shared with `tests/face.rs`.
 `tests/atlas.rs` holds the page over hand-built masks: placement apart
 with its gutter, the coverage copied intact, shelf sharing, the dirty
 band, blank and missing slots taking no space, the reset of a full page
-keeping only the mask that did not fit, the key budget, each entry's
+keeping only the mask that did not fit, the key budget and an atlas
+made for fewer keys resetting at them, each entry's
 gutter zeroed after a reset over opaque bytes, a held key keeping its
 slot and a short alpha recorded missing.
 `tests/face.rs` holds the face and the executor: the cell from encoded
@@ -1657,7 +1684,11 @@ scalar the face lacks bold through the bitmap fallback), the bold style
 at the bold file's own units per em and falling back to its regular
 outline, a Bold lookup on a face without one the regular slot, fills
 and marks unchanged, and a padded stride at scale three whose padding is
-never written, with origins at the i64 extremes writing nothing. For the fit it holds the cell, size, baseline
+never written, with origins at the i64 extremes writing nothing; faces
+covering in one shared `Scratch` equal to each covering in its own, a
+face made in another's atlas storage drawing as one made fresh, and an
+outline past the mask axis covered smaller inside its box. For the fit
+it holds the cell, size, baseline
 and pen for the four grid cells and two others, the fit's refusals, an
 exact square from the pen and baseline, a full-width glyph leaving no seam
 between two cells, an integral advance centred to the pixel, a tall line
@@ -1712,7 +1743,33 @@ faces; a raster lending the metrics of its faces across scale changes,
 and the cell's without; `Faces::new`'s refusal by family and style; and
 the loader over a directory the test writes, sharing a typeface, silent
 under `bitmap`, and naming a refused file, a missing style's path and a
-missing family's places. Five more read the pinned faces where the
+missing family's places. At a size, over those fonts: the bound refused
+and clamped by name, the default and `overhang` an em at each size;
+each family's, the monospace face's and the bitmap face's advances and
+the line scaled with sizes from the least to the greatest at three
+scales, the prose size named measuring as the default and the cell's
+answers without faces; a glyph's ink exactly its advance wide and its
+hang inside an em at five sizes; the prose size named drawing pixel for
+pixel as the default at scales one to four and taking no page; a scalar
+no face has drawn as the bitmap face at its whole scale for the size;
+`wrap` measuring each run at its size and `draw` reaching the em of a
+line's largest size; the pages held to `PAGES` over 21 sizes in three
+families, none for the scale's own size and none kept across a scale
+change, and `ATLAS` the sum of its pages, key maps, shelves and
+scratch; a page let go and made again drawing as one made fresh; the
+page drawn again kept and the eldest let go instead (a ninth size after
+redrawing the first lets the second go); every page, made and remade,
+resetting at `PAGE_KEYS`; a style at its own units per em scaled by
+them at every size; a frame of twelve family and
+size pairs drawn three times in a cycle past the cap equal to each draw
+made with faces of its own; a family or monospace face refused that
+does not size at `MIN_SIZE` or at `MAX_SIZE`; a glyph past the mask
+axis at `MAX_SIZE` measured and drawn from its family inside its
+advance on one page, however often drawn; `reach_at` bounding a deep
+glyph's and the bitmap face's ink past the line box; `top_at` putting
+glyphs of three sizes on one baseline; and measuring faces and drawing
+faces made apart laying, measuring and drawing the same lines at five
+sizes and two scales. Five more read the pinned faces where the
 image and `./install-fonts` put them (`/etc/fonts/noto` and the XDG data
 home's `fonts/noto`, and the monospace face's two, never a host font
 root, so they never describe a host's packaged Noto), and are ignored
@@ -3890,8 +3947,13 @@ way, where each grid pixel clamps before the mask pixel averages them;
 masks past 128 pixels on an axis stay unrefined. The Mono Regular and
 Bold faces flag no glyph. The resulting mask is at most 512 pixels on an
 axis and carries its bearing from the pen and the baseline. A refusal
-leaves the caller's mask untouched. Both the rasterizer and the outline
-are reused, so a steady state allocates nothing.
+leaves the caller's mask untouched. A face asks for no mask past that
+axis: an outline that would pass it at the face's scale is covered at
+the largest scale at which it fits, scaled about the pen, so its ink
+stays inside what the outline spans at full scale, inside its advance
+where the outline is and inside `prose`'s reach (see "Sizes"). Both the
+rasterizer and the outline are reused, so a steady state allocates
+nothing.
 
 ### The atlas executor
 
@@ -4136,8 +4198,9 @@ glyphs it shows, once.
 
 ## Proportional faces
 
-**Status: increments 38 and 39 landed: the faces are pinned, delivered,
-found and loaded, and td-ui measures, wraps and draws prose in them.
+**Status: increments 38 to 40 landed: the faces are pinned, delivered,
+found and loaded, and td-ui measures, wraps and draws prose in them, at
+the prose size or any size within a bound (see "Sizes").
 td-web, its first consumer, draws its pages in prose (td-web/DESIGN.md
 §5, its increment 5).** Every face above lays text on a
 cell: one advance for every scalar, glyphs clipped to it. Prose reads
@@ -4208,7 +4271,7 @@ family and style; the loader names the file. A missing or refused
 family is the whole set missing: the program says so once on standard
 error, naming `./install-fonts`, and its prose draws on the cell. The
 monospace typeface's style bytes are shared, not read again
-(`Faces::with_mono`); a monospace face refused at the prose size is
+(`Faces::with_mono`); a monospace face refused at a prose size is
 said, and the faces keep without it. `bitmap` reads and says nothing. A
 host-packaged Noto found first is parsed under the same bounds and only
 changes the measurements and the glyphs (see "Delivery and trust
@@ -4223,9 +4286,11 @@ draws as above, in the monospace face's cell. `with_family` sets it. A
 `Sans`, `Serif` or `Mono` glyph is prose: drawn with its pen at the
 draw's `x` and the line's baseline at `y` plus the prose line's baseline
 (`Metrics::line`), clipped only by the draw's clip, not to a cell, at the
-prose size. `Mono` is the monospace face's outlines on a prose line, for
+prose size, or at the size its style names (`GlyphStyle::size`, see
+"Sizes"), the baseline then that size's line's. `Mono` is the
+monospace face's outlines on a prose line, for
 code inside a page: its advance is the face's one advance (that of `0`,
-else `M`) at the prose size, and its baseline the line's. Without the
+else `M`) at the glyph's size, and its baseline the line's. Without the
 prose faces (none loaded, `TD_UI_FACE=bitmap`, every in-process test) a
 prose glyph draws exactly as a `Cell` glyph does. A `Glyph` still names
 one scalar and a style, never a bitmap, and the draw-stream oracles see
@@ -4240,7 +4305,10 @@ A raster draws prose from `prose::Faces`, lent with
 `window::run_with_prose`): Sans and Serif in their four styles and, when
 the program has it, the monospace face, each sized at the prose size
 with an atlas page of its own (three pages beside a widget window's
-fitted face), made on first use and remade when the scale changes. A
+fitted face), made on first use and remade when the scale changes,
+and a glyph of another size from a face at that size on the pages of
+other sizes, at most `prose::PAGES` within `prose::ATLAS` (see
+"Sizes"). A
 page is the 1 MiB one of "The atlas executor": at scale four, 64 pixels
 per em, it holds about 350 glyphs, so a frame drawing many scalars in a
 family's four styles can reset that family's page every frame. That is
@@ -4309,8 +4377,10 @@ the line in order, with the run's index, tag and style, the bytes of its
 text the line shows, and its extent in pixels; `Line::hit` finds the
 piece under a pixel, so a consumer hit-tests a link by pixel. `draw`
 streams a line's glyphs at an origin inside its bounds, clipped to the
-damage, up to the first whose pen is `OVERHANG` (one em at the largest
-scale, 64 pixels) or more past the clip's right: Noto's italic `f` and
+damage, up to the first whose pen is `OVERHANG` (one em of the prose
+size at the largest scale, 64 pixels), or the em of the line's largest
+named size where that is more (see "Sizes"), or more past the clip's
+right: Noto's italic `f` and
 `j` hang their ink left of their pens, so a glyph just past the clip
 may still ink inside it, and a repaint of part of a line equals the
 whole line's inside its damage. The raster clips the rest. On the cell
@@ -4333,9 +4403,160 @@ uses only nonallocating element copies. Moving a line or consuming the
 outer result retains the respective backing charges until their owners
 drop. The cache, Items and wrapping modules have strict allocation-source
 guards; font construction elsewhere in prose remains inventoried debt.
+The pages of other sizes (see "Sizes") are a fixed array under the
+strict guard that allocates nothing itself: each place's atlas page is
+allocated once, the atlas's inventoried allocation, and every face made
+in that place after covers into it, sharing one scratch, so the pages
+stay within `ATLAS`. Font parsing for a page made is the inventoried
+debt above.
 
 The default size is `SIZE`, 16 pixels per em at scale 1, the device size
 the scale times that; its line is 22 pixels with the baseline at 17.
+
+### Sizes
+
+A prose glyph names its size in its style: `GlyphStyle::size`, a
+`prose::Size`, `Size::DEFAULT` unless a consumer sets another with
+`with_size`. The default is the prose size, `SIZE` at the surface's
+scale, so a draw stream that names no size is unchanged. Another size
+is a whole number of device pixels per em, which does not move with
+the scale. `Size::new` refuses one outside `MIN_SIZE` and `MAX_SIZE` as
+`sfnt::Error::Limit("prose size")`; `Size::clamped` brings one inside
+them, as td-web does with a computed size times the scale, rounded. A
+size is one byte, so a style naming one is no larger than before.
+
+The bound is 6 to 192 device pixels per em. The least is the outline
+face's least (`face::MIN_PIXELS_PER_EM`), where a Latin x-height is
+three pixels. The greatest is a 64-pixel heading at scale three, or a
+96-pixel one at scale two. A page is 1 MiB at every size, so what the
+bound limits is how many glyphs a page holds. Measured on the pinned
+Noto Sans Regular and Noto Serif Bold, a page holds:
+
+- more than 1177 glyphs at 32 pixels per em;
+- 413 and 330 at 64;
+- 101 and 107 at 128;
+- 58 and 44 at 192;
+- 32 and 28 at 256.
+
+At the greatest size a page holds most of a Latin alphabet's 52
+letters, not all of them in Serif Bold; a heading that needs more resets
+its page as it draws, which costs time, not correctness. Covering the 52
+letters takes 1.8 to 2.2 ms at 192 and 0.2 ms at 16. `Faces::new` and
+`with_mono` refuse a family that does not size at `MIN_SIZE` and
+`MAX_SIZE`, beside the prose size at scales one and four.
+
+`Metrics` measures at a size with `advance_at`, `width_at` and
+`line_at`; `advance`, `width` and `line` are those at `Size::DEFAULT`.
+A family's advance is its units at the size's pixels per em, unhinted
+and rounded to a `UNIT`. The prose size uses the same arithmetic, so the
+prose size named (`Size::new` of `SIZE` times the scale) measures as the
+default does. Which face draws a scalar does not depend on the size, so
+the cache holds a scalar's source, the style whose font measured it, its
+advance in that font's units and its advance at the prose size, eight
+bytes, and each other size scales the units. The monospace face's one
+advance scales the same way. No size is grid-fitted. Measured over the
+pinned faces at scale two, `wrap` at the default size costs 13.9 to
+14.5 ns a scalar over twelve runs in three families, as before sizes
+(14.6 to 14.7), and up to about 5% more over Sans alone (13.9 to 14.5
+against 13.2 to 13.7 ns, and 18.7 to 18.8 against 17.7 to 18.2 in
+another measurement); `width` costs 30% less than before.
+
+The bitmap face draws prose at a whole scale for the size
+(`bitmap_scale`): its 16-pixel em nearest the size and at least one, so
+1 up to 23 pixels per em and 12 at 192. Its advance is `CELL_WIDTH` at
+that scale, and its `CELL_BASELINE` at that scale sits on the line's
+baseline. At the prose size that scale is the surface's, as before. The
+line box at a size follows the prose size's rule at that size. Without
+proportional faces a size changes nothing: every glyph is the cell's at
+the surface's scale, so in-process tests and `driven`'s read-back stay
+on the grid.
+
+An outline whose mask at a size would pass `coverage::MAX_MASK_AXIS` is
+covered at the largest scale at which it fits, about its pen
+(`face`'s cover, see "The atlas executor"), not refused, so a scalar the
+family maps is drawn from the family at every size, as `Metrics`
+measures it. Scaled about the pen, its ink stays inside what its
+outline spans at full scale: inside its advance where the outline is,
+and inside `reach_at`. Noto's U+2E3B, three ems, is 545 pixels at 192
+and drawn 511 wide inside that advance, from one Sans page. A glyph
+whose outline its font refuses at every size falls back as "Glyph
+semantics" says, at the advance measured.
+
+**Placing glyphs.** `wrap` measures each run at its style's size, so a
+line may mix sizes, and its pieces keep the size in their style. A line
+keeps no height. `draw` gives every glyph of a line the line's top as
+its line box's top, so glyphs of several sizes are top-aligned; a
+consumer aligning them on one baseline places each piece itself at
+`Metrics::top_at(size, baseline)`, the top whose glyphs' baseline falls
+there. `draw` streams a line's glyphs past the clip by `OVERHANG` or by
+the em of its largest named size, whichever is more;
+`prose::overhang(size, scale)` is one em at a size. Ink also passes the
+line box vertically: a face's glyphs reach as far as its `head` says,
+and the bitmap face's cell rises above a line shorter than it.
+`Metrics::reach_at` says how far, above and below, at a size: every
+face's reach as its `head` states it at the size, a pixel more for
+coverage's rounding, and the bitmap cell at its scale for the size.
+Over the pinned faces it is 8 above and 2 below at 6 pixels per em (the
+bitmap cell), 2 and 3 at 16, and 12 and 21 at 192. A consumer culling
+lines by their boxes widens them by it.
+
+**Pages.** A raster draws a prose glyph at its size. At its scale's
+prose size it draws from the faces sized for that scale, the path the
+default always took. At any other size it draws from a face of that
+size on the prose faces' pages of other sizes. Each page is one family
+(Sans, Serif or Mono) at one size: a face in its four styles with its
+own 1 MiB atlas page, holding at most `PAGE_KEYS` (1024) keys before it
+resets. There are at most `PAGES` (8), in a fixed array, and they cover
+their glyphs in one shared `face::Scratch`. A size no page holds takes
+an empty place, else the place of the page drawn from longest ago. The
+new face covers into that place's atlas storage (`Face::sized_in`,
+`Face::into_atlas`), so after the first eight no page is allocated
+again however the pages turn over. The page let go is made again when
+its size is next drawn, and its glyphs are covered again as they are
+asked for. A page remade draws exactly as one made fresh, since a face's
+glyphs depend only on its bytes and size. A frame that needs more pages
+than the cap still draws every glyph correctly, remaking pages as it
+goes. The pages are dropped with the scale's faces when the scale
+changes, before the new scale's are made. `Faces::pages_held`,
+`Faces::pages_made` and `Faces::page_keys` report the pages held and
+made and the keys they reset at.
+
+`ATLAS` is what the pages hold at most, 13.5 MB (12.9 MiB): eight
+pages of 1 MiB each with a key map of at most 1024 keys (at most 258
+nodes of at most 768 bytes) and its shelves (48 KiB), and the shared
+scratch (3 MiB: a 514 by 512 accumulator, a 512-square mask and an
+outline at its point, contour and flag bounds, each at most twice that
+in capacity). The scale's own faces are not in it. Measured, drawing
+every glyph of the three families in four styles at 6, 7, 191 and 192
+pixels per em, twelve pages through eight places, raised resident
+memory by 7.1 MiB at its peak, against 11.0 MiB with a face's own
+scratch and fresh page per place.
+
+Tests pin which pages are held, made and let go, and the keys a page
+resets at. The memory the bound counts on is verified by measurement,
+not pinned by a test, since td-ui has no counting allocator: that the
+pages share one scratch, that a new face covers into the storage of the
+page it replaces, and that `Faces::at` drops the old scale's faces
+before it makes the new ones.
+
+**Switching.** A page made costs the parse of its four styles and the
+covering of each glyph again; its storage is reused. Measured in a
+release build at scale two, a 900-glyph frame cycling glyph by glyph
+through more family and size pairs than there are pages remakes a page
+at every glyph: about 4 µs a glyph at 20 to 36 pixels per em (3.6 ms a
+frame), 15 µs at 48 to 128 (13 ms) and 42 to 47 µs at 184 to 192 (38
+ms), where up to eight pairs the frame takes 0.4 ms. So a consumer
+orders its draws by family and size, or bounds the glyphs a frame may
+draw with 47 µs a glyph in mind; the order within a frame, not the
+number of sizes, decides what is remade.
+
+Measuring and drawing agree across threads. td-web's render thread
+measures with its own clone of the faces (`Metrics::new_in`), and the
+window thread draws with the window's. Both depend only on the same
+bytes, size and scale. The advance is integer arithmetic on the font's
+units, and the drawn face is covered from the same outlines at the same
+size. So faces made apart measure and draw identically at every size;
+a test holds two independently made `Faces` to that.
 
 ### Not yet
 
@@ -4344,11 +4565,7 @@ text, mark positioning (a combining mark draws at the pen with its own
 advance, zero in these faces), hyphenation, and faces beyond Latin,
 Greek and Cyrillic (Noto's CJK faces are CFF collections, which `sfnt`
 refuses by name). A scalar outside the families' coverage still draws:
-from the monospace face, its stand-in or Unifont. Nor is prose
-measured and drawn at sizes other than `SIZE`, within a named size
-bound, with `OVERHANG` an em at each size and their atlas pages
-capped, which td-web's styled pages need first (td-web/DESIGN.md §10,
-increment 6). Nor does the seam
+from the monospace face, its stand-in or Unifont. Nor does the seam
 read prose back over proportional faces: `driven::text` reads the cell
 grid, so a
 consumer whose text matters to an agent says it through its own verbs
@@ -4610,6 +4827,14 @@ regressions. Those increments extend the original sequence below.
     loader of the prose faces, with oracles on the bitmap face and on
     the pinned faces read from a checkout's install. td-web is the first
     consumer, in its own increment. Landed.
+40. Prose at a size ("Sizes"): `prose::Size` in `GlyphStyle`, its bound
+    (`MIN_SIZE`, `MAX_SIZE`), `Metrics` at a size, `overhang` an em at
+    each size, `reach_at` and `top_at` for placing lines and glyphs of
+    several sizes, an outline past the mask axis covered smaller, and
+    at most `PAGES` pages of other sizes within `ATLAS`, a new size
+    reusing the eldest's storage and one shared scratch, for td-web's
+    styled pages (td-web/DESIGN.md §10, increment 6). The prose size
+    draws and measures as before. Landed.
 
 ## Foreground terminal relay
 

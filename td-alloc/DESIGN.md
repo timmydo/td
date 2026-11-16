@@ -83,7 +83,12 @@ conservative external models. Prose measurement caches and browser wrapping
 scratch, line arrays and navigation caches own actual capacity, under the
 page root and a 24 MiB per-wrap child respectively. Cache admission failure
 falls back to uncached measurement; wrapping refusal preserves logical
-navigation state and paints a static notice. Their dedicated modules have
+navigation state and paints a static notice. td-ui's prose pages of
+other sizes are a fixed array of at most `prose::PAGES` faces sharing one
+coverage scratch; each place's 1 MiB atlas page is allocated once, by
+the atlas's inventoried infallible `vec!`, and reused by every face made
+in that place after, so a page is allocated at most `PAGES` times a
+scale, whatever is drawn. Their dedicated modules have
 strict source guards. Browser find scratch and both generations of match
 results share a 2 MiB child of the page budget. Scratch and alternate result
 buffers are reused; search and reveal must both succeed before new matches

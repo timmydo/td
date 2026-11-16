@@ -130,6 +130,9 @@ impl Outline {
 #[derive(Clone, Copy, Debug)]
 pub struct Font<'a> {
     units_per_em: u16,
+    /// The lowest and highest any glyph reaches, `head`'s bounding box.
+    y_min: i16,
+    y_max: i16,
     ascender: i16,
     descender: i16,
     line_gap: i16,
@@ -204,6 +207,12 @@ impl<'a> Font<'a> {
         if !(16..=16384).contains(&units_per_em) {
             return Err(Error::Malformed("units per em"));
         }
+        let bound = |at| {
+            be_u16(head, at)
+                .map(|v| v as i16)
+                .ok_or(Error::Truncated("head"))
+        };
+        let (y_min, y_max) = (bound(38)?, bound(42)?);
         let long_offsets = match be_u16(head, 50) {
             Some(0) => false,
             Some(1) => true,
@@ -252,6 +261,8 @@ impl<'a> Font<'a> {
         let cmap = select_cmap(table(b"cmap", "cmap")?)?;
         Ok(Self {
             units_per_em,
+            y_min,
+            y_max,
             ascender,
             descender,
             line_gap,
@@ -267,6 +278,17 @@ impl<'a> Font<'a> {
 
     pub fn units_per_em(&self) -> u16 {
         self.units_per_em
+    }
+
+    /// The lowest any glyph reaches, in font units above the baseline, as
+    /// the font's `head` states it: data, not a measurement.
+    pub fn y_min(&self) -> i16 {
+        self.y_min
+    }
+
+    /// The highest any glyph reaches, as `head` states it.
+    pub fn y_max(&self) -> i16 {
+        self.y_max
     }
 
     /// The `hhea` line metrics in font units: ascender above the baseline

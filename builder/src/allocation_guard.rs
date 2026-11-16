@@ -278,6 +278,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
 const UI_STORAGE_SOURCES: &[&str] = &[
     "td-ui/src/prose/cache.rs",
     "td-ui/src/prose/items.rs",
+    "td-ui/src/prose/pages.rs",
     "td-ui/src/prose/wrap.rs",
     "td-web/src/wrap.rs",
     "td-web/src/search.rs",

@@ -73,15 +73,19 @@ struct Pending {
 }
 
 /// Lays `runs` into lines no wider than `width` pixels, measured with
-/// `metrics`: a line breaks after a space, and inside a word only when the
-/// word alone is wider than a line; spaces at a line's end take no width
-/// and are dropped with the break, and a line never ends holding only
+/// `metrics`, each glyph at its run's size: a line breaks after a space,
+/// and inside a word only when the word alone is wider than a line;
+/// spaces at a line's end take no width and are dropped with the break,
+/// and a line never ends holding only
 /// spaces: those before a word that moves to the next line go with the
 /// break, leading spaces included; a newline ends a line and is not shown,
 /// and a line holds at least one glyph however narrow. Each glyph's pen is
 /// its advances summed in `UNIT`s and then rounded, so a line's width does
 /// not drift with its length. There is always one line, empty for empty
-/// text, and one more after each newline. Work and memory are linear in
+/// text, and one more after each newline. A line keeps no height: runs of
+/// several sizes share it, and `draw` puts every glyph's line box top at
+/// its top, so a consumer aligning their baselines places each piece
+/// itself, its glyphs' top `Metrics::top_at` its baseline. Work and memory are linear in
 /// the runs' text: a consumer bounds what it hands over.
 pub fn wrap(
     metrics: &mut Metrics,
@@ -131,7 +135,9 @@ pub fn wrap_at_most(
             }
             let shown = shown(scalar);
             let space = shown == ' ';
-            let advance = u64::from(metrics.advance(run.style.family, run.style.font_style, shown));
+            let style = run.style;
+            let advance = metrics.advance_at(style.size, style.family, style.font_style, shown);
+            let advance = u64::from(advance);
             let over = |pen: u64| u64::from(pixels(pen.saturating_add(advance))) > limit;
             if !space && over(pen) && !line.is_empty() {
                 // The word so far moves to a new line; if it is alone
