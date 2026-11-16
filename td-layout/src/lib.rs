@@ -85,6 +85,8 @@ impl From<td_dom::Error> for Error {
 pub struct Limits<'c> {
     /// Input bytes admitted; MAX_PAGE_INPUT by default, at most MAX_INPUT.
     pub input: usize,
+    /// The ceiling on construction's `Charges::construction` and, unless a
+    /// request sets its own, a layout's `page_bytes`.
     pub bytes: usize,
     pub boxes: usize,
     pub depth: usize,
@@ -255,6 +257,43 @@ pub struct BoxNode {
     pub first_child: Option<BoxId>,
     pub next_sibling: Option<BoxId>,
 }
+/// A styled document's declared charges, by the owner that holds each
+/// (DESIGN.md §2, "Whole-page memory"). They are the conservative
+/// admission model's terms, not td-alloc's measure of storage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charges {
+    /// The document's declared charge, td-html's `charged_bytes`: a
+    /// cumulative parse bound, discarded parse temporaries included, not
+    /// the storage it holds. The document's owner holds it, once however
+    /// many styled documents share it.
+    pub tree: usize,
+    /// The styled document's: its boxes, list items and style pool, which
+    /// it holds, and the input, which the caller holds but it counts as
+    /// its own from the cascade on. The pool's charge conservatively
+    /// includes strings a computed style shares with its sheets.
+    pub styled: usize,
+    /// td-dom's navigation index, admitted while construction ran and
+    /// returned when it ended.
+    pub index: usize,
+    /// Construction's own per-node arrays, admitted and returned as the
+    /// index is.
+    pub scratch: usize,
+}
+impl Charges {
+    /// What the styled document and its tree hold once built, where a
+    /// layout's admission starts. Two styled documents sharing one tree
+    /// each count it: a ledger takes `tree` once.
+    pub fn held(&self) -> usize {
+        self.tree.saturating_add(self.styled)
+    }
+    /// What construction admitted at its peak, all four together, which
+    /// `Limits::bytes` bounds.
+    pub fn construction(&self) -> usize {
+        self.held()
+            .saturating_add(self.index)
+            .saturating_add(self.scratch)
+    }
+}
 /// Immutable text, borrowed or shared; one style per equivalence class.
 pub struct StyledDocument<'d> {
     document: DocumentOwner<'d>,
@@ -262,7 +301,10 @@ pub struct StyledDocument<'d> {
     boxes: BudgetVec<BoxNode>,
     first: Option<BoxId>,
     geometry_count: usize,
-    charged: usize,
+    /// Charges but the tree's, which is its document's.
+    styled_bytes: usize,
+    index_bytes: usize,
+    scratch_bytes: usize,
     limits: Limits<'static>,
     cascade: CascadeWork,
     /// Each list-item box's ordinal value, in box order.
@@ -341,18 +383,26 @@ impl<'d> StyledDocument<'d> {
         if input_bytes > limits.input {
             return Err(Error::Limit("MAX_PAGE_INPUT"));
         }
-        // Reserve all fixed arrays and navigation before constructing them.
-        // Navigation and the temporary node map remain charged after dropping.
-        let fixed = document
+        // Reserve all fixed arrays and navigation before constructing them,
+        // beside the document's charge. Navigation and the per-node maps
+        // are construction's alone, returned when it ends.
+        let index_bytes = document
             .len()
-            .checked_mul(
-                td_dom::MAX_INDEX_BYTES / td_dom::MAX_INDEX_NODES
-                    + size_of::<Option<StyleId>>()
-                    + size_of::<BoxNode>()
-                    + 4 * size_of::<Option<BoxId>>(),
-            )
-            .and_then(|n| n.checked_add(document.charged_bytes()))
+            .checked_mul(td_dom::MAX_INDEX_BYTES / td_dom::MAX_INDEX_NODES)
+            .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
+        let scratch_bytes = document
+            .len()
+            .checked_mul(size_of::<Option<StyleId>>() + 4 * size_of::<Option<BoxId>>())
+            .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
+        let own = document
+            .len()
+            .checked_mul(size_of::<BoxNode>())
             .and_then(|n| n.checked_add(input_bytes + 1024))
+            .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
+        let fixed = own
+            .checked_add(index_bytes)
+            .and_then(|n| n.checked_add(scratch_bytes))
+            .and_then(|n| n.checked_add(document.charged_bytes()))
             .filter(|n| *n <= limits.bytes)
             .ok_or(Error::Limit("MAX_PAGE_BYTES"))?;
         // Read after the up-front limits, so they refuse by name first.
@@ -411,7 +461,9 @@ impl<'d> StyledDocument<'d> {
         }
         let mut out = Self {
             document: DocumentOwner::Borrowed(document),
-            charged: fixed + styles.charged_bytes(),
+            styled_bytes: own + styles.charged_bytes(),
+            index_bytes,
+            scratch_bytes,
             styles,
             boxes: td_alloc::BudgetVec::with_capacity(memory, document.len())?,
             first: None,
@@ -426,7 +478,8 @@ impl<'d> StyledDocument<'d> {
             tables: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
-        let list_base = out.charged;
+        // List items are admitted while the index and scratch live.
+        let list_base = fixed + out.styles.charged_bytes();
         let mut list_bytes = 0usize;
         let mut last = BudgetVec::filled(memory, document.len(), None)?;
         let mut parents = BudgetVec::filled(memory, document.len(), None)?;
@@ -561,7 +614,10 @@ impl<'d> StyledDocument<'d> {
             }
         }
         out.list_items = numbering.finish()?;
-        out.charged = out.charged.checked_add(list_bytes).ok_or(Error::Invalid)?;
+        out.styled_bytes = out
+            .styled_bytes
+            .checked_add(list_bytes)
+            .ok_or(Error::Invalid)?;
         Ok(out)
     }
     pub fn document(&self) -> &Document {
@@ -591,8 +647,15 @@ impl<'d> StyledDocument<'d> {
     pub fn style_count(&self) -> usize {
         self.styles.len()
     }
-    pub fn charged_bytes(&self) -> usize {
-        self.charged
+    /// Its declared charges, by owner: a page's ledger takes `styled`
+    /// from each styled document and `tree` once from the document.
+    pub fn charges(&self) -> Charges {
+        Charges {
+            tree: self.document().charged_bytes(),
+            styled: self.styled_bytes,
+            index: self.index_bytes,
+            scratch: self.scratch_bytes,
+        }
     }
     /// The clamped limits it was built under, without the build's flag.
     pub fn limits(&self) -> Limits<'static> {
@@ -650,7 +713,9 @@ impl StyledDocument<'static> {
             boxes,
             first,
             geometry_count,
-            charged,
+            styled_bytes,
+            index_bytes,
+            scratch_bytes,
             limits,
             cascade,
             list_items,
@@ -664,7 +729,9 @@ impl StyledDocument<'static> {
             boxes,
             first,
             geometry_count,
-            charged,
+            styled_bytes,
+            index_bytes,
+            scratch_bytes,
             limits,
             cascade,
             list_items,
@@ -750,12 +817,171 @@ mod tests {
         );
     }
     #[test]
+    fn charges_split_by_owner_and_sum_to_what_construction_admits() {
+        let html = "<p>one<p>two <b>three</b><div>four</div>";
+        let dom = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(""), html.len(), Limits::default()).unwrap();
+        let charges = styled.charges();
+        // The tree's is its document's; the index's is td-dom's per node.
+        assert_eq!(charges.tree, dom.charged_bytes());
+        assert!(charges.tree > 0);
+        assert_eq!(
+            charges.index,
+            dom.len() * (td_dom::MAX_INDEX_BYTES / td_dom::MAX_INDEX_NODES)
+        );
+        // Construction's per-node maps are its own scratch; the styled
+        // term is what the styled document keeps: input, boxes and pool.
+        assert_eq!(
+            charges.scratch,
+            dom.len() * (size_of::<Option<StyleId>>() + 4 * size_of::<Option<BoxId>>())
+        );
+        let own = dom.len() * size_of::<BoxNode>() + html.len() + 1024;
+        assert_eq!(charges.styled, own + styled.styles.charged_bytes());
+        assert_eq!(charges.held(), charges.tree + charges.styled);
+        // The four are the single charge construction admitted before.
+        assert_eq!(
+            charges.construction(),
+            dom.len()
+                * (td_dom::MAX_INDEX_BYTES / td_dom::MAX_INDEX_NODES
+                    + size_of::<Option<StyleId>>()
+                    + size_of::<BoxNode>()
+                    + 4 * size_of::<Option<BoxId>>())
+                + dom.charged_bytes()
+                + html.len()
+                + 1024
+                + styled.styles.charged_bytes()
+        );
+        // A longer text grows the tree's charge, and the styled term only
+        // by the input the caller declares: declared as the short page's,
+        // the styled term is unchanged.
+        let long = format!("<p>{}<p>two <b>three</b><div>four</div>", "x".repeat(4096));
+        let grown = td_html::document::parse(&long).unwrap();
+        assert_eq!(grown.len(), dom.len());
+        let charge = |input| {
+            StyledDocument::new(&grown, &sheets(""), input, Limits::default())
+                .unwrap()
+                .charges()
+        };
+        let other = charge(html.len());
+        assert!(other.tree > charges.tree);
+        assert_eq!(
+            (other.styled, other.index, other.scratch),
+            (charges.styled, charges.index, charges.scratch)
+        );
+        assert_eq!(
+            charge(long.len()).styled,
+            charges.styled + long.len() - html.len()
+        );
+        // A layout starts from what is held; index and scratch are gone.
+        let out =
+            block::layout(&styled, &mut Count(0), &block::Request::new(400.0, 300.0)).unwrap();
+        assert_eq!(out.page_bytes, charges.held() + out.output_bytes);
+    }
+    #[test]
+    fn a_shared_document_is_charged_once_and_reports_as_a_borrowed_one() {
+        use td_alloc::{Budget, BudgetShared};
+        let html = "<ol><li>one<li>two</ol><p>three <i>four</i>";
+        let css = sheets("p{color:red}");
+        let page = Budget::new(16 * 1024 * 1024).unwrap();
+        let doc = td_html::document::parse_with_budget(html, Default::default(), &page).unwrap();
+        let shared = BudgetShared::new(&page, doc).unwrap();
+        let holder = shared.try_clone().unwrap();
+        let borrowed =
+            StyledDocument::with_budget(&holder, &css, html.len(), Limits::default(), &page)
+                .unwrap();
+        let alone = borrowed.charges();
+        let first = StyledDocument::shared(
+            shared.try_clone().unwrap(),
+            &css,
+            html.len(),
+            Limits::default(),
+            &page,
+        )
+        .unwrap();
+        let second =
+            StyledDocument::shared(shared, &css, html.len(), Limits::default(), &page).unwrap();
+        // Borrowed and shared report alike.
+        assert_eq!(first.charges(), alone);
+        assert_eq!(second.charges(), alone);
+        // Each names the one document's charge as its tree, which neither
+        // styled term holds: a ledger takes the tree once, beside both.
+        assert_eq!(alone.tree, first.document().charged_bytes());
+        let ledger = alone.tree + first.charges().styled + second.charges().styled;
+        assert_eq!(
+            ledger,
+            first.charges().held() + second.charges().held() - alone.tree
+        );
+        assert!(ledger < first.charges().held() + second.charges().held());
+        // A shared document with a larger charge and the same nodes, the
+        // input declared alike, leaves the styled term as it was.
+        let long = format!(
+            "<ol><li>one<li>two</ol><p>three <i>{}</i>",
+            "y".repeat(4096)
+        );
+        let grown = td_html::document::parse_with_budget(&long, Default::default(), &page).unwrap();
+        assert_eq!(grown.len(), first.document().len());
+        let grown = StyledDocument::shared(
+            BudgetShared::new(&page, grown).unwrap(),
+            &css,
+            html.len(),
+            Limits::default(),
+            &page,
+        )
+        .unwrap()
+        .charges();
+        assert!(grown.tree > alone.tree);
+        assert_eq!(grown.styled, alone.styled);
+        // Their layouts admit alike, each from its own tree and styled.
+        let request = block::Request::new(300.0, 200.0);
+        let a = block::layout(&borrowed, &mut Count(0), &request).unwrap();
+        let b = block::layout(&second, &mut Count(0), &request).unwrap();
+        assert_eq!(a.page_bytes, b.page_bytes);
+        assert_eq!(a.output_bytes, b.output_bytes);
+    }
+    #[test]
+    fn construction_returns_its_index_and_scratch_to_the_budget() {
+        use td_alloc::Budget;
+        // A list-free page leaves under a byte a node between what the
+        // budget holds and the styled term, so any one per-node map kept
+        // (8 bytes a node at the least) passes it; a list's items too.
+        let pages = [
+            (format!("<body>{}", "<p>x".repeat(20_000)), 1),
+            (format!("<ol>{}</ol>", "<li>item".repeat(2000)), 64),
+        ];
+        for (html, slack) in pages {
+            let dom = td_html::document::parse(&html).unwrap();
+            assert!(dom.len() > 4000);
+            let page = Budget::new(64 * 1024 * 1024).unwrap();
+            let child = page.child(32 * 1024 * 1024).unwrap();
+            let base = child.used();
+            let css = sheets("");
+            let styled =
+                StyledDocument::with_budget(&dom, &css, html.len(), Limits::default(), &child)
+                    .unwrap();
+            let used = child.used() - base;
+            let charges = styled.charges();
+            // The input is the caller's, not in the budget; what remains is
+            // the boxes, list items and pool, within the styled term less it.
+            let own = charges.styled - html.len() - 1024;
+            assert!(used >= styled.boxes.capacity() * size_of::<BoxNode>());
+            assert!(used <= own);
+            assert!(
+                own - used < dom.len() * slack,
+                "{} {}",
+                own - used,
+                dom.len()
+            );
+            drop(styled);
+            assert_eq!(child.used(), base);
+        }
+    }
+    #[test]
     fn page_and_box_limits_at_edges() {
         let dom = td_html::document::parse("<p>x").unwrap();
         let sheet = sheets("");
         let styled = StyledDocument::new(&dom, &sheet, 4, Limits::default()).unwrap();
         let count = styled.boxes().len();
-        let bytes = styled.charged_bytes();
+        let bytes = styled.charges().construction();
         for (limit, ok) in [(count, true), (count - 1, false)] {
             assert_eq!(
                 StyledDocument::new(
@@ -1220,11 +1446,11 @@ mod tests {
             cancel: Some(&set_flag),
             ..block::Request::new(400.0, 300.0)
         };
-        // The styled document's charge, then the geometry array's, then the
-        // retained output's.
+        // What the styled document and its tree hold, then that and the
+        // geometry array's charge, then the retained output's.
         for (bytes, retained) in [
-            (Some(styled.charged_bytes() - 1), 0),
-            (Some(styled.charged_bytes()), 0),
+            (Some(styled.charges().held() - 1), 0),
+            (Some(styled.charges().held()), 0),
             (None, MAX_PAGE_BYTES),
         ] {
             request.bytes = bytes;

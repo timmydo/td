@@ -145,7 +145,8 @@ pub struct Line {
 }
 pub struct WrappedText {
     pub lines: BudgetVec<Line>,
-    pub charged_bytes: usize,
+    /// The styled document's tree and styled charges and these lines'.
+    pub page_bytes: usize,
     pub work: usize,
     pub cuts: Cuts,
 }
@@ -289,7 +290,7 @@ pub(crate) struct Counters<'c> {
 impl<'c> Counters<'c> {
     pub fn new(styled: &StyledDocument<'_>, cancel: Option<&'c AtomicBool>) -> Self {
         Self {
-            bytes: styled.charged_bytes(),
+            bytes: styled.charges().held(),
             work: 0,
             lines: 0,
             fragments: 0,
@@ -415,7 +416,7 @@ pub fn wrap_text_with_budget(
     flow.finish(&mut counters, &mut sink)?;
     Ok(WrappedText {
         lines: sink.0,
-        charged_bytes: counters.bytes,
+        page_bytes: counters.bytes,
         work: counters.work,
         cuts: counters.cuts,
     })
@@ -1409,14 +1410,22 @@ mod tests {
                 ok
             );
         }
-        for (limit, ok) in [
-            (measured.charged_bytes, true),
-            (measured.charged_bytes - 1, false),
-        ] {
+        // Wrapped lines enough that their charge passes construction's
+        // index and scratch, so the edge is the wrap's, not construction's.
+        let words = format!("<p>{}", "ab ".repeat(100));
+        let word_dom = td_html::document::parse(&words).unwrap();
+        let word_sheet = sheets("");
+        let built =
+            StyledDocument::new(&word_dom, &word_sheet, words.len(), Limits::default()).unwrap();
+        let word_runs = self::runs(&built);
+        let wrapped =
+            wrap_text(&built, &mut Metrics(64), &word_runs, 10, word_runs[0].style).unwrap();
+        assert!(wrapped.page_bytes > built.charges().construction());
+        for (limit, ok) in [(wrapped.page_bytes, true), (wrapped.page_bytes - 1, false)] {
             let styled = StyledDocument::new(
-                &dom,
-                &sheet,
-                html.len(),
+                &word_dom,
+                &word_sheet,
+                words.len(),
                 Limits {
                     bytes: limit,
                     ..Limits::default()
@@ -1424,7 +1433,14 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                wrap_text(&styled, &mut Metrics(64), &runs, 10, runs[0].style).is_ok(),
+                wrap_text(
+                    &styled,
+                    &mut Metrics(64),
+                    &word_runs,
+                    10,
+                    word_runs[0].style
+                )
+                .is_ok(),
                 ok
             );
         }

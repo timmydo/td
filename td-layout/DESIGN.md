@@ -55,11 +55,31 @@ by td-html rendering and the kept page in td-web/DESIGN.md §3, within the
 account for the old representation before admitting a replacement.
 
 MAX_PAGE_BYTES is 224 MiB of charged retained storage. Admission includes
-the document's conservative charged_bytes, td-dom's navigation arrays,
-style-pool allocations, node/style/box arrays, list items' ordinals,
-line records and fragments, markers included.
+the document's conservative charged_bytes, style-pool allocations, box
+arrays, list items' ordinals, line records and fragments, markers
+included, and td-dom's navigation arrays and construction's per-node
+maps while construction holds them.
 The original input, up to the input limit, is charged too while retained
 by the caller.
+
+`StyledDocument::charges` names the charges by owner, so a consumer
+that keeps a ledger of its own (td-web/DESIGN.md §10, "Memory") counts
+each once. `tree` is the document's charge, td-html's cumulative parse
+bound (discarded parse temporaries included, not the storage it holds),
+held by whoever owns the document and the same in every styled document
+that borrows or shares it. `styled` is what the styled document holds:
+the input, which it counts as its own from the cascade on, its boxes,
+list items and style pool, whose charge conservatively includes strings
+a computed style shares with its sheets. `index`, td-dom's arrays at 28
+bytes a node, and `scratch`, construction's per-node maps at 80, are
+admitted beside the other two while construction runs
+(`construction()`, under `Limits::bytes`) and returned when it ends.
+A layout's admission starts from `held()`, tree and styled, and its
+`Layout::page_bytes` adds `retained_output_bytes` and the new output.
+Neither sees a sibling: two styled documents sharing one tree each
+count it in `held()` and `page_bytes`, and a caller holding another
+styled document or its layout folds it into `retained_output_bytes`.
+
 An additional 64 MiB working allowance brings the target to 288 MiB
 (302 MB). It covers one cascade candidate, wrapping scratch and allocator
 overhead. Charging precedes retained allocations; capacities, map overhead
@@ -89,7 +109,7 @@ document owner: its consumer must retain the corresponding StyledDocument
 for source lookup. Memory limits refuse work; they never return partial
 successful layout.
 
-The conservative charged_bytes/output_bytes admission model remains a
+The conservative page_bytes/output_bytes admission model remains a
 separate bound. It is not an additional td-alloc reservation: doing so would
 double-charge owned storage. Original input bytes and caller font caches
 must be separately owned or reserved by the consumer. Shared stylesheet
@@ -112,10 +132,10 @@ comparison: interning, custom-map reuse and suppression of hidden subtrees
 all contribute; it does not isolate the saving from interning alone.
 Section 6 records the workload, capture identities and limits of this
 measurement. The 2 MiB many-block case peaks at 91.1 MiB RSS and charges
-134.6 MiB for one retained page, below the 224 MiB admission ceiling.
-The densest 4 MiB markup td-html admits charges up to 212.8 MiB, and
-MAX_PAGE_BYTES refuses denser layouts by name (§6, "Caller-set
-limits").
+115.9 MiB for one retained page, below the 224 MiB admission ceiling.
+4 MiB of markup td-html admits charges up to 222.4 MiB measured, and
+MAX_PAGE_BYTES refuses others by name, not in order of density (§6,
+"Caller-set limits").
 
 ## 3. Public data and source identity
 
@@ -132,9 +152,11 @@ geometry and emitted lines, with resource usage, work counters and the
 lines cut at MAX_LINE_SCALARS (`cuts`, §4, "Long lines") and its list
 markers (`markers`, §5, "List markers").
 BoxGeometry records are in postorder and name DOM elements; this is not
-a paint-order API. `output_bytes` excludes the shared styled document,
-so it can be passed as `retained_output_bytes` on a resize request. Refusal
-is an error, never successful partial output. There is no implicit I/O.
+a paint-order API. `output_bytes` excludes the shared styled document
+and its tree, so it can be passed as `retained_output_bytes` on a resize
+request; `page_bytes` is the four together: tree, styled,
+`retained_output_bytes` and the new output (§2). Refusal is an error,
+never successful partial output. There is no implicit I/O.
 `cascade_work()` reports what the cascade spent (§6, "Cascade work").
 `text::fit` takes the styled text page, mutable FontMetrics, a
 viewport width, a cap of lines and an optional cancel flag, and counts
@@ -147,8 +169,8 @@ optional `&AtomicBool`, which another thread may set while the call runs.
 Construction reads it once its up-front limits (the input and the fixed
 arrays' charge) pass, before each element's cascade and after every
 `CANCEL_INTERVAL` (4,096)th node's tests in box generation; layout reads
-it at its first work tick, after its up-front charges (the styled
-document's, `retained_output_bytes` and the geometry array, under its
+it at its first work tick, after its up-front charges (tree and styled
+terms, `retained_output_bytes` and the geometry array, under its
 byte limit), and then once every 4,096 units of `MAX_LAYOUT_WORK`, which
 every box, line and scalar visit charges. A set flag returns
 `Error::Cancelled`, distinct from every limit. As with any refusal, the call
@@ -647,13 +669,15 @@ markers cost their measurement: `<ol>` and 100,000 `<li>item text`
 lay out in 44.3 ms without markers and 57.2 with, and style in 380 and
 395 ms. 200,000
 empty items, within td-html's `MAX_NODES` (262,144) only without a text
-node each, style in about 790 ms to 74.4 MiB and lay out decimal
-markers in 49 ms (bullets 33 ms, none 28 ms), charging 177.0 MiB with
-the styled document (149.6 MiB with `list-style-type: none`), 3% of
+node each, style in about 790 ms, admitting 74.4 MiB while
+construction runs and holding 53.8 MiB of tree and styled after, and
+lay out decimal markers in 49 ms (bullets 33 ms, none 28 ms), charging
+156.4 MiB with the tree and styled document (129.0 MiB without
+markers), 3% of
 `MAX_LAYOUT_WORK`. Inside, each of those markers lays a line, and the
 lines' 68 MiB step refuses the layout `Limit("MAX_PAGE_BYTES")`; 131,000
-items of one letter, which lay a line each anyway, charge 189.6 MiB
-with markers either way and 171.6 without.
+items of one letter, which lay a line each anyway, charge 162.6 MiB
+with markers either way and 144.6 without (charges after §2's split).
 
 ### Tables
 
@@ -868,17 +892,17 @@ Worst cases, in one process each, the same day:
 
 | Shape | Result |
 | --- | --- |
-| 100,000 cells, 1,000 rows of 100 (604,015 bytes) | 59 ms, 152 MiB charged with the styled document |
-| 28 rows of 4,096 columns | 64 ms, 167 MiB |
+| 100,000 cells, 1,000 rows of 100 (604,015 bytes) | 59 ms, 132 MiB charged with the tree and styled document |
+| 28 rows of 4,096 columns | 64 ms, 143 MiB |
 | 2,000 rows each one `colspan=1000` cell | 2.6 ms |
 | 200 `rowspan=65534` cells beside 20,000 rows | 70 ms |
 | a 4 MiB cell of words, `Limits::input` at MAX_INPUT, 1 / 2 / 8 / 10 tables deep | 137 / 177 / 409 / 476 ms (54,473,298 work at 10) |
 | the same 30 deep | `Limit("MAX_LAYOUT_WORK")` after 583 ms |
 | 4,097 columns | `Limit("MAX_TABLE_COLUMNS")` in 0.5 ms |
-| 20,000 / 50,000 rows of four `colspan=1000` cells | `Limit("MAX_LAYOUT_WORK")` in 38 ms / `Limit("MAX_PAGE_BYTES")` in 9 ms |
+| 20,000 / 50,000 rows of four `colspan=1000` cells | `Limit("MAX_LAYOUT_WORK")` in 38 ms / in about 37 ms (`Limit("MAX_PAGE_BYTES")` in 9 ms before §2's split) |
 | 2 MiB of one-cell tables each holding 62 nested empty divs | 62 ms, 2,120,466 work (29 ns a unit) |
 | 300 one-cell tables nested 61 deep | 249 ms, 20,369,104 work (12 ns a unit) |
-| 100,000 empty divs in a cell 45 tables deep | 575 ms, 40,737,039 work, 73 MiB |
+| 100,000 empty divs in a cell 45 tables deep | 575 ms, 40,737,039 work, 62 MiB |
 | a million lines of `pre` in one cell | whole `Limit("MAX_PAGE_BYTES")` in 106 ms; windowed at 0 to 1,000 px 76 ms, 9.6 MiB, as without the table; at 10,000,000 px 143 ms, 9.6 MiB, no output bytes past its 51 lines'; past 10,485,763 px `Limit("MAX_PAGE_BYTES")` |
 | 100,000 inline images 5 px square in a cell 60 tables deep | 744 ms, 54,465,584 work (14 ns a unit; 59 before images measured at `MEASURE_BOX`) |
 
@@ -1002,6 +1026,9 @@ configurations and all layout passes. Setup is parse + stylesheet compile
 + cascade; layout excludes setup. Charged page storage includes DOM,
 original input, shared styles, full output and conservative capacities.
 It can exceed process RSS because it deliberately overcharges allocations.
+As measured it holds td-dom's index and construction's scratch too,
+108 bytes a node, which a layout's charge no longer does (§2): 0.07 to
+1.30 MiB for these pages.
 
 | Page | HTML bytes | Nodes / styles | Charged page MiB | Setup ms | Layout ms | Peak RSS MiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1043,7 +1070,10 @@ cascade, which styles blocks in about 400 ms on the same host
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Prose | 16.0 / 0.0 | 54.5 / 55.3 / 48.0 | 13,618 / 41 | 14.3 / 18.5 / 10.1 | 12.4 |
 | Word | 16.1 / 0.0 | 54.7 / 53.7 / 47.0 | 13,274 / 41 | 14.3 / 18.5 / 10.1 | 12.3 |
-| Blocks | 49.2 / 416.0 | 70.5 / 67.0 / 52.9 | 91,181 / 23 | 134.6 / 134.6 / 100.7 | 91.1 |
+| Blocks | 49.2 / 416.0 | 70.5 / 67.0 / 52.9 | 91,181 / 23 | 115.9 / 115.9 / 81.9 | 91.1 |
+
+Charges are recomputed after §2's split; blocks' were 18.8 MiB more,
+the index and scratch of its 182,365 nodes.
 
 Resized full line counts are 21,184, 20,561 and 91,181 respectively.
 Resized layout work is 6,333,820, 6,291,454 and 4,650,203 visits; windowed
@@ -1054,15 +1084,15 @@ These figures do not justify promising viewport-only CPU cost.
 
 The overlap probe keeps the old full layout while constructing the new
 one. It succeeds for prose and word at 22.8 MiB charged, and for blocks
-at 203.3 MiB, its 68.6 MiB old output beside a 66.0 MiB styled document
-and the new 68.6 MiB, in a median 66.9 ms; the table times the resize
-after releasing the old output. A denser page's overlap is refused
-MAX_PAGE_BYTES (below, "Caller-set limits"), so a caller should release
-or budget old output before choosing this path rather than routinely
-retrying it. The largest accepted case, that overlap, plus the 64 MiB
-working allowance is 267.3 MiB, within the roughly 300 MB target;
-observed RSS does not exhaust that allowance. This is measured coverage,
-not a worst-case RSS proof.
+at 184.5 MiB, its 68.6 MiB old output beside a 34.1 MiB tree, a 13.2
+MiB styled document and the new 68.6 MiB, in a median 66.9 ms; the
+table times the resize after releasing the old output. A denser page's
+overlap is refused MAX_PAGE_BYTES (below, "Caller-set limits"), so a
+caller should release or budget old output before choosing this path
+rather than routinely retrying it. The largest accepted case, that
+overlap, plus the 64 MiB working allowance is 248.5 MiB, within the
+roughly 300 MB target; observed RSS does not exhaust that allowance.
+This is measured coverage, not a worst-case RSS proof.
 
 Committed synthetic regressions exercise the exact 2 MiB prose/word
 shapes, DOM byte-range validity and window equivalence, a smaller dense
@@ -1108,17 +1138,17 @@ matches, and td-css's attribute scans count it. td-web's second rung and
 §10).
 
 `Request::bytes`, None by default, sets one layout's ceiling on charged
-bytes (the styled document's, `retained_output_bytes` and the new
-output together) in place of the styled document's `Limits::bytes`,
-fixed when it was cascaded. It is clamped to MAX_PAGE_BYTES and may lie
-above or below the styled document's limit; past it the request is
-refused `Limit("MAX_PAGE_BYTES")`. It bounds the conservative admission
-model (§2), not td-alloc storage. A document built by `new` or
-`with_state` owns a budget sized from its own `Limits::bytes` (§2), so a
-request raised past that can still fail `Error::Memory`; only a caller
-that builds with `with_budget` or `shared` and sizes that budget gets
-the whole raise. `inline::wrap_text`, which takes no request, keeps
-`Limits::bytes`.
+bytes (the tree's and styled document's, `retained_output_bytes` and
+the new output together, `Layout::page_bytes`) in place of the styled
+document's `Limits::bytes`, fixed when it was cascaded. It is clamped to
+MAX_PAGE_BYTES and may lie above or below the styled document's limit;
+past it the request is refused `Limit("MAX_PAGE_BYTES")`. It bounds the
+conservative admission model (§2), not td-alloc storage. A document
+built by `new` or `with_state` owns a budget sized from its own
+`Limits::bytes` (§2), so a request raised past that can still fail
+`Error::Memory`; only a caller that builds with `with_budget` or
+`shared` and sizes that budget gets the whole raise.
+`inline::wrap_text`, which takes no request, keeps `Limits::bytes`.
 
 **Measured.** Release, the AMD Ryzen 7 5700G host, deterministic metrics
 as above (a monospace advance of 8 px at the 16 px UA size). The 4 MiB
@@ -1133,14 +1163,22 @@ repeats `<p style="top:0;left:0;color:red">a`.
 
 | 4 MiB markup | Nodes | Parse / cascade / layout ms at 1280 | Lines at 1280 / 128 | Charged MiB at 1280 / 128 | Peak MiB at 1280 / 128 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 26-letter paragraphs | 254,203 | 83.5 / 567.1 / 129.7 | 127,100 / 254,201 | 178.8 / 212.8 | 64.4 / 89.9 |
-| 32-letter paragraphs | 215,097 | 76.3 / 507.6 / 128.0 | 107,547 / refused | 160.2 / refused | 58.7 / — |
-| 48-letter paragraphs | 152,523 | 62.2 / 340.5 / 109.2 | 76,260 / refused | 130.5 / refused | 49.6 / — |
-| `style` attributes | 239,678 | 59.7 / 740.2 / 43.9 | 119,837 / 119,837 | 197.2 / 197.2 | 62.3 / 62.3 |
+| 26-letter paragraphs | 254,203 | 83.5 / 567.1 / 129.7 | 127,100 / 254,201 | 152.6 / 186.6 | 64.4 / 89.9 |
+| 32-letter paragraphs | 215,097 | 76.3 / 507.6 / 128.0 | 107,547 / refused | 138.0 / refused | 58.7 / — |
+| 48-letter paragraphs | 152,523 | 62.2 / 340.5 / 109.2 | 76,260 / 305,040 | 114.8 / 216.8 | 49.6 / 126.1 |
+| `style` attributes | 239,678 | 59.7 / 740.2 / 43.9 | 119,837 / 119,837 | 172.6 / 172.6 | 62.3 / 62.3 |
 
 "Refused" is `Limit("MAX_PAGE_BYTES")` on one layout. Twenty-six letters
 are the densest paragraphs MAX_NODES admits at 4 MiB. Of two layouts
-held together, only the 48-letter shape's at 1280 px fit, at 194.1 MiB.
+held together, the 48- and 32-letter shapes' at 1280 px fit, at 178.4
+and 212.1 MiB; the 26-letter shape's would charge 233.2. Charges are
+after §2's split (2026-11-16), which admits two things refused before:
+the 48-letter shape at 128 px, whose tree, styled document and layout
+hold 114.8 MiB of td-alloc storage, and the 32-letter pair, 106.5 MiB.
+At 128 px admission is not monotonic in paragraph length: 26 to 28
+letters fit, 29 to 40 are refused, 41 and 42 fit under the line array's
+68 MiB step, and 43 and more fit. 43 letters charge the most measured,
+222.4 MiB, 168.2 MiB of it the output of 335,544 lines.
 4 MiB of prose or of one word charges 28.5 MiB and lays out in about
 107 ms (2026-11-14, medians of three).
 
@@ -1161,12 +1199,12 @@ for two fragments, 448 for three or four, 864 for five to eight. A
 preserved tab coalesces with the source text around it (§4, "Tab
 stops"), so a line of one text node is one fragment whatever its tabs,
 and a tabbed page costs what an untabbed one of its laid lines does,
-plus its bytes in the styled document's charge (about 1 MiB a tab a
-line at 199,999 lines). Measured on 2026-11-15 with the deterministic
-metrics: one layout's charge in MiB, with its lines where they differ
-from the source's (a page's lines end in a newline, so its last line
-is empty and 199,999 lines lay 200,000), and whether a second layout
-fits beside it (`retained_output_bytes`), else one, or refused
+plus its bytes in the tree's and styled document's charges (about 1
+MiB a tab a line at 199,999 lines). Measured on 2026-11-15 with the
+deterministic metrics: one layout's charge in MiB, with its lines where
+they differ from the source's (a page's lines end in a newline, so its
+last line is empty and 199,999 lines lay 200,000), and whether a second
+layout fits beside it (`retained_output_bytes`), else one, or refused
 (`MAX_PAGE_BYTES`):
 
 | Text page, 0.5 em (8 px) | 1280 px | 320 px | 128 px | 104 px |
@@ -1293,12 +1331,12 @@ line, would have passed it but for that line.
 
 262,144 is the line array's 68 MiB step. A text page within it lays
 at most 262,144 lines at every width, a fragment each at most, so two
-layouts, the old beside the new, charge at most 136 MiB beside a
-styled document of at most 17 MiB for 4 MiB of text, within
-MAX_PAGE_BYTES. Counting in td-web's least viewport, 128 px, and
-laying the kept page at 128 and 1280 px, release, pinned, medians of
-seven counts and of three layouts under a load average of 3 to 4
-(2026-11-15), each count cut at 262,144 laid lines:
+layouts, the old beside the new, charge at most 136 MiB beside a tree
+and styled document of at most 17 MiB measured, within MAX_PAGE_BYTES.
+Counting in td-web's least viewport, 128 px, and laying the kept page at
+128 and 1280 px, release, pinned, medians of seven counts and of three
+layouts under a load average of 3 to 4 (2026-11-15), each count cut at
+262,144 laid lines:
 
 | Text page | Em | Count ms | Kept | Lines at 1280 px | Layout ms at 128 / 1280 px |
 | --- | ---: | ---: | --- | ---: | ---: |

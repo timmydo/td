@@ -1160,7 +1160,7 @@ mod cases {
                 ..Request::new(400.0, 600.0)
             };
             let out = layout(&styled, &mut Metrics, &request).unwrap();
-            (out.charged_bytes - styled.charged_bytes(), out.lines.len())
+            (out.page_bytes - styled.charges().held(), out.lines.len())
         };
         // One cell's 20,000 lines: those below the window are dropped as
         // they are laid, since alignment only moves them down.
@@ -1198,7 +1198,7 @@ mod cases {
             let doc = td_html::document::parse(&html).unwrap();
             let styled = styled(&doc, &html, "");
             let out = layout(&styled, &mut Metrics, &Request::new(400.0, 600.0)).unwrap();
-            (out.charged_bytes - styled.charged_bytes(), out.work)
+            (out.page_bytes - styled.charges().held(), out.work)
         };
         let ((one, work), (deep, _)) = (charged(1), charged(20));
         // Each div measured costs eight units and laid one, besides the

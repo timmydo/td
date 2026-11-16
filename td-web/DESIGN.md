@@ -1091,7 +1091,7 @@ and full work are identical), so a window would cost a whole pass at
 every scroll past it. td-web keeps every line: scrolling is a paint,
 and its memory is the layout's output, which the page's budget counts:
 68.6 MiB for the costliest 2 MiB shape measured, sixteen-letter
-paragraphs, 114.7 MiB for 4 MiB of 26-letter ones at the narrowest
+paragraphs, 168.2 MiB for 4 MiB of 43-letter ones at the narrowest
 pane, and at most 37.8 MiB for a whole corpus page, tree and styles
 included.
 
@@ -1135,7 +1135,16 @@ block::layout_with_budget. The shared styled document owns the immutable
 Document without a self-referential borrow. Its arrays and retained styles
 keep their charges until dropped; the temporary DOM index returns its
 actual admission when construction ends. Outputs retained across resize
-count against their common ancestor automatically.
+count against their common ancestor automatically. Its declared charges
+come by owner (`StyledDocument::charges`, td-layout/DESIGN.md §2): the
+tree's is the document's own, the same in every styled document holding
+it, and taken once; the styled term takes `styled` alone, the input
+among it; td-dom's `index` and construction's `scratch` are admitted
+only while construction runs. A layout's admission starts from tree and
+styled (`held()`), and its `page_bytes` adds any
+`retained_output_bytes` and the output; it sees no other styled
+document, so one sharing the tree, or kept beside it, is the caller's
+to fold into `retained_output_bytes`.
 
 No external reservation covers these owned arrays. Limits::bytes, or a
 layout request's own Request::bytes, and Request::retained_output_bytes
@@ -1148,7 +1157,7 @@ through td-alloc as well. Any refusal follows "Cuts" below.
 |---|---|---:|
 | tree | td-html's owned allocation layouts, including parser scratch and growth overlap | 128 MiB, `MAX_TREE_BYTES`, plus budget metadata |
 | styled | owned input, boxes, CSS pool and td-web tree-order table; excludes independently owned tree and DOM storage | the page's |
-| index | td-dom's owned arrays, only while its index lives | `MAX_INDEX_BYTES`, within the page's |
+| index | td-dom's owned arrays and construction's per-node maps, only during construction | `MAX_INDEX_BYTES` and 80 bytes a node, within the page's |
 | layout | owned geometry, lines, fragments and td-web's indexes over them | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
 | sheets | their text, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB (estimate) |
@@ -1172,12 +1181,13 @@ fit is now. A
 relayout's output is charged beside the one it replaces (td-layout's
 `retained_output_bytes`, set from the old layout's `output_bytes`), or
 the old one is let go first, as "Relayout" decides. Measured
-(td-layout/DESIGN.md §6), a corpus page charges 1.1 to 37.8 MiB in all
-and the costliest 2 MiB shape 134.6 MiB, so any two corpus pages fit
+(td-layout/DESIGN.md §6), a corpus page charges at most 37.8 MiB in all
+and the costliest 2 MiB shape 115.9 MiB, so any two corpus pages fit
 together, and a page is cut down (below, "Cuts") only when the page
 shown leaves it too little or its own layout is past td-layout's
-`MAX_PAGE_BYTES`, which 4 MiB of markup can be (up to 212.8 MiB
-measured at the narrowest pane, denser layouts refused by name).
+`MAX_PAGE_BYTES`, which 4 MiB of markup can be (up to 222.4 MiB
+measured at the narrowest pane, others refused by name, not in order of
+density).
 
 **The jail.** What td-alloc does not hold is a fixed term:
 
@@ -1546,8 +1556,8 @@ count. Why 262,144: a layout's lines are charged in capacity steps
 lines, 136 MiB to 524,288, and refused past that, and a text page's
 line holds one fragment at most, its tabs coalescing with its text. So
 two layouts of a cut page, the old beside the new, charge at most 136
-MiB at every width, beside a styled document of at most 17 MiB
-measured, within the page term, and a relayout never has to let the
+MiB at every width, beside a tree and styled document of at most 17
+MiB measured, within the page term, and a relayout never has to let the
 old one go first; at 262,145 lines one layout would charge 136 MiB and
 two would not fit. Measured in the least viewport with 0.5 and 0.6 em
 monospace faces (td-layout §6), the count takes 44 to 83 ms for a full
@@ -1662,17 +1672,19 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      device-pixel size within a named bound, `OVERHANG` an em at each
      size, and atlas pages for sizes but its own capped at `ATLAS` in
      all, the eldest remade when another is needed.
-   - **td-layout**: a declared-charge split excluding independently
-     owned tree, DOM and CSS storage (above, "Memory"): a styled
-     document's `charged_bytes` still counts its document's own charge
-     and td-dom's index arrays (td-layout/DESIGN.md §2, "Whole-page
-     memory"), which the page budget's tree and index terms already
-     hold. Available: a styled document holding its document by shared
-     ownership (`StyledDocument::shared`), so a page passes between
-     threads, as td-web, which forbids `unsafe`, cannot hold a borrowed
-     one beside its owner; a text page's lines counted at a width
-     through layout's own sizing and breaking, without laying it out,
-     and the page cut where they would pass a cap
+   - **td-layout** (available): a declared-charge split excluding
+     independently owned tree, DOM and CSS storage (above, "Memory";
+     `StyledDocument::charges`, td-layout/DESIGN.md §2, "Whole-page
+     memory"), each charge named by the owner holding it, so the tree
+     term takes the document's once and the styled term none of it or
+     of construction's index and scratch, though the pool's charge
+     conservatively includes strings a computed style shares with its
+     sheets; a styled document holding its
+     document by shared ownership (`StyledDocument::shared`), so a page
+     passes between threads, as td-web, which forbids `unsafe`, cannot
+     hold a borrowed one beside its owner; a text page's lines counted
+     at a width through layout's own sizing and breaking, without laying
+     it out, and the page cut where they would pass a cap
      (`text::fit`, td-layout/DESIGN.md §6, "Text pages"); a basic table
      layout, so a page's tables line up as
      §5's do rather than stacking as blocks: the automatic and fixed

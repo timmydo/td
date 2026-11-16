@@ -152,7 +152,12 @@ pub struct Layout {
     /// Lines cut at Limits::line_scalars, whether retained or not.
     pub cuts: Cuts,
     pub work: usize,
-    pub charged_bytes: usize,
+    /// What this layout admitted: `Charges::held` (tree and styled),
+    /// `retained_output_bytes` and this output (DESIGN.md §2). It sees no
+    /// sibling styled document: one sharing the tree counts it again, and
+    /// a caller holding another folds it into `retained_output_bytes`.
+    pub page_bytes: usize,
+    /// This output's charge alone, what a later request retains.
     pub output_bytes: usize,
 }
 pub fn layout(
@@ -279,7 +284,7 @@ pub fn layout_with_budget(
         line_count: engine.counters.lines,
         cuts: engine.counters.cuts,
         work: engine.counters.work,
-        charged_bytes: engine.counters.bytes,
+        page_bytes: engine.counters.bytes,
         output_bytes: engine.counters.bytes - initial,
     })
 }
@@ -2041,7 +2046,7 @@ mod tests {
                 with.lines.iter().collect::<Vec<_>>(),
                 without.lines.iter().collect::<Vec<_>>()
             );
-            assert_eq!(with.charged_bytes, without.charged_bytes);
+            assert_eq!(with.page_bytes, without.page_bytes);
         }
     }
     #[test]
@@ -2144,8 +2149,8 @@ mod tests {
         window.retained_output_bytes = full.output_bytes;
         let resized = layout(&styled, &mut Metrics, &window).unwrap();
         assert_eq!(
-            resized.charged_bytes,
-            styled.charged_bytes() + full.output_bytes + resized.output_bytes
+            resized.page_bytes,
+            styled.charges().held() + full.output_bytes + resized.output_bytes
         );
         assert!(resized.line_count > full.line_count);
         window.retained_output_bytes = crate::MAX_PAGE_BYTES;
@@ -2167,22 +2172,22 @@ mod tests {
             bytes: Some(bytes),
             ..request.clone()
         };
-        let exact = layout(&styled, &mut Metrics, &at(full.charged_bytes)).unwrap();
-        assert_eq!(exact.charged_bytes, full.charged_bytes);
+        let exact = layout(&styled, &mut Metrics, &at(full.page_bytes)).unwrap();
+        assert_eq!(exact.page_bytes, full.page_bytes);
         assert_eq!(
             exact.lines.iter().collect::<Vec<_>>(),
             full.lines.iter().collect::<Vec<_>>()
         );
         assert!(matches!(
-            layout(&styled, &mut Metrics, &at(full.charged_bytes - 1)),
+            layout(&styled, &mut Metrics, &at(full.page_bytes - 1)),
             Err(Error::Limit("MAX_PAGE_BYTES"))
         ));
         // Output kept from an earlier layout counts against it too.
-        let both = full.charged_bytes + full.output_bytes;
+        let both = full.page_bytes + full.output_bytes;
         let mut kept = at(both);
         kept.retained_output_bytes = full.output_bytes;
         assert_eq!(
-            layout(&styled, &mut Metrics, &kept).unwrap().charged_bytes,
+            layout(&styled, &mut Metrics, &kept).unwrap().page_bytes,
             both
         );
         kept.bytes = Some(both - 1);
@@ -2196,20 +2201,21 @@ mod tests {
             &css,
             html.len(),
             Limits {
-                bytes: styled.charged_bytes(),
+                bytes: styled.charges().construction(),
                 ..Limits::default()
             },
         )
         .unwrap();
+        assert!(full.page_bytes > styled.charges().construction());
         assert!(matches!(
             layout(&tight, &mut Metrics, &request),
             Err(Error::Limit("MAX_PAGE_BYTES"))
         ));
-        let raised = layout(&tight, &mut Metrics, &at(full.charged_bytes)).unwrap();
-        assert_eq!(raised.charged_bytes, full.charged_bytes);
+        let raised = layout(&tight, &mut Metrics, &at(full.page_bytes)).unwrap();
+        assert_eq!(raised.page_bytes, full.page_bytes);
         // Clamped to MAX_PAGE_BYTES.
         let mut beyond = at(usize::MAX);
-        beyond.retained_output_bytes = crate::MAX_PAGE_BYTES - styled.charged_bytes() + 1;
+        beyond.retained_output_bytes = crate::MAX_PAGE_BYTES - styled.charges().held() + 1;
         assert!(matches!(
             layout(&styled, &mut Metrics, &beyond),
             Err(Error::Limit("MAX_PAGE_BYTES"))

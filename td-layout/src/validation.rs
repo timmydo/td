@@ -41,8 +41,8 @@ mod tests {
             for width in [1280.0, 832.0] {
                 let mut request = Request::new(width, 720.0);
                 let full = layout(&styled, &mut Metrics, &request).unwrap();
-                assert!(full.charged_bytes <= MAX_PAGE_BYTES);
-                assert!(full.charged_bytes + WORKING_BYTES <= 288 * 1024 * 1024);
+                assert!(full.page_bytes <= MAX_PAGE_BYTES);
+                assert!(full.page_bytes + WORKING_BYTES <= 288 * 1024 * 1024);
                 assert!(full.line_count > 10_000);
                 let mut last = None;
                 for line in &full.lines {
@@ -102,7 +102,7 @@ mod tests {
             let out = result.unwrap();
             assert_eq!(out.markers.len(), count);
             assert!(out.lines.is_empty());
-            assert!(out.charged_bytes <= MAX_PAGE_BYTES);
+            assert!(out.page_bytes <= MAX_PAGE_BYTES);
             assert!(out.work < crate::MAX_LAYOUT_WORK / 16);
             let last = out.markers.last().unwrap();
             assert_eq!(last.ordinal, count as i32 - 4);
@@ -145,7 +145,7 @@ mod tests {
         let full = layout(&styled, &mut Metrics, &Request::new(1280.0, 720.0)).unwrap();
         assert_eq!(full.line_count, source.matches('\n').count() + 1);
         assert_eq!(full.lines.len(), full.line_count);
-        assert!(full.charged_bytes <= MAX_PAGE_BYTES);
+        assert!(full.page_bytes <= MAX_PAGE_BYTES);
         let last = full.lines.last().unwrap().fragments.last().unwrap();
         assert_eq!(last.range.end, source.len());
     }
@@ -305,7 +305,7 @@ mod tests {
         let second = Request::new(832.0, 720.0);
         let full = layout(&styled, &mut Metrics, &first).unwrap();
         let resized = layout(&styled, &mut Metrics, &second).unwrap();
-        let budget = full.charged_bytes.max(resized.charged_bytes);
+        let budget = full.page_bytes.max(resized.page_bytes);
         drop((styled, full, resized));
         let limited = StyledDocument::new(
             &doc,
@@ -327,7 +327,7 @@ mod tests {
         drop(old);
         let resized = layout(&limited, &mut Metrics, &second).unwrap();
         assert_eq!(resized.line_count, 256);
-        assert!(resized.charged_bytes <= budget);
+        assert!(resized.page_bytes <= budget);
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
         assert!(styled.style_count() <= 5);
         let output = layout(&styled, &mut Metrics, &Request::new(390.0, 844.0)).unwrap();
         assert_eq!(output.line_count, 512);
-        assert!(output.charged_bytes < 2 * 1024 * 1024);
+        assert!(output.page_bytes < 2 * 1024 * 1024);
     }
 
     #[test]

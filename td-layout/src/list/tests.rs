@@ -696,7 +696,7 @@ mod cases {
         let marked = styled(&doc, &html, "");
         let plain = styled(&doc, &html, "li{list-style-type:none}");
         // The ordinals cost the styled document the same either way.
-        assert_eq!(marked.charged_bytes(), plain.charged_bytes());
+        assert_eq!(marked.charges(), plain.charges());
         let with = layout(&marked, &mut Metrics, &Request::new(400.0, 600.0)).unwrap();
         let without = layout(&plain, &mut Metrics, &Request::new(400.0, 600.0)).unwrap();
         // Each scalar of "1. " … "100. " measured, and each marker placed.
@@ -718,13 +718,14 @@ mod cases {
         let none = td_html::document::parse("<p>x").unwrap();
         let base = StyledDocument::new(&none, &sheets(""), 4, Limits::default())
             .unwrap()
-            .charged_bytes();
+            .charges()
+            .styled;
         let list = td_html::document::parse("<p>x<ol><li></ol>").unwrap();
         let one = StyledDocument::new(&list, &sheets(""), 4, Limits::default()).unwrap();
-        assert!(one.charged_bytes() > base);
+        assert!(one.charges().styled > base);
         for (bytes, ok) in [
-            (one.charged_bytes(), true),
-            (one.charged_bytes() - 1, false),
+            (one.charges().construction(), true),
+            (one.charges().construction() - 1, false),
         ] {
             let result = StyledDocument::new(
                 &list,
