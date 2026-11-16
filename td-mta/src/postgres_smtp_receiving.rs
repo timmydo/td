@@ -50,6 +50,8 @@ impl Pending {
     }
     /// Historical inspection only, using independent settlement capacity.
     /// Absence and errors leave the original operation fenced and retained.
+    /// Receipts last one minute (POSTGRES.md section 46): a production caller
+    /// must settle within it or keep the operation fenced.
     pub fn settle(
         &self,
         loaded: &Loaded,

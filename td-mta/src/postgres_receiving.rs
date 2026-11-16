@@ -26,7 +26,14 @@ pub use fanout::{
 pub use input::Message;
 pub const MAX_RECEIPTS: i64 = 16_384;
 /// Every inspection or retry of an operation ends within this, then it expires.
-pub const RECEIPT_RETENTION_MS: i64 = 3_600_000;
+/// Six publication phase deadlines: operations are random per delivery, so a
+/// receipt never dedupes a sender's retry, and a short window keeps a flood
+/// from refusing an account's mail beyond MAX_RECEIPTS per minute.
+pub const RECEIPT_RETENTION_MS: i64 = 60_000;
+const _: () = assert!(
+    RECEIPT_RETENTION_MS > 0
+        && RECEIPT_RETENTION_MS as u128 >= 6 * crate::postgres_probe::MAX_DURATION.as_millis()
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

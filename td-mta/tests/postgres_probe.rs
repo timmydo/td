@@ -10199,6 +10199,12 @@ fn exercise_receiving(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE email_id=decode('{}','hex')",bulk_outcome.email)),"1000");
     assert_eq!(sql(fixture,&format!("SELECT sum(octet_length(bytes)) FROM td_mta.blob_chunks WHERE blob_id=decode('{}','hex')",bulk_outcome.blob)),bulk_outcome.length.to_string());
     // Crossing the former lifetime cap must still publish a fresh delivery.
+    // Restamp earlier receipts so time spent in the earlier sections cannot
+    // expire them while this one runs.
+    sql(
+        fixture,
+        "UPDATE td_mta.receiving_receipts SET created_at=(extract(epoch FROM clock_timestamp())*1000)::bigint",
+    );
     sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
     let capacity =
         td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
@@ -10251,7 +10257,7 @@ fn exercise_receiving(
         fixture,
         "DELETE FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
     );
-    sql(fixture,&format!("INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,{}) n",receiving::MAX_RECEIPTS));
+    sql(fixture,&format!("INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,(extract(epoch FROM clock_timestamp())*1000)::bigint,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,{}) n",receiving::MAX_RECEIPTS));
     assert_eq!(
         receiving::publish(request, trust, deadline(), &fresh),
         Err(receiving::Error::Capacity)
@@ -10260,12 +10266,14 @@ fn exercise_receiving(
         receiving::inspect(request, trust, deadline(), &fresh).unwrap(),
         None
     );
-    // A full ledger is not a lifetime cap: receipts past retention expire.
-    sql(fixture,&format!("UPDATE td_mta.receiving_receipts SET created_at=created_at-{}-1 WHERE request_digest=decode(repeat('00',32),'hex')",receiving::RECEIPT_RETENTION_MS));
+    // A full ledger is no lockout: receipts past a one-minute retention expire,
+    // so a flood refuses an account's mail for at most a minute. Literals, so a
+    // longer retention fails here; the boundary receipt is 30 seconds old.
+    sql(fixture,"UPDATE td_mta.receiving_receipts SET created_at=created_at-61000 WHERE request_digest=decode(repeat('00',32),'hex')");
     // Expiry is scoped to the publishing account and stops at retention.
     sql(fixture,"INSERT INTO td_mta.accounts VALUES(decode(lpad(to_hex(2001),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES(decode(lpad(to_hex(2001),32,'0'),'hex'),0,0,0,0,0)");
     sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT decode(lpad(to_hex(2001),32,'0'),'hex'),operation,decode(repeat('22',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 1");
-    sql(fixture,&format!("INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(1),32,'1'),'hex'),decode(repeat('11',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,(extract(epoch FROM clock_timestamp())*1000)::bigint-{}+60000,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 1",receiving::RECEIPT_RETENTION_MS));
+    sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(1),32,'1'),'hex'),decode(repeat('11',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,(extract(epoch FROM clock_timestamp())*1000)::bigint-30000,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 1");
     let after_expiry = receiving::publish(request, trust, deadline(), &fresh).unwrap();
     assert_eq!(
         sql(

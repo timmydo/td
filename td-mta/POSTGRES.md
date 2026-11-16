@@ -1964,29 +1964,46 @@ recipients, one unread/unstarred Email, membership, anchor, history, shared
 quota effects and the operation receipt in one synchronous transaction.
 Each delivery advances account state once; repeated envelope recipients still
 produce one Email. Body and blob quotas are charged once. Receipts survive
-deletion of the delivered Email and are kept for at least one hour, measured
+deletion of the delivered Email and are kept for at least one minute, measured
 by the database clock that stamped them. Each publication samples that clock
 once, stamps its receipt with it and, under its account write lock, first
-deletes only that account's receipts older than one hour before the sample.
-It then refuses with Capacity only while 16,384 younger receipts remain, so a
-full ledger is an hour-long flood bound, never a lifetime one. An idle
-account keeps expired receipts until its next publication; capacity
-inspection counts only unexpired ones. Receipts stamped while the clock ran
-ahead expire once it catches up. No operator procedure is needed for receipts
-left by an older binary.
+deletes only that account's receipts older than one minute before the sample.
+It then refuses with Capacity only while 16,384 younger receipts remain.
+
+Retention is short so the ledger cannot be used to deny service. Receiving
+admission bounds concurrent sessions and per-peer DATA jobs, not message
+rate, so any sender can drive an account's receipt count; a full ledger may
+refuse that account's mail only while more than 16,384 deliveries arrive
+within one minute, and for at most a minute after they stop. That rate is at
+or beyond what the single publication worker sustains for every account, so
+the ledger is not the binding ingest limit; body and blob quotas remain an
+account's real exposure to flooding. A minute is six publication phase
+deadlines (ten seconds each), and an operation identity is random per
+prepared delivery, so a receipt never dedupes a sender's retry; only
+in-process settlement of that one delivery needs it. An idle account keeps
+expired receipts until its next publication; capacity inspection counts only
+unexpired ones. Receipts stamped while the clock ran ahead expire once it
+catches up. No operator procedure is needed for receipts left by an older
+binary.
 
 Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
 account publisher and uses the retained operation/digest; known success stays
 success after policy replacement. This is internal delivery recovery, not
 cross-session SMTP deduplication. Every inspection, settlement or retry of an
-operation, in process or after restart, must finish within one hour of its
+operation, in process or after restart, must finish within one minute of its
 publication attempt. Today publish inspects and writes within its own
-deadline, an indeterminate commit stops the receiving service, and no
-durable custody carries an operation across restart; later in-process
-settlement or restart custody must keep the same bound. After expiry an
-operation is not replayable: a single delivery inspects as absent and a
+ten-second deadline, an indeterminate commit stops the receiving service, and
+no durable custody carries an operation across restart; later in-process
+settlement or restart custody must keep the same bound, so settlement after
+a database outage or failover longer than a minute cannot rely on the receipt
+and must keep the operation fenced instead. A database clock stepped forward
+by more than a minute during a publication can expire its receipt early;
+that only turns a replay into the refusals below, never into a second
+delivery. Once the account's next publication has swept an expired receipt,
+the operation is not replayable: a single delivery inspects as absent and a
 republication refuses with Conflict on its retained Email identity, while a
-fanout may inspect as Integrity because each account expires lazily.
+fanout may inspect as Integrity because each account expires lazily. A
+database clock stepped backward lengthens a flood refusal by the step.
 Runtime connection/gateway authorization, ingress reservations and
 activation remain runtime integration work.
 
