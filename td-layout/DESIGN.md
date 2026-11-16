@@ -216,6 +216,18 @@ place within this document, rather than a fragile wrapped-line number.
 Reparsing creates new identities; cross-navigation place restoration is a
 consumer policy. Layout does not implement td-web's selection or history.
 
+Each Line names the block container whose inline content laid it
+(`Line::block`, a `BoxId`; `BoxId::index` is its place in
+`StyledDocument::boxes`) and how it ended (`Line::end`, a `LineEnd`,
+§4, "Line ends"). A table cell's lines name the cell, a caption's the
+caption, an anonymous cell's the box holding its run (§5, "Anonymous
+objects"). Every `block::layout` line names a block, td-css
+blockifying the root; `inline::wrap_text`'s lines name none. Both ride
+in four bytes (`LineTag`) in the tag word of the line's
+replaced-fragment storage, which its alignment left unused, so a Line
+stays 136 bytes and §6's charge steps are unchanged. A windowed
+layout's lines carry them as the whole layout's do.
+
 Geometry uses CSS pixels with subpixel precision and finite checked bounds.
 There is no per-glyph retained page array. `inline::replay` replays a
 text fragment's scalars through the layout's metrics and white-space
@@ -300,21 +312,20 @@ A preserved tab is shown as itself, `DisplayText::Source`, and coalesces
 with the source text around it in one fragment, so `name\tvalue\tthird`
 in one text node is one fragment whatever its tabs, and a copy of the
 fragment's bytes keeps them. A fragment keeps no pen of its line, so
-`inline::replay`, given the style of the block that laid the line (the
-nearest `BoxKind::Block` box enclosing the fragment's line, or the
-first box at the top; with another style a mixed-size fragment can be
-refused), recovers its tabs from its width: the first tab takes what the other
-scalars leave, which ends on a stop, and each later tab meets the next
-stop from there. Each replayed scalar, a tab included, names its own
-byte range, so a point over a tab maps to the tab's byte. Replay must
-be given the layout's metrics. It refuses (`Invalid`) a fragment whose
-advances cannot sum to its width, or whose first tab would advance
-nothing or more than an interval; within that, metrics that differ
-from the layout's are not detected for a fragment with a tab, whose
-first tab absorbs the difference. A tabbed fragment is checked before
-any scalar is reported, an untabbed one only at its end, after its
-scalars were: a caller that must not act on a refused fragment gathers
-them first.
+`inline::replay`, given the style of the block that laid the line
+(`Line::block`'s, or the first box's where it names none; with another
+style a mixed-size fragment can be refused), recovers its tabs from its
+width: the first tab takes what the other scalars leave, which ends on a
+stop, and each later tab meets the next stop from there. Each replayed
+scalar, a tab included, names its own byte range, so a point over a tab
+maps to the tab's byte. Replay must be given the layout's metrics. It
+refuses (`Invalid`) a fragment whose advances cannot sum to its width,
+or whose first tab would advance nothing or more than an interval;
+within that, metrics that differ from the layout's are not detected for
+a fragment with a tab, whose first tab absorbs the difference. A tabbed
+fragment is checked before any scalar is reported, an untabbed one only
+at its end, after its scalars were: a caller that must not act on a
+refused fragment gathers them first.
 
 **Long lines.** `Limits::line_scalars` (`MAX_LINE_SCALARS`, clamped to
 at least 1) bounds the scalars, replaced elements and inside list
@@ -358,6 +369,24 @@ an unbounded layout's only where a line holds more items than
 `line_scalars` before its last wrap opportunity or the pane's width,
 which needs a run of that many spaces, or of items that do not wrap,
 or advances near zero.
+
+**Line ends.** `Line::end` says how a line ended: `Wrap` where a
+break may fall, at a space (laid, trimmed from the line's end, or
+dropped past a cut) or at an image's or inside marker's edge; `Split`
+between two scalars of a word with nothing between them, where its
+content wraps anywhere (or reaches `line_scalars`), the next line
+continuing the word; `Newline` at a preserved newline, CR LF or CR as
+one; `Break` at a `br`; `End` where its inline sequence ends, at its
+block's end or a block box inside it. A `Wrap` does not promise a
+space: the white space laid between its line and the next may be none
+(an edge), one, or several (pre-wrap), and a consumer copies it as
+laid, past a cut only what layout dropped as space. A last `br` or
+preserved newline leaves an empty line after it, ended `End`. A
+consumer reads paragraphs, copy separators and selection moves from
+these and `Line::block` rather than from gaps between lines: in a
+whole layout a paragraph is a run of lines ended by one that ends
+`Newline`, `Break` or `End` (a window can leave two runs' lines
+adjacent).
 
 `inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
 StyleId for the line strut, which also sets the tab interval. It returns
@@ -1100,6 +1129,14 @@ block shape that refuses overlapping output under a lowered page budget,
 and repeated global custom properties shared by differently colored
 siblings. Timing and RSS are deliberately not assertions in the gate.
 
+Naming each line's block and end (§4, "Line ends") costs a full layout
+little: interleaved with the build before it, pinned to one CPU under a
+load average of 4 to 6, medians of seven processes of nine layouts
+(2026-11-16), 2 MiB each: prose 50.8 ms before and 51.1 after, one
+word 49.1 and 50.0, 46-byte text-page lines at 128 px 82.0 and 83.2,
+`ab <img width=20 height=10>` 23.0 and 24.0, and blocks, a block and a
+line each, 71.1 and 74.8 (5%).
+
 ### Caller-set limits
 
 Each `Limits` field defaults to its constant above and is clamped to it,
@@ -1633,13 +1670,14 @@ Intrinsic sizes for replaced elements supplied by the caller, a change
 needing a layout and no cascade, are §5's "Intrinsic sizes". The input
 limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
-are §6's "Caller-set limits"; eight-column tab stops where white space
-is preserved, a tab costing no fragment, and a line past
+are §6's "Caller-set limits"; each line's block and end (`Line::block`,
+`Line::end`) are §3's and §4's "Line ends"; eight-column tab stops where
+white space is preserved, a tab costing no fragment, and a line past
 MAX_LINE_SCALARS cut and marked, or broken where it wraps, rather than
-refused, are §4's "Tab stops" and "Long lines". A tabbed text page
-costs what an untabbed one of its laid lines does. Counting a text
-page's lines in a viewport through layout's own sizing and breaking
-without laying it out, and cutting it where the count, its dropped
-indents included, would pass a cap, within the source line that passes
-it, so the page td-web cuts at its least width fits two layouts at
-every width, is §6's "Text pages" (`text::fit`).
+refused, are §4's "Tab stops" and "Long lines". A tabbed text page costs
+what an untabbed one of its laid lines does. Counting a text page's
+lines in a viewport through layout's own sizing and breaking without
+laying it out, and cutting it where the count, its dropped indents
+included, would pass a cap, within the source line that passes it, so
+the page td-web cuts at its least width fits two layouts at every width,
+is §6's "Text pages" (`text::fit`).

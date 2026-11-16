@@ -1,7 +1,7 @@
 //! Normal-flow geometry and windowed line retention.
 use crate::inline::{
-    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineSink, Marker,
-    Pending, TextRun,
+    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineEnd, LineSink,
+    Marker, Pending, TextRun,
 };
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
@@ -14,6 +14,8 @@ use td_css::values::Length;
 use td_css::{ComputedStyle, ComputedValue, Property};
 use td_html::document::NodeId;
 
+#[cfg(test)]
+mod ends;
 mod intrinsic;
 mod table;
 
@@ -263,6 +265,7 @@ pub fn layout_with_budget(
                 definite: Some(request.height),
                 offset: (0.0, 0.0),
                 strut,
+                block: None,
             },
             0,
             None,
@@ -585,6 +588,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             definite,
             offset,
             strut,
+            block,
         } = *place;
         let run_y = run.y + run.previous_margin.unwrap_or(0.0);
         let before = self.counters.lines;
@@ -614,7 +618,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             run_y,
             self.memory,
             &mut self.pending,
-        )?;
+        )?
+        .naming(block);
         if let Some(marker) = marker {
             flow.marker(&marker, &mut self.counters, &mut sink)?;
         }
@@ -642,7 +647,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         &mut sink,
                     )?;
                 }
-                BoxKind::Break => flow.hard_break(b.style, &mut self.counters, &mut sink)?,
+                BoxKind::Break => {
+                    flow.hard_break(b.style, LineEnd::Break, &mut self.counters, &mut sink)?
+                }
                 BoxKind::Image => {
                     let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
                     let dims = dimensions(
@@ -781,6 +788,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     definite: dims.height,
                     offset,
                     strut: b.style,
+                    block: Some(id),
                 },
                 depth,
                 inside,
@@ -853,13 +861,15 @@ struct Run {
     y: f64,
     previous_margin: Option<f64>,
 }
-/// A block's content: its box, definite height, offset and strut.
+/// A block's content: its box, definite height, offset and strut, and
+/// the block its lines name.
 #[derive(Clone, Copy)]
 struct Place {
     container: Rect,
     definite: Option<f64>,
     offset: (f64, f64),
     strut: StyleId,
+    block: Option<BoxId>,
 }
 /// Whether a non-empty window meets the span from `y`, `height` tall.
 fn meets(window: &Range<f64>, y: f64, height: f64) -> bool {

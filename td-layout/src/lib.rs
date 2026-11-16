@@ -213,6 +213,12 @@ impl CascadeWork {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxId(usize);
+impl BoxId {
+    /// Its position in `StyledDocument::boxes`.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoxKind {
     Block,

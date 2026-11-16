@@ -1,7 +1,8 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
-    cancelled, keyword, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL, MAX_COORDINATE,
+    cancelled, keyword, BoxId, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL,
+    MAX_COORDINATE,
 };
 use std::mem::size_of;
 use std::ops::Range;
@@ -56,20 +57,25 @@ pub struct ReplacedFragment {
     pub height: f64,
 }
 /// A single fragment lives in its line; longer runs own budgeted storage.
-pub struct Fragments<T>(FragmentStorage<T>);
+/// `M` rides in the storage's own tag word (a line's `LineTag`), so it
+/// costs no bytes there.
+pub struct Fragments<T, M = ()>(FragmentStorage<T, M>);
 #[derive(Debug)]
-enum FragmentStorage<T> {
-    One(Option<T>),
-    Many(BudgetVec<T>),
+enum FragmentStorage<T, M> {
+    One(Option<T>, M),
+    Many(BudgetVec<T>, M),
 }
-impl<T> Fragments<T> {
-    fn new() -> Self {
-        Self(FragmentStorage::One(None))
+impl<T, M: Copy> Fragments<T, M> {
+    fn with(meta: M) -> Self {
+        Self(FragmentStorage::One(None, meta))
+    }
+    fn meta(&self) -> M {
+        *self.0.tag()
     }
     fn add(&mut self, value: T, memory: &Budget, counters: &mut Counters) -> Result<(), Error> {
         match &mut self.0 {
-            FragmentStorage::One(first) if first.is_none() => *first = Some(value),
-            FragmentStorage::One(first) => {
+            FragmentStorage::One(first, _) if first.is_none() => *first = Some(value),
+            FragmentStorage::One(first, meta) => {
                 let mut values = BudgetVec::new(memory)?;
                 // Reserve both before moving the first fragment out.
                 counters.charge(
@@ -82,9 +88,9 @@ impl<T> Fragments<T> {
                 BudgetVec::try_reserve_exact(&mut values, 2)?;
                 values.try_push(first.take().ok_or(Error::Invalid)?)?;
                 values.try_push(value)?;
-                self.0 = FragmentStorage::Many(values);
+                self.0 = FragmentStorage::Many(values, *meta);
             }
-            FragmentStorage::Many(values) => {
+            FragmentStorage::Many(values, _) => {
                 counters.admit_growth(values)?;
                 values.try_push(value)?;
             }
@@ -92,41 +98,51 @@ impl<T> Fragments<T> {
         Ok(())
     }
 }
-impl<T> std::ops::Deref for Fragments<T> {
+impl<T, M> std::ops::Deref for Fragments<T, M> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         match &self.0 {
-            FragmentStorage::One(value) => value.as_slice(),
-            FragmentStorage::Many(values) => values,
+            FragmentStorage::One(value, _) => value.as_slice(),
+            FragmentStorage::Many(values, _) => values,
         }
     }
 }
-impl<T> std::ops::DerefMut for Fragments<T> {
+impl<T, M> std::ops::DerefMut for Fragments<T, M> {
     fn deref_mut(&mut self) -> &mut [T] {
         match &mut self.0 {
-            FragmentStorage::One(value) => value.as_mut_slice(),
-            FragmentStorage::Many(values) => values,
+            FragmentStorage::One(value, _) => value.as_mut_slice(),
+            FragmentStorage::Many(values, _) => values,
         }
     }
 }
-impl<T: std::fmt::Debug> std::fmt::Debug for Fragments<T> {
+impl<T: std::fmt::Debug, M: std::fmt::Debug> std::fmt::Debug for Fragments<T, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (**self).fmt(f)
+        f.debug_struct("Fragments")
+            .field("items", &&**self)
+            .field("tag", self.0.tag())
+            .finish()
     }
 }
-impl<T: PartialEq> PartialEq for Fragments<T> {
+impl<T, M> FragmentStorage<T, M> {
+    fn tag(&self) -> &M {
+        match self {
+            Self::One(_, meta) | Self::Many(_, meta) => meta,
+        }
+    }
+}
+impl<T: PartialEq, M: PartialEq> PartialEq for Fragments<T, M> {
     fn eq(&self, other: &Self) -> bool {
-        **self == **other
+        **self == **other && self.0.tag() == other.0.tag()
     }
 }
-impl<'a, T> IntoIterator for &'a Fragments<T> {
+impl<'a, T, M> IntoIterator for &'a Fragments<T, M> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
-impl<'a, T> IntoIterator for &'a mut Fragments<T> {
+impl<'a, T, M> IntoIterator for &'a mut Fragments<T, M> {
     type Item = &'a mut T;
     type IntoIter = std::slice::IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
@@ -141,7 +157,73 @@ pub struct Line {
     /// Content advance; negative replaced-element margins can make it signed.
     pub width: f64,
     pub fragments: Fragments<TextFragment>,
-    pub replaced: Fragments<ReplacedFragment>,
+    /// Its replaced fragments, and its block and end (`Line::block`,
+    /// `Line::end`) in their storage's tag word.
+    pub replaced: Fragments<ReplacedFragment, LineTag>,
+}
+impl Line {
+    /// The block container whose inline content laid it: a table cell's
+    /// lines name the cell, an anonymous cell's the box holding its run.
+    /// Every `block::layout` line names one (td-css blockifies the root);
+    /// `wrap_text`'s lines name none.
+    pub fn block(&self) -> Option<BoxId> {
+        self.replaced.meta().block()
+    }
+    /// How it ended; within a whole layout, a paragraph's last line ends
+    /// `Newline`, `Break` or `End` (DESIGN.md §4, "Line ends").
+    pub fn end(&self) -> LineEnd {
+        self.replaced.meta().end()
+    }
+}
+/// How a line ended (DESIGN.md §4, "Line ends").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LineEnd {
+    /// Wrapped where a break may fall: at a space, laid, trimmed or
+    /// dropped past a cut, or at an image's or inside marker's edge. The
+    /// source between the two lines, which may hold no space, is what a
+    /// copy puts there.
+    Wrap,
+    /// Wrapped between two scalars of a word with nothing between them:
+    /// the next line's text continues it.
+    Split,
+    /// A preserved newline in the text, CR LF or CR as one.
+    Newline,
+    /// A `br`.
+    Break,
+    /// The inline content ended: its block's end, or a block box in it.
+    End,
+}
+/// A line's block and end, packed into four bytes: the end in the low
+/// four bits, the block's index plus one (0 for none) above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineTag(u32);
+// Every box's index fits the tag's 28 bits.
+const _: () = assert!(crate::MAX_BOXES < 1 << 28);
+impl LineTag {
+    fn new(block: Option<BoxId>, end: LineEnd) -> Result<Self, Error> {
+        let index = match block {
+            Some(id) => u32::try_from(id.index())
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .filter(|n| *n < 1 << 28)
+                .ok_or(Error::Invalid)?,
+            None => 0,
+        };
+        Ok(Self((index << 4) | u32::from(end as u8)))
+    }
+    fn block(self) -> Option<BoxId> {
+        (self.0 >> 4).checked_sub(1).map(|n| BoxId(n as usize))
+    }
+    fn end(self) -> LineEnd {
+        match self.0 & 15 {
+            0 => LineEnd::Wrap,
+            1 => LineEnd::Split,
+            2 => LineEnd::Newline,
+            3 => LineEnd::Break,
+            _ => LineEnd::End,
+        }
+    }
 }
 pub struct WrappedText {
     pub lines: BudgetVec<Line>,
@@ -445,8 +527,12 @@ pub(crate) struct Flow<'s, 'd, 'm, M> {
     cut_counted: bool,
     /// While cut: a wrap opportunity was dropped since the last non-space.
     cut_opportunity: bool,
+    /// While cut: the last item dropped was a space, wrapping or not.
+    cut_space: bool,
     /// The block's style, whose space sets the tab interval, found once.
     strut: StyleId,
+    /// The block its lines name.
+    block: Option<BoxId>,
     stops: Option<i64>,
     above: i64,
     below: i64,
@@ -482,12 +568,19 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             cut: None,
             cut_counted: false,
             cut_opportunity: false,
+            cut_space: false,
             strut,
+            block: None,
             stops: None,
             above,
             below,
             y,
         })
+    }
+    /// Its lines name `block`; without, none.
+    pub fn naming(mut self, block: Option<BoxId>) -> Self {
+        self.block = block;
+        self
     }
     pub fn text(
         &mut self,
@@ -514,7 +607,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             }
             self.previous_cr = scalar == '\r' && newline;
             if newline && matches!(scalar, '\n' | '\r') {
-                self.hard_break(run.style, counters, sink)?;
+                self.hard_break(run.style, LineEnd::Newline, counters, sink)?;
                 self.previous_cr = scalar == '\r';
                 continue;
             }
@@ -582,7 +675,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             && !self.pending.is_empty()
         {
             if self.pending.iter().any(|p| !p.space) {
-                self.emit(counters, sink, None)?;
+                self.emit(counters, sink, None, LineEnd::Wrap)?;
             }
             self.restart();
         }
@@ -655,6 +748,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     pub fn hard_break(
         &mut self,
         style: StyleId,
+        end: LineEnd,
         counters: &mut Counters,
         sink: &mut impl LineSink,
     ) -> Result<(), Error> {
@@ -662,7 +756,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.metrics,
             self.styled.style(style).ok_or(Error::Invalid)?,
         )?;
-        self.emit(counters, sink, Some(metrics))?;
+        self.emit(counters, sink, Some(metrics), end)?;
         self.restart();
         self.last_space = true;
         self.after_newline = true;
@@ -683,10 +777,15 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             && !self.pending.is_empty()
             && (soft || self.after_space.is_some())
         {
-            let keep = self.after_space.unwrap_or(self.pending.len());
-            self.break_at(keep, counters, sink)?;
+            // At a space, or, wrapping anywhere, before the item.
+            let (keep, end) = match self.after_space {
+                Some(keep) => (keep, LineEnd::Wrap),
+                None => (self.pending.len(), self.soft_end(&item)),
+            };
+            self.break_at(keep, end, counters, sink)?;
             if soft && over(self.pen) && !self.pending.is_empty() {
-                self.emit(counters, sink, None)?;
+                let end = self.soft_end(&item);
+                self.emit(counters, sink, None, end)?;
                 self.restart();
             }
         }
@@ -717,7 +816,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         sink: &mut impl LineSink,
     ) -> Result<(), Error> {
         if !self.pending.is_empty() || self.after_newline {
-            self.emit(counters, sink, None)?;
+            self.emit(counters, sink, None, LineEnd::End)?;
         }
         self.restart();
         self.after_newline = false;
@@ -739,7 +838,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             // nothing: before a non-space, or before a space past it.
             if let Some(keep) = self.after_space.filter(|k| (1..=len).contains(k)) {
                 if keep < len || !item.space {
-                    self.break_at(keep, counters, sink)?;
+                    self.break_at(keep, LineEnd::Wrap, counters, sink)?;
                     return Ok(true);
                 }
             }
@@ -747,8 +846,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         if !self.drops(item.space, soft) {
             // A wrap opportunity ends a cut line, or breaks a full one as a
             // word wider than the line is split.
+            let end = self.soft_end(item);
             if self.pending.iter().any(|p| !p.space) {
-                self.emit(counters, sink, None)?;
+                self.emit(counters, sink, None, end)?;
             }
             self.restart();
             return Ok(true);
@@ -760,6 +860,17 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     /// a non-space ends it where it or a dropped space can wrap.
     fn drops(&self, space: bool, soft: bool) -> bool {
         space || !self.opportunity(soft)
+    }
+    /// A soft break before `next`, a non-space: inside a word unless it is
+    /// atomic or a space, laid or dropped, comes before it. `emit_prefix`
+    /// makes a Split that trims trailing spaces, or follows an atomic, a
+    /// Wrap.
+    fn soft_end(&self, next: &Pending) -> LineEnd {
+        if next.atomic.is_some() || self.opportunity(false) || self.cut_space {
+            LineEnd::Wrap
+        } else {
+            LineEnd::Split
+        }
     }
     /// A break may come before the next item: it wraps itself, or a space
     /// before it, laid or dropped, does.
@@ -781,6 +892,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         counters: &mut Counters,
     ) -> Result<(), Error> {
         self.cut_opportunity = space && self.opportunity(soft);
+        self.cut_space = space;
         let place = self.cut.unwrap_or(Cut { node, offset });
         self.cut = Some(place);
         if !space && !self.cut_counted {
@@ -796,6 +908,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     fn break_at(
         &mut self,
         keep: usize,
+        end: LineEnd,
         counters: &mut Counters,
         sink: &mut impl LineSink,
     ) -> Result<(), Error> {
@@ -808,7 +921,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             .iter()
             .any(|p| !p.space)
         {
-            self.emit_prefix(counters, sink, None, keep)?;
+            self.emit_prefix(counters, sink, None, keep, end)?;
         } else if keep > 0 {
             counters.indents = counters.indents.saturating_add(1);
         }
@@ -851,14 +964,16 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         self.cut = None;
         self.cut_counted = false;
         self.cut_opportunity = false;
+        self.cut_space = false;
     }
     fn emit(
         &mut self,
         counters: &mut Counters,
         sink: &mut impl LineSink,
         extra: Option<(i64, i64)>,
+        end: LineEnd,
     ) -> Result<(), Error> {
-        self.emit_prefix(counters, sink, extra, self.pending.len())
+        self.emit_prefix(counters, sink, extra, self.pending.len(), end)
     }
     fn emit_prefix(
         &mut self,
@@ -866,6 +981,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         sink: &mut impl LineSink,
         extra: Option<(i64, i64)>,
         count: usize,
+        line_end: LineEnd,
     ) -> Result<(), Error> {
         let prefix = self.pending.get(..count).ok_or(Error::Invalid)?;
         counters.step(prefix.len())?;
@@ -875,6 +991,14 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         counters.lines += 1;
         let end = prefix.iter().rposition(|p| !p.space).map_or(0, |i| i + 1);
         let pending = self.pending.get(..end).ok_or(Error::Invalid)?;
+        // A space trimmed, or an atomic's edge, is no split word.
+        let line_end = if line_end == LineEnd::Split
+            && (end < count || pending.last().is_some_and(|p| p.atomic.is_some()))
+        {
+            LineEnd::Wrap
+        } else {
+            line_end
+        };
         let (above, below) = extra.map_or((self.above, self.below), |(above, below)| {
             (self.above.max(above), self.below.max(below))
         });
@@ -929,8 +1053,8 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         }
         sink.measure(bounds, counters)?;
         if sink.wants(self.y, height) {
-            let mut fragments: Fragments<TextFragment> = Fragments::new();
-            let mut replaced = Fragments::new();
+            let mut fragments: Fragments<TextFragment> = Fragments::with(());
+            let mut replaced = Fragments::with(LineTag::new(self.block, line_end)?);
             let mut marker = None;
             for p in pending {
                 if let Some(Atomic::Marker(kind, ordinal)) = p.atomic {
@@ -1330,6 +1454,29 @@ mod tests {
         assert_eq!(result.lines[0].width, 66.0 / 64.0);
         let result = wrap_text(&styled, &mut Metrics(64), &runs, 0, runs[0].style).unwrap();
         assert_eq!(result.lines.len(), 4);
+    }
+    #[test]
+    fn line_tags_pack_and_compare() {
+        let ends = [
+            LineEnd::Wrap,
+            LineEnd::Split,
+            LineEnd::Newline,
+            LineEnd::Break,
+            LineEnd::End,
+        ];
+        for block in [None, Some(BoxId(0)), Some(BoxId(crate::MAX_BOXES - 1))] {
+            for end in ends {
+                let tag = LineTag::new(block, end).unwrap();
+                assert_eq!((tag.block(), tag.end()), (block, end));
+            }
+        }
+        assert!(LineTag::new(Some(BoxId(1 << 28)), LineEnd::End).is_err());
+        // Fragments with equal items but different tags differ.
+        let tagged =
+            |end| Fragments::<ReplacedFragment, LineTag>::with(LineTag::new(None, end).unwrap());
+        assert_ne!(tagged(LineEnd::Wrap), tagged(LineEnd::End));
+        assert_eq!(tagged(LineEnd::End), tagged(LineEnd::End));
+        assert!(format!("{:?}", tagged(LineEnd::End)).contains("tag"));
     }
     #[test]
     fn whitespace_modes_and_empty_input() {

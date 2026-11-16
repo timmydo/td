@@ -1381,12 +1381,15 @@ order. A **paragraph**, the unit find matches within and `Shift+Up` and
 `Shift+Down` move by, as §5's logical line is, is a run of consecutive
 lines one block container lays: text either side of a child block is
 two paragraphs, and a preserved newline or a `<br>` ends one. td-web
-reads containers from the styled document's box parents.
+reads both from td-layout, each line naming the block that laid it
+and how it ended (`Line::block`, `Line::end`, td-layout/DESIGN.md §4,
+"Line ends"), not from gaps between lines.
 
 **Find** searches each paragraph's text as td-layout displays it,
-spaces collapsed and a replaced scalar as U+FFFD, with the space a
-wrap drops put back (a word split across lines gets none) and an
-image's `alt` text in its place, in tree order and
+spaces collapsed and a replaced scalar as U+FFFD, with the white
+space a `Wrap` end leaves between lines put back as Copying puts it
+(none at an edge, nor across a `Split`) and an image's `alt` text in
+its place, in tree order and
 not past a paragraph, ignoring case, each character looked at once
 (Knuth, Morris and Pratt) as now, at most `MAX_HITS` matches. Text with
 no fragment (`display: none`) or not painted (`visibility: hidden`) is
@@ -1404,8 +1407,8 @@ it scans a table's run of lines by y and then x, td-layout/DESIGN.md
 §5, "Tables"), on a fragment by its x,
 and between scalars by the halves of their advances, replayed through
 td-layout's `inline::replay` with the layout's metrics and the style of
-the block that laid the line (the nearest block box enclosing it,
-td-layout §4), which sets the tab stops: it gives a tab
+the block that laid the line (`Line::block`, td-layout §3), which sets
+the tab stops: it gives a tab
 the advance to its stop and its own byte, and refuses a fragment whose
 advances do not sum to its width, an untabbed one only after reporting
 its scalars, so the window thread gathers a fragment's scalars before
@@ -1417,32 +1420,44 @@ scalars and words taken in tree order across fragments; a double click
 selects a word and a triple click a paragraph.
 
 **Copying** takes the text between the two places in tree order as it
-is shown: fragments' displayed text, the space a wrap drops copied
-(td-layout keeps its source bytes), a preserved newline a newline,
-paragraphs joined by a newline, a replaced element its `alt` text when
-the selection holds it whole; at most `MAX_COPY`, measured before it is
-gathered, as now. A list item's marker, td-layout's `MarkerFragment`
-(generated text naming its item and no byte, td-layout/DESIGN.md §5,
-"List markers"), is copied as its `text()` shows it at the start of the
-paragraph its line begins, when the selection holds that start, an
-outer item's before an inner one's where they share a line; one whose
-item laid no line, an empty item, is copied as a paragraph of its own
-where its item begins. A marker is no place: a point on an outside
-marker, left of its line, falls on the line's start, and one on an
-inside marker, before the line's first fragment, on the same start,
-and the keys step over it. A table is copied as rows of cells: within
-a row, a cell's paragraphs are joined by a space and cells by a tab, and
+is shown: fragments' displayed text; after a `Wrap` end the white
+space laid between its line and the next line with a fragment, as
+laid: one space where spaces collapse, the preserved run in pre-wrap,
+none at an edge, and past a cut only what td-layout dropped as space,
+never the tree's bytes between, which can hold hidden text or runs
+that collapse. A line of spaces alone has no fragment and no place, so
+that gap is copied once, however many `Wrap` ends lie in it. After a
+`Split` nothing is copied; after each paragraph one newline, whether a
+newline, a `<br>` or its block ended it; and for a replaced element its
+`alt` text when the selection holds it whole; at
+most `MAX_COPY`, measured before it is gathered, as now. A list item's
+marker, td-layout's `MarkerFragment` (generated text naming its item and
+no byte, td-layout/DESIGN.md §5, "List markers"), is copied as its
+`text()` shows it at the start of the paragraph its line begins, when
+the selection holds that start, an outer item's before an inner one's
+where they share a line; one whose item laid no line, an empty item, is
+copied as a paragraph of its own where its item begins. A marker is no
+place: a point on an outside marker, left of its line, falls on the
+line's start, and one on an inside marker, before the line's first
+fragment, on the same start, and the keys step over it. A table is
+copied as rows of cells: within a row, a cell's paragraphs are joined by
+a space, whatever ended them, `<br>` included, and cells by a tab, and
 each row ends in a newline, so a copied table pastes into a spreadsheet
-a row a line. Cells come in tree order, as td-layout lays them (row by
-row, each row's cells left to right, td-layout/DESIGN.md §5, "Tables"),
-and td-web tells a cell's and a row's boundaries from the box parents of
-the block that laid each line, by `StyledDocument::table_role`. A row
-or cell CSS left anonymous has no box (td-layout/DESIGN.md §5,
-"Anonymous objects"), so a CSS table's anonymous ones give no boundary
-and their content is copied as the paragraphs it lays; a
-selection that starts or ends inside a table copies the cells it holds,
-partly held ones from or to its place, with the same separators. What
-§5 copies and td-web no longer does: a quote's marks, which nothing
+a row a line. An empty cell lays no line, so td-web takes a row's cells
+from the box tree (its `table_role` children) rather than from lines,
+and an empty one still gives its tab. Cells come in tree order,
+as td-layout lays them (row by row, each row's cells left to right,
+td-layout/DESIGN.md §5, "Tables"), and td-web tells a cell's and a row's
+boundaries from each line's `Line::block` and its box parents, by
+`StyledDocument::table_role`. A row or cell CSS left anonymous has no
+box (td-layout/DESIGN.md §5, "Anonymous objects"): an anonymous cell's
+lines name the box holding its run, so a CSS table's anonymous ones give
+no cell boundary and their content is copied as the paragraphs it lays;
+a selection that starts or ends inside a table and holds more than one
+cell copies the cells it holds, partly held ones from or to its place,
+with the same separators, and one within a single cell copies it as
+ordinary paragraphs, joined by newlines.
+What §5 copies and td-web no longer does: a quote's marks, which nothing
 draws now; and a table's row, which §5's renderer copies a cell a line,
 the rule this one replaces at the cutover.
 

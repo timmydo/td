@@ -1902,6 +1902,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 definite: None,
                 offset: ctx.offset,
                 strut,
+                // An anonymous cell's lines name the box holding its run.
+                block: node.or_else(|| {
+                    first
+                        .and_then(|f| self.styled.box_node(f))
+                        .and_then(|b| b.parent)
+                }),
             },
             depth + 3,
             None,
