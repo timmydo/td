@@ -39,6 +39,7 @@ pub mod email_response;
 pub mod postgres_queue_candidates;
 pub mod postgres_queue_expiry;
 pub mod postgres_submission_cancel;
+pub mod postgres_submission_retention;
 pub mod queue_clock;
 pub use td_mime::encoded_word;
 pub mod external_sort;

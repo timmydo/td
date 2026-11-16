@@ -143,6 +143,7 @@ pub enum RelayStep {
     Body,
     Source,
     Final,
+    Retention,
 }
 impl RelayStep {
     pub const fn code(self) -> &'static str {
@@ -155,6 +156,7 @@ impl RelayStep {
             Self::Body => "body",
             Self::Source => "source",
             Self::Final => "final",
+            Self::Retention => "retention",
         }
     }
 }
@@ -742,6 +744,9 @@ mod tests {
             },
             Kind::RelayStepFailed {
                 stage: RelayStep::Final,
+            },
+            Kind::RelayStepFailed {
+                stage: RelayStep::Retention,
             },
         ];
         for phase in crate::performance::Phase::ALL {

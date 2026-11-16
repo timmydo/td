@@ -1602,8 +1602,9 @@ reclamation or serving. Those remain prerequisites for the runtime integration.
 Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
 one usage row per account from existing bodies, leases and submissions in the
 same transaction as its ledger entry. Expired leases and completed submissions
-remain charged while retained; a body shared by submissions is charged once
-for queue bytes. New account bootstrap writes an all-zero usage row atomically.
+remain charged while retained (section 216 releases retired submissions); a
+body shared by submissions is charged once for queue bytes. New account
+bootstrap writes an all-zero usage row atomically.
 Every future body/reference mutation must adjust these counters under the
 account lock in the same transaction. Owner-side direct SQL is outside this
 application-maintained accounting contract.
@@ -4993,8 +4994,8 @@ kinds locks the account row FOR UPDATE before COMMIT and every inspector
 locks it FOR SHARE before reading the receipt; lock and statement timeouts
 surface as errors, which retain custody; all of them use the single pinned
 primary; and no path deletes such a receipt while its operation can still be
-pending, beyond the bounded sweeps of sections 52 and 123. A future sweep of
-attempt, phase, recovery or expiry receipts must respect that.
+pending, beyond the bounded sweeps of sections 52, 123 and 216. Any further
+sweep of attempt, phase, recovery or expiry receipts must respect that.
 
 This is a bounded settlement job, not a renewal of any expired transport owner.
 No production scheduler or backend is activated.
@@ -6804,6 +6805,84 @@ a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
 archive/replication retention, backups and whole-volume headroom still require
 normal operational limits and monitoring. A stopped diagnostic sink must not
 be treated as a reason to resend mail.
+
+## 216. Retention of settled submissions
+
+Nothing else removes a submission, so without retention every per-account
+submission, attempt and receipt cap (1,024 each, and the configured
+`queue_submissions` quota) would be a lifetime limit on sent mail.
+`postgres_submission_retention::retire` deletes, in one transaction, the
+oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
+than 30 days ago (`RETENTION_MS`, against the database clock), every
+recipient Accepted (uncertain or not) or every recipient Canceled, no
+Pending failure notice, and no active attempt or final reservation.
+Failed and OutcomeUnknown records, pending notices and anything not yet
+completed stay until explicit administration. A completed Failed group
+canceled later keeps its completedAt and so retires with the Canceled
+category, possibly on the next pass.
+
+A batch holds at most 64 submissions, 2,048 recipients and 64 MiB of
+transmitted blobs, admitting its first submission whatever its size, so
+the statement that cascades blob chunks stays far inside the 5 s statement
+timeout and other writers' 1 s lock timeout rarely meets the account lock.
+Attempt IDs stay in the database: an account may hold 1,024, more rows than
+the mutation connection's frame budget admits.
+
+It runs under the relay's route claim: `owners::begin` takes the account row
+FOR UPDATE, and the owner fence is checked before selection and again before
+COMMIT. The batch is selected oldest first and locked; then every receipt
+keyed by its attempts or submissions (phase, acceptance, refusal, RCPT,
+command, recovery, route-health failure and success, submission,
+cancellation and expiry), the attempts, recipients and submissions are
+deleted; `submission_routes` cascades. A transmitted blob another
+submission still references stays queued; one no Email, lease or
+submission reaches is deleted with its chunks, as Email deletion does.
+`blob_ids` rows stay, so a retired blob or submission ID cannot be reused.
+The same transaction decrements `queue_submissions`, `queue_bytes`,
+`body_bytes` and `blob_count` exactly, under guards that refuse with
+Integrity rather than underflow, writes a Destroyed EmailSubmission change
+per submission and advances the account sequence, so state strings change
+and the submission ID collision check still finds the ID.
+
+Deletion is irreversible and time-driven, so the relay calls it only right
+after a queue clock observation whose guard reports the stable status retry
+dispatch needs (no discontinuity, five minutes of UTC/monotonic progress),
+passing that observation's database UTC; the transaction refuses with Clock
+if the database clock has since moved more than a minute from it. Unlike
+expiry it does not wait for administrator confirmation, so an unattended
+relay still reclaims; a clock step that predates the relay's start is no
+more detectable here than for dispatch.
+
+The relay calls it on idle and active account turns: again on the next
+round after a non-empty batch, otherwise ten minutes later. A failure
+records `relay_step_failed` at `retention`, renews the lease to serialize
+behind any interrupted transaction, and retries after the same pause; only a
+failed renewal stops the relay, as everywhere. Retirement is idempotent, so
+an uncertain COMMIT needs no Pending custody. A first pass over a long
+history drains it at 64 submissions per round. The candidate scan reads all
+of the account's submissions (no completed_at index), bounded by the
+`queue_submissions` quota, once per pass.
+
+Deleting attempt-family receipts is one of the bounded sweeps section 165
+admits. Relay operations on these kinds are settled before the worker does
+anything else, and none targets a submission completed 30 days earlier; a
+settlement that outlived that would read absence, release custody, and its
+republication would find the attempt or submission Missing. An HTTP
+submission settlement that outlived it reads absence and keeps the
+operation fenced (section 165 does not cover that path yet). A cancellation
+of an old Failed group whose COMMIT response was lost, settled after the
+group retired, reads absence and its retry reports notFound, although the
+cancellation took effect.
+
+The `real_postgres_submissions_publish_queue_and_retained_outcomes` fixture
+builds accepted, uncertain-accepted, canceled, refused-then-canceled,
+failed, mixed, OutcomeUnknown, unfinished and notice-pending groups with
+every receipt kind, shared, leased and 32 MiB blobs, 900 attempts on one
+submission, a group inside retention, groups held by an active attempt or a
+final reservation and released, and three 1,000-recipient groups that need
+two batches. It checks the stale-owner and clock refusals, exactly which
+rows, blobs and receipts go and stay, the Destroyed changes, the sequence
+advance and the usage audit. A unit test pins the batch bounds.
 
 ## 8.121 Native ACME state and certificate pairs
 

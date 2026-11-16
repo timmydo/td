@@ -12271,6 +12271,8 @@ mod final_capacity;
 mod final_work;
 #[path = "postgres_probe/new_possible.rs"]
 mod new_possible;
+#[path = "postgres_probe/submission_retention.rs"]
+mod submission_retention;
 
 fn exercise_dispatch(
     fixture: &Fixture,
@@ -12591,6 +12593,7 @@ fn exercise_attempt_recovery(
     route_repair::exercise(fixture, request, trust, binding, submission);
     route_success::exercise(fixture, request, trust, binding, submission);
     submission_cancel::exercise(fixture, request, trust, binding, submission, policies);
+    submission_retention::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(

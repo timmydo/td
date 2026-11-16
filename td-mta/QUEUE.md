@@ -365,9 +365,11 @@ it is a wall-clock observation and can precede sendAt after a clock step.
 Once present, preserve that exact timestamp in every subsequent submission
 update, including cancellation and failure-notice updates.
 Retain accepted/canceled submission records and their blobs for at least
-30 days after completion by default. Failed and terminal OutcomeUnknown
-records remain until explicit administrator deletion; storing a notice does
-not resolve them. Ordinary retention never deletes pending responsibility.
+30 days after completion by default; the relay then retires them, with
+their attempts and receipts (POSTGRES.md section 216). Failed and terminal
+OutcomeUnknown records remain until explicit administrator deletion;
+storing a notice does not resolve them. Ordinary retention never deletes
+pending responsibility.
 Manual JMAP destruction is forbidden for all submission records; record
 destruction does not mean cancellation (RFC 8621 §7.5).
 

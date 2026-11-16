@@ -2973,6 +2973,7 @@ td-mta/src/postgres_submission_cancel/snapshot.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_submission_input.rs	direct-reservation	4
 td-mta/src/postgres_submission_input.rs	heap-owner	1
 td-mta/src/postgres_submission_input.rs	unchecked-growth-or-clone	6
+td-mta/src/postgres_submission_retention.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_submissions.rs	direct-reservation	1
 td-mta/src/postgres_submissions.rs	heap-owner	2
 td-mta/src/postgres_submissions.rs	unchecked-growth-or-clone	4

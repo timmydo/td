@@ -60,6 +60,17 @@ fn meter(until: Deadline) -> Meter {
         },
     )
 }
+/// Between empty retention passes for one account.
+const RETENTION_PAUSE: Duration = Duration::from_secs(600);
+/// The observation's database UTC when retention is due and the queue clock
+/// is stable; decided once, so the idle reader closes exactly when it runs.
+fn retention_due(
+    state: &multi::AccountState,
+    status: crate::queue_clock::Status,
+    observed_at: i64,
+) -> Option<i64> {
+    (status.retry && Instant::now() >= state.retention_at).then_some(observed_at)
+}
 fn pause(control: &Control, duration: Duration) {
     let end = Instant::now() + duration;
     while !control.stop_requested() && Instant::now() < end {
@@ -179,7 +190,13 @@ impl Worker<'_, '_> {
             };
             if let Some(observed_at) = observed {
                 state.empty = true;
-                self.observe_queue_clock(worker, observed_at)?;
+                let status = self.observe_queue_clock(worker, observed_at)?;
+                // Quiet accounts reclaim too; the reader stays open otherwise.
+                let due = retention_due(state, status, observed_at);
+                if due.is_some() {
+                    idle_reader.close();
+                }
+                self.retain(worker, claim, generation, control, state, due)?;
                 if let Some(turn) = expiry_turn {
                     turn.advance();
                 }
@@ -264,6 +281,8 @@ impl Worker<'_, '_> {
         ))?;
         state.active |= !expiry.candidates.is_empty();
         let status = self.observe_queue_clock(worker, expiry.observed_at)?;
+        let due = retention_due(state, status, expiry.observed_at);
+        self.retain(worker, claim, generation, control, state, due)?;
         if let Some(turn) = expiry_turn {
             let mut limited = false;
             if let Some(candidate) = expiry.candidates.first().filter(|_| status.expiry) {
@@ -374,6 +393,60 @@ impl Worker<'_, '_> {
         }
         state.retry = !state.retry;
         Ok(buffers)
+    }
+    /// Retire settled submissions (POSTGRES.md section 216) when
+    /// `retention_due` returned the stable observation. Failure is logged and
+    /// retried later, as retention only frees capacity; the caller has
+    /// closed its idle reader.
+    fn retain(
+        &self,
+        worker: &Dispatches<'_, '_>,
+        claim: &owners::Claim,
+        generation: u64,
+        control: &Control,
+        state: &mut multi::AccountState,
+        stable_at: Option<i64>,
+    ) -> Result<(), Error> {
+        let Some(observed_at) = stable_at else {
+            return Ok(());
+        };
+        let retired = match worker.connection.slots.acquire() {
+            Ok(_slot) => crate::postgres_submission_retention::retire(
+                self.request,
+                self.trust,
+                Instant::now() + Duration::from_secs(10),
+                claim,
+                generation,
+                observed_at,
+            )
+            .ok(),
+            Err(_) => None,
+        };
+        let wait = match retired {
+            // A full batch may leave more for the next turn.
+            Some(count) if count > 0 => Duration::ZERO,
+            Some(_) => RETENTION_PAUSE,
+            None => {
+                control.log(
+                    crate::observability::Kind::RelayStepFailed {
+                        stage: crate::observability::RelayStep::Retention,
+                    },
+                    None,
+                    None,
+                );
+                // Serialize behind COMMIT or rollback before short-lock reads.
+                database(owners::renew(
+                    self.request,
+                    self.trust,
+                    Instant::now() + Duration::from_secs(10),
+                    claim,
+                    generation,
+                ))?;
+                RETENTION_PAUSE
+            }
+        };
+        state.retention_at = Instant::now() + wait;
+        Ok(())
     }
     fn observe_queue_clock(
         &self,
