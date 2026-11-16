@@ -3,6 +3,7 @@
 pub mod block;
 pub mod inline;
 pub mod list;
+pub mod text;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use td_alloc::{Budget, BudgetShared, BudgetVec};

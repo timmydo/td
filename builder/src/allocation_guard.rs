@@ -302,6 +302,7 @@ const LAYOUT_STORAGE_SOURCES: &[&str] = &[
     "td-layout/src/block/intrinsic.rs",
     "td-layout/src/block/table.rs",
     "td-layout/src/list.rs",
+    "td-layout/src/text.rs",
 ];
 const CSS_STORAGE_SOURCES: &[&str] = &[
     "td-css/src/lib.rs",

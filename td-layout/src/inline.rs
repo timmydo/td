@@ -279,6 +279,9 @@ pub(crate) struct Counters<'c> {
     pub lines: usize,
     pub fragments: usize,
     pub cuts: Cuts,
+    /// All-space line starts dropped before a word that moved (§4): a
+    /// wider line could keep each, with its word, as a line of its own.
+    pub indents: usize,
     pub limits: Limits<'static>,
     cancel: Option<&'c AtomicBool>,
     next_check: usize,
@@ -291,6 +294,7 @@ impl<'c> Counters<'c> {
             lines: 0,
             fragments: 0,
             cuts: Cuts::default(),
+            indents: 0,
             limits: styled.limits(),
             cancel,
             next_check: 0,
@@ -349,6 +353,8 @@ pub(crate) struct LineBounds {
     pub y: f64,
     pub height: f64,
     pub baseline: f64,
+    /// The byte its first item starts at, if it has one.
+    pub start: Option<usize>,
 }
 pub(crate) trait LineSink {
     /// Every line, retained or not.
@@ -802,6 +808,8 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             .any(|p| !p.space)
         {
             self.emit_prefix(counters, sink, None, keep)?;
+        } else if keep > 0 {
+            counters.indents = counters.indents.saturating_add(1);
         }
         let remaining = self.pending.len() - keep;
         // Both positions are below the original length: keep <= len,
@@ -888,6 +896,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             y: self.y,
             height,
             baseline: above as f64 / 64.0,
+            start: prefix.first().map(|p| p.range.start),
         };
         counters.step(pending.len())?;
         for p in pending {

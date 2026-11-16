@@ -136,6 +136,11 @@ a paint-order API. `output_bytes` excludes the shared styled document,
 so it can be passed as `retained_output_bytes` on a resize request. Refusal
 is an error, never successful partial output. There is no implicit I/O.
 `cascade_work()` reports what the cascade spent (§6, "Cascade work").
+`text::fit` takes the styled text page, mutable FontMetrics, a
+viewport width, a cap of lines and an optional cancel flag, and counts
+the page's lines through layout's own sizing and breaking without
+laying it out, returning where to cut it so its lines stay within the
+cap at that width and every wider one (§6, "Text pages").
 
 **Cancellation.** `Limits::cancel` and `Request::cancel` each take an
 optional `&AtomicBool`, which another thread may set while the call runs.
@@ -165,8 +170,9 @@ refuses by name even when cancelled; a limit the work would meet only
 after a read gives way to a set flag. A flag set while the last element
 cascades, or after layout's last read, can still return Ok. A caller
 that must not use superseded work tests its own flag after the call.
-td-dom's projection, which construction builds before the cascade, and
-`inline::wrap_text`, which has no request, read no flag. The flag is
+`text::fit` reads it as layout does. td-dom's projection, which
+construction builds before the cascade, and `inline::wrap_text`, which
+has no request, read no flag. The flag is
 loaded with relaxed ordering: it publishes nothing else. A styled
 document keeps no flag, as `limits()` shows: each layout names its own.
 
@@ -1140,12 +1146,14 @@ held together, only the 48-letter shape's at 1280 px fit, at 194.1 MiB.
 
 **Text pages.** A text page is `<!doctype html><plaintext>` and its
 text, styled `plaintext{display:block;white-space:pre-wrap;
-font-family:monospace}` as td-web's sheet styles it, its lines within
-td-web's `MAX_TEXT` (4 MiB) and `MAX_TEXT_LINES` (200,000). A layout's
-line array dominates its output, and is charged in capacity steps: it
-grows by doubling, each step charging twice the capacity it adds at 136
-bytes a line, so up to 131,072 lines charge 34 MiB, to 262,144 68 MiB,
-to 524,288 136 MiB, and past 524,288 lines a layout is always refused.
+font-family:monospace}` as td-web's sheet styles it, its text within
+td-web's `MAX_TEXT` (4 MiB) and cut where it would lay past
+`MAX_TEXT_LINES` (262,144) lines at td-web's least width (below). A
+layout's line array dominates its output, and is charged in capacity
+steps: it grows by doubling, each step charging twice the capacity it
+adds at 136 bytes a line, so up to 131,072 lines charge 34 MiB, to
+262,144 68 MiB, to 524,288 136 MiB, and past 524,288 lines a layout is
+always refused.
 A per-line figure is therefore an artefact of where the count falls: 356
 bytes a line at 199,999 lines is the 68 MiB step. A line holding more
 than one fragment adds its fragment array, in the same steps: 224 bytes
@@ -1206,10 +1214,108 @@ untabbed page (199,999 lines of 12 letters and one long line to 4
 MiB, or 55,066 of 12 letters and 144,934 of 23) is refused on one
 layout at 128 px with 0.6 em and at 104 px with 0.5 em, and so is a
 page of short tab-separated lines at 128 px. Two layouts
-of any page past 262,144 laid lines do not fit, so a relayout there
-lets the old one go first. What remains is td-web's text cut (§7):
-bounding a text page by the lines it lays at its least width rather
-than by its source lines.
+of any page past 262,144 laid lines do not fit.
+
+So td-web cuts a text page by the lines it lays at its least width,
+not by its source lines, and `text::fit` counts them. Given the styled
+text page, its metrics, a viewport width and a cap, it sizes the text's
+block as layout sizes blocks, through the same `dimensions` from the
+viewport down, and lays the one text node through the inline flow
+layout lays it with, the same breaking, tab stops and
+`MAX_LINE_SCALARS` breaks, into a sink that keeps no line and builds
+no fragment, charged work and read for cancellation as a layout is, its
+only storage the flow's pending scratch. It lays a source line at a
+time, a long one 16 KiB at a time, and stops within that of the cap.
+Lines past `Limits::lines` refuse `MAX_LINES` as layout's do, so a cap
+within that of them can be refused rather than cut. A text page here
+is one text node laid `pre-wrap` or `break-spaces` in an ordinary
+block, every other box an ordinary block (no inline box, image, `<br>`,
+table or list marker, which would put items or lines in the flow the
+count does not see), and its text holds no control scalar but tab,
+newline and carriage return: any other shows as U+FFFD, a fragment of
+its own (§3), so a line of them would hold several. `fit` refuses
+anything else (`Invalid`); td-web's text, its controls but the tab
+dropped, meets it.
+
+It returns the lines laid, as `Layout::line_count` counts them for the
+kept text, and where the text is cut, a byte offset in its text node:
+within the source line that passes the cap, where its first laid line
+past the cap would start, when that keeps at least one of its laid
+lines; else at the end of the last source line kept, before its
+newline. Text cut where a soft break starts a line lays the lines
+before it, the line before keeping its hanging spaces, and drops its
+source line's indent as it did, but at a word split after that dropped
+indent: the kept part of the word then fits beside the indent, which
+stays (` abcdefghijklm界` in 14 columns splits before `界`, but
+` abcdefghijklm` is one line with its indent). The counts returned
+are those the flow had when the cap was passed, with no second pass,
+so at such a split `Fit::lines` counts the indent the kept text keeps
+and the cut is conservative by that one line; it never counts fewer
+than the kept text lays. A line whose
+first laid line passes is left out whole, since text cut at its start
+would lay one more line, empty or of its indent alone. A page whose
+first laid line passes keeps nothing. td-html makes a text page's CR
+and CRLF one LF and its NUL U+FFFD; td-web's text, its newlines LF
+and its controls dropped, is then its node's, byte for byte, so the
+offset is one in td-web's text.
+
+The count td-web needs is one that no wider width exceeds, so a page
+cut at its least width fits at every width. Laid lines alone are not
+that. In `pre-wrap` a line from a given start ends at its last break
+opportunity before the first non-space that does not fit, or before
+that non-space when it has none, and a space always fits, hanging
+(§4). Every advance but a tab's is fixed and a tab's runs to the next
+stop after its pen, so an item's end is non-decreasing in its pen:
+starting a line later never moves an item's end right, and a wider
+line never fits less. A line's end is therefore non-decreasing in its
+start and in the width, and by induction a wider width's k-th line
+ends no earlier than a narrower one's, so within a source line it lays
+no more lines; `MAX_LINE_SCALARS`'s breaks, which count items, not
+widths, keep that (tested, below). The exception is a source line's
+all-space start dropped before a word that moves (§4): `   ab c` at
+4 columns drops its indent, `ab` moves, and `ab c` is one line; at 5,
+`   ab` fits and `c` takes a second. A width drops a line's indent only
+if every narrower one does, and keeping it costs at most that one line,
+so `Fit::lines` counts the lines laid and each indent dropped, and it
+is non-increasing in width and no less than what any wider width lays.
+td-web cuts by it. Tests check, over random text pages of words,
+runs of spaces and tabs, indents, newlines of every kind (a carriage
+return kept in an escaped `pre-wrap` block, which td-html does not
+normalise), long words, wide, zero-width and combining scalars, some
+past small scalar bounds, under sheets that size the block through
+margins, padding, a border and a percentage width, at 19 viewports
+from 16 to 1,280 px, that `Fit::laid` equals block layout's line count,
+that `Fit::lines` never rises with width and bounds every wider
+width's lines, and that a cut text laid again lays what was counted,
+or a line fewer within a line, within the cap at its width and every
+wider one, while the next source line, or the passing line's next laid
+line, would have passed it but for that line.
+
+262,144 is the line array's 68 MiB step. A text page within it lays
+at most 262,144 lines at every width, a fragment each at most, so two
+layouts, the old beside the new, charge at most 136 MiB beside a
+styled document of at most 17 MiB for 4 MiB of text, within
+MAX_PAGE_BYTES. Counting in td-web's least viewport, 128 px, and
+laying the kept page at 128 and 1280 px, release, pinned, medians of
+seven counts and of three layouts under a load average of 3 to 4
+(2026-11-15), each count cut at 262,144 laid lines:
+
+| Text page | Em | Count ms | Kept | Lines at 1280 px | Layout ms at 128 / 1280 px |
+| --- | ---: | ---: | --- | ---: | ---: |
+| 199,999 lines of 12 and one to 4 MiB | 0.5 | 83 | the lines of 12, 0.8 MiB of the last | 205,506 | 123 / 113 |
+| the same | 0.6 | 44 | 131,072 lines | 131,072 | 79 / 58 |
+| 55,066 lines of 12 and 144,934 of 23 | 0.5 | 75 | 158,605 lines | 158,605 | 117 / 100 |
+| the same | 0.6 | 50 | 105,736 lines and a part | 105,737 | 86 / 54 |
+| `aa\tbb\tcc\tdd\tee`, 200,000 | 0.5, 0.6 | 33 | 87,381 lines and a part | 87,382 | 69 / 36 |
+| `a\tb\t…\tj`, 200,000 | 0.5, 0.6 | 28 | 52,428 lines and a part | 52,429 | 62 / 27 |
+| 46-byte lines, 4 MiB | 0.5 | 73 | 65,536 lines | 65,536 | 116 / 77 |
+| the same | 0.6 | 58 | 52,428 lines and a part | 52,429 | 100 / 62 |
+| a banner and a 4 MiB minified line | 0.5 | 72 | the banner, 2.8 MiB of the line | 18,726 | 115 / 71 |
+| the same | 0.6 | 57 | the banner, 2.1 MiB of the line | 16,385 | 97 / 54 |
+
+Every kept page lays 262,144 lines at 128 px, 68 MiB of output, and
+its whole is refused there. The count costs half to two thirds of a
+layout of what it keeps at 128 px.
 
 None of the three limits slows a page: interleaved and pinned to one
 CPU, the 2 MiB shapes cascade within 2% of two identical builds of the
@@ -1493,8 +1599,9 @@ are §6's "Caller-set limits"; eight-column tab stops where white space
 is preserved, a tab costing no fragment, and a line past
 MAX_LINE_SCALARS cut and marked, or broken where it wraps, rather than
 refused, are §4's "Tab stops" and "Long lines". A tabbed text page
-costs what an untabbed one of its laid lines does. What remains of a
-text page td-web admits fitting one layout at its narrowest pane is
-td-web's text cut: a page whose source lines each lay as several there,
-short tab-separated lines or a full 4 MiB page at 11 columns, still
-passes 524,288 laid lines (§6, "Text pages").
+costs what an untabbed one of its laid lines does. Counting a text
+page's lines in a viewport through layout's own sizing and breaking
+without laying it out, and cutting it where the count, its dropped
+indents included, would pass a cap, within the source line that passes
+it, so the page td-web cuts at its least width fits two layouts at
+every width, is §6's "Text pages" (`text::fit`).

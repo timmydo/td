@@ -1056,6 +1056,10 @@ charges anything for the new one.
   for the size the page was last styled at, until a width or scale
   change styles it again.
 - A page arriving takes every step.
+- For a text page, a change of face or scale counts its text again in
+  the least viewport (below, "Cuts") before it is laid out, and cuts it
+  further where it now passes: a round trip through a denser face can
+  leave less of it shown, until it is loaded again.
 
 A recompiled set is charged to the sheets term while it lives, and the
 new styled document and layout are charged beside the old ones, which
@@ -1515,38 +1519,47 @@ in monospace, td-layout's tab stops every eight columns in place of
 td-web's expansion. Its bound stays `MAX_TEXT` (4 MiB), the prefix
 included, so it fits td-html's 4 MiB input, and td-layout takes it
 under a raised input limit (`Limits::input` at td-layout's `MAX_INPUT`,
-4 MiB). td-web cuts it before it is parsed at `MAX_TEXT_LINES`
-(200,000) lines of its source, as `MAX_LINES` cuts it now, with the
-status row's note. A layout's lines are charged in capacity steps
-(td-layout/DESIGN.md §6, "Text pages"): 68 MiB up to 262,144 laid
-lines, 136 MiB to 524,288, and refused past that. So at ordinary
-widths, a source line a laid line, two layouts of a cut page, the old
-beside the new, charge 136 MiB beside its styled document (148 to 155
-MiB measured) within the page term; a narrow pane lays a long source
-line as several, and past 262,144 laid lines one layout charges 136
-MiB, so two no longer fit and the old one is let go first (above,
-"Relayout"). Rung 3's text takes the same bounds. td-web's own pages,
+4 MiB). td-web cuts it by the lines it lays at its least width, not
+by its source lines: where it would lay past `MAX_TEXT_LINES`
+(262,144) lines in the 128 px viewport `MIN_WRAP_EMS` sets, counted by
+td-layout's own sizing and breaking with the faces it is measured with
+(`text::fit`, td-layout/DESIGN.md §6, "Text pages"). td-web parses and
+styles the text whole within `MAX_TEXT`, counts it, and if the count
+passes, builds the page again from its text up to the cut, which falls
+within the source line that passes, where its first laid line past the
+count would start, or, when that line's first laid line passes, at the
+end of the line before. The status row's note says, as `MAX_LINES`'s
+does now, how many of its lines are shown, and that the last is shown
+in part when it is. The cut is an offset in the page's text node, and
+td-web's text, its newlines made LF and its controls but the tab
+dropped as td-html would have them, is that node's byte for byte; it
+meets `text::fit`'s precondition, no control scalar a line could not
+lay as one fragment. The count is of the lines laid and of each indent
+a line drops before a word that moves: a wider pane keeps such an
+indent beside its word and can need one more line for it, and with
+those counted no wider viewport lays more (td-layout §6), so the page
+cut at the least width fits at every width. A change of face or scale,
+which can change advances, counts the text shown again and cuts it
+further if it now passes (above, "Relayout"); a new width needs no
+count. Why 262,144: a layout's lines are charged in capacity steps
+(td-layout/DESIGN.md §6, "Text pages"), 68 MiB up to 262,144 laid
+lines, 136 MiB to 524,288, and refused past that, and a text page's
+line holds one fragment at most, its tabs coalescing with its text. So
+two layouts of a cut page, the old beside the new, charge at most 136
+MiB at every width, beside a styled document of at most 17 MiB
+measured, within the page term, and a relayout never has to let the
+old one go first; at 262,145 lines one layout would charge 136 MiB and
+two would not fit. Measured in the least viewport with 0.5 and 0.6 em
+monospace faces (td-layout §6), the count takes 44 to 83 ms for a full
+4 MiB page at 11 or 14 columns, 33 for 200,000
+`aa\tbb\tcc\tdd\tee` lines, 28 for 200,000 `a\tb\t…\tj` lines, 58
+to 73 for a 4 MiB page of 46-byte lines and 57 to 72 for a licence
+banner and a 4 MiB minified line, half to two thirds of laying what it
+keeps. Rung 3's text takes the same bounds, its controls but the tab
+dropped as a text page's are. td-web's own pages,
 an error, the start page and the note for a type it does not show, are
 markup it writes with their text escaped; want of memory for one
 paints the static notice.
-
-**Open: a text page that does not fit.** A cut text page must fit one
-layout at td-web's narrowest pane and with its tabs, and today need
-not. td-layout's tab stops cost no fragment (td-layout/DESIGN.md §4,
-"Tab stops"), so a tabbed line costs what an untabbed one of its laid
-lines does: 199,999 lines with up to four tabs and 4 MiB of
-tab-separated lines lay out at ordinary widths in 81 to 88 MiB, two
-layouts fitting. What remains is the count of laid lines, past
-td-layout's 524,288 when each source line lays as several: a full 4
-MiB page at 11 columns (td-ui's 0.6 em monospace face in a 128 px
-pane) with no tab at all, and 200,000 short tab-separated lines that
-wrap into three at 128 px (`aa\tbb\tcc\tdd\tee`, 34 columns
-expanded), or at 320 px with 0.6 em (`a\tb\t…\tj`, 73), are refused on
-one layout (td-layout §6, "Text pages"). Either leaves rung 3 nothing
-to show. td-web's text cut settles it before the cutover (increment
-7): `MAX_TEXT_LINES`, `MAX_TEXT` or a text page's least width, or a cut
-by the lines a page lays at its least width, counting a tab to its stop,
-rather than by its source lines.
 
 ### Painting
 
@@ -1650,11 +1663,18 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      size, and atlas pages for sizes but its own capped at `ATLAS` in
      all, the eldest remade when another is needed.
    - **td-layout**: a declared-charge split excluding independently
-     owned tree, DOM and CSS storage (above, "Memory"); a styled document
-     holding its document by shared
-     ownership, so a page passes between threads, as td-web, which
-     forbids `unsafe`, cannot hold a borrowed one beside its owner.
-     Available: a basic table layout, so a page's tables line up as
+     owned tree, DOM and CSS storage (above, "Memory"): a styled
+     document's `charged_bytes` still counts its document's own charge
+     and td-dom's index arrays (td-layout/DESIGN.md §2, "Whole-page
+     memory"), which the page budget's tree and index terms already
+     hold. Available: a styled document holding its document by shared
+     ownership (`StyledDocument::shared`), so a page passes between
+     threads, as td-web, which forbids `unsafe`, cannot hold a borrowed
+     one beside its owner; a text page's lines counted at a width
+     through layout's own sizing and breaking, without laying it out,
+     and the page cut where they would pass a cap
+     (`text::fit`, td-layout/DESIGN.md §6, "Text pages"); a basic table
+     layout, so a page's tables line up as
      §5's do rather than stacking as blocks: the automatic and fixed
      width algorithms, rows and cells with `colspan` and `rowspan`
      within HTML's bounds, refused past `MAX_TABLE_COLUMNS`, border
@@ -1734,9 +1754,9 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    as the stages took, which AGENTS.md's principle 4 forbids; what can
    land first without a second mechanism is the other crates' work in
    increment 6, which is why it is theirs. td-mail and td-news keep
-   td-html's renderer, which this does not change. It lands only once
-   the text page that does not fit (above, "Cuts") is settled, a cut
-   text page fitting one layout at the narrowest pane with its tabs.
+   td-html's renderer, which this does not change. A text page is cut
+   by the lines it lays at the least width (above, "Cuts"), so a cut
+   text page fits two layouts at every width with its tabs.
    Validation: tests
    of each of the above in-process on the cell, §8's behaviours carried
    over, each rung of the cuts by a lowered limit, a cancelled job, and

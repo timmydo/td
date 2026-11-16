@@ -1020,6 +1020,30 @@ fn dimensions(
 ) -> Result<Dimensions, Error> {
     sized(styled, b, style, Some(width), height, intrinsic)
 }
+/// The content width layout gives `id`, an ordinary block whose
+/// ancestors are all ordinary blocks, in a viewport `viewport` wide: each
+/// sized against its parent's content as `children` sizes it, the root
+/// against the viewport.
+pub(crate) fn content_width(
+    styled: &StyledDocument<'_>,
+    id: BoxId,
+    viewport: f64,
+    depth: usize,
+) -> Result<f64, Error> {
+    if depth > styled.limits().depth {
+        return Err(Error::Limit("MAX_DEPTH"));
+    }
+    let b = styled.box_node(id).ok_or(Error::Invalid)?;
+    if b.kind != BoxKind::Block || styled.table_role(id).is_some() {
+        return Err(Error::Invalid);
+    }
+    let container = match b.parent {
+        Some(parent) => content_width(styled, parent, viewport, depth + 1)?,
+        None => viewport,
+    };
+    let style = styled.style(b.style).ok_or(Error::Invalid)?;
+    Ok(dimensions(styled, b, style, container, None, None)?.width)
+}
 /// dimensions() against a containing width, or none: then percentages of
 /// it are auto, or 0 for edges, as an intrinsic contribution takes them.
 fn sized(
