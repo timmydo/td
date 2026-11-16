@@ -7,7 +7,8 @@
 //! them under its own file rules: td-secret's store and workers, with every
 //! crate compiling the store, td-install's storage worker
 //! (td-install/DESIGN.md, "Storage operation worker"), td-authd's
-//! credential intake and the compositor's PIN field.
+//! credential intake, the compositor's PIN field and td-pass's portable
+//! host, which lets its account accept named storage devices.
 
 use std::ffi::OsStr;
 use std::io;
