@@ -702,7 +702,13 @@ fn health(
             // Proven absent under the account share lock (POSTGRES.md
             // section 165): republish the same change.
             Ok(None) => unknown = false,
-            Err(E::Connection(_) | E::Database) => (),
+            // A lock timeout, as while an uncertain COMMIT still runs, is
+            // transient like a lost connection.
+            Err(
+                E::Connection(_)
+                | E::Database
+                | E::Owner(crate::postgres_route_owners::Error::Busy),
+            ) => (),
             Err(_) => return Err(Error::Database),
         }
         if control.stop_requested() {
@@ -754,6 +760,75 @@ mod tests {
         );
         assert!(matches!(result, Ok(true)));
         assert_eq!((publishes, inspections), (2, 1));
+    }
+    #[test]
+    fn health_retries_a_lock_timeout_while_the_commit_runs() {
+        use crate::postgres_route_health::{Error as E, Outcome, State};
+        use crate::postgres_route_owners::Error as Owner;
+        let control = Control::default();
+        let outcome = Outcome {
+            old_revision: 0,
+            state: State {
+                revision: 1,
+                failure_count: 0,
+                reason: 0,
+                failed_at: None,
+                next_at: None,
+                repair_generation: None,
+            },
+        };
+        let mut inspections = 0;
+        let result = health(
+            &control,
+            || Err(E::Indeterminate),
+            || {
+                inspections += 1;
+                if inspections == 1 {
+                    Err(E::Owner(Owner::Busy))
+                } else {
+                    Ok(Some(outcome))
+                }
+            },
+        );
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(inspections, 2);
+    }
+    #[test]
+    fn health_retries_a_publication_lock_timeout() {
+        use crate::postgres_route_health::{Error as E, Outcome, State};
+        use crate::postgres_route_owners::Error as Owner;
+        let control = Control::default();
+        let outcome = Outcome {
+            old_revision: 0,
+            state: State {
+                revision: 1,
+                failure_count: 0,
+                reason: 0,
+                failed_at: None,
+                next_at: None,
+                repair_generation: None,
+            },
+        };
+        let mut publishes = 0;
+        let mut inspections = 0;
+        let result = health(
+            &control,
+            || {
+                publishes += 1;
+                if publishes == 1 {
+                    Err(E::Owner(Owner::Busy))
+                } else {
+                    Ok(outcome)
+                }
+            },
+            || {
+                inspections += 1;
+                Ok(None)
+            },
+        );
+        assert!(matches!(result, Ok(true)));
+        // A lock timeout before any write is not uncertain.
+        assert_eq!((publishes, inspections), (2, 0));
     }
     #[test]
     fn repair_completion_cannot_finish_a_newer_request() {

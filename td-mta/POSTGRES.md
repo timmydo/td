@@ -6582,7 +6582,10 @@ network failures, including DNS idle timeout while the original cap remains
 live, publish route backoff. A local exhausted cap does not diagnose the route.
 Durably accepted final DATA resets consecutive route failures. Success and
 repair retain exact operations and inspect unknown COMMIT before further work;
-a receipt proven absent (section 165) returns them to publication.
+a receipt proven absent (section 165) returns them to publication, and a
+lock timeout on the configuration or account row, as while the uncertain
+COMMIT still runs, is retried like a lost connection until stop is
+requested rather than stopping the relay.
 After selecting a repaired configuration and restarting, an explicit private
 `queue-route-repair` request releases the configuration-bound pause only if
 the database confirms a newer selected generation. Mere restart never repairs.
