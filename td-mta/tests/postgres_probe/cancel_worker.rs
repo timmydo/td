@@ -150,9 +150,34 @@ pub(super) fn exercise(
     assert_eq!(success.changed, 1000);
     assert!(closed.load(Ordering::Relaxed));
     assert_eq!(pending.operation().unwrap(), None);
-    sql(fixture, &format!("UPDATE td_mta.recipients SET state=1,reason=0,next_attempt_at=0 WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL WHERE id=decode('{submission}','hex')"));
+    let reset = || {
+        sql(fixture, &format!("UPDATE td_mta.recipients SET state=1,reason=0,next_attempt_at=0 WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL WHERE id=decode('{submission}','hex')"));
+        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    };
+    reset();
+    // A route-owner COMMIT that outlives its deadline and then rolls back:
+    // the next cancellation settles the absent receipt inline and proceeds.
+    sql(fixture, "CREATE FUNCTION public.rollback_worker_cancel() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_worker_cancel AFTER INSERT ON td_mta.submission_cancel_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_worker_cancel()");
+    assert_eq!(
+        worker.cancel(input(2000), claim, generation, &mut meter(), |_| Ok(())),
+        Err(Error::Publication(cancel::Error::Indeterminate))
+    );
+    let absent = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.cancel(input(10_000), claim, generation, &mut meter(), refused),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert_eq!(pending.operation().unwrap(), Some(absent));
+    thread::sleep(Duration::from_secs(6));
+    sql(fixture, "DROP TRIGGER rollback_worker_cancel ON td_mta.submission_cancel_receipts; DROP FUNCTION public.rollback_worker_cancel()");
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
-    sql(fixture, "CREATE CONSTRAINT TRIGGER delay_http_cancel AFTER INSERT ON td_mta.submission_cancel_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_cancel()");
+    let proceeded = worker
+        .cancel(input(10_000), claim, generation, &mut meter(), |_| Ok(()))
+        .unwrap();
+    assert_eq!(proceeded.changed, 1000);
+    assert_eq!(pending.operation().unwrap(), None);
+    reset();
+    sql(fixture, "CREATE FUNCTION public.delay_worker_cancel() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_cancel AFTER INSERT ON td_mta.submission_cancel_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_worker_cancel()");
     assert_eq!(
         worker.cancel(input(2000), claim, generation, &mut meter(), |_| Ok(())),
         Err(Error::Publication(cancel::Error::Indeterminate))
@@ -163,10 +188,10 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Busy))
     );
     assert_eq!(pending.operation().unwrap(), Some(operation));
-    thread::sleep(Duration::from_secs(4));
+    thread::sleep(Duration::from_secs(6));
     sql(
         fixture,
-        "DROP TRIGGER delay_http_cancel ON td_mta.submission_cancel_receipts",
+        "DROP TRIGGER delay_http_cancel ON td_mta.submission_cancel_receipts; DROP FUNCTION public.delay_worker_cancel()",
     );
     let mut connection = loaded
         .bootstrap
@@ -198,7 +223,7 @@ pub(super) fn exercise(
         .unwrap();
     assert_eq!(settled.operation, operation);
     assert_eq!(settled.outcome.changed, 1000);
-    assert_eq!(settled.outcome.old_sequence, success.new_sequence);
+    assert_eq!(settled.outcome.old_sequence, proceeded.new_sequence);
     assert_eq!(pending.operation().unwrap(), None);
     drop(foreground);
     assert!(pending

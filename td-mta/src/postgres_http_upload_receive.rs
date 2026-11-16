@@ -62,7 +62,6 @@ pub(crate) fn receive(
     if control.stop_requested() || body_deadline.expired(service.clock.sample()?.monotonic) {
         return Err(Error::Deadline);
     }
-    let ingress = service.pending.uploads.admit_ingress()?;
     let work = service.admission.work();
     let output = maximum
         .checked_mul(2)
@@ -77,6 +76,16 @@ pub(crate) fn receive(
             ..Charge::default()
         },
     );
+    let uploads = Uploads {
+        loaded: service.loaded,
+        executable: service.executable,
+        binding: service.binding,
+        slots: service.slots,
+        clock: service.clock,
+        pending: &service.pending.uploads,
+        password: request.credentials.password(),
+    };
+    let ingress = uploads.admit(&mut meter, body_deadline)?;
     charge(
         service,
         &mut meter,
@@ -161,15 +170,6 @@ pub(crate) fn receive(
         };
     }
     sender.check()?;
-    let uploads = Uploads {
-        loaded: service.loaded,
-        executable: service.executable,
-        binding: service.binding,
-        slots: service.slots,
-        clock: service.clock,
-        pending: &service.pending.uploads,
-        password: request.credentials.password(),
-    };
     match uploads.create_admitted(
         Input {
             account: request.account,

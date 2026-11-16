@@ -9,8 +9,9 @@ use crate::{
     jmap_request::dispatch::{DraftCreator, DraftError, DraftInput},
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_drafts::{self as changes, Draft},
+    postgres_http_settlement as settlement,
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, Endpoint, Mode},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
     store_fs::DraftCompletion,
@@ -20,10 +21,11 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-/// One active or uncertain mutation. Retain this owner across HTTP requests.
+/// One active or uncertain mutation and the endpoint it was published to.
+/// Retain this owner across HTTP requests.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Draft>>,
+    change: Mutex<Option<(Draft, Endpoint)>>,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<DraftOperationId>, Error> {
@@ -32,7 +34,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(Draft::operation))
+            .map(|(change, _)| change.operation()))
     }
 }
 
@@ -44,7 +46,8 @@ pub struct Settled {
 }
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
-    /// Absence or any error retains the exact operation and keeps writes fenced.
+    /// A found receipt or proven absence releases the operation; any error
+    /// retains it and keeps writes fenced.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -57,9 +60,9 @@ impl Pending {
             return Err(Error::Invalid);
         }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
-        let Some(change) = pending.as_ref() else {
+        if pending.is_none() {
             return Ok(None);
-        };
+        }
         let now = Instant::now();
         let deadline = clock.deadline_instant(until)?.min(
             now.checked_add(Duration::from_secs(10))
@@ -68,33 +71,29 @@ impl Pending {
         if now >= deadline {
             return Err(Error::Deadline);
         }
-        let _slot = settlement_slots.acquire().map_err(|_| Error::Busy)?;
-        let dns_deadline = deadline.min(
-            now.checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses =
-            crate::postgres_resolver::resolve(executable, &loaded.bootstrap, dns_deadline)
-                .map_err(|error| match error {
-                    crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                    _ => Error::Dns,
-                })?;
-        for address in addresses {
-            let mut connection = loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            match changes::inspect(&connection, &loaded.trust, deadline, change) {
-                Ok(Some(outcome)) => {
-                    let operation = change.operation();
-                    *pending = None;
-                    return Ok(Some(Settled { operation, outcome }));
-                }
-                Ok(None) => return Ok(None),
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(map_error(error)),
-            }
-        }
-        Err(Error::Invalid)
+        settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
+}
+/// Inspect only at the retained endpoint; absence proves rollback (section 165).
+fn settle_held(
+    pending: &mut Option<(Draft, Endpoint)>,
+    loaded: &Loaded,
+    slots: &ReadSlots,
+    deadline: Instant,
+) -> Result<Option<Settled>, Error> {
+    let Some((change, endpoint)) = pending.as_ref() else {
+        return Ok(None);
+    };
+    let _slot = slots.acquire().map_err(|_| Error::Busy)?;
+    let connection = settlement::request(loaded, *endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+        .map_err(map_error)?
+        .map(|outcome| Settled {
+            operation: change.operation(),
+            outcome,
+        });
+    *pending = None;
+    Ok(settled)
 }
 
 pub struct Drafts<'a> {
@@ -153,7 +152,15 @@ impl Drafts<'_> {
             .try_lock()
             .map_err(|_| store(Error::Busy))?;
         if pending.is_some() {
-            return Err(store(Error::Busy));
+            // Settle within this request's capped deadline, with a foreground
+            // slot it releases before taking its own.
+            settlement::charge(meter, self.clock, 1).map_err(store)?;
+            let inline = settlement::inline_deadline(deadline).map_err(store)?;
+            if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
+                || pending.is_some()
+            {
+                return Err(store(Error::Busy));
+            }
         }
         // One owner retains at most 32 MiB each of source and composed bytes.
         let _slot = self.slots.acquire().map_err(|_| store(Error::Busy))?;
@@ -324,17 +331,16 @@ impl Drafts<'_> {
         let blob = draft.blob();
         let thread = draft.thread_candidate();
         let size = draft.length();
-        *pending = Some(draft);
-        let draft = pending.as_ref().ok_or_else(|| store(Error::Invalid))?;
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+        let mut endpoint = None;
         for address in addresses {
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
+            endpoint = Some(address);
+            let connection = settlement::request(self.loaded, address);
             outcome = changes::publish(
                 &connection,
                 &self.loaded.trust,
                 deadline,
-                draft,
+                &draft,
                 self.password,
             );
             if !matches!(
@@ -345,33 +351,32 @@ impl Drafts<'_> {
             }
         }
         match outcome {
-            Ok(outcome) => {
-                *pending = None;
+            Ok(outcome) => Ok(DraftCompletion {
+                before_epoch,
+                before_sequence: Sequence::from_u64(outcome.old_sequence),
+                email: outcome.email,
+                blob: outcome.blob,
+                thread: outcome.thread,
+                size: outcome.length,
+                outcome: Ok(Sequence::from_u64(outcome.new_sequence)),
+                admission_stopped: false,
+                cleanup_error: None,
+            }),
+            Err(changes::Error::Indeterminate) => {
+                *pending = Some((draft, endpoint.ok_or_else(|| store(Error::Invalid))?));
                 Ok(DraftCompletion {
                     before_epoch,
-                    before_sequence: Sequence::from_u64(outcome.old_sequence),
-                    email: outcome.email,
-                    blob: outcome.blob,
-                    thread: outcome.thread,
-                    size: outcome.length,
-                    outcome: Ok(Sequence::from_u64(outcome.new_sequence)),
-                    admission_stopped: false,
+                    before_sequence: Sequence::from_u64(0),
+                    email,
+                    blob,
+                    thread,
+                    size,
+                    outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
+                    admission_stopped: true,
                     cleanup_error: None,
                 })
             }
-            Err(changes::Error::Indeterminate) => Ok(DraftCompletion {
-                before_epoch,
-                before_sequence: Sequence::from_u64(0),
-                email,
-                blob,
-                thread,
-                size,
-                outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
-                admission_stopped: true,
-                cleanup_error: None,
-            }),
             Err(error) => {
-                *pending = None;
                 if error == changes::Error::MissingAttachment {
                     Err(DraftError::Input(draft_input::Error::Property(
                         "attachments",

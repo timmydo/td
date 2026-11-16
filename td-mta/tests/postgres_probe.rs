@@ -2713,7 +2713,7 @@ fn real_postgres_td_mail_sends_plain_text() {
 
 #[test]
 #[ignore = "real PostgreSQL 17 installation required"]
-fn real_postgres_http_upload_owner_retains_and_settles() {
+fn real_postgres_http_upload_owner_settles_and_releases() {
     exercise_configuration(ConfigurationExercise::HttpUploads);
 }
 
@@ -7712,6 +7712,34 @@ fn exercise_http_read(
         assert_eq!(settled.operation, operation);
         assert_eq!(pending.drafts.operation().unwrap(), None);
         assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
+        // A COMMIT that outlives its deadline and then rolls back: the next
+        // draft settles the absent receipt inline and proceeds.
+        sql(fixture, "CREATE FUNCTION public.rollback_http_draft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_http_draft AFTER INSERT ON td_mta.draft_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_http_draft()");
+        milliseconds.set(2_000);
+        // The lost COMMIT spends the whole request deadline: no response.
+        let (result, output) = call(&body, password, device, false, false, false);
+        assert!(
+            matches!(
+                result,
+                Err(td_mta::https_download::Failure::Before(Error::Deadline))
+            ),
+            "{output}"
+        );
+        assert!(output.is_empty(), "{output}");
+        let operation = pending.drafts.operation().unwrap().unwrap();
+        milliseconds.set(10_000);
+        let (result, output) = call(&body, password, device, false, false, false);
+        result.unwrap();
+        assert!(output.contains("storageBusy"), "{output}");
+        assert_eq!(pending.drafts.operation().unwrap(), Some(operation));
+        thread::sleep(Duration::from_secs(6));
+        sql(fixture, "DROP TRIGGER rollback_http_draft ON td_mta.draft_receipts; DROP FUNCTION public.rollback_http_draft()");
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
+        let (result, output) = call(&body, password, device, false, false, false);
+        result.unwrap();
+        assert!(output.contains("\"created\""), "{output}");
+        assert_eq!(pending.drafts.operation().unwrap(), None);
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "5");
         let catalog = binding.identity_catalog().unwrap();
         let identity_id = catalog.ids().next().unwrap();
         let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
@@ -7851,7 +7879,7 @@ fn exercise_http_read(
                 .unwrap(),
             uploads_before + 2
         );
-        sql(fixture, "CREATE FUNCTION public.delay_http_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_upload()");
+        sql(fixture, "CREATE FUNCTION public.delay_http_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_upload()");
         milliseconds.set(3000);
         let (result, _) = upload(b"uncertain", Framing::Length(9), false, password);
         let response = result.unwrap();
@@ -7862,7 +7890,7 @@ fn exercise_http_read(
         let (result, wire) = upload(b"x", Framing::Length(1), true, password);
         assert!(matches!(result, Err(Error::Busy)));
         assert!(wire.is_empty());
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(6));
         sql(
             fixture,
             "DROP TRIGGER delay_http_upload ON td_mta.upload_receipts",
@@ -7880,6 +7908,24 @@ fn exercise_http_read(
                 .parse::<usize>()
                 .unwrap(),
             uploads_before + 3
+        );
+        // A COMMIT that rolled back: the next upload's admission settles the
+        // absent receipt inline, then receives and publishes its body.
+        sql(fixture, "CREATE FUNCTION public.refuse_http_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER refuse_http_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refuse_http_upload()");
+        let (result, _) = upload(b"absent", Framing::Length(6), false, password);
+        assert_eq!(result.unwrap().bytes(), Err(Error::Conflict));
+        assert!(pending.uploads.operation().unwrap().is_some());
+        sql(fixture, "DROP TRIGGER refuse_http_upload ON td_mta.upload_receipts; DROP FUNCTION public.refuse_http_upload()");
+        let (result, wire) = upload(b"proceeds", Framing::Length(8), true, password);
+        let response = td_json::parse_slice(result.unwrap().bytes().unwrap()).unwrap();
+        assert_eq!(response["size"].as_u64(), Some(8));
+        assert_eq!(wire, b"HTTP/1.1 100 Continue\r\n\r\n");
+        assert_eq!(pending.uploads.operation().unwrap(), None);
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts")
+                .parse::<usize>()
+                .unwrap(),
+            uploads_before + 4
         );
         assert_eq!(pending.submissions.operation().unwrap(), None);
         assert_eq!(pending.drafts.operation().unwrap(), None);
@@ -11350,7 +11396,7 @@ fn exercise_http_submission_owner(
     );
     assert_eq!(pending.operation().unwrap(), None);
     assert_eq!(count(), before + 1);
-    sql(fixture, "DROP TRIGGER refuse_http_submission ON td_mta.submission_receipts; CREATE FUNCTION public.delay_http_submission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_submission AFTER INSERT ON td_mta.submission_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_submission()");
+    sql(fixture, "DROP TRIGGER refuse_http_submission ON td_mta.submission_receipts; CREATE FUNCTION public.delay_http_submission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_submission AFTER INSERT ON td_mta.submission_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_submission()");
     assert_eq!(
         worker.create(request(3000), &mut meter()),
         Err(Error::Publication(submissions::Error::Indeterminate))
@@ -11361,7 +11407,7 @@ fn exercise_http_submission_owner(
         Err(Error::Admission(ports::Error::Busy))
     );
     assert_eq!(pending.operation().unwrap(), Some(operation));
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(6));
     sql(
         fixture,
         "DROP TRIGGER delay_http_submission ON td_mta.submission_receipts",
@@ -11393,6 +11439,27 @@ fn exercise_http_submission_owner(
         .settle(&loaded, executable, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
+    // A COMMIT that outlives its deadline and then rolls back: the next
+    // submission settles the absent receipt inline and proceeds.
+    sql(fixture, "CREATE FUNCTION public.rollback_http_submission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_http_submission AFTER INSERT ON td_mta.submission_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_http_submission()");
+    assert_eq!(
+        worker.create(request(3000), &mut meter()),
+        Err(Error::Publication(submissions::Error::Indeterminate))
+    );
+    let absent = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.create(request(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert_eq!(pending.operation().unwrap(), Some(absent));
+    thread::sleep(Duration::from_secs(7));
+    sql(fixture, "DROP TRIGGER rollback_http_submission ON td_mta.submission_receipts; DROP FUNCTION public.rollback_http_submission()");
+    assert_eq!(count(), before + 2);
+    let proceeded = worker.create(request(10_000), &mut meter()).unwrap();
+    assert_eq!(proceeded.email, input.source().email);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(count(), before + 3);
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.submission_receipts WHERE operation=decode('{absent}','hex')")), "0");
     exercise_http_filing_owner(fixture, &loaded, binding, input, password);
     exercise_submission_reads(fixture, &loaded, binding, input, password);
     exercise_submission_set_dispatch(fixture, &loaded, binding, input, password);
@@ -11808,7 +11875,7 @@ fn exercise_http_filing_owner(
         queued
     );
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.keywords WHERE email_id=decode('{email}','hex') AND keyword='$draft'")), "1");
-    sql(fixture, "DROP TRIGGER reject_http_filing ON td_mta.flag_receipts; CREATE FUNCTION public.delay_http_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_filing AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_filing()");
+    sql(fixture, "DROP TRIGGER reject_http_filing ON td_mta.flag_receipts; CREATE FUNCTION public.delay_http_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_filing AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_filing()");
     let result = worker.file(request(3000), &mut meter()).unwrap();
     assert!(matches!(
         result.outcome,
@@ -11821,7 +11888,7 @@ fn exercise_http_filing_owner(
         Err(td_mta::store_fs::UploadError::Store(ports::Error::Busy))
     ));
     assert_eq!(pending.operation().unwrap(), Some(operation));
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(6));
     sql(
         fixture,
         "DROP TRIGGER delay_http_filing ON td_mta.flag_receipts",
@@ -13128,7 +13195,7 @@ fn exercise_http_upload_owner(
         Err(owner::Error::Publication(changes::Error::Database))
     );
     assert_eq!(pending.operation().unwrap(), None);
-    sql(fixture, "DROP TRIGGER reject_owned_upload ON td_mta.upload_receipts; CREATE FUNCTION public.delay_owned_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_upload()");
+    sql(fixture, "DROP TRIGGER reject_owned_upload ON td_mta.upload_receipts; CREATE FUNCTION public.delay_owned_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_upload()");
     assert_eq!(
         worker.create(input(3000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
@@ -13139,7 +13206,7 @@ fn exercise_http_upload_owner(
         Err(owner::Error::Admission(Error::Busy))
     );
     assert_eq!(pending.operation().unwrap(), Some(operation));
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(6));
     sql(
         fixture,
         "DROP TRIGGER delay_owned_upload ON td_mta.upload_receipts",
@@ -13169,24 +13236,59 @@ fn exercise_http_upload_owner(
         "2"
     );
     drop(foreground);
+    // A delayed COMMIT that then commits: the next upload finds its receipt
+    // inline, releases the owner and publishes.
+    sql(fixture, "CREATE CONSTRAINT TRIGGER delay_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_upload()");
+    assert_eq!(
+        worker.create(input(3000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    assert!(pending.operation().unwrap().is_some());
+    thread::sleep(Duration::from_secs(7));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_owned_upload ON td_mta.upload_receipts",
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "3"
+    );
+    let found = worker.create(input(10_000), &mut meter()).unwrap();
+    assert_eq!(found.length, first.length);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "4"
+    );
     sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_upload()");
     assert_eq!(
         worker.create(input(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
     let absent = pending.operation().unwrap().unwrap();
+    // The COMMIT ended in rollback: absence at its endpoint releases the owner.
     assert!(pending
         .settle(&loaded, executable, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
-    assert_eq!(pending.operation().unwrap(), Some(absent));
+    assert_eq!(pending.operation().unwrap(), None);
     assert_eq!(
         worker.create(input(10_000), &mut meter()),
-        Err(owner::Error::Admission(Error::Busy))
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
+    let second = pending.operation().unwrap().unwrap();
+    assert_ne!(second, absent);
     sql(
         fixture,
         "DROP TRIGGER reject_owned_upload ON td_mta.upload_receipts",
+    );
+    // The next upload settles the absent receipt inline and publishes.
+    let proceeded = worker.create(input(10_000), &mut meter()).unwrap();
+    assert_eq!(proceeded.length, first.length);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "5"
     );
     let revoked =
         devices::prepare_revocation(binding.epoch(), binding.account(), creation.device_id(), 2)
@@ -13204,7 +13306,7 @@ fn exercise_http_upload_owner(
     assert_eq!(fresh.operation().unwrap(), None);
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
-        "2"
+        "5"
     );
 }
 

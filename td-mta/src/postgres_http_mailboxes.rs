@@ -7,9 +7,10 @@ use crate::{
     ids::{AccountId, DeviceId, MailboxId, MailboxOperationId, StoreEpoch},
     jmap_request::dispatch::MailboxMutator,
     ports::{Clock, CommitFailure, Deadline, Error},
+    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_mailbox_set::{self as changes, Change},
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
     store_fs::{
@@ -22,11 +23,12 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-/// One active or uncertain mutation. Retain this owner across HTTP requests.
+/// One active or uncertain mutation and the endpoint it was published to.
+/// Retain this owner across HTTP requests.
 /// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Change>>,
+    change: Mutex<Option<(Change, Endpoint)>>,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<MailboxOperationId>, Error> {
@@ -35,7 +37,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(Change::operation))
+            .map(|(change, _)| change.operation()))
     }
 }
 
@@ -47,7 +49,8 @@ pub struct Settled {
 }
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
-    /// Absence or any error retains the exact operation and keeps writes fenced.
+    /// A found receipt or proven absence releases the operation; any error
+    /// retains it and keeps writes fenced.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -60,9 +63,9 @@ impl Pending {
             return Err(Error::Invalid);
         }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
-        let Some(change) = pending.as_ref() else {
+        if pending.is_none() {
             return Ok(None);
-        };
+        }
         let now = Instant::now();
         let deadline = clock.deadline_instant(until)?.min(
             now.checked_add(Duration::from_secs(10))
@@ -71,33 +74,29 @@ impl Pending {
         if now >= deadline {
             return Err(Error::Deadline);
         }
-        let _slot = settlement_slots.acquire().map_err(|_| Error::Busy)?;
-        let dns_deadline = deadline.min(
-            now.checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses =
-            crate::postgres_resolver::resolve(executable, &loaded.bootstrap, dns_deadline)
-                .map_err(|error| match error {
-                    crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                    _ => Error::Dns,
-                })?;
-        for address in addresses {
-            let mut connection = loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            match changes::inspect(&connection, &loaded.trust, deadline, change) {
-                Ok(Some(outcome)) => {
-                    let operation = change.operation();
-                    *pending = None;
-                    return Ok(Some(Settled { operation, outcome }));
-                }
-                Ok(None) => return Ok(None),
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(map_error(error)),
-            }
-        }
-        Err(Error::Invalid)
+        settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
+}
+/// Inspect only at the retained endpoint; absence proves rollback (section 165).
+fn settle_held(
+    pending: &mut Option<(Change, Endpoint)>,
+    loaded: &Loaded,
+    slots: &ReadSlots,
+    deadline: Instant,
+) -> Result<Option<Settled>, Error> {
+    let Some((change, endpoint)) = pending.as_ref() else {
+        return Ok(None);
+    };
+    let _slot = slots.acquire().map_err(|_| Error::Busy)?;
+    let connection = settlement::request(loaded, *endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+        .map_err(map_error)?
+        .map(|outcome| Settled {
+            operation: change.operation(),
+            outcome,
+        });
+    *pending = None;
+    Ok(settled)
 }
 
 /// Borrows the request secret only during bounded synchronous publication.
@@ -248,7 +247,15 @@ impl Mailboxes<'_> {
         }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
         if pending.is_some() {
-            return Err(Error::Busy);
+            // Settle within this request's capped deadline, with a foreground
+            // slot it releases before taking its own.
+            settlement::charge(meter, self.clock, 1)?;
+            let inline = settlement::inline_deadline(deadline)?;
+            if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
+                || pending.is_some()
+            {
+                return Err(Error::Busy);
+            }
         }
         let _slot = self.slots.acquire().map_err(|_| Error::Busy)?;
         let mut results = Vec::new();
@@ -290,17 +297,16 @@ impl Mailboxes<'_> {
             crate::postgres_resolver::Error::Deadline => Error::Deadline,
             _ => Error::Dns,
         })?;
-        *pending = Some(change);
-        let change = pending.as_ref().ok_or(Error::Invalid)?;
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+        let mut endpoint = None;
         for address in addresses {
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
+            endpoint = Some(address);
+            let connection = settlement::request(self.loaded, address);
             outcome = changes::publish(
                 &connection,
                 &self.loaded.trust,
                 deadline,
-                change,
+                &change,
                 self.password,
             );
             if !matches!(
@@ -313,10 +319,10 @@ impl Mailboxes<'_> {
         match outcome {
             Ok(outcome) => {
                 if outcome.results.len() != count {
+                    *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
                     return Err(Error::Corrupt);
                 }
                 results.extend(outcome.results);
-                *pending = None;
                 Ok(Completion {
                     before_epoch: self.binding.epoch(),
                     before_sequence: Sequence::from_u64(outcome.old_sequence),
@@ -325,17 +331,17 @@ impl Mailboxes<'_> {
                     admission_stopped: false,
                 })
             }
-            Err(changes::Error::Indeterminate) => Ok(Completion {
-                before_epoch: self.binding.epoch(),
-                before_sequence: Sequence::from_u64(0),
-                outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
-                results,
-                admission_stopped: true,
-            }),
-            Err(error) => {
-                *pending = None;
-                Err(map_error(error))
+            Err(changes::Error::Indeterminate) => {
+                *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
+                Ok(Completion {
+                    before_epoch: self.binding.epoch(),
+                    before_sequence: Sequence::from_u64(0),
+                    outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
+                    results,
+                    admission_stopped: true,
+                })
             }
+            Err(error) => Err(map_error(error)),
         }
     }
 }

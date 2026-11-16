@@ -5,8 +5,9 @@ use crate::{
     device_credentials::Presented,
     ids::{AccountId, DeviceId, EmailId, IdentityId, StoreEpoch, SubmissionOperationId},
     ports::{self, Clock, Deadline},
+    postgres_http_settlement as settlement,
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, Endpoint, Mode},
     postgres_read::{self, ReadSlots},
     postgres_runtime_profile::Binding,
     postgres_submission_input as inputs,
@@ -30,11 +31,12 @@ impl From<ports::Error> for Error {
     }
 }
 
-/// One active or uncertain outgoing body. Retain across requests; no password
-/// survives the call. Runtime startup/recovery wiring belongs to cutover.
+/// One active or uncertain outgoing body and the endpoint it was published
+/// to. Retain across requests; no password survives the call. Runtime
+/// startup/recovery wiring belongs to cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Submission>>,
+    change: Mutex<Option<(Submission, Endpoint)>>,
 }
 
 #[derive(Debug)]
@@ -49,10 +51,11 @@ impl Pending {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(Submission::operation))
+            .map(|(change, _)| change.operation()))
     }
     /// Historical inspection only, using independent settlement capacity.
-    /// Absence and errors leave the original operation fenced and retained.
+    /// A found receipt or proven absence releases the operation; errors
+    /// leave it fenced and retained.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -65,27 +68,33 @@ impl Pending {
             return Err(ports::Error::Invalid.into());
         }
         let mut pending = self.change.try_lock().map_err(|_| ports::Error::Busy)?;
-        let Some(change) = pending.as_ref() else {
+        if pending.is_none() {
             return Ok(None);
-        };
-        let deadline = phase(clock, until)?;
-        let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-        for address in addresses(loaded, executable, deadline)? {
-            let mut connection = loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            match changes::inspect(&connection, &loaded.trust, deadline, change) {
-                Ok(Some(outcome)) => {
-                    let operation = change.operation();
-                    *pending = None;
-                    return Ok(Some(Settled { operation, outcome }));
-                }
-                Ok(None) => return Ok(None),
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(Error::Publication(error)),
-            }
         }
-        Err(ports::Error::Invalid.into())
+        let deadline = phase(clock, until)?;
+        settle_held(&mut pending, loaded, slots, deadline)
     }
+}
+/// Inspect only at the retained endpoint; absence proves rollback (section 165).
+fn settle_held(
+    pending: &mut Option<(Submission, Endpoint)>,
+    loaded: &Loaded,
+    slots: &ReadSlots,
+    deadline: Instant,
+) -> Result<Option<Settled>, Error> {
+    let Some((change, endpoint)) = pending.as_ref() else {
+        return Ok(None);
+    };
+    let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
+    let connection = settlement::request(loaded, *endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+        .map_err(Error::Publication)?
+        .map(|outcome| Settled {
+            operation: change.operation(),
+            outcome,
+        });
+    *pending = None;
+    Ok(settled)
 }
 
 pub struct Input {
@@ -141,7 +150,15 @@ impl Submissions<'_> {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?;
         if pending.is_some() {
-            return Err(ports::Error::Busy.into());
+            // Settle within this request's capped deadline, with a foreground
+            // slot it releases before taking its own.
+            settlement::charge(meter, self.clock, 1)?;
+            let inline = settlement::inline_deadline(deadline)?;
+            if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
+                || pending.is_some()
+            {
+                return Err(ports::Error::Busy.into());
+            }
         }
         // One outgoing body, capped at 32 MiB by input preparation, plus its
         // temporary verified source. No second request can prepare alongside it.
@@ -192,17 +209,16 @@ impl Submissions<'_> {
                 },
             )
             .map_err(stop)?;
-        *pending = Some(change);
-        let change = pending.as_ref().ok_or(ports::Error::Invalid)?;
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+        let mut endpoint = None;
         for address in addresses {
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
+            endpoint = Some(address);
+            let connection = settlement::request(self.loaded, address);
             outcome = changes::publish(
                 &connection,
                 &self.loaded.trust,
                 deadline,
-                change,
+                &change,
                 self.password,
             );
             if !matches!(
@@ -212,8 +228,8 @@ impl Submissions<'_> {
                 break;
             }
         }
-        if !matches!(outcome, Err(changes::Error::Indeterminate)) {
-            *pending = None;
+        if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
+            *pending = Some((change, endpoint));
         }
         outcome.map_err(Error::Publication)
     }

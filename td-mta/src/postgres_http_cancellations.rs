@@ -5,8 +5,9 @@ use crate::{
     device_credentials::Presented,
     ids::{AccountId, DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
     ports::{self, Clock, Deadline},
+    postgres_http_settlement as settlement,
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_route_owners::Claim,
     postgres_runtime_profile::Binding,
@@ -29,11 +30,12 @@ impl From<ports::Error> for Error {
     }
 }
 
-/// Retain across requests. Unknown COMMIT blocks another cancellation until
-/// historical settlement; no password or transport callback is retained.
+/// Retain across requests with the endpoint the operation was published to.
+/// Unknown COMMIT blocks another cancellation until historical settlement;
+/// no password or transport callback is retained.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Cancellation>>,
+    change: Mutex<Option<(Cancellation, Endpoint)>>,
 }
 #[derive(Debug)]
 pub struct Settled {
@@ -47,10 +49,11 @@ impl Pending {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(Cancellation::operation))
+            .map(|(change, _)| change.operation()))
     }
     /// Internal historical settlement using independent connection capacity.
-    /// Absence or errors retain the exact operation. This is not client auth.
+    /// A found receipt or proven absence releases the operation; errors
+    /// retain it. This is not client auth.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -63,36 +66,35 @@ impl Pending {
             return Err(ports::Error::Invalid.into());
         }
         let mut pending = self.change.try_lock().map_err(|_| ports::Error::Busy)?;
-        let Some(change) = pending.as_ref() else {
+        if pending.is_none() {
             return Ok(None);
-        };
-        let deadline = phase(clock, until)?;
-        let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-        for address in addresses(loaded, executable, deadline)? {
-            let mut connection = loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            match changes::inspect(&connection, &loaded.trust, deadline, change) {
-                Ok(Some(outcome)) => {
-                    let operation = change.operation();
-                    *pending = None;
-                    return Ok(Some(Settled { operation, outcome }));
-                }
-                Ok(None) => {
-                    // Frontend inspect holds the account lock behind the unknown
-                    // COMMIT: absence now proves rollback, not a live race.
-                    if change.frontend() {
-                        *pending = None;
-                    }
-                    return Ok(None);
-                }
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(Error::Publication(error)),
-            }
         }
-        Err(Error::Publication(changes::Error::Connection(
-            postgres_probe::Error::Transport,
-        )))
+        let deadline = phase(clock, until)?;
+        settle_held(&mut pending, loaded, slots, deadline)
     }
+}
+/// Inspect only at the retained endpoint. Frontend and route-owner inspection
+/// both take the account lock behind the unknown COMMIT, so absence proves
+/// rollback (POSTGRES.md section 165).
+fn settle_held(
+    pending: &mut Option<(Cancellation, Endpoint)>,
+    loaded: &Loaded,
+    slots: &ReadSlots,
+    deadline: Instant,
+) -> Result<Option<Settled>, Error> {
+    let Some((change, endpoint)) = pending.as_ref() else {
+        return Ok(None);
+    };
+    let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
+    let connection = settlement::request(loaded, *endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+        .map_err(Error::Publication)?
+        .map(|outcome| Settled {
+            operation: change.operation(),
+            outcome,
+        });
+    *pending = None;
+    Ok(settled)
 }
 pub struct Input {
     pub account: AccountId,
@@ -129,17 +131,6 @@ impl Cancellations<'_> {
         input: Input,
         meter: &mut Meter,
     ) -> Result<changes::Outcome, Error> {
-        if self.pending.operation()?.is_some() {
-            charge(meter, self.clock)?;
-            let original = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
-            self.pending.settle(
-                self.loaded,
-                self.executable,
-                self.slots,
-                self.clock,
-                input.deadline.min(original),
-            )?;
-        }
         self.publish(input, None, meter, |_| Ok(()))
     }
     fn publish(
@@ -172,7 +163,18 @@ impl Cancellations<'_> {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?;
         if pending.is_some() {
-            return Err(ports::Error::Busy.into());
+            // Settle within this request's capped limits, with a foreground
+            // slot it releases before taking its own. A frontend request
+            // reports a settlement failure; a route owner's is refused as busy.
+            charge(meter, self.clock)?;
+            let inline = settlement::inline_deadline(deadline)?;
+            let settled = settle_held(&mut pending, self.loaded, self.slots, inline);
+            if owner.is_none() {
+                settled?;
+            }
+            if pending.is_some() {
+                return Err(ports::Error::Busy.into());
+            }
         }
         charge(meter, self.clock)?;
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
@@ -189,25 +191,21 @@ impl Cancellations<'_> {
         }
         .map_err(Error::Publication)?;
         let addresses = addresses(self.loaded, self.executable, deadline)?;
-        *pending = Some(change);
-        let change = pending.as_ref().ok_or(ports::Error::Invalid)?;
         let close = Arc::new(close);
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
+        let mut endpoint = None;
         for (index, address) in addresses.into_iter().enumerate() {
             if index != 0 {
-                if let Err(error) = charge(meter, self.clock) {
-                    *pending = None;
-                    return Err(error.into());
-                }
+                charge(meter, self.clock)?;
             }
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
+            endpoint = Some(address);
+            let connection = settlement::request(self.loaded, address);
             let close = close.clone();
             outcome = changes::publish_authenticated(
                 &connection,
                 &self.loaded.trust,
                 deadline,
-                change,
+                &change,
                 self.password,
                 move |until| close(until),
             );
@@ -218,8 +216,8 @@ impl Cancellations<'_> {
                 break;
             }
         }
-        if !matches!(outcome, Err(changes::Error::Indeterminate)) {
-            *pending = None;
+        if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
+            *pending = Some((change, endpoint));
         }
         outcome.map_err(Error::Publication)
     }

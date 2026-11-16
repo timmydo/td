@@ -144,6 +144,7 @@ pub mod postgres_http_auth;
 pub mod postgres_http_cancellations;
 pub mod postgres_http_drafts;
 pub mod postgres_http_mailboxes;
+mod postgres_http_settlement;
 pub mod postgres_http_submissions;
 pub mod postgres_http_updates;
 mod postgres_http_upload_receive;

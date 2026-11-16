@@ -473,9 +473,12 @@ pub(super) fn exercise(
             let uncertain = client.ask(json!({"command":"flag", "id":email["id"]}));
             assert!(uncertain["ok"].is_true(), "queued intention: {uncertain}");
             let operation = pending.operation().unwrap().unwrap();
+            // The next write settles the rolled-back COMMIT's absent receipt
+            // inline, then publishes afresh and meets the same failure.
             let blocked = client.ask(json!({"command":"flag", "id":email["id"]}));
             assert!(blocked["ok"].is_true(), "queued intention: {blocked}");
-            assert_eq!(pending.operation().unwrap(), Some(operation));
+            let retried = pending.operation().unwrap().unwrap();
+            assert_ne!(retried, operation);
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"), "0");
             drop(client);
             let mut client = Client::start_with_state(&config, &runtime, &runtime.join("fresh-reader"));
@@ -484,12 +487,19 @@ pub(super) fn exercise(
             let settlement_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
             assert!(pending.settle(&loaded, executable, &settlement_slots, &clock,
                 Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap()).unwrap().is_none());
-            assert_eq!(pending.operation().unwrap(), Some(operation));
+            assert_eq!(pending.operation().unwrap(), None);
 
             let fresh = client.ask(json!({"command":"query_emails", "mailbox_id":folders[0]["id"], "limit":50}));
             assert!(fresh["ok"].is_true(), "{fresh}");
             assert!(!fresh["emails"][0]["is_flagged"].is_true());
             sql(fixture, "DROP TRIGGER refuse_client_commit ON td_mta.flag_receipts; DROP FUNCTION public.refuse_client_commit()");
+            let flagged = client.ask(json!({"command":"flag", "id":email["id"]}));
+            assert!(flagged["ok"].is_true(), "{flagged}");
+            assert_eq!(pending.operation().unwrap(), None);
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"), "1");
+            let restored = client.ask(json!({"command":"unflag", "id":email["id"]}));
+            assert!(restored["ok"].is_true(), "{restored}");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"), "0");
 
             let attachment = &email["attachments"][0];
             let download = client.ask(json!({"command":"download_attachment", "blob_id":attachment["blob_id"], "name":"bytes.bin"}));
@@ -511,7 +521,6 @@ pub(super) fn exercise(
         return;
     }
     // A separate owner exercises a lost acknowledgement whose receipt commits.
-    // The HTTP owner's absent receipt above remains fenced.
     let confirmed = td_mta::postgres_http_updates::Pending::default();
     let updates = td_mta::postgres_http_updates::Updates {
         loaded: &loaded,
@@ -876,6 +885,56 @@ pub(super) fn exercise(
         "0"
     );
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=3 AND object=decode('{recovered}','hex')")), "1");
+    // A folder COMMIT that outlives its deadline and then rolls back: the
+    // next folder write settles the absent receipt inline and proceeds.
+    sql(fixture, "CREATE FUNCTION public.rollback_folder_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_folder_commit AFTER INSERT ON td_mta.mailbox_create_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_folder_commit()");
+    let create = |milliseconds| {
+        let until = Deadline::after(clock.sample().unwrap().monotonic, milliseconds).unwrap();
+        let mut meter = td_mta::admission::work::Meter::new(
+            until,
+            td_mta::admission::work::Charge {
+                records: 10000,
+                io_bytes: 65536,
+                output_bytes: 65536,
+                ..Default::default()
+            },
+        );
+        td_mta::jmap_request::dispatch::MailboxMutator::create_mailboxes(
+            &folders,
+            td_mta::store_fs::MailboxCreateRequest {
+                account: binding.account(),
+                device: device.device_id(),
+                expected: None,
+                names: &["Rolled back"],
+                deadline: until,
+            },
+            &mut meter,
+        )
+    };
+    assert!(matches!(
+        create(2_000).unwrap().outcome,
+        Err(td_mta::ports::CommitFailure::Indeterminate(_))
+    ));
+    let absent = confirmed.mailboxes.operation().unwrap().unwrap();
+    assert!(matches!(
+        create(10_000),
+        Err(td_mta::store_fs::UploadError::Store(
+            td_mta::ports::Error::Busy
+        ))
+    ));
+    assert_eq!(confirmed.mailboxes.operation().unwrap(), Some(absent));
+    thread::sleep(Duration::from_secs(6));
+    sql(fixture, "DROP TRIGGER rollback_folder_commit ON td_mta.mailbox_create_receipts; DROP FUNCTION public.rollback_folder_commit()");
+    let name = "SELECT count(*) FROM td_mta.mailboxes WHERE name='Rolled back'";
+    assert_eq!(sql(fixture, name), "0");
+    let completion = create(10_000).unwrap();
+    assert!(completion.outcome.is_ok());
+    assert!(matches!(
+        completion.results.as_slice(),
+        [td_mta::store_fs::MailboxCreateResult::Created(_)]
+    ));
+    assert_eq!(confirmed.mailboxes.operation().unwrap(), None);
+    assert_eq!(sql(fixture, name), "1");
 }
 
 fn exercise_rule_projection(

@@ -1520,8 +1520,9 @@ Owner-side receipt inspection takes an account shared lock before looking for
 the result, excluding an earlier writer's still-pending COMMIT. Historical
 receipts resolve even after policy changes or revocation; this does not
 authorize another mutation. The API is not a client authentication endpoint.
-A missing receipt never authorizes a new operation identity after uncertainty.
 COMMIT loss returns Indeterminate and requires retaining the original Change.
+A missing receipt authorizes a new operation identity only once section 165
+proves the uncertain transaction rolled back.
 At 1024 receipts per account fresh operations refuse. Cold callers retain
 receipts for historical inspection; there is no age-based or arbitrary pruning.
 The HTTP owner retires its exact receipt only after confirmed publication or
@@ -1532,8 +1533,10 @@ operation again. Missing receipts settle a lost retirement acknowledgement.
 Retirement failures preserve the known successful response and keep this
 owner fenced until retirement succeeds; the next mutation retries cleanup
 before admitting a new operation. Unknown publication outcomes retain the
-original receipt and inspection-only settlement path. A process crash may
-leave orphan receipts; no live request sweeps another owner's records.
+original operation and its publication endpoint until inspection there finds
+the receipt or proves its absence; the next mutation settles inline before
+admitting a new operation. A process crash may leave orphan receipts; no
+live request sweeps another owner's records.
 Existing installations at the ceiling require the fenced, backed-up operator
 procedure in PRODUCTION.md before serving the new binary. All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
@@ -1637,7 +1640,8 @@ publication still committing. Repeated publication resolves the same operation
 before new policy/device admission; a matching historical receipt is known
 success, not current permission to download or import. A mismatched digest or
 malformed receipt refuses. Lost COMMIT response is Indeterminate: retain the
-same prepared upload and inspect/retry it after the original settles. The
+same prepared upload until inspection after the original transaction ended
+finds its receipt or proves its absence (section 165). The
 1024-receipt account bound is preparation-only until runtime retention and
 retry lifetimes are defined together.
 
@@ -1704,7 +1708,8 @@ Email creation, Thread creation/update and Mailbox update.
 Receipt inspection excludes a still-committing operation with an account
 shared lock. Matching historical success survives policy replacement and
 credential revocation without authorizing a new write. Lost COMMIT response
-requires retaining and resolving that same operation. Failure before commit
+requires retaining that same operation until inspection finds its receipt or
+proves its absence (section 165). Failure before commit
 rolls back bodies, ID reservation, metadata, usage and receipt together.
 This remains a cold storage API: HTTP dispatch, sender-identity policy,
 submission, runtime admission and the runtime integration remain work.
@@ -1862,7 +1867,8 @@ any mailbox. No generic hierarchy, rename or destroy flow is introduced.
 The complete receipt binds the canonical request and generated IDs and is
 checked before reauthorizing a fresh write. Owner-side inspection waits
 behind account publication; lost COMMIT response remains indeterminate until
-resolved with that same operation. Each account retains at most 1024 receipts;
+inspection of that same operation finds its receipt or proves its absence
+(section 165). Each account retains at most 1024 receipts;
 expiry/reclamation remains part of runtime integration work. Folder transactions have a
 one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
@@ -1923,8 +1929,9 @@ for their surviving owners. Counter underflow or inconsistency refuses the
 entire transaction. Blob identity tombstones remain, preventing ID reuse.
 Existing repeatable-read snapshots retain deleted metadata and body bytes.
 
-Lost COMMIT response remains indeterminate until the same retained operation
-resolves. Historical receipts remain inspectable after later policy change,
+Lost COMMIT response remains indeterminate until inspection of the same
+retained operation finds its receipt or proves its absence (section 165).
+Historical receipts remain inspectable after later policy change,
 revocation, object deletion or body retirement. This does not grant a fresh
 write or a new body read. Reclamation of retained leases, submissions and
 operation receipts remains runtime integration work.
@@ -2056,7 +2063,8 @@ The visible Email and its blind-recipient headers remain unchanged.
 Receipts are bounded to 1024 per account and retained independently of the
 source Email or queued submission. Concurrent publication of one retained
 operation serializes through the account row. Lost COMMIT responses remain
-indeterminate until primary receipt inspection resolves them; a digest
+indeterminate until receipt inspection on the publishing primary finds the
+receipt or proves its absence (section 165); a digest
 mismatch refuses replay. Historical success survives later revocation, source
 deletion or configuration replacement. Deleting the source after enqueueing
 does not cancel delivery or retire its separately owned outgoing body.
@@ -2806,35 +2814,54 @@ cannot invoke this mutation adapter. Draft creation remains outside this
 prepared endpoint; §80 connects mailbox moves and §81 connects deletion.
 
 One process-lifetime Pending owner serializes flag mutations without waiting.
-An uncertain COMMIT retains the exact Change and refuses new flag writes
-with a nonfatal busy response while reads continue;
-no new operation ID or transparent replay replaces it. Known outcomes survive
-late local deadline expiry. The owner contains no password. Production
-startup, receipt settlement/reclamation and restart recovery remain cutover
-requirements; this adapter is not a production serving entry point.
+An uncertain COMMIT retains the exact Change and its publication endpoint.
+The next flag write settles it first (section 79); while it stays uncertain,
+new flag writes get a nonfatal busy response and reads continue. No
+transparent replay replaces it. Known outcomes survive late local deadline
+expiry. The owner contains no password. Production startup, receipt
+reclamation and restart recovery remain cutover requirements; this adapter
+is not a production serving entry point.
 
 The real td-mail PostgreSQL fixture now marks read, stars, marks unread and
 unstars the delivered message, querying fresh state after every result. It
-also forces a COMMIT error and verifies a later write refuses without losing
-the original operation or stopping reads. Mailbox rights advertise seen and
+also forces a COMMIT error and verifies that the next write settles the
+absent receipt and publishes afresh without stopping reads, and that a write
+after the fault clears succeeds. Mailbox rights advertise seen and
 keyword updates; §80 adds membership rights while structural rights stay false.
 
 ## 79. Prepared flag receipt settlement
 
 Pending::settle inspects the exact retained Change under runtime-role
 qualification and the existing account lock that excludes a still-running
-COMMIT. It uses a separately supplied settlement connection allowance, fresh
-DNS and one original deadline capped at ten seconds. It borrows no app
-password and does not authorize or retry a mutation.
+COMMIT. It connects only to the endpoint the Change was published to, never
+resolving again or falling back, with a separately supplied settlement
+connection allowance and one original deadline capped at ten seconds. It
+borrows no app password and does not authorize or retry a mutation.
 
 A confirmed receipt returns its operation ID and complete original outcome,
-then releases the flag-write fence. Absence, deadline, DNS or database failure
+then releases the flag-write fence. Absence proves rollback (section 165)
+and releases the fence with nothing to return. Deadline or database failure
 preserves the original Change and fence. A confirmed success survives a late
 local deadline poll. The caller must retain the returned outcome as required
-by its own recovery workflow. Production scheduling, restart persistence and
-receipt reclamation remain runtime integration requirements.
+by its own recovery workflow.
 
-The real-client fixture checks absence does not clear uncertainty. A second
+Every HTTP write owner (sections 82, 84, 89, 101 and 130 name the others)
+runs the same settlement inline when a write meets its retained operation.
+It first prepays each connection settlement may open from the write's
+meter, 1088 records apiece: one inspection, plus the receipt retirement an
+Email operation needs once its receipt is found (a pending retirement
+prepays that one alone; a cancellation charges its section 130 ceilings
+instead). A refused charge returns that refusal, Capacity or Deadline,
+rather than busy. Settlement then runs under the write's deadline capped
+at three seconds, so an unreachable endpoint cannot hold the owner,
+worker and a foreground slot for the whole request, and that slot is
+released before the write takes its own. The write is admitted only if
+settlement empties the owner; otherwise it is refused as busy, except that
+a frontend cancellation reports the settlement failure (section 214).
+Restart persistence and receipt reclamation remain runtime integration
+requirements.
+
+The real-client fixture checks that absence clears uncertainty. A second
 prepared owner loses a COMMIT acknowledgement to a deadline and later settles
 the committed receipt while both foreground read slots are held, proving that
 settlement has separate connection admission.
@@ -2853,7 +2880,8 @@ Prepared HTTP mailbox rights advertise add/remove alongside seen/keyword
 updates. Section 82 connects root-folder creation. Rename and
 submission remain unsupported.
 The same uncertainty owner and settlement mechanism cover combined flag/move
-requests without new retry identities. The real-client fixture prepares an
+requests; a new operation identity follows only a found receipt or proven
+absence. The real-client fixture prepares an
 Archive folder through the existing storage helper, moves Inbox to Archive
 and back, checks database membership and unchanged flags, and queries the
 same Email/body ID after each move. This does not activate production serving.
@@ -2894,16 +2922,20 @@ Mixed method batches never enter this mutation path or native storage.
 
 A dedicated bounded owner retains one exact Change through uncertain COMMIT.
 It blocks further folder creation or deletion without stopping reads or independent Email
-writes. Receipt settlement uses separately admitted capacity and never retries
-creation with a new identity. Absence and errors preserve the owner; confirmed
-outcomes survive local expiry. The encompassing prepared mutation owner keeps
-both operation families across requests. Restart persistence, settlement
-scheduling and receipt reclamation remain required before runtime integration.
+writes. Receipt settlement inspects only the publishing endpoint, with
+separately admitted capacity or inline before the next folder write
+(section 79), and never republishes. A found receipt or proven absence
+releases the owner and errors preserve it; confirmed outcomes survive local
+expiry. The encompassing prepared mutation owner keeps both operation
+families across requests. Restart persistence and receipt reclamation remain
+required before runtime integration.
 
 Mailbox completion exposes only the original epoch and sequence, without a
 fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
 its duplicate, lists it and moves mail through it. A delayed creation COMMIT
-proves exact receipt settlement and one durable folder. Hierarchy creation and renaming remain outside this td-mail milestone.
+proves exact receipt settlement and one durable folder; a rolled-back one is
+released inline by the next creation. Hierarchy creation and renaming remain
+outside this td-mail milestone.
 Singleton deletion uses the same owner as described below.
 
 
@@ -2943,11 +2975,14 @@ before DNS. No app password survives the synchronous call. Other mutation
 families retain their independent bounded owners. Runtime memory-plan
 qualification and durable restart ownership remain runtime integration work.
 
-Uncertain COMMIT retains the original Draft and blocks new draft creation.
-Settlement uses separately admitted database capacity to inspect that exact
-receipt; absence or error preserves the owner. It does not publish again.
-The HTTP fixture creates and retrieves a draft, refuses a stale state without
-effects, downloads its immutable message and settles a delayed commit. This
+Uncertain COMMIT retains the original Draft and its publication endpoint
+and blocks new draft creation. Settlement inspects that exact receipt there,
+with separately admitted database capacity or inline before the next draft
+(section 79); a found receipt or proven absence releases the owner and an
+error preserves it. It does not publish again. The HTTP fixture creates and
+retrieves a draft, refuses a stale state without effects, downloads its
+immutable message, settles a delayed commit and releases a rolled-back one
+inline before the next draft. This
 activates no production service, attachment upload or submission capability.
 
 
@@ -3042,16 +3077,18 @@ other failures do not fall back to another profile.
 
 An uncertain COMMIT retains the exact immutable submission and fences another
 submission. The owner stores no application password. Its settlement method
-uses independent connection capacity and fresh resolution to inspect the
-historical receipt. Confirmed outcomes release the owner; absence and errors
-retain it. One outgoing body is bounded by preparation's 32 MiB cap, alongside
+uses independent connection capacity to inspect the historical receipt at
+the publishing endpoint, and the next submission settles inline (section 79).
+Confirmed outcomes and proven absence release the owner; errors retain it.
+One outgoing body is bounded by preparation's 32 MiB cap, alongside
 the temporary verified source during preparation. The HTTP mutation owner
 holds this submission owner separately from drafts and Email mutations.
 
 The local PostgreSQL fixture uses the restricted Runtime login to check
 publication, the submitting route, prepublication budget/device/deadline
-refusals, rollback, delayed COMMIT fencing, and exact receipt settlement while
-foreground capacity is occupied. JMAP dispatch, implicit success filing,
+refusals, rollback, delayed COMMIT fencing, exact receipt settlement while
+foreground capacity is occupied, and inline release of a rolled-back COMMIT
+before the next submission. JMAP dispatch, implicit success filing,
 durable startup ownership and capability activation remain separate work.
 
 ## 90. Prepared PostgreSQL Identity/get
@@ -3087,8 +3124,9 @@ The original request meter funds bounded membership inspection and history
 updates before effects. Fresh Runtime qualification, account/device checks,
 the current selected policy and the original deadline apply as for other
 Email writes. Uncertain filing retains its exact receipt operation in the
-same owner and fences subsequent Email mutations. Independent settlement
-capacity can recover it without obtaining another application password.
+same owner and fences subsequent Email mutations until settlement, inline
+before the next one (section 79) or with independent capacity, without
+obtaining another application password.
 
 The local PostgreSQL fixture verifies exhausted work, transaction rollback
 without queue or draft loss, delayed-COMMIT fencing, settlement with occupied
@@ -3247,10 +3285,12 @@ immutable body on uncertain COMMIT. Publication rechecks current device and
 profile policy. Known outcomes release the owner; uncertainty keeps the exact
 operation and refuses another upload. No password survives the call.
 
-Receipt settlement uses fresh runtime-qualified connections and separate
-connection capacity. A confirmed receipt releases the fence and returns the
-original operation/outcome. Absence, timeout or connection failure preserves
-it; settlement does not replay or authorize publication. The runtime caller
+Receipt settlement uses a runtime-qualified connection to the publishing
+endpoint only, with separate connection capacity or inline at the next
+upload's admission (section 79). A confirmed receipt releases the fence and
+returns the original operation/outcome; proven absence releases it with
+nothing to return. Timeout or connection failure preserves it; settlement
+does not replay or authorize publication. The runtime caller
 still owns ingress memory, response retention and startup/recovery scheduling.
 No HTTPS upload endpoint or production backend is activated by this owner.
 
@@ -3265,8 +3305,10 @@ is used for an upload.
 
 The prepared PostgreSQL HTTPS adapter receives length-delimited or chunked
 upload bytes on the fixed body worker. One ingress permit excludes another
-body or preparation on that pending owner; an uncertain upload refuses before
-100 Continue or body allocation. The original request meter prepays bounded
+body or preparation on that pending owner. Admission first settles an
+uncertain upload under the request's meter and body deadline; one that stays
+uncertain refuses before 100 Continue or body allocation. The original
+request meter prepays bounded
 ingress and response storage, charges wire/decoded input, and carries through
 preparation/publication. Body idle, transfer and original deadlines never
 extend each other. No SQL transaction spans peer input. Publication rechecks
@@ -4011,13 +4053,16 @@ closure but before COMMIT can retry the same operation. It still performs no
 SQL or SMTP round trips and is invoked only after complete reservation.
 
 Known success or refusal releases the prepared operation; unknown COMMIT
-retains it and refuses another cancellation. Independent settlement capacity
-only inspects the exact historical receipt. Absence, deadline and errors keep
-it retained. Confirmation releases it without credentials or a transport
-callback, including after device revocation. Neither password nor callback
-survives the foreground call. These are internal owner APIs, not a public
-settlement endpoint; production dispatch, relay-worker ownership/restart
-custody and runtime integration remain separate work.
+retains it with its publication endpoint. The next cancellation settles it
+inline (section 214); a route-owner cancellation is refused as busy while it
+stays uncertain. Settlement only inspects the exact historical receipt at
+that endpoint; a found receipt or proven absence (section 165) releases it,
+while deadline and errors keep it retained. Confirmation releases it
+without credentials or a transport callback, including after device
+revocation. Neither password nor callback survives the foreground call.
+These are internal owner APIs, not a public settlement endpoint; production
+dispatch, relay-worker ownership/restart custody and runtime integration
+remain separate work.
 
 ## 131. Borrowed cancellation patch decoding
 
@@ -4989,13 +5034,34 @@ the scheduler's next turn finds a committed attempt through active-attempt
 discovery and otherwise dispatches anew. The relay's route success and
 repair loop treats absence the same way.
 
+The fixed HTTPS worker's owners obey the same order and treat absence the
+same way: Email update, deletion and filing, folder, draft, upload,
+submission and cancellation (sections 32, 35, 37, 42, 44, 48, 91 and 214).
+Each retains an uncertain operation with the endpoint its COMMIT went to
+and inspects only there, never resolving again or falling back, because
+the share lock proves nothing on another server. The next write in that
+family settles inline (section 79). A found receipt or absence releases the
+owner; the owner never republishes the absent operation, and the client
+decides whether to issue its request again.
+
+Once released, the family is no longer fenced, and the server does not
+deduplicate a second draft or submission of the same Email. A client whose
+create response was lost must therefore reconcile before retrying, as
+td-mail does for submissions by querying its identity and sendAt interval
+(DESIGN.md). A pinned endpoint that disappears, as after failover to a new
+address, or a settlement error that persists keeps the family refusing
+until restart; each write in it pays for and waits out the capped
+settlement attempt first.
+
 The proof needs four things this design must keep: every publisher of these
 kinds locks the account row FOR UPDATE before COMMIT and every inspector
 locks it FOR SHARE before reading the receipt; lock and statement timeouts
 surface as errors, which retain custody; all of them use the single pinned
-primary; and no path deletes such a receipt while its operation can still be
-pending, beyond the bounded sweeps of sections 52, 123 and 216. Any further
-sweep of attempt, phase, recovery or expiry receipts must respect that.
+primary, and an HTTP owner inspects only the endpoint it published to; and
+no path deletes such a receipt while its operation can still be pending,
+beyond the bounded sweeps of sections 52, 123 and 216 and an Email owner's
+retirement of its own confirmed receipt. Any further sweep of attempt,
+phase, recovery, expiry or HTTP-family receipts must respect that.
 
 This is a bounded settlement job, not a renewal of any expired transport owner.
 No production scheduler or backend is activated.
@@ -6689,11 +6755,12 @@ attempt does not clear route failures as a successful delivery.
 The HTTPS worker retains one unknown operation. Before another cancellation
 it charges and inspects that receipt under the original request/meter
 limits. Receipt inspection takes the account lock behind the unknown COMMIT:
-Stored confirms success; absence proves rollback and releases the frontend
-pending slot. Restart needs no local journal: durable canceled state is an
-idempotent update, and a rolled-back request can be issued again. No password
-or transport callback is retained. Existing route-owner callers retain their
-historical settlement contract.
+Stored confirms success; absence proves rollback (section 165) and releases
+the pending slot, for frontend and route-owner operations alike. A frontend
+request reports a settlement failure; a route owner's is refused as busy.
+Restart needs no local journal: durable canceled state is an idempotent
+update, and a rolled-back request can be issued again. No password or
+transport callback is retained.
 
 Native qualification covers both prepared-owner and frontend JMAP dispatch,
 state mismatch, cannotUnsend, a thousand recipients, repeated cancellation,
@@ -6868,8 +6935,8 @@ admits. Relay operations on these kinds are settled before the worker does
 anything else, and none targets a submission completed 30 days earlier; a
 settlement that outlived that would read absence, release custody, and its
 republication would find the attempt or submission Missing. An HTTP
-submission settlement that outlived it reads absence and keeps the
-operation fenced (section 165 does not cover that path yet). A cancellation
+submission settlement that outlived it reads absence and releases the
+owner, which never republishes, so only the fence lifts. A cancellation
 of an old Failed group whose COMMIT response was lost, settled after the
 group retired, reads absence and its retry reports notFound, although the
 cancellation took effect.

@@ -8,8 +8,9 @@ use crate::{
     jmap_request::dispatch::EmailMutator,
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_email_set::{self as changes, deletion, filing, Change},
+    postgres_http_settlement as settlement,
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
+    postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
     store_fs::{
@@ -162,11 +163,12 @@ struct Completion {
     admission_stopped: bool,
 }
 
-/// One active or uncertain mutation. Retain this owner across HTTP requests.
+/// One active or uncertain mutation and the endpoint it was published to.
+/// Retain this owner across HTTP requests.
 /// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<Operation>>,
+    change: Mutex<Option<(Operation, Endpoint)>>,
     pub mailboxes: crate::postgres_http_mailboxes::Pending,
     pub drafts: crate::postgres_http_drafts::Pending,
     pub submissions: crate::postgres_http_submissions::Pending,
@@ -180,7 +182,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(Operation::operation))
+            .map(|(change, _)| change.operation()))
     }
 }
 
@@ -192,7 +194,8 @@ pub struct Settled {
 }
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
-    /// Absence or any error retains the exact operation and keeps writes fenced.
+    /// A found receipt becomes retirement custody and absence proves rollback;
+    /// either releases the uncertain fence. Any error retains the operation.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -216,57 +219,39 @@ impl Pending {
         if now >= deadline {
             return Err(Error::Deadline);
         }
-        let _slot = settlement_slots.acquire().map_err(|_| Error::Busy)?;
-        let dns_deadline = deadline.min(
-            now.checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses =
-            crate::postgres_resolver::resolve(executable, &loaded.bootstrap, dns_deadline)
-                .map_err(|error| match error {
-                    crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                    _ => Error::Dns,
-                })?;
-        let mut confirmed = None;
-        for address in addresses {
-            let mut connection = loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
-            let change = pending.as_ref().ok_or(Error::Invalid)?;
-            match change.inspect(&connection, &loaded.trust, deadline) {
-                Ok(Some(outcome)) => {
-                    let operation = change.operation();
-                    let retiring = pending
-                        .take()
-                        .ok_or(Error::Invalid)?
-                        .confirmed(outcome.clone());
-                    *pending = Some(retiring);
-                    confirmed = Some(Settled { operation, outcome });
-                    match pending.as_ref().ok_or(Error::Invalid)?.retire(
-                        &connection,
-                        &loaded.trust,
-                        deadline,
-                    ) {
-                        Ok(()) => {
-                            *pending = None;
-                            return Ok(confirmed);
-                        }
-                        Err(changes::Error::Connection(postgres_probe::Error::Transport)) => {
-                            continue
-                        }
-                        Err(_) => return Ok(confirmed),
-                    }
-                }
-                Ok(None) => return Ok(None),
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(map_error(error)),
-            }
-        }
-        if confirmed.is_some() {
-            Ok(confirmed)
-        } else {
-            Err(Error::Invalid)
-        }
+        settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
+}
+/// Inspect and retire only at the retained endpoint (section 165).
+fn settle_held(
+    pending: &mut Option<(Operation, Endpoint)>,
+    loaded: &Loaded,
+    slots: &ReadSlots,
+    deadline: Instant,
+) -> Result<Option<Settled>, Error> {
+    let Some((change, endpoint)) = pending.as_ref() else {
+        return Ok(None);
+    };
+    let endpoint = *endpoint;
+    let _slot = slots.acquire().map_err(|_| Error::Busy)?;
+    let connection = settlement::request(loaded, endpoint);
+    let Some(outcome) = change
+        .inspect(&connection, &loaded.trust, deadline)
+        .map_err(map_error)?
+    else {
+        *pending = None;
+        return Ok(None);
+    };
+    let operation = change.operation();
+    let (change, _) = pending.take().ok_or(Error::Invalid)?;
+    let retiring = change.confirmed(outcome.clone());
+    if retiring
+        .retire(&connection, &loaded.trust, deadline)
+        .is_err()
+    {
+        *pending = Some((retiring, endpoint));
+    }
+    Ok(Some(Settled { operation, outcome }))
 }
 
 /// Borrows the request secret only for this synchronous call. No background SQL.
@@ -445,21 +430,24 @@ impl Updates<'_> {
         if Instant::now() >= deadline {
             return Err(Error::Deadline);
         }
-        let retiring = matches!(
-            self.pending
-                .change
-                .try_lock()
-                .map_err(|_| Error::Busy)?
-                .as_ref(),
-            Some(Operation::Retiring(_))
-        );
-        if retiring {
-            self.pending
-                .settle(self.loaded, self.executable, self.slots, self.clock, until)?;
-        }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
-        if pending.is_some() {
-            return Err(Error::Busy);
+        if let Some((change, _)) = pending.as_ref() {
+            // Settle within this request's capped deadline with a foreground
+            // slot it releases before taking its own. A found receipt costs a
+            // retirement connection after the inspection; a retirement retries
+            // with that one alone.
+            let connections = if matches!(change, Operation::Retiring(_)) {
+                1
+            } else {
+                2
+            };
+            settlement::charge(meter, self.clock, connections)?;
+            let inline = settlement::inline_deadline(deadline)?;
+            if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
+                || pending.is_some()
+            {
+                return Err(Error::Busy);
+            }
         }
         let _slot = self.slots.acquire().map_err(|_| Error::Busy)?;
         let change = request.input.prepare(
@@ -481,14 +469,11 @@ impl Updates<'_> {
             crate::postgres_resolver::Error::Deadline => Error::Deadline,
             _ => Error::Dns,
         })?;
-        *pending = Some(change);
-        let change = pending.as_ref().ok_or(Error::Invalid)?;
         let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut publication_address = None;
+        let mut endpoint = None;
         for address in addresses {
-            publication_address = Some(address);
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = Mode::Runtime;
+            endpoint = Some(address);
+            let connection = settlement::request(self.loaded, address);
             outcome = change.publish(&connection, &self.loaded.trust, deadline, self.password);
             if !matches!(
                 outcome,
@@ -499,6 +484,8 @@ impl Updates<'_> {
         }
         match outcome {
             Ok(outcome) => {
+                let endpoint = endpoint.ok_or(Error::Invalid)?;
+                *pending = Some((change, endpoint));
                 // Allocate before effects; preserve a known commit after deadline.
                 if outcome.results.len() != request.input.len() {
                     return Err(Error::Corrupt);
@@ -510,22 +497,14 @@ impl Updates<'_> {
                 {
                     return Err(Error::Corrupt);
                 }
-                let confirmed = pending
-                    .take()
-                    .ok_or(Error::Invalid)?
-                    .confirmed(outcome.clone());
-                *pending = Some(confirmed);
-                if let Some(address) = publication_address {
-                    let mut connection = self.loaded.bootstrap.request(address);
-                    connection.mode = Mode::Runtime;
-                    if pending
-                        .as_ref()
-                        .ok_or(Error::Invalid)?
-                        .retire(&connection, &self.loaded.trust, deadline)
-                        .is_ok()
-                    {
-                        *pending = None;
-                    }
+                let (change, _) = pending.take().ok_or(Error::Invalid)?;
+                let confirmed = change.confirmed(outcome.clone());
+                let connection = settlement::request(self.loaded, endpoint);
+                if confirmed
+                    .retire(&connection, &self.loaded.trust, deadline)
+                    .is_err()
+                {
+                    *pending = Some((confirmed, endpoint));
                 }
                 Ok(Completion {
                     before_sequence: Sequence::from_u64(outcome.state.old_sequence),
@@ -534,16 +513,16 @@ impl Updates<'_> {
                     admission_stopped: false,
                 })
             }
-            Err(changes::Error::Indeterminate) => Ok(Completion {
-                before_sequence: Sequence::from_u64(0),
-                outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
-                results: Vec::new(),
-                admission_stopped: true,
-            }),
-            Err(error) => {
-                *pending = None;
-                Err(map_error(error))
+            Err(changes::Error::Indeterminate) => {
+                *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
+                Ok(Completion {
+                    before_sequence: Sequence::from_u64(0),
+                    outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
+                    results: Vec::new(),
+                    admission_stopped: true,
+                })
             }
+            Err(error) => Err(map_error(error)),
         }
     }
 }

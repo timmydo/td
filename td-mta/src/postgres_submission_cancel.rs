@@ -361,13 +361,18 @@ pub fn inspect(
     value: &Cancellation,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             begin(client, &value, false, false).await?;
             receipt(client, &value).await
         })
     })
-    .map_err(Error::Connection)?
+    .map_err(Error::Connection)?;
+    // A late absence or error is not proof; a found receipt survives.
+    if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
+    result
 }
 
 /// Locally abort/fence the owned route transport in `close`, without database
