@@ -112,7 +112,8 @@ impl Connection<'_, '_> {
     }
 }
 /// Retain for the relay worker's lifetime. An unresolved COMMIT blocks another
-/// acquisition, attempt, phase or expiry; settlement inspects the exact receipt.
+/// acquisition, attempt, phase or expiry until settlement inspects the exact
+/// receipt and finds it or proves it absent.
 #[derive(Default)]
 pub struct Pending {
     operation: Mutex<Option<Operation>>,
@@ -163,8 +164,13 @@ impl Pending {
             .as_ref()
             .map(Operation::identity))
     }
-    /// Use independently reserved settlement slots. Absence and every error
-    /// retain custody. A receipt is historical and cannot authorize SMTP.
+    /// Use independently reserved settlement slots. Every error retains
+    /// custody; a found receipt or proven absence releases it. Inspection
+    /// takes the account share lock, which waits for the uncertain transaction:
+    /// it held the account write lock when it sent COMMIT, so absence means it
+    /// rolled back (or, where a receipt kind expires, outlived its retention).
+    /// The caller then republishes the same value or rederives from durable
+    /// state. A receipt is historical and cannot authorize SMTP.
     pub fn settle(
         &self,
         connection: &Connection<'_, '_>,
@@ -221,9 +227,7 @@ impl Pending {
                     .map(Settlement::RouteClaim)
             }
         };
-        if outcome.is_some() {
-            *pending = None;
-        }
+        *pending = None;
         Ok(outcome)
     }
 }

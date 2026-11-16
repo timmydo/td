@@ -421,6 +421,51 @@ pub(super) fn exercise(
     .unwrap();
     sql(fixture,&format!("UPDATE td_mta.submissions SET completed_at=NULL,notification=0 WHERE id={sub}; UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    // An unknown COMMIT that rolled back: settlement's account share lock
+    // waits for it, then proves the receipt absent and releases custody.
+    sql(fixture,"CREATE FUNCTION public.rollback_dispatch_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_dispatch_worker AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_dispatch_worker()");
+    assert_eq!(
+        worker
+            .publish_prepared(claim, generation, input(1500, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Publication(attempts::Error::Indeterminate))
+    );
+    let Identity::Attempt(rolled_back) = pending.identity().unwrap().unwrap() else {
+        panic!("expected pending attempt");
+    };
+    // While it is still running, inspection cannot take the account share
+    // lock and keeps custody.
+    assert_eq!(
+        pending
+            .settle(&settle, until(10_000), &mut meter())
+            .map(|_| ()),
+        Err(Error::Publication(attempts::Error::Owner(
+            owners::Error::Busy
+        )))
+    );
+    assert_eq!(
+        pending.identity().unwrap(),
+        Some(Identity::Attempt(rolled_back))
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        pending
+            .settle(&settle, until(10_000), &mut meter())
+            .unwrap(),
+        None
+    );
+    assert_eq!(pending.identity().unwrap(), None);
+    assert_eq!(
+        sql(
+            fixture,
+            &format!("SELECT count(*) FROM td_mta.submission_attempts WHERE attempt_id=decode('{rolled_back}','hex')")
+        ),
+        "0"
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER rollback_dispatch_worker ON td_mta.submission_attempts",
+    );
     sql(fixture,"CREATE FUNCTION public.delay_dispatch_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_dispatch_worker AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_dispatch_worker()");
     assert_eq!(
         worker
@@ -497,19 +542,6 @@ pub(super) fn exercise(
         pending.identity().unwrap(),
         Some(Identity::Attempt(attempt))
     );
-    // Absence is not proof that the original commit cannot still complete.
-    sql(fixture,&format!("CREATE TABLE public.dispatch_worker_receipt AS SELECT * FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')"));
-    assert_eq!(
-        pending
-            .settle(&settle, until(10_000), &mut meter())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        pending.identity().unwrap(),
-        Some(Identity::Attempt(attempt))
-    );
-    sql(fixture,"INSERT INTO td_mta.submission_attempts SELECT * FROM public.dispatch_worker_receipt; DROP TABLE public.dispatch_worker_receipt");
     let sequence = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
@@ -596,18 +628,6 @@ pub(super) fn exercise(
         pending.settle(&settle, until(10_000), &mut empty),
         Err(Error::Admission(ports::Error::Capacity))
     );
-    sql(fixture,&format!("CREATE TABLE public.phase_worker_receipt AS SELECT * FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex')"));
-    assert_eq!(
-        pending
-            .settle(&settle, until(10_000), &mut meter())
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        pending.identity().unwrap(),
-        Some(Identity::Attempt(attempt))
-    );
-    sql(fixture,"INSERT INTO td_mta.attempt_phase_receipts SELECT * FROM public.phase_worker_receipt; DROP TABLE public.phase_worker_receipt");
     let sequence = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",

@@ -2132,9 +2132,9 @@ receipt swept by another acquisition and then acquires afresh under a higher
 generation; the unused earlier generation was never live authority, since
 every fence compares the owner row's generation, boot and operation.
 Otherwise the old receipt replays, observation reports it stale and the relay
-replaces the claim. Any inspect-only settlement of an acquisition (section
-191) must finish within that hour, as receipt absence afterwards no longer
-shows the acquisition was not committed.
+replaces the claim. Inspect-only settlement of an acquisition (section 191)
+after that hour may read an expired receipt as absent; it then releases
+custody, and the retried acquisition takes a fresh generation as above.
 
 The cap therefore bounds acquisitions in any hour plus one lease, not per
 account lifetime. The relay releases on every exit and acquires once per
@@ -4243,8 +4243,9 @@ There is no waiter queue, address fallback or hidden DNS operation.
 Known success transfers the opaque Dispatch and passive receipt to the caller;
 known refusal releases the prepared identity. Unknown COMMIT retains exactly
 that Dispatch and refuses another publication. Independent settlement capacity
-only inspects the retained receipt: absence and errors keep it, and a matching
-receipt releases custody without changing account state. Settlement never
+only inspects the retained receipt: errors keep it, a matching receipt
+releases custody without changing account state, and proven absence (section
+165) releases it so the scheduler rederives from durable state. Settlement never
 republishes, constructs a replacement attempt or authorizes SMTP. Recovery and
 current transport admission remain separate operations.
 
@@ -4257,8 +4258,9 @@ Production scheduler wiring and runtime integration remain separate work.
 
 The real PostgreSQL fixture checks preparation-mode refusal, exhausted work,
 original deadlines, startup retry hold, fresh publication and envelope access,
-unknown-COMMIT blocking, retained absence/deadline/capacity failures, and
-historical settlement without a second account-sequence increment.
+unknown-COMMIT blocking, retained deadline/capacity failures, released
+custody after a rolled-back COMMIT, and historical settlement without a
+second account-sequence increment.
 
 ## 140. Bounded relay phase publication custody
 
@@ -4266,9 +4268,12 @@ The prepared dispatch worker uses one shared pending-operation slot for
 attempt preparation and durable Body, AcceptancePossible or result changes.
 An uncertain commit of either kind blocks both kinds of publication. The
 retained operation includes its exact attempt, phase, subset, replies and
-digest; settlement only inspects that operation's receipt. Absence, admission
-refusal and database errors retain it. A matching receipt releases custody
-and returns a tagged historical result without a second state mutation.
+digest; settlement only inspects that operation's receipt. Admission refusal
+and database errors retain it. A matching receipt releases custody and
+returns a tagged historical result without a second state mutation; proven
+absence (section 165) releases it. Passive evidence changes are then
+published afresh; a live Body or AcceptancePossible plan was consumed with
+its closed transport, so the relay falls back to recovery from durable phase.
 
 Phase publication and settlement prepay three MiB plus 128 KiB of I/O and
 4096 records, covering the two bounded connections, their protocol input,
@@ -4964,16 +4969,41 @@ owner used by dispatch, phase and route-failure publication (section 184).
 All new dispatch, phase, recovery, route-failure and final-capacity work
 stays blocked. Settlement prepays fresh work
 and uses the caller's independent settlement slots to inspect that exact
-receipt; absence or error retains custody, and only a found receipt clears it.
-Settlement never republishes or creates continuing SMTP authority. This is a
-bounded settlement job, not a renewal of any expired transport owner.
+receipt; an error retains custody, and a found receipt or proven absence
+clears it. Settlement never republishes or creates continuing SMTP authority.
+
+Absence is proof because of lock order. Every publication this barrier holds
+(attempt, phase, recovery, route failure, route acquisition, expiry) takes
+the account row FOR UPDATE before it writes its receipt and sends COMMIT,
+and every inspection takes that row FOR SHARE before it reads the receipt
+under a fresh READ COMMITTED snapshot. Settlement starts only after the
+uncertain call returned, so its share lock waits until the uncertain
+transaction committed or rolled back, and a missing receipt then means it
+rolled back; a receipt kind with bounded retention (sections 52 and 123) can
+also read absent once it expired. Either way the operation is not retained,
+and holding the barrier would only wedge the worker while it keeps renewing
+its lease. The caller then publishes the same passive change afresh, under
+the same fences as any first publication, or rederives from durable state:
+the scheduler's next turn finds a committed attempt through active-attempt
+discovery and otherwise dispatches anew. The relay's route success and
+repair loop treats absence the same way.
+
+The proof needs four things this design must keep: every publisher of these
+kinds locks the account row FOR UPDATE before COMMIT and every inspector
+locks it FOR SHARE before reading the receipt; lock and statement timeouts
+surface as errors, which retain custody; all of them use the single pinned
+primary; and no path deletes such a receipt while its operation can still be
+pending, beyond the bounded sweeps of sections 52 and 123. A future sweep of
+attempt, phase, recovery or expiry receipts must respect that.
+
+This is a bounded settlement job, not a renewal of any expired transport owner.
 No production scheduler or backend is activated.
 
 The real PostgreSQL fixture checks runtime mode, budget/deadline/slot refusal,
 exact work charging, known rollback and retry, delayed COMMIT, blocked new
-work, missing-receipt retention and historical settlement while ordinary
-capacity is occupied. It verifies preserved positive replies, attempt
-retirement, and an unchanged account sequence during receipt inspection.
+work and historical settlement while ordinary capacity is occupied. It
+verifies preserved positive replies, attempt retirement, and an unchanged
+account sequence during receipt inspection.
 
 ## 166. RCPT collection bound to admitted envelope custody
 
@@ -5574,19 +5604,21 @@ Each step runs at most one bounded publication or exact receipt inspection.
 Health must complete before recovery retires recipients. A known failure
 retains that publication stage for explicit retry. An unknown health or
 recovery COMMIT moves the exact request into the existing Pending barrier
-and switches the continuation permanently to receipt inspection for that
-stage. Missing receipts and errors never permit republication. A validated
+and switches the continuation to receipt inspection for that stage. Errors
+keep inspecting; a receipt proven absent (section 165) returns the stage to
+publication of the same request, which the still-active attempt admits
+idempotently. A validated
 health receipt advances to recovery; only validated recovery completion
 returns the combined passive outcome. Repeated completed steps do no I/O.
 
 The continuation never accepts public Settlement data as authority. It
 inspects its own retained request and matches an occupied Pending slot by
 private request identity, not merely attempt ID; another operation refuses
-Busy. If ordinary Pending.settle already found a receipt and cleared the
-slot, the continuation reinstalls its exact request and inspects it again.
-Empty Pending proves neither success nor rollback. Inspection and matching
-slot clearance occur under the existing Pending mutex. No second pending
-queue is introduced.
+Busy. If ordinary Pending.settle already cleared the slot, by a found receipt or
+proven absence, the continuation reinstalls its exact request and inspects it
+again. Empty Pending alone proves neither success nor rollback. Inspection
+and matching slot clearance occur under the existing Pending mutex. No second
+pending queue is introduced.
 
 After transport is fenced, passive steps may receive fresh bounded deadlines
 and work even when the original SMTP cap has expired. Runtime admission,
@@ -5598,7 +5630,7 @@ transport permission can be reconstructed from this continuation.
 
 Native PostgreSQL/TLS cases cover actual AUTH refusal and its repair hold,
 Network backoff, TLS repair hold, settlement after SMTP expiry, known health
-and recovery rollback, delayed commits and missing receipts, generic
+and recovery rollback, delayed and rolled-back commits, generic
 settlement followed by exact reinspection, budget/deadline/slot refusal,
 ordinary-slot occupancy during inspection, unrelated Pending preservation,
 and recovery expiry-wait marker. They assert health before retirement, one health
@@ -5854,10 +5886,12 @@ Pending::identity replaces its attempt-only accessor with a closed identity
 sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and route
 failure identities are unchanged. Pending::settle uses independently admitted
 capacity to inspect the retained claim receipt, with no acquisition replay.
-Absence and errors preserve custody; a matching receipt clears it and returns
-Settlement::RouteClaim. The receipt is retained only for section 52's hour
-after its lease, so a production caller must settle within that bound or
-settle by replaying the acquisition; this path has only test callers. The
+Errors preserve custody; a matching receipt clears it and returns
+Settlement::RouteClaim, and proven absence (section 165) clears it without a
+settlement. The receipt is retained only for section 52's hour after its
+lease, so absence settled later may also mean an expired receipt; the
+caller's retried acquisition then takes a fresh generation, which is safe
+under section 52. This path has only test callers. The
 grant is historical evidence only, even when returned by a known
 acquisition. Fresh current-owner and attempt admission
 must still precede SMTP, and an expired or released receipt cannot revive an
@@ -5867,8 +5901,7 @@ The native route-owner fixture exercises short and nonrenewing budgets,
 expired input/meter deadlines, mode refusal, ordinary/settlement slot pressure,
 known stale receipt replay, definite busy refusal and delayed acquisition
 COMMIT. All candidate kinds and further worker publication refuse while the
-claim remains unresolved. Removing the receipt temporarily proves absence
-cannot clear Pending; restoration permits inspection-only settlement. These
+claim remains unresolved, and inspection-only settlement then clears it. These
 cases preserve account sequence and leave both slot pools reusable.
 
 ## 192. Admitted expiry and retained uncertainty
@@ -5885,8 +5918,9 @@ before SQL; its public identity is `Identity::Expiry(SubmissionExpiryId)`.
 Known publication or historical replay returns the outcome and clears
 custody; definite failure clears custody; an unknown COMMIT retains the
 operation and excludes every further worker operation. Independent settlement
-capacity can inspect only that exact receipt. Absence and errors retain the
-barrier; `Settlement::Expiry` clears it only on a matching historical outcome.
+capacity can inspect only that exact receipt. Errors retain the barrier;
+`Settlement::Expiry` clears it on a matching historical outcome, and proven
+absence (section 165) clears it for the next expiry turn to rederive.
 Settlement never retries publication or changes recipient state.
 
 The underlying expiry transaction retains fresh policy and owner fencing,
@@ -5902,7 +5936,7 @@ The native submission fixture starts a real runtime clock and database-UTC
 guard during setup, waits out any remaining hold while renewing the current route lease,
 then explicitly confirms
 it before the expiry exercise. It drives the existing delayed-COMMIT expiry
-through this worker, including absent-receipt retention, separate settlement
+through this worker, including separate settlement
 capacity, blocked worker operations, pre-SQL admission refusals, unconfirmed
 clock refusal, historical replay, nonrenewing budgets and reclaimed slots.
 The existing recipient-state and sequence assertions remain in force.
@@ -6533,9 +6567,11 @@ Restart recovery uses the previous generation; locally abandoned Prepared
 attempts use current-owner interruption after transport closure. Possible
 acceptance remains uncertain. Known MAIL/DATA/final refusal and RCPT evidence
 are settled before generic recovery. Unknown COMMIT retains the exact Pending
-owner and blocks subsequent work until its receipt is observed. No absent
-receipt authorizes replay. A requested stop may abandon unresolved custody;
-durable phase recovery on restart remains conservative.
+owner and blocks subsequent work until its receipt is observed or proven
+absent (section 165). Absence authorizes no SMTP replay: the step republishes
+the same durable change or rederives from durable state, and active-attempt
+discovery still finds any committed attempt. A requested stop may abandon
+unresolved custody; durable phase recovery on restart remains conservative.
 
 The process starts the five-minute retry guard from database UTC and its one
 monotonic clock. New mail may dispatch while retries wait. Expiry scans precede
@@ -6545,7 +6581,8 @@ until confirmation. Authentication and TLS failures publish a route pause;
 network failures, including DNS idle timeout while the original cap remains
 live, publish route backoff. A local exhausted cap does not diagnose the route.
 Durably accepted final DATA resets consecutive route failures. Success and
-repair retain exact operations and inspect unknown COMMIT before further work.
+repair retain exact operations and inspect unknown COMMIT before further work;
+a receipt proven absent (section 165) returns them to publication.
 After selecting a repaired configuration and restarting, an explicit private
 `queue-route-repair` request releases the configuration-bound pause only if
 the database confirms a newer selected generation. Mere restart never repairs.

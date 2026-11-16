@@ -253,13 +253,6 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Busy))
     );
     drop(held);
-    sql(fixture,&format!("CREATE TABLE public.worker_expiry_receipt AS SELECT * FROM td_mta.submission_expiry_receipts WHERE operation=decode('{}','hex'); DELETE FROM td_mta.submission_expiry_receipts WHERE operation=decode('{}','hex')",value.operation(),value.operation()));
-    assert_eq!(
-        pending.settle(&settle, until(10_000), &mut work()).unwrap(),
-        None
-    );
-    assert_eq!(pending.identity().unwrap(), Some(identity));
-    sql(fixture,"INSERT INTO td_mta.submission_expiry_receipts SELECT * FROM public.worker_expiry_receipt; DROP TABLE public.worker_expiry_receipt");
     assert_eq!(
         pending.settle(&settle, until(10_000), &mut work()).unwrap(),
         Some(dispatch::Settlement::Expiry(outcome))

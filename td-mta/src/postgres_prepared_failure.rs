@@ -93,7 +93,11 @@ impl FailedPrepared<'_, '_, '_> {
                         settlement_slots,
                     )? {
                         Some(Settlement::RouteFailure(value)) => Some(value),
-                        None => None,
+                        // Proven absent: the next step republishes it.
+                        None => {
+                            *unknown = false;
+                            None
+                        }
                         _ => return Err(ports::Error::Invalid.into()),
                     }
                 } else {
@@ -133,7 +137,11 @@ impl FailedPrepared<'_, '_, '_> {
                         settlement_slots,
                     )? {
                         Some(Settlement::Recovery(value)) => Some(value),
-                        None => None,
+                        // Proven absent: the next step republishes it.
+                        None => {
+                            *unknown = false;
+                            None
+                        }
                         _ => return Err(ports::Error::Invalid.into()),
                     }
                 } else {
@@ -185,8 +193,9 @@ impl Dispatches<'_, '_> {
                 return Err(ports::Error::Busy.into());
             }
         } else {
-            // Generic settlement may already have cleared custody. Reinspect
-            // this exact request; an empty slot never proves its completion.
+            // Generic settlement may already have cleared custody, by a found
+            // receipt or proven absence. Reinspect this exact request; an empty
+            // slot alone proves neither.
             *pending = Some(expected);
         }
         let connection = Connection {

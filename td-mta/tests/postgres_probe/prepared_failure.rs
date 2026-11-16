@@ -201,6 +201,50 @@ pub(super) fn exercise(
             );
         }
         if n == 161 {
+            // A health COMMIT that rolled back: inspection proves the receipt
+            // absent, releases custody and returns the stage to publication.
+            sql(fixture,"CREATE FUNCTION public.rollback_failed_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_failed_health AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_failed_health()");
+            assert_eq!(
+                failed.step(until(1500), &mut meter(), &settlement),
+                Err(Error::RouteFailure(health::Error::Indeterminate))
+            );
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
+            // While it is still running, inspection cannot take the account
+            // share lock and keeps custody.
+            assert_eq!(
+                failed.step(until(10_000), &mut meter(), &settlement),
+                Err(Error::RouteFailure(health::Error::Owner(
+                    td_mta::postgres_route_owners::Error::Busy
+                )))
+            );
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
+            thread::sleep(Duration::from_secs(4));
+            assert_eq!(
+                failed
+                    .step(until(10_000), &mut meter(), &settlement)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(pending.identity().unwrap(), None);
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!(
+                        "SELECT count(*) FROM td_mta.route_health_receipts WHERE operation={key}"
+                    )
+                ),
+                "0"
+            );
+            sql(
+                fixture,
+                "DROP TRIGGER rollback_failed_health ON td_mta.route_health_receipts",
+            );
             sql(fixture,"CREATE FUNCTION public.delay_failed_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_failed_health AFTER INSERT ON td_mta.route_health_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_failed_health()");
             assert_eq!(
                 failed.step(until(1500), &mut meter(), &settlement),
@@ -281,21 +325,7 @@ pub(super) fn exercise(
                 pending.identity().unwrap(),
                 Some(Identity::Attempt(attempt))
             );
-            sql(
-                fixture,
-                &format!("DELETE FROM td_mta.route_health_receipts WHERE operation={key}"),
-            );
-            assert_eq!(
-                failed
-                    .step(until(10_000), &mut meter(), &settlement)
-                    .unwrap(),
-                None
-            );
-            assert_eq!(
-                pending.identity().unwrap(),
-                Some(Identity::Attempt(attempt))
-            );
-            sql(fixture, "INSERT INTO td_mta.route_health_receipts SELECT * FROM public.failed_health_receipt; DROP TABLE public.failed_health_receipt");
+            sql(fixture, &format!("DELETE FROM td_mta.route_health_receipts WHERE operation={key}; INSERT INTO td_mta.route_health_receipts SELECT * FROM public.failed_health_receipt; DROP TABLE public.failed_health_receipt"));
             assert!(matches!(
                 pending
                     .settle(&settle, until(10_000), &mut meter())
@@ -360,6 +390,43 @@ pub(super) fn exercise(
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id={sub}"));
         }
         if n == 162 {
+            // A recovery COMMIT that rolled back returns the stage to
+            // publication, as the health stage does.
+            sql(fixture,"CREATE FUNCTION public.rollback_failed_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_failed_recovery AFTER INSERT ON td_mta.attempt_recovery_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_failed_recovery()");
+            assert_eq!(
+                failed.step(until(1500), &mut meter(), &settlement),
+                Err(Error::Recovery(recovery::Error::Indeterminate))
+            );
+            assert_eq!(
+                failed.step(until(10_000), &mut meter(), &settlement),
+                Err(Error::Recovery(recovery::Error::Owner(
+                    td_mta::postgres_route_owners::Error::Busy
+                )))
+            );
+            assert_eq!(
+                pending.identity().unwrap(),
+                Some(Identity::Attempt(attempt))
+            );
+            thread::sleep(Duration::from_secs(4));
+            assert_eq!(
+                failed
+                    .step(until(10_000), &mut meter(), &settlement)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(pending.identity().unwrap(), None);
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!("SELECT count(*) FROM td_mta.attempt_recovery_receipts WHERE attempt_id={key}")
+                ),
+                "0"
+            );
+            sql(
+                fixture,
+                "DROP TRIGGER rollback_failed_recovery ON td_mta.attempt_recovery_receipts",
+            );
+            owners::renew(request, trust, deadline(), claim, generation).unwrap();
             sql(fixture,"CREATE FUNCTION public.delay_failed_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_failed_recovery AFTER INSERT ON td_mta.attempt_recovery_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_failed_recovery()");
             assert_eq!(
                 failed.step(until(1500), &mut meter(), &settlement),
@@ -391,21 +458,7 @@ pub(super) fn exercise(
                 pending.identity().unwrap(),
                 Some(Identity::Attempt(attempt))
             );
-            sql(
-                fixture,
-                &format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE attempt_id={key}"),
-            );
-            assert_eq!(
-                failed
-                    .step(until(10_000), &mut meter(), &settlement)
-                    .unwrap(),
-                None
-            );
-            assert_eq!(
-                pending.identity().unwrap(),
-                Some(Identity::Attempt(attempt))
-            );
-            sql(fixture, "INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.failed_recovery_receipt; DROP TABLE public.failed_recovery_receipt");
+            sql(fixture, &format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE attempt_id={key}; INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.failed_recovery_receipt; DROP TABLE public.failed_recovery_receipt"));
             assert!(matches!(
                 pending
                     .settle(&settle, until(10_000), &mut meter())

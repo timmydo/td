@@ -246,13 +246,6 @@ pub(super) fn exercise(
     );
     drop(held);
     assert_eq!(pending.identity().unwrap(), Some(identity));
-    sql(fixture,&format!("CREATE TABLE public.route_acquisition_receipt AS SELECT * FROM td_mta.route_owner_receipts WHERE operation=decode('{}','hex'); DELETE FROM td_mta.route_owner_receipts WHERE operation=decode('{}','hex')",uncertain.operation(),uncertain.operation()));
-    assert_eq!(
-        pending.settle(&settle, until(10_000), &mut work()).unwrap(),
-        None
-    );
-    assert_eq!(pending.identity().unwrap(), Some(identity));
-    sql(fixture,"INSERT INTO td_mta.route_owner_receipts SELECT * FROM public.route_acquisition_receipt; DROP TABLE public.route_acquisition_receipt");
     assert_eq!(
         pending.settle(&settle, until(10_000), &mut work()).unwrap(),
         Some(dispatch::Settlement::RouteClaim(recovered))

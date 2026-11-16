@@ -217,18 +217,7 @@ pub(super) fn exercise(
                 pending.identity().unwrap(),
                 Some(Identity::Attempt(attempt))
             );
-            sql(fixture, &format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE operation=decode('{operation}','hex')"));
-            assert_eq!(
-                pending
-                    .settle(&settle, until(10_000), &mut meter())
-                    .unwrap(),
-                None
-            );
-            assert_eq!(
-                pending.identity().unwrap(),
-                Some(Identity::Attempt(attempt))
-            );
-            sql(fixture,"INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.recovery_worker_receipt; DROP TABLE public.recovery_worker_receipt");
+            sql(fixture,&format!("DELETE FROM td_mta.attempt_recovery_receipts WHERE operation=decode('{operation}','hex'); INSERT INTO td_mta.attempt_recovery_receipts SELECT * FROM public.recovery_worker_receipt; DROP TABLE public.recovery_worker_receipt"));
             let before = sql(
                 fixture,
                 "SELECT encode(sequence,'hex') FROM td_mta.accounts",

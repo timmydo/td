@@ -623,12 +623,11 @@ fn settle(worker: &Dispatches<'_, '_>, slots: &ReadSlots, control: &Control) -> 
     };
     while database(worker.pending.identity())?.is_some() {
         let cap = until(&worker.connection.clock, 10_000)?;
+        // A found receipt or proven absence both release custody.
         if worker
             .pending
             .settle(&connection, cap, &mut meter(cap))
-            .ok()
-            .flatten()
-            .is_some()
+            .is_ok()
         {
             continue;
         }
@@ -700,7 +699,10 @@ fn health(
             Ok(Some(_)) => return Ok(true),
             Err(E::Conflict | E::Missing | E::RepairRequired) if !unknown => return Ok(false),
             Err(E::Indeterminate) => unknown = true,
-            Err(E::Connection(_) | E::Database) | Ok(None) => (),
+            // Proven absent under the account share lock (POSTGRES.md
+            // section 165): republish the same change.
+            Ok(None) => unknown = false,
+            Err(E::Connection(_) | E::Database) => (),
             Err(_) => return Err(Error::Database),
         }
         if control.stop_requested() {
@@ -714,6 +716,45 @@ fn health(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn health_republishes_after_proven_absence() {
+        use crate::postgres_route_health::{Error as E, Outcome, State};
+        let control = Control::default();
+        let outcome = Outcome {
+            old_revision: 0,
+            state: State {
+                revision: 1,
+                failure_count: 0,
+                reason: 0,
+                failed_at: None,
+                next_at: None,
+                repair_generation: None,
+            },
+        };
+        let mut publishes = 0;
+        let mut inspections = 0;
+        let result = health(
+            &control,
+            || {
+                publishes += 1;
+                if publishes == 1 {
+                    Err(E::Indeterminate)
+                } else {
+                    Ok(outcome)
+                }
+            },
+            || {
+                inspections += 1;
+                // Under the old rule this would inspect forever; fail instead.
+                if inspections > 2 {
+                    control.stop();
+                }
+                Ok(None)
+            },
+        );
+        assert!(matches!(result, Ok(true)));
+        assert_eq!((publishes, inspections), (2, 1));
+    }
     #[test]
     fn repair_completion_cannot_finish_a_newer_request() {
         let control = QueueControl::default();
