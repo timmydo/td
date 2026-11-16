@@ -9,11 +9,11 @@ use crate::{
     jmap_request::dispatch::{DraftCreator, DraftError, DraftInput},
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_drafts::{self as changes, Draft},
-    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_probe::{self, Endpoint, Mode},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
+    postgres_settlement as settlement,
     store_fs::DraftCompletion,
 };
 use std::{

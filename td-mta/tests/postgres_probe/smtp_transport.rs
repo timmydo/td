@@ -93,6 +93,9 @@ impl<B: Storage> Storage for ObservedStorage<'_, B> {
     fn stopped(&self) -> bool {
         self.inner.stopped()
     }
+    fn take_unsettled(&self) -> bool {
+        self.inner.take_unsettled()
+    }
     fn begin(
         &self,
         input: smtp_storage::Begin<'_, '_>,
@@ -392,6 +395,7 @@ pub(super) fn exercise(
     policies: &GenerationLease<TlsPolicies>,
     socket: TcpListener,
     tls: bool,
+    backstop: bool,
 ) {
     let address = socket.local_addr().unwrap();
     let loaded = td_mta::postgres_input::Loaded {
@@ -408,7 +412,12 @@ pub(super) fn exercise(
     };
     let clock = Arc::new(RuntimeClock::new());
     let slots = ReadSlots::new(1).unwrap();
-    let pending = Pending::default();
+    // The backstop case stops on the first failed settlement.
+    let pending = if backstop {
+        Pending::with_backstop(Duration::ZERO)
+    } else {
+        Pending::default()
+    };
     let storage = Backend::new(
         Owner {
             loaded: &loaded,
@@ -516,6 +525,33 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"), "0");
             assert_eq!(pending.operation().unwrap(), None);
 
+            if backstop {
+                // A retained delivery that cannot settle past the backstop
+                // stops the run, so a restart releases its fence.
+                sql(fixture, "CREATE FUNCTION public.lose_wire_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'lost'; END $$; CREATE CONSTRAINT TRIGGER lose_wire_commit AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_wire_commit()");
+                envelope(&mut client);
+                command(&mut client, b"Subject: uncertain\r\n\r\nbody\r\n.\r\n", "451");
+                assert_eq!(control.state(), State::Ready);
+                assert!(pending.operation().unwrap().is_some());
+                // Runtime connections now refuse, so settlement keeps failing.
+                sql(fixture, "DROP TRIGGER lose_wire_commit ON td_mta.receiving_receipts; UPDATE td_mta.runtime_barrier SET blocked=true WHERE singleton=true");
+                command(&mut client, b"MAIL FROM:<sender@example.test>\r\n", "250");
+                command(&mut client, b"RCPT TO:<main@example.test>\r\n", "250");
+                command(&mut client, b"DATA\r\n", "4");
+                let failed = Instant::now() + Duration::from_secs(5);
+                while control.state() != State::Failed {
+                    assert!(Instant::now() < failed, "backstop did not fail the run");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(storage.stopped());
+                assert!(pending.operation().unwrap().is_some());
+                sql(fixture, "UPDATE td_mta.runtime_barrier SET blocked=false WHERE singleton=true");
+                drop(stop);
+                assert!(server.join().unwrap().is_err());
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
+                return;
+            }
+
             // A known rollback refuses the transaction without retiring the worker.
             sql(fixture, "CREATE FUNCTION public.reject_wire_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject'; END $$; CREATE TRIGGER reject_wire_receiving BEFORE INSERT ON td_mta.receiving_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_receiving()");
             envelope(&mut client);
@@ -526,6 +562,19 @@ pub(super) fn exercise(
             envelope(&mut client);
             command(&mut client, b"Subject: after refusal\r\n\r\nbody\r\n.\r\n", "250");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+
+            // A lost COMMIT answers 451 and the run keeps serving; the next
+            // message settles the absent receipt inline and is delivered.
+            sql(fixture, "CREATE FUNCTION public.lose_wire_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'lost'; END $$; CREATE CONSTRAINT TRIGGER lose_wire_commit AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_wire_commit()");
+            envelope(&mut client);
+            command(&mut client, b"Subject: uncertain\r\n\r\nbody\r\n.\r\n", "451");
+            assert_eq!(control.state(), State::Ready);
+            assert!(pending.operation().unwrap().is_some());
+            sql(fixture, "DROP TRIGGER lose_wire_commit ON td_mta.receiving_receipts");
+            envelope(&mut client);
+            assert_eq!(pending.operation().unwrap(), None);
+            command(&mut client, b"Subject: after uncertain\r\n\r\nbody\r\n.\r\n", "250");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "3");
 
             concurrent_data(fixture, address, tls, clock.clone());
             copy_during_publication(fixture, address, tls, clock.clone(), probe.clone());
@@ -560,9 +609,9 @@ pub(super) fn exercise(
             drop(client);
             assert_eq!(control.state(), State::Stopped);
             assert_eq!(pending.operation().unwrap(), None);
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "6");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "6");
-            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "6");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "7");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "7");
+            assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "7");
         });
     }).unwrap();
 }

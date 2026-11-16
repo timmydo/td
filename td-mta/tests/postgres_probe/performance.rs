@@ -622,9 +622,12 @@ fn intake(fixture: &Fixture, smtp: SocketAddr, cloud: &Service, knobs: &Knobs) {
         .unwrap()
         .checked_sub(stored + total)
         .unwrap_or_else(|| panic!("every accepted message is stored"));
+    // An uncertain publication answers 451 at the dot; a close after it is
+    // also uncertain.
+    let after_dot = intake.closed_after_dot + intake.deferrals[PHASES.len() - 1];
     assert!(
-        duplicates <= intake.closed_after_dot,
-        "{duplicates} messages stored twice without an uncertain close"
+        duplicates <= after_dot,
+        "{duplicates} messages stored twice without an uncertain reply"
     );
     let (_, hwm) = memory(cloud.pid());
     let deferrals = PHASES

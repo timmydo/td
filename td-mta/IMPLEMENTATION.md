@@ -2386,7 +2386,7 @@ Transcript tests connect real storage outcomes to final SMTP replies and
 verify recovered mail after reopening. Other fixtures cover framing splits,
 sequencing, Postmaster, aliases, null/quoted senders and extensions.
 Header overflow is a permanent 552; resource/storage refusal is temporary;
-indeterminate publication closes without final acceptance. Stored-message
+indeterminate publication is temporary too, never a final acceptance. Stored-message
 reservations include format-derived trace room excluded from incoming SIZE.
 Remaining: the runtime must bind receiving authorization to actual sockets,
 TLS evidence and current gateway policy, schedule the bounded transport

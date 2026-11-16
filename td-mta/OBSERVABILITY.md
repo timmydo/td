@@ -81,6 +81,7 @@ and `severity`.
 | `relay_connection_failed` | fixed `stage` and `error` class | warning | inspect_relay |
 | `relay_step_failed` | fixed `stage` | warning | inspect_relay |
 | `service_stopped` | boolean `failed` | error if failed, otherwise info | inspect_service if failed |
+| `receiving_unsettled` | boolean `stopping` | error if stopping, otherwise warning | inspect_recovery |
 | `log_write_failed` | signed `os_code` or null | error | inspect_logging |
 
 Protocol values are `smtp`, `jmap`, `relay`; listener-ready records accept only
@@ -98,6 +99,12 @@ Unknown means a potentially accepted relay outcome requiring inspection, not
 proof of failure or an instruction to resend. The queue state machine owns
 retry policy. `mail_accepted` means locally durable acceptance; it never implies
 relay acceptance. Neither an event nor its absence proves durable storage.
+`receiving_unsettled` means a retained SMTP delivery whose COMMIT result was
+lost failed inline settlement, and the delivery that met it was refused.
+`stopping` is true when the delivery was held past the 30-second backstop
+and the receiving run stops so a restart releases it (POSTGRES.md section
+104); the run's `service_stopped` follows. Each value has its own
+one-per-minute bucket.
 
 Refusal reasons/actions are: `capacity` and `deadline` -> `retry_later`,
 `quota` -> `inspect_quota`, `storage` -> `inspect_storage`, `configuration` ->
@@ -413,16 +420,16 @@ may be missing or separated by other events or inspection pages. Correlate
 by boot and request ID, never adjacency. Loss counters cover queue failure,
 invalid diagnostic addresses and exhausted IDs; a refusal still logs without
 companions if its ID cannot be issued. The group is not atomic or a complete
-delivery ledger. Transport-only interruptions without a queued DATA refusal,
-pre-DATA admission failures and indeterminate publication retain their existing
-metadata-only diagnostics. The daily digest continues to count refusals; these
+delivery ledger. Transport-only interruptions without a queued DATA refusal
+and pre-DATA admission failures retain their existing metadata-only
+diagnostics. The daily digest continues to count refusals; these
 private address companions are available through `postgres logs`.
 `smtp_data_interrupted` records network-reported closure/error during admitted
 DATA with a numeric
 peer and fixed error class; `error:none` means the transport owner closed
 without returning an error, not successful delivery. A refused DATA exchange
-can emit both records. No final SMTP status is invented for an interruption or
-uncertain COMMIT. Transport closure before DATA admission, forced shutdown retirement and
+can emit both records. No final SMTP status is invented for an interruption;
+an uncertain COMMIT is answered and logged as a temporary 451 refusal. Transport closure before DATA admission, forced shutdown retirement and
 worker failures that bypass network progress are outside this event.
 Refusal groups and interruption events use separate fixed one-per-minute producer buckets and the
 existing bounded queue/database retention. Suppression counts remain visible;

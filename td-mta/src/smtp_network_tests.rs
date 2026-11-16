@@ -477,17 +477,20 @@ fn known_final_result_and_service_close_share_one_nonrenewing_grace() {
 #[test]
 fn unknown_commit_and_failed_completion_clock_never_emit_acceptance() {
     fixture(|routes, plan, timer| {
+        // An unknown commit is a temporary failure; the connection continues.
         let mut n = network(routes, plan, timer);
         let mut w = Wire::default();
         pending_commit(&mut n, &mut w, timer);
-        let output = w.output.clone();
-        n.committed(
-            Err(CommitFailure::Indeterminate(Error::WriterStopped)),
-            timer,
-        )
-        .unwrap();
-        assert_eq!(n.advance(&mut w, timer), Ok(Progress::Closed));
-        assert_eq!(w.output, output);
+        let before = w.output.len();
+        n.committed(Err(CommitFailure::Indeterminate(Error::Busy)), timer)
+            .unwrap();
+        w.input.extend(b"RSET\r\n");
+        turns(&mut n, &mut w, timer, 5);
+        assert_eq!(
+            &w.output[before..],
+            b"451 4.3.0 Delivery temporarily unavailable\r\n250 2.0.0 Reset\r\n"
+        );
+        assert_eq!(w.aborts, 0);
 
         let mut n = network(routes, plan, timer);
         let mut w = Wire::default();

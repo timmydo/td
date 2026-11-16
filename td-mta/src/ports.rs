@@ -311,7 +311,9 @@ pub struct Commit {
     pub sequence: Sequence,
 }
 /// Rejected guarantees this attempt committed no transaction. Indeterminate means a
-/// transaction may have committed: stop the writer and recover before more writes.
+/// transaction may have committed: never report success or replay it, and keep it
+/// fenced until recovered. SMTP receiving retains and settles it in process
+/// (POSTGRES.md section 104) rather than stopping the writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitFailure {
     Rejected(Error),

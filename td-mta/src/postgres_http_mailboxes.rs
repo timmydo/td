@@ -7,12 +7,12 @@ use crate::{
     ids::{AccountId, DeviceId, MailboxId, MailboxOperationId, StoreEpoch},
     jmap_request::dispatch::MailboxMutator,
     ports::{Clock, CommitFailure, Deadline, Error},
-    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_mailbox_set::{self as changes, Change},
     postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
+    postgres_settlement as settlement,
     store_fs::{
         MailboxCreateCompletion, MailboxCreateRequest, MailboxCreateResult,
         MailboxDeleteCompletion, MailboxDeleteRequest, MailboxDeleteResult, UploadError,

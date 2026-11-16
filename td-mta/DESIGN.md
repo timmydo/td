@@ -1726,7 +1726,8 @@ The current `smtp_session` engine consumes one command or at most 1000 DATA byte
 per turn. Pending replies require an explicit flush acknowledgement; reservation,
 body writes and publication require separate trusted driver results before
 input resumes. A final DATA 250 follows only a successful commit result for
-the routed account. An indeterminate result closes without a final reply.
+the routed account. An indeterminate result gets the temporary 451 of a
+refused one; the sender's retry may duplicate a delivery that committed.
 A supplied result alone is not durability proof. PostgreSQL receiving
 stages bounded ingress, replaces Return-Path, generates
 Received from trusted connection facts, resolves immutable threads and

@@ -1037,9 +1037,17 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     .map(|entry| entry.sequence),
                             );
                         }
-                        if completion.stop || matches!(result, Err(CommitFailure::Indeterminate(_)))
-                        {
+                        // An uncertain publication stays retained by storage
+                        // and answers 451; only an explicit stop fails the run.
+                        if completion.stop {
                             control.fail();
+                            // A committed outcome the reply cannot describe
+                            // closes without one.
+                            if matches!(result, Err(CommitFailure::Indeterminate(_))) {
+                                slot.delivery.take();
+                                slot.phase = Phase::Retire;
+                                return Ok(());
+                            }
                         }
                         slot.delivery.take();
                         slot.connection()?.network_mut()?.committed(result, clock)?;
@@ -1153,6 +1161,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 network.committed(Err(CommitFailure::Rejected(error)), self.clock.as_ref())?
             }
             Work::Tls => return Err(Error::Conflict),
+        }
+        if self.storage.take_unsettled() {
+            control.log(
+                crate::observability::Kind::ReceivingUnsettled {
+                    stopping: self.storage.stopped(),
+                },
+                None,
+                None,
+            );
         }
         if self.storage.stopped() {
             control.fail();

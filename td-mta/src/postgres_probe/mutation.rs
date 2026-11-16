@@ -2,7 +2,7 @@
 use super::{
     connect_authenticated_until,
     retained::{Bounds, LIFETIME},
-    Error, Input, Mode, Request, Worker, MAX_DURATION,
+    Endpoint, Error, Input, Mode, Request, Worker, MAX_DURATION,
 };
 use crate::{
     ids::StoreEpoch,
@@ -31,6 +31,8 @@ pub(crate) struct MutationSession {
     worker: Worker,
     bounds: Bounds,
     epoch: StoreEpoch,
+    // Where an uncertain COMMIT on this session went, for settlement there.
+    endpoint: Endpoint,
     // None selects the fixed renewal budget, never SMTP publication credit.
     accounts: Option<usize>,
     retired: bool,
@@ -91,10 +93,14 @@ impl MutationSession {
             worker,
             bounds,
             epoch: schema.store_epoch,
+            endpoint: request.address,
             accounts,
             retired: false,
             clean_idle: true,
         })
+    }
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         !self.retired

@@ -427,9 +427,9 @@ which the services inherit. Each scenario prints one `td-mta-perf
   a sending MTA would retry later, at most 200 times. A 421 or close,
   including the server's per-connection transaction limit, counts as a
   reconnect, not a deferral. Every message must finally be stored; one
-  may be stored twice only after a close following its dot, which the
-  server uses when publication is uncertain, and `closed_after_dot` and
-  `duplicates` count those.
+  may be stored twice only after a deferral at its dot, which the server
+  answers when publication is uncertain, or a close following it;
+  `deferrals`, `closed_after_dot` and `duplicates` count those.
 - `jmap_fetch`: one client with a fresh device credential reads the
   delivered mailbox one request at a time: five session discoveries,
   256-ID `Email/query` pages, 64-ID `Email/get` batches for blob and

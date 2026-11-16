@@ -5,12 +5,12 @@ use crate::{
     device_credentials::Presented,
     ids::{AccountId, DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
     ports::{self, Clock, Deadline},
-    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_route_owners::Claim,
     postgres_runtime_profile::Binding,
+    postgres_settlement as settlement,
     postgres_submission_cancel::{self as changes, Cancellation},
 };
 use std::{

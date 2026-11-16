@@ -56,6 +56,11 @@ pub trait Storage: Sync {
     fn capacity(&self) -> u64;
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error>;
     fn stopped(&self) -> bool;
+    /// Whether a retained uncertain publication failed to settle since the
+    /// last call; diagnostics only.
+    fn take_unsettled(&self) -> bool {
+        false
+    }
     fn begin(
         &self,
         input: Begin<'_, '_>,

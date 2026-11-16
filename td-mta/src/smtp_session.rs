@@ -531,15 +531,17 @@ impl<'a> Session<'a> {
                 self.reset();
                 self.respond("250 2.0.0 Message accepted\r\n", Next::Command);
             }
-            Err(CommitFailure::Rejected(_)) => {
+            // An uncertain publication is temporary too: the sender's retry
+            // may duplicate one that committed (POSTGRES.md section 46).
+            Err(CommitFailure::Rejected(_) | CommitFailure::Indeterminate(_)) => {
                 self.reset();
                 self.respond(
                     "451 4.3.0 Delivery temporarily unavailable\r\n",
                     Next::Command,
                 );
             }
-            // No final reply can accurately describe an uncertain publication.
-            _ => self.abort(),
+            // An acceptance that does not cover the envelope cannot be reported.
+            Ok(_) => self.abort(),
         }
         Ok(())
     }

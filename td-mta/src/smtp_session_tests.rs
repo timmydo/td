@@ -430,7 +430,7 @@ fn commit_outcomes_and_begin_refusal() {
             assert_eq!(s.pending(), Pending::Commit);
             s.committed(outcome.map(|commit| Commits::new([commit]).unwrap()))
                 .unwrap();
-            if matches!(outcome, Err(CommitFailure::Rejected(_))) {
+            if outcome.is_err() {
                 assert!(reply(&s).starts_with("451 "));
                 s.reply_sent().unwrap();
                 assert_eq!(s.pending(), Pending::Input);

@@ -2738,6 +2738,12 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
     exercise_configuration(ConfigurationExercise::ReceivingTls);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_worker_stops_when_settlement_cannot_heal() {
+    exercise_configuration(ConfigurationExercise::ReceivingBackstop);
+}
+
 #[path = "postgres_probe/multi_account.rs"]
 mod multi_account;
 #[path = "postgres_probe/multi_receiving.rs"]
@@ -2815,6 +2821,7 @@ enum ConfigurationExercise {
     ReplicaPublication,
     Performance,
     ReceivingTls,
+    ReceivingBackstop,
     ReceivingTransport,
     ReceivingOwner,
     HttpUploads,
@@ -3010,6 +3017,7 @@ per_peer_limit = 1
         exercise,
         ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
+            | ConfigurationExercise::ReceivingBackstop
             | ConfigurationExercise::Serving
             | ConfigurationExercise::ReplicaPublication
             | ConfigurationExercise::Performance
@@ -3026,6 +3034,7 @@ per_peer_limit = 1
         ConfigurationExercise::Performance
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
+            | ConfigurationExercise::ReceivingBackstop
     ) {
         let limits = "session_limit = 1\nper_peer_limit = 1\n";
         assert_eq!(cloud.matches(limits).count(), 1, "cloud listener limits");
@@ -3579,6 +3588,7 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingOwner
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
+            | ConfigurationExercise::ReceivingBackstop
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -3711,7 +3721,8 @@ per_peer_limit = 1
                 ConfigurationExercise::Receiving
                 | ConfigurationExercise::ReceivingOwner
                 | ConfigurationExercise::ReceivingTransport
-                | ConfigurationExercise::ReceivingTls => {}
+                | ConfigurationExercise::ReceivingTls
+                | ConfigurationExercise::ReceivingBackstop => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -3819,7 +3830,9 @@ per_peer_limit = 1
         if name == "cloud"
             && matches!(
                 exercise,
-                ConfigurationExercise::ReceivingTransport | ConfigurationExercise::ReceivingTls
+                ConfigurationExercise::ReceivingTransport
+                    | ConfigurationExercise::ReceivingTls
+                    | ConfigurationExercise::ReceivingBackstop
             )
         {
             smtp_transport::exercise(
@@ -3829,6 +3842,7 @@ per_peer_limit = 1
                 &active,
                 smtp_socket.take().unwrap(),
                 matches!(exercise, ConfigurationExercise::ReceivingTls),
+                matches!(exercise, ConfigurationExercise::ReceivingBackstop),
             );
             return;
         }
@@ -13376,7 +13390,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         .unwrap();
     let mut random = td_crypto::SystemEntropy::try_new().unwrap();
     let mut prior_pid = None;
-    for case in 0..4 {
+    let data_session = || {
         let mut session = Session::new(
             &routes,
             Settings {
@@ -13401,6 +13415,20 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             session.reply_sent().unwrap();
         }
         session.feed(b"DATA\r\n").unwrap();
+        session
+    };
+    let fresh_begin = |session| Begin {
+        config_generation: 7,
+        peer: "192.0.2.2".parse().unwrap(),
+        tls: ReceiptTls::Plain,
+        clock: clock.clone(),
+        session,
+        header_bytes: 16384,
+        deadline: until(20_000),
+    };
+    let sibling_sessions = [data_session(), data_session()];
+    for case in 0..4 {
+        let mut session = data_session();
         let deadline = until(if case == 3 { 3000 } else { 10_000 });
         let begin = |clock: Arc<dyn Clock>, generation| Begin {
             config_generation: generation,
@@ -13534,15 +13562,27 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         session.feed(b".\r\n").unwrap();
         assert!(matches!(session.pending(), Action::Commit));
         job.prepare(until(10_000)).unwrap();
+        // Two siblings with live deadlines, admitted and prepared before the
+        // uncertain job commits.
+        let mut siblings = Vec::new();
         if case == 3 {
-            // A separately admitted and prepared job cannot publish after an
-            // uncertain sibling, even when historical settlement later succeeds.
-            let other = others.first_mut().unwrap();
-            other.write(b"Subject: fenced sibling\r\n").unwrap();
-            other.write(b"\r\n").unwrap();
-            other.write(b"body\r\n").unwrap();
-            other.prepare(until(10_000)).unwrap();
-            sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
+            others.clear();
+            for (subject, sibling_session) in ["fenced sibling", "settling sibling"]
+                .into_iter()
+                .zip(&sibling_sessions)
+            {
+                let mut input = fresh_begin(sibling_session);
+                input.peer = "192.0.2.3".parse().unwrap();
+                let mut sibling = storage.begin(input, &mut random).unwrap();
+                sibling
+                    .write(format!("Subject: {subject}\r\n").as_bytes())
+                    .unwrap();
+                sibling.write(b"\r\n").unwrap();
+                sibling.write(b"body\r\n").unwrap();
+                sibling.prepare(until(20_000)).unwrap();
+                siblings.push(sibling);
+            }
+            sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(8); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
         }
         let completed = job.commit().unwrap();
         assert!(matches!(
@@ -13565,50 +13605,52 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
                 (initial + 1).to_string()
             );
         } else {
-            assert!(completed.stop && storage.stopped());
+            // The uncertain job answers 451 and the adapter keeps serving.
+            assert!(!completed.stop && !storage.stopped());
             assert!(matches!(
                 completed.outcome,
                 Err(CommitFailure::Indeterminate(_))
             ));
             session.committed(completed.outcome).unwrap();
-            assert!(matches!(session.pending(), Action::Closed));
-            assert_eq!(
-                storage.ready(binding.account(), until(10_000)),
-                Err(Error::WriterStopped)
+            assert!(
+                matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"451"))
             );
             assert!(pending.operation().unwrap().is_some());
-            let other = others.first_mut().unwrap();
+            // While the 8 s COMMIT still runs (past the 3 s job deadline), a
+            // sibling's commit settles first, waits out the 1 s lock timeout
+            // and is refused as busy, never published.
             assert!(matches!(
-                other.commit(),
-                Err(Failure::Refused(Error::WriterStopped))
+                siblings.first_mut().unwrap().commit(),
+                Err(Failure::Refused(Error::Busy))
             ));
-            assert_eq!(
-                others.get_mut(1).unwrap().write(b"body\r\n"),
-                Err(Failure::Refused(Error::WriterStopped))
-            );
-            assert_eq!(
-                others.get_mut(2).unwrap().prepare(until(10_000)),
-                Err(Failure::Refused(Error::WriterStopped))
-            );
-            thread::sleep(Duration::from_secs(5));
+            assert!(pending.operation().unwrap().is_some());
+            assert!(!storage.stopped());
+            thread::sleep(Duration::from_secs(7));
             sql(
                 fixture,
                 "DROP TRIGGER delay_storage_receiving ON td_mta.receiving_receipts",
+            );
+            assert_eq!(
+                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                (initial + 2).to_string()
+            );
+            // The other sibling's commit settles the found receipt at the
+            // pinned endpoint before opening a session (one foreground slot:
+            // holding both would refuse), then publishes.
+            let delivered = siblings.get_mut(1).unwrap().commit().unwrap();
+            assert!(!delivered.stop);
+            assert_eq!(delivered.outcome.unwrap().iter().count(), 1);
+            assert_eq!(pending.operation().unwrap(), None);
+            siblings.clear();
+            assert_eq!(
+                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                (initial + 3).to_string()
             );
             let settlement = ReadSlots::new(1).unwrap();
             assert!(pending
                 .settle(&loaded, executable, &settlement, &clock, until(10_000))
                 .unwrap()
-                .is_some());
-            assert_eq!(
-                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-                (initial + 2).to_string()
-            );
-            assert!(storage.stopped());
-            assert!(matches!(
-                others.first_mut().unwrap().commit(),
-                Err(Failure::Refused(Error::WriterStopped))
-            ));
+                .is_none());
         }
     }
     storage.close().unwrap();
@@ -13760,7 +13802,10 @@ fn exercise_smtp_receiving_owner(
         Err(owner::Error::Publication(changes::Error::Database))
     );
     assert_eq!(pending.operation().unwrap(), None);
-    sql(fixture, "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts; CREATE FUNCTION public.delay_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
+    // The COMMIT outlives the 3 s client deadline and then commits. Writes
+    // meeting it wait out the 1 s lock timeout inside inline settlement, so
+    // the 10 s sleep keeps both refusals well before it ends.
+    sql(fixture, "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts; CREATE FUNCTION public.delay_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
     assert_eq!(
         worker.create(&message, until(3000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
@@ -13775,7 +13820,7 @@ fn exercise_smtp_receiving_owner(
         Err(owner::Error::Admission(Error::Busy))
     );
     assert_eq!(pending.operation().unwrap(), Some(operation));
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(8));
     sql(
         fixture,
         "DROP TRIGGER delay_owned_receiving ON td_mta.receiving_receipts",
@@ -13794,24 +13839,84 @@ fn exercise_smtp_receiving_owner(
         sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
         "2"
     );
+    // A refused COMMIT leaves no receipt: absence settles and clears.
     sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
-    let absent = pending.operation().unwrap().unwrap();
+    assert!(pending.operation().unwrap().is_some());
     assert!(pending
         .settle(&loaded, executable, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
-    assert_eq!(pending.operation().unwrap(), Some(absent));
+    assert_eq!(pending.operation().unwrap(), None);
+    // Readiness settles a retained absence inline.
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    assert!(pending.operation().unwrap().is_some());
+    worker.ready(until(10_000)).unwrap();
+    assert_eq!(pending.operation().unwrap(), None);
+    sql(
+        fixture,
+        "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts",
+    );
+    worker
+        .create(&message, until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "3"
+    );
+    // A COMMIT that sleeps past the 2 s client deadline and then rolls back:
+    // a write while it runs is busy and retains it; the next one after it
+    // ends settles the absence inline and publishes.
+    sql(fixture, "CREATE FUNCTION public.rollback_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_owned_receiving()");
+    assert_eq!(
+        worker.create(&message, until(2000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    let rolled = pending.operation().unwrap().unwrap();
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Admission(Error::Busy))
     );
+    assert_eq!(pending.operation().unwrap(), Some(rolled));
+    thread::sleep(Duration::from_secs(4));
     sql(
         fixture,
-        "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts",
+        "DROP TRIGGER rollback_owned_receiving ON td_mta.receiving_receipts",
+    );
+    worker
+        .create(&message, until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "4"
+    );
+    // A delayed COMMIT that commits: the next write finds its receipt inline
+    // and publishes.
+    sql(fixture, "CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
+    assert_eq!(
+        worker.create(&message, until(3000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    assert!(pending.operation().unwrap().is_some());
+    thread::sleep(Duration::from_secs(9));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_owned_receiving ON td_mta.receiving_receipts",
+    );
+    worker
+        .create(&message, until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "6"
     );
     sql(
         fixture,
@@ -13833,7 +13938,7 @@ fn exercise_smtp_receiving_owner(
     assert_eq!(fresh.operation().unwrap(), None);
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "2"
+        "6"
     );
     sql(
         fixture,

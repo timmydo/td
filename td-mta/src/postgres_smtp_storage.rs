@@ -27,7 +27,9 @@ pub struct Backend<'a> {
     clock: Arc<RuntimeClock>,
     generation: u64,
     admitted: Admissions,
+    // Set only by the settlement backstop (POSTGRES.md section 104).
     stopped: AtomicBool,
+    unsettled: AtomicBool,
     session: Mutex<SessionState<'a>>,
 }
 struct SessionState<'a> {
@@ -62,6 +64,7 @@ impl<'a> Backend<'a> {
             generation,
             admitted: Admissions::new(),
             stopped: AtomicBool::new(false),
+            unsettled: AtomicBool::new(false),
             session: Mutex::new(SessionState {
                 owner: None,
                 connection: None,
@@ -97,9 +100,11 @@ impl Backend<'_> {
     fn with_session<T>(
         &self,
         until: Deadline,
+        meter: &mut Meter,
         operation: impl FnOnce(
             &mut crate::postgres_probe::MutationSession,
             Deadline,
+            &mut Meter,
         ) -> Result<T, owner::Error>,
     ) -> Result<T, owner::Error> {
         let now = Instant::now();
@@ -119,6 +124,24 @@ impl Backend<'_> {
             return Err(Error::Invalid.into());
         }
         state.owner = Some(owner);
+        // Settle a retained delivery before this session holds a foreground
+        // slot; the uncertain delivery's own session closed on its error.
+        if self.owner.pending.operation()?.is_some() {
+            state.close(deadline);
+            if let Err(error) = self.owner.settle_retained(deadline, meter) {
+                match error {
+                    owner::Error::Admission(Error::WriterStopped) => {
+                        self.unsettled.store(true, Ordering::Release);
+                        self.stopped.store(true, Ordering::Release);
+                    }
+                    owner::Error::Admission(Error::Busy) => {
+                        self.unsettled.store(true, Ordering::Release);
+                    }
+                    _ => (),
+                }
+                return Err(error);
+            }
+        }
         if state
             .connection
             .as_ref()
@@ -174,7 +197,11 @@ impl Backend<'_> {
             state.connection = Some((connection.ok_or(Error::Dns)?, permit));
         }
         let cap = self.clock.deadline_before(deadline)?;
-        let result = operation(&mut state.connection.as_mut().ok_or(Error::Invalid)?.0, cap);
+        let result = operation(
+            &mut state.connection.as_mut().ok_or(Error::Invalid)?.0,
+            cap,
+            meter,
+        );
         if reused {
             crate::performance::record(
                 crate::performance::Phase::DbReuse,
@@ -281,8 +308,13 @@ impl<'b> Storage for Backend<'b> {
     fn capacity(&self) -> u64 {
         self.owner.binding.upload_maximum().min(32 * 1024 * 1024) as u64
     }
+    /// A lost COMMIT does not stop the adapter; only a retained delivery that
+    /// still cannot settle past the backstop does (POSTGRES.md section 104).
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+    fn take_unsettled(&self) -> bool {
+        self.unsettled.swap(false, Ordering::AcqRel)
     }
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error> {
         if self.owner.binding_for(account).is_none() {
@@ -348,7 +380,7 @@ impl<'b> Storage for Backend<'b> {
                 ..Charge::default()
             },
         )?;
-        self.with_session(input.deadline, |session, cap| {
+        self.with_session(input.deadline, &mut meter, |session, cap, _| {
             self.owner.ready_cached(session, cap)
         })
         .map_err(|error| Failure::Refused(owner_error(error)))?;
@@ -527,9 +559,10 @@ impl Job for Delivery<'_, '_> {
         }
         let original = Deadline::after(crate::ports::Tick(0), self.meter.deadline().tick().0)
             .map_err(Failure::Refused)?;
-        let result = self
-            .backend
-            .with_session(deadline.min(original), |session, cap| {
+        let result = self.backend.with_session(
+            deadline.min(original),
+            &mut self.meter,
+            |session, cap, meter| {
                 self.backend.owner.create_fanout_cached(
                     &targets,
                     &Message {
@@ -548,25 +581,31 @@ impl Job for Delivery<'_, '_> {
                         },
                     },
                     cap,
-                    &mut self.meter,
+                    meter,
                     session,
                 )
-            });
+            },
+        );
         match result {
-            Ok(outcome) => Ok(Completion {
-                outcome: Commits::new(outcome.accounts.iter().map(|(account, result)| Commit {
-                    account: *account,
-                    epoch: self.backend.owner.binding.epoch(),
-                    sequence: Sequence::from_u64(result.new_sequence),
-                }))
-                .map_err(CommitFailure::Indeterminate),
-                stop: false,
-            }),
-            Err(owner::Error::Publication(postgres_receiving::Error::Indeterminate)) => {
-                self.backend.stopped.store(true, Ordering::Release);
+            Ok(outcome) => {
+                let commits =
+                    Commits::new(outcome.accounts.iter().map(|(account, result)| Commit {
+                        account: *account,
+                        epoch: self.backend.owner.binding.epoch(),
+                        sequence: Sequence::from_u64(result.new_sequence),
+                    }));
+                // A committed account set the reply cannot describe still
+                // stops the service.
                 Ok(Completion {
-                    outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),
-                    stop: true,
+                    stop: commits.is_err(),
+                    outcome: commits.map_err(CommitFailure::Indeterminate),
+                })
+            }
+            // The owner retains the operation; the next job settles it.
+            Err(owner::Error::Publication(postgres_receiving::Error::Indeterminate)) => {
+                Ok(Completion {
+                    outcome: Err(CommitFailure::Indeterminate(Error::Busy)),
+                    stop: false,
                 })
             }
             Err(owner::Error::Publication(postgres_receiving::Error::HeaderLimit)) => {

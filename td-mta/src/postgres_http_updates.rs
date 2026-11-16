@@ -8,11 +8,11 @@ use crate::{
     jmap_request::dispatch::EmailMutator,
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_email_set::{self as changes, deletion, filing, Change},
-    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_probe::{self, Endpoint},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
+    postgres_settlement as settlement,
     store_fs::{
         EmailDestroyCompletion, EmailDestroyRequest, EmailDestroyResult, EmailUpdate,
         EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult, UploadError,

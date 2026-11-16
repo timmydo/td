@@ -5,12 +5,11 @@ use crate::{
     device_credentials::Presented,
     ids::{AccountId, DeviceId, EmailId, IdentityId, StoreEpoch, SubmissionOperationId},
     ports::{self, Clock, Deadline},
-    postgres_http_settlement as settlement,
     postgres_input::Loaded,
     postgres_probe::{self, Endpoint, Mode},
     postgres_read::{self, ReadSlots},
     postgres_runtime_profile::Binding,
-    postgres_submission_input as inputs,
+    postgres_settlement as settlement, postgres_submission_input as inputs,
     postgres_submissions::{self as changes, Submission},
 };
 use std::{

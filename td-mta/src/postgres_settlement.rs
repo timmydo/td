@@ -1,4 +1,4 @@
-//! Inline receipt settlement shared by the fixed HTTPS worker's owners.
+//! Inline receipt settlement shared by the HTTPS and SMTP publication owners.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
