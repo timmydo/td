@@ -12190,8 +12190,47 @@ fn exercise_route_owners(
         owners::acquire(request, trust, deadline(), &pending),
         Err(owners::Error::Capacity)
     );
-    sql(fixture,"DELETE FROM td_mta.route_owner_receipts WHERE request_digest=decode(repeat('00',32),'hex')");
+    // Not a lifetime cap: receipts whose first lease ended over the retention
+    // ago expire at the next acquisition; one five minutes inside retention and
+    // another account's stay.
+    let age = owners::RECEIPT_RETENTION_MS + owners::LEASE_MS + 1;
+    // A literal, so shortening the retention below an hour fails here. The
+    // boundary claim time lies five minutes outside retention, so expiry must
+    // key on the lease end.
+    let inside: i64 = 3_300_000;
+    sql(fixture,&format!("UPDATE td_mta.route_owner_receipts SET expires_at=t.v,claimed_at=t.v-600000 FROM (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint-{inside} v) t WHERE request_digest=decode(repeat('00',32),'hex') AND operation=decode(lpad(to_hex(1),32,'0'),'hex')"));
+    sql(fixture,&format!("UPDATE td_mta.route_owner_receipts SET claimed_at=claimed_at-{age},expires_at=expires_at-{age} WHERE request_digest=decode(repeat('00',32),'hex') AND operation<>decode(lpad(to_hex(1),32,'0'),'hex'); INSERT INTO td_mta.accounts VALUES(decode(lpad(to_hex(2002),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES(decode(lpad(to_hex(2002),32,'0'),'hex'),0,0,0,0,0); INSERT INTO td_mta.route_owner_receipts SELECT decode(lpad(to_hex(2002),32,'0'),'hex'),operation,decode(repeat('22',32),'hex'),generation,claimed_at,expires_at FROM td_mta.route_owner_receipts WHERE request_digest=decode(repeat('00',32),'hex') AND operation=decode(lpad(to_hex(2),32,'0'),'hex')"));
+    // capacity-inspect already reports only the live receipts.
+    let capacity =
+        td_mta::postgres_capacity::inspect(request, trust, deadline(), relay.epoch()).unwrap();
+    let used = capacity
+        .get("metrics")
+        .unwrap()
+        .as_arr()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r.get("name").and_then(td_json::Json::as_str) == Some("route_owner_receipts")
+                && r.get("scope").and_then(td_json::Json::as_str)
+                    == Some(&relay.account().to_string())
+        })
+        .unwrap()
+        .get("used")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        used,
+        sql(
+            fixture,
+            &format!("SELECT count(*) FROM td_mta.route_owner_receipts WHERE account=decode('{}','hex') AND (request_digest<>decode(repeat('00',32),'hex') OR operation=decode(lpad(to_hex(1),32,'0'),'hex'))", relay.account())
+        )
+    );
     let last = owners::acquire(request, trust, deadline(), &pending).unwrap();
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FILTER (WHERE request_digest=decode(repeat('00',32),'hex')),count(*) FILTER (WHERE request_digest=decode(repeat('22',32),'hex')) FROM td_mta.route_owner_receipts"),
+        "1|1"
+    );
+    sql(fixture,"DELETE FROM td_mta.route_owner_receipts WHERE request_digest IN (decode(repeat('00',32),'hex'),decode(repeat('22',32),'hex')); DELETE FROM td_mta.account_usage WHERE account=decode(lpad(to_hex(2002),32,'0'),'hex'); DELETE FROM td_mta.accounts WHERE id=decode(lpad(to_hex(2002),32,'0'),'hex')");
     assert_eq!(last.generation, 5);
     owners::release(request, trust, deadline(), &pending, last.generation).unwrap();
     assert_eq!(

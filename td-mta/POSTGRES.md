@@ -2103,6 +2103,28 @@ claim. The serialized receipt recheck precedes current-policy rejection,
 so a concurrently committed acquisition remains resolvable after selection
 changes. Route rows and acquisition receipts each have a 1024-per-account cap.
 
+Acquisition receipts are retained for a bounded time, not for life. An
+acquisition that passes its replay, policy, Busy and Clock checks first
+deletes, under the account write lock, the account's receipts whose recorded
+first lease ended more than one hour before its locked database time; a
+later refusal rolls that back. Renewal does not extend a receipt, and none is
+needed then: a claim replays its receipt only to settle its own acquisition
+while it holds no grant, and the relay retries a slot without a grant every
+round. A claim retried more than an hour after its lease ended may find its
+receipt swept by another acquisition and then acquires afresh under a higher
+generation; the unused earlier generation was never live authority, since
+every fence compares the owner row's generation, boot and operation.
+Otherwise the old receipt replays, observation reports it stale and the relay
+replaces the claim. Any inspect-only settlement of an acquisition (section
+191) must finish within that hour, as receipt absence afterwards no longer
+shows the acquisition was not committed.
+
+The cap therefore bounds acquisitions in any hour plus one lease, not per
+account lifetime. The relay releases on every exit and acquires once per
+start, so a supervisor restarting it more than about 1024 times in an hour
+for one account still meets Capacity, which fails the relay until receipts
+age out; that heals by itself.
+
 A fixed 30-second database-time lease binds the process boot identity, claim
 operation, route destination and generation. Renewal checks every field,
 current selected policy and unexpired ownership under lock. Release compares
@@ -5816,8 +5838,11 @@ sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and r
 failure identities are unchanged. Pending::settle uses independently admitted
 capacity to inspect the retained claim receipt, with no acquisition replay.
 Absence and errors preserve custody; a matching receipt clears it and returns
-Settlement::RouteClaim. The grant is historical evidence only, even when
-returned by a known acquisition. Fresh current-owner and attempt admission
+Settlement::RouteClaim. The receipt is retained only for section 52's hour
+after its lease, so a production caller must settle within that bound or
+settle by replaying the acquisition; this path has only test callers. The
+grant is historical evidence only, even when returned by a known
+acquisition. Fresh current-owner and attempt admission
 must still precede SMTP, and an expired or released receipt cannot revive an
 owner. Known committed results are not converted into deadline refusals.
 

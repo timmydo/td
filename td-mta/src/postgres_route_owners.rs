@@ -16,6 +16,8 @@ use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
 pub const LEASE_MS: i64 = 30_000;
+/// An acquisition receipt stays inspectable this long after its first lease.
+pub const RECEIPT_RETENTION_MS: i64 = 3_600_000;
 const MAX_ROWS: i64 = 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -386,6 +388,18 @@ pub fn acquire(
             } else {
                 1
             };
+            // A claim replays its receipt only while it has no grant, so one
+            // whose first lease ended an hour ago is settled or abandoned.
+            let cutoff = timestamp
+                .checked_sub(RECEIPT_RETENTION_MS)
+                .ok_or(Error::Clock)?;
+            client
+                .execute(
+                    "DELETE FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at<$2",
+                    &[&claim.binding.account().as_bytes().as_slice(), &cutoff],
+                )
+                .await
+                .map_err(|_| Error::Database)?;
             let counts = client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owners WHERE account=$1 LIMIT 1024) owners),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 LIMIT 1024) receipts)", &[&claim.binding.account().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
             let owners: i64 = counts.try_get(0).map_err(|_| Error::Integrity)?;
             let receipts: i64 = counts.try_get(1).map_err(|_| Error::Integrity)?;

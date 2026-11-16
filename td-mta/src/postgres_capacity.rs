@@ -166,14 +166,20 @@ async fn count(
     u64::try_from(value).map_err(|_| ())
 }
 
-// Expired rows await the account's next delivery and refuse nothing.
-async fn live_receiving(
+// Expired rows await the account's next delivery or acquisition and refuse
+// nothing.
+async fn live(
     client: &tokio_postgres::Client,
     account: &[u8],
+    query: &str,
+    retention: i64,
     cap: u64,
 ) -> Result<u64, ()> {
     let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
-    let row = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 AND created_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", &[&account, &crate::postgres_receiving::RECEIPT_RETENTION_MS, &n]).await.map_err(|_| ())?;
+    let row = client
+        .query_one(query, &[&account, &retention, &n])
+        .await
+        .map_err(|_| ())?;
     let value: i64 = row.try_get(0).map_err(|_| ())?;
     u64::try_from(value).map_err(|_| ())
 }
@@ -264,10 +270,10 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             ("attempt_recovery_receipts", 1024, true),
             ("submission_expiry_receipts", 1024, true),
         ] {
-            let used = if table == "receiving_receipts" {
-                live_receiving(client, id, cap).await?
-            } else {
-                count(client, table, Some(id), cap).await?
+            let used = match table {
+                "receiving_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 AND created_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_receiving::RECEIPT_RETENTION_MS, cap).await?,
+                "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap).await?,
+                _ => count(client, table, Some(id), cap).await?,
             };
             rows.push(metric(
                 &scope,
