@@ -590,13 +590,26 @@ fn backup_summary(output: &str, check: &Json) -> Result<String> {
         number(check, "archive_bytes")?
     ))
 }
+/// performance-status's process identity, which changes only when its
+/// counters restart; boot_id also changes on an in-process reload.
+fn process(sample: &Json) -> Option<&str> {
+    match sample.get("process_id") {
+        Some(Json::Str(id)) => Some(id),
+        _ => None,
+    }
+}
 fn performance_summary(output: &str, previous: Option<&Json>) -> Result<(String, Json)> {
     let value = json::parse(output).map_err(|e| e.to_string())?;
     if string(&value, "status")? != "ok" {
         return Err("performance unavailable".into());
     }
     let boot = string(&value, "boot_id")?;
-    let same = previous.is_some_and(|p| p.get("boot_id").and_then(Json::as_str) == Some(boot));
+    // Counters continue across an in-process reload; an older binary
+    // without process_id keeps the boot_id rule.
+    let same = previous.is_some_and(|p| match (process(p), process(&value)) {
+        (Some(old), Some(new)) => old == new,
+        _ => p.get("boot_id").and_then(Json::as_str) == Some(boot),
+    });
     let mut summary = if same {
         "Counters since previous digest:\n"
     } else {
@@ -1181,6 +1194,54 @@ mod tests {
         set(&mut phases, "smtp_data", Json::Null).unwrap();
         set(&mut value, "phases", phases).unwrap();
         assert!(performance_summary(&value.to_canonical(), None).is_err());
+    }
+    #[test]
+    fn performance_deltas_follow_the_process_across_reloads() {
+        let sample = |boot: &str, process: &str, calls: u64| {
+            let mut phases = vec![];
+            for phase in [
+                "smtp_admission",
+                "smtp_data",
+                "smtp_commit",
+                "http_api",
+                "http_download",
+            ] {
+                phases.push((
+                    phase.to_string(),
+                    object(&[
+                        ("calls", num(calls)),
+                        ("failures", num(0)),
+                        ("lost", num(0)),
+                    ]),
+                ));
+            }
+            object(&[
+                ("status", Json::Str("ok".into())),
+                ("boot_id", Json::Str(boot.into())),
+                ("process_id", Json::Str(process.into())),
+                ("phases", Json::Obj(phases)),
+            ])
+        };
+        let previous = sample("one", "p1", 4);
+        // An in-process reload: new boot_id, same process, counters go on.
+        let (summary, _) =
+            performance_summary(&sample("two", "p1", 6).to_canonical(), Some(&previous)).unwrap();
+        assert!(summary.starts_with("Counters since previous digest"));
+        assert!(summary.contains("calls=2 "));
+        // A new process: its counters began at zero.
+        let (summary, _) =
+            performance_summary(&sample("two", "p2", 3).to_canonical(), Some(&previous)).unwrap();
+        assert!(summary.starts_with("Current process lifetime"));
+        assert!(summary.contains("calls=3 "));
+        // When either sample lacks process_id (an older binary, or a failed
+        // draw), boot_id decides.
+        let mut legacy = sample("one", "p1", 6);
+        set(&mut legacy, "process_id", Json::Null).unwrap();
+        let (summary, _) = performance_summary(&legacy.to_canonical(), Some(&previous)).unwrap();
+        assert!(summary.contains("calls=2 "));
+        set(&mut legacy, "boot_id", Json::Str("two".into())).unwrap();
+        let (summary, _) = performance_summary(&legacy.to_canonical(), Some(&previous)).unwrap();
+        assert!(summary.starts_with("Current process lifetime"));
     }
     #[test]
     fn explicit_resolution_binds_pending_id_and_keeps_evidence() {

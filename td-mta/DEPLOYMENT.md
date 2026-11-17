@@ -1106,8 +1106,11 @@ bound is 120 seconds); other invocations refuse contention. A digest
 advances its log-ID cursor only after acknowledged SMTP delivery; event
 wall-clock times do not discard late-collected samples. Ring eviction, a stale
 collector or an unfinished scan makes the report explicitly incomplete.
-Performance differences are calculated only within the same process boot;
-after restart, current-lifetime counters are labeled as partial window evidence.
+Performance differences are calculated within one process ID, across
+in-process reloads that change the boot ID. When either snapshot lacks a
+process ID (an older binary, or a null one after a failed entropy draw), they
+are calculated within one boot ID. After restart, current-lifetime counters
+are labeled as partial window evidence.
 
 Local SMTP acceptance is recorded durably before connection cleanup. The same
 UTC day's acknowledged digest is not sent twice. A lost final SMTP reply or

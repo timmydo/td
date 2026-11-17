@@ -40,12 +40,6 @@ fn capacity(output: &str, issues: &mut BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 const PHASES: &[&str] = &["smtp_commit", "smtp_publish"];
-fn process(sample: &Json) -> Option<&str> {
-    match sample.get("process_id") {
-        Some(Json::Str(id)) => Some(id),
-        _ => None,
-    }
-}
 fn performance(
     label: &str,
     output: &str,
