@@ -308,6 +308,29 @@ fn current(
     }
     Ok(())
 }
+/// An owner row of another route name retires once unleased and untouched
+/// this long; a selected route's relay renews it every few seconds.
+pub const IDLE_OWNER_MS: i64 = 7 * 24 * 3_600_000;
+
+/// Under the account lock, delete rows of routes no relay is using: owner rows
+/// idle for `IDLE_OWNER_MS`, then health rows no remaining owner row holds,
+/// with their repair receipts. Rows an active attempt or uncompleted submission
+/// names stay, and so does any health row with a repair latch or an unelapsed
+/// backoff. A recreated owner restarts its generation, which fences nothing
+/// old: every fence also compares the random claim operation and boot.
+async fn retire_obsolete(client: &Client, claim: &Claim, now: i64) -> Result<(), Error> {
+    let account = claim.binding.account();
+    let account = account.as_bytes().as_slice();
+    let route = claim.binding.route();
+    let name = route.name();
+    let destination = route.destination().as_slice();
+    client.execute("DELETE FROM td_mta.route_owners o WHERE o.account=$1 AND o.route_name<>$2 AND (o.expires_at IS NULL OR o.expires_at<=$3) AND o.last_clock<$3-$4 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=o.account AND a.route_name=o.route_name AND a.active)", &[&account, &name, &now, &IDLE_OWNER_MS]).await.map_err(|_| Error::Database)?;
+    // This claim is about to own its route name at its destination only.
+    client.execute("DELETE FROM td_mta.route_health h WHERE h.account=$1 AND h.repair_generation IS NULL AND (h.next_at IS NULL OR h.next_at<=$4) AND NOT (h.route_name=$2 AND h.destination=$3) AND NOT EXISTS(SELECT 1 FROM td_mta.route_owners o WHERE o.account=h.account AND o.route_name=h.route_name AND o.destination=h.destination AND o.route_name<>$2) AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=h.account AND a.route_name=h.route_name AND a.destination=h.destination AND a.active) AND NOT EXISTS(SELECT 1 FROM td_mta.submission_routes r JOIN td_mta.submissions s ON s.account=r.account AND s.id=r.submission_id WHERE r.account=h.account AND r.route_name=h.route_name AND r.destination=h.destination AND s.completed_at IS NULL)", &[&account, &name, &destination, &now]).await.map_err(|_| Error::Database)?;
+    client.execute("DELETE FROM td_mta.route_health_receipts k WHERE k.account=$1 AND k.action=2 AND NOT (k.route_name=$2 AND k.destination=$3) AND NOT EXISTS(SELECT 1 FROM td_mta.route_health h WHERE h.account=k.account AND h.route_name=k.route_name AND h.destination=k.destination)", &[&account, &name, &destination]).await.map_err(|_| Error::Database)?;
+    Ok(())
+}
+
 /// The caller holds the configuration/account locks established by begin.
 pub(crate) async fn check_locked(
     client: &Client,
@@ -411,6 +434,7 @@ pub fn acquire(
                 )
                 .await
                 .map_err(|_| Error::Database)?;
+            retire_obsolete(client, &claim, timestamp).await?;
             let counts = client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owners WHERE account=$1 LIMIT 1024) owners),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 LIMIT 1024) receipts)", &[&claim.binding.account().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
             let owners: i64 = counts.try_get(0).map_err(|_| Error::Integrity)?;
             let receipts: i64 = counts.try_get(1).map_err(|_| Error::Integrity)?;

@@ -12588,6 +12588,8 @@ mod final_capacity;
 mod final_work;
 #[path = "postgres_probe/new_possible.rs"]
 mod new_possible;
+#[path = "postgres_probe/route_retirement.rs"]
+mod route_retirement;
 #[path = "postgres_probe/submission_retention.rs"]
 mod submission_retention;
 
@@ -12913,6 +12915,7 @@ fn exercise_attempt_recovery(
     submission_retention::exercise(fixture, request, trust, binding, submission);
     attempt_reclamation::exercise(fixture, request, trust, binding, submission);
     failure_notice::exercise(fixture, request, trust, binding, submission);
+    route_retirement::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(

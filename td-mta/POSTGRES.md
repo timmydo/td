@@ -248,7 +248,8 @@ Each foreground process has one outbound worker across its configured accounts;
 different processes may deliver different accounts concurrently.
 
 A short transaction locks a due route and eligible recipient batch, installs
-an owner boot ID, fresh attempt ID, increasing fencing generation and database
+an owner boot ID, fresh attempt ID, increasing fencing generation (restarting
+only after its owner row retired, section 52) and database
 lease expiry, and commits Prepared before any SMTP work. Bounded due scans
 may use FOR UPDATE SKIP LOCKED for competing workers; ordinary mail reads
 must not skip locked rows. Heartbeats renew only the exact current unexpired
@@ -2222,12 +2223,36 @@ start, so a supervisor restarting it more than about 1024 times in an hour
 for one account still meets Capacity, which fails the relay until receipts
 age out; that heals by itself.
 
+Route rows are retired, not kept for life. A selected configuration may
+have several relay profiles, each serving its own route for every account,
+so retirement asks whether any relay still uses a row, not whether the
+acquiring claim does. The same acquisition, under the same locks and before
+its capacity check, deletes the account's owner rows of other route names
+that hold no lease and have not been acquired, renewed or released for seven
+days (`IDLE_OWNER_MS`); a running relay renews within seconds and a stopping
+one releases at once, so neither is touched. It then deletes health rows that
+no remaining owner row holds at that route name and destination, other than
+its own route name at its own destination, together with those destinations'
+repair receipts. A row stays while an active attempt names its route
+(owners) or its route and destination (health), and a health row also while
+an uncompleted submission names it, while it holds a repair latch (section
+124), or while its backoff has not elapsed. Rows therefore grow only with
+configuration churn. A route no relay uses retires at the account's first
+acquisition a week after its last use; the acquiring route's own old
+destination retires at its next acquisition; and a latched row stays until
+an explicit repair clears its latch, so abandoning a latched destination
+without repairing it keeps one row. A route used again after that starts afresh: its
+owner at generation 1 with a new clock floor, which fences nothing old
+because every fence also compares the random claim operation and boot, and
+its health at revision 1 with no failure history. The backward-clock check
+of the retired row is lost with it.
+
 A fixed 30-second database-time lease binds the process boot identity, claim
 operation, route destination and generation. Renewal checks every field,
 current selected policy and unexpired ownership under lock. Release compares
 the same owner and fence but can clear an expired lease or removed policy;
-its caller must first close its SMTP transport. Release retains the fencing
-counter. Historical acquisition receipts are never live authority: `observe`
+its caller must first close its SMTP transport. Release retains the
+fencing counter until the row retires, a week after its last use. Historical acquisition receipts are never live authority: `observe`
 checks current policy, identity, fence and database expiry. Unknown renewal
 or release responses remain indeterminate; fresh primary observation resolves
 whether that owner remains live. Internal coordination does not advance JMAP
@@ -3948,7 +3973,9 @@ no transport, scan, scheduler or administrator clock-confirm endpoint.
 Schema version 25 prepares route health keyed by account, route name and
 immutable destination fingerprint, plus independently retained operation
 receipts. Separate destination keys keep a changed endpoint from inheriting
-or erasing the prior endpoint's backoff. Each health revision is nonzero;
+or erasing the prior endpoint's backoff; retirement (section 52) removes
+an endpoint's row only once its backoff has elapsed and it holds no repair
+latch. Each health revision is nonzero;
 receipt revisions increase and the future publisher must check exact adjacency.
 Receipts capture the resulting state and one of failure, repair or success,
 so later state changes cannot rewrite an earlier operation's settlement.
@@ -4047,7 +4074,8 @@ future shared retry time refuses new dispatch. Receipt replay remains historical
 and does not acquire new transport authority. The local queue-clock guard and
 recipient due times remain separate requirements. No scheduler or transport is
 activated; explicit configuration repair and successful-route reset are the
-next publication operations, and no timer silently clears a repair latch.
+next publication operations, and no timer silently clears a repair latch;
+route retirement never deletes a latched row.
 
 
 ## 124. Explicit shared route repair
@@ -4067,7 +4095,8 @@ Dispatch therefore remains blocked until the existing shared minimum interval
 and the separate recipient/clock guards permit it. Receipt action 2 captures
 that repaired state atomically, with the shared 1024-receipt account limit;
 each publication first keeps only the four newest repair receipts of each
-destination (section 123).
+destination (section 123); an acquisition retires the receipts of
+destinations whose health row has retired (section 52).
 Backward UTC, stale ownership, overflow and write failure refuse publication;
 unknown COMMIT settles the retained operation without applying another repair.
 
