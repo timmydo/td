@@ -61,6 +61,9 @@ fn toml_string(text: &str) -> String {
     out
 }
 
+/// Native cases mostly wait on compositor round trips, not CPU.
+const THREADS: &str = "--test-threads=8";
+
 fn test_command(
     root: &Path,
     manifest: &str,
@@ -97,11 +100,11 @@ fn test_command(
             cmd.arg(unit);
         } else {
             cmd.args(["--test", "control_process", "native_compositor::fixture::"])
-                .args(["--", "--ignored", "--test-threads=2"]);
+                .args(["--", "--ignored", THREADS]);
         }
     } else {
         cmd.args(["--test", "control_process", "native_compositor::"])
-            .args(["--", "--ignored", "--test-threads=2"]);
+            .args(["--", "--ignored", THREADS]);
     }
     Ok(cmd)
 }
@@ -312,6 +315,7 @@ mod tests {
                 args.contains(&"native_compositor::fixture::"),
                 unit.is_none()
             );
+            assert_eq!(args.contains(&"--test-threads=8"), unit.is_none());
             assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.force=true"));
             assert!(fixture
                 .get_envs()
@@ -349,7 +353,7 @@ mod tests {
                 "native_compositor::",
                 "--",
                 "--ignored",
-                "--test-threads=2"
+                "--test-threads=8"
             ]
         );
         let cmd = test_command(

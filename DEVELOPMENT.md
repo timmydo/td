@@ -1199,10 +1199,12 @@ declared native-test consumers as readers even without shared source files.
 `td-builder gate-crates native-compositor --manifest-path CRATE/Cargo.toml`
 checks that declaration, builds the repository's compositor offline into a
 fresh owned directory under `target/`, then runs the consumer's ignored
-`control_process` cases filtered by `native_compositor::`, with two test
-threads. Ordinary tests and optional Weston cases keep their own commands.
-The cases drive the compositor through one shared harness, the
-`td-test-compositor` crate, which a consumer names under
+`control_process` cases filtered by `native_compositor::`, with eight test
+threads: the cases wait on compositor round trips, and each keeps its own
+session directory and child environment. Ordinary tests and optional
+Weston cases keep their own commands. The cases drive the compositor
+through one shared harness, the `td-test-compositor` crate, which a
+consumer names under
 `[dev-dependencies]`: it launches the tool, reads its readiness line and
 speaks its control socket (layout, input with receipts, observation,
 capture, clipboard). Cargo resolves a dev-dependency into the consumer's
