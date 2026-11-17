@@ -1002,6 +1002,7 @@ fn publish_inner(
                             let delay = crate::postgres_attempt_recovery::retry_delay(
                                 entropy.as_mut().ok_or(Error::Integrity)?,
                                 u32::try_from(attempts).map_err(|_| Error::Integrity)?,
+                                value.claim.retry_floor(),
                             )
                             .map_err(|error| match error {
                                 crate::postgres_attempt_recovery::Error::Crypto => Error::Crypto,

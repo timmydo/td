@@ -592,8 +592,10 @@ and EmailSubmission through the executable's HTTPS endpoint to its separate
 relay profile. Its local TLS smart host refuses the first MAIL with 451;
 the fixture restarts the relay, delivers fresh mail during the retry hold,
 delivers a verified eight-bit fixture source using 8BITMIME and checks route
-backoff reset, then observes the original message delivered after the real five-minute
-startup guard and persisted retry deadline. It checks durable recipient
+backoff reset, then observes the original message delivered after the real
+startup guard and persisted retry deadline, both of the 60-second minimum
+retry interval its profiles are served with (POSTGRES.md section 219).
+It checks durable recipient
 states and actual DATA receipt, including the binary attachment encoding. It confirms the stable clock through local
 control, then kills the process during a later MAIL and checks that a new
 owner recovers Prepared after the abandoned lease expires. That interrupted

@@ -466,7 +466,8 @@ Run these commands as the relay service identity against its runtime path:
 ```
 
 Clock status reports `held` or `confirmed`. Confirmation is eligible only
-after five minutes of stable database UTC/monotonic progress. Its immediate
+after the minimum retry interval of stable database UTC/monotonic progress:
+five minutes unless `serve --minimum-retry-seconds` shortens it. Its immediate
 `requested` result acknowledges the request; inspect status afterward and
 request again if it was too early. Restart or clock discontinuity restores
 the hold. Confirmation permits bounded overdue expiry; it does not move

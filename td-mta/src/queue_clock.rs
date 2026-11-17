@@ -23,7 +23,9 @@ pub(crate) fn admit_database(
     }
 }
 
-const GUARD_MS: u64 = 300_000;
+/// UTC/monotonic disagreement beyond this is a clock discontinuity, whatever
+/// the retry floor.
+const DISCONTINUITY_MS: u64 = 300_000;
 static NEXT_CONFIRMATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_confirmation(counter: &AtomicU64) -> Result<u64, Error> {
@@ -36,6 +38,27 @@ fn next_confirmation(counter: &AtomicU64) -> Result<u64, Error> {
         }
     }
     Err(Error::Invalid)
+}
+
+/// The minimum retry interval (QUEUE.md section 4): the first automatic retry
+/// delay and route backoff, and the stable monotonic interval before an
+/// attempted recipient is redispatched or the clock confirmed. Five minutes
+/// unless `serve --minimum-retry-seconds` chooses a shorter one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryFloor(u64);
+impl RetryFloor {
+    pub const DEFAULT: Self = Self(300_000);
+    /// The shortest floor any process may choose. Persisted retry times are
+    /// checked against it, so rows any permitted floor wrote stay valid.
+    pub const LOWEST_MS: i64 = 1_000;
+    pub fn from_seconds(seconds: u64) -> Option<Self> {
+        (1..=300)
+            .contains(&seconds)
+            .then_some(Self(seconds * 1_000))
+    }
+    pub fn millis(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +81,7 @@ pub struct Status {
 /// Feed database UTC paired with this runtime's one monotonic tick domain.
 /// Recreate at process startup; never persist or transfer its local ticks.
 pub struct Guard {
+    floor: RetryFloor,
     anchor: Time,
     last: Time,
     stable_since: u64,
@@ -85,10 +109,15 @@ impl Expiry {
 
 impl Guard {
     pub fn new(sample: Time) -> Result<Self, Error> {
+        Self::with_retry_floor(sample, RetryFloor::DEFAULT)
+    }
+
+    pub fn with_retry_floor(sample: Time, floor: RetryFloor) -> Result<Self, Error> {
         if sample.utc_ms < 0 {
             return Err(Error::Invalid);
         }
         Ok(Self {
+            floor,
             anchor: sample,
             last: sample,
             stable_since: sample.monotonic.0,
@@ -122,7 +151,7 @@ impl Guard {
         let discontinuity = [self.anchor, self.last].iter().any(|prior| {
             let utc_elapsed = i128::from(sample.utc_ms) - i128::from(prior.utc_ms);
             let monotonic_elapsed = i128::from(sample.monotonic.0) - i128::from(prior.monotonic.0);
-            (utc_elapsed - monotonic_elapsed).abs() > i128::from(GUARD_MS)
+            (utc_elapsed - monotonic_elapsed).abs() > i128::from(DISCONTINUITY_MS)
         });
         if discontinuity {
             self.hold(sample);
@@ -206,7 +235,7 @@ impl Guard {
     }
 
     fn stable(&self) -> bool {
-        self.last.monotonic.0.saturating_sub(self.stable_since) >= GUARD_MS
+        self.last.monotonic.0.saturating_sub(self.stable_since) >= self.floor.millis()
     }
 
     fn status(&self) -> Status {
@@ -296,6 +325,25 @@ mod tests {
             guard.confirm(time(2_200_004, 600_002)),
             Err(Error::Unstable)
         );
+    }
+
+    #[test]
+    fn a_shorter_floor_shortens_the_stable_interval_but_not_the_discontinuity_bound() {
+        assert_eq!(RetryFloor::from_seconds(0), None);
+        assert_eq!(RetryFloor::from_seconds(301), None);
+        assert_eq!(RetryFloor::from_seconds(300), Some(RetryFloor::DEFAULT));
+        let floor = RetryFloor::from_seconds(30).unwrap();
+        let mut guard = Guard::with_retry_floor(time(1_000_000, 0), floor).unwrap();
+        assert_eq!(guard.observe(time(1_029_999, 29_999)), Ok(FRESH));
+        assert_eq!(guard.confirm(time(1_029_999, 29_999)), Err(Error::Unstable));
+        assert_eq!(guard.observe(time(1_030_000, 30_000)), Ok(RETRY));
+        assert_eq!(guard.confirm(time(1_030_000, 30_000)), Ok(READY));
+        // Drift within five minutes is no discontinuity, as at the default.
+        assert_eq!(guard.observe(time(1_330_000, 30_001)), Ok(READY));
+        assert_eq!(guard.observe(time(1_630_002, 30_002)), Ok(HELD));
+        assert_eq!(guard.observe(time(1_660_001, 60_001)), Ok(HELD));
+        assert_eq!(guard.confirm(time(1_660_001, 60_001)), Err(Error::Unstable));
+        assert_eq!(guard.confirm(time(1_660_002, 60_002)), Ok(READY));
     }
 
     #[test]

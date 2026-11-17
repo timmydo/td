@@ -78,7 +78,8 @@ fn pause(control: &Control, duration: Duration) {
     }
 }
 /// The database address remains pinned for this generation. A reload or restart
-/// selects a different primary, and starts a new five-minute retry clock guard.
+/// selects a different primary, and starts a new retry clock guard of the
+/// worker's minimum retry interval.
 #[derive(Default)]
 pub struct QueueControl {
     confirm: AtomicBool,
@@ -141,6 +142,7 @@ pub struct Worker<'a, 'r> {
     pub clock: Arc<RuntimeClock>,
     pub handshakes: &'a HandshakePool,
     pub maximum: u64,
+    pub retry_floor: crate::queue_clock::RetryFloor,
 }
 impl Worker<'_, '_> {
     pub fn run(&self, control: &Control, ready: &AtomicBool) -> Result<(), Error> {

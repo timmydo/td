@@ -457,7 +457,7 @@ fn publish_inner(
                         || count <= 0
                         || phase != 4
                         || last
-                            .checked_add(300_000)
+                            .checked_add(crate::queue_clock::RetryFloor::LOWEST_MS)
                             .is_none_or(|minimum| due < minimum)
                         || !(matches!(reason, 1 | 3 | 4 | 5 | 8) || (reason == 9 && uncertain == 1))
                         || (reason == 1

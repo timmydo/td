@@ -467,7 +467,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 41);
+    assert_eq!(receipt.version, 42);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -544,7 +544,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        41
+        42
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -685,7 +685,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":41"));
+    assert!(initialized.contains("\"schema_version\":42"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -935,7 +935,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=41",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=42",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -943,7 +943,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=41 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=42 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1126,7 +1126,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 41);
+    assert_eq!(receipt.version, 42);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -2011,7 +2011,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 41);
+        assert_eq!(receipt.version, 42);
         assert_eq!(
             sql(
                 &fixture,
@@ -2100,7 +2100,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
     };
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 41);
+    assert_eq!(receipt.version, 42);
     assert_eq!(sql(&fixture,
         "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
         "1.6:search_owner:td_mta_trgm");

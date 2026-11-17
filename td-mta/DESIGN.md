@@ -2454,7 +2454,9 @@ diagnostics; no DNS response by itself permanently fails a recipient. Pending
 mail remains queued subject to its normal expiry. Manual retry cannot bypass
 the route's concurrency or minimum retry interval.
 
-Default automatic retry starts at five minutes, doubles to an hourly cap with
+Default automatic retry starts at the minimum retry interval, five minutes
+unless `serve --minimum-retry-seconds` shortens it (QUEUE.md section 4),
+doubles at most four times, capped hourly, with
 jitter, and expires after five days. V1 ignores free-text server retry hints.
 Persist UTC scheduling data; use monotonic time within a running attempt and
 bound catch-up after clock changes/restart. No sleeping thread per queue item.

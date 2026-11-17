@@ -284,9 +284,11 @@ bytes/Message-ID, without assuming provider deduplication.
 
 ## 4. Retry, cancellation and retention
 
-After failed attempt n (n starts at 1), nominal delay is
-min(300000 * 2^(min(n-1, 4)), 3600000) milliseconds. Sample uniformly from
-the integer interval [max(300000, nominal * 9 / 10),
+The minimum retry interval F is 300000 milliseconds unless the serving
+process is started with `--minimum-retry-seconds` 1..300, which sets it
+for that process alone. After failed attempt n (n starts at 1), nominal
+delay is min(F * 2^(min(n-1, 4)), 3600000) milliseconds. Sample uniformly
+from the integer interval [max(F, nominal * 9 / 10),
 min(3600000, nominal * 11 / 10)] using Entropy; rejection sampling has a
 limit of 32 entropy samples and failure pauses dispatch. Clipping the interval
 before sampling avoids concentrating probability at either bound. Use checked
@@ -304,19 +306,19 @@ or certificate verification require a successful explicit configuration/
 certificate reload before dispatch resumes. Reconstruct a conservative
 route delay from retained attempt/retry rows during the bounded startup
 scan; configuration repair releases the pause but not the minimum interval.
-After restart or a wall-clock discontinuity, require five monotonic minutes
-before redispatching an attempted recipient. Newly queued messages may be
+After restart or a wall-clock discontinuity, require F monotonic
+milliseconds before redispatching an attempted recipient. Newly queued messages may be
 sent immediately on a healthy route. Evaluate expiry before dispatch; once
 expired, a clock moving backward cannot revive a terminal row. M02c3 owns
 scan/scheduler work ceilings. Persisting/rebuilding an index cannot itself
 change these authoritative times.
 
-A UTC discontinuity exceeding five minutes relative to monotonic elapsed
-time pauses new dispatch and expiry before any more terminal transitions.
+A UTC discontinuity exceeding five minutes, whatever F, relative to
+monotonic elapsed time pauses new dispatch and expiry before any more terminal transitions.
 At startup, any already-overdue pending submission is held for clock
 validation, not immediately expired. An administrator must confirm the UTC
-clock through a named queue clock-confirm operation after at least five
-minutes of stable UTC/monotonic progress; until then health exposes the hold.
+clock through a named queue clock-confirm operation after at least F of
+stable UTC/monotonic progress; until then health exposes the hold.
 This is deliberately conservative for a restart after a long outage: no
 durable row/format is added, and a restart repeats the validation if items
 remain overdue. Non-overdue items may dispatch after the normal restart guard.

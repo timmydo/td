@@ -1829,8 +1829,14 @@ version identifiers, deadlines and redacted errors.
 ## Foreground PostgreSQL service
 
 `td-mta serve --connection-file PATH --profile NAME --runtime PATH
---scratch PATH` starts the named database profile. Each option is required
-once; the old `--config`, `--smtp-only` and `--mailbox-access` serving forms
+--scratch PATH` starts the named database profile. Each of those options is
+required once. Optional `--read-only` serves restricted local mail reading,
+and optional `--minimum-retry-seconds N`, at most once with N a decimal in
+1..300 (default 300), sets the relay's minimum retry interval (QUEUE.md
+section 4, POSTGRES.md section 219); a profile without the relay role
+ignores it. It exists so fixtures need not wait five real minutes; a
+shorter production interval retries more often and shortens the clock
+observation before retries, confirmation and retention. The old `--config`, `--smtp-only` and `--mailbox-access` serving forms
 are removed. POSTGRES.md owns connection-file protection, primary/schema
 qualification and profile selection. Serving uses a dedicated non-owner
 runtime login and refuses the owner credential, maintenance barriers,
@@ -1850,7 +1856,9 @@ configuration, or the database is unreachable just then, the process exits.
 expiry. `queue-clock-confirm --runtime PATH` requests clock confirmation on
 that process through its private control socket. The acknowledgment is
 `requested`, not completion: check status afterward. Confirmation before
-five minutes of stable database UTC/monotonic progress is refused; submit
+the process's minimum retry interval (five minutes unless `serve
+--minimum-retry-seconds` shortens it) of stable database UTC/monotonic
+progress is refused; submit
 again afterward. A restart, reload or clock discontinuity restores the hold. This
 operation permits bounded overdue expiry under QUEUE.md; it does not move
 retry deadlines earlier.

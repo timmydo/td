@@ -19,7 +19,8 @@ pub(super) fn exercise(
     generation: u64,
     submission: SubmissionId,
 ) {
-    // Independently seed elapsed due times; no fixture waits five real minutes.
+    // Independently seed elapsed due times; no fixture waits a real retry
+    // interval. Admission bounds the gap by the lowest permitted floor, 1 s.
     let previous = sql(fixture,&format!("SELECT encode(attempt_id,'hex') FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     sql(fixture,&format!("UPDATE td_mta.recipients SET state=5,phase=4,uncertain=0,attempt_id=decode('{previous}','hex'),attempt_count=1,last_attempt_at=(extract(epoch FROM clock_timestamp())*1000)::bigint-600000,next_attempt_at=NULL,reason=2,rcpt_reply='250 earlier RCPT',data_reply='550 earlier DATA',diagnostic='earlier diagnostic' WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL,notification=0,expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex'); UPDATE td_mta.recipients SET state=3,reason=1,data_reply='450 earlier DATA',next_attempt_at=(extract(epoch FROM clock_timestamp())*1000)::bigint-1 WHERE submission_id=decode('{submission}','hex') AND ordinal<200; UPDATE td_mta.recipients SET state=7,uncertain=1,reason=9 WHERE submission_id=decode('{submission}','hex') AND ordinal IN (0,100); UPDATE td_mta.recipients SET state=4,reason=0,data_reply='250 accepted' WHERE submission_id=decode('{submission}','hex') AND ordinal=200; UPDATE td_mta.recipients SET state=7,uncertain=1 WHERE submission_id=decode('{submission}','hex') AND ordinal=201; UPDATE td_mta.recipients SET state=1,phase=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex') AND ordinal=202; UPDATE td_mta.recipients SET state=3,reason=1,data_reply='450 later',next_attempt_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE submission_id=decode('{submission}','hex') AND ordinal=203; UPDATE td_mta.recipients SET state=7,uncertain=1,reason=6 WHERE submission_id=decode('{submission}','hex') AND ordinal=204"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
@@ -43,12 +44,12 @@ pub(super) fn exercise(
         super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Capacity)
     );
-    sql(fixture,&format!("UPDATE td_mta.recipients SET attempt_count=1,next_attempt_at=last_attempt_at+299999 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
+    sql(fixture,&format!("UPDATE td_mta.recipients SET attempt_count=1,next_attempt_at=last_attempt_at+999 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     assert_eq!(
         super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Integrity)
     );
-    sql(fixture,&format!("UPDATE td_mta.recipients SET next_attempt_at=last_attempt_at+300000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET expires_at=send_at WHERE id=decode('{submission}','hex')"));
+    sql(fixture,&format!("UPDATE td_mta.recipients SET next_attempt_at=last_attempt_at+1000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET expires_at=send_at WHERE id=decode('{submission}','hex')"));
     assert_eq!(
         super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::NotDue)

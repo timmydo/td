@@ -151,7 +151,8 @@ impl Registry {
             Err(owners::Error::Stale) => {
                 // This slot has never dispatched. A known expired/released
                 // historical claim can be replaced; uncertainty cannot.
-                let replacement = database(owners::prepare(claim.binding(), claim.boot()))?;
+                let replacement = database(owners::prepare(claim.binding(), claim.boot()))?
+                    .with_retry_floor(claim.retry_floor());
                 let mut slots = self.slots.lock().map_err(|_| Error::Worker)?;
                 let slot = slots.get_mut(index).ok_or(Error::Worker)?;
                 if slot.claim.operation() != claim.operation() || slot.grant.is_some() {
@@ -257,7 +258,7 @@ pub(super) fn run(
         .map_err(|_| Error::Admission(ports::Error::Capacity))?;
     for binding in worker.profile.bindings() {
         slots.push(Slot {
-            claim: database(owners::prepare(binding, boot))?,
+            claim: database(owners::prepare(binding, boot))?.with_retry_floor(worker.retry_floor),
             grant: None,
             renewed: false,
         });
@@ -290,10 +291,13 @@ pub(super) fn run(
             pause(control, Duration::from_millis(250));
         }
     };
-    let guard = Arc::new(Mutex::new(database(Guard::new(Time {
-        utc_ms: observed,
-        monotonic: worker.clock.sample()?.monotonic,
-    }))?));
+    let guard = Arc::new(Mutex::new(database(Guard::with_retry_floor(
+        Time {
+            utc_ms: observed,
+            monotonic: worker.clock.sample()?.monotonic,
+        },
+        worker.retry_floor,
+    ))?));
     let slots = database(ReadSlots::new(2))?;
     let settlement = database(ReadSlots::new(1))?;
     let source_slots = database(ReadSlots::new(2))?;

@@ -29,9 +29,11 @@ pub(super) struct Options {
     runtime: String,
     scratch: String,
     read_only: bool,
+    retry_floor: td_mta::queue_clock::RetryFloor,
 }
 pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Options> {
     let (mut connection, mut profile, mut runtime, mut scratch) = (None, None, None, None);
+    let mut retry_floor = None;
     let mut read_only = false;
     while let Some(flag) = args.next() {
         if flag == "--read-only" {
@@ -47,6 +49,14 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
             "--profile" if profile.is_none() => profile = Some(value),
             "--runtime" if runtime.is_none() => runtime = Some(value),
             "--scratch" if scratch.is_none() => scratch = Some(value),
+            "--minimum-retry-seconds" if retry_floor.is_none() => {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                retry_floor = Some(td_mta::queue_clock::RetryFloor::from_seconds(
+                    value.parse().ok()?,
+                )?)
+            }
             _ => return None,
         }
     }
@@ -56,6 +66,7 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
         runtime: runtime?,
         scratch: scratch?,
         read_only,
+        retry_floor: retry_floor.unwrap_or(td_mta::queue_clock::RetryFloor::DEFAULT),
     })
 }
 
@@ -621,6 +632,7 @@ fn run_once(
                         clock: clock.clone(),
                         handshakes: &handshakes,
                         maximum: limits.message_bytes as u64,
+                        retry_floor: options.retry_floor,
                     };
                     Some(
                         std::thread::Builder::new()
@@ -799,5 +811,47 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
         assert!(control.stop_requested());
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    fn floor(extra: &[&str]) -> Option<td_mta::queue_clock::RetryFloor> {
+        let base = [
+            "--connection-file",
+            "c",
+            "--profile",
+            "p",
+            "--runtime",
+            "r",
+            "--scratch",
+            "s",
+        ];
+        let args = base.iter().chain(extra).map(std::ffi::OsString::from);
+        super::arguments(args).map(|options| options.retry_floor)
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_minimum_retry_interval_is_optional_bounded_decimal_and_single() {
+        use td_mta::queue_clock::RetryFloor;
+        assert_eq!(floor(&[]), Some(RetryFloor::DEFAULT));
+        assert_eq!(
+            floor(&["--minimum-retry-seconds", "60"]),
+            RetryFloor::from_seconds(60)
+        );
+        assert_eq!(
+            floor(&["--minimum-retry-seconds", "1"]).unwrap().millis(),
+            RetryFloor::LOWEST_MS as u64
+        );
+        for refused in ["0", "301", "", "+30", " 30", "30s", "-1", "0x1e"] {
+            assert_eq!(floor(&["--minimum-retry-seconds", refused]), None);
+        }
+        assert_eq!(
+            floor(&[
+                "--minimum-retry-seconds",
+                "30",
+                "--minimum-retry-seconds",
+                "30"
+            ]),
+            None
+        );
     }
 }

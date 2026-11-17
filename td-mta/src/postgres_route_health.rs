@@ -140,9 +140,9 @@ pub(crate) fn state(row: &Row, offset: usize, revision: u64) -> Result<State, Er
         let failed = failed.ok_or(Error::Integrity)?;
         let next = next.ok_or(Error::Integrity)?;
         if failed < 0
-            || next
-                .checked_sub(failed)
-                .is_none_or(|delay| !(300_000..=3_600_000).contains(&delay))
+            || next.checked_sub(failed).is_none_or(|delay| {
+                !(crate::queue_clock::RetryFloor::LOWEST_MS..=3_600_000).contains(&delay)
+            })
         {
             return Err(Error::Integrity);
         }
@@ -341,11 +341,15 @@ pub fn publish(
                 .map_or(0, |state| state.failure_count)
                 .checked_add(1)
                 .ok_or(Error::Capacity)?;
-            let delay = crate::postgres_attempt_recovery::retry_delay(&mut entropy, count)
-                .map_err(|error| match error {
-                    crate::postgres_attempt_recovery::Error::Crypto => Error::Crypto,
-                    _ => Error::Capacity,
-                })?;
+            let delay = crate::postgres_attempt_recovery::retry_delay(
+                &mut entropy,
+                count,
+                value.claim.retry_floor(),
+            )
+            .map_err(|error| match error {
+                crate::postgres_attempt_recovery::Error::Crypto => Error::Crypto,
+                _ => Error::Capacity,
+            })?;
             let next = timestamp.checked_add(delay).ok_or(Error::Clock)?;
             let repair = if matches!(value.failure, Failure::Tls | Failure::Auth) {
                 Some(binding.selection().generation)

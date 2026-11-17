@@ -24,6 +24,14 @@ pub(super) fn exercise(
         super::replica_seed::exercise();
     }
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
+    // Schema 42 left both route-health retry windows at the one-second floor.
+    let windows = |bound: &str| {
+        sql(fixture, &format!("SELECT count(*) FROM pg_catalog.pg_constraint WHERE contype='c' AND conrelid IN ('td_mta.route_health'::regclass,'td_mta.route_health_receipts'::regclass) AND pg_catalog.pg_get_constraintdef(oid) LIKE '%(next_at - failed_at) >= {bound})%'"))
+    };
+    assert_eq!(
+        (windows("1000").as_str(), windows("300000").as_str()),
+        ("2", "0")
+    );
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();
     let connection = fixture.root.join("serving-connection");
@@ -57,6 +65,10 @@ pub(super) fn exercise(
                 .arg(&runtime)
                 .arg("--scratch")
                 .arg(&scratch)
+                // Every real guard below, at a 60-second floor instead of five
+                // minutes: long enough that fresh mail and the route reset
+                // still finish while the earlier failure is held.
+                .args(["--minimum-retry-seconds", "60"])
                 .stdout(fs::File::create(local.join(format!("{profile}-output"))).unwrap())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -469,26 +481,33 @@ pub(super) fn exercise(
             "UPDATE td_mta.submissions SET expires_at=send_at WHERE id=decode('{expired}','hex')"
         ),
     );
+    // The new process's guard starts after this instant, so the earlier
+    // failure stays held for at least the floor from here.
+    let held_from = std::time::Instant::now();
     let restarted = start("cloud");
     cloud = restarted.0;
     wait(
         "SELECT count(*) FROM td_mta.recipients WHERE state=4",
         "1",
-        30,
+        25,
     );
-    wait("SELECT failure_count FROM td_mta.route_health", "0", 30);
-    assert_eq!(
-        sql(
-            fixture,
-            "SELECT count(*) FROM td_mta.recipients WHERE state=3"
-        ),
-        "1"
+    wait("SELECT failure_count FROM td_mta.route_health", "0", 25);
+    // Read before checking elapsed time: a count taken within the floor
+    // cannot include the retry.
+    let held = sql(
+        fixture,
+        "SELECT count(*) FROM td_mta.recipients WHERE state=3",
     );
-    // Real monotonic startup guard and persisted five-minute minimum, no clock bypass.
+    assert!(
+        held_from.elapsed() < Duration::from_secs(60),
+        "fresh delivery and the route reset outlasted the 60 s retry floor"
+    );
+    assert_eq!(held, "1");
+    // Real monotonic startup guard and persisted retry minimum, no clock bypass.
     wait(
         "SELECT count(*) FROM td_mta.recipients WHERE state=4",
         "2",
-        360,
+        150,
     );
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 2);
     let clock_command = |operation: &str| {

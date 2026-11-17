@@ -2287,8 +2287,8 @@ This path preserves near-expiry/overdue responsibility using the QUEUE.md
 expiry-wait marker and retires the active attempt without declaring terminal
 failure. Clock-confirmed expiry remains a
 separate activation prerequisite. A backwards last-attempt timestamp refuses.
-Runtime clock discontinuity validation and the five-minute monotonic restart
-guard still precede any actual retry. Receipt storage has a 1024-per-account
+Runtime clock discontinuity validation and the monotonic restart guard of
+the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
 cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
 
 ## 55. Runtime database credential preparation
@@ -3785,9 +3785,10 @@ rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.
 
 The prepared `queue_clock::Guard` pairs database UTC with samples from one
 process-local monotonic domain. Startup permits fresh dispatch but holds
-attempted recipients for five monotonic minutes. Expiry remains held until
-an explicitly authorized queue clock-confirm operation observes at least five
-stable minutes. The caller must check database due times, ownership and route
+attempted recipients for the minimum retry interval of monotonic time (five
+minutes by default, section 219). Expiry remains held until an explicitly
+authorized queue clock-confirm operation observes that interval of stable
+progress. The caller must check database due times, ownership and route
 health separately; a status snapshot is neither a permit nor historical
 transport authority.
 
@@ -3815,8 +3816,8 @@ work, Accepted, Failed, terminal OutcomeUnknown and future retry timestamps.
 The first-attempt preparation continues to select only fresh Queued work.
 
 The transaction validates final phase, attempt identity/count, uncertainty
-and retry reason, a due timestamp at least five minutes after the previous
-attempt, and checked count increment. InFlight/Prepared publication preserves
+and retry reason, a due timestamp at least the lowest permitted minimum
+retry interval (one second, section 219) after the previous attempt, and checked count increment. InFlight/Prepared publication preserves
 uncertainty and genuine prior replies, replaces attempt identity and timestamp,
 and clears only next-attempt time, failure reason and local diagnostic.
 Immutable transmitted content and envelope remain unchanged. Active-route
@@ -3954,8 +3955,8 @@ so later state changes cannot rewrite an earlier operation's settlement.
 
 The stored consecutive failure count is bounded by u32. A zero count is the
 healthy state, with no failure/retry timestamp or repair latch. A nonzero count
-retains failure UTC and a next-attempt time between five minutes and one hour
-later. Reasons are None, Network, Tls, Auth or Protocol. A repair latch, when
+retains failure UTC and a next-attempt time between the lowest permitted
+minimum retry interval (one second, section 219) and one hour later. Reasons are None, Network, Tls, Auth or Protocol. A repair latch, when
 present, names a nonzero configuration-selection generation and is permitted
 only for TLS/authentication failures. Explicit repair may clear that latch
 while preserving the failure count and minimum retry time; successful transport
@@ -4414,7 +4415,8 @@ checks the applicable guard status before selecting recipients. The locked
 database sample reaches the guard before owner-clock or lease refusal, so a
 failed ownership check cannot hide a discontinuity from the persistent hold.
 Fresh work is
-allowed at startup; retries require five stable monotonic minutes. A clock
+allowed at startup; retries require the minimum retry interval of stable
+monotonic time (section 219). A clock
 discontinuity or primary-change hold continues to refuse dispatch until the
 existing explicit confirmation rules are satisfied. The adapter's UTC field
 is never used for queue decisions.
@@ -6171,7 +6173,8 @@ absence (section 165) clears it for the next expiry turn to rederive.
 Settlement never retries publication or changes recipient state.
 
 The underlying expiry transaction retains fresh policy and owner fencing,
-explicit queue-clock confirmation after the real five-minute stability hold,
+explicit queue-clock confirmation after the real stability hold of the
+minimum retry interval,
 process-local and database-wide spacing, at most 100 recipients, current
 attempt reservation handling, uncertainty preservation and one account
 sequence change. Admission does not confirm or replace the shared clock
@@ -6832,7 +6835,7 @@ the same durable change or rederives from durable state, and active-attempt
 discovery still finds any committed attempt. A requested stop may abandon
 unresolved custody; durable phase recovery on restart remains conservative.
 
-The process starts the five-minute retry guard from database UTC and its one
+The process starts its retry guard of the minimum retry interval from database UTC and its one
 monotonic clock. New mail may dispatch while retries wait. Expiry scans precede
 dispatch; the private queue clock confirmation operation in CONFIG.md enables
 at most one 100-recipient expiry batch per second. Overdue work remains held
@@ -7154,7 +7157,8 @@ holds the account lock longer than its own bounded batch.
 
 Deletion is irreversible and time-driven, so the relay calls it only right
 after a queue clock observation whose guard reports the stable status retry
-dispatch needs (no discontinuity, five minutes of UTC/monotonic progress),
+dispatch needs (no discontinuity, the minimum retry interval of
+UTC/monotonic progress),
 passing that observation's database UTC; the transaction refuses with Clock
 if the database clock has since moved more than a minute from it. Unlike
 expiry it does not wait for administrator confirmation, so an unattended
@@ -7342,6 +7346,44 @@ removes exactly the 61-minute attempt and the 63 oldest with their
 receipts, keeps the rest and the recipients' rows unchanged, and leaves a
 reclaimed attempt's phase settlement absent and its republication Missing.
 Repeated publications drain the backlog.
+
+## 219. Configurable minimum retry interval (schema 42)
+
+`td-mta serve --minimum-retry-seconds N`, N in 1..300, sets the serving
+process's minimum retry interval F; without it F stays five minutes. The
+option exists so fixtures need not wait five real minutes. F is:
+
+- the base and floor of every automatic retry delay and route backoff
+  (QUEUE.md section 4). The exponent stays capped at four doublings, so
+  the largest delay is 16F plus jitter: the one-hour cap is reached only
+  when F is at least 225 seconds, and at F of one second a failing
+  recipient retries every 14.4 to 17.6 seconds until expiry;
+- the stable monotonic interval the queue clock guard requires after
+  startup or a hold before an attempted recipient is redispatched, before
+  queue clock confirmation, and before the relay's unattended retention
+  (section 216: submission retirement and upload-lease reclamation),
+  which runs only on that stable status.
+
+F is local process policy, carried on the relay worker's route claims and
+guard, never published configuration; processes serving one route may
+differ. The clock discontinuity bound stays five minutes whatever F, so a
+shorter F never tolerates more clock disagreement, but it shortens the
+observation window before retries, confirmation and retention to F.
+
+Persisted times are checked against the lowest permitted interval, one
+second, not against the writing process's own: rows a shorter interval
+wrote stay valid for any process that reads them later, including one
+started with the default. Schema 42 relaxes the route-health and
+route-health receipt CHECKs from at least 300000 to at least 1000
+milliseconds between failure and next attempt; recipient retry admission
+(section 117) takes the same bound. Schema-41 binaries cannot serve
+schema 42; the upgrade only widens constraints, so no existing row needs
+repair. The native serving fixture checks that no route-health CHECK
+keeps the old bound, and runs its profiles at 60 seconds, so its real
+restart guard, persisted retry deadline and clock confirmation take 60
+seconds rather than five minutes; fresh delivery and the route reset must
+finish within that hold, which the fixture asserts by elapsed time before
+it checks the earlier failure is still held.
 
 ## 8.121 Native ACME state and certificate pairs
 
@@ -7700,8 +7742,8 @@ Registry acknowledgements match the exact claim operation and generation.
 Published slots are never replaced while the worker runs. One fresh database
 UTC sample initializes the shared queue-clock guard; historical receipt time
 and later account acquisition never reset it. Renewal timestamps do not feed
-that guard out of order. Existing five-minute restart/retry and explicit expiry
-confirmation rules continue across the entire process.
+that guard out of order. Existing restart/retry rules of the minimum retry
+interval and explicit expiry confirmation rules continue across the entire process.
 
 An explicit route-repair request remains pending until every configured account
 has been visited. An account without a repair hold completes a fresh observation;

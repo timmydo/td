@@ -4,6 +4,7 @@ use crate::{
     postgres_probe::{self, Request},
     postgres_runtime_profile::Binding,
     postgres_schema,
+    queue_clock::RetryFloor,
 };
 use std::{
     sync::{
@@ -42,8 +43,17 @@ pub struct Claim {
     boot: BootId,
     operation: RouteClaimId,
     digest: [u8; 32],
+    retry_floor: RetryFloor,
 }
 impl Claim {
+    /// The owning worker's retry policy; local, so outside the claim digest.
+    pub fn with_retry_floor(mut self, floor: RetryFloor) -> Self {
+        self.retry_floor = floor;
+        self
+    }
+    pub fn retry_floor(&self) -> RetryFloor {
+        self.retry_floor
+    }
     pub(crate) fn binding(&self) -> &Binding {
         &self.binding
     }
@@ -93,6 +103,7 @@ pub fn prepare(binding: &Binding, boot: BootId) -> Result<Claim, Error> {
         boot,
         operation: RouteClaimId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
+        retry_floor: RetryFloor::DEFAULT,
     })
 }
 fn number(bytes: &[u8]) -> Result<u64, Error> {

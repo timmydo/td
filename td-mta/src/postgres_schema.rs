@@ -55,8 +55,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_replica_mailboxes.sql"),
     include_str!("postgres_search_index.sql"),
     include_str!("postgres_receipt_stamps.sql"),
+    include_str!("postgres_retry_floor.sql"),
 ];
-const VERSION: u32 = 41;
+const VERSION: u32 = 42;
 #[path = "postgres_schema_acl.rs"]
 mod acl;
 // Shared by every future serving connection and explicit schema operation.

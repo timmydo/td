@@ -3,6 +3,7 @@ use crate::{
     ids::{AttemptId, AttemptRecoveryId},
     postgres_probe::{self, Request},
     postgres_route_owners::{self as owners, Claim},
+    queue_clock::RetryFloor,
 };
 use std::{
     sync::{
@@ -276,13 +277,18 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
-pub(crate) fn retry_delay(entropy: &mut impl Entropy, count: u32) -> Result<i64, Error> {
+pub(crate) fn retry_delay(
+    entropy: &mut impl Entropy,
+    count: u32,
+    floor: RetryFloor,
+) -> Result<i64, Error> {
     let exponent = count.checked_sub(1).ok_or(Error::Integrity)?.min(4);
-    let nominal = (300_000u64
+    let nominal = (floor
+        .millis()
         .checked_mul(1u64 << exponent)
         .ok_or(Error::Capacity)?)
     .min(3_600_000);
-    let low = (nominal * 9 / 10).max(300_000);
+    let low = (nominal * 9 / 10).max(floor.millis());
     let high = (nominal * 11 / 10).min(3_600_000);
     let width = high - low + 1;
     let limit = u64::MAX - u64::MAX % width;
@@ -451,6 +457,7 @@ pub fn publish(
                 let delay = retry_delay(
                     &mut entropy,
                     u32::try_from(count).map_err(|_| Error::Integrity)?,
+                    value.claim.retry_floor(),
                 )?;
                 // Equality is an expiry-wait marker, never eligible dispatch.
                 let retry = timestamp
@@ -577,21 +584,33 @@ mod tests {
     }
     #[test]
     fn retry_jitter_clips_before_sampling_and_bounds_rejection() {
-        for (count, low, high) in [
-            (1, 300_000, 330_000),
-            (2, 540_000, 660_000),
-            (5, 3_240_000, 3_600_000),
-            (u32::MAX, 3_240_000, 3_600_000),
+        let short = RetryFloor::from_seconds(30).unwrap();
+        let shortest = RetryFloor::from_seconds(1).unwrap();
+        for (floor, count, low, high) in [
+            (RetryFloor::DEFAULT, 1, 300_000, 330_000),
+            (RetryFloor::DEFAULT, 2, 540_000, 660_000),
+            (RetryFloor::DEFAULT, 5, 3_240_000, 3_600_000),
+            (RetryFloor::DEFAULT, u32::MAX, 3_240_000, 3_600_000),
+            (short, 1, 30_000, 33_000),
+            (short, 2, 54_000, 66_000),
+            (short, u32::MAX, 432_000, 528_000),
+            (shortest, 1, 1_000, 1_100),
         ] {
-            assert_eq!(retry_delay(&mut Fixed(0, 0), count).unwrap(), low);
+            assert_eq!(retry_delay(&mut Fixed(0, 0), count, floor).unwrap(), low);
             assert_eq!(
-                retry_delay(&mut Fixed((high - low) as u64, 0), count).unwrap(),
+                retry_delay(&mut Fixed((high - low) as u64, 0), count, floor).unwrap(),
                 high
             );
         }
-        assert_eq!(retry_delay(&mut Fixed(0, 0), 0), Err(Error::Integrity));
+        assert_eq!(
+            retry_delay(&mut Fixed(0, 0), 0, RetryFloor::DEFAULT),
+            Err(Error::Integrity)
+        );
         let mut rejected = Fixed(u64::MAX, 0);
-        assert_eq!(retry_delay(&mut rejected, 1), Err(Error::Crypto));
+        assert_eq!(
+            retry_delay(&mut rejected, 1, RetryFloor::DEFAULT),
+            Err(Error::Crypto)
+        );
         assert_eq!(rejected.1, 32);
     }
 }
