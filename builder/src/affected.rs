@@ -30,6 +30,7 @@ mod source_reads;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // shell `case` glob matcher: `*` matches any run INCLUDING `/` (case-glob, not
@@ -2180,6 +2181,11 @@ fn last_check_targets(output: &str) -> Vec<String> {
 }
 
 pub fn run_self_test(root: &Path) -> Vec<String> {
+    // Every assertion selects over this one unchanging tree.
+    with_reader_graphs(|| run_self_test_over(root))
+}
+
+fn run_self_test_over(root: &Path) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     let mut fail = |m: String| failures.push(m);
 
@@ -3763,8 +3769,11 @@ fn run_cargo_groups_on(
     let canon = canonical_preflight();
     // Each measured tree's paths, kept for the selection that weighs it.
     let deltas = std::cell::RefCell::new(std::collections::HashMap::new());
+    // One reader graph for every journaled tree weighed: the tree is taken
+    // to hold still until the groups start, as each weighing already took
+    // it to.
     let vouchers = match (&journal, &key, &tree) {
-        (Some(journal), Some(key), Some(tree)) => {
+        (Some(journal), Some(key), Some(tree)) => with_reader_graphs(|| {
             let wanted: Vec<String> = cmds.iter().map(|c| canon(c)).collect();
             shared_preflight_passes(
                 &journal.read_lines(key),
@@ -3781,7 +3790,7 @@ fn run_cargo_groups_on(
                     cleared_preflights(root, &changed, &canon)
                 },
             )
-        }
+        }),
         _ => std::collections::HashMap::new(),
     };
     // Appends verdicts for this run's tree; nothing without a journal.
@@ -5880,6 +5889,61 @@ fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<S
     Ok(crate_reader_graph(root, roster)?.readers)
 }
 
+/// The graph a root and roster give, while a caller that holds the tree
+/// still has said so (`with_reader_graphs`): one build costs a read of every
+/// roster crate's sources, and one selection over many paths or journaled
+/// trees would otherwise pay it each time.
+type ReaderGraphMemo = Option<(PathBuf, Vec<GateCrate>, Rc<CrateReaderGraph>)>;
+
+thread_local! {
+    /// None outside every scope; Some(None) inside one before its first build.
+    static READER_GRAPHS: std::cell::RefCell<Option<ReaderGraphMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with each reader graph built once per root and roster. The
+/// caller promises no roster crate's sources change while `f` runs. A
+/// nested scope is the outer one; the memo is gone when the outermost ends,
+/// unwinding included.
+fn with_reader_graphs<T>(f: impl FnOnce() -> T) -> T {
+    struct Scope(bool);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if self.0 {
+                READER_GRAPHS.with(|memo| *memo.borrow_mut() = None);
+            }
+        }
+    }
+    let outermost = READER_GRAPHS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let outermost = memo.is_none();
+        if outermost {
+            *memo = Some(None);
+        }
+        outermost
+    });
+    let _scope = Scope(outermost);
+    f()
+}
+
+/// `crate_reader_graph`, from the memo inside `with_reader_graphs`.
+fn reader_graph(root: &Path, roster: &[GateCrate]) -> Result<Rc<CrateReaderGraph>, String> {
+    let (scoped, held) = READER_GRAPHS.with(|memo| match &*memo.borrow() {
+        None => (false, None),
+        Some(Some((r, k, graph))) if r == root && k == roster => (true, Some(Rc::clone(graph))),
+        Some(_) => (true, None),
+    });
+    if let Some(graph) = held {
+        return Ok(graph);
+    }
+    let graph = Rc::new(crate_reader_graph(root, roster)?);
+    if scoped {
+        let entry = (root.to_path_buf(), roster.to_vec(), Rc::clone(&graph));
+        READER_GRAPHS.with(|memo| *memo.borrow_mut() = Some(Some(entry)));
+    }
+    Ok(graph)
+}
+
 /// Files under `builder/src` that are NOT the build engine, and so do not owe
 /// the from-source behavioural tier the rest of that directory does.
 ///
@@ -5957,7 +6021,7 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     let Some(mut selected) = changed_roster_crates(&roster, changed) else {
         return Ok(all);
     };
-    let graph = crate_reader_graph(root, &roster)?;
+    let graph = reader_graph(root, &roster)?;
     if changed.iter().any(|p| recipe_definition(p)) && graph.recipe_definitions {
         return Ok(all);
     }
@@ -5966,8 +6030,8 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
             push_unique(&mut selected, reader);
         }
     }
-    let readers = graph.readers;
-    close_over_changed_readers(root, &roster, &mut selected, &readers, changed)?;
+    let readers = &graph.readers;
+    close_over_changed_readers(root, &roster, &mut selected, readers, changed)?;
     // A workspace path beside the one crate still owes its workspace legs.
     let workspace = changed.iter().any(|p| workspace_only_change(p));
     let exempt = match selected.as_slice() {
@@ -7074,10 +7138,11 @@ mod tests {
     /// the failure mode that produced the stranding above.
     ///
     /// They are separate because the two tests read different things:
-    /// `run_self_test`'s only filesystem read is `builder/src/gate_defs`,
-    /// through `gate_files`, while the lock roster reads the SIBLING crates'
-    /// locks. The lock half is asked of the roster's own first entry, so a
-    /// renamed lock moves the check with it instead of stranding it again.
+    /// `run_self_test` needs `builder/src/gate_defs`, through `gate_files` (its
+    /// cargo selections read the roster crates' sources, whatever is there),
+    /// while the lock roster reads the SIBLING crates' locks. The lock half is
+    /// asked of the roster's own first entry, so a renamed lock moves the check
+    /// with it instead of stranding it again.
     fn require_gate_defs(root: &Path) {
         assert!(
             root.join("builder/src/gate_defs").is_dir(),
@@ -7677,6 +7742,55 @@ mod tests {
         let err = crate_readers(&root, &roster).unwrap_err();
         assert!(err.contains("tools/t.rs"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reader graph is built once per root and roster inside a scope and
+    /// every time outside one; a nested scope is its outer one, and the memo
+    /// is gone when the outermost ends, by unwinding too.
+    #[test]
+    fn a_reader_graph_is_built_once_per_root_and_roster_only_in_a_scope() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let held = || READER_GRAPHS.with(|memo| memo.borrow().is_some());
+        let built = || READER_GRAPHS.with(|memo| matches!(&*memo.borrow(), Some(Some(_))));
+        let same = |x: &CrateReaderGraph, y: &CrateReaderGraph| {
+            assert_eq!(x.readers, y.readers);
+            assert_eq!(x.recipe_definitions, y.recipe_definitions);
+            assert_eq!(x.evaluator_readers, y.evaluator_readers);
+        };
+        let a = reader_graph(&root, &roster).unwrap();
+        let b = reader_graph(&root, &roster).unwrap();
+        assert!(!Rc::ptr_eq(&a, &b), "no memo outside a scope");
+        assert!(!held());
+        with_reader_graphs(|| {
+            // The selection itself takes its graph from the memo.
+            assert!(!built());
+            let changed = [format!("{}/src/lib.rs", roster[0].name)];
+            cargo_test_cmds(&root, &changed).unwrap();
+            assert!(built(), "a selection in a scope keeps its graph");
+            let c = reader_graph(&root, &roster).unwrap();
+            let d = with_reader_graphs(|| reader_graph(&root, &roster).unwrap());
+            assert!(Rc::ptr_eq(&c, &d), "a nested scope shares the outer memo");
+            assert!(held(), "a nested scope leaves the outer memo in place");
+            same(&c, &a);
+            let fewer = reader_graph(&root, &roster[..1]).unwrap();
+            assert!(!Rc::ptr_eq(&c, &fewer), "another roster, another graph");
+            let again = reader_graph(&root, &roster).unwrap();
+            assert!(!Rc::ptr_eq(&c, &again), "one graph is held at a time");
+            same(&again, &c);
+        });
+        assert!(!held(), "the scope's end drops the memo");
+        let unwound = std::panic::catch_unwind(|| {
+            with_reader_graphs(|| {
+                reader_graph(&root, &roster).unwrap();
+                panic!("unwinding out of the scope");
+            })
+        });
+        assert!(unwound.is_err());
+        assert!(!held(), "unwinding out of the scope drops the memo");
     }
 
     /// The one-pass scan finds exactly the crate directories the one-name
@@ -10136,18 +10250,20 @@ mod tests {
             eprintln!("SKIP: no roster crates (builder-only sandbox)");
             return;
         };
-        for krate in roster {
-            let mine =
-                cargo_test_cmds(&root, &[format!("{}/src/lib.rs", krate.name)]).expect("narrowing");
-            for want in ["cargo test ", "cargo clippy "] {
-                assert!(
-                    mine.iter().any(|c| cargo_driver(c, want)
-                        && cmd_manifest_crate(c) == Some(krate.name.as_str())),
-                    "{} has no `{want}` command: {mine:?}",
-                    krate.name
-                );
+        with_reader_graphs(|| {
+            for krate in roster {
+                let mine = cargo_test_cmds(&root, &[format!("{}/src/lib.rs", krate.name)])
+                    .expect("narrowing");
+                for want in ["cargo test ", "cargo clippy "] {
+                    assert!(
+                        mine.iter().any(|c| cargo_driver(c, want)
+                            && cmd_manifest_crate(c) == Some(krate.name.as_str())),
+                        "{} has no `{want}` command: {mine:?}",
+                        krate.name
+                    );
+                }
             }
-        }
+        });
     }
 
     /// `cmd_manifest_crate` is the whole of what decides which suites a

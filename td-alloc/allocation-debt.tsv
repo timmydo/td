@@ -3,9 +3,9 @@ builder/build.rs	allocating-conversion	13
 builder/build.rs	allocation-macro	8
 builder/build.rs	unchecked-growth-or-clone	7
 builder/src/affected.rs	allocating-constructor	1
-builder/src/affected.rs	allocating-conversion	131
+builder/src/affected.rs	allocating-conversion	133
 builder/src/affected.rs	allocation-macro	159
-builder/src/affected.rs	heap-owner	1
+builder/src/affected.rs	heap-owner	2
 builder/src/affected.rs	unchecked-growth-or-clone	127
 builder/src/affected/source_reads.rs	allocating-conversion	13
 builder/src/affected/source_reads.rs	allocation-macro	5
