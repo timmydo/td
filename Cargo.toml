@@ -34,8 +34,8 @@ members = ["builder", "recipes", "engine"]
 # workspace root (member [profile.*] sections are ignored), so this is the one
 # place it can live for td-builder and td-recipe-eval.
 
-# td-builder and td-engine are optimized under the TEST profile. td-builder's
-# xz and bzip2 decoders are exercised on real release tarballs
+# td-builder, td-engine and td-recipe are optimized under the TEST profile.
+# td-builder's xz and bzip2 decoders are exercised on real release tarballs
 # (`xz::tests::decodes_real_release_tarballs` decodes a Linux tarball to some
 # 800 MiB), and an unoptimized decoder made those two tests the whole wall
 # clock of the workspace suite: 152 s and 43 s here, against 25 s and 4 s with
@@ -43,15 +43,22 @@ members = ["builder", "recipes", "engine"]
 # sha256 the xz decoder calls; bzip2 carries its own table — is optimized as
 # well; the next-longest test takes 14 s. Test only: `cargo test` alone reads
 # this, and `cargo build`, `check`, `clippy` and every release build are
-# untouched. These two packages only: the recipes crate has no such loop and
-# stays unoptimized itself, linking the one optimized engine unit. Only
-# `opt-level` is set, so the profile keeps `dev`'s debug assertions, overflow
-# checks and incremental builds — the tests are unchanged, only faster. A cold
-# test build costs some seventeen seconds more, an incremental one no more, and
-# neither package's non-test units share artifacts with `cargo build` any
-# longer. A debugger session wants unoptimized locals; one run gets them with
-# `cargo test --config profile.test.package.td-builder.opt-level=0`.
+# untouched. td-recipe too, since `td-recipe-eval`'s
+# `full_drain_keeps_reading_protocol_evidence_after_the_target` rescans a 4
+# MiB serial flood through a 65 KB lookback: 82.7 s unoptimized, 3.7-6.8 s at
+# opt-level 2, the tail of the evaluator's test binary. Only `opt-level` is
+# set, so the profile keeps `dev`'s debug assertions, overflow checks and
+# incremental builds — the tests are unchanged, only faster. A cold test build
+# costs some seventeen seconds more for the first two and fourteen for
+# td-recipe (30 s against 16 s, and its tests then take 11 s, not 94 s), an
+# incremental one no more, and none of the three packages' non-test units,
+# td-recipe's build script included, share artifacts with `cargo build` or the
+# dev-profile clippy leg any longer. A debugger session wants unoptimized
+# locals; one run gets them with `cargo test --config
+# profile.test.package.td-builder.opt-level=0`.
 [profile.test.package.td-builder]
 opt-level = 2
 [profile.test.package.td-engine]
+opt-level = 2
+[profile.test.package.td-recipe]
 opt-level = 2

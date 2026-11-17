@@ -34,3 +34,12 @@ indexing_slicing = "deny"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Tests only (`cargo test`; build, check, clippy and release are untouched):
+# the crash-cut upgrade test replays every cut through unoptimised byte
+# loops. Only `opt-level` is set, so `dev`'s debug and overflow assertions
+# stay on.
+# A debugger run gets unoptimised locals with
+# `cargo test --config profile.test.opt-level=0`.
+[profile.test]
+opt-level = 2
