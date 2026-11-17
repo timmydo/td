@@ -5521,7 +5521,10 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMemb
 /// Whether `text` names crate `name`'s DIRECTORY: `name/` with no identifier
 /// character before it. The slash is what keeps `td-sh/` out of `td-shell/`;
 /// the boundary before keeps it out of the store path `abc-td-sh/bin/td-sh`
-/// a td-login test spells, which is no read of td-sh.
+/// a td-login test spells, which is no read of td-sh. The reader graph
+/// asks this of every crate at once (`each_crate_dir_named`); this is the
+/// one-name oracle its tests hold it to.
+#[cfg(test)]
 fn names_crate_dir(text: &str, name: &str) -> bool {
     let needle = format!("{name}/");
     let mut from = 0usize;
@@ -5534,6 +5537,36 @@ fn names_crate_dir(text: &str, name: &str) -> bool {
         from = start.saturating_add(1);
     }
     false
+}
+
+/// Calls `found` for each crate of `roster` whose directory `text` names,
+/// exactly as `names_crate_dir` decides it, in one pass over `text` rather
+/// than one per crate. A roster name is name characters only
+/// (`discover_gate_crates` refuses any other), so `name/` with no name
+/// character before it is a `/` whose whole run of name characters before
+/// it is `name`. A crate may be found more than once.
+fn each_crate_dir_named<'a>(
+    text: &str,
+    roster: &'a [GateCrate],
+    mut found: impl FnMut(&'a GateCrate),
+) {
+    for (slash, _) in text.match_indices('/') {
+        let Some(before) = text.get(..slash) else {
+            continue;
+        };
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_name_char(*c))
+            .last()
+            .map_or(slash, |(i, _)| i);
+        let Some(run) = text.get(start..slash).filter(|run| !run.is_empty()) else {
+            continue;
+        };
+        if let Some(krate) = roster.iter().find(|k| k.name == run) {
+            found(krate);
+        }
+    }
 }
 
 /// Whether a manifest names crate `name` as a whole word outside a `#`
@@ -5813,12 +5846,18 @@ fn crate_reader_graph(root: &Path, roster: &[GateCrate]) -> Result<CrateReaderGr
         if may_read_evaluator(&text) || manifest_code().any(may_read_evaluator) {
             evaluator_readers.push(reader.name.clone());
         }
+        each_crate_dir_named(&text, roster, |read| {
+            if read.name != reader.name {
+                if let Some((_, readers)) = out.iter_mut().find(|(n, _)| *n == read.name) {
+                    push_unique(readers, &reader.name);
+                }
+            }
+        });
         for read in roster {
             if read.name == reader.name {
                 continue;
             }
-            if names_crate_dir(&text, &read.name)
-                || manifest_names(&manifest, &read.name)
+            if manifest_names(&manifest, &read.name)
                 || (reader.native_compositor_tests && read.name == "td-compositor")
                 // The isolated mail gate builds this client for PostgreSQL fixtures.
                 || (reader.name == "td-mta" && read.name == "td-mail")
@@ -7638,6 +7677,79 @@ mod tests {
         let err = crate_readers(&root, &roster).unwrap_err();
         assert!(err.contains("tools/t.rs"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The one-pass scan finds exactly the crate directories the one-name
+    /// oracle does: on each boundary case alone, against a stated answer,
+    /// and over every roster crate's own sources, each crate asked of each.
+    #[test]
+    fn one_pass_crate_dir_scan_matches_the_one_name_oracle() {
+        let krate = |name: &str| GateCrate {
+            trusted_test_root: false,
+            native_compositor_tests: false,
+            native_fixture_feature: None,
+            name: name.to_string(),
+            path_dependencies: Vec::new(),
+            path_dev_dependencies: Vec::new(),
+            clippy_all_targets: false,
+            test_args: None,
+            gate_test_args: None,
+        };
+        let both = |text: &str, roster: &[GateCrate]| {
+            let mut got: Vec<String> = Vec::new();
+            each_crate_dir_named(text, roster, |k| push_unique(&mut got, &k.name));
+            got.sort_unstable();
+            let want: Vec<String> = roster
+                .iter()
+                .filter(|k| names_crate_dir(text, &k.name))
+                .map(|k| k.name.clone())
+                .collect();
+            (got, want)
+        };
+        // `sh` is a strict suffix of `td-sh`, and `td-sh` a prefix of
+        // `td-shell`.
+        let roster = [
+            krate("a_b"),
+            krate("sh"),
+            krate("td-sh"),
+            krate("td-shell"),
+            krate("td-ui"),
+        ];
+        // One case per text, so no other match in it can hide a miss.
+        for (text, named) in [
+            ("\"../td-shell/src/x.rs\"", &["td-shell"][..]),
+            ("td-shell", &[]),
+            ("abc-td-sh/bin", &[]),
+            ("xtd-ui/", &[]),
+            ("\u{e9}td-ui/", &[]),
+            ("\u{2192}td-ui/", &["td-ui"]),
+            ("(td-ui/a", &["td-ui"]),
+            ("td-sh/", &["td-sh"]),
+            ("-sh/", &[]),
+            (" sh/", &["sh"]),
+            ("/a_b/ a_b//", &["a_b"]),
+            ("//td-sh", &[]),
+            ("", &[]),
+            ("/", &[]),
+        ] {
+            let (got, want) = both(text, &roster);
+            assert_eq!(got, want, "{text:?}");
+            assert_eq!(got, named, "{text:?}");
+        }
+        let root = repo_root();
+        let Ok(mut roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        roster.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let mut edges = 0;
+        for reader in &roster {
+            let (text, _) = crate_reader_inputs(&root, reader).unwrap();
+            let (got, want) = both(&text, &roster);
+            edges += got.len();
+            assert_eq!(got, want, "{}", reader.name);
+        }
+        assert!(edges > 0, "the repository's crates name each other");
     }
 
     /// The two name tests, in both directions: the directory form finds a
