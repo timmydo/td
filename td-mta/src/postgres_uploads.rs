@@ -23,6 +23,10 @@ use tokio_postgres::Client;
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECEIPTS: i64 = 1024;
+/// One reclamation batch keeps its cascading chunk delete far inside the
+/// statement timeout, as submission retention's does.
+pub const RECLAIM_LEASES: i64 = 64;
+pub const RECLAIM_BYTES: i64 = 64 * 1024 * 1024;
 use publication::CHUNK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,7 +369,8 @@ pub fn publish(
             let created_at = expiry::admit(client, expiry::Ledger::Uploads, account, MAX_RECEIPTS)
                 .await
                 .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
-            let usage = publication::charge(
+            let reclaimed = reclaim(client, account, created_at).await?;
+            let usage = match publication::charge(
                 client,
                 upload.binding.account(),
                 upload.binding.quotas(),
@@ -378,7 +383,17 @@ pub fn publish(
                 ],
             )
             .await
-            .map_err(publication_error)?;
+            {
+                // Keep the batch, so repeated refusals still drain expired leases.
+                Err(publication::Error::Quota) if reclaimed => {
+                    client
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(|_| Error::Database)?;
+                    return Err(Error::Quota);
+                }
+                usage => usage.map_err(publication_error)?,
+            };
             let expires_at = created_at
                 .checked_add(upload.ttl_ms)
                 .ok_or(Error::Integrity)?;
@@ -474,6 +489,59 @@ pub fn publish(
     }
 }
 
+/// Whether a lease fits after `taken` earlier ones with `bytes` including it.
+/// The first always fits: one upload holds at most `MAX_BYTES`.
+fn fits(taken: usize, bytes: i64) -> bool {
+    taken == 0 || bytes <= RECLAIM_BYTES
+}
+
+/// Under the caller's account lock, delete one bounded batch of this account's
+/// leases expired at database time `now`, oldest first, release their upload
+/// bytes and retire each body nothing else reaches. Returns whether it
+/// reclaimed any lease.
+async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<bool, Error> {
+    let rows = client.query("SELECT l.blob_id,b.length FROM td_mta.leases l JOIN td_mta.blobs b ON b.account=l.account AND b.id=l.blob_id WHERE l.account=$1 AND l.expires_at<=$2 ORDER BY l.expires_at,l.blob_id LIMIT $3", &[&account, &now, &RECLAIM_LEASES]).await.map_err(|_| Error::Database)?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let budget = td_alloc::Budget::new(16 * 1024).map_err(|_| Error::Capacity)?;
+    let mut blobs: td_alloc::BudgetVec<&[u8]> =
+        td_alloc::BudgetVec::with_capacity(&budget, rows.len()).map_err(|_| Error::Capacity)?;
+    let mut bytes = 0i64;
+    for row in &rows {
+        let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let length: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+        if id.len() != 16 || length < 0 {
+            return Err(Error::Integrity);
+        }
+        let total = bytes.checked_add(length).ok_or(Error::Integrity)?;
+        if !fits(blobs.len(), total) {
+            break;
+        }
+        blobs.try_push(id).map_err(|_| Error::Capacity)?;
+        bytes = total;
+    }
+    // The primary key admits one lease per body, so each body's whole length
+    // leaves upload bytes.
+    let deleted = client
+        .execute(
+            "DELETE FROM td_mta.leases WHERE account=$1 AND blob_id=ANY($2::bytea[])",
+            &[&account, &blobs.as_slice()],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    if usize::try_from(deleted).ok() != Some(blobs.len()) {
+        return Err(Error::Integrity);
+    }
+    let (body, count) = publication::retire_blobs(client, account, blobs.as_slice())
+        .await
+        .map_err(publication_error)?;
+    publication::release(client, account, [body, count, bytes, 0, 0])
+        .await
+        .map_err(publication_error)?;
+    Ok(true)
+}
+
 fn publication_error(error: publication::Error) -> Error {
     match error {
         publication::Error::Capacity => Error::Capacity,
@@ -482,5 +550,18 @@ fn publication_error(error: publication::Error) -> Error {
         publication::Error::Conflict => Error::Conflict,
         publication::Error::Database => Error::Database,
         publication::Error::Deadline => Error::Connection(postgres_probe::Error::Deadline),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reclamation_batches_stop_at_the_byte_bound_but_admit_one() {
+        assert!(fits(0, MAX_BYTES as i64));
+        assert!(fits(0, RECLAIM_BYTES + 1));
+        assert!(fits(1, RECLAIM_BYTES));
+        assert!(!fits(1, RECLAIM_BYTES + 1));
+        assert!(RECLAIM_BYTES >= 2 * MAX_BYTES as i64);
     }
 }

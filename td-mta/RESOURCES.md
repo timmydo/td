@@ -276,7 +276,8 @@ be accepted.
 The per-upload byte ceiling is `message_bytes`, at most 32 MiB; M13 publishes
 that value as `maxSizeUpload` and enforces it even for attachment uploads.
 `upload_disk_bytes` is the separate aggregate quota for bodies retained by
-upload leases.
+upload leases. A lease counts until `upload_expiry_seconds` passes and the
+account's next upload reclaims it (POSTGRES.md section 35), not for life.
 
 The compiled maxima and checked default values live in `limits.rs`; this table
 records the default byte ledger only. Transaction/WAL limits are fixed to the

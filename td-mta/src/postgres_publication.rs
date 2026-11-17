@@ -62,6 +62,41 @@ impl Usage {
     }
 }
 
+/// Delete those of `blobs` that no Email, lease or submission still reaches,
+/// under the caller's account lock. Chunks cascade; `blob_ids` rows stay, so
+/// no ID is reused. Returns the deleted bodies' total length and count.
+pub(crate) async fn retire_blobs(
+    client: &Client,
+    account: &[u8],
+    blobs: &[&[u8]],
+) -> Result<(i64, i64), Error> {
+    let released = client.query_one("WITH retired AS (DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=ANY($2::bytea[]) AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length) SELECT coalesce(sum(length),0)::bigint,count(*) FROM retired", &[&account, &blobs]).await.map_err(|_| Error::Database)?;
+    let bytes: i64 = released.try_get(0).map_err(|_| Error::Integrity)?;
+    let count: i64 = released.try_get(1).map_err(|_| Error::Integrity)?;
+    if bytes < 0 || count < 0 || !usize::try_from(count).is_ok_and(|n| n <= blobs.len()) {
+        return Err(Error::Integrity);
+    }
+    Ok((bytes, count))
+}
+
+/// Subtract released body bytes, blobs, upload bytes, queue bytes and queue
+/// submissions in the caller's account transaction. Refuses with Integrity
+/// rather than underflow or leave upload or queue bytes above body bytes.
+pub(crate) async fn release(
+    client: &Client,
+    account: &[u8],
+    released: [i64; 5],
+) -> Result<(), Error> {
+    if released.iter().any(|value| *value < 0) {
+        return Err(Error::Integrity);
+    }
+    let [body, blobs, uploads, queue, submissions] = released;
+    if client.execute("UPDATE td_mta.account_usage SET body_bytes=body_bytes-$2,blob_count=blob_count-$3,upload_bytes=upload_bytes-$4,queue_bytes=queue_bytes-$5,queue_submissions=queue_submissions-$6 WHERE account=$1 AND body_bytes>=$2 AND blob_count>=$3 AND upload_bytes>=$4 AND queue_bytes>=$5 AND queue_submissions>=$6 AND body_bytes-$2>=upload_bytes-$4 AND body_bytes-$2>=queue_bytes-$5", &[&account, &body, &blobs, &uploads, &queue, &submissions]).await.map_err(|_| Error::Database)? != 1 {
+        return Err(Error::Integrity);
+    }
+    Ok(())
+}
+
 /// Prepared immutable bytes and their verified digest; no input is read from a
 /// remote peer while this transaction holds its account lock.
 pub(crate) struct Blob<'a> {

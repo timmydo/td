@@ -1603,8 +1603,9 @@ reclamation or serving. Those remain prerequisites for the runtime integration.
 Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
 one usage row per account from existing bodies, leases and submissions in the
 same transaction as its ledger entry. Expired leases and completed submissions
-remain charged while retained (section 216 releases retired submissions); a
-body shared by submissions is charged once for queue bytes. New account
+remain charged while retained (the account's next upload reclaims expired
+leases, below; section 216 releases retired submissions); a body shared by
+submissions is charged once for queue bytes. New account
 bootstrap writes an all-zero usage row atomically.
 Every future body/reference mutation must adjust these counters under the
 account lock in the same transaction. Owner-side direct SQL is outside this
@@ -1646,6 +1647,39 @@ upload lease, not the receipt, governs access and upload expiry.
 Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
 current usage exceeds its cap. Logical counters do not reserve server disk.
+
+Nothing else removes a lease, and no Email or submission takes over an
+uploaded body (a draft copies attachment bytes into its own body), so without
+reclamation `upload_bytes` would only grow and the upload quota would be a
+lifetime budget. After device authentication and its receipt sweep, upload
+publication therefore deletes, under its account lock and before the quota
+charge, at most 64 of the account's leases (`RECLAIM_LEASES`) whose
+`expires_at` is at or before its database-clock sample, oldest expiry first,
+stopping before one would take the batch past 64 MiB (`RECLAIM_BYTES`); the
+first is always admitted. Each lease's whole body length leaves
+`upload_bytes` (the key admits one lease per body). A body no Email, lease or
+submission still reaches is then deleted with its chunks and released from
+`body_bytes` and `blob_count`, by the same statement Email deletion and
+section 216 use; a body still referenced elsewhere stays and is charged only
+there. Guards refuse with Integrity rather than underflow. `blob_ids` rows
+stay, so no Blob ID is reused. No change row or sequence step is written:
+leases and bodies carry no JMAP state.
+
+If the quota charge then refuses with Quota and the batch reclaimed anything,
+publication commits the batch alone (and that call's receipt sweep) and still
+returns Quota, so repeated refusals drain any backlog; every other failure
+rolls the batch back with the publication, including a deadline expiry while
+the batch and a large upload share the operation's deadline; the next upload
+repeats it, and small uploads still drain a backlog. Reclamation is
+idempotent.
+Expired leases already refuse downloads and draft attachment use (sections 36
+and 37); deleting them changes neither, and a historical upload receipt still
+answers its own replay inside its minute. An idle account keeps expired leases,
+and the body bytes and blob count they hold, until its next upload. Their bytes
+never exceed the upload quota, though zero-length uploads can hold blob count.
+The candidate scan reads the account's leases (no expiry index), which the
+upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
+grant of section 55.
 
 
 ## 36. Authenticated blob downloads
@@ -1920,19 +1954,21 @@ remaining Emails. One account sequence covers the complete batch.
 
 Memberships, keywords, anchors and receipt-recipient rows are removed with the
 Email. A body retires only after its last Email disappears and no retained
-lease or submission owns it, including expired leases and completed
-submissions. Removing a body cascades its chunks and decrements body-byte and
-blob counters in the same transaction; upload/queue counters remain charged
-for their surviving owners. Counter underflow or inconsistency refuses the
-entire transaction. Blob identity tombstones remain, preventing ID reuse.
-Existing repeatable-read snapshots retain deleted metadata and body bytes.
+lease or submission owns it, including expired leases not yet reclaimed
+(section 35) and completed submissions. Removing a body cascades its chunks
+and decrements body-byte and blob counters in the same transaction;
+upload/queue counters remain charged for their surviving owners. Counter
+underflow or inconsistency refuses the entire transaction. Blob identity
+tombstones remain, preventing ID reuse. Existing repeatable-read snapshots
+retain deleted metadata and body bytes.
 
 Lost COMMIT response remains indeterminate until inspection of the same
 retained operation finds its receipt or proves its absence (section 165).
 Historical receipts remain inspectable after later policy change,
 revocation, object deletion or body retirement. This does not grant a fresh
-write or a new body read. Reclamation of retained leases, submissions and
-operation receipts remains runtime integration work.
+write or a new body read. The account's next upload reclaims expired
+upload leases (section 35), section 216 retires settled submissions and
+section 217 expires HTTP write receipts.
 
 ## 45. Shared receiving header preparation
 
@@ -2243,7 +2279,9 @@ The exact table privilege roster lives in `postgres_runtime_access::TABLES`.
 All current tables require SELECT. Mail data and receipt tables require
 INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
 receipts, bootstrap receipts and reserved import tables are read-only.
-Upload leases require SELECT and INSERT only; UPDATE and DELETE refuse.
+Upload leases require SELECT, INSERT and DELETE, so upload publication can
+reclaim expired ones (section 35); any UPDATE, which could extend a lease,
+refuses. The replica reader keeps SELECT and INSERT only.
 The selection singleton permits only column-level UPDATE on `singleton`,
 which allows FOR SHARE policy fencing without changing its generation/version.
 Application tables must be ordinary logged tables without row security.
@@ -2270,7 +2308,7 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.replica_blob_identities,
     td_mta.leases, td_mta.imports FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
-GRANT INSERT ON td_mta.leases TO td_mta_runtime;
+GRANT INSERT, DELETE ON td_mta.leases TO td_mta_runtime;
 COMMIT;
 ```
 
@@ -6284,7 +6322,8 @@ and device authorization. No account row lock, write or repair is performed.
 
 Body bytes and blob count include every live blob manifest, including a
 zero-length blob. Upload bytes count each manifest with an existing lease;
-expired but unreclaimed leases still count. Queue bytes count each manifest
+expired leases count until the account's next upload reclaims them (section
+35). Queue bytes count each manifest
 referenced as a transmitted blob by a submission, once even if several
 submissions reference it. Queue submission count includes every durable
 submission, including completed ones retained in the database. Reserved blob

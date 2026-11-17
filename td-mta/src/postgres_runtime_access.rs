@@ -60,7 +60,7 @@ const TABLES: &[(&str, Access)] = &[
     ("thread_anchors", Access::Mail),
     ("submissions", Access::Mail),
     ("recipients", Access::Mail),
-    ("leases", Access::Insert),
+    ("leases", Access::Lease),
     ("imports", Access::Read),
     ("changes", Access::Mail),
     ("devices", Access::Mail),
@@ -93,7 +93,7 @@ const TABLES: &[(&str, Access)] = &[
 enum Access {
     Replica,
     Read,
-    Insert,
+    Lease,
     Selection,
     Mail,
 }
@@ -132,7 +132,10 @@ const PRIVILEGES: &str = "SELECT c.relname::text,
             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
             AND a.attname<>'id'
             AND pg_catalog.has_column_privilege(c.oid,a.attnum,'UPDATE'))
-        ELSE false END
+        ELSE false END,
+    pg_catalog.has_table_privilege(c.oid,'INSERT')
+        AND pg_catalog.has_table_privilege(c.oid,'DELETE')
+        AND NOT pg_catalog.has_any_column_privilege(c.oid,'UPDATE')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='td_mta' AND c.relkind IN ('r','p','v','m','f','S')
     ORDER BY c.relname LIMIT $1";
@@ -256,7 +259,9 @@ async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error
                     !value(4)?
                 }
             }
-            Access::Insert => value(7)?,
+            // Writers reclaim expired upload leases; none may extend one.
+            Access::Lease if authority == Authority::Reader => value(7)?,
+            Access::Lease => value(9)?,
             Access::Selection => value(6)?,
             Access::Mail if authority == Authority::Reader => match name {
                 "accounts" => value(8)?,

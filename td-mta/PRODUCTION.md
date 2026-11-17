@@ -473,7 +473,9 @@ Readiness does not prove a remote recipient accepted an outbound message.
 ## Roll back a binary-only update
 
 Use the **recorded** previous executable, not whichever release happens to be
-second in a directory listing. Preserve the failed candidate and its logs.
+second in a directory listing. Returning to a release older than upload lease
+reclamation also needs that section's `REVOKE` before the old executable
+starts. Preserve the failed candidate and its logs.
 Stop all five services and verify their stopped states as above, then:
 
 If reconnecting after a failed update, recover `previous` from the private
@@ -666,3 +668,28 @@ ledger refuses that family with `storageWorkLimit` only while 1,024 receipts
 younger than a minute remain; it needs no operator action. Receipts an older
 binary left expire on the account's next publication of their family after the
 fenced upgrade. Do not delete receipts by hand.
+
+## Upload lease reclamation grant
+
+Each upload deletes a bounded batch of the account's expired upload leases
+and releases their quota (POSTGRES.md section 35), so the runtime login needs
+DELETE on `td_mta.leases`. A binary with this reclamation refuses a runtime
+login without that grant, and an older binary refuses one with it, so this
+update is not binary-only. With all five MTA processes stopped as for
+activation, grant it as the schema owner on the primary, and to a replica
+database's runtime login too, then run the candidate's `runtime-check` and
+`config-check` before switching the link. Run `usage-inspect` for each
+account first: an account whose usage counters disagree with its leases
+refuses every upload until repaired, because reclamation releases counters
+before charging:
+
+```sql
+GRANT DELETE ON td_mta.leases TO td_mta_runtime;
+```
+
+Rolling back to an older binary requires
+`REVOKE DELETE ON td_mta.leases FROM td_mta_runtime;` with the services
+stopped, before starting the previous executable. Leave the replica reader's
+grants unchanged. An account whose upload quota filled under an older binary
+recovers as it uploads again: each attempt, even one refused for quota,
+reclaims one batch. Do not delete leases by hand.

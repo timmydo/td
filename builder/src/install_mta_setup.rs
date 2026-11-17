@@ -1142,7 +1142,7 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.replica_blob_identities
     FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
-GRANT INSERT ON td_mta.leases TO td_mta_runtime;
+GRANT INSERT, DELETE ON td_mta.leases TO td_mta_runtime;
 COMMIT;
 "#;
     p.sql("runtime-grants", grants)?;

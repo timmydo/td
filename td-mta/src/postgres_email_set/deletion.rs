@@ -1,5 +1,6 @@
 //! Email deletion with shared-body retention and transactional quota release.
 use super::*;
+use crate::postgres_publication as publication;
 
 #[derive(Clone)]
 pub struct Deletion(Change);
@@ -200,13 +201,16 @@ pub(crate) async fn apply_ids(
     if written != deleted.len() as u64 {
         return Err(Error::Integrity);
     }
-    let released = client.query_one("WITH retired AS (DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=ANY($2::bytea[]) AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length) SELECT coalesce(sum(length),0)::bigint,count(*) FROM retired", &[&account,&blobs]).await.map_err(|_| Error::Database)?;
-    let bytes: i64 = released.try_get(0).map_err(|_| Error::Integrity)?;
-    let count: i64 = released.try_get(1).map_err(|_| Error::Integrity)?;
-    if bytes < 0 || count < 0 || count > blobs.len() as i64 {
-        return Err(Error::Integrity);
-    }
-    if client.execute("UPDATE td_mta.account_usage SET body_bytes=body_bytes-$2,blob_count=blob_count-$3 WHERE account=$1 AND body_bytes>=$2 AND blob_count>=$3 AND body_bytes-$2>=upload_bytes AND body_bytes-$2>=queue_bytes", &[&account,&bytes,&count]).await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
+    let refused = |error| match error {
+        publication::Error::Database => Error::Database,
+        _ => Error::Integrity,
+    };
+    let (bytes, count) = publication::retire_blobs(client, account, &blobs)
+        .await
+        .map_err(refused)?;
+    publication::release(client, account, [bytes, count, 0, 0, 0])
+        .await
+        .map_err(refused)?;
     let kept = survives.iter().filter(|value| **value).count() as u64;
     if client.execute("UPDATE td_mta.threads t SET changed=$4 FROM unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND q.survives", &[&account,&threads,&survives,&changed.as_slice()]).await.map_err(|_| Error::Database)? != kept { return Err(Error::Integrity); }
     if client.execute("DELETE FROM td_mta.threads t USING unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND NOT q.survives", &[&account,&threads,&survives]).await.map_err(|_| Error::Database)? != threads.len() as u64-kept { return Err(Error::Integrity); }

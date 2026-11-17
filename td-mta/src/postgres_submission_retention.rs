@@ -1,6 +1,7 @@
 //! Retire accepted or canceled submissions once their retention ends.
 use crate::{
     postgres_probe::{self, Request},
+    postgres_publication as publication,
     postgres_route_owners::{self as owners, Claim},
 };
 use std::time::Instant;
@@ -124,16 +125,17 @@ async fn retire_locked(
     // A blob another submission still transmits stays queued; one that an
     // Email or lease still reaches stays stored.
     let queued: i64 = client.query_one("SELECT coalesce(sum(b.length),0)::bigint FROM td_mta.blobs b WHERE b.account=$1 AND b.id IN (SELECT DISTINCT unnest($2::bytea[])) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id)", &[&account, &blobs.as_slice()]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-    let released = client.query_one("WITH retired AS (DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=ANY($2::bytea[]) AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length) SELECT coalesce(sum(length),0)::bigint,count(*) FROM retired", &[&account, &blobs.as_slice()]).await.map_err(|_| Error::Database)?;
-    let bytes: i64 = released.try_get(0).map_err(|_| Error::Integrity)?;
-    let count: i64 = released.try_get(1).map_err(|_| Error::Integrity)?;
+    let refused = |error| match error {
+        publication::Error::Database => Error::Database,
+        _ => Error::Integrity,
+    };
+    let (bytes, count) = publication::retire_blobs(client, account, blobs.as_slice())
+        .await
+        .map_err(refused)?;
     let retired = i64::try_from(submissions.len()).map_err(|_| Error::Integrity)?;
-    if queued < 0 || bytes < 0 || count < 0 || count > retired {
-        return Err(Error::Integrity);
-    }
-    if client.execute("UPDATE td_mta.account_usage SET queue_submissions=queue_submissions-$2,queue_bytes=queue_bytes-$3,body_bytes=body_bytes-$4,blob_count=blob_count-$5 WHERE account=$1 AND queue_submissions>=$2 AND queue_bytes>=$3 AND body_bytes>=$4 AND blob_count>=$5 AND body_bytes-$4>=upload_bytes AND body_bytes-$4>=queue_bytes-$3", &[&account, &retired, &queued, &bytes, &count]).await.map_err(|_| Error::Database)? != 1 {
-        return Err(Error::Integrity);
-    }
+    publication::release(client, account, [bytes, count, 0, queued, retired])
+        .await
+        .map_err(refused)?;
     let state = client
         .query_one(
             "SELECT sequence FROM td_mta.accounts WHERE id=$1",

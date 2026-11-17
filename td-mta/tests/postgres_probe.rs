@@ -399,7 +399,7 @@ fn create_runtime_login(fixture: &Fixture) {
 }
 
 fn grant_runtime_mail(fixture: &Fixture) {
-    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.runtime_barrier,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports,td_mta.replica_source,td_mta.replica_accounts,td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,td_mta.replica_blob_identities FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime; GRANT INSERT ON td_mta.leases TO mail_runtime");
+    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.runtime_barrier,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports,td_mta.replica_source,td_mta.replica_accounts,td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,td_mta.replica_blob_identities FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime; GRANT INSERT,DELETE ON td_mta.leases TO mail_runtime");
 }
 
 fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
@@ -851,8 +851,13 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
             access::Error::Privileges,
         ),
         (
-            "GRANT DELETE ON td_mta.leases TO mail_runtime",
+            "GRANT UPDATE ON td_mta.leases TO mail_runtime",
+            "REVOKE UPDATE ON td_mta.leases FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
             "REVOKE DELETE ON td_mta.leases FROM mail_runtime",
+            "GRANT DELETE ON td_mta.leases TO mail_runtime",
             access::Error::Privileges,
         ),
         (
@@ -961,12 +966,13 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         }
     };
     execute("BEGIN; SELECT singleton FROM td_mta.config_selection FOR SHARE; UPDATE td_mta.accounts SET sequence=sequence; ROLLBACK", true);
+    // Upload publication reclaims expired leases but can never extend one.
+    execute("BEGIN; DELETE FROM td_mta.leases; ROLLBACK", true);
     for statement in [
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
         "CREATE TABLE td_mta.forbidden(id integer)",
         "DELETE FROM td_mta.schema_migrations",
         "UPDATE td_mta.leases SET expires_at=expires_at",
-        "DELETE FROM td_mta.leases",
     ] {
         execute(statement, false);
     }
@@ -5963,7 +5969,11 @@ fn exercise_uploads(
         uploads::inspect(request, trust, deadline(), &first),
         Err(uploads::Error::Integrity)
     );
+    upload_reclamation::exercise(fixture, request, trust, binding);
 }
+
+#[path = "postgres_probe/upload_reclamation.rs"]
+mod upload_reclamation;
 
 fn exercise_drafts(
     fixture: &Fixture,

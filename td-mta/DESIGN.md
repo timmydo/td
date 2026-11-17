@@ -1379,7 +1379,7 @@ Initial default ceilings (validated together at startup):
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 4 MiB |
 | Storage read views | 6, each with bounded row/key/cursor scratch and a database snapshot |
-| Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours |
+| Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours, reclaimed by the next upload |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
 | Active log plus retained generations | 8 MiB each, 4 retained |
