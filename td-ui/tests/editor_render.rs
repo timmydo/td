@@ -1100,3 +1100,120 @@ fn inked_ranges_draw_their_glyphs_in_their_ink_and_a_selection_keeps_its_own() {
     assert!(glyphs.contains(&('α', GREEN)));
     assert!(glyphs.contains(&('β', raster::INK)));
 }
+
+/// A placeholder lies where the text would start while the document is
+/// empty, in `LINE_NUMBER` on paper, cut to the columns; text, or an
+/// empty placeholder, draws none.
+#[test]
+#[allow(clippy::unwrap_used, reason = "validated renderer fixtures")]
+fn a_placeholder_shows_only_in_an_empty_document() {
+    let hint = "Write a message; Return sends";
+    let glyphs = |geometry: Geometry, input: &str, placeholder: Option<&str>| {
+        let area = geometry.document();
+        let editor = editor(input, Selection::default());
+        let scene = Scene::new(&editor, geometry, View::default(), &[], Profile::Windows)
+            .unwrap()
+            .placeholder(placeholder);
+        let mut glyphs = Vec::new();
+        scene.emit(geometry.bounds(), &mut |draw| {
+            if let Primitive::Glyph {
+                x,
+                y,
+                scalar,
+                style,
+                ..
+            } = draw.primitive
+            {
+                if area.contains(x, y) {
+                    glyphs.push((x, y, scalar, style.ink, style.background));
+                }
+            }
+        });
+        glyphs
+    };
+    for scale in 1..=4u8 {
+        let wide = geometry(400 * usize::from(scale), 200 * usize::from(scale), scale);
+        let area = wide.document();
+        let shown = glyphs(wide, "", Some(hint));
+        let text: String = shown.iter().map(|g| g.2).collect();
+        assert_eq!(text, hint, "{scale}");
+        assert_eq!(shown.first().map(|g| (g.0, g.1)), Some((area.x, area.y)));
+        assert!(shown
+            .iter()
+            .all(|g| (g.3, g.4) == (raster::LINE_NUMBER, raster::PAPER)));
+        let typed = glyphs(wide, "x", Some(hint));
+        assert!(!typed.is_empty() && typed.iter().all(|g| g.2 == 'x'));
+        assert!(glyphs(wide, "\n", Some(hint)).is_empty());
+        let shown: String = glyphs(wide, "", Some("a\tb\nc"))
+            .iter()
+            .map(|g| g.2)
+            .collect();
+        assert_eq!(shown, "abc", "control scalars dropped");
+        assert!(glyphs(wide, "", Some("")).is_empty());
+        assert!(glyphs(wide, "", None).is_empty());
+        // Cut to the columns of a narrow document.
+        let narrow = geometry(80 * usize::from(scale), 200 * usize::from(scale), scale);
+        let columns = narrow.grid().0;
+        assert!(columns > 0 && columns < hint.len());
+        let cut: String = glyphs(narrow, "", Some(hint)).iter().map(|g| g.2).collect();
+        assert_eq!(
+            cut,
+            hint.chars().take(columns).collect::<String>(),
+            "{scale}"
+        );
+        // Under the caret: streamed before it, which is drawn over it.
+        let empty = editor("", Selection::default());
+        let view = View {
+            focused: true,
+            caret_visible: true,
+            ..View::default()
+        };
+        let scene = Scene::new(&empty, wide, view, &[], Profile::Windows)
+            .unwrap()
+            .placeholder(Some(hint));
+        let (mut glyph, mut caret) = (None, None);
+        let mut at = 0;
+        scene.emit(wide.bounds(), &mut |draw| {
+            match draw.primitive {
+                Primitive::Glyph { x, y, .. } if area.contains(x, y) && glyph.is_none() => {
+                    glyph = Some(at)
+                }
+                Primitive::Fill { rect, color }
+                    if color == raster::INK && rect.x == area.x && rect.y == area.y =>
+                {
+                    caret = Some(at)
+                }
+                _ => {}
+            }
+            at += 1;
+        });
+        assert!(
+            glyph.is_some() && caret.is_some() && glyph < caret,
+            "{scale}"
+        );
+        // Scrolled as the cells are: from the view's first column, and
+        // none once its first row is out of view.
+        let from = |origin: Position| {
+            let editor = editor("", Selection::default());
+            let view = View {
+                origin,
+                soft_wrap: false,
+                ..View::default()
+            };
+            let scene = Scene::new(&editor, wide, view, &[], Profile::Windows)
+                .unwrap()
+                .placeholder(Some(hint));
+            let mut text = String::new();
+            scene.emit(wide.bounds(), &mut |draw| {
+                if let Primitive::Glyph { x, y, scalar, .. } = draw.primitive {
+                    if area.contains(x, y) {
+                        text.push(scalar);
+                    }
+                }
+            });
+            text
+        };
+        assert_eq!(from(Position { row: 0, column: 6 }), &hint[6..]);
+        assert_eq!(from(Position { row: 1, column: 0 }), "");
+    }
+}

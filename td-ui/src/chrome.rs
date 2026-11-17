@@ -67,6 +67,18 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
 /// than two bezels each is at most half the side. The bezel is four bands
 /// and the face one fill, so damage inside the face streams no `BORDER`.
 fn bezel(rect: Rect, scale: Scale, face: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) -> Rect {
+    ringed(rect, scale, BORDER, face, damage, sink)
+}
+
+/// `bezel` with the ring in `ring`.
+fn ringed(
+    rect: Rect,
+    scale: Scale,
+    ring: u32,
+    face: u32,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) -> Rect {
     let s = scale.value() as u32;
     let inset_x = s.min(rect.width / 2);
     let inset_y = s.min(rect.height / 2);
@@ -101,10 +113,109 @@ fn bezel(rect: Rect, scale: Scale, face: u32, damage: Rect, sink: &mut dyn FnMut
             ..sides
         },
     ] {
-        fill(band, BORDER, damage, sink);
+        fill(band, ring, damage, sink);
     }
     fill(inner, face, damage, sink);
     inner
+}
+
+/// Logical pixels between a well's rectangle and its bezel.
+pub const WELL_MARGIN: usize = 6;
+/// Logical pixels between a well's bezel and what it holds.
+pub const WELL_PADDING: usize = 4;
+
+/// A well: a paper field framed by a bezel a scaled pixel wide, set
+/// `WELL_MARGIN` in from its rectangle on the paper around it, holding
+/// something its owner draws, such as an editor pane, `WELL_PADDING` in
+/// from the bezel. The bezel is `BORDER`, or `SELECTED` while what it
+/// holds has the focus, so the field shows where typing goes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Well {
+    rect: Rect,
+    scale: Scale,
+}
+
+impl Well {
+    pub fn new(rect: Rect, scale: Scale) -> Self {
+        Self { rect, scale }
+    }
+
+    /// The height of a well holding `inner` pixels.
+    pub fn height(inner: u32, scale: Scale) -> u32 {
+        inner.saturating_add(2 * Self::inset(scale))
+    }
+
+    fn inset(scale: Scale) -> u32 {
+        ((WELL_MARGIN + 1 + WELL_PADDING) * scale.value()) as u32
+    }
+
+    /// The bezel's rectangle: the well's less its margin, at most half
+    /// each side.
+    fn frame(self) -> Rect {
+        let m = (WELL_MARGIN * self.scale.value()) as u32;
+        let (mx, my) = (m.min(self.rect.width / 2), m.min(self.rect.height / 2));
+        Rect {
+            x: self.rect.x + i64::from(mx),
+            y: self.rect.y + i64::from(my),
+            width: self.rect.width - 2 * mx,
+            height: self.rect.height - 2 * my,
+        }
+    }
+
+    /// Where what the well holds lies: the rectangle less the margin,
+    /// bezel and padding, empty when the well is too small for them.
+    pub fn inner(self) -> Rect {
+        let inset = Self::inset(self.scale);
+        let (ix, iy) = (
+            inset.min(self.rect.width / 2),
+            inset.min(self.rect.height / 2),
+        );
+        Rect {
+            x: self.rect.x + i64::from(ix),
+            y: self.rect.y + i64::from(iy),
+            width: self.rect.width - 2 * ix,
+            height: self.rect.height - 2 * iy,
+        }
+    }
+
+    /// Paints the paper margin, the bezel, `SELECTED` when `focused`, and
+    /// the paper face; the owner draws what the well holds over `inner`.
+    pub fn emit(self, focused: bool, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let frame = self.frame();
+        // The margin, four bands, so damage inside the frame streams none.
+        let sides = Rect {
+            y: frame.y,
+            height: frame.height,
+            ..self.rect
+        };
+        for band in [
+            Rect {
+                height: (frame.y - self.rect.y) as u32,
+                ..self.rect
+            },
+            Rect {
+                y: frame.y + i64::from(frame.height),
+                height: (self.rect.y + i64::from(self.rect.height)
+                    - frame.y
+                    - i64::from(frame.height)) as u32,
+                ..self.rect
+            },
+            Rect {
+                width: (frame.x - self.rect.x) as u32,
+                ..sides
+            },
+            Rect {
+                x: frame.x + i64::from(frame.width),
+                width: (self.rect.x + i64::from(self.rect.width) - frame.x - i64::from(frame.width))
+                    as u32,
+                ..sides
+            },
+        ] {
+            fill(band, PAPER, damage, sink);
+        }
+        let ring = if focused { SELECTED } else { BORDER };
+        ringed(frame, self.scale, ring, PAPER, damage, sink);
+    }
 }
 
 /// The most scalars a tooltip shows; a longer text is cut to it.
@@ -2005,6 +2116,86 @@ mod tests {
             _ => {}
         });
         (glyphs, fills)
+    }
+
+    /// A well: what it holds lies inside its margin, bezel and padding,
+    /// its height that plus those twice; its margin and face paper, its
+    /// bezel a scaled pixel of BORDER, or SELECTED while focused; and a
+    /// rectangle too small for it holds nothing past its middle.
+    #[test]
+    fn a_well_frames_what_it_holds() {
+        for scale in 1..=4u8 {
+            let sc = Scale::new(scale).unwrap();
+            let s = i64::from(scale);
+            let rect = Rect {
+                x: 10 * s,
+                y: 20 * s,
+                width: 300 * u32::from(scale),
+                height: 60 * u32::from(scale),
+            };
+            let well = Well::new(rect, sc);
+            let inset = (WELL_MARGIN + 1 + WELL_PADDING) as i64 * s;
+            assert_eq!(
+                well.inner(),
+                Rect {
+                    x: rect.x + inset,
+                    y: rect.y + inset,
+                    width: rect.width - 2 * inset as u32,
+                    height: rect.height - 2 * inset as u32,
+                }
+            );
+            assert_eq!(Well::height(32, sc), 32 + 2 * inset as u32);
+            let frame = Rect {
+                x: rect.x + WELL_MARGIN as i64 * s,
+                y: rect.y + WELL_MARGIN as i64 * s,
+                width: rect.width - 2 * (WELL_MARGIN as u32 * u32::from(scale)),
+                height: rect.height - 2 * (WELL_MARGIN as u32 * u32::from(scale)),
+            };
+            for (focused, ring) in [(false, BORDER), (true, SELECTED)] {
+                let (glyphs, fills) = drawn(|sink| well.emit(focused, rect, sink));
+                assert!(glyphs.is_empty());
+                // The top band of the bezel, a scaled pixel high.
+                assert!(fills.contains(&(
+                    Rect {
+                        height: u32::from(scale),
+                        ..frame
+                    },
+                    ring
+                )));
+                assert_eq!(fills.iter().filter(|f| f.1 == ring).count(), 4);
+                // The fills tile the rectangle: the margin's four bands,
+                // the ring's four and the face, with no gap or overlap.
+                let area: u64 = fills
+                    .iter()
+                    .map(|f| u64::from(f.0.width) * u64::from(f.0.height))
+                    .sum();
+                assert_eq!(area, u64::from(rect.width) * u64::from(rect.height));
+                for (at, a) in fills.iter().enumerate() {
+                    for b in fills.iter().skip(at + 1) {
+                        assert_eq!(a.0.intersection(b.0), None, "{scale}");
+                    }
+                }
+                // Everything else paper, and inside the rectangle.
+                assert!(fills.iter().all(|f| f.1 == ring || f.1 == PAPER));
+                assert!(fills.iter().all(|f| f.0.intersection(rect) == Some(f.0)
+                    || f.0.width == 0
+                    || f.0.height == 0));
+                // Damage inside the face streams no ring.
+                let (_, inside) = drawn(|sink| well.emit(focused, well.inner(), sink));
+                assert!(inside.iter().all(|f| f.1 == PAPER), "{scale}");
+            }
+            let tiny = Well::new(
+                Rect {
+                    width: 5,
+                    height: 3,
+                    ..rect
+                },
+                sc,
+            );
+            let inner = tiny.inner();
+            assert!(inner.width <= 1 && inner.height <= 1);
+            let _ = drawn(|sink| tiny.emit(true, rect, sink));
+        }
     }
 
     /// A row's segments are as wide as their items joined by ` | `: each

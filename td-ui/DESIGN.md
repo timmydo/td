@@ -625,6 +625,16 @@ of its own files may name each module.
   each, and the status band, the list and the text entry are rasterized
   whole to pixels. td-editor's `Geometry` and `Scene` compose the bands
   and its `--preview` stays byte-identical.
+  `Well` is a paper field for something its owner draws, such as an
+  editor pane: a bezel a scaled pixel wide set `WELL_MARGIN` (6) logical
+  pixels in from its rectangle, on paper, and `inner` a further
+  `WELL_PADDING` (4) in from the bezel, where the held thing lies, each
+  inset at most half its side. `Well::height(h)` is the well's height
+  for a held height `h`. The bezel is `BORDER`, or `SELECTED` while
+  what it holds has the focus, so the field shows where typing goes;
+  paper on the selection is a pair the theme floors hold. The margin is
+  four bands and the face one fill, so damage inside `inner` streams
+  paper alone.
 - `entry_model`: `EntryModel`, the editing state a `TextEntry` paints:
   text bounded at a byte `limit`, at most `MAX_LIMIT` (1 MiB) and
   reserved by `new`, so no edit reallocates, with the caret, the
@@ -850,7 +860,11 @@ of its own files may name each module.
   conflict and close flows; `editor`, the `Controller` (`default` for a
   window, `pane` for an embedded pane) with its `Event` and `Outcome`;
   `editor_render`, the `Geometry` and the `Scene` that implements
-  `Composition`; `editor_search`, find's `History`, `Found` and
+  `Composition`, whose `placeholder` is a hint drawn where the text
+  would start while the active document is empty, in `LINE_NUMBER` on
+  paper, on its first row, a scalar a cell, control scalars dropped,
+  scrolled as the cells are and cut to the columns, under the caret;
+  `editor_search`, find's `History`, `Found` and
   `Intent`; and `editor_error`, their `Error` and `Result`.
   `Controller::generation_for_test` is test support, public because a
   consumer's tests are another crate.

@@ -331,6 +331,7 @@ pub struct Scene<'a> {
     inks: &'a [(std::ops::Range<usize>, u32)],
     link: Option<std::ops::Range<usize>>,
     notice: Option<&'a str>,
+    placeholder: Option<&'a str>,
     scrollbars: [Option<Scrollbar>; 2],
 }
 
@@ -430,6 +431,7 @@ impl<'a> Scene<'a> {
             inks: &[],
             link: None,
             notice: None,
+            placeholder: None,
             scrollbars,
         })
     }
@@ -458,6 +460,15 @@ impl<'a> Scene<'a> {
     /// bytes, underlined in `INK`, or paper under a focused selection.
     pub fn link(mut self, link: Option<std::ops::Range<usize>>) -> Self {
         self.link = link;
+        self
+    }
+
+    /// A hint drawn where the text would start while the active document
+    /// is empty, in `LINE_NUMBER` on its first row, a scalar a cell,
+    /// control scalars dropped, scrolled as the cells are and cut to the
+    /// columns, under the caret; gone with the first scalar typed.
+    pub fn placeholder(mut self, placeholder: Option<&'a str>) -> Self {
+        self.placeholder = placeholder.filter(|text| !text.is_empty());
         self
     }
 
@@ -569,6 +580,32 @@ impl<'a> Scene<'a> {
         let Ok(layout) = Layout::for_document(doc, columns, self.view.soft_wrap) else {
             return;
         };
+        // Scrolled as the cells are: from the view's first column, and
+        // none once its first row is out of view.
+        let first_column = if self.view.soft_wrap {
+            0
+        } else {
+            self.view.origin.column
+        };
+        if let Some(placeholder) = self
+            .placeholder
+            .filter(|_| doc.text().is_empty() && self.view.origin.row == 0)
+        {
+            let area = self.geometry.document();
+            text_run(
+                self.geometry.scale,
+                placeholder
+                    .chars()
+                    .filter(|scalar| !scalar.is_control())
+                    .skip(first_column)
+                    .take(columns),
+                (area.x, area.y),
+                area,
+                GlyphStyle::medium(LINE_NUMBER, PAPER),
+                damage,
+                sink,
+            );
+        }
         let gutter = self.geometry.gutter();
         if gutter.width != 0 && gutter.intersection(damage).is_some() {
             let mut number = 1usize;

@@ -467,7 +467,7 @@ impl PromptDialog {
             line(rect, text, plain, sink);
         }
         if let Some(clip) = layout.editor.intersection(damage) {
-            self.composer.emit(clip, sink);
+            self.composer.emit(None, clip, sink);
         }
         if let Some(message) = &self.message {
             for (at, text) in wrap(message, self.columns(), MESSAGE_ROWS as usize)

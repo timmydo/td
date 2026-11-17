@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use td_ui::chrome::{segments_cells, Emphasis, Segment, ROW};
+use td_ui::chrome::{segments_cells, Emphasis, Segment, Well, ROW};
 use td_ui::editor::{Event as PaneEvent, Outcome as PaneOutcome};
 use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
@@ -75,6 +75,9 @@ const SHOWN_AXIS: usize = 1024;
 
 /// Why a hello came without the prefix (DESIGN.md §4).
 const LONG_PREFIX: &str = "the conversation's prefix file is longer than the window is sent";
+
+/// What the empty composer says, in place of its text.
+const COMPOSER_HINT: &str = "Write a message; Return sends, S-Return adds a line";
 
 /// The composer's text rows when the window has room for them.
 const COMPOSER_ROWS: usize = 6;
@@ -679,8 +682,7 @@ struct Regions {
     transcript: Rect,
     /// The todo list, empty when there is none.
     todo: Rect,
-    /// The rule above the composer.
-    rule: Rect,
+    /// The composer's well, its pane inside (`chrome::Well`).
     composer: Rect,
     status: Rect,
 }
@@ -4141,10 +4143,14 @@ impl App {
             let right = layout.second;
             let status_height = ((ROW * s) as u32).min(right.height);
             let rest = right.height - status_height;
-            let wanted = (COMPOSER_ROWS * CELL_HEIGHT * s + 2 * s) as u32;
-            let composer_height = wanted.min(rest / 2);
-            let rule_height = (s as u32).min(rest - composer_height);
-            let above = rest - composer_height - rule_height;
+            let wanted = Well::height(
+                (COMPOSER_ROWS * CELL_HEIGHT * s + 2 * s) as u32,
+                self.surface.scale,
+            );
+            // Half the column at most, but a text row whenever it fits.
+            let least = Well::height((CELL_HEIGHT * s + 2 * s) as u32, self.surface.scale);
+            let composer_height = wanted.min(rest / 2).max(least.min(rest));
+            let above = rest - composer_height;
             let todo_height = ((todo_rows * ROW * s) as u32).min(above / 2);
             let transcript_height = above - todo_height;
             let at = |y: u32, height: u32| Rect {
@@ -4157,8 +4163,7 @@ impl App {
                 list: layout.first,
                 transcript: at(0, transcript_height),
                 todo: at(transcript_height, todo_height),
-                rule: at(above, rule_height),
-                composer: at(above + rule_height, composer_height),
+                composer: at(above, composer_height),
                 status: at(rest, status_height),
             }
         });
@@ -4184,7 +4189,8 @@ impl App {
                     Ok(()) => break,
                 }
             }
-            self.composer.place(regions.composer, self.surface);
+            let well = Well::new(regions.composer, self.surface.scale);
+            self.composer.place(well.inner(), self.surface);
         }
         self.touch();
     }
@@ -4194,21 +4200,24 @@ impl App {
         self.apply_focus();
     }
 
+    /// Whether `f` has the keyboard: it is the focus, the window has it,
+    /// and no modal dialog does, under which no widget shows focus.
+    fn shows_focus(&self, f: Focus) -> bool {
+        self.focused
+            && self.dialog.is_none()
+            && self.template.is_none()
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && self.notes.is_none()
+            && self.chooser.is_none()
+            && self.confirm.is_none()
+            && self.focus == f
+    }
+
     /// Hands the keyboard focus to the focused widget, and takes it from
     /// the others, so exactly one shows a focused caret or selection.
     fn apply_focus(&mut self) {
-        // A modal dialog has the keyboard: no widget under it shows focus.
-        let on = |f: Focus| {
-            self.focused
-                && self.dialog.is_none()
-                && self.template.is_none()
-                && self.prompt.is_none()
-                && self.picker.is_none()
-                && self.notes.is_none()
-                && self.chooser.is_none()
-                && self.confirm.is_none()
-                && self.focus == f
-        };
+        let on = |f: Focus| self.shows_focus(f);
         let list_focus = if on(Focus::List) {
             tree_table::Focus::Rows
         } else {
@@ -7534,17 +7543,10 @@ impl Composition for App {
         );
         self.transcript.emit(damage, sink);
         self.emit_todo(regions.todo, damage, sink);
-        if let Some(clip) = regions.rule.intersection(damage) {
-            sink(Draw {
-                clip,
-                primitive: Primitive::Fill {
-                    rect: regions.rule,
-                    color: BORDER,
-                },
-            });
-        }
-        if let Some(clip) = regions.composer.intersection(damage) {
-            self.composer.emit(clip, sink);
+        let well = Well::new(regions.composer, self.surface.scale);
+        well.emit(self.shows_focus(Focus::Composer), damage, sink);
+        if let Some(clip) = well.inner().intersection(damage) {
+            self.composer.emit(Some(COMPOSER_HINT), clip, sink);
         }
         self.emit_status(regions.status, damage, sink);
         menu::bar(self.surface).emit(damage, sink);
@@ -9085,6 +9087,8 @@ pub mod tests {
         assert_eq!(app.transcript().len(), 2);
         let shown = text(&app);
         assert!(shown.contains("did not run: why"), "{shown}");
+        // The composer's hint says Return, which is no turn.
+        let shown = shown.replace(COMPOSER_HINT, "");
         assert!(
             shown.contains("review") && !shown.contains("compaction") && !shown.contains("turn"),
             "{shown}"
@@ -10118,7 +10122,7 @@ pub mod tests {
         assert!(regions.todo.height > 0 && regions.transcript.height < before);
         assert_eq!(
             regions.todo.y + i64::from(regions.todo.height),
-            regions.rule.y
+            regions.composer.y
         );
         assert_eq!(
             app.todo_lines(),
@@ -11620,6 +11624,85 @@ pub mod tests {
             exchange_at(&mut app, 0);
             assert!(text(&app).contains("hi there"), "{}", text(&app));
         }
+    }
+
+    /// The composer lies in a well: its frame `SELECTED` while it has the
+    /// focus and `BORDER` otherwise, its hint where the text would start
+    /// while it is empty and gone once there is text.
+    #[test]
+    fn the_composer_is_a_framed_well_with_a_hint() {
+        let mut app = app();
+        app.resize(Surface::new(1280, 800, Scale::default()).unwrap());
+        let regions = app.regions.unwrap();
+        let s = Scale::default().value() as i64;
+        let well = Well::new(regions.composer, app.surface.scale);
+        let inner = well.inner();
+        assert!(regions.composer.contains(inner.x, inner.y));
+        assert_eq!(
+            regions.composer.y + i64::from(regions.composer.height),
+            regions.status.y
+        );
+        // The frame's top band: a scaled pixel, inside the well's margin.
+        let top = Rect {
+            x: regions.composer.x + td_ui::chrome::WELL_MARGIN as i64 * s,
+            y: regions.composer.y + td_ui::chrome::WELL_MARGIN as i64 * s,
+            width: regions.composer.width - 2 * (td_ui::chrome::WELL_MARGIN as i64 * s) as u32,
+            height: s as u32,
+        };
+        let framed = |app: &App, ink: u32| {
+            let mut draws = Vec::new();
+            app.emit(app.surface.bounds(), &mut |draw| draws.push(draw));
+            draws.iter().any(|draw| match draw.primitive {
+                Primitive::Fill { rect, color } => rect == top && color == ink,
+                _ => false,
+            })
+        };
+        app.focus_composer();
+        assert!(framed(&app, td_ui::raster::SELECTED));
+        app.set_focus(Focus::List);
+        assert!(framed(&app, BORDER) && !framed(&app, td_ui::raster::SELECTED));
+        // A press in the well's margin, outside the pane, focuses it.
+        let (x, y) = (regions.composer.x + s, regions.composer.y + s);
+        assert!(!inner.contains(x, y));
+        press(&mut app, x, y);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(framed(&app, td_ui::raster::SELECTED));
+        // Not while the window has lost the focus, or a dialog has it.
+        app.input(Input::Focus(false), &mut NoClipboard);
+        assert!(framed(&app, BORDER));
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert!(framed(&app, td_ui::raster::SELECTED));
+        // The key dialog, from the File menu, as `keyless` opens it.
+        app.set_key_path(Some(PATH.into()));
+        key(&mut app, "F10");
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
+        key(&mut app, "Return");
+        assert!(app.dialog.is_some());
+        assert!(framed(&app, BORDER) && !framed(&app, td_ui::raster::SELECTED));
+        key(&mut app, "Escape");
+        assert!(app.dialog.is_none());
+        app.set_focus(Focus::List);
+        // The hint while empty, at the pane's first cell (the editor's own
+        // inset, eight pixels, in from the well's); none with text.
+        let mut first = None;
+        app.emit(app.surface.bounds(), &mut |draw| {
+            if let Primitive::Glyph {
+                x, y, scalar: 'W', ..
+            } = draw.primitive
+            {
+                if inner.contains(x, y) && first.is_none() {
+                    first = Some((x, y));
+                }
+            }
+        });
+        assert_eq!(first, Some((inner.x + 8 * s, inner.y)));
+        // Shown with the composer unfocused, as it is here.
+        assert_ne!(app.focus, Focus::Composer);
+        assert!(text(&app).contains(COMPOSER_HINT));
+        app.composer.insert("hi").unwrap();
+        assert!(!text(&app).contains(COMPOSER_HINT));
     }
 
     /// The status row's segments: a failed state an alert; an unconfined

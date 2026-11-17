@@ -148,9 +148,10 @@ impl Composer {
         self.insert(&format!("{tail}{text}\n"))
     }
 
-    pub fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    /// Paints the pane, `placeholder` in place of its text while empty.
+    pub fn emit(&self, placeholder: Option<&str>, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         if let Ok(scene) = self.pane.scene(&[]) {
-            scene.emit(damage, sink);
+            scene.placeholder(placeholder).emit(damage, sink);
         }
     }
 }

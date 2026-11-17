@@ -1444,7 +1444,13 @@ repository workspace's worktrees go with either as §7 says.
   action buttons and wrapped text block, never transcript text.
 - a question the model asks (§12), above the composer until answered.
 - the todo list (§12), collapsed to its item in progress until opened.
-- the composer, an editable pane. `Return` sends, as `C-Return` does
+- the composer, an editable pane in a td-ui `Well` above the status
+  row, half the column at most but a text row whenever one fits: its
+  frame stands between it and what is above, in the selection's ink
+  while the composer has the keyboard (as its caret shows, so not under
+  a modal dialog or in an unfocused window), and while it is
+  empty it says `Write a message; Return sends, S-Return adds a line`
+  where the text would start. `Return` sends, as `C-Return` does
   from outside a dialog; `S-Return` is a newline. `C-v` and `S-Insert`
   ask the clipboard for its picture when the selection offers PNG or
   JPEG (td-ui DESIGN.md, Widget window), and for its text otherwise, so
