@@ -776,11 +776,20 @@ fn health(
             // section 165): republish the same change.
             Ok(None) => unknown = false,
             // A lock timeout, as while an uncertain COMMIT still runs, is
-            // transient like a lost connection.
+            // transient like a lost connection. The route owner row's lock
+            // timeout surfaces as the owner's Database error, and a schema
+            // check's statement failure as its schema Database error. A
+            // permanent one also fails lease renewal, which stops the relay.
             Err(
                 E::Connection(_)
                 | E::Database
-                | E::Owner(crate::postgres_route_owners::Error::Busy),
+                | E::Owner(
+                    crate::postgres_route_owners::Error::Busy
+                    | crate::postgres_route_owners::Error::Database
+                    | crate::postgres_route_owners::Error::Schema(
+                        crate::postgres_schema::Error::Database,
+                    ),
+                ),
             ) => (),
             Err(_) => return Err(Error::Database),
         }
@@ -882,26 +891,51 @@ mod tests {
                 repair_generation: None,
             },
         };
-        let mut publishes = 0;
-        let mut inspections = 0;
+        // The account row's lock timeout, the route owner row's (reported as
+        // the owner's Database error) and a schema check's statement failure
+        // each retry instead of stopping the relay.
+        let transient = [
+            Owner::Busy,
+            Owner::Database,
+            Owner::Schema(crate::postgres_schema::Error::Database),
+        ];
+        for error in transient {
+            let mut publishes = 0;
+            let mut inspections = 0;
+            let result = health(
+                &control,
+                || {
+                    publishes += 1;
+                    if publishes == 1 {
+                        Err(E::Owner(error))
+                    } else {
+                        Ok(outcome)
+                    }
+                },
+                || {
+                    inspections += 1;
+                    Ok(None)
+                },
+            );
+            assert!(matches!(result, Ok(true)), "{error:?}");
+            // A lock timeout before any write is not uncertain.
+            assert_eq!((publishes, inspections), (2, 0), "{error:?}");
+        }
+        // A refusal that cannot heal stops at once, without inspection.
+        let (mut publishes, mut inspections) = (0, 0);
         let result = health(
             &control,
             || {
                 publishes += 1;
-                if publishes == 1 {
-                    Err(E::Owner(Owner::Busy))
-                } else {
-                    Ok(outcome)
-                }
+                Err(E::Owner(Owner::Integrity))
             },
             || {
                 inspections += 1;
                 Ok(None)
             },
         );
-        assert!(matches!(result, Ok(true)));
-        // A lock timeout before any write is not uncertain.
-        assert_eq!((publishes, inspections), (2, 0));
+        assert!(matches!(result, Err(Error::Database)));
+        assert_eq!((publishes, inspections), (1, 0));
     }
     #[test]
     fn repair_completion_cannot_finish_a_newer_request() {
