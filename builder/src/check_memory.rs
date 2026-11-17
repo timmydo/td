@@ -870,13 +870,32 @@ mod tests {
             gate_tokens: 2,
         };
         let pool = TokenPool::create(&temp, &budget).unwrap();
+        // A sibling test's forked child can hold copies of this pool's
+        // locks until it execs or exits (`contain_pid_namespace`'s waiter,
+        // in this binary, never execs), so an expected grant waits for its
+        // full size, within a minute. A copy can only shrink a grant, so a
+        // larger one fails at once.
+        let size = |minimum: usize, tokens: usize, want: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let late = || std::time::Instant::now() > deadline;
+            let want = want as u64 * TOKEN_BYTES;
+            loop {
+                let grant = pool.acquire_range(minimum, tokens, 0, &late).unwrap();
+                assert!(grant.bytes() <= want, "granted {}", grant.bytes());
+                if grant.bytes() == want {
+                    break grant;
+                }
+                drop(grant);
+                assert!(!late(), "never granted {want} bytes");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
         let peer = pool.acquire(1, 0, &|| false).unwrap();
-        let plan = pool.acquire_range(2, 3, 0, &|| true).unwrap();
-        assert_eq!(plan.bytes(), 2 * TOKEN_BYTES);
+        let plan = size(2, 3, 2);
         assert!(pool.acquire(1, 0, &|| true).is_err());
         drop(plan);
         drop(peer);
-        let wide = pool.acquire_range(2, 3, 0, &|| true).unwrap();
+        let wide = size(2, 3, 3);
         assert_eq!(wide.bytes(), 3 * TOKEN_BYTES);
     }
 
@@ -893,36 +912,45 @@ mod tests {
             gate_tokens: 2,
         };
         let pool = TokenPool::create(&temp, &budget).unwrap();
-        // A grant this test expects may wait out a sibling test's fork,
-        // which briefly shares the locks of a probe this test refused.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let late = || std::time::Instant::now() > deadline;
-        let mine = pool.acquire(1, 2, &late).unwrap();
+        // A sibling test's forked child can hold copies of this pool's
+        // locks, the admission lock's included, until it execs or exits
+        // (`contain_pid_namespace`'s waiter, in this binary, never execs).
+        // So every expected grant, and every refusal probe's wait for the
+        // admission lock, has its own minute; `admit` never waits for
+        // tokens, so a refusal is still immediate.
+        let within = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            move || std::time::Instant::now() > deadline
+        };
+        let mine = pool.acquire(1, 2, &within()).unwrap();
         // Six, less the request's one and a base and gate grant reserved,
         // leave two: a lane of two is lent, then nothing more, and a lane
         // of three is refused whole.
-        let lend = |tokens: usize, reserve: usize| loop {
-            if let Some(permit) = pool.admit(tokens, tokens, reserve, &late).unwrap() {
-                break permit;
+        let lend = |tokens: usize, reserve: usize| {
+            let late = within();
+            loop {
+                if let Some(permit) = pool.admit(tokens, tokens, reserve, &late).unwrap() {
+                    break permit;
+                }
+                assert!(!late(), "{tokens} token(s) were never lent");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(!late(), "{tokens} token(s) were never lent");
-            std::thread::sleep(Duration::from_millis(20));
         };
         let spare = lend(2, 3);
         assert_eq!(spare.bytes(), 2 * TOKEN_BYTES);
-        assert!(pool.admit(1, 1, 3, &|| true).unwrap().is_none());
+        assert!(pool.admit(1, 1, 3, &within()).unwrap().is_none());
         drop(spare);
-        assert!(pool.admit(3, 3, 3, &|| true).unwrap().is_none());
-        let spare = pool.acquire(2, 3, &late).unwrap();
+        assert!(pool.admit(3, 3, 3, &within()).unwrap().is_none());
+        let spare = pool.acquire(2, 3, &within()).unwrap();
         assert!(
             pool.admit(4, 4, 3, &|| true).is_err(),
             "more than the pool can lend"
         );
         // The reserve still admits another worktree's request and its gate.
-        let other = pool.acquire(1, 2, &late).unwrap();
-        let gate = pool.acquire(2, 0, &late).unwrap();
+        let other = pool.acquire(1, 2, &within()).unwrap();
+        let gate = pool.acquire(2, 0, &within()).unwrap();
         drop((gate, other, spare, mine));
-        let freed = pool.acquire(4, 2, &late).unwrap();
+        let freed = pool.acquire(4, 2, &within()).unwrap();
         assert_eq!(freed.bytes(), 4 * TOKEN_BYTES);
     }
 
