@@ -4093,3 +4093,196 @@ fn a_heading_row_keeps_its_prefix_and_strike_on_its_baseline() {
         assert_eq!(strikes, [row.y + large - middle; 2], "scale {scale}");
     }
 }
+
+/// Prose rows read back as their text, a scalar a cell: a bullet's
+/// prefix and its row, and a heading row of two sizes.
+#[test]
+fn prose_rows_read_back_as_their_text() {
+    for scale in 1..=4u8 {
+        let mut list = list(scale, 40, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        // Wide 'm's put a pen past the cells read so far: still one run.
+        let mut rich = Rich::new("- iiii mmmm x\n\ni m").unwrap();
+        rich.block("\u{2022} ", "  ", false).unwrap();
+        rich.text(2..13, Look::PLAIN, None).unwrap();
+        rich.gap().unwrap();
+        rich.text(15..17, Look::PLAIN, None).unwrap();
+        rich.text(17..18, Look::LARGER, None).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        let scene = Scene {
+            surface: surface(scale),
+            list: &list,
+        };
+        let (_, _, text) = td_ui::driven::text(&scene).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&"\u{2022} iiii mmmm x"),
+            "scale {scale}: {text}"
+        );
+        assert!(lines.contains(&"i m"), "scale {scale}: {text}");
+    }
+}
+
+/// A composition of `draws`, in order, over a surface `width` by `height`
+/// at scale one.
+struct Draws {
+    surface: Surface,
+    draws: Vec<Draw>,
+}
+
+impl Draws {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            surface: Surface::new(width, height, Scale::new(1).unwrap()).unwrap(),
+            draws: Vec::new(),
+        }
+    }
+
+    /// `text` in Sans at `size` pixels an em (the prose size for none),
+    /// its tops at `y` and its pens `step` apart from `x`.
+    fn prose(mut self, text: &str, x: i64, y: i64, step: i64, size: Option<u32>) -> Self {
+        let mut style = GlyphStyle::medium(INK, PAPER).with_family(TextFamily::Sans);
+        if let Some(size) = size {
+            style = style.with_size(Size::new(size).unwrap());
+        }
+        for (nth, scalar) in text.chars().enumerate() {
+            self.draws.push(Draw {
+                clip: self.surface.bounds(),
+                primitive: Primitive::Glyph {
+                    x: x + step * nth as i64,
+                    y,
+                    scalar,
+                    style,
+                },
+            });
+        }
+        self
+    }
+
+    /// A cell glyph at cell `column` of grid row `row`.
+    fn cell(mut self, scalar: char, column: i64, row: i64) -> Self {
+        self.draws.push(Draw {
+            clip: self.surface.bounds(),
+            primitive: Primitive::Glyph {
+                x: column * CELL_WIDTH as i64,
+                y: row * CELL_HEIGHT as i64,
+                scalar,
+                style: GlyphStyle::medium(INK, PAPER),
+            },
+        });
+        self
+    }
+
+    fn fill(mut self, x: i64, y: i64, width: u32, height: u32) -> Self {
+        self.draws.push(Draw {
+            clip: self.surface.bounds(),
+            primitive: Primitive::Fill {
+                rect: Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                color: PAPER,
+            },
+        });
+        self
+    }
+
+    fn read(&self) -> String {
+        td_ui::driven::text(self).unwrap().2
+    }
+}
+
+impl Composition for Draws {
+    fn surface(&self) -> Surface {
+        self.surface
+    }
+    fn emit(&self, _damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        for draw in &self.draws {
+            sink(*draw);
+        }
+    }
+}
+
+/// A prose line narrower a scalar than a cell reads whole, past the
+/// grid's columns; under paint drawn after it, a glyph is not read, and
+/// one read toward that paint reads on past it, never over it.
+#[test]
+fn prose_reads_past_the_grid_and_not_under_later_paint() {
+    let line = "abcdefghijklmnopqrst";
+    let whole = Draws::new(80, 32).prose(line, 0, 0, 4, None);
+    let (rows, columns, text) = td_ui::driven::text(&whole).unwrap();
+    assert_eq!((rows, columns), (2, 10));
+    assert_eq!(text, line);
+    // Paint over pixels 40 to 80 after the line: 'k' (at 40) onward is
+    // under it; "fghij", standing left of it, reads on past it.
+    let covered = Draws::new(80, 32)
+        .prose(line, 0, 0, 4, None)
+        .fill(40, 0, 40, 32);
+    assert_eq!(covered.read(), "abcde     fghij");
+    // A scrollbar's thumb, drawn last over cell 8 alone, past the line's
+    // pixels: none of the line is hidden, and it reads whole through it.
+    let thumb = Draws::new(80, 32)
+        .prose("abcdefghijkl", 0, 0, 4, None)
+        .fill(64, 0, 12, 32);
+    assert_eq!(thumb.read(), "abcdefghijkl");
+    // Paint before the line hides none of it.
+    let under = Draws::new(80, 32)
+        .fill(0, 0, 80, 32)
+        .prose(line, 0, 0, 4, None);
+    assert_eq!(under.read(), line);
+}
+
+/// Cell text drawn after prose reads as it did: a dialog's glyph beside
+/// or over a prose line is never written over.
+#[test]
+fn later_cell_text_reads_over_prose() {
+    // A glyph two pixels into cell 0, then paint and a cell glyph there.
+    let over = Draws::new(80, 32)
+        .prose("a", 2, 0, 4, None)
+        .fill(0, 0, 8, 16)
+        .cell('X', 0, 0);
+    assert_eq!(over.read(), "X");
+    // A panel over pixels 24 to 80 with a glyph in its cell 3: the line's
+    // visible "abcdef" reads around the glyph and the panel's cells.
+    let beside = Draws::new(80, 32)
+        .prose("abcdefghijklmnopqrst", 0, 0, 4, None)
+        .fill(24, 0, 56, 16)
+        .cell('Z', 3, 0);
+    assert_eq!(beside.read(), "abcZ      def");
+    // A tooltip's paint, a pixel below the line's top, covers no whole
+    // cell: its glyph alone holds its cell, hiding 'g' and 'h' (at 24
+    // and 28) under its ground, and the line reads around it.
+    let tip = Draws::new(80, 32)
+        .prose("abcdefghij", 0, 0, 4, None)
+        .fill(0, 1, 80, 22)
+        .cell('Z', 3, 0);
+    assert_eq!(tip.read(), "abcZdefij");
+}
+
+/// Text of two sizes on one baseline is one line at every phase of the
+/// grid: the larger's top higher by its baseline's difference.
+#[test]
+fn sizes_on_a_baseline_read_as_one_line_at_every_phase() {
+    for phase in 0..16 {
+        let baseline = 40 + phase;
+        // Baselines a little past the em, as in Noto: 26 at 24, 17 at 16.
+        let read = Draws::new(160, 96)
+            .prose("MM", 0, baseline - 26, 20, Some(24))
+            .prose(" ii", 40, baseline - 17, 4, Some(16))
+            .read();
+        assert_eq!(read.trim(), "MM ii", "phase {phase}");
+    }
+}
+
+/// Lines closer than a cell read on rows of their own, in order.
+#[test]
+fn close_lines_read_on_rows_of_their_own() {
+    let read = Draws::new(80, 64)
+        .prose("aaa", 0, 0, 4, Some(10))
+        .prose("bbb", 0, 12, 4, Some(10))
+        .read();
+    assert_eq!(read, "aaa\nbbb");
+}

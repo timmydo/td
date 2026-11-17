@@ -2074,11 +2074,12 @@ order; each is its own design amendment when it starts:
   allowlist: §5's tests run on the host and fake the mount table.
 - **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
   agent can operate td-web through the verbs td-ui's other programs
-  take, and an oracle can boot it in the image. Reading a page back
-  needs td-ui's prose-aware read-back first (td-ui/DESIGN.md,
-  "Proportional faces", "Not yet"): its seam reads the cell grid, and
-  over proportional faces narrow glyphs share a cell, so the text it
-  reads is not the text drawn.
+  take, and an oracle can boot it in the image. td-ui's seam reads
+  prose back as its text (td-ui/DESIGN.md, "The semantic seam") only
+  from a glyph per scalar, spaces included, and paint drawn after the
+  text it covers: the painter skips whitespace and emits every glyph
+  after its fills, so a page reads its words together until it draws
+  them in order.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

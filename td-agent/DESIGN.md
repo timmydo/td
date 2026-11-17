@@ -1600,10 +1600,11 @@ with one copy and the transcript measures with the other
 `TD_UI_FACE=bitmap` it stays on the cell; without the faces too, and
 the window says once on standard error why. Everything else in the
 window stays on the cell, the composer included. The driven `text`
-verb reads the cell grid, which prose does not fill, so with faces a
-reply or the person's message does not read back from it; the native
-compositor tests run with `TD_UI_FACE=bitmap`, where it does, and an
-agent that reads the window back should too.
+verb reads prose back as its text, a scalar a cell (td-ui DESIGN.md,
+"The semantic seam"), so a reply or the person's message reads back
+with the faces loaded as on the cell, though its rows may stand a grid
+row apart; the native compositor tests still run with
+`TD_UI_FACE=bitmap`, which pins their cell layouts.
 
 A streaming reply's text is kept as it comes and drawn again whole,
 since a delimiter that closes later restyles what came before it: at

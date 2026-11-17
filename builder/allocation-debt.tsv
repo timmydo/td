@@ -4052,7 +4052,7 @@ td-ui/src/control_worker.rs	heap-owner	2
 td-ui/src/control_worker.rs	unchecked-growth-or-clone	2
 td-ui/src/coverage.rs	unchecked-growth-or-clone	4
 td-ui/src/driven.rs	allocating-conversion	7
-td-ui/src/driven.rs	allocation-macro	12
+td-ui/src/driven.rs	allocation-macro	11
 td-ui/src/driven.rs	unchecked-growth-or-clone	10
 td-ui/src/editor.rs	unchecked-growth-or-clone	3
 td-ui/src/editor_clipboard.rs	allocating-constructor	1

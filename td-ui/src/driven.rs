@@ -15,7 +15,7 @@ use crate::control::{
 };
 use crate::font::Font;
 use crate::keyboard::Held;
-use crate::raster::{self, Composition, Primitive, Raster, Rect, Scale, Surface};
+use crate::raster::{self, Composition, Primitive, Raster, Rect, Scale, Surface, TextFamily};
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 use std::sync::OnceLock;
 
@@ -441,8 +441,14 @@ fn wire(error: raster::Error) -> control::Error {
 /// origin names (an origin off the grid, a glyph straddling the top or
 /// left edge included, names none), later draws over earlier ones, a fill
 /// clears every cell it wholly covers, wholly clipped glyphs are absent,
-/// rows are trimmed on the right and trailing blank rows dropped. Returns
-/// the grid's rows and columns and the text, of at most that many lines.
+/// rows are trimmed on the right and trailing blank rows dropped.
+///
+/// A proportional glyph (any family but the cell's) stands at a pixel,
+/// not a cell, so it is read once the stream ends (`read_prose`): a scalar
+/// a cell, in the order of its line, never over text drawn after it,
+/// and a line may run past the grid's columns, to twice them, rather than
+/// lose its end. Returns the grid's rows and columns and the text, of at
+/// most that many lines.
 pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), raster::Error> {
     let surface = composition.surface();
     surface.check()?;
@@ -451,13 +457,28 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
     let cell_height = CELL_HEIGHT.saturating_mul(scale);
     let columns = surface.width / cell_width;
     let rows = surface.height / cell_height;
+    // A row's cells, and as many again a prose line may read into.
+    let wide = columns.saturating_mul(2);
     let (Ok(width), Ok(height)) = (u32::try_from(cell_width), u32::try_from(cell_height)) else {
         return Err(raster::Error::Limit);
     };
-    let mut grid = vec![' '; rows.saturating_mul(columns)];
+    let refused = |_| raster::Error::Limit;
+    let mut grid = td_alloc::filled(rows.saturating_mul(wide), ' ').map_err(refused)?;
+    // Each cell's place in the stream of the last cell glyph or fill there,
+    // and whether that was a glyph: text, not only paint.
+    let mut last = td_alloc::filled(rows.saturating_mul(wide), (0usize, false)).map_err(refused)?;
+    let mut prose: Vec<Placed> = Vec::new();
+    let mut place = 0usize;
+    let mut failed = false;
     composition.emit(surface.bounds(), &mut |draw| {
-        let (x, y, scalar) = match draw.primitive {
-            Primitive::Glyph { x, y, scalar, .. } => (x, y, scalar),
+        place = place.saturating_add(1);
+        let (x, y, scalar, style) = match draw.primitive {
+            Primitive::Glyph {
+                x,
+                y,
+                scalar,
+                style,
+            } => (x, y, scalar, style),
             // A mark is a hint's pixel, not text the window shows.
             Primitive::Mark { .. } => return,
             // A picture covers its cells as paint does.
@@ -469,9 +490,12 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
                 let span = covered_cells(covered.x, covered.width, cell_width, columns);
                 for row in covered_cells(covered.y, covered.height, cell_height, rows) {
                     for column in span.clone() {
-                        let index = row.saturating_mul(columns).saturating_add(column);
+                        let index = row.saturating_mul(wide).saturating_add(column);
                         if let Some(slot) = grid.get_mut(index) {
                             *slot = ' ';
+                        }
+                        if let Some(slot) = last.get_mut(index) {
+                            *slot = (place, false);
                         }
                     }
                 }
@@ -487,18 +511,48 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
         if draw.clip.intersection(cell).is_none() {
             return;
         }
-        let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+        let (Ok(column), Ok(row)) = (usize::try_from(x), usize::try_from(y)) else {
             return;
         };
-        let (column, row) = (x / cell_width, y / cell_height);
+        let (column, row) = (column / cell_width, row / cell_height);
+        if style.family != TextFamily::Cell {
+            let em = i64::from(style.size.pixels(surface.scale));
+            let glyph = Placed {
+                anchor: y.saturating_add(em),
+                top: y,
+                x: usize::try_from(x).unwrap_or(usize::MAX),
+                em: usize::try_from(em).unwrap_or(0),
+                place,
+                scalar,
+                line: 0,
+            };
+            if row < rows && td_alloc::push(&mut prose, glyph).is_err() {
+                failed = true;
+            }
+            return;
+        }
         if column < columns && row < rows {
-            if let Some(slot) = grid.get_mut(row.saturating_mul(columns).saturating_add(column)) {
+            let index = row.saturating_mul(wide).saturating_add(column);
+            if let Some(slot) = grid.get_mut(index) {
                 *slot = scalar;
+            }
+            if let Some(slot) = last.get_mut(index) {
+                *slot = (place, true);
             }
         }
     });
+    if failed {
+        return Err(raster::Error::Limit);
+    }
+    let cells = Cells {
+        wide,
+        rows,
+        cell_width,
+        cell_height,
+    };
+    read_prose(&mut prose, &mut grid, &last, cells);
     let mut lines: Vec<String> = grid
-        .chunks(columns.max(1))
+        .chunks(wide.max(1))
         .take(rows)
         .map(|row| row.iter().collect::<String>().trim_end().to_string())
         .collect();
@@ -506,6 +560,176 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
         lines.pop();
     }
     Ok((rows, columns, lines.join("\n")))
+}
+
+/// A proportional glyph as the stream drew it: where its baseline about
+/// falls (its top and its size's em), its pixel column, its em, its
+/// place in the stream and, once grouped, its line's grid row.
+#[derive(Clone, Copy)]
+struct Placed {
+    anchor: i64,
+    top: i64,
+    x: usize,
+    em: usize,
+    place: usize,
+    scalar: char,
+    line: usize,
+}
+
+/// The read grid's shape: a row's slots, the rows and a cell in pixels.
+#[derive(Clone, Copy)]
+struct Cells {
+    wide: usize,
+    rows: usize,
+    cell_width: usize,
+    cell_height: usize,
+}
+
+/// Reads proportional glyphs onto `grid`, `last` holding each slot's
+/// place of the last cell glyph or fill there and whether it was a glyph:
+/// - Glyphs whose estimated baselines (top plus em) lie within a third of
+///   an em of the one before are one line, so text of several sizes on a
+///   baseline is one; its grid row is its highest top's, and a line never
+///   shares a row with the line above it, taking the next.
+/// - Along a line by pixel, a glyph within an em and a half of the one
+///   before continues its run, a scalar a cell after it; another starts
+///   a run in the cell its origin names, or the first after what the
+///   line has read.
+/// - A run's own grounds and lines come between its glyphs; what was
+///   drawn after its last glyph is over it: a glyph whose own cell that
+///   later paint holds is hidden, the run going on past it at its own
+///   column. A glyph read past its own cell, toward one later text holds,
+///   is read in the first after it, never over that text. One only later
+///   paint cleared takes it if none of the run is hidden, so a line reads
+///   whole past a scrollbar's thumb in its gutter; a run partly under a
+///   panel passes over all the panel holds.
+///
+/// A consumer that draws no glyph for a space reads its words together.
+fn read_prose(prose: &mut [Placed], grid: &mut [char], last: &[(usize, bool)], cells: Cells) {
+    prose.sort_unstable_by_key(|glyph| (glyph.anchor, glyph.place));
+    // Lines first, numbered in order of their baselines.
+    let mut number = 0usize;
+    let mut before: Option<i64> = None;
+    for glyph in prose.iter_mut() {
+        let near = before
+            .is_some_and(|anchor| glyph.anchor.saturating_sub(anchor) <= (glyph.em / 3) as i64);
+        if before.is_some() && !near {
+            number = number.saturating_add(1);
+        }
+        glyph.line = number;
+        before = Some(glyph.anchor);
+    }
+    // Then each line's row: its highest top's, below the line above.
+    let mut above: Option<usize> = None;
+    let mut start = 0;
+    while start < prose.len() {
+        let Some(number) = prose.get(start).map(|glyph| glyph.line) else {
+            break;
+        };
+        let mut end = start;
+        while prose.get(end).is_some_and(|glyph| glyph.line == number) {
+            end += 1;
+        }
+        let line = prose.get_mut(start..end).unwrap_or(&mut []);
+        let top = line
+            .iter()
+            .map(|glyph| usize::try_from(glyph.top).unwrap_or(0) / cells.cell_height.max(1))
+            .min()
+            .unwrap_or(0);
+        let row = above.map_or(top, |above| top.max(above.saturating_add(1)));
+        for glyph in line.iter_mut() {
+            glyph.line = row;
+        }
+        above = Some(row);
+        start = end;
+    }
+    // A line's glyphs together, left to right; a line moved to a row of
+    // its own stays apart from the one above by its row.
+    prose.sort_unstable_by_key(|glyph| (glyph.line, glyph.x, glyph.place));
+    let mut start = 0;
+    while start < prose.len() {
+        let Some(line) = prose.get(start).map(|glyph| glyph.line) else {
+            break;
+        };
+        let mut end = start;
+        while prose.get(end).is_some_and(|glyph| glyph.line == line) {
+            end += 1;
+        }
+        read_line(
+            prose.get(start..end).unwrap_or(&[]),
+            line,
+            grid,
+            last,
+            cells,
+        );
+        start = end;
+    }
+}
+
+/// One line's glyphs, left to right, onto grid row `row`.
+fn read_line(
+    glyphs: &[Placed],
+    row: usize,
+    grid: &mut [char],
+    last: &[(usize, bool)],
+    cells: Cells,
+) {
+    if row >= cells.rows {
+        return;
+    }
+    let base = row.saturating_mul(cells.wide);
+    let mut next = 0;
+    let mut start = 0;
+    while start < glyphs.len() {
+        // A run: glyphs each within an em and a half of the one before.
+        let mut end = start + 1;
+        while let (Some(before), Some(glyph)) = (glyphs.get(end - 1), glyphs.get(end)) {
+            if glyph.x > before.x.saturating_add(before.em.saturating_mul(3) / 2) {
+                break;
+            }
+            end += 1;
+        }
+        let run = glyphs.get(start..end).unwrap_or(&[]);
+        let latest = run.iter().map(|glyph| glyph.place).max().unwrap_or(0);
+        // Whether later paint holds a slot, and whether later text does.
+        let over = |column: usize, text: bool| {
+            column < cells.wide
+                && last
+                    .get(base.saturating_add(column))
+                    .is_some_and(|&(place, glyph)| place > latest && (glyph || !text))
+        };
+        // A run later paint covers in part lies under a panel: its tail
+        // passes over all that paint holds, not only text, so it never
+        // reads into the panel.
+        let own = |glyph: &Placed| glyph.x / cells.cell_width.max(1);
+        let under = run.iter().any(|glyph| over(own(glyph), false));
+        let mut first = true;
+        for glyph in run {
+            let own = own(glyph);
+            if over(own, false) {
+                // Under later paint: the run goes on past it at its own
+                // column.
+                next = next.max(own.saturating_add(1));
+                first = true;
+                continue;
+            }
+            let mut column = if first { next.max(own) } else { next };
+            first = false;
+            // Later text, or under a panel any later paint, is passed
+            // over, the run read on after it rather than over it or lost.
+            while column < cells.wide && over(column, !under) {
+                column += 1;
+            }
+            if let Some(slot) = grid
+                .get_mut(base.saturating_add(column))
+                .filter(|_| column < cells.wide)
+            {
+                *slot = glyph.scalar;
+            }
+            next = column.saturating_add(1);
+        }
+        start = end;
+    }
 }
 
 /// The cells along one axis that a span from `start` for `length` pixels

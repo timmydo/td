@@ -1304,7 +1304,9 @@ denote literal Tabs):
   would refuse it, before the consumer sees it; the outcome word.
 - `1 ID focus 0|1` and `1 ID tick MS`: the outcome word.
 - `1 ID text`: `ROWS COLUMNS HEX_TEXT`: the cell grid's rows and columns
-  and the read-back below, of at most ROWS lines.
+  and the read-back below, of at most ROWS lines, a prose line up to
+  twice COLUMNS scalars; a reply past the frame closes the connection
+  unanswered, as any oversized reply does.
 - `1 ID frame`: `W H SCALE DIGEST`, the FNV-1a 64 of the frame's RGB rows
   in hex.
 - `1 ID frame-page OFFSET LIMIT`: `W H OFFSET HEX_BYTES` of the RGB rows,
@@ -1335,7 +1337,43 @@ an earlier one, a fill clearing every cell it wholly covers, so an opaque panel
 hides what it paints over, a glyph whose clip excludes it wholly absent, a
 mark (a hint's pixels, not text the window shows) passed over; rows
 are trimmed on the right and trailing blank rows dropped, so the text has at
-most ROWS lines. That is the accessibility question answered at the seam the
+most ROWS lines.
+
+A proportional glyph (a `GlyphStyle` family other than `Cell`) stands
+at a pixel, not a cell, so it is read once the stream ends, each grid
+cell keeping the stream place of the last cell glyph or paint there:
+- Glyphs whose estimated baselines (top plus their size's em) lie
+  within a third of an em of the one before form one line, so text of
+  several sizes on a baseline reads together. A line takes its highest
+  top's grid row, or the row after the line above it, never sharing
+  one; a prose row taller than a cell may leave an empty row after it.
+  Lines are ordered across the whole surface, so lines closer than a
+  cell, or two prose columns side by side whose lines alternate, drift
+  down a row each and may pass the last row, unread.
+- Along a line by pixel, a glyph within an em and a half of the one
+  before continues its run, a scalar a cell after it; another starts a
+  run in the cell its origin names, or after what the line has read.
+- Paint drawn after a run's last glyph is over it (its own grounds and
+  lines, between its glyphs, are not): a glyph whose cell that paint
+  holds is not read, its run going on at its own column. A scalar read
+  past its own cell, bound for one later cell text holds, reads in the
+  first one after it. One later paint only cleared takes it while none
+  of the run is hidden, so a line reads whole past a scrollbar's thumb
+  in its gutter; a run partly under a panel passes over every cell
+  later paint holds, the panel's and any other, reading on after it. A run ending just short of a panel
+  may still read its last scalars into the panel's blank cells, never
+  over its text: a space drawn as a cell glyph is text, a cell only a
+  fill painted is not. A panel's edge within a cell holds no cell, as
+  without prose.
+A line so reads as its text, a scalar a cell, and may run past
+COLUMNS, to twice them, rather than lose its end. It assumes the
+consumer draws a glyph for each scalar, spaces included, as `prose`'s
+`draw` and the message list do; words drawn without their spaces read
+run together, two texts closer than an em and a half as one, and prose
+drawn over prose on about its baseline interleaves with it.
+Columns of prose do not line up with the pixels it stands at.
+
+That is the accessibility question answered at the seam the
 toolkit already has: every widget emits its text as Unicode scalars, so nothing
 is retyped for the agent. `paint` paints the composition into a fresh buffer
 through the pinned face, parsed once per process, and returns the `Frame`, its
@@ -4427,11 +4465,10 @@ else `M`) at the glyph's size, and its baseline the line's. Without the
 prose faces (none loaded, `TD_UI_FACE=bitmap`, every in-process test) a
 prose glyph draws exactly as a `Cell` glyph does. A `Glyph` still names
 one scalar and a style, never a bitmap, and the draw-stream oracles see
-prose as they see cells. `driven`'s read-back places each glyph in the
-cell its origin falls in, so it reads prose back exactly on the cell,
-where every pen is a cell's (no faces, `TD_UI_FACE=bitmap`, every
-in-process test); over proportional faces narrow glyphs share cells and
-the text it reads is not the text drawn (see "Not yet").
+prose as they see cells. `driven`'s read-back reads prose as its text,
+a scalar a cell ("The semantic seam"); on the cell (no faces,
+`TD_UI_FACE=bitmap`, every in-process test) that is each glyph's own
+cell, save that a wide stand-in takes one cell, not its two.
 
 A raster draws prose from `prose::Faces`, lent with
 `Raster::with_prose` (the window's `with_prose`, or
@@ -4698,12 +4735,12 @@ text, mark positioning (a combining mark draws at the pen with its own
 advance, zero in these faces), hyphenation, and faces beyond Latin,
 Greek and Cyrillic (Noto's CJK faces are CFF collections, which `sfnt`
 refuses by name). A scalar outside the families' coverage still draws:
-from the monospace face, its stand-in or Unifont. Nor does the seam
-read prose back over proportional faces: `driven::text` reads the cell
-grid, so a
-consumer whose text matters to an agent says it through its own verbs
-until the seam reads the pieces a consumer laid out; the message list's
-`shown` read-back gives its rows' text whatever face draws it.
+from the monospace face, its stand-in or Unifont. The seam reads prose
+back a scalar a cell, line by line ("The semantic seam"): its columns
+no longer line up with the pixels it stands at, a consumer that needs
+exact geometry says it through its own verbs, and one that draws no
+glyph for a space reads its words together; the message list's `shown`
+read-back gives its rows' text whatever face draws it.
 
 ## Independently landable increments
 
