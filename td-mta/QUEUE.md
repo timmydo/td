@@ -367,9 +367,12 @@ update, including cancellation and failure-notice updates.
 Retain completed submission records and their blobs for at least 30 days
 after completion by default, whatever their recipients' outcomes; the relay
 then retires them, with their attempts and receipts (POSTGRES.md section
-216). Failed and terminal OutcomeUnknown records retire once their failure
-notice is stored, so an outcome-unknown record's evidence is kept for that
-window only. Ordinary retention never deletes pending responsibility: an
+216). Retired delivery attempts and their receipts of any submission are
+reclaimed sooner, at a later attempt publication (POSTGRES.md section 218);
+each recipient keeps its own attempt count, replies and uncertainty. Failed
+and terminal OutcomeUnknown records retire once their failure notice is
+stored, so an outcome-unknown record's evidence is kept for that window
+only. Ordinary retention never deletes pending responsibility: an
 uncompleted record, a pending notice, an active attempt or a final
 reservation.
 Manual JMAP destruction is forbidden for all submission records; record

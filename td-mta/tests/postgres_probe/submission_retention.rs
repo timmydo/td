@@ -277,36 +277,43 @@ pub(super) fn exercise(
     sql(fixture, &format!("INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals FROM td_mta.submission_attempts WHERE attempt_id={}", id(0xef)));
     sql(fixture, &format!("INSERT INTO td_mta.submission_attempts SELECT (jsonb_populate_record(NULL::td_mta.submission_attempts,to_jsonb(a)||jsonb_build_object('attempt_id','\\x{PREFIX}0000000000f2'||lpad(to_hex(n),8,'0'),'submission_id',{},'active',false))).* FROM (SELECT * FROM td_mta.submission_attempts LIMIT 1) a CROSS JOIN generate_series(1,900) n", bytea(0xf2)));
     let e2 = bytea(0xe2);
-    for table in [
-        "attempt_phase_receipts",
-        "attempt_acceptance_receipts",
-        "attempt_refusal_receipts",
-        "attempt_rcpt_receipts",
-        "attempt_command_receipts",
+    // Attempt publication reclaims retired attempts' receipts (POSTGRES.md
+    // section 218), so none may be left to copy: write them out.
+    let account = format!("decode('{}','hex')", binding.account());
+    let tail = "decode(repeat('ab',32),'hex'),1,decode('0000000000000001','hex'),decode('0000000000000002','hex')";
+    for (table, phase) in [
+        ("attempt_phase_receipts", 2),
+        ("attempt_acceptance_receipts", 4),
+        ("attempt_refusal_receipts", 5),
+        ("attempt_rcpt_receipts", 6),
+        ("attempt_command_receipts", 7),
     ] {
-        clone(fixture, table, &[("attempt_id", e2.clone())]);
+        sql(
+            fixture,
+            &format!(
+                "INSERT INTO td_mta.{table} VALUES({account},{},{phase},{tail})",
+                id(0xe2)
+            ),
+        );
     }
     // A kept attempt's receipt stays.
-    clone(
+    sql(
         fixture,
-        "attempt_acceptance_receipts",
-        &[("attempt_id", bytea(0xe4))],
+        &format!(
+            "INSERT INTO td_mta.attempt_acceptance_receipts VALUES({account},{},4,{tail})",
+            id(0xe4)
+        ),
     );
-    clone(
-        fixture,
-        "attempt_recovery_receipts",
-        &[("operation", bytea(0xc1)), ("attempt_id", e2.clone())],
-    );
-    clone(
-        fixture,
-        "route_health_receipts",
-        &[("operation", e2.clone()), ("action", "3".into())],
-    );
-    clone(
-        fixture,
-        "route_health_receipts",
-        &[("operation", bytea(0xe5)), ("action", "1".into())],
-    );
+    sql(fixture, &format!("INSERT INTO td_mta.attempt_recovery_receipts VALUES({account},{},decode(repeat('ab',32),'hex'),{},1,decode('0000000000000001','hex'),decode('0000000000000002','hex'))", id(0xc1), id(0xe2)));
+    let route = binding.route();
+    let destination: String = route
+        .destination()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    for (operation, action, failure) in [(0xe2, 3, "0,0,NULL,NULL"), (0xe5, 1, "1,3,0,300000")] {
+        sql(fixture, &format!("INSERT INTO td_mta.route_health_receipts VALUES({account},{},decode(repeat('ab',32),'hex'),'{}',decode('{destination}','hex'),{action},decode('0000000000000001','hex'),decode('0000000000000002','hex'),{failure},NULL)", id(operation), route.name()));
+    }
     for (table, operation) in [
         ("submission_receipts", 0xc2),
         ("submission_cancel_receipts", 0xc3),
@@ -321,7 +328,6 @@ pub(super) fn exercise(
             ],
         );
     }
-    let account = format!("decode('{}','hex')", binding.account());
     resync(fixture, &account);
     let usage = || {
         audit::inspect(

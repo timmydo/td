@@ -36,19 +36,15 @@ pub(super) fn exercise(
     )
     .unwrap();
     sql(fixture, &format!("UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-1200000,next_attempt_at=next_attempt_at-1200000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
-    let first = super::attempt_clock::publish(
-        fixture,
-        request,
-        trust,
-        deadline(),
-        &attempts::retry(claim, generation, submission).unwrap(),
-    )
-    .unwrap();
+    let retry = attempts::retry(claim, generation, submission).unwrap();
+    let first = super::attempt_clock::publish(fixture, request, trust, deadline(), &retry).unwrap();
+    // That publication reclaimed the retired attempt (POSTGRES.md section
+    // 218): a late report for it finds nothing to count.
     let stale =
         health::prepare(claim, generation, abandoned.attempt, health::Failure::Tls).unwrap();
     assert_eq!(
         health::publish(request, trust, deadline(), &stale),
-        Err(health::Error::Conflict)
+        Err(health::Error::Missing)
     );
 
     let value =
@@ -142,8 +138,8 @@ pub(super) fn exercise(
         "DROP TRIGGER delay_health ON td_mta.route_health_receipts",
     );
     assert_eq!(
-        super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap(),
-        abandoned
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &retry).unwrap(),
+        first
     );
     assert_eq!(
         super::attempt_clock::publish(
@@ -197,15 +193,15 @@ pub(super) fn exercise(
         ),
         Err(attempts::Error::RouteHealth(health::Error::RepairRequired))
     );
-    // The next publication on the route expired the retired first attempt's
-    // settlement; the retired attempt still cannot count a second failure.
+    // The next publication on the route reclaimed the retired first attempt
+    // with its settlement; it still cannot count a second failure.
     assert_eq!(
         health::inspect(request, trust, deadline(), &value).unwrap(),
         None
     );
     assert_eq!(
         health::publish(request, trust, deadline(), &value),
-        Err(health::Error::Conflict)
+        Err(health::Error::Missing)
     );
     assert_eq!(
         health::publish(request, trust, deadline(), &auth).unwrap(),

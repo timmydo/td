@@ -12493,6 +12493,8 @@ mod attempt_interrupted;
 mod attempt_phases;
 #[path = "postgres_probe/attempt_rcpt.rs"]
 mod attempt_rcpt;
+#[path = "postgres_probe/attempt_reclamation.rs"]
+mod attempt_reclamation;
 #[path = "postgres_probe/attempt_refusal.rs"]
 mod attempt_refusal;
 #[path = "postgres_probe/attempt_retry.rs"]
@@ -12830,6 +12832,7 @@ fn exercise_attempt_recovery(
     route_success::exercise(fixture, request, trust, binding, submission);
     submission_cancel::exercise(fixture, request, trust, binding, submission, policies);
     submission_retention::exercise(fixture, request, trust, binding, submission);
+    attempt_reclamation::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(

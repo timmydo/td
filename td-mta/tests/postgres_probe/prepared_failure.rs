@@ -471,6 +471,10 @@ pub(super) fn exercise(
             let other_sub = format!("decode('{other}','hex')");
             sql(fixture,&format!("UPDATE td_mta.route_health SET failed_at=failed_at-1200000,next_at=next_at-1200000; INSERT INTO td_mta.submissions SELECT account,{other_sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{other_sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{other_sub},0,'other@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={other_sub}"));
             owners::renew(request, trust, deadline(), claim, generation).unwrap();
+            // The relay steps a failure continuation to completion before it
+            // publishes again; this interleaving would reclaim the retired
+            // attempt (POSTGRES.md section 218), so a reservation holds it.
+            sql(fixture,&format!("INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals FROM td_mta.submission_attempts WHERE attempt_id={key}"));
             sql(fixture,"CREATE FUNCTION public.delay_unrelated_prepared() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_unrelated_prepared AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_unrelated_prepared()");
             assert_eq!(
                 worker
@@ -511,6 +515,10 @@ pub(super) fn exercise(
             sql(
                 fixture,
                 "DROP TRIGGER delay_unrelated_prepared ON td_mta.submission_attempts",
+            );
+            sql(
+                fixture,
+                &format!("DELETE FROM td_mta.attempt_final_reservations WHERE attempt_id={key}"),
             );
             worker
                 .publish_recovery(

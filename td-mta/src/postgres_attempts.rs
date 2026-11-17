@@ -363,6 +363,15 @@ fn publish_inner(
             if active {
                 return Err(Error::Busy);
             }
+            // The worker publishes only with nothing Pending, so its route's
+            // retired attempts are settled (POSTGRES.md section 218).
+            crate::postgres_attempt_reclamation::reclaim(
+                client,
+                account,
+                binding.route().name(),
+                timestamp,
+            )
+            .await?;
             let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 LIMIT 1024) attempts", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
             if count >= 1024 {
                 return Err(Error::Capacity);

@@ -568,7 +568,10 @@ impl Worker<'_, '_> {
                     connect::Closed::Auth(mut failed) => loop {
                         let cap = until(&self.clock, 10_000)?;
                         match failed.step(cap, &mut meter(cap), settlement) {
-                            Ok(Some(_)) => break,
+                            // A reclaimed attempt was retired by a committed
+                            // recovery; as in recover(), nothing remains.
+                            Ok(Some(_))
+                            | Err(dispatch::Error::Recovery(recovery::Error::Missing)) => break,
                             _ if control.stop_requested() => return Err(Error::Custody),
                             _ => pause(control, Duration::from_secs(1)),
                         }

@@ -3610,8 +3610,8 @@ bound receipt commit atomically. A second request for the same phase with
 different input refuses. Historical receipt inspection precedes fresh policy
 checks and excludes an in-progress publisher through the account lock;
 unknown COMMIT requires closing transport, not transmitting on guessed state.
-Receipt storage has a 2048-per-account ceiling. Runtime retention/reclamation
-and final-outcome capacity admission remain prerequisites for activation.
+Receipt storage has a 2048-per-account ceiling; a retired attempt's receipts
+are reclaimed with it (section 218).
 
 These are durable facts, not continuing permission to transmit. The runtime
 must retain current ownership and its monotonic transport fence, and reserve
@@ -3966,7 +3966,9 @@ next renewal fails Stale, within about fifteen seconds, `check_locked`
 refuses its publications, so it can only inspect. A change to that renewal
 policy must keep this property. Another relay
 process serving a different route keeps its settlement for the hour.
-Attempt rows must outlive that hour after preparation.
+Attempt rows on another route must outlive that hour after preparation;
+section 218 reclaims the publishing route's retired attempts at once and
+another route's only after it.
 
 Expiry cannot let an attempt change route health twice. Failure needs an
 active attempt of the current owner, so a retired attempt never records a
@@ -5126,8 +5128,8 @@ and every inspection takes that row FOR SHARE before it reads the receipt
 under a fresh READ COMMITTED snapshot. Settlement starts only after the
 uncertain call returned, so its share lock waits until the uncertain
 transaction committed or rolled back, and a missing receipt then means it
-rolled back; a receipt kind with bounded retention (sections 52 and 123) can
-also read absent once it expired. Either way the operation is not retained,
+rolled back; a receipt kind with bounded retention (sections 52, 123 and 218)
+can also read absent once it expired. Either way the operation is not retained,
 and holding the barrier would only wedge the worker while it keeps renewing
 its lease. The caller then publishes the same passive change afresh, under
 the same fences as any first publication, or rederives from durable state:
@@ -5172,10 +5174,10 @@ locks it FOR SHARE before reading the receipt; lock and statement timeouts
 surface as errors, which retain custody; all of them use the single pinned
 primary, and an HTTP or SMTP receiving owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
-still be pending, beyond the bounded sweeps of sections 52, 123 and 216, an
-Email owner's retirement of its own confirmed receipt, and, by another
-instance serving the same account, section 46's receiving sweep (section
-104) and the HTTP families' sweeps (section 217).
+still be pending, beyond the bounded sweeps of sections 52, 123, 216 and
+218, an Email owner's retirement of its own confirmed receipt, and, by
+another instance serving the same account, section 46's receiving sweep
+(section 104) and the HTTP families' sweeps (section 217).
 Any further sweep of attempt, phase, recovery, expiry, HTTP-family or
 receiving receipts must respect that.
 
@@ -7001,9 +7003,12 @@ be treated as a reason to resend mail.
 
 ## 216. Retention of settled submissions
 
-Nothing else removes a submission, so without retention every per-account
-submission, attempt and attempt-receipt cap (1,024 each, and the configured
-`queue_submissions` quota) would be a lifetime limit on sent mail.
+Nothing else removes a submission, so without retention the per-account
+submission caps (1,024 receipts and the configured `queue_submissions`
+quota) would be a lifetime limit on sent mail. Attempts and their receipts
+are also reclaimed independently, at attempt publication (section 218), so
+submissions still retrying or inside retention do not hold the attempt
+caps.
 Submission and cancellation receipts expire a minute after publication on
 their own (section 217), so the deletes below usually find none of them; the
 rest wait for this retention.
@@ -7139,6 +7144,91 @@ capacity inspection must count only live receipts. The HTTP submission
 owner fixture backdates a held operation's committed receipt; while inline
 settlement cannot get a read slot, the next submission is refused rather
 than published, and settlement then still finds the receipt.
+
+## 218. Reclamation of retired attempts
+
+Section 216 retires submissions only a month after completion, so it
+alone would leave the per-account caps on attempts
+(1,024), phase receipts (2,048) and RCPT, command, acceptance, refusal and
+recovery receipts (1,024 each) as lifetime limits: ordinary sending, or a
+few submissions retrying for days, would fill them and refuse every later
+dispatch with Capacity. Attempts are therefore reclaimed on their own.
+
+Fresh and retry attempt publication first calls
+`postgres_attempt_reclamation::reclaim` in the same transaction. One statement
+deletes at most 64 (`RECLAIM_ATTEMPTS`) of the account's retired attempts,
+oldest prepared first: any retired attempt on the publishing route, and
+another route's prepared more than an hour (`RECEIPT_RETENTION_MS`, section
+123) before the locked database time. Active attempts and any attempt holding
+a final reservation stay. It deletes every receipt keyed by those attempts:
+phase, RCPT, command, acceptance, refusal and recovery receipts and their
+route-health failure and success receipts. Submission, cancellation and expiry
+receipts, recipients and submissions stay; attempts are not JMAP objects, so
+no change row is written and the sequence does not advance. Attempt ID lists
+stay in the database, never sent to the client; a reclaimed attempt ID is not
+reserved against reuse (fresh IDs are random). The attempt cap is counted
+afterwards, so an account already full recovers on its next publication, and
+each publication reclaims more than it adds, so a backlog drains. A
+publication refused later rolls its reclaim back.
+
+Lock order is unchanged: configuration selection FOR SHARE and the account
+row FOR UPDATE (`owners::begin`), the route owner fence, route-health
+admission and the busy check, then the reclaim, which locks only this
+account's retired attempt rows, then the sequence, submission and
+recipients.
+
+A deleted receipt reads absent, which section 165 treats as settled; a
+republication then finds the attempt Missing, which the relay's phase,
+recovery and route-health loops treat as done. Reclaiming is therefore safe
+only while nothing pending can still settle against the attempt. Route
+owners are keyed by account and route name, so the publishing owner owns
+every attempt on its route. Its worker publishes only with nothing Pending
+(`Dispatches::publish_with` refuses Busy) and settles phase, recovery and
+route failure or success before its next dispatch, so the route's retired
+attempts have nothing pending at any age. A failed Prepared continuation
+(section 184) can still be inspecting its recovery after generic
+settlement cleared Pending; the relay steps it to completion inline, a
+caller must not publish another attempt before it completes, and its loop
+treats a recovery that finds the attempt Missing as complete. That is
+section 123's argument for
+the route's own health receipts, with the same reliance on a superseded
+owner stopping when its lease renewal fails. Another route's owner may
+still be settling, so its retired attempts keep the hour section 123 gives
+their health receipts, measured from preparation as there: an attempt
+retired late becomes reclaimable sooner, losing at most a passive outcome
+(only committed retirement makes an attempt reclaimable, so an absent
+receipt with a Missing republication always means its effect is
+durable). A final reservation is outcome-unknown custody
+(section 142) and keeps its attempt.
+
+Every other reader of attempt rows reads only active ones (phase and recovery
+publication, active-attempt discovery, route failure, cancellation, queue
+expiry, failure notices and candidate discovery) or reserved ones (final
+capacity); route success reads the retired attempt it just accepted, before
+the next publication. A settled recipient keeps its attempt ID, count, replies
+and uncertainty on its own row, which has no foreign key to the attempt, so
+retry publication, the JMAP projection and failure notices lose nothing.
+Section 216 then finds fewer attempts to delete with a submission. The attempt
+row is also its publication receipt, so a reclaimed attempt's dispatch no
+longer replays; no caller republishes a committed dispatch (each prepares a
+fresh attempt ID, and a Pending one is only inspected).
+
+Residual risks: a settlement on another route that outlives the hour reads
+absent and loses only its passive outcome, as its health receipt already
+does (section 123); capacity inspection counts reclaimable attempts until
+the account's next publication; and the scan reads the account's retired
+attempts without a prepared_at index, which the cap keeps small.
+
+The `real_postgres_submissions_publish_queue_and_retained_outcomes` fixture
+fills an account with 1,024 retired attempts, under a Failed and an
+OutcomeUnknown submission, with every receipt kind, beside a reserved one,
+an active one, another account's and another route's 30 and 61 minutes
+old. While they sit on another route inside the margin, publication refuses
+Capacity; moved to the owner's route, the next publication succeeds,
+removes exactly the 61-minute attempt and the 63 oldest with their
+receipts, keeps the rest and the recipients' rows unchanged, and leaves a
+reclaimed attempt's phase settlement absent and its republication Missing.
+Repeated publications drain the backlog.
 
 ## 8.121 Native ACME state and certificate pairs
 

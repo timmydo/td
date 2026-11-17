@@ -215,7 +215,8 @@ pub(super) fn exercise(
     assert_eq!(outcome.state.failed_at, None);
     assert_eq!(outcome.state.next_at, None);
     assert_eq!(outcome.state.repair_generation, None);
-    // A delayed report for the retired older attempt cannot undo recovery.
+    // A delayed report for the older attempt, which the later publication
+    // reclaimed (POSTGRES.md section 218), cannot undo recovery.
     assert_eq!(
         health::publish(
             request,
@@ -229,7 +230,7 @@ pub(super) fn exercise(
             )
             .unwrap()
         ),
-        Err(Error::Conflict)
+        Err(Error::Missing)
     );
     assert_eq!(
         sql(
