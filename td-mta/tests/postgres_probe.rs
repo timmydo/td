@@ -2315,9 +2315,9 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     assert_eq!(
         sql(
             &fixture,
-            "SELECT count(*),min(revoked_at) FROM td_mta.devices"
+            "SELECT count(*),min(revoked_at)>1000000000000 FROM td_mta.devices"
         ),
-        "1|20"
+        "1|t"
     );
     fixture.stop();
     assert!(devices::check(
@@ -2378,7 +2378,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         Err(devices::Error::Invalid)
     ));
     // Competing independent connections cannot both consume the final slot.
-    sql(&fixture, "INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,254) n");
+    sql(&fixture, "INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,255-(SELECT count(*)::integer FROM td_mta.devices WHERE revoked_at IS NULL)) n");
     let first = devices::prepare_creation(epoch, account, "first", 1).unwrap();
     let second = devices::prepare_creation(epoch, account, "second", 1).unwrap();
     let barrier = std::sync::Barrier::new(2);
@@ -2414,7 +2414,13 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
             .count(),
         1
     );
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "256");
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.devices WHERE revoked_at IS NULL"
+        ),
+        "256"
+    );
 }
 
 #[test]
@@ -2493,9 +2499,9 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     assert_eq!(
         sql(
             &fixture,
-            "SELECT count(*),min(revoked_at) FROM td_mta.devices"
+            "SELECT count(*),min(revoked_at)>1000000000000 FROM td_mta.devices"
         ),
-        "1|2"
+        "1|t"
     );
     sql(&fixture, "DROP TRIGGER delay_device ON td_mta.devices; CREATE FUNCTION public.reject_device() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_device BEFORE INSERT ON td_mta.devices FOR EACH ROW EXECUTE FUNCTION public.reject_device()");
     let rejected = devices::prepare_creation(epoch, account, "rejected", 3).unwrap();
@@ -4630,7 +4636,7 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
             assert!(Instant::now() < stop, "mailbox observation did not reach barrier");
             thread::sleep(Duration::from_millis(5));
         }
-        writeln!(input, "UPDATE td_mta.devices SET revoked_at=4,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex') AND id=decode('{}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex') WHERE id=decode('{account}','hex'); UPDATE td_mta.mailboxes SET name='After snapshot',changed=decode('0000000000000002','hex') WHERE account=decode('{account}','hex'); COMMIT;", admitted.device_id()).unwrap();
+        writeln!(input, "UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex') AND id=decode('{}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex') WHERE id=decode('{account}','hex'); UPDATE td_mta.mailboxes SET name='After snapshot',changed=decode('0000000000000002','hex') WHERE account=decode('{account}','hex'); COMMIT;", admitted.device_id()).unwrap();
         drop(input);
         wait_command(&mut blocker);
         let old = pending.join().unwrap().unwrap();
@@ -5071,7 +5077,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     );
     body::with_email(&request, &trust, deadline(), selected, device.password(), |_, reader| {
         assert_eq!(sql(&fixture, &format!("SELECT pg_try_advisory_lock({}::bigint)", postgres_schema::MIGRATION_KEY)), "f");
-        sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at=4,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex'); UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0"));
+        sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex'); UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0"));
         let mut bytes = [0;100];
         assert_eq!(reader.read_at(0, &mut bytes)?, 100);
         assert_eq!(bytes, [b'A';100]);
@@ -7773,7 +7779,7 @@ fn exercise_http_read(
                 if policy {
                     sql(fixture, "UPDATE td_mta.config_selection SET generation=decode('000000000000ffff','hex') WHERE singleton=true");
                 } else {
-                    sql(fixture, &format!("UPDATE td_mta.devices SET revoked_at=1,revocation_id=decode(repeat('ee',16),'hex'),revocation_digest=decode(repeat('ee',32),'hex') WHERE id=decode('{device}','hex')"));
+                    sql(fixture, &format!("UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=decode(repeat('ee',16),'hex'),revocation_digest=decode(repeat('ee',32),'hex') WHERE id=decode('{device}','hex')"));
                 }
                 input.write_all(b"COMMIT;\n\\q\n").unwrap();
                 input.flush().unwrap();

@@ -1,6 +1,8 @@
 //! Owner-side device preparation. Observations grant no serving authority.
 use crate::{
-    device_credentials::{self, Credential, DevicePassword, Presented, DEVICE_CAPACITY},
+    device_credentials::{
+        self, Credential, DevicePassword, Presented, DEVICE_CAPACITY, DEVICE_RECORDS,
+    },
     ids::{AccountId, DeviceId, DeviceOperationId, StoreEpoch},
     postgres_probe::{self, Request},
     postgres_schema,
@@ -10,7 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::{types::Type, Client};
@@ -28,10 +30,46 @@ pub enum Error {
     Invalid,
     Conflict,
     Capacity,
+    /// The Creation outlived `CREATION_LIFETIME` without a stored receipt.
+    Stale,
     Crypto,
     Database,
     /// Retain the same prepared operation. The original COMMIT may settle later.
     Indeterminate,
+}
+
+/// A revoked device row is deleted once its revocation, stamped by the database
+/// clock, is older than this; no record then holds its credential.
+pub const REVOKED_RETENTION_MS: i64 = 30 * 24 * 3_600_000;
+/// A Creation without a stored receipt is refused once this old. A retired row
+/// was revoked after it was inserted, so its Creation is over 30 days old and
+/// can never be published again.
+pub const CREATION_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+
+/// When a Creation was prepared, on two clocks: the monotonic one misses
+/// suspend and snapshot-restore, which the wall clock counts.
+#[derive(Clone, Copy)]
+struct Clocks {
+    monotonic: Instant,
+    wall: SystemTime,
+}
+impl Clocks {
+    fn now() -> Self {
+        Self {
+            monotonic: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+}
+
+/// Past `CREATION_LIFETIME` on either clock. A wall clock set backwards
+/// leaves the monotonic bound.
+fn stale(prepared: Clocks, now: Clocks) -> bool {
+    now.monotonic.saturating_duration_since(prepared.monotonic) > CREATION_LIFETIME
+        || now
+            .wall
+            .duration_since(prepared.wall)
+            .is_ok_and(|age| age > CREATION_LIFETIME)
 }
 
 /// Retain before publication, including after an uncertain response. The
@@ -44,6 +82,7 @@ pub struct Creation {
     label: String,
     created: i64,
     digest: [u8; 32],
+    prepared: Clocks,
 }
 impl Creation {
     pub fn device_id(&self) -> DeviceId {
@@ -85,6 +124,7 @@ pub fn prepare_creation(
         label: label.into(),
         created,
         digest,
+        prepared: Clocks::now(),
     })
 }
 
@@ -95,7 +135,6 @@ pub struct Revocation {
     account: AccountId,
     device: DeviceId,
     id: DeviceOperationId,
-    revoked: i64,
     digest: [u8; 32],
 }
 impl Revocation {
@@ -128,7 +167,6 @@ pub fn prepare_revocation(
         account,
         device,
         id,
-        revoked,
         digest,
     })
 }
@@ -148,6 +186,7 @@ struct CreationRow {
     label: String,
     created: i64,
     digest: [u8; 32],
+    stale: bool,
 }
 enum Action {
     Create(CreationRow),
@@ -171,6 +210,7 @@ pub fn publish_creation(
         label: creation.label.clone(),
         created: creation.created,
         digest: creation.digest,
+        stale: stale(creation.prepared, Clocks::now()),
     };
     mutate(
         request,
@@ -209,7 +249,8 @@ fn mutate(
 ) -> Result<RevocationOutcome, Error> {
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    // Retirement and the record counts outgrow the ordinary 128-frame budget.
+    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             begin(client, epoch).await?;
             // Every device writer takes the account fence before device rows.
@@ -278,19 +319,32 @@ async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result
         }
         return Ok(Change::Known(RevocationOutcome::Recorded));
     }
-    let limit = i64::try_from(DEVICE_CAPACITY.checked_add(1).ok_or(Error::Capacity)?)
+    if row.stale {
+        return Err(Error::Stale);
+    }
+    // Rows are bounded by DEVICE_RECORDS, so this deletes at most that many.
+    client
+        .execute(
+            "DELETE FROM td_mta.devices WHERE account=$1 AND revoked_at<(extract(epoch FROM clock_timestamp())*1000)::bigint-$2::bigint",
+            &[&account.as_bytes().as_slice(), &REVOKED_RETENTION_MS],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let limit = i64::try_from(DEVICE_RECORDS.checked_add(1).ok_or(Error::Capacity)?)
         .map_err(|_| Error::Capacity)?;
-    let count: i64 = client
+    // Active rows are a subset of the bounded scan, exact whenever it is not full.
+    let counts = client
         .query_one(
-            "SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 LIMIT $2) bounded",
+            "SELECT count(*) FILTER (WHERE revoked_at IS NULL),count(*) FROM (SELECT revoked_at FROM td_mta.devices WHERE account=$1 LIMIT $2) bounded",
             &[&account.as_bytes().as_slice(), &limit],
         )
         .await
-        .map_err(|_| Error::Database)?
-        .try_get(0)
-        .map_err(|_| Error::Invalid)?;
-    if count < 0 || usize::try_from(count).map_err(|_| Error::Invalid)? >= DEVICE_CAPACITY {
-        return Err(Error::Capacity);
+        .map_err(|_| Error::Database)?;
+    for (column, cap) in [(0, DEVICE_CAPACITY), (1, DEVICE_RECORDS)] {
+        let count: i64 = counts.try_get(column).map_err(|_| Error::Invalid)?;
+        if usize::try_from(count).map_err(|_| Error::Invalid)? >= cap {
+            return Err(Error::Capacity);
+        }
     }
     let written = client.execute("INSERT INTO td_mta.devices (account,id,salt,verifier,label,created_at,creation_digest) VALUES ($1,$2,$3,$4,$5,$6,$7)",
         &[&account.as_bytes().as_slice(), &row.id.as_bytes().as_slice(), &row.salt.as_slice(),
@@ -332,9 +386,11 @@ async fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error>
     if revoked.is_some() {
         return Ok(Change::Known(RevocationOutcome::AlreadyRevoked));
     }
-    let written = client.execute("UPDATE td_mta.devices SET revoked_at=$3,revocation_id=$4,revocation_digest=$5 WHERE account=$1 AND id=$2 AND revoked_at IS NULL",
+    // The database clock, not the requester's, dates the revocation: retention
+    // counts from it.
+    let written = client.execute("UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=$3,revocation_digest=$4 WHERE account=$1 AND id=$2 AND revoked_at IS NULL",
         &[&operation.account.as_bytes().as_slice(), &operation.device.as_bytes().as_slice(),
-        &operation.revoked, &operation.id.as_bytes().as_slice(), &operation.digest.as_slice()])
+        &operation.id.as_bytes().as_slice(), &operation.digest.as_slice()])
         .await.map_err(|_| Error::Database)?;
     if written != 1 {
         return Err(Error::Invalid);
@@ -405,4 +461,34 @@ fn hash(parts: &[&[u8]]) -> Result<[u8; 32], Error> {
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     hash.finish().map_err(|_| Error::Crypto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn creations_go_stale_after_their_lifetime_on_either_clock() {
+        let prepared = Clocks::now();
+        let after = |monotonic: Duration, wall: Duration| Clocks {
+            monotonic: prepared.monotonic + monotonic,
+            wall: prepared.wall + wall,
+        };
+        let over = CREATION_LIFETIME + Duration::from_millis(1);
+        let zero = Duration::ZERO;
+        assert!(!stale(prepared, prepared));
+        assert!(!stale(
+            prepared,
+            after(CREATION_LIFETIME, CREATION_LIFETIME)
+        ));
+        assert!(stale(prepared, after(over, zero)));
+        // Suspend or snapshot-restore: only the wall clock moved on.
+        assert!(stale(prepared, after(zero, over)));
+        // A wall clock set backwards, or an earlier sample, stays fresh.
+        let earlier = Clocks {
+            monotonic: prepared.monotonic,
+            wall: prepared.wall - Duration::from_secs(3600),
+        };
+        assert!(!stale(prepared, earlier));
+        assert!(!stale(after(Duration::from_secs(1), zero), prepared));
+    }
 }

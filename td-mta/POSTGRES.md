@@ -1040,21 +1040,40 @@ verifier enters SQL. The device ID is the creation operation identity;
 its digest binds the epoch, account and complete creation request. An
 existing matching receipt confirms the original creation without another
 write, including if the device has since been revoked. A mismatched digest
-refuses. Creation retains the existing 256-device account ceiling, including
-revoked records. There is no delete/reuse API. Labels retain the existing
-UTF-8 byte/control-character rules. Audit timestamps are nonnegative signed
+refuses. Without such a receipt, a Creation more than 24 hours old on its
+process's monotonic or wall clock refuses as `Stale` (CLI:
+`stale-device-creation`); the wall clock counts suspend and
+snapshot-restore, which the monotonic one misses. Creation admits at most
+256 unrevoked devices and 320 device records per account. It first deletes
+records revoked more than 30 days ago by the database clock. A deleted
+record was revoked after it was inserted, so its Creation is over 30 days
+old and refuses. This assumes the database clock does not jump forward 29
+days while a process holds a Creation whose own clocks both stand still.
+The CLI holds one for seconds and never republishes after a possible
+COMMIT. No record then holds the credential, so it cannot authenticate,
+and revoking it reports the device missing. A revocation is listed for at
+least 30 days, until the account's next creation after that. The first
+creation after this rule took effect also deletes every record whose
+earlier, client-dated revocation is that old, and a record with a
+future-dated one stays until 30 days past that date; save a `device-list`
+first if they matter. With 256 unrevoked devices and 64 revocations inside
+30 days, creation refuses until the oldest of those revocations retires.
+There is no other delete or ID reuse. Labels retain the existing UTF-8
+byte/control-character rules. Audit timestamps are nonnegative signed
 64-bit UTC milliseconds; timestamp overflow refuses before database work.
 
 Prepare Revocation once with a random operation ID and a digest binding the
 epoch, account, device, operation and requested timestamp. First revocation
-stores that receipt with the revoked timestamp. The same operation confirms
-Recorded; conflicting reuse refuses. A different operation observing an
-already revoked device returns AlreadyRevoked without writing or replacing
-the original receipt. Revocation operation IDs are unique within an account. Neither
-preparation API contacts a database, and retained values do not implement
-on-disk recovery for an operator command. A lost process must not invent a
-replacement creation to resolve missing output; later administration must
-inspect/revoke an undisclosed credential instead.
+stores that receipt and dates it by the database clock, not the requested
+timestamp, so retention counts from a time no client chose. The same
+operation confirms Recorded; conflicting reuse refuses. A different
+operation observing an already revoked device returns AlreadyRevoked without
+writing or replacing the original receipt. Revocation operation IDs are
+unique within an account. Neither preparation API contacts a database, and
+retained values do not implement on-disk recovery for an operator command. A
+lost process must not invent a replacement creation to resolve missing
+output; later administration must inspect/revoke an undisclosed credential
+instead.
 
 Every writer takes the shared session migration lock and validates primary,
 schema and expected epoch. It explicitly begins a read-committed,
@@ -1072,13 +1091,16 @@ No account lock spans peer I/O, and this module admits no mail operation.
 A possible COMMIT handoff followed by connection/deadline failure returns
 Indeterminate. Retain the original prepared value. Repeating it takes the
 same account lock and resolves its durable receipt, so it cannot race an
-unsettled original into a duplicate or replace a revoked credential. A
-definite failure of a retry does not settle the original uncertainty;
-retain that unresolved status until its receipt is observed. A
-known receipt is success even if the final local poll crosses the deadline.
-Receipts live with the bounded, undeleted device records; no shorter receipt
-expiry permits identity reuse. Account/schema restoration still requires a
-fresh epoch under the deployment-wide recovery barrier.
+unsettled original into a duplicate or replace a revoked credential. After a
+revoked record retires, repeating its Creation refuses as Stale and its
+Revocation as missing; neither writes. A definite failure of a retry does
+not settle the original uncertainty; retain that unresolved status until its
+receipt is observed. A known receipt is success even if the final local poll
+crosses the deadline. Receipts live with their device records and retire
+with them, 30 days after revocation; device and operation IDs are random
+128-bit values, and the Creation lifetime above keeps a retired credential
+from returning. Account/schema restoration still requires a fresh epoch
+under the deployment-wide recovery barrier.
 
 check uses one fresh read-only repeatable-read primary snapshot and current
 revocation state, preserving dummy verifier work for unknown IDs. It closes
@@ -1087,10 +1109,12 @@ later mail read or write, and is never a credential cache. Future serving
 admission must perform credential/policy checks inside the same retained
 snapshot or publication transaction as its mail operation. A malformed token
 can be denied without database access; database failures never authenticate.
-Read snapshots also set the ten-second idle-transaction timeout.
-All operations retain the ten-second worker, statement/lock deadlines and
-128-frame/1 MiB input bounds. Provider errors and secret values remain
-redacted.
+Read snapshots also set the ten-second idle-transaction timeout. All
+operations retain the ten-second worker and statement/lock deadlines. Reads
+keep the 128-frame/1 MiB input bound; creation and revocation use the
+mutation connection's 1088-frame/1 MiB input and 128 KiB output bounds,
+since retirement and the record counts outgrow 128 frames. Provider errors
+and secret values remain redacted.
 
 ## 22. Selected-profile database material adapter
 
@@ -6176,8 +6200,10 @@ write fence is taken and no mail sequence, credential or receipt is changed.
 
 The query selects only ID, label, creation time and revocation time, ordered
 by ID. It never requests passwords, salts, verifiers or request digests.
-At most 257 rows are fetched so a registry exceeding the existing 256-device
-ceiling is refused without a truncated success. IDs, labels and nonnegative
+At most 321 rows are fetched so a registry exceeding the 320-record ceiling
+(section 21: 256 unrevoked devices plus revoked records awaiting retirement)
+is refused without a truncated success. Retired records are no longer
+listed. IDs, labels and nonnegative
 timestamps are validated before any result is returned. The returned public
 metadata is historical and cannot authorize authentication or a mail operation.
 
@@ -6226,8 +6252,9 @@ A possible COMMIT without a known response reports the fixed error
 operator can inspect the named device with `device-list`; absence of a
 revocation in a snapshot does not settle an outstanding COMMIT. A later
 explicit revoke of that same device is safe: the account fence serializes
-with the original operation and either records a revocation or observes
-the retained prior one. It cannot identify the original operation's receipt
+with the original operation and either records a revocation, observes
+the retained prior one, or, 30 days after a revocation, reports the
+retired device missing. It cannot identify the original operation's receipt
 and never creates a replacement credential. Process loss has no automatic
 retry or on-disk operation recovery. No creation command is introduced.
 
@@ -6239,7 +6266,8 @@ The protected connection input, fresh DNS, TLS/SCRAM, ten-second worker and
 expected epoch rules match other explicit preparation commands. The label
 retains the registry's 128-byte UTF-8 limit and control-character refusal.
 The command takes checked UTC milliseconds and prepares one Creation before
-address attempts. The existing 256-record ceiling includes revoked devices.
+address attempts. Section 21's 256-unrevoked and 320-record ceilings and
+retirement of old revoked records apply.
 
 Only confirmed creation success prints the password, once, in the local JSON
 receipt together with its public device identity. The guarded password is

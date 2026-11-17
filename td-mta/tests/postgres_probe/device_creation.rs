@@ -188,14 +188,86 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         ),
         sequence
     );
-    sql(&fixture,"INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,256-(SELECT count(*)::integer FROM td_mta.devices)) n");
+    // Fill to the 256 unrevoked devices; earlier revocations do not count.
+    let count = |fixture: &Fixture, filter: &str| -> usize {
+        sql(
+            fixture,
+            &format!("SELECT count(*) FROM td_mta.devices{filter}"),
+        )
+        .parse()
+        .unwrap()
+    };
+    let listed = |fixture: &Fixture| {
+        devices::list(&fixture.request(), &trust, deadline(), epoch, account)
+            .unwrap()
+            .len()
+    };
+    sql(&fixture,"INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,256-(SELECT count(*)::integer FROM td_mta.devices WHERE revoked_at IS NULL)) n");
+    assert_eq!(count(&fixture, " WHERE revoked_at IS NULL"), 256);
     let full = invoke(epoch, account, "full", 1);
     assert!(full.contains("device-capacity"));
     assert!(!full.contains("password"));
+    assert_eq!(listed(&fixture), count(&fixture, ""));
+
+    // Revoked devices free their unrevoked slots.
+    const NOW: &str = "(extract(epoch FROM clock_timestamp())*1000)::bigint";
+    sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at={NOW},revocation_id=id,revocation_digest=decode(repeat('00',32),'hex') WHERE label='fixture'"));
+    assert!(invoke(epoch, account, "after revocation", 0).contains("password"));
+    // Revoked records awaiting retirement still count against 320.
+    sql(&fixture, &format!("INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest,revoked_at,revocation_id,revocation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex'),{NOW},decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex') FROM generate_series(4096,4096+319-(SELECT count(*)::integer FROM td_mta.devices)) n"));
+    assert_eq!(count(&fixture, ""), 320);
+    assert_eq!(listed(&fixture), 320);
+    assert!(invoke(epoch, account, "records", 1).contains("device-capacity"));
+    // Records revoked over 30 days ago by the database clock retire at the
+    // next creation; a recent revocation stays however old its creation.
+    sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at={NOW}-{}-1 WHERE label='fixture' AND id<>decode(lpad(to_hex(4096),32,'0'),'hex')", devices::REVOKED_RETENTION_MS));
+    assert!(invoke(epoch, account, "after retirement", 0).contains("password"));
+    assert_eq!(count(&fixture, " WHERE label='fixture'"), 1);
+    assert_eq!(listed(&fixture), count(&fixture, ""));
+
+    // A revocation records the database's time, whatever was requested; a
+    // retired credential stays unusable and cannot be revoked again.
+    let retired = devices::prepare_creation(epoch, account, "retired", 1).unwrap();
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &retired).unwrap();
+    let check = |password: &[u8]| {
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            password,
+        )
+    };
+    assert_eq!(check(retired.password()), Ok(Some(retired.device_id())));
+    let revoke = devices::prepare_revocation(epoch, account, retired.device_id(), 2).unwrap();
     assert_eq!(
-        devices::list(&fixture.request(), &trust, deadline(), epoch, account)
-            .unwrap()
-            .len(),
-        256
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        Ok(devices::RevocationOutcome::Recorded)
+    );
+    let id = format!("decode('{}','hex')", retired.device_id());
+    assert_eq!(
+        sql(
+            &fixture,
+            &format!("SELECT abs(revoked_at-{NOW})<600000 FROM td_mta.devices WHERE id={id}")
+        ),
+        "t"
+    );
+    assert_eq!(check(retired.password()), Ok(None));
+    sql(
+        &fixture,
+        &format!(
+            "UPDATE td_mta.devices SET revoked_at=revoked_at-{}-1 WHERE id={id}",
+            devices::REVOKED_RETENTION_MS
+        ),
+    );
+    let later = devices::prepare_creation(epoch, account, "later", 1).unwrap();
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &later).unwrap();
+    assert_eq!(count(&fixture, &format!(" WHERE id={id}")), 0);
+    assert_eq!(check(retired.password()), Ok(None));
+    let again = devices::prepare_revocation(epoch, account, retired.device_id(), 3).unwrap();
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &again),
+        Err(devices::Error::Missing)
     );
 }

@@ -1,7 +1,7 @@
 //! Bounded historical device metadata for explicit administration.
 use super::{
     device_credentials, postgres_probe, postgres_schema, AccountId, DeviceId, Error, Request,
-    StoreEpoch, TrustStore, DEVICE_CAPACITY,
+    StoreEpoch, TrustStore, DEVICE_RECORDS,
 };
 use std::time::Instant;
 
@@ -35,11 +35,11 @@ pub fn list(
                 .await.map_err(|_| Error::Database)?.is_empty() {
                 return Err(Error::Missing);
             }
-            let limit = i64::try_from(DEVICE_CAPACITY.checked_add(1).ok_or(Error::Capacity)?)
+            let limit = i64::try_from(DEVICE_RECORDS.checked_add(1).ok_or(Error::Capacity)?)
                 .map_err(|_| Error::Capacity)?;
             let rows = client.query("SELECT id,label,created_at,revoked_at FROM td_mta.devices WHERE account=$1 ORDER BY id LIMIT $2",
                 &[&account.as_bytes().as_slice(), &limit]).await.map_err(|_| Error::Database)?;
-            if rows.len() > DEVICE_CAPACITY {
+            if rows.len() > DEVICE_RECORDS {
                 return Err(Error::Capacity);
             }
             let mut devices = Vec::new();

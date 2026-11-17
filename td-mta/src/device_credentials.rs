@@ -3,7 +3,10 @@ use crate::ids::{AccountId, DeviceId};
 use std::io;
 use td_crypto::{Crypto, Digest, Entropy, Provider};
 
+/// Unrevoked devices per account.
 pub const DEVICE_CAPACITY: usize = 256;
+/// Device rows per account, revoked ones awaiting retirement included.
+pub const DEVICE_RECORDS: usize = 320;
 pub const DEVICE_LABEL_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

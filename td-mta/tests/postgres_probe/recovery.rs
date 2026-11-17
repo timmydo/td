@@ -120,7 +120,7 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
     )
     .unwrap();
     assert_eq!(release(plan), Err(Error::ActiveCredentials));
-    sql(&fixture,"UPDATE td_mta.devices SET revoked_at=1,revocation_id=decode(repeat('99',16),'hex'),revocation_digest=decode(repeat('88',32),'hex')");
+    sql(&fixture,"UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=decode(repeat('99',16),'hex'),revocation_digest=decode(repeat('88',32),'hex')");
     assert_eq!(
         release(Plan {
             maximum_rows: 1,

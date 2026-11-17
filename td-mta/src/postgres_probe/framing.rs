@@ -38,7 +38,7 @@ impl Input {
 
     pub(super) fn capacity() -> Self {
         Self {
-            // 16 accounts x 23 count queries x ~10 frames each, plus about
+            // 16 accounts x 24 count queries x ~10 frames each, plus about
             // 150 for connection, schema and global queries: ~3,830.
             frames: 6144,
             ..Self::new()

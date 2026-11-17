@@ -4364,10 +4364,13 @@ The existing confirmed clock guard, spacing and 100-recipient transaction
 limit remain mandatory; this admission layer neither confirms the clock nor
 allocates an unbounded queue of expiry operations.
 
-Administrative PostgreSQL device listing fetches at most 257 rows and returns
-at most the existing 256-device account ceiling, including revoked records.
-Only ID, label and two timestamps are selected; the 128-byte label bound makes
-the command's complete escaped JSON output less than 128 KiB. Overflow and
+Administrative PostgreSQL device listing fetches at most 321 rows and returns
+at most the 320-record account ceiling, including revoked records awaiting
+retirement. Its connection spends about 100 frames on setup, one per
+schema migration among them, and one per row, so a full listing leaves
+about 90 of the 512-frame bound below. Only ID, label and two timestamps
+are selected; the 128-byte label bound makes the command's complete
+escaped JSON output less than 128 KiB. Overflow and
 invalid metadata return no partial listing. One mailbox-profile connection
 caps input at one MiB, output at 64 KiB and frames at 512 in Preparation mode
 (1024 in Runtime mode). The original deadline remains capped at ten seconds;

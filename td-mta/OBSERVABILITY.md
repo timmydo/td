@@ -604,10 +604,12 @@ credentials. Durable usage counters are observed without an integrity audit.
 Account tables are counted only through their ceiling plus one; reserved
 final-result claims are included in each affected receipt table's occupancy.
 Receiving, route-owner, HTTP write and submission expiry receipts count only
-those inside their retention; expired rows await the account's next
-publication of their kind and refuse nothing (POSTGRES.md sections 46, 52, 120
-and 217). Connection usage includes this inspection and other client backends;
-its ceiling excludes reserved slots. Configured protocol, disk/work and
+those inside their retention, and device records only unrevoked ones or
+revocations inside 30 days; expired rows await the account's next
+publication of their kind and refuse nothing (POSTGRES.md sections 21, 46,
+52, 120 and 217). `active_devices` counts unrevoked devices against 256.
+Connection usage includes this inspection and other client backends; its
+ceiling excludes reserved slots. Configured protocol, disk/work and
 concurrency limits have null usage when no live gauge exists. Memory
 reservations are distinct from measured memory. The host notification helper
 renders the report and can alert through external SMTP as specified in

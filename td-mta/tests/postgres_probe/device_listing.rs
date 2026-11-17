@@ -149,14 +149,22 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     assert!(!refused.contains("not-for-output"));
     let revoked = devices::prepare_revocation(epoch, account, creation.device_id(), 20).unwrap();
     devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoked).unwrap();
+    // The database dates the revocation; the requested 20 stays in its digest.
+    let listed = list(account).unwrap();
+    let revoked_at = listed[0].revoked_at.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(revoked_at.abs_diff(now) < 600_000, "{revoked_at}");
     assert_eq!(
-        list(account).unwrap(),
+        listed,
         vec![devices::DeviceSummary {
-            revoked_at: Some(20),
+            revoked_at: Some(revoked_at),
             ..expected
         }]
     );
-    assert!(invoke(&epoch_text, 0).contains("\"revoked_at\":20"));
+    assert!(invoke(&epoch_text, 0).contains(&format!("\"revoked_at\":{revoked_at}")));
     sql(
         &fixture,
         "UPDATE td_mta.devices SET label=E'invalid\\nlabel'",
@@ -164,9 +172,9 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     assert_eq!(list(account), Err(devices::Error::Invalid));
     assert!(invoke(&epoch_text, 1).contains("invalid-device-metadata"));
     sql(&fixture, "UPDATE td_mta.devices SET label='restored'");
-    sql(&fixture,"INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,255) n");
+    sql(&fixture,"INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,319) n");
     let full = list(account).unwrap();
-    assert_eq!(full.len(), 256);
+    assert_eq!(full.len(), 320);
     assert!(full
         .windows(2)
         .all(|rows| rows[0].id.as_bytes() < rows[1].id.as_bytes()));

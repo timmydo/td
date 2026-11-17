@@ -273,6 +273,11 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             ),
             (
                 "devices",
+                crate::device_credentials::DEVICE_RECORDS as u64,
+                false,
+            ),
+            (
+                "active_devices",
                 crate::device_credentials::DEVICE_CAPACITY as u64,
                 false,
             ),
@@ -297,6 +302,13 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             ("submission_expiry_receipts", 1024, true),
         ] {
             let used = match table {
+                "active_devices" => {
+                    let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
+                    let row = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND revoked_at IS NULL LIMIT $2) bounded", &[&id, &n]).await.map_err(|_| ())?;
+                    let value: i64 = row.try_get(0).map_err(|_| ())?;
+                    u64::try_from(value).map_err(|_| ())?
+                }
+                "devices" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND (revoked_at IS NULL OR revoked_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2) LIMIT $3) bounded", crate::postgres_devices::REVOKED_RETENTION_MS, cap).await?,
                 "receiving_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 AND created_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_receiving::RECEIPT_RETENTION_MS, cap).await?,
                 "submission_expiry_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_queue_expiry::RECEIPT_RETENTION_MS, cap).await?,
                 "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap).await?,

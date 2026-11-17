@@ -122,7 +122,7 @@ pub(crate) fn with_client<T>(
 }
 
 // Capacity observation: schema ledger plus at most 16 accounts, each with
-// twenty-three bounded count queries, and global counters. No body contents.
+// twenty-four bounded count queries, and global counters. No body contents.
 pub(crate) fn with_capacity_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,

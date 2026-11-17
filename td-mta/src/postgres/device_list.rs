@@ -82,6 +82,7 @@ fn classify(error: Error) -> AttemptError {
         Error::Missing => "account-not-found",
         Error::Invalid => "invalid-device-metadata",
         Error::Capacity => "device-capacity",
+        Error::Stale => "stale-device-creation",
         Error::Database => "query-failed",
         Error::Conflict => "conflict",
         Error::Crypto => "crypto",
