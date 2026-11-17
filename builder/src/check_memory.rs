@@ -222,6 +222,27 @@ impl TokenPool {
         leave_free: usize,
         aborted: &dyn Fn() -> bool,
     ) -> Result<MemoryPermit, String> {
+        loop {
+            if let Some(permit) = self.admit(minimum, tokens, leave_free, aborted)? {
+                return Ok(permit);
+            }
+            if aborted() {
+                return Err("memory grant cancelled before admission".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// One admission: `minimum` to `tokens` tokens, leaving `leave_free`,
+    /// or None when the tokens are short or memory is under pressure. It
+    /// waits out only the short admission lock.
+    fn admit(
+        &self,
+        minimum: usize,
+        tokens: usize,
+        leave_free: usize,
+        aborted: &dyn Fn() -> bool,
+    ) -> Result<Option<MemoryPermit>, String> {
         if minimum == 0 || minimum > tokens || tokens.saturating_add(leave_free) > self.count {
             return Err(format!(
                 "memory grant asks for {tokens} token(s) plus {leave_free} reserved from a {}-token pool",
@@ -279,17 +300,12 @@ impl TokenPool {
                 .unwrap_or(true);
             if held.len() >= minimum && pressure_ok {
                 drop(admission);
-                return Ok(MemoryPermit {
+                return Ok(Some(MemoryPermit {
                     _files: held,
                     bytes: requested_bytes,
-                });
+                }));
             }
-            drop(held);
-            drop(admission);
-            if aborted() {
-                return Err("memory grant cancelled before admission".to_string());
-            }
-            std::thread::sleep(Duration::from_millis(200));
+            return Ok(None);
         }
     }
 }
@@ -332,6 +348,17 @@ fn plan_grant_tokens(count: usize, base: usize, cpus: usize) -> usize {
 pub fn borrow_permit(tokens: usize, aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
     let pool = TokenPool::from_env()?;
     pool.acquire(tokens, borrow_reserve()?, aborted)
+}
+
+/// `tokens` beyond what this hosted request holds, all or none, from tokens
+/// nothing holds now, leaving what `borrow_permit` leaves; it waits only
+/// for the short admission lock, never for tokens. None outside the check
+/// host, when that many are not free, or under memory pressure. Each lane
+/// of a hosted cargo preflight phase beyond its first takes one.
+pub fn borrow_spare(tokens: usize) -> Option<MemoryPermit> {
+    let pool = TokenPool::from_env().ok()?;
+    pool.admit(tokens, tokens, borrow_reserve().ok()?, &|| false)
+        .ok()?
 }
 
 /// The tokens a borrower leaves free: one base grant and one gate grant.
@@ -851,6 +878,52 @@ mod tests {
         drop(peer);
         let wide = pool.acquire_range(2, 3, 0, &|| true).unwrap();
         assert_eq!(wide.bytes(), 3 * TOKEN_BYTES);
+    }
+
+    /// What a hosted cargo lane borrows: its share from what is free now
+    /// beyond the reserve, at once, or nothing rather than a wait.
+    #[test]
+    fn a_spare_borrow_takes_what_is_free_and_never_waits() {
+        let temp = crate::test_temp::TempDir::new("td-spare-memory").unwrap();
+        let budget = HostBudget {
+            work_bytes: 6 * TOKEN_BYTES,
+            reserve_bytes: 0,
+            token_count: 6,
+            base_tokens: 1,
+            gate_tokens: 2,
+        };
+        let pool = TokenPool::create(&temp, &budget).unwrap();
+        // A grant this test expects may wait out a sibling test's fork,
+        // which briefly shares the locks of a probe this test refused.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let late = || std::time::Instant::now() > deadline;
+        let mine = pool.acquire(1, 2, &late).unwrap();
+        // Six, less the request's one and a base and gate grant reserved,
+        // leave two: a lane of two is lent, then nothing more, and a lane
+        // of three is refused whole.
+        let lend = |tokens: usize, reserve: usize| loop {
+            if let Some(permit) = pool.admit(tokens, tokens, reserve, &late).unwrap() {
+                break permit;
+            }
+            assert!(!late(), "{tokens} token(s) were never lent");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let spare = lend(2, 3);
+        assert_eq!(spare.bytes(), 2 * TOKEN_BYTES);
+        assert!(pool.admit(1, 1, 3, &|| true).unwrap().is_none());
+        drop(spare);
+        assert!(pool.admit(3, 3, 3, &|| true).unwrap().is_none());
+        let spare = pool.acquire(2, 3, &late).unwrap();
+        assert!(
+            pool.admit(4, 4, 3, &|| true).is_err(),
+            "more than the pool can lend"
+        );
+        // The reserve still admits another worktree's request and its gate.
+        let other = pool.acquire(1, 2, &late).unwrap();
+        let gate = pool.acquire(2, 0, &late).unwrap();
+        drop((gate, other, spare, mine));
+        let freed = pool.acquire(4, 2, &late).unwrap();
+        assert_eq!(freed.bytes(), 4 * TOKEN_BYTES);
     }
 
     #[test]

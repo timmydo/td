@@ -174,6 +174,24 @@ symbol names, which the loader never reads, so they share passes;
 builders built from different sources do not.
 Commands are journaled with this td-builder's path spelled `td-builder`.
 
+The preflights run as cargo groups, one per crate and one for the
+workspace, up to a quarter of the CPUs (at most four) at a time. Hosted,
+the request's base grant pays for one lane, with as many build jobs as
+it pays for at 2 GiB a job (and no more than the CPUs over the lanes);
+each further lane borrows that lane's tokens, all or none and without
+waiting, from those no request holds beyond one base and one gate grant,
+and none under memory pressure. When the pool lends too little to beat
+the base grant split between lanes at a job each, the run takes that
+split. Each lane that finds no group left returns one borrowed grant, so
+the lanes still running hold what they need beyond the base. Groups a
+journaled pass answers in full take no lane. Nothing polices a lane's
+memory but each test binary's cap (below) and the host's emergency
+reserve. Groups start longest first, by each command's newest recorded
+wall time on this host (the journal's `durations` key, read and kept
+under the run's hold, which decides no verdict), a group holding a
+command with no record before every other and one a pass answers
+counting as free.
+
 The journal lives outside `~/.td/build-daemon`, which build sandboxes bind
 writable; without a HOME nothing is shared. Cargo tests run unsandboxed
 as the user, so any branch's test code could write a pass every worktree

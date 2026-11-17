@@ -3611,11 +3611,12 @@ fn cargo_group_key(cmd: &str) -> Option<String> {
 /// pass is recorded only on unchanged content, and TD_CHECK_FULL runs every
 /// one.
 fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
-    run_cargo_groups_with(
+    run_cargo_groups_on(
         root,
         cmds,
         std::env::var_os("TD_CHECK_FULL").is_none(),
         preflight_verdicts_dir().as_deref(),
+        crate::check_memory::request_job_budget(),
     )
 }
 
@@ -3658,10 +3659,85 @@ fn git_object_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The host-wide journal key a run's commands' wall times are kept under,
+/// as `SECONDS\tCOMMAND` lines, beside the toolchain-keyed passes (whose
+/// keys are digests). They order a run's starts and decide nothing, so
+/// they are not keyed by toolchain or content.
+const DURATIONS_KEY: &str = "durations";
+
+/// Bytes the durations file is trimmed to once it holds twice this.
+const DURATIONS_BYTES: u64 = 256 << 10;
+
+/// A durations line.
+fn duration_line(secs: u64, cmd: &str) -> String {
+    format!("{secs}\t{cmd}")
+}
+
+/// `cmd`'s newest recorded wall time in `lines`, oldest first, in seconds.
+fn recorded_duration(lines: &[String], cmd: &str) -> Option<u64> {
+    lines.iter().rev().find_map(|line| {
+        let (secs, recorded) = line.split_once('\t')?;
+        if recorded == cmd {
+            secs.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// The order groups start in, as (expected seconds, group) pairs: longest
+/// first, a group holding a command with no recorded time before every
+/// other, ties in table order. A group is expected to take the sum of its
+/// commands' times.
+fn start_order(
+    groups: &[(Option<String>, Vec<String>)],
+    took: &dyn Fn(&str) -> Option<u64>,
+) -> Vec<(u64, usize)> {
+    let mut order: Vec<(u64, usize)> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, (_, list))| {
+            let total = list
+                .iter()
+                .try_fold(0u64, |sum, cmd| Some(sum.saturating_add(took(cmd)?)));
+            (total.unwrap_or(u64::MAX), i)
+        })
+        .collect();
+    order.sort_unstable_by_key(|&(total, i)| (std::cmp::Reverse(total), i));
+    order
+}
+
+/// A hosted run's lanes: (width, build jobs per lane, memory tokens a lane
+/// beyond the first borrows). The request's base grant pays for the first
+/// lane, so a lane takes no more jobs than that grant pays for, and the
+/// lanes together no more than the CPUs.
+fn hosted_lanes(groups: usize, cpus: usize, base: u64) -> (usize, usize, usize) {
+    use crate::check_memory::{jobs_for_budget, BUILD_JOB_TOKEN_BYTES, TOKEN_BYTES};
+    let width = cargo_group_width(groups, cpus);
+    let jobs = jobs_for_budget(base, cpus).min((cpus / width.max(1)).max(1));
+    let per_job = usize::try_from(BUILD_JOB_TOKEN_BYTES / TOKEN_BYTES).unwrap_or(usize::MAX);
+    (width, jobs, jobs.saturating_mul(per_job))
+}
+
 /// `run_cargo_groups`, with whether a journaled pass may answer a command,
 /// and where the host-wide journal is, given rather than read from the
-/// environment.
+/// environment; it plans as a run outside the check host does.
+#[cfg(test)]
 fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool, shared: Option<&Path>) -> i32 {
+    run_cargo_groups_on(root, cmds, reuse, shared, None)
+}
+
+/// `run_cargo_groups_with`, and the hosted request's base grant in bytes,
+/// when it has one: its lanes beyond the first then borrow their own
+/// memory tokens (`hosted_lanes`), each returned as its lane runs out of
+/// groups, so a run's tail holds only what it still uses.
+fn run_cargo_groups_on(
+    root: &Path,
+    cmds: &[String],
+    reuse: bool,
+    shared: Option<&Path>,
+    base: Option<u64>,
+) -> i32 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
     // Held to the end of the run, in this worktree only, so a second run
@@ -3731,114 +3807,187 @@ fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool, shared: Opti
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|j| *j > 0);
-    let (width, jobs) = cargo_group_plan(groups.len(), cpus, caller);
-    let jobs = jobs.to_string();
+    // A group a journaled pass answers in full needs no lane.
+    let to_run = groups
+        .iter()
+        .filter(|(_, list)| {
+            list.iter()
+                .any(|cmd| !(reuse && vouchers.contains_key(&canon(cmd))))
+        })
+        .count();
+    // Hosted, the base grant pays for the first lane and each further one
+    // borrows its share without waiting, leaving a base and a gate grant
+    // free. When the pool lends too little to beat the base grant split
+    // between lanes, as every hosted run did before, that split it is.
+    let mut lane_grants: [Option<crate::check_memory::MemoryPermit>; MAX_CARGO_GROUPS] =
+        Default::default();
+    let mut borrowed = 0;
+    let (width, jobs) = match base {
+        Some(base) => {
+            let (lanes, jobs, tokens) = hosted_lanes(to_run.max(1), cpus, base);
+            for grant in lane_grants.iter_mut().take(lanes).skip(1) {
+                *grant = crate::check_memory::borrow_spare(tokens);
+                if grant.is_none() {
+                    break;
+                }
+                borrowed += 1;
+            }
+            let floor = cargo_group_plan(
+                to_run.max(1),
+                cpus,
+                Some(crate::check_memory::jobs_for_budget(base, cpus)),
+            );
+            if borrowed + 1 < floor.0 {
+                lane_grants = Default::default();
+                borrowed = 0;
+                floor
+            } else {
+                (borrowed + 1, jobs)
+            }
+        }
+        None => cargo_group_plan(groups.len(), cpus, caller),
+    };
     if groups.len() > 1 {
-        println!(
-            "affected-checks: {} cargo groups, {width} at a time, {jobs} build job(s) each{}",
-            groups.len(),
-            caller.map_or(String::new(), |t| format!(
-                " (CARGO_BUILD_JOBS={t} for the run)"
-            ))
+        print!(
+            "affected-checks: {} cargo groups, {width} at a time, {jobs} build job(s) each",
+            groups.len()
         );
+        match (base, caller) {
+            (Some(_), _) if borrowed > 0 => print!(
+                " ({borrowed} lane(s) borrowed {} GiB each beside the request's grant)",
+                jobs.saturating_mul(2)
+            ),
+            (Some(_), _) => print!(" (on the request's grant)"),
+            (None, Some(t)) => print!(" (CARGO_BUILD_JOBS={t} for the run)"),
+            (None, None) => {}
+        }
+        println!();
     }
+    let jobs = jobs.to_string();
+    // Longest first, by what each took when it last ran here, so the run
+    // does not end on a long group started late.
+    // Read and kept only under the run hold, as the passes are.
+    let timings = held.as_ref().and(journal.as_ref());
+    let took = timings
+        .map(|j| j.read_lines(DURATIONS_KEY))
+        .unwrap_or_default();
+    let order = start_order(&groups, &|cmd: &str| {
+        let line = canon(cmd);
+        if reuse && vouchers.contains_key(&line) {
+            Some(0)
+        } else {
+            recorded_duration(&took, &line)
+        }
+    });
     let next = AtomicUsize::new(0);
     let codes: Vec<Mutex<Option<i32>>> = groups.iter().map(|_| Mutex::new(None)).collect();
     // Serializes the REPORTING, not the work.
     let pen = Mutex::new(());
+    // A lane that finds no group left returns one borrowed grant, whichever
+    // it is, so the lanes still running hold what they need beyond the base.
+    let lane_grants = Mutex::new(lane_grants);
     std::thread::scope(|scope| {
         for _ in 0..width {
             let (next, codes, pen, groups, jobs) = (&next, &codes, &pen, &groups, &jobs);
             let (host, tree, vouchers, reused, canon, mark) =
                 (&host, &tree, &vouchers, &reused, &canon, &mark);
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some((_, list)) = groups.get(i) else {
-                    return;
-                };
-                let mut code = 0;
-                let mut passed: Vec<String> = Vec::new();
-                for cmd in list {
-                    let line = canon(cmd);
-                    if reuse {
-                        if let Some(from) = vouchers.get(&line).and_then(|v| v.first()) {
-                            let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
-                            println!(
-                                "================ {cmd}: REUSED (passed on tree {from}, \
-                                 which differs here in nothing it reads) ================"
-                            );
-                            reused.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                    // Owed here until it passes: a run that reds or is
-                    // stopped leaves this content answered by no pass.
-                    let failed = tree
-                        .as_deref()
-                        .map(|t| vec![preflight_line(t, PREFLIGHT_FAIL, &line)])
-                        .unwrap_or_default();
-                    mark(&failed);
-                    {
-                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
-                        println!("affected-checks: running: {cmd}");
-                    }
-                    let started = std::time::Instant::now();
-                    let (got, output) = run_shell_captured(root, cmd, jobs);
-                    {
-                        use std::io::Write;
-                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
-                        // One stream: banners and body together under one
-                        // redirect, and nothing for a CI runner that buffers
-                        // the two apart to reorder.
-                        let mut out = std::io::stdout().lock();
-                        let _ = writeln!(
-                            out,
-                            "================ {cmd} ({}s) ================",
-                            started.elapsed().as_secs()
-                        );
-                        let _ = out.write_all(&output);
-                        if !output.ends_with(b"\n") {
-                            let _ = writeln!(out);
-                        }
-                        let verdict = match got {
-                            0 => "PASS".to_string(),
-                            code => format!("FAIL (exit {code})"),
-                        };
-                        let _ = writeln!(out, "================ {cmd}: {verdict} ================");
-                        let _ = out.flush();
-                    }
-                    if got != 0 {
-                        // Again: a pass another worktree recorded on this
-                        // content while this ran does not outweigh the red.
-                        // And on each tree whose pass would have answered
-                        // here (a forced run's, or a run on a host change
-                        // the key misses): those passes are in doubt too,
-                        // and a later edit here could reach them again.
-                        let vouching = vouchers.get(&line).map(Vec::as_slice);
-                        mark(&red_lines(
-                            tree.as_deref(),
-                            vouching.unwrap_or_default(),
-                            &line,
-                        ));
-                        code = got;
+            let (order, timings, lane_grants) = (&order, &timings, &lane_grants);
+            scope.spawn(move || {
+                while let Some(&(_, i)) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let Some((_, list)) = groups.get(i) else {
                         break;
-                    }
-                    // Only if the content is still what the run started on:
-                    // a pass over an edit made meanwhile proves neither.
-                    if let Some(t) = tree {
-                        if content_tree(root).as_ref() == Some(t) {
-                            passed.push(preflight_line(t, PREFLIGHT_PASS, &line));
+                    };
+                    let mut code = 0;
+                    let mut passed: Vec<String> = Vec::new();
+                    for cmd in list {
+                        let line = canon(cmd);
+                        if reuse {
+                            if let Some(from) = vouchers.get(&line).and_then(|v| v.first()) {
+                                let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                                println!(
+                                    "================ {cmd}: REUSED (passed on tree {from}, \
+                                 which differs here in nothing it reads) ================"
+                                );
+                                reused.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        // Owed here until it passes: a run that reds or is
+                        // stopped leaves this content answered by no pass.
+                        let failed = tree
+                            .as_deref()
+                            .map(|t| vec![preflight_line(t, PREFLIGHT_FAIL, &line)])
+                            .unwrap_or_default();
+                        mark(&failed);
+                        {
+                            let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                            println!("affected-checks: running: {cmd}");
+                        }
+                        let started = std::time::Instant::now();
+                        let (got, output) = run_shell_captured(root, cmd, jobs);
+                        {
+                            use std::io::Write;
+                            let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                            // One stream: banners and body together under one
+                            // redirect, and nothing for a CI runner that buffers
+                            // the two apart to reorder.
+                            let mut out = std::io::stdout().lock();
+                            let _ = writeln!(
+                                out,
+                                "================ {cmd} ({}s) ================",
+                                started.elapsed().as_secs()
+                            );
+                            let _ = out.write_all(&output);
+                            if !output.ends_with(b"\n") {
+                                let _ = writeln!(out);
+                            }
+                            let verdict = match got {
+                                0 => "PASS".to_string(),
+                                code => format!("FAIL (exit {code})"),
+                            };
+                            let _ =
+                                writeln!(out, "================ {cmd}: {verdict} ================");
+                            let _ = out.flush();
+                        }
+                        if got != 0 {
+                            // Again: a pass another worktree recorded on this
+                            // content while this ran does not outweigh the red.
+                            // And on each tree whose pass would have answered
+                            // here (a forced run's, or a run on a host change
+                            // the key misses): those passes are in doubt too,
+                            // and a later edit here could reach them again.
+                            let vouching = vouchers.get(&line).map(Vec::as_slice);
+                            mark(&red_lines(
+                                tree.as_deref(),
+                                vouching.unwrap_or_default(),
+                                &line,
+                            ));
+                            code = got;
+                            break;
+                        }
+                        if let Some(journal) = timings {
+                            let took = duration_line(started.elapsed().as_secs(), &line);
+                            journal.record_bounded(DURATIONS_KEY, &[took], Some(DURATIONS_BYTES));
+                        }
+                        // Only if the content is still what the run started on:
+                        // a pass over an edit made meanwhile proves neither.
+                        if let Some(t) = tree {
+                            if content_tree(root).as_ref() == Some(t) {
+                                passed.push(preflight_line(t, PREFLIGHT_PASS, &line));
+                            }
                         }
                     }
+                    // The host once per group rather than per command: its
+                    // probes are the expensive part of the recheck.
+                    if !passed.is_empty() && host.is_some() && preflight_host(root) == *host {
+                        mark(&passed);
+                    }
+                    if let Some(cell) = codes.get(i) {
+                        *cell.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+                    }
                 }
-                // The host once per group rather than per command: its
-                // probes are the expensive part of the recheck.
-                if !passed.is_empty() && host.is_some() && preflight_host(root) == *host {
-                    mark(&passed);
-                }
-                if let Some(cell) = codes.get(i) {
-                    *cell.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
-                }
+                let mut grants = lane_grants.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(grants.iter_mut().find_map(Option::take));
             });
         }
     });
@@ -4297,12 +4446,15 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
     Some(h.finalize().to_vec())
 }
 
+/// The most cargo groups a run has at once.
+const MAX_CARGO_GROUPS: usize = 4;
+
 /// How many cargo groups run at once: a quarter of the CPUs, at least one
-/// and at most four, never more than there are groups, so none for none.
-/// Four concurrent builds is where a sixteen-thread host is kept busy
-/// without four rustc trees competing for its memory.
+/// and at most `MAX_CARGO_GROUPS`, never more than there are groups, so
+/// none for none. Four concurrent builds is where a sixteen-thread host is
+/// kept busy without four rustc trees competing for its memory.
 fn cargo_group_width(groups: usize, cpus: usize) -> usize {
-    (cpus / 4).clamp(1, 4).min(groups)
+    (cpus / 4).clamp(1, MAX_CARGO_GROUPS).min(groups)
 }
 
 /// The run's width and each cargo's build jobs. A caller's `CARGO_BUILD_JOBS`
@@ -11783,6 +11935,63 @@ mod tests {
         assert_eq!(cargo_group_plan(20, 16, Some(1)), (1, 1));
         assert_eq!(cargo_group_plan(1, 16, Some(2)), (1, 2));
         assert_eq!(cargo_group_plan(20, 16, Some(0)), (4, 4));
+        // Hosted: the base grant's jobs per lane, at most the CPUs over the
+        // lanes, each further lane borrowing a job's 2 GiB per job.
+        assert_eq!(hosted_lanes(87, 16, 4 << 30), (4, 2, 4));
+        assert_eq!(hosted_lanes(87, 16, 32 << 30), (4, 4, 8));
+        assert_eq!(hosted_lanes(2, 16, 4 << 30), (2, 2, 4));
+        assert_eq!(hosted_lanes(87, 4, 8 << 30), (1, 4, 8));
+        assert_eq!(hosted_lanes(87, 16, 1 << 30), (4, 1, 2));
+        assert_eq!(hosted_lanes(1, 1, 4 << 30), (1, 1, 2));
+    }
+
+    /// Groups start longest first by their commands' recorded times, one
+    /// with an unrecorded command before all, ties in table order; the
+    /// newest record of a command is its time.
+    #[test]
+    fn cargo_groups_start_longest_first() {
+        let group = |key: &str, cmds: &[&str]| {
+            (
+                Some(key.to_string()),
+                cmds.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        let groups = vec![
+            group("ws", &["ws-test", "ws-clippy"]),
+            group("a", &["a-test"]),
+            group("mta", &["mta-test", "mta-clippy"]),
+            group("b", &["b-test"]),
+            group("new", &["new-test"]),
+            group("c", &["c-test"]),
+        ];
+        let lines = [
+            duration_line(900, "ws-test"),
+            duration_line(5, "ws-clippy"),
+            duration_line(30, "a-test"),
+            duration_line(2000, "mta-test"),
+            duration_line(9, "mta-clippy"),
+            duration_line(999, "b-test"),
+            duration_line(30, "b-test"),
+            duration_line(30, "c-test"),
+            "garbage".to_string(),
+            duration_line(7, "c-test").replace('7', "x"),
+        ];
+        let took = |cmd: &str| recorded_duration(&lines, cmd);
+        assert_eq!(took("b-test"), Some(30));
+        assert_eq!(
+            took("c-test"),
+            Some(30),
+            "an unreadable newest line is skipped"
+        );
+        assert_eq!(took("new-test"), None);
+        let order: Vec<usize> = start_order(&groups, &took)
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
+        assert_eq!(order, vec![4, 2, 0, 1, 3, 5]);
+        assert!(start_order(&[], &|_| None).is_empty());
+        // Never a digest, so never a toolchain key's file.
+        assert!(!git_object_name(DURATIONS_KEY));
     }
 
     /// A listing error must RED rather than come back short: the caller's loop
