@@ -761,6 +761,20 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // Only the allocation guard reads the debt inventory, and the cargo-test
+    // preflight runs the guard before any cargo command. Staging copies it
+    // with td-alloc's tree, but no build step, build script or test opens
+    // it, so it selects no crate legs (`changed_roster_crates`) and no
+    // recipe check (`check_scope`).
+    if p == crate::allocation_guard::INVENTORY {
+        sel.add_preflight("cargo-test");
+        sel.add_note(
+            "the allocation debt inventory is read by the allocation guard alone: the \
+             cargo-test preflight runs it",
+        );
+        return;
+    }
+
     if matches!(p, "td-inflate/src/gzip.rs" | "td-alloc/src/lib.rs") {
         sel.add_preflight("cargo-test");
         sel.add_preflight("net-test");
@@ -6160,11 +6174,13 @@ fn recipe_definition(p: &str) -> bool {
 /// or a `..`. Refuse traversal rather than resolve it, since
 /// `td-review/../td-sh/x.rs` starts with
 /// one crate and names another (git never emits one, so it is reachable only
-/// through `--path`). A workspace-only path selects no crate, so a diff of
-/// only those is `Some` of none: the workspace legs alone.
+/// through `--path`). A workspace-only path, or the allocation debt
+/// inventory, selects no crate, so a diff of only those is `Some` of none:
+/// the workspace legs alone.
 fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec<String>> {
     let mut selected: Vec<String> = Vec::new();
     let mut workspace_only = false;
+    let mut inventory = false;
     for p in changed {
         if p.contains("..") {
             return None;
@@ -6173,13 +6189,19 @@ fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec
             workspace_only = true;
             continue;
         }
+        // The guard runs before every cargo command; it owes nothing more,
+        // and does not cost a narrowed crate its workspace exemption.
+        if p == crate::allocation_guard::INVENTORY {
+            inventory = true;
+            continue;
+        }
         // The separator matters: `td-reviewer/x` is not `td-review/x`.
         let owner = roster
             .iter()
             .find(|c| p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/'))?;
         push_unique(&mut selected, &owner.name);
     }
-    (workspace_only || !selected.is_empty()).then_some(selected)
+    (workspace_only || inventory || !selected.is_empty()).then_some(selected)
 }
 
 /// Only the initial changed source files have a precise scope. Once a
@@ -6203,9 +6225,10 @@ fn close_over_changed_readers(
             full.push(donor.clone());
         }
         let prefix = format!("{donor}/");
+        // The debt inventory beside a td-alloc source edit is no read.
         let paths: Vec<String> = changed
             .iter()
-            .filter(|p| p.starts_with(&prefix))
+            .filter(|p| p.starts_with(&prefix) && *p != crate::allocation_guard::INVENTORY)
             .cloned()
             .collect();
         let precise = precise
@@ -6300,6 +6323,13 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
         crates.push(RECIPE_SOURCES.trim_end_matches('/').to_string());
     }
     let mut paths: Vec<String> = changed.to_vec();
+    // No recipe step reads the debt inventory, though td-alloc's tree, which
+    // every recipe compiles in, holds it: as a scope path it would reach
+    // every check.
+    paths.retain(|p| p != crate::allocation_guard::INVENTORY);
+    if paths.is_empty() {
+        return None;
+    }
     paths.sort();
     paths.dedup();
     let size = paths
@@ -10286,6 +10316,49 @@ mod tests {
                 "{cmd:?} is not `--manifest-path <crate>/Cargo.toml`"
             );
         }
+    }
+
+    /// The allocation debt inventory is read by the guard alone, which the
+    /// cargo-test preflight runs before any cargo command: on its own it
+    /// selects that preflight, no target and no crate legs, and beside a
+    /// crate's change it changes nothing: not its legs, td-mta's workspace
+    /// exemption included, and not its recipe-checks scope.
+    #[test]
+    fn the_debt_inventory_selects_the_guard_and_no_crate_legs() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        let inventory = crate::allocation_guard::INVENTORY.to_string();
+        let selection = compute_selection(&root, std::slice::from_ref(&inventory));
+        assert_eq!(selection.preflights, ["cargo-test"]);
+        assert!(selection.targets.is_empty(), "{:?}", selection.targets);
+        let alone = cargo_test_cmds(&root, std::slice::from_ref(&inventory)).unwrap();
+        assert!(alone.iter().any(|c| is_workspace_cmd(c)), "{alone:?}");
+        assert!(
+            alone.iter().all(|c| cmd_manifest_crate(c).is_none()),
+            "{alone:?}"
+        );
+        for krate in ["td-mta/src/lib.rs", "td-layout/src/lib.rs"] {
+            let without = cargo_test_cmds(&root, &[krate.to_string()]).unwrap();
+            let with = cargo_test_cmds(&root, &[krate.to_string(), inventory.clone()]).unwrap();
+            assert_eq!(with, without, "{krate}");
+        }
+        // Nor does it widen the recipe-checks scope of a change that has one.
+        let layout = "td-layout/src/lib.rs".to_string();
+        let targets = compute_selection(&root, std::slice::from_ref(&layout)).targets;
+        assert!(runs_recipe_checks(&targets), "{targets:?}");
+        let alone = check_scope(&root, std::slice::from_ref(&layout), &targets);
+        assert!(alone.is_some());
+        assert_eq!(
+            check_scope(&root, &[layout.clone(), inventory.clone()], &targets),
+            alone
+        );
+        assert_eq!(
+            compute_selection(&root, &[layout.clone(), inventory.clone()]).targets,
+            targets
+        );
     }
 
     /// The narrowing itself, in both directions. The unsound direction is the

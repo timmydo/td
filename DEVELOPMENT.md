@@ -80,9 +80,12 @@ static i386 executable, so it also needs a `cc` that targets `-m32`.
 `td-builder gate-crates allocations` checks production Rust against the
 reviewed inventory in `td-alloc/allocation-debt.tsv`. The cargo-test and
 net-test preflights run it before Cargo, and sandbox gate 325 reaches the
-same check through `gate-crates locks`. Inventory growth is a reviewed debt
-amendment, never a routine way to make a guard pass. The allocator contract,
-scanner limits and migration rules live in `td-alloc/DESIGN.md`.
+same check through `gate-crates locks`. Nothing else reads the inventory
+(staging copies it with td-alloc's tree, but no build step or test opens
+it), so a change to it selects the cargo-test preflight, no crate's legs and
+no recipe check. Inventory growth is a reviewed debt amendment, never a
+routine way to make a guard pass. The allocator contract, scanner limits and
+migration rules live in `td-alloc/DESIGN.md`.
 
 ## Ready
 

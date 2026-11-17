@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 type Inventory = BTreeMap<(String, String), usize>;
-const INVENTORY: &str = "td-alloc/allocation-debt.tsv";
+pub(crate) const INVENTORY: &str = "td-alloc/allocation-debt.tsv";
 
 fn operations(source: &str) -> BTreeMap<String, usize> {
     let code =
