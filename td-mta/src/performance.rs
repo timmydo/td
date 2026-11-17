@@ -236,6 +236,23 @@ pub fn record(phase: Phase, duration: Duration, outcome: Outcome) {
         cell.record(duration, outcome);
     }
 }
+static PROCESS: std::sync::OnceLock<crate::ids::BootId> = std::sync::OnceLock::new();
+/// One identity for the lifetime of CELLS, carried in the BootId type but
+/// distinct from the logger's boot ID. The logger's boot ID changes on an
+/// in-process reload while these counters continue, so a monitor tells a new
+/// process (counters from zero) from a reload only by this value.
+fn process() -> Option<crate::ids::BootId> {
+    if let Some(process) = PROCESS.get() {
+        return Some(*process);
+    }
+    use td_crypto::Entropy;
+    let mut bytes = [0; 16];
+    td_crypto::SystemEntropy::try_new()
+        .ok()?
+        .fill(&mut bytes)
+        .ok()?;
+    Some(*PROCESS.get_or_init(|| crate::ids::BootId::from_bytes(bytes)))
+}
 pub(crate) fn snapshot(phase: Phase) -> Option<Sample> {
     CELLS.get(phase as usize).and_then(Cell::snapshot)
 }
@@ -276,25 +293,32 @@ pub(crate) fn encode_status(
 ) -> Result<(), crate::bounded::Error> {
     let samples =
         std::array::from_fn(|index| Phase::ALL.get(index).and_then(|phase| snapshot(*phase)));
-    encode_samples(output, boot, generation, utc_ms, &samples)
+    encode_samples(output, boot, process(), generation, utc_ms, &samples)
 }
 
 fn encode_samples(
     output: &mut crate::bounded::TextBuffer<'_>,
     boot: crate::ids::BootId,
+    process: Option<crate::ids::BootId>,
     generation: u64,
     utc_ms: Option<i64>,
     samples: &[Option<Sample>; Phase::ALL.len()],
 ) -> Result<(), crate::bounded::Error> {
     struct Json<'a> {
         boot: crate::ids::BootId,
+        process: Option<crate::ids::BootId>,
         generation: u64,
         utc_ms: Option<i64>,
         samples: &'a [Option<Sample>; Phase::ALL.len()],
     }
     impl std::fmt::Display for Json<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{{\"schema\":1,\"command\":\"performance-status\",\"status\":\"ok\",\"boot_id\":\"{}\",\"config_generation\":{},\"utc_ms\":", self.boot, self.generation)?;
+            write!(f, "{{\"schema\":1,\"command\":\"performance-status\",\"status\":\"ok\",\"boot_id\":\"{}\",\"process_id\":", self.boot)?;
+            match self.process {
+                Some(process) => write!(f, "\"{process}\""),
+                None => f.write_str("null"),
+            }?;
+            write!(f, ",\"config_generation\":{},\"utc_ms\":", self.generation)?;
             match self.utc_ms {
                 Some(value) => write!(f, "{value}"),
                 None => f.write_str("null"),
@@ -317,6 +341,7 @@ fn encode_samples(
         "{}",
         Json {
             boot,
+            process,
             generation,
             utc_ms,
             samples
@@ -343,9 +368,18 @@ mod tests {
         let mut bytes = [0; MAX_STATUS_BYTES];
         let mut output = crate::bounded::TextBuffer::new(&mut bytes);
         let boot = crate::ids::BootId::from_bytes([255; 16]);
-        encode_samples(&mut output, boot, u64::MAX, Some(i64::MIN), &samples).unwrap();
+        encode_samples(
+            &mut output,
+            boot,
+            Some(boot),
+            u64::MAX,
+            Some(i64::MIN),
+            &samples,
+        )
+        .unwrap();
         let json = td_json::parse(output.as_str().unwrap()).unwrap();
         assert_eq!(json["command"].as_str(), Some("performance-status"));
+        assert_eq!(json["process_id"].as_str(), Some(&*"f".repeat(32)));
         for phase in Phase::ALL {
             assert_eq!(
                 json["phases"][phase.code()]["max_us"].as_u64(),
@@ -355,16 +389,28 @@ mod tests {
         let needed = output.as_str().unwrap().len();
         let mut short = vec![0; needed - 1];
         let mut short = crate::bounded::TextBuffer::new(&mut short);
-        assert!(encode_samples(&mut short, boot, 0, None, &samples).is_ok());
+        assert!(encode_samples(&mut short, boot, Some(boot), 0, None, &samples).is_ok());
         short.clear();
-        assert!(encode_samples(&mut short, boot, u64::MAX, Some(i64::MIN), &samples).is_err());
+        assert!(encode_samples(
+            &mut short,
+            boot,
+            Some(boot),
+            u64::MAX,
+            Some(i64::MIN),
+            &samples
+        )
+        .is_err());
         assert_eq!(short.as_str().unwrap(), "");
         output.clear();
-        encode_samples(&mut output, boot, 0, None, &[None; Phase::ALL.len()]).unwrap();
+        encode_samples(&mut output, boot, None, 0, None, &[None; Phase::ALL.len()]).unwrap();
         let json = td_json::parse(output.as_str().unwrap()).unwrap();
+        assert!(json["process_id"].is_null());
         for phase in Phase::ALL {
             assert!(json["phases"][phase.code()].is_null());
         }
+        // One identity for the process, however many logger generations.
+        assert!(process().is_some());
+        assert_eq!(process(), process());
     }
 
     #[test]

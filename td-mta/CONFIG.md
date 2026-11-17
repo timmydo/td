@@ -2012,8 +2012,9 @@ list across generation preparation and publication.
 
 `td-mta performance-status --runtime PATH` returns a bounded current snapshot
 through the same private control socket as `logging-status`. Its schema-1 JSON
-has a logger boot ID, configuration generation, nullable UTC milliseconds and
-fixed phase counters. It is read-only, requires no database connection, and
+has a logger boot ID, a nullable process ID that changes only when the counters
+restart, configuration generation, nullable UTC milliseconds and fixed phase
+counters. It is read-only, requires no database connection, and
 never resets counters or changes service readiness. See OBSERVABILITY.md for
 phase meanings, nesting, saturation and null observations. Compare snapshots
 before and after a slow operation; hourly database summaries retain history

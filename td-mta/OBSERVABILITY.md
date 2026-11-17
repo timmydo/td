@@ -487,8 +487,10 @@ snapshot reset, so a later summary recovers cumulative observations across a
 lost intermediate summary. Abrupt termination can lose the final partial hour;
 a quiet phase whose last summary was lost need not produce another record.
 Process counters survive in-process configuration reload; a new process starts
-at zero. The event boot ID identifies a logger generation, so a new boot ID
-requires a new baseline even when process counters survived a reload. They are diagnostic evidence, not an operation or delivery ledger.
+at zero. The event boot ID identifies a logger generation, so for event records
+a new boot ID requires a new baseline even when process counters survived a
+reload; `performance-status` also reports a `process_id` that tells the two
+apart. They are diagnostic evidence, not an operation or delivery ledger.
 
 For two records from one process and phase, subtract `calls` and `total_us` to
 compute interval throughput and mean latency. `max_us` is a process maximum,
@@ -503,9 +505,14 @@ current counters through the existing private mode-0600 local control socket.
 It needs neither PostgreSQL nor info-level event logging and does not reset any
 counter. Capture before and after the operation, seconds apart, to measure its
 cost without waiting for historical persistence. It returns schema-1 JSON with
-`command`, `status`, `boot_id`, `config_generation`, nullable `utc_ms` and a
-`phases` object keyed by the closed names below. Every value is the same numeric
-sample as an event; a contended/poisoned cell is null, never a fabricated zero.
+`command`, `status`, `boot_id`, nullable `process_id`, `config_generation`,
+nullable `utc_ms` and a `phases` object keyed by the closed names below.
+`process_id` is 32 lowercase hex digits drawn on the process's first status
+request and kept for its life; it changes exactly when the counters restart
+from zero, while `boot_id` also changes on an in-process reload. A request is
+answered with null only if that draw found no system entropy; a later request
+may still draw it.
+Every value is the same numeric sample as an event; a contended/poisoned cell is null, never a fabricated zero.
 The response is at most 16 KiB including LF, with unchanged two-second control
 exchange limits. A service lacking a logging owner returns `unavailable`.
 It is not exposed over public HTTP and supplies no mutation operation.

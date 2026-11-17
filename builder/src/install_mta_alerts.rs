@@ -39,6 +39,13 @@ fn capacity(output: &str, issues: &mut BTreeMap<String, String>) -> Result<()> {
     }
     Ok(())
 }
+const PHASES: &[&str] = &["smtp_commit", "smtp_publish"];
+fn process(sample: &Json) -> Option<&str> {
+    match sample.get("process_id") {
+        Some(Json::Str(id)) => Some(id),
+        _ => None,
+    }
+}
 fn performance(
     label: &str,
     output: &str,
@@ -49,28 +56,48 @@ fn performance(
     if string(&value, "status")? != "ok" {
         return Err("performance unavailable".into());
     }
-    let same = previous.is_some_and(|p| p.get("boot_id") == value.get("boot_id"));
-    for phase in ["smtp_commit", "smtp_publish"] {
-        let failures = number(field(field(&value, "phases")?, phase)?, "failures")?;
-        // Do not replay historical failures on the first sample or a restart.
-        if same {
-            let old = number(
-                field(field(previous.ok_or("missing previous")?, "phases")?, phase)?,
-                "failures",
-            )?;
-            if failures < old {
-                return Err("counter decreased".into());
-            }
-            if failures > old {
-                issue(
-                    issues,
-                    format!("{label}:{phase}"),
-                    format!(
-                        "{label} {phase}: {} new failures since last successful observation",
-                        failures - old
-                    ),
-                );
-            }
+    // Validate before any sample, the first included, becomes a baseline.
+    string(&value, "boot_id")?;
+    let mut current = [0; PHASES.len()];
+    for (count, phase) in current.iter_mut().zip(PHASES) {
+        *count = number(field(field(&value, "phases")?, phase)?, "failures")?;
+    }
+    // The first sample has no baseline, so its history is not replayed.
+    let Some(previous) = previous else {
+        return Ok(value);
+    };
+    // Failure counters live as long as the process; boot_id names a logger
+    // generation and changes on an in-process reload. Only a changed
+    // process_id means counters restarted from zero. A status without one
+    // (an older binary) keeps the boot_id baseline rule.
+    let baseline = match (process(previous), process(&value)) {
+        (Some(old), Some(new)) if old != new => Some(None),
+        (Some(_), Some(_)) => Some(Some(previous)),
+        _ if previous.get("boot_id") == value.get("boot_id") => Some(Some(previous)),
+        _ => None,
+    };
+    let Some(baseline) = baseline else {
+        return Ok(value);
+    };
+    for (failures, phase) in current.into_iter().zip(PHASES) {
+        let old = match baseline {
+            Some(previous) => number(field(field(previous, "phases")?, phase)?, "failures")?,
+            None => 0,
+        };
+        if failures < old {
+            return Err("counter decreased".into());
+        }
+        if failures > old {
+            let since = if baseline.is_some() {
+                "since last successful observation"
+            } else {
+                "since the service restarted"
+            };
+            issue(
+                issues,
+                format!("{label}:{phase}"),
+                format!("{label} {phase}: {} new failures {since}", failures - old),
+            );
         }
     }
     Ok(value)
@@ -327,30 +354,53 @@ mod tests {
         assert!(issues.contains_key("critical:account:receiving_receipts"));
     }
     #[test]
-    fn failure_deltas_ignore_restart_and_first_observation() {
-        let input = r#"{"status":"ok","boot_id":"one","phases":{"smtp_commit":{"failures":60},"smtp_publish":{"failures":60}}}"#;
+    fn failure_deltas_follow_the_process_not_the_logger() {
+        let input = r#"{"status":"ok","boot_id":"one","process_id":"p1","phases":{"smtp_commit":{"failures":60},"smtp_publish":{"failures":60}}}"#;
         let mut issues = BTreeMap::new();
+        let check = |text: &str, old: &Json, issues: &mut BTreeMap<String, String>| {
+            performance("receive", text, Some(old), issues).unwrap()
+        };
+        // The first sample only establishes a baseline.
         let old = performance("receive", input, None, &mut issues).unwrap();
         assert!(issues.is_empty());
-        performance("receive", input, Some(&old), &mut issues).unwrap();
+        check(input, &old, &mut issues);
         assert!(issues.is_empty());
-        performance(
-            "receive",
-            &input.replace("60", "61"),
-            Some(&old),
-            &mut issues,
-        )
-        .unwrap();
+        check(&input.replace("60", "61"), &old, &mut issues);
         assert_eq!(issues.len(), 2);
         issues.clear();
-        performance(
-            "receive",
-            &input.replace("one", "two"),
-            Some(&old),
-            &mut issues,
-        )
-        .unwrap();
+        // An in-process reload draws a new boot_id while the counters go on:
+        // nothing new failed, and a later failure is counted from the old value.
+        let reloaded = input.replace("one", "two");
+        check(&reloaded, &old, &mut issues);
         assert!(issues.is_empty());
+        check(&reloaded.replace("60", "61"), &old, &mut issues);
+        assert_eq!(issues.len(), 2);
+        assert!(issues
+            .values()
+            .all(|text| text.contains("1 new failures since last successful")));
+        issues.clear();
+        // A new process's counters began at zero: its failures before the
+        // first poll alert, and a clean restart does not.
+        let restarted = reloaded.replace("p1", "p2");
+        check(&restarted, &old, &mut issues);
+        assert_eq!(issues.len(), 2);
+        assert!(issues
+            .values()
+            .all(|text| text.contains("60 new failures since the service restarted")));
+        issues.clear();
+        check(&restarted.replace("60", "0"), &old, &mut issues);
+        assert!(issues.is_empty());
+        // Without process_id (an older binary) a new boot_id is a baseline.
+        let legacy = input.replace(r#""process_id":"p1","#, "");
+        let old = performance("receive", &legacy, None, &mut issues).unwrap();
+        check(&legacy.replace("one", "two"), &old, &mut issues);
+        assert!(issues.is_empty());
+        // An unusable first sample never becomes the baseline.
+        let contended = input.replace(
+            r#"{"failures":60},"smtp_publish""#,
+            r#"null,"smtp_publish""#,
+        );
+        assert!(performance("receive", &contended, None, &mut issues).is_err());
     }
     #[test]
     fn incident_changes_retries_reminders_and_recovery() {

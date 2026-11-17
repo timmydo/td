@@ -1176,8 +1176,12 @@ submission, PostgreSQL and the MTA's relay workers for delivery.
 The minute collector checks configured readiness/freshness, disk and capacity,
 and new SMTP commit/publication failures. Capacity warnings start at 80 percent,
 critical at 95 percent; rotating log row occupancy is not an incident. Failure
-counter differences require the same boot ID. First observations and restarts
-establish a baseline, not an invented interval. Missing inspections are incidents.
+counters are differenced within one process ID, across in-process reloads that
+change the boot ID. A changed process ID is a new process whose counters began
+at zero, so every failure it reports happened after the restart and alerts. The
+collector's first observation only establishes a baseline; a status without a
+process ID (an older binary) is differenced within one boot ID and becomes a
+new baseline when the boot ID changes. Missing inspections are incidents.
 Collection has a ten-second paging budget, inspections a 35-second scheduling
 budget (one bounded child may finish afterward); incomplete work is reported.
 
