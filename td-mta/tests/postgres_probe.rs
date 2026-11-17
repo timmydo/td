@@ -5687,9 +5687,19 @@ fn exercise_uploads(
             uploads::prepare_with_meter(binding, device, bytes, deadline(), &mut meter, &clock)
                 .unwrap();
         assert!(before.io_bytes - meter.remaining().io_bytes >= 2 * bytes.len() as u64);
+        // Body output, then nonrefundable MIME-evidence credit prepaid from at
+        // most half of what remains, so publication keeps the rest.
+        let length = bytes.len() as u64;
+        let spent = before.output_bytes - meter.remaining().output_bytes;
+        let evidence = (before.output_bytes - length) / 2;
+        assert!(
+            spent >= length && spent - length <= evidence,
+            "length={length} spent={spent}"
+        );
         assert_eq!(
-            before.output_bytes - meter.remaining().output_bytes,
-            bytes.len() as u64
+            spent > length,
+            evidence > 0,
+            "length={length} spent={spent}"
         );
         upload
     };
