@@ -3628,7 +3628,8 @@ header's buttons for its driven read-back and its tests.
 
 A section may show styled text (`Message::rich`, or `set_rich` on one
 shown): a `rich::Rich` its owner builds from a source, td-agent's from
-a reply's Markdown (`td-agent/DESIGN.md` §4). The list parses nothing.
+a reply's Markdown and the person's text as typed, its code styled
+(`td-agent/DESIGN.md` §4). The list parses nothing.
 The owner says what each piece is: `text`, a range of the source shown
 as written, or `put`, text the source does not hold as such (a soft
 break's space, an entity's character, an image's stand-in), standing

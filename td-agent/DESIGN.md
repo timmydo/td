@@ -1535,6 +1535,24 @@ copyable:
 drawn as Markdown: `markdown.rs` parses it with td-markdown and maps the
 document onto td-ui's styled text (td-ui DESIGN.md "Styled sections"),
 so a copy of a reply, or of any part of it, is the Markdown as written.
+
+The person's own messages are styled text too, but shown as typed
+(`markdown::typed`): every line, space and character kept, with only
+code read: a fenced block (up to three spaces, then three or more
+backticks or tildes, a backtick fence's rest holding none, to a closing
+fence of at least as many of the same followed only by blanks) shows
+its lines as a code block without its fences, its columns aligned in
+the monospace face, a fence never closed being text, and a run of
+backticks closed by as many on the same line a code span without them;
+a message whose fences hold nothing to show is plain. Nothing else is
+Markdown there, since what a person types and pastes (logs,
+diffs, commands, paths, `__init__.py`, `Option<T>`, a `# comment`) is
+rarely meant as markup and the bubble shows what the model was sent; a
+copy takes it exactly as typed. A styled message holds its source, its
+shown text and its records, so it takes at least twice its length of
+the transcript's budget, more for many short lines, as a reply does: a
+long paste lets the oldest messages go from the view (never the log)
+sooner.
 Headings are bold, a first-level ATX one (`#`) half again the text's
 size and a second-level one (`##`) a quarter (`Look::LARGER`,
 `Look::LARGE`) where the prose faces draw it, and as the text on the
@@ -1567,8 +1585,8 @@ alt text in brackets, `image` with none, in quiet ink and linked to its
 destination unless it is a link's own, its brackets standing for its
 markup so a copy reaching into it takes the image's Markdown whole. Text
 the styled text cannot hold (past td-ui's bounds) is shown as written.
-The reasoning, the person's messages, other conversations' messages,
-tool blocks and notices stay plain text; a reply with calls and no text
+The reasoning, other conversations' messages, tool blocks and notices
+stay plain text; a reply with calls and no text
 stands on its reasoning's summary (above), which is drawn as the reply
 is, since summaries carry Markdown headings of their own. A heading in a
 quotation is bold in the quotation's quiet ink.
@@ -1581,9 +1599,9 @@ with one copy and the transcript measures with the other
 (`App::set_prose`, td-ui's `Controller::set_prose`). With
 `TD_UI_FACE=bitmap` it stays on the cell; without the faces too, and
 the window says once on standard error why. Everything else in the
-window stays on the cell, the person's messages and the composer
-included. The driven `text` verb reads the cell grid, which prose does
-not fill, so with faces a reply does not read back from it; the native
+window stays on the cell, the composer included. The driven `text`
+verb reads the cell grid, which prose does not fill, so with faces a
+reply or the person's message does not read back from it; the native
 compositor tests run with `TD_UI_FACE=bitmap`, where it does, and an
 agent that reads the window back should too.
 

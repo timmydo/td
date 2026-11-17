@@ -1,7 +1,10 @@
 //! A reply's Markdown as the transcript's styled text (DESIGN.md §4,
 //! "Markdown"): td-markdown's blocks and spans mapped onto td-ui's
 //! `Rich`, whose copy takes the reply as written. Nothing is fetched: an
-//! image shows as its alt text, a link to its source.
+//! image shows as its alt text, a link to its source. The person's own
+//! text is styled only where it is code (`typed`).
+
+use std::ops::Range;
 
 use td_markdown::{BlockKind, Document, Level, Marker, Span, SpanKind, Style};
 use td_ui::rich::{self, Look, Rich, MAX_PREFIX_CHARS};
@@ -18,6 +21,188 @@ const RULE: &str = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2
 pub fn rich(text: &str) -> Option<Rich> {
     let document = td_markdown::parse(text).ok()?;
     build(text, &document).ok()
+}
+
+/// The person's `text` as styled text: shown as typed, every line,
+/// space and character, with its fenced code blocks and code spans in
+/// code and nothing else read as Markdown, since what they type and
+/// paste (logs, diffs, commands, paths) is rarely meant as markup;
+/// `None` past styled text's bounds, for the caller to show it plain.
+pub fn typed(text: &str) -> Option<Rich> {
+    // A message of matched fences around nothing would show nothing:
+    // plain.
+    build_typed(text)
+        .ok()
+        .filter(|rich| !rich.shown().trim().is_empty() || text.trim().is_empty())
+}
+
+fn build_typed(text: &str) -> Result<Rich, rich::Error> {
+    let mut rich = Rich::new(text)?;
+    // The open fence's character and length, inside a fenced block.
+    let mut fence: Option<(u8, usize)> = None;
+    // Whether the open block is code, none before the first line's text
+    // and after a fence's edge.
+    let mut open: Option<bool> = None;
+    // The line ending before this line in the same block.
+    let mut ending: Option<Range<usize>> = None;
+    // The shortest backtick and tilde fences found never closed: a later
+    // one at least as long cannot close either, so it is text unscanned.
+    let mut unclosed = (usize::MAX, usize::MAX);
+    let mut at = 0;
+    for whole in text.split_inclusive('\n') {
+        let start = at;
+        at += whole.len();
+        let line = whole.trim_end_matches('\n').trim_end_matches('\r');
+        let end = start + line.len();
+        let next = (end < at).then_some(end..at);
+        match fence {
+            None => {
+                let opened = opens(line).filter(|&(mark, length)| {
+                    let shortest = if mark == b'`' {
+                        &mut unclosed.0
+                    } else {
+                        &mut unclosed.1
+                    };
+                    if length >= *shortest {
+                        return false;
+                    }
+                    let found = closed(text, at, mark, length);
+                    if !found {
+                        *shortest = length;
+                    }
+                    found
+                });
+                if let Some(opened) = opened {
+                    // The fence's own line shows nothing; its code is a
+                    // block of its own.
+                    fence = Some(opened);
+                    open = None;
+                    ending = None;
+                    continue;
+                }
+            }
+            Some((mark, length)) => {
+                if closes(line, mark, length) {
+                    fence = None;
+                    open = None;
+                    ending = None;
+                    continue;
+                }
+            }
+        }
+        let code = fence.is_some();
+        if open != Some(code) {
+            rich.block("", "", code)?;
+            open = Some(code);
+        } else if let Some(ending) = ending.take() {
+            rich.line(ending)?;
+        }
+        if code {
+            if !line.is_empty() {
+                rich.text(start..end, Look::PLAIN, None)?;
+            }
+        } else {
+            spans(&mut rich, text, start..end)?;
+        }
+        ending = next;
+    }
+    Ok(rich)
+}
+
+/// A fence opening on `line`: up to three spaces, then three or more
+/// backticks or tildes, a backtick fence's rest holding none.
+fn opens(line: &str) -> Option<(u8, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let mark = *rest.as_bytes().first()?;
+    if mark != b'`' && mark != b'~' {
+        return None;
+    }
+    let length = rest.bytes().take_while(|&byte| byte == mark).count();
+    let info = rest.get(length..).unwrap_or("");
+    (length >= 3 && !(mark == b'`' && info.contains('`'))).then_some((mark, length))
+}
+
+/// Whether a line of `text` from byte `from` on closes a fence of
+/// `length` `mark`s: one never closed is no fence, its line text (a row
+/// of tildes as a separator). A scan that fails is for a fence shorter
+/// than every one that failed before (`build_typed` keeps the shortest),
+/// so with lengths distinct and summing within the text at most the
+/// square root of twice its length fail for each mark; one that succeeds stops at the
+/// closer, and the lines up to it are the fence's, so those never
+/// overlap.
+fn closed(text: &str, from: usize, mark: u8, length: usize) -> bool {
+    text.get(from..)
+        .unwrap_or("")
+        .split('\n')
+        .any(|line| closes(line.trim_end_matches('\r'), mark, length))
+}
+
+/// Whether `line` closes a fence of `length` `mark`s: up to three
+/// spaces, at least as many of them, then only blanks.
+fn closes(line: &str, mark: u8, length: usize) -> bool {
+    let rest = line.trim_start_matches(' ');
+    let count = rest.bytes().take_while(|&byte| byte == mark).count();
+    line.len() - rest.len() <= 3
+        && count >= length
+        && rest
+            .get(count..)
+            .is_some_and(|after| after.trim_matches([' ', '\t']).is_empty())
+}
+
+/// A typed line's `range` of `text`: as typed, a run of backticks and
+/// the next run of as many on the line closing a code span, shown
+/// without them.
+fn spans(rich: &mut Rich, text: &str, range: Range<usize>) -> Result<(), rich::Error> {
+    let line = text.get(range.start..range.end).unwrap_or("").as_bytes();
+    let mut shown = 0;
+    let mut at = 0;
+    while at < line.len() {
+        if line.get(at) != Some(&b'`') {
+            at += 1;
+            continue;
+        }
+        let run = line
+            .get(at..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|&&b| b == b'`')
+            .count();
+        let inner = at + run;
+        let mut close = None;
+        let mut look = inner;
+        while look < line.len() {
+            let length = line
+                .get(look..)
+                .unwrap_or(&[])
+                .iter()
+                .take_while(|&&b| b == b'`')
+                .count();
+            if length == run {
+                close = Some(look);
+                break;
+            }
+            look += length.max(1);
+        }
+        let Some(close) = close else {
+            at = inner;
+            continue;
+        };
+        if shown < at {
+            rich.text(range.start + shown..range.start + at, Look::PLAIN, None)?;
+        }
+        if inner < close {
+            rich.text(range.start + inner..range.start + close, Look::CODE, None)?;
+        }
+        shown = close + run;
+        at = shown;
+    }
+    if shown < line.len() {
+        rich.text(range.start + shown..range.end, Look::PLAIN, None)?;
+    }
+    Ok(())
 }
 
 fn build(text: &str, document: &Document) -> Result<Rich, rich::Error> {
@@ -241,6 +426,68 @@ mod tests {
              \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
              fn x() {}\nlet y;"
         );
+    }
+
+    /// The person's text shows as typed: nothing but code read as
+    /// Markdown, every line kept.
+    #[test]
+    fn typed_text_shows_as_typed() {
+        let typed = "Two things:\n  fix `__init__.py`\n- a\n+ b\n# not a heading\n---\n\
+                     2*3*4, \\.rs$, Option<std::path::PathBuf>, 5~10, [a](b)\n\n\\\
+                     \r\nend";
+        let rich = super::typed(typed).unwrap();
+        assert_eq!(rich.source(), typed);
+        assert_eq!(rich.shown(), typed.replace(['`', '\r'], ""));
+        let code = rich.shown().find("__init__").unwrap();
+        assert_eq!(rich.look_at(code), Look::CODE);
+        assert_eq!(rich.look_at(0), Look::PLAIN);
+    }
+
+    /// A fenced block shows its code without its fences; a fence never
+    /// closed, a lone backtick and a row of tildes are text; past styled
+    /// text's bounds the text is left to show plain.
+    #[test]
+    fn typed_fences_and_lone_backticks() {
+        let rich = super::typed("see:\n```sh\nls -l\n  cd x\n```\ndone ` here").unwrap();
+        assert_eq!(rich.shown(), "see:\nls -l\n  cd x\ndone ` here");
+        for typed in ["~~~\nopen\nstill", "a\n~~~~~~~~\nb", "```"] {
+            assert_eq!(super::typed(typed).unwrap().shown(), typed);
+        }
+        let rich = super::typed("~~~~\nin ~~~\n~~~~~\nout").unwrap();
+        assert_eq!(rich.shown(), "in ~~~\nout");
+        // Openers that cannot close each other scan once, then not again.
+        let many = "~~~a\n".repeat(20_000);
+        assert_eq!(super::typed(&many).unwrap().shown(), many.trim_end());
+        // Fences alone show plain, not an empty bubble.
+        assert!(super::typed("```\n```").is_none());
+        assert!(super::typed("```\n\n\n```").is_none());
+        assert!(super::typed(&"a\n".repeat(rich::MAX_RECORDS)).is_none());
+        assert!(super::typed(&"a".repeat(rich::MAX_BYTES + 1)).is_none());
+        assert!(opens("   ```rust") == Some((b'`', 3)) && opens("    ```").is_none());
+        assert!(opens("``` a`b").is_none() && opens("``").is_none());
+        assert!(closes("````  ", b'`', 3) && !closes("``", b'`', 3) && !closes("``` x", b'`', 3));
+    }
+
+    /// The pieces `typed` lays stand for the source bytes they show: a
+    /// line's text and its ending, a fence's code in a code block, the
+    /// fences and a CRLF's carriage return standing for nothing shown;
+    /// two spans on a line.
+    #[test]
+    fn typed_pieces_stand_for_their_bytes() {
+        let source = "a\r\ne\r\n```\r\nx\r\n```\r\n`b` c `d`";
+        let mut expected = Rich::new(source).unwrap();
+        expected.block("", "", false).unwrap();
+        expected.text(0..1, Look::PLAIN, None).unwrap();
+        expected.line(1..3).unwrap();
+        expected.text(3..4, Look::PLAIN, None).unwrap();
+        expected.block("", "", true).unwrap();
+        expected.text(11..12, Look::PLAIN, None).unwrap();
+        expected.block("", "", false).unwrap();
+        expected.text(20..21, Look::CODE, None).unwrap();
+        expected.text(22..25, Look::PLAIN, None).unwrap();
+        expected.text(26..27, Look::CODE, None).unwrap();
+        assert_eq!(super::typed(source).unwrap(), expected);
+        assert_eq!(expected.shown(), "a\ne\nx\nb c d");
     }
 
     /// ATX headings of the top two levels are larger, a setext one only

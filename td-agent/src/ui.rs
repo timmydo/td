@@ -248,6 +248,15 @@ fn reply_body(message: Message, text: &str) -> Result<Message, MessagesError> {
     }
 }
 
+/// The person's text as their message's body: as typed, its code styled
+/// (`markdown::typed`), or plain when styled text cannot hold it.
+fn typed_body(message: Message, text: &str) -> Result<Message, MessagesError> {
+    match crate::markdown::typed(text) {
+        Some(rich) => message.rich(rich),
+        None => message.text(text),
+    }
+}
+
 /// A notice of td-agent's own: a divider across the transcript labelled
 /// by what it is about (DESIGN.md §4, Notices).
 fn divider(topic: &str) -> Result<Message, MessagesError> {
@@ -2532,7 +2541,7 @@ impl App {
                 let pushed = Message::new(YOU)
                     .map(|m| m.side(Side::Right))
                     .and_then(|m| self.stamped(m, event.time))
-                    .and_then(|m| m.text(&text))
+                    .and_then(|m| typed_body(m, &text))
                     .and_then(|m| self.show_pictures(m, &pictures))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
@@ -8607,8 +8616,9 @@ pub mod tests {
     #[test]
     fn a_long_conversation_keeps_its_most_recent_messages_in_view() {
         let mut app = app();
-        // Past the list's byte bound: 140 messages of 128 KiB.
-        let big = "x".repeat(MAX_TEXT);
+        // Past the list's byte bound: 140 messages of 64 KiB, each held
+        // as its source and its styled text.
+        let big = "x".repeat(MAX_TEXT / 2);
         for n in 0..140u64 {
             app.update(user(n * 3 + 1, &big), 0);
             app.update(
@@ -9244,6 +9254,23 @@ pub mod tests {
         );
     }
 
+    /// The person's message shows as typed, its code styled: its lines
+    /// kept, accidental Markdown left as it is, a copy the text as typed.
+    #[test]
+    fn the_persons_text_shows_as_typed_with_its_code_styled() {
+        let mut app = app();
+        let typed = "see `x` and **y**\n- a\n# b";
+        app.update(user(1, typed), 0);
+        let shown = text(&app);
+        for row in ["see x and **y**", "- a", "# b"] {
+            assert!(shown.contains(row), "{row}: {shown}");
+        }
+        let last = app.transcript().len() - 1;
+        let message = app.transcript().message(last).unwrap();
+        assert_eq!(message.section_text(0), Some(typed));
+        assert_eq!(&*app.transcript().message_text(last).unwrap(), typed);
+    }
+
     /// The person's messages sit on the right, a bubble in from the
     /// edge, and replies across the list on the paper, each with its
     /// event's time, in the window's zone, and the whole date its
@@ -9619,11 +9646,14 @@ pub mod tests {
     #[test]
     fn a_stream_at_the_transcripts_limit_makes_room() {
         let mut app = app();
-        // Sixteen messages of just under a mebibyte: the transcript's 16
-        // MiB all but full.
-        let big = "x".repeat(messages::MAX_TEXT_BYTES - 1024);
-        let full = (messages::MAX_TOTAL_BYTES / big.len()) as u64;
-        for seq in 1..=full {
+        // Messages of just under half a mebibyte, each held as its source
+        // and its styled text: the transcript's 16 MiB all but full.
+        let big = "x".repeat((messages::MAX_TEXT_BYTES - 1024) / 2);
+        let empty = app.transcript().storage_bytes();
+        app.update(user(1, &big), 0);
+        let cost = app.transcript().storage_bytes() - empty;
+        let full = (messages::MAX_TOTAL_BYTES / cost) as u64;
+        for seq in 2..=full {
             app.update(user(seq, &big), 0);
         }
         assert_eq!(app.transcript().len() as u64, full);
