@@ -36,6 +36,7 @@ use td_ui::chrome::{segments_cells, Emphasis, Segment, Well, ROW};
 use td_ui::editor::{Event as PaneEvent, Outcome as PaneOutcome};
 use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
+use td_ui::prose::Faces;
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER,
 };
@@ -4026,6 +4027,16 @@ impl App {
         if self.transcript.set_icons(icons) {
             self.touch();
         }
+    }
+
+    /// The prose faces a reply's styled text is measured and drawn in, or
+    /// none for the cell (DESIGN.md §4, Markdown).
+    pub fn set_prose(&mut self, faces: Option<Faces>) {
+        // A refusal leaves the transcript no layout; placing the panes
+        // lays it out again, letting the oldest messages go if it must,
+        // and says so.
+        let _ = self.transcript.set_prose(faces);
+        self.place();
     }
 
     /// Where the pointer moves with no button held, or `None`: the

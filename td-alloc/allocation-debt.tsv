@@ -1058,7 +1058,7 @@ td-agent/src/web.rs	allocation-macro	7
 td-agent/src/web.rs	unchecked-growth-or-clone	3
 td-agent/src/window.rs	allocating-conversion	23
 td-agent/src/window.rs	allocation-macro	39
-td-agent/src/window.rs	unchecked-growth-or-clone	10
+td-agent/src/window.rs	unchecked-growth-or-clone	11
 td-agent/src/window_wire.rs	allocating-conversion	43
 td-agent/src/window_wire.rs	allocation-macro	139
 td-agent/src/window_wire.rs	heap-owner	5

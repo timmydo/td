@@ -59,6 +59,9 @@ impl Look {
     pub const CODE: Self = Self(8);
     /// Quieter ink: a quotation, an image's stand-in.
     pub const QUIET: Self = Self(16);
+    /// Monospace without code's ground, so text laid out by its columns
+    /// (a table as written) stays aligned in prose.
+    pub const MONO: Self = Self(32);
 
     pub fn has(self, other: Self) -> bool {
         other.0 != 0 && self.0 & other.0 == other.0

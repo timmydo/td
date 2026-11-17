@@ -846,7 +846,7 @@ fn units_at(units: u16, upem: u16, size: i64) -> u32 {
 }
 
 /// `UNIT`s rounded to the nearest pixel.
-fn pixels(units: u64) -> u32 {
+pub(crate) fn pixels(units: u64) -> u32 {
     u32::try_from(units.saturating_add(u64::from(UNIT / 2)) / u64::from(UNIT)).unwrap_or(u32::MAX)
 }
 

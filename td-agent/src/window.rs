@@ -1071,6 +1071,15 @@ pub fn run(broker: Broker, control: Option<PathBuf>) -> Result<(), String> {
     // The pinned face draws the transcript's icons; the bitmap one has
     // none, so its buttons keep their captions.
     app.set_icons(typeface.is_some());
+    // A reply's styled text in Noto Sans, its code in the pinned face;
+    // without the faces it draws on the cell. The raster draws with one
+    // copy and the transcript measures with the other.
+    let prose = td_ui::pinned_face::prose_or_note(
+        "td-agent",
+        std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
+        typeface.as_ref(),
+    );
+    app.set_prose(prose.clone());
     let (peer, far, title) = match broker {
         Broker::Here { state, program } => (
             attached(state.root(), &program)?,
@@ -1108,7 +1117,8 @@ pub fn run(broker: Broker, control: Option<PathBuf>) -> Result<(), String> {
         asked_new: false,
         more: false,
     };
-    let ran = td_ui::window::run(&mut window, stream, std::env::temp_dir(), typeface);
+    let ran =
+        td_ui::window::run_with_prose(&mut window, stream, std::env::temp_dir(), typeface, prose);
     // What the last input asked goes before the window does.
     window.serve();
     // What could not be told to have got there is not lost without a word.

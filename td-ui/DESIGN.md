@@ -1886,7 +1886,18 @@ any block in a block of its own, a source past the bound, links up to
 storage; and the draw stream at two scales: the prefix in quiet ink,
 bold and italic font styles, a link's ink and underline, a strike's
 line, and the code ground under a code span and across a code block's
-row.
+row. In prose faces, synthetic ones of exact widths, at scales one
+through four: text that wraps on the cell fitting a row and text that
+fits the cell wrapping, rows a prose line tall, glyphs in `Sans` at
+their summed pens, a drag selecting by them and `set_prose(None)`
+restoring the cell layout; no row past its limit when a word carried
+down leaves the next scalar no room; a mark of no width selected with
+the scalar before it and a control drawn as the replacement; a link's
+press and tip over its measured glyphs and a code span in `Mono`;
+a prefix in `Mono` on the row's line, clipped off the text, and an
+underline on the prose baseline; a bubble as wide as its text measures;
+`Look::MONO` in `Mono` with no ground, plain on the cell; and a new
+scale measured again.
 
 For pictures `tests/picture.rs` holds a picture's bounds and its
 pixels' length, the fit size keeping the aspect, bound by either axis,
@@ -3423,7 +3434,9 @@ since nothing counts rows then, may lay out past
 until a trim makes room.
 
 The layout is rows in the cell model: a `ROW`-tall header, title, text
-and more rows a cell high, and a `GAP` below each message, all scaled.
+and more rows a cell high, and a `GAP` below each message, all scaled;
+a styled section's rows are a prose line tall while the list has prose
+faces (Styled sections, below), a cell without them.
 The rectangle less a `chrome::List`-sized scrollbar gutter holds the
 rows, text a cell in from each side. Text wraps at the columns that
 leave: a newline ends a row, a row breaks after the last space or tab
@@ -3527,8 +3540,9 @@ and a focused one's `SELECTED_ROW`); a captioned button is not lit. `tip` names 
 under it, icon or caption: its message, its `Target`, its
 rectangle and its tooltip's text, `COPY_TIP` (naming the list's own
 `CopyMessage` chord), the action's tip, or its caption without one;
-over a styled section's link it names the link (`Target::Link`), its
-cells on that row and its target, so where a link leads shows before it
+over a styled section's link it names the link (`Target::Link`), the
+span its glyphs take on that row and its target, so where a link leads
+shows before it
 is followed. The
 list draws no tooltip and keeps no clock: the owner places a
 `chrome::Tooltip` on `tip`'s rectangle after its own delay. An action
@@ -3597,8 +3611,12 @@ and `C-End`; `M-Up` and `M-Down`; `Return` to fold; `C-c`, `C-S-c` and
 `C-a`), routing the wheel and keys to the list when it has focus, focus
 itself (`Event::Focus`), and what a message means. Painting and input
 allocate nothing, but for the text a copy hands the clipboard and the
-rows a fold lays out, which it reserves fallibly as its setter does;
-nothing reads a clock, a file or the environment. `shown`,
+rows a fold lays out, which it reserves fallibly as its setter does,
+and the prose measures' bounded cache under its own budget, which the
+layout fills with the advances a paint or hit test asks, so these
+measure again (parsing a face) only after the cache has started over
+at its bound; nothing
+reads a clock, a file or the environment. `shown`,
 `copy_button` and `action_button` give a consumer the shown rows and a
 header's buttons for its driven read-back and its tests.
 
@@ -3612,11 +3630,13 @@ as written, or `put`, text the source does not hold as such (a soft
 break's space, an entity's character, an image's stand-in), standing
 for a range of the source whole. Each piece has a `Look`: bold and
 italic through the glyph's font style, struck through, code on a ground
-of its own, or quiet ink, and it may be in a link, whose target `link`
+of its own, monospace without it (`MONO`, for text aligned by its
+columns, such as a table as written), or quiet ink, and it may be in a
+link, whose target `link`
 records. Blocks give rows their shape: each starts on a row of its own
 behind a prefix, a first row's and its later rows' of as many
 characters (a bullet and spaces, a quote's bar on both), the block
-wrapped to the columns the prefix leaves; a code block stands on the
+wrapped to the room the prefix leaves; a code block stands on the
 code ground; `gap` is a block with no prefix, an empty row unless text
 follows it; `line` ends a row inside a block, standing for a hard
 break's source. A piece holds no line ending, a prefix no control
@@ -3629,11 +3649,36 @@ looks, blocks and links together), and the list counts all of it,
 records by the room they take, against its budgets.
 
 The rows lay out over the shown text, so selection, words and the
-`Shown` read-back work as on plain text, a row's columns starting past
+`Shown` read-back work as on plain text, a row's text starting past
 its prefix; the read-back holds a row's text, not its prefix. A prefix
 takes at most half a row's columns, cut to them when it is wider, so a
 deep nesting in a narrow bubble keeps its text half the row; the indent
 is the row's own, so painting and every hit test use what wrapping did.
+
+`Controller::set_prose` gives the list `prose::Faces`, or takes them
+away, and lays it out again; it keeps a `prose::Metrics` of its own at
+the surface's scale, measured again when a resize changes the scale,
+since it paints through `Composition` and never sees the raster's.
+Each styled scalar is measured in the glyph style it is drawn in: bold
+and italic as its look says, in `Mono` when it is code (a code block's
+or a code span's) and `Sans` otherwise; without faces every scalar is
+the cell's, and the layout, the draw stream and every hit are the cell
+model's exactly. A block's text wraps to the pixels its prefix leaves
+by the same rule as plain text, a scalar's advance in place of a
+column, a row holding a scalar at least, so its rows still tile the
+shown text; a row is a prose line tall (`Metrics::line`, in font
+pixels rounded up), a cell at the least. Pens are summed in `prose::UNIT`s
+and rounded to pixels as prose rounds them, so one walk of a row
+(`styled_walk`) gives painting, a press's byte, a link under the
+pointer and its tooltip's span, and a message's laid width in whole
+cells, the same measures. A press or a drag falls before the first
+scalar whose middle lies past it, and a word or a link is the scalar
+whose right lies past it; a mark of no width goes with the scalar it
+follows. The list measures with its own `Metrics` from the faces it
+was given; a raster that refuses those faces at a scale draws its
+`Sans` and `Mono` glyphs on the cell at the measured pens, so an owner
+gives the list and the raster the same faces. A draw sink must not call
+back into the list: the walk holds the measures while it draws.
 An excerpt section given styled text keeps its cut at `EXCERPT_ROWS`
 and its more row.
 
@@ -3653,14 +3698,20 @@ selection survives the replacement only where the section's shown text
 before its points is unchanged; a point past the first change clears
 it.
 
-It is painted a character a cell at a time: the prefix in
-`LINE_NUMBER` ink, the code ground (`CHROME` on paper, `PAPER` on a
-bubble) across a code block's rows from past its prefix and under code
-spans, the selection's ground over both, a link in `ACCENT` ink with an
-underline a scale pixel high two pixels above the cell's foot, struck
-text with a line through its middle, quiet text in `LINE_NUMBER`, a tab
-as a space and another control scalar as the raster's replacement, as
-on plain rows. A click on a link answers `Outcome::Link` with its
+It is painted a character at a time at its pen: the prefix in
+`LINE_NUMBER` ink, a cell a character (with faces in `Mono`, on the
+text's baseline, clipped off the text), the code ground (`CHROME` on
+paper, `PAPER` on a bubble)
+across a code block's rows from past its prefix and under code spans,
+the selection's ground over both under each scalar's advance, a link in
+`ACCENT` ink with an underline a scale pixel high on the baseline,
+struck text with a line through its middle, quiet text in
+`LINE_NUMBER`, a tab as a space and another control scalar as the
+raster's replacement, as on plain rows. With faces a glyph is a prose
+`Glyph` at its pen and the row's top, clipped to the text area and
+the row, which the raster sets on the line's baseline, so ink reaching
+past the line box or behind the next glyph's ground is cut; without
+them it is the cell's text run. A click on a link answers `Outcome::Link` with its
 message, section and link, whose target `Controller::link` gives: a
 press on text, not extending and not paired with the click before, and
 its release on the link with the pointer never more than `NEAR` scaled
@@ -4260,11 +4311,13 @@ glyphs it shows, once.
 
 ## Proportional faces
 
-**Status: increments 38 to 40 landed: the faces are pinned, delivered,
+**Status: increments 38 to 41 landed: the faces are pinned, delivered,
 found and loaded, and td-ui measures, wraps and draws prose in them, at
 the prose size or any size within a bound (see "Sizes").
 td-web, its first consumer, draws its pages in prose (td-web/DESIGN.md
-§5, its increment 5).** Every face above lays text on a
+§5, its increment 5); the shared message list draws a styled section in
+prose when its owner gives it faces, as td-agent's transcript does
+(Shared message list, Styled sections).** Every face above lays text on a
 cell: one advance for every scalar, glyphs clipped to it. Prose reads
 better in a face whose glyphs take their own widths, and td-web, which
 shows documents, needs one. This section adds two proportional families
@@ -4631,7 +4684,8 @@ from the monospace face, its stand-in or Unifont. Nor does the seam
 read prose back over proportional faces: `driven::text` reads the cell
 grid, so a
 consumer whose text matters to an agent says it through its own verbs
-until the seam reads the pieces a consumer laid out.
+until the seam reads the pieces a consumer laid out; the message list's
+`shown` read-back gives its rows' text whatever face draws it.
 
 ## Independently landable increments
 
@@ -4897,6 +4951,15 @@ regressions. Those increments extend the original sequence below.
     reusing the eldest's storage and one shared scratch, for td-web's
     styled pages (td-web/DESIGN.md §10, increment 6). The prose size
     draws and measures as before. Landed.
+41. Prose in the message list ("Shared message list", "Styled
+    sections"): `Controller::set_prose` and `proportional`, a styled
+    section's rows `Kind::Styled`, a prose line tall, wrapped by
+    measured advances (`wrap_by`), and one measuring walk for painting,
+    hits, tooltips and laid widths; code and `Look::MONO` in `Mono`,
+    prefixes in `Mono` a cell a character; without faces the cell
+    model exactly.
+    td-agent's transcript is its first consumer (td-agent/DESIGN.md §4,
+    Markdown). Landed.
 
 ## Foreground terminal relay
 

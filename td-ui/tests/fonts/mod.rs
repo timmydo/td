@@ -361,3 +361,80 @@ pub fn square(x: i32, y: i32, size: i32) -> Vec<(i32, i32, bool)> {
         (x + size, y, true),
     ]
 }
+
+/// A glyph's outline: an axis-aligned rectangle.
+pub fn rectangle(left: i32, bottom: i32, right: i32, top: i32) -> Vec<(i32, i32, bool)> {
+    vec![
+        (left, bottom, true),
+        (left, top, true),
+        (right, top, true),
+        (right, bottom, true),
+    ]
+}
+
+/// A font mapping each scalar to its glyph, with each glyph's advance.
+pub fn encoded(glyphs: &[(char, Glyph, u16)], ascender: i16, descender: i16) -> Vec<u8> {
+    encoded_reaching(glyphs, ascender, descender, (descender, ascender))
+}
+
+/// `encoded` at `units_per_em`.
+pub fn encoded_per_em(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    units_per_em: u16,
+) -> Vec<u8> {
+    encoded_in(
+        glyphs,
+        ascender,
+        descender,
+        (descender, ascender),
+        units_per_em,
+    )
+}
+
+/// `encoded`, its `head` saying its glyphs reach from `low` to `high`.
+pub fn encoded_reaching(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    reach: (i16, i16),
+) -> Vec<u8> {
+    encoded_in(glyphs, ascender, descender, reach, 1000)
+}
+
+pub fn encoded_in(
+    glyphs: &[(char, Glyph, u16)],
+    ascender: i16,
+    descender: i16,
+    (low, high): (i16, i16),
+    units_per_em: u16,
+) -> Vec<u8> {
+    let mut sorted: Vec<(char, u16)> = glyphs
+        .iter()
+        .enumerate()
+        .map(|(index, (scalar, _, _))| (*scalar, index as u16 + 1))
+        .collect();
+    sorted.sort();
+    let mut builder = Builder::new(
+        std::iter::once(Glyph::Empty)
+            .chain(glyphs.iter().map(|(_, glyph, _)| glyph.clone()))
+            .collect(),
+    );
+    builder.advances = std::iter::once(0)
+        .chain(glyphs.iter().map(|(_, _, advance)| *advance))
+        .collect();
+    builder.format4 = sorted
+        .into_iter()
+        .map(|(scalar, glyph)| {
+            let code = u32::from(scalar) as u16;
+            Segment::Delta(code, code, glyph.wrapping_sub(code))
+        })
+        .collect();
+    builder.ascender = ascender;
+    builder.descender = descender;
+    builder.y_min = low;
+    builder.y_max = high;
+    builder.units_per_em = units_per_em;
+    builder.font()
+}

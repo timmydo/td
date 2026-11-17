@@ -12,6 +12,8 @@
 //! window's clipboard, the bounds, the geometry and draw-stream and pixel
 //! checks at scales one through four.
 
+mod fonts;
+
 use std::sync::Arc;
 
 use td_ui::atlas::Style as FontStyle;
@@ -23,9 +25,10 @@ use td_ui::messages::{
     MIN_COLUMNS, MORE,
 };
 use td_ui::picture::{Fitted, Picture};
+use td_ui::prose::{Faces, Metrics};
 use td_ui::raster::{
-    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, ACCENT, BORDER, BUBBLE,
-    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
+    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily, ACCENT,
+    BORDER, BUBBLE, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
 };
 use td_ui::rich::{
     Error as RichError, Look, Rich, MAX_BYTES as RICH_MAX_BYTES, MAX_RECORDS as RICH_MAX_RECORDS,
@@ -3500,4 +3503,441 @@ fn a_picture_without_text_is_framed_only_when_the_selection_passes_it() {
     let end = at(text_row(&list, 1), 3, 1);
     drag_points(&mut list, start, end);
     assert!(framed(&list));
+}
+
+/// A Sans of exact pixel widths at the prose size, 16 pixels an em of
+/// 1000 units: 'i' and ' ' 4 pixels, 'x' 8 and 'm' 16; an 800 ascender
+/// and a -300 descender, so its line is taller than a cell.
+fn prose_faces() -> Faces {
+    let sans = fonts::encoded(
+        &[
+            // Faces measure their cell by '0'.
+            (
+                '0',
+                fonts::Glyph::Simple(vec![fonts::rectangle(0, 0, 500, 500)]),
+                600,
+            ),
+            (' ', fonts::Glyph::Empty, 250),
+            // A combining acute: a mark of no width.
+            ('\u{301}', fonts::Glyph::Empty, 0),
+            (
+                'i',
+                fonts::Glyph::Simple(vec![fonts::rectangle(0, 0, 150, 500)]),
+                250,
+            ),
+            (
+                'm',
+                fonts::Glyph::Simple(vec![fonts::rectangle(0, 0, 900, 500)]),
+                1000,
+            ),
+            (
+                'x',
+                fonts::Glyph::Simple(vec![fonts::rectangle(0, 0, 400, 500)]),
+                500,
+            ),
+        ],
+        800,
+        -300,
+    );
+    let four = |bytes: Vec<u8>| [bytes.clone(), bytes.clone(), bytes.clone(), bytes];
+    Faces::new(four(sans.clone()), four(sans)).unwrap()
+}
+
+/// `source` as one styled paragraph: `link` over the bytes it names, code
+/// over `code`'s, the rest plain.
+fn paragraph(
+    source: &str,
+    link: Option<std::ops::Range<usize>>,
+    code: Option<std::ops::Range<usize>>,
+) -> Rich {
+    let mut rich = Rich::new(source).unwrap();
+    let mut at = 0;
+    let marks = [(link.clone(), true), (code, false)];
+    let mut spans: Vec<(std::ops::Range<usize>, bool)> = marks
+        .into_iter()
+        .filter_map(|(range, link)| range.map(|range| (range, link)))
+        .collect();
+    spans.sort_by_key(|(range, _)| range.start);
+    for (range, is_link) in spans {
+        if at < range.start {
+            rich.text(at..range.start, Look::PLAIN, None).unwrap();
+        }
+        if is_link {
+            let target = rich.link("http://x").unwrap();
+            rich.text(range.clone(), Look::PLAIN, Some(target)).unwrap();
+        } else {
+            rich.text(range.clone(), Look::CODE, None).unwrap();
+        }
+        at = range.end;
+    }
+    if at < source.len() {
+        rich.text(at..source.len(), Look::PLAIN, None).unwrap();
+    }
+    rich
+}
+
+/// With prose faces a styled section wraps by measured width, its rows a
+/// prose line tall, each glyph in Sans (code in Mono) at its summed pen;
+/// a drag selects and a link answers by the same measures, its tip as
+/// wide as its glyphs; without them it is laid on the cell as before.
+#[test]
+fn styled_text_is_measured_in_prose_faces_when_they_are_loaded() {
+    let narrow = "iiiiiiiiii iiiiiiiiii iiiiiiiiii";
+    let wide = "mmmm mmmm mmmm";
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 18, 300);
+        assert!(!list.proportional());
+        list.push(
+            Message::new("a")
+                .unwrap()
+                .rich(paragraph(narrow, None, None))
+                .unwrap(),
+        )
+        .unwrap();
+        list.push(
+            Message::new("b")
+                .unwrap()
+                .rich(paragraph(wide, None, None))
+                .unwrap(),
+        )
+        .unwrap();
+        // On the cell: eighteen columns wrap the narrow text, not the wide.
+        let cell = rows(&list);
+        assert_eq!(
+            cell,
+            [
+                "H0",
+                "iiiiiiiiii ",
+                "iiiiiiiiii ",
+                "iiiiiiiiii",
+                "G0",
+                "H1",
+                wide,
+                "G1"
+            ],
+            "scale {scale}"
+        );
+        assert_eq!(
+            text_row(&list, 0).height,
+            CELL_HEIGHT as u32 * u32::from(scale)
+        );
+        // In prose: 144 pixels hold the narrow text's 128, and not the
+        // wide text's 220.
+        list.set_prose(Some(prose_faces())).unwrap();
+        assert!(list.proportional());
+        assert_eq!(
+            rows(&list),
+            ["H0", narrow, "G0", "H1", "mmmm mmmm ", "mmmm", "G1"],
+            "scale {scale}"
+        );
+        let metrics = Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap());
+        let line = metrics.line().height.div_ceil(u32::from(scale));
+        assert!(line > CELL_HEIGHT as u32);
+        let row = text_row(&list, 0);
+        assert_eq!(row.height, line * u32::from(scale), "scale {scale}");
+        // Each glyph in Sans at its pen, four pixels on, from a cell in.
+        let mut glyphs = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph {
+                x,
+                y,
+                scalar,
+                style,
+            } = draw.primitive
+            {
+                if y == row.y && scalar == 'i' {
+                    glyphs.push((x, style.family));
+                }
+            }
+        });
+        assert_eq!(glyphs.len(), 30, "scale {scale}");
+        let left = row.x + CELL_WIDTH as i64 * s;
+        for (nth, (x, family)) in glyphs.iter().take(10).enumerate() {
+            assert_eq!(*x, left + 4 * s * nth as i64, "scale {scale}");
+            assert_eq!(*family, TextFamily::Sans);
+        }
+        // A drag from the fifth 'i' to the eighth selects three, by the
+        // glyphs' measures, not the cell's.
+        let mut board = Board::default();
+        let point = |nth: i64| (left + 4 * s * nth + s, row.y + 2 * s);
+        press(&mut list, &mut board, point(4), false, 0);
+        let (x, y) = point(7);
+        list.event(Event::Move { x, y }, &mut board);
+        release(&mut list, &mut board, point(7), 10);
+        assert_eq!(list.selected_text().unwrap().as_deref(), Some("iii"));
+        // Back on the cell, the layout is the cell's again.
+        list.set_prose(None).unwrap();
+        assert!(!list.proportional());
+        assert_eq!(rows(&list), cell, "scale {scale}");
+    }
+}
+
+/// In prose a link answers a press over its measured glyphs, its tip as
+/// wide as they are, and a code span draws in Mono.
+#[test]
+fn a_prose_link_and_code_span_keep_their_measures() {
+    // "ii mm x": the link over "mm", code over "x".
+    let source = "ii mm x";
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 30, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        list.push(
+            Message::new("a")
+                .unwrap()
+                .rich(paragraph(source, Some(3..5), Some(6..7)))
+                .unwrap(),
+        )
+        .unwrap();
+        let row = text_row(&list, 0);
+        let left = row.x + CELL_WIDTH as i64 * s;
+        // "ii " is twelve pixels, so the link runs 12..44.
+        let over = (left + 12 * s + 20 * s, row.y + 2 * s);
+        list.hover(Some(over));
+        let tip = list.tip().unwrap();
+        assert_eq!(
+            (tip.rect.x, tip.rect.width),
+            (left + 12 * s, 32 * scale as u32)
+        );
+        let mut board = Board::default();
+        press(&mut list, &mut board, over, false, 0);
+        assert_eq!(
+            release(&mut list, &mut board, over, 10),
+            Outcome::Link {
+                message: 0,
+                section: 0,
+                link: 0
+            },
+            "scale {scale}"
+        );
+        // Off its glyphs, past the link's end, no link.
+        list.hover(Some((left + 46 * s, row.y + 2 * s)));
+        assert!(list.tip().is_none());
+        let mut code = None;
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph {
+                scalar: 'x', style, ..
+            } = draw.primitive
+            {
+                code = Some(style.family);
+            }
+        });
+        assert_eq!(code, Some(TextFamily::Mono));
+    }
+}
+
+/// A resize to another scale measures again at it: a styled row stays a
+/// prose line tall there.
+#[test]
+fn a_new_scale_measures_prose_again() {
+    let mut list = list(1, 18, 300);
+    list.set_prose(Some(prose_faces())).unwrap();
+    list.push(
+        Message::new("a")
+            .unwrap()
+            .rich(paragraph("iiii", None, None))
+            .unwrap(),
+    )
+    .unwrap();
+    for scale in [2u8, 3, 1] {
+        list.resize(surface(scale), rect(scale, 18, 300)).unwrap();
+        assert!(list.proportional());
+        let metrics = Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap());
+        let line = metrics.line().height.div_ceil(u32::from(scale));
+        assert_eq!(
+            text_row(&list, 0).height,
+            line * u32::from(scale),
+            "scale {scale}"
+        );
+    }
+}
+
+/// A word carried down to a new row in prose leaves the scalar that broke
+/// it no room when advances differ: that scalar starts a row of its own,
+/// so no row is wider than its limit.
+#[test]
+fn a_prose_row_never_runs_past_its_limit() {
+    // 18 columns: 144 pixels; "i " is 8, seventeen 'x' 136, 'm' 16.
+    let source = format!("i {}m", "x".repeat(17));
+    for scale in 1..=4u8 {
+        let mut list = list(scale, 18, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        list.push(
+            Message::new("a")
+                .unwrap()
+                .rich(paragraph(&source, None, None))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = ["H0", "i ", "xxxxxxxxxxxxxxxxx", "m", "G0"];
+        assert_eq!(rows(&list), expected, "scale {scale}");
+    }
+}
+
+/// A mark of no width goes with the scalar before it, and a control
+/// scalar draws as the replacement it was measured as.
+#[test]
+fn prose_marks_and_controls_draw_as_measured() {
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 30, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        // 'i' 'i' a combining acute, 'i' a bell 'i'.
+        let source = "ii\u{301}i\u{7}i";
+        list.push(
+            Message::new("a")
+                .unwrap()
+                .rich(paragraph(source, None, None))
+                .unwrap(),
+        )
+        .unwrap();
+        let row = text_row(&list, 0);
+        let left = row.x + CELL_WIDTH as i64 * s;
+        // A drag from before the first 'i' to past the second's middle
+        // takes the mark with it.
+        let mut board = Board::default();
+        let at = |pixels: i64| (left + pixels * s, row.y + 2 * s);
+        press(&mut list, &mut board, at(1), false, 0);
+        let (x, y) = at(7);
+        list.event(Event::Move { x, y }, &mut board);
+        release(&mut list, &mut board, at(7), 10);
+        assert_eq!(
+            list.selected_text().unwrap().as_deref(),
+            Some("ii\u{301}"),
+            "scale {scale}"
+        );
+        let mut drawn = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph { scalar, y, .. } = draw.primitive {
+                if y == row.y {
+                    drawn.push(scalar);
+                }
+            }
+        });
+        assert!(drawn.contains(&'\u{fffd}'), "scale {scale}: {drawn:?}");
+        assert!(!drawn.contains(&'\u{7}'), "scale {scale}: {drawn:?}");
+    }
+}
+
+/// In prose a block's prefix draws in the monospace face a cell a
+/// character, on the text's line and kept off its text, and a link's
+/// underline sits on the prose baseline.
+#[test]
+fn a_prose_prefix_and_underline_sit_on_the_baseline() {
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let cell = CELL_WIDTH as i64 * s;
+        let mut list = list(scale, 30, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        let mut rich = Rich::new("- ii").unwrap();
+        rich.block("\u{2022} ", "  ", false).unwrap();
+        let link = rich.link("http://x").unwrap();
+        rich.text(2..4, Look::PLAIN, Some(link)).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        let row = text_row(&list, 0);
+        let text = row.x + cell + 2 * cell;
+        let baseline = i64::from(
+            Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap())
+                .line()
+                .baseline,
+        );
+        let (mut bullet, mut underline) = (None, Vec::new());
+        list.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+            Primitive::Glyph {
+                x,
+                y,
+                scalar: '\u{2022}',
+                style,
+            } => bullet = Some((x, y, style.family, draw.clip)),
+            // Each glyph's underline under its own advance.
+            Primitive::Fill { rect, color } if color == ACCENT => underline.push(rect),
+            _ => {}
+        });
+        let (x, y, family, clip) = bullet.unwrap();
+        assert_eq!((x, y, family), (row.x + cell, row.y, TextFamily::Mono));
+        assert_eq!(clip.x + i64::from(clip.width), text, "scale {scale}");
+        assert_eq!(underline.len(), 2, "scale {scale}");
+        let mut x = text;
+        for rect in underline {
+            assert_eq!((rect.x, rect.y), (x, row.y + baseline), "scale {scale}");
+            x += i64::from(rect.width);
+        }
+        assert_eq!(x, text + 8 * s, "scale {scale}");
+    }
+}
+
+/// A bubble is as wide as its styled text measures in prose, not as many
+/// cells as it has characters.
+#[test]
+fn a_prose_bubble_is_as_wide_as_its_text_measures() {
+    for scale in 1..=4u8 {
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let mut list = list(scale, 60, 300);
+        let index = list
+            .push(
+                Message::new("assistant")
+                    .unwrap()
+                    .rich(paragraph(&"i".repeat(40), None, None))
+                    .unwrap()
+                    .side(Side::Left),
+            )
+            .unwrap();
+        // Forty columns and a cell each side.
+        assert_eq!(i64::from(bubble(&list, index).0.width), 42 * cell);
+        // 160 pixels are twenty cells; the header's 21 cells are wider.
+        list.set_prose(Some(prose_faces())).unwrap();
+        assert_eq!(i64::from(bubble(&list, index).0.width), 22 * cell);
+    }
+}
+
+/// `Look::MONO` measures and draws in the monospace face without code's
+/// ground: on the cell it is plain.
+#[test]
+fn mono_text_is_monospace_without_a_ground() {
+    for scale in 1..=4u8 {
+        let mut list = list(scale, 30, 300);
+        let mut rich = Rich::new("| x |").unwrap();
+        rich.text(0..5, Look::MONO, None).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        let cell_draws = draws(&list, scale);
+        list.set_prose(Some(prose_faces())).unwrap();
+        let mut families = Vec::new();
+        let mut grounds = 0;
+        list.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+            Primitive::Glyph {
+                scalar: 'x', style, ..
+            } => families.push(style.family),
+            Primitive::Fill { color, .. } if color == CHROME => grounds += 1,
+            _ => {}
+        });
+        assert_eq!(families, [TextFamily::Mono], "scale {scale}");
+        let mut plain = Rich::new("| x |").unwrap();
+        plain.text(0..5, Look::PLAIN, None).unwrap();
+        let mut other = list_of(scale, plain);
+        assert_eq!(draws(&other, scale), cell_draws, "scale {scale}");
+        other.set_prose(Some(prose_faces())).unwrap();
+        let mut plain_grounds = 0;
+        other.emit(surface(scale).bounds(), &mut |draw| {
+            if matches!(draw.primitive, Primitive::Fill { color, .. } if color == CHROME) {
+                plain_grounds += 1;
+            }
+        });
+        assert_eq!(grounds, plain_grounds, "scale {scale}");
+    }
+}
+
+fn list_of(scale: u8, rich: Rich) -> Controller {
+    let mut list = list(scale, 30, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    list
+}
+
+fn draws(list: &Controller, scale: u8) -> Vec<Draw> {
+    let mut out = Vec::new();
+    list.emit(surface(scale).bounds(), &mut |draw| out.push(draw));
+    out
 }

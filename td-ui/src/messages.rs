@@ -10,11 +10,13 @@
 use crate::picture::{Fitted, Picture};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 
 use crate::chrome::{Button, BUTTON_MARGIN, ROW, SELECTED_ROW};
+use crate::prose::{self, Faces, Metrics, UNIT};
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scrollbar, Surface, ACCENT, BORDER, BUBBLE,
-    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
+    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, TextFamily, ACCENT,
+    BORDER, BUBBLE, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
 };
 use crate::rich::{Look, Rich};
 use crate::window::{Clipboard, Refusal};
@@ -545,14 +547,16 @@ enum Kind {
     Header,
     Title,
     Text,
+    /// A row of a styled section's text, measured in its faces.
+    Styled,
     /// A cell-high slice of a picture: `start` is which, `end` how many.
     Image,
     More,
     Gap,
 }
 
-/// One laid-out row: a byte range of a section's text for `Text`, and
-/// the cells its styled block's prefix takes.
+/// One laid-out row: a byte range of a section's text for `Text` and
+/// `Styled`, and the cells a styled block's prefix takes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Line {
     message: u32,
@@ -564,12 +568,18 @@ struct Line {
 }
 
 impl Line {
-    fn height(self) -> u64 {
+    /// The row's height in font pixels, a styled row's `styled`.
+    fn height(self, styled: u64) -> u64 {
         (match self.kind {
             Kind::Header => ROW,
             Kind::Gap => GAP,
+            Kind::Styled => return styled,
             Kind::Title | Kind::Text | Kind::Image | Kind::More => CELL_HEIGHT,
         }) as u64
+    }
+    /// A row of a section's text, plain or styled.
+    fn is_text(self) -> bool {
+        matches!(self.kind, Kind::Text | Kind::Styled)
     }
     /// The order rows read in, by which an anchor survives a relayout.
     fn key(self) -> (u32, u32, u32) {
@@ -577,7 +587,7 @@ impl Line {
         match self.kind {
             Kind::Header => (self.message, 0, 0),
             Kind::Title => (self.message, section + 1, 0),
-            Kind::Text | Kind::Image => (self.message, section + 2, self.start),
+            Kind::Text | Kind::Styled | Kind::Image => (self.message, section + 2, self.start),
             Kind::More => (self.message, section + 3, 0),
             Kind::Gap => (self.message, u32::MAX, 0),
         }
@@ -604,7 +614,7 @@ impl Line {
                 section,
                 byte,
             },
-            Kind::Text => Point {
+            Kind::Text | Kind::Styled => Point {
                 message,
                 section,
                 byte,
@@ -797,6 +807,16 @@ pub struct Controller {
     pressed: Option<(i64, i64)>,
     /// Whether the face draws icons, so the header's buttons are icons.
     icons: bool,
+    /// The prose faces styled text is measured and drawn in, if loaded,
+    /// and their measures at the surface's scale: the cell's without them.
+    faces: Option<Faces>,
+    metrics: Mutex<Metrics>,
+    /// A styled row's height in font pixels, its baseline below its top in
+    /// pixels, and whether faces measure it: a cell's height and baseline
+    /// on the cell. Kept outside `metrics`, so asking takes no lock.
+    styled: u64,
+    baseline: i64,
+    prose: bool,
     /// Where the pointer hovers with no button held, for the button under
     /// it: lit, and its tooltip `tip`.
     hover_at: Option<(i64, i64)>,
@@ -841,6 +861,11 @@ impl Controller {
             word: false,
             pressed: None,
             icons: false,
+            faces: None,
+            metrics: Mutex::new(Metrics::new(None, surface.scale)),
+            styled: CELL_HEIGHT as u64,
+            baseline: (prose::CELL_BASELINE * surface.scale.value()) as i64,
+            prose: false,
             hover_at: None,
         };
         list.resize(surface, rect)?;
@@ -891,6 +916,14 @@ impl Controller {
         }
         self.surface = surface;
         self.rect = rect;
+        let measured = self
+            .metrics
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .scale();
+        if measured != surface.scale {
+            self.measure(surface.scale);
+        }
         if !self.roomy() {
             return Ok(());
         }
@@ -900,6 +933,7 @@ impl Controller {
         let mut lines = std::mem::take(&mut self.lines);
         let mut result = Ok(());
         let scale = self.surface.scale.value();
+        let mut metrics = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
         for index in 0..self.messages.len() {
             let Some(message) = self.messages.get(index) else {
                 break;
@@ -908,15 +942,25 @@ impl Controller {
             self.first_line.push(start);
             let budget = MAX_LINES.saturating_sub(start);
             let columns = self.wrap_columns(message);
-            if let Err(error) = layout(index, message, columns, scale, budget, &mut lines) {
+            if let Err(error) = layout(
+                index,
+                message,
+                columns,
+                scale,
+                budget,
+                &mut metrics,
+                &mut lines,
+            ) {
                 result = Err(error);
                 break;
             }
-            let laid = laid_columns(message, lines.get(start..).unwrap_or(&[]), columns, scale);
+            let rows = lines.get(start..).unwrap_or(&[]);
+            let laid = laid_columns(message, rows, columns, scale, &mut metrics);
             if let Some(message) = self.messages.get_mut(index) {
                 message.columns = laid;
             }
         }
+        drop(metrics);
         self.lines = lines;
         if let Err(error) = result {
             self.lines.clear();
@@ -925,7 +969,8 @@ impl Controller {
         }
         self.laid = true;
         self.kept = None;
-        self.total_y = self.lines.iter().map(|line| line.height()).sum();
+        let styled = self.styled;
+        self.total_y = self.lines.iter().map(|line| line.height(styled)).sum();
         self.settle(anchor);
         Ok(())
     }
@@ -990,20 +1035,32 @@ impl Controller {
             let budget = MAX_LINES.saturating_sub(self.lines.len());
             let columns = self.wrap_columns(&message);
             let scale = self.surface.scale.value();
-            let laid =
-                layout(index, &message, columns, scale, budget, &mut scratch).and_then(|()| {
-                    self.lines
-                        .try_reserve(scratch.len())
-                        .map_err(|_| Error::Limit)
-                });
+            let mut metrics = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
+            let laid = layout(
+                index,
+                &message,
+                columns,
+                scale,
+                budget,
+                &mut metrics,
+                &mut scratch,
+            )
+            .and_then(|()| {
+                self.lines
+                    .try_reserve(scratch.len())
+                    .map_err(|_| Error::Limit)
+            });
             if let Err(error) = laid {
+                drop(metrics);
                 self.scratch = scratch;
                 return Err(error);
             }
-            message.columns = laid_columns(&message, &scratch, columns, scale);
+            message.columns = laid_columns(&message, &scratch, columns, scale, &mut metrics);
+            drop(metrics);
             let anchor = self.anchor();
             self.first_line.push(self.lines.len());
-            self.total_y += scratch.iter().map(|line| line.height()).sum::<u64>();
+            let styled = self.styled;
+            self.total_y += scratch.iter().map(|line| line.height(styled)).sum::<u64>();
             self.lines.extend_from_slice(&scratch);
             self.scratch = scratch;
             self.settle(anchor);
@@ -1265,6 +1322,64 @@ impl Controller {
         let changed = self.icons != icons;
         self.icons = icons;
         changed
+    }
+
+    /// The prose faces styled sections are measured and drawn in, or
+    /// none for the cell; the list is laid out again in them, keeping the
+    /// first shown row's place.
+    pub fn set_prose(&mut self, faces: Option<Faces>) -> Result<(), Error> {
+        self.faces = faces;
+        self.measure(self.surface.scale);
+        let anchor = self.top_key();
+        self.relayout_all(self.surface, self.rect, anchor)
+    }
+
+    /// Whether styled text is measured and drawn in prose faces.
+    pub fn proportional(&self) -> bool {
+        self.prose
+    }
+
+    /// Measures in the faces at `scale`: a styled row as tall as a prose
+    /// line, on its baseline.
+    fn measure(&mut self, scale: Scale) {
+        let metrics = Metrics::new(self.faces.as_ref(), scale);
+        let line = metrics.line();
+        let s = scale.value();
+        self.styled = u64::from(line.height)
+            .div_ceil(s as u64)
+            .max(CELL_HEIGHT as u64);
+        self.prose = metrics.proportional();
+        self.baseline = if self.prose {
+            i64::from(line.baseline)
+        } else {
+            (prose::CELL_BASELINE * s) as i64
+        };
+        *self
+            .metrics
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = metrics;
+    }
+
+    /// Walks a styled row's scalars, measured as its layout measured them
+    /// (`styled_walk`); nothing for another row.
+    fn walk(&self, line: Line, each: &mut dyn FnMut(Walked) -> bool) {
+        if line.kind != Kind::Styled {
+            return;
+        }
+        let Some(rich) = self
+            .section(line)
+            .and_then(|section| section.rich.as_deref())
+        else {
+            return;
+        };
+        let mut metrics = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
+        styled_walk(
+            rich,
+            line.start as usize,
+            line.end as usize,
+            &mut metrics,
+            each,
+        );
     }
 
     /// Where the pointer hovers with no button held, or `None`: answers
@@ -1538,7 +1653,7 @@ impl Controller {
         let mut start = 0u64;
         let mut row = self.lines.len().saturating_sub(1);
         for (index, line) in self.lines.iter().enumerate() {
-            let end = start + line.height();
+            let end = start + line.height(self.styled);
             if (y as u64) < end {
                 row = index;
                 break;
@@ -1749,11 +1864,25 @@ impl Controller {
         let budget = MAX_LINES.saturating_sub(self.lines.len().saturating_sub(end - start));
         let columns = self.wrap_columns(message);
         let scale = self.surface.scale.value();
-        if let Err(error) = layout(index, message, columns, scale, budget, &mut scratch) {
-            self.scratch = scratch;
-            return Err(error);
-        }
-        let laid = laid_columns(message, &scratch, columns, scale);
+        let mut metrics = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
+        let laid = layout(
+            index,
+            message,
+            columns,
+            scale,
+            budget,
+            &mut metrics,
+            &mut scratch,
+        )
+        .map(|()| laid_columns(message, &scratch, columns, scale, &mut metrics));
+        drop(metrics);
+        let laid = match laid {
+            Ok(laid) => laid,
+            Err(error) => {
+                self.scratch = scratch;
+                return Err(error);
+            }
+        };
         if let Some(message) = self.messages.get_mut(index) {
             message.columns = laid;
         }
@@ -1782,7 +1911,7 @@ impl Controller {
                     last = Some(at);
                     break;
                 }
-                Kind::More | Kind::Title | Kind::Image => return Ok(()),
+                Kind::More | Kind::Title | Kind::Image | Kind::Styled => return Ok(()),
                 Kind::Gap => {}
             }
         }
@@ -1822,7 +1951,10 @@ impl Controller {
             return Err(error);
         }
         // Rows before the re-wrapped one keep their widths.
-        let laid = laid_columns(message, &scratch, columns, self.surface.scale.value());
+        let scale = self.surface.scale.value();
+        let mut metrics = self.metrics.lock().unwrap_or_else(PoisonError::into_inner);
+        let laid = laid_columns(message, &scratch, columns, scale, &mut metrics);
+        drop(metrics);
         if let Some(message) = self.messages.get_mut(index) {
             message.columns = message.columns.max(laid);
         }
@@ -1851,11 +1983,10 @@ impl Controller {
         }
         let anchor = self.anchor();
         let (top, top_y) = (self.top, self.top_y);
-        let old: u64 = self
-            .lines
-            .get(start..end)
-            .map_or(0, |lines| lines.iter().map(|line| line.height()).sum());
-        let new: u64 = scratch.iter().map(|line| line.height()).sum();
+        let old: u64 = self.lines.get(start..end).map_or(0, |lines| {
+            lines.iter().map(|line| line.height(self.styled)).sum()
+        });
+        let new: u64 = scratch.iter().map(|line| line.height(self.styled)).sum();
         self.total_y = self.total_y.saturating_sub(old) + new;
         let added = scratch.len();
         self.lines.splice(start..end, scratch.drain(..));
@@ -1899,14 +2030,14 @@ impl Controller {
             self.lines
                 .iter()
                 .take(index)
-                .map(|line| line.height())
+                .map(|line| line.height(self.styled))
                 .sum()
         } else {
             let after: u64 = self
                 .lines
                 .iter()
                 .skip(index)
-                .map(|line| line.height())
+                .map(|line| line.height(self.styled))
                 .sum();
             self.total_y.saturating_sub(after)
         }
@@ -1921,7 +2052,7 @@ impl Controller {
         let mut used = 0u64;
         let mut top = self.lines.len();
         for line in self.lines.iter().rev() {
-            used += line.height();
+            used += line.height(self.styled);
             if used > room {
                 break;
             }
@@ -1949,10 +2080,10 @@ impl Controller {
         let mut used = 0u64;
         let mut index = self.top;
         while let Some(line) = self.lines.get(index) {
-            if used + line.height() > room {
+            if used + line.height(self.styled) > room {
                 break;
             }
-            used += line.height();
+            used += line.height(self.styled);
             index += 1;
         }
         index.max(self.top + 1)
@@ -1963,10 +2094,10 @@ impl Controller {
         let mut used = 0u64;
         let mut index = self.top;
         while let Some(line) = index.checked_sub(1).and_then(|i| self.lines.get(i)) {
-            if used + line.height() > room {
+            if used + line.height(self.styled) > room {
                 break;
             }
-            used += line.height();
+            used += line.height(self.styled);
             index -= 1;
         }
         index.min(self.top.saturating_sub(1))
@@ -1985,7 +2116,7 @@ impl Controller {
                 return None;
             }
             let line = *self.lines.get(index)?;
-            let height = (line.height() * scale) as u32;
+            let height = (line.height(self.styled) * scale) as u32;
             let rect = Rect { y, height, ..view };
             y = y.saturating_add(i64::from(height));
             index += 1;
@@ -2010,7 +2141,7 @@ impl Controller {
                     section,
                     collapsed: self.section(line).is_some_and(|section| section.collapsed),
                 },
-                Kind::Text => Shown::Text {
+                Kind::Text | Kind::Styled => Shown::Text {
                     message,
                     section,
                     text: self.text(line),
@@ -2036,7 +2167,7 @@ impl Controller {
     }
 
     fn text(&self, line: Line) -> &str {
-        if line.kind != Kind::Text {
+        if !line.is_text() {
             return "";
         }
         self.section(line)
@@ -2103,7 +2234,9 @@ impl Controller {
     }
 
     /// The column a pointer at `x` falls before, rounded to the nearer
-    /// cell edge, as a byte of the row.
+    /// cell edge, as a byte of the row; on a styled row, the scalar it
+    /// falls before as its layout measured them, a mark of no width going
+    /// with the scalar it follows.
     fn byte_at(&self, line: Line, x: i64, round: bool) -> usize {
         if line.kind == Kind::Image {
             return 0;
@@ -2113,6 +2246,22 @@ impl Controller {
             + cell
             + self.indent(line) as i64 * cell;
         let offset = x.saturating_sub(left);
+        if line.kind == Kind::Styled {
+            let mut byte = line.end as usize;
+            self.walk(line, &mut |glyph| {
+                let edge = if round {
+                    (glyph.x0 + glyph.x1) / 2
+                } else {
+                    glyph.x1
+                };
+                if glyph.x1 > glyph.x0 && offset < edge {
+                    byte = glyph.byte;
+                    return false;
+                }
+                true
+            });
+            return byte;
+        }
         let offset = if round {
             offset.saturating_add(cell / 2)
         } else {
@@ -2194,7 +2343,7 @@ impl Controller {
 
     /// The selected bytes of a text row, if any.
     fn selected(&self, line: Line, lo: Point, hi: Point) -> Option<(usize, usize)> {
-        if line.kind != Kind::Text {
+        if !line.is_text() {
             return None;
         }
         let from = line.point(line.start as usize).max(lo);
@@ -2222,7 +2371,7 @@ impl Controller {
         let mut group: Option<Line> = None;
         for &line in self.lines.get(from..to).unwrap_or(&[]) {
             let line = match line.kind {
-                Kind::Text => line,
+                Kind::Text | Kind::Styled => line,
                 // A picture's rows stand for its section's text whole.
                 Kind::Image => Line {
                     kind: Kind::Text,
@@ -2291,7 +2440,7 @@ impl Controller {
 
     /// Selects every shown text row.
     pub fn select_all(&mut self) -> bool {
-        let shown = |line: &&Line| matches!(line.kind, Kind::Text | Kind::Image);
+        let shown = |line: &&Line| matches!(line.kind, Kind::Text | Kind::Styled | Kind::Image);
         let first = self.lines.iter().find(shown);
         let last = self.lines.iter().rev().find(shown);
         let (Some(&first), Some(&last)) = (first, last) else {
@@ -2470,7 +2619,7 @@ impl Controller {
     fn link_under(&self, x: i64, y: i64) -> Option<(Line, Rect, usize, usize)> {
         let (_, line, rect) = self
             .rows()
-            .find(|(_, line, rect)| line.kind == Kind::Text && rect.contains(x, y))?;
+            .find(|(_, line, rect)| line.kind == Kind::Styled && rect.contains(x, y))?;
         let frame = self.frame(line.message as usize, rect);
         let left = frame.x + self.cell() + self.indent(line) as i64 * self.cell();
         if !frame.contains(x, y) || x < left {
@@ -2491,22 +2640,21 @@ impl Controller {
         let (line, frame, byte, link) = self.link_under(x, y)?;
         let rich = self.section(line)?.rich.as_deref()?;
         let text = rich.target(link)?;
-        let start = line.start as usize;
-        // The link's cells on the row around the one under the pointer.
-        let mut span: Option<(usize, usize)> = None;
-        for (column, (offset, _)) in self.text(line).char_indices().enumerate() {
-            let at = start + offset;
-            if rich.look(at).1 == Some(link) {
-                span = Some(span.map_or((column, column + 1), |(first, _)| (first, column + 1)));
-            } else if at > byte {
-                break;
+        // The link's span on the row around the scalar under the pointer.
+        let mut span: Option<(i64, i64)> = None;
+        self.walk(line, &mut |glyph| {
+            if glyph.link == Some(link) {
+                span = Some(span.map_or((glyph.x0, glyph.x1), |(first, _)| (first, glyph.x1)));
+            } else if glyph.byte > byte {
+                return false;
             } else {
                 span = None;
             }
-        }
+            true
+        });
         let (first, last) = span?;
         let cell = self.cell();
-        let left = frame.x + cell + (self.indent(line) + first) as i64 * cell;
+        let left = frame.x + cell + self.indent(line) as i64 * cell + first;
         Some(Tip {
             message: line.message as usize,
             target: Target::Link {
@@ -2515,7 +2663,7 @@ impl Controller {
             },
             rect: Rect {
                 x: left,
-                width: ((last - first) as i64 * cell) as u32,
+                width: (last - first).max(0) as u32,
                 ..frame
             },
             text,
@@ -2673,7 +2821,7 @@ impl Controller {
                         && cx.abs_diff(x) <= (NEAR * s) as u64
                         && cy.abs_diff(y) <= (NEAR * s) as u64
                 });
-                let word = (paired.is_some() && !extend && line.kind == Kind::Text)
+                let word = (paired.is_some() && !extend && line.is_text())
                     .then(|| self.word_at(line, x))
                     .flatten();
                 let point = self.point_on(line, rect, x, y);
@@ -2739,7 +2887,7 @@ impl Controller {
             .get(start..end)?
             .iter()
             .rev()
-            .find(|row| row.kind == Kind::Text && row.section == line.section)
+            .find(|row| row.is_text() && row.section == line.section)
             .map(|row| row.end as usize)
     }
 
@@ -2835,7 +2983,9 @@ impl Controller {
                     clip,
                     sink,
                 ),
-                Kind::Text => self.paint_text(line, rect, paper, selection, clip, sink),
+                Kind::Text | Kind::Styled => {
+                    self.paint_text(line, rect, paper, selection, clip, sink)
+                }
                 Kind::Image => self.paint_picture(line, rect, selection, clip, sink),
                 Kind::Gap => {}
             }
@@ -3097,10 +3247,12 @@ impl Controller {
         self.run(text.chars().skip(to), rect, to, normal, clip, sink);
     }
 
-    /// A styled section's row: its block's prefix in quiet ink, a code
-    /// block's ground, and each character in its run's look on its
-    /// ground (code's, or the selection's), a link underlined and struck
-    /// text struck through in its ink.
+    /// A styled section's row: its block's prefix in quiet ink a cell a
+    /// character (in Mono with faces), a code block's ground, and
+    /// each character in its run's look on its ground (code's, or the
+    /// selection's) at its measured pen, in prose faces when they are
+    /// loaded, a link underlined and struck text struck through in its
+    /// ink under its advance.
     fn paint_rich(
         &self,
         line: Line,
@@ -3116,8 +3268,7 @@ impl Controller {
         else {
             return;
         };
-        let (start, end) = (line.start as usize, line.end as usize);
-        let text = rich.shown().get(start..end).unwrap_or("");
+        let start = line.start as usize;
         let block = rich.block_at(start);
         let indent = usize::from(line.indent);
         let cell = self.cell();
@@ -3130,10 +3281,34 @@ impl Controller {
         // Code stands on the other of the two grounds a row may have.
         let code_ground = if paper == PAPER { CHROME } else { PAPER };
         let code_block = block.is_some_and(|block| block.code);
+        let proportional = self.proportional();
+        let left = shown.x + indent as i64 * cell;
         if let Some(block) = block {
             let prefix = rich.prefix(block, start == block.start as usize);
             let style = GlyphStyle::medium(LINE_NUMBER, paper);
-            self.run(prefix.chars().take(indent), rect, 0, style, clip, sink);
+            if proportional {
+                // In the monospace prose face, a cell a character, so it
+                // stands on the text's baseline, kept off the text.
+                let area = Rect {
+                    width: (left - shown.x).max(0) as u32,
+                    ..shown
+                };
+                if let Some(area) = area.intersection(clip) {
+                    for (column, scalar) in prefix.chars().take(indent).enumerate() {
+                        sink(Draw {
+                            clip: area,
+                            primitive: Primitive::Glyph {
+                                x: shown.x + column as i64 * cell,
+                                y: rect.y,
+                                scalar: prose::shown(scalar),
+                                style: style.with_family(TextFamily::Mono),
+                            },
+                        });
+                    }
+                }
+            } else {
+                self.run(prefix.chars().take(indent), rect, 0, style, clip, sink);
+            }
         }
         let base = if code_block { code_ground } else { paper };
         if code_block {
@@ -3149,21 +3324,12 @@ impl Controller {
         } else {
             (INACTIVE_SELECTION, INK)
         };
-        let (mut look, mut link) = rich.look(start);
-        let mut changes = rich.changes(start, end).peekable();
-        for (column, (offset, scalar)) in text.char_indices().enumerate() {
-            let byte = start + offset;
-            while let Some(&(at, next, next_link)) = changes.peek() {
-                if at > byte {
-                    break;
-                }
-                (look, link) = (next, next_link);
-                changes.next();
-            }
-            let x = shown.x + (indent + column) as i64 * cell;
+        self.walk(line, &mut |glyph| {
+            let (byte, look, link) = (glyph.byte, glyph.look, glyph.link);
+            let x = left + glyph.x0;
             let at = Rect {
                 x,
-                width: cell as u32,
+                width: (glyph.x1 - glyph.x0).max(0) as u32,
                 ..rect
             };
             let chosen = selected.is_some_and(|(a, b)| a <= byte && byte < b);
@@ -3188,41 +3354,56 @@ impl Controller {
             } else {
                 INK
             };
-            let mut style = GlyphStyle::medium(ink, ground);
-            if look.has(Look::BOLD) {
-                style = style.bold();
+            let style = styled_glyph(look, glyph.code, proportional, ink, ground);
+            if proportional {
+                // A prose glyph at its pen, the raster setting it on the
+                // line's baseline, clipped to the text area.
+                if let Some(area) = shown.intersection(clip) {
+                    sink(Draw {
+                        clip: area,
+                        primitive: Primitive::Glyph {
+                            x,
+                            y: rect.y,
+                            // What was measured: a tab as a space, another
+                            // control as the replacement.
+                            scalar: prose::shown(glyph.scalar),
+                            style,
+                        },
+                    });
+                }
+            } else {
+                text_run(
+                    self.surface.scale,
+                    std::iter::once(if glyph.scalar == '\t' {
+                        ' '
+                    } else {
+                        glyph.scalar
+                    }),
+                    (x, rect.y),
+                    shown,
+                    style,
+                    clip,
+                    sink,
+                );
             }
-            if look.has(Look::ITALIC) {
-                style = style.italic();
-            }
-            let scalar = if scalar == '\t' { ' ' } else { scalar };
-            text_run(
-                self.surface.scale,
-                std::iter::once(scalar),
-                (x, rect.y),
-                shown,
-                style,
-                clip,
-                sink,
-            );
-            // A link's underline near the cell's foot, a strike's line
-            // through its middle.
-            let height = CELL_HEIGHT as i64;
+            // A link's underline on the baseline, a strike's line through
+            // the middle of the lowercase, each under its advance.
+            let middle = (prose::CELL_BASELINE - CELL_HEIGHT / 2) as i64 * s;
             for (on, y) in [
-                (link.is_some(), height - 2),
-                (look.has(Look::STRIKE), height / 2),
+                (link.is_some(), self.baseline),
+                (look.has(Look::STRIKE), self.baseline - middle),
             ] {
                 let line = Rect {
-                    x,
-                    y: rect.y + y * s,
-                    width: cell as u32,
+                    y: rect.y + y,
                     height: s as u32,
+                    ..at
                 };
                 if let Some(area) = line.intersection(shown).filter(|_| on) {
                     fill(area, ink, clip, sink);
                 }
             }
-        }
+            true
+        });
     }
 
     fn paint_header(&self, line: Line, rect: Rect, clip: Rect, sink: &mut dyn FnMut(Draw)) {
@@ -3552,6 +3733,88 @@ fn common_prefix(a: &str, b: &str) -> usize {
     same
 }
 
+/// A styled character's glyph style in `ink` on `ground`: bold and italic
+/// as its look says, and with prose faces in Mono when it is code (a code
+/// block's or a code span's) and Sans otherwise; on the cell without them.
+/// Wrapping measures by it and painting draws by it, so the two agree.
+fn styled_glyph(look: Look, code: bool, proportional: bool, ink: u32, ground: u32) -> GlyphStyle {
+    let mut style = GlyphStyle::medium(ink, ground);
+    if look.has(Look::BOLD) {
+        style = style.bold();
+    }
+    if look.has(Look::ITALIC) {
+        style = style.italic();
+    }
+    if !proportional {
+        return style;
+    }
+    style.with_family(if code || look.has(Look::CODE) || look.has(Look::MONO) {
+        TextFamily::Mono
+    } else {
+        TextFamily::Sans
+    })
+}
+
+/// A styled row's scalar as `styled_walk` measures it: its shown byte, its
+/// look, link and block's code, and its span in pixels from the left of
+/// the row's text, `x0..x1`, empty for a mark of no width.
+#[derive(Clone, Copy, Debug)]
+struct Walked {
+    byte: usize,
+    scalar: char,
+    look: Look,
+    link: Option<usize>,
+    code: bool,
+    x0: i64,
+    x1: i64,
+}
+
+/// Each scalar of a styled section's shown bytes `start..end`, until
+/// `each` answers false, its pen summed in `UNIT`s as `wrap_rich`
+/// measured it and rounded to pixels as prose rounds a pen, so a span
+/// never drifts from its neighbours.
+fn styled_walk(
+    rich: &Rich,
+    start: usize,
+    end: usize,
+    metrics: &mut Metrics,
+    each: &mut dyn FnMut(Walked) -> bool,
+) {
+    let text = rich.shown().get(start..end).unwrap_or("");
+    let code = rich.block_at(start).is_some_and(|block| block.code);
+    let proportional = metrics.proportional();
+    let (mut look, mut link) = rich.look(start);
+    let mut changes = rich.changes(start, end).peekable();
+    let mut pen = 0u64;
+    for (offset, scalar) in text.char_indices() {
+        let byte = start + offset;
+        while let Some(&(at, next, next_link)) = changes.peek() {
+            if at > byte {
+                break;
+            }
+            (look, link) = (next, next_link);
+            changes.next();
+        }
+        let style = styled_glyph(look, code, proportional, INK, PAPER);
+        let x0 = i64::from(prose::pixels(pen));
+        let wide = metrics.advance(style.family, style.font_style, prose::shown(scalar));
+        pen = pen.saturating_add(u64::from(wide));
+        let x1 = i64::from(prose::pixels(pen));
+        let walked = Walked {
+            byte,
+            scalar,
+            look,
+            link,
+            code,
+            x0,
+            x1,
+        };
+        if !each(walked) {
+            return;
+        }
+    }
+}
+
 /// The cells a block's prefix of `width` takes in `columns`: at most
 /// half, so its text keeps the other half however deep its nesting.
 fn fitted_indent(width: u16, columns: usize) -> u8 {
@@ -3559,15 +3822,23 @@ fn fitted_indent(width: u16, columns: usize) -> u8 {
 }
 
 /// Appends a styled section's text rows to `out`: each block's text
-/// wrapped to the columns its prefix leaves, a row at least, an excerpt
-/// cut at `EXCERPT_ROWS` with a `More` row.
-fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Error> {
+/// wrapped to the room its prefix leaves, measured in `metrics` as it is
+/// drawn (`styled_glyph`), a row at least, an excerpt cut at
+/// `EXCERPT_ROWS` with a `More` row.
+fn wrap_rich(
+    wrap: Wrap<'_>,
+    rich: &Rich,
+    metrics: &mut Metrics,
+    out: &mut Vec<Line>,
+) -> Result<(), Error> {
     let shown = rich.shown();
     let blocks = rich.blocks();
     if blocks.is_empty() {
-        let line = row(wrap.message, wrap.section, Kind::Text, 0, 0)?;
+        let line = row(wrap.message, wrap.section, Kind::Styled, 0, 0)?;
         return push(out, wrap.budget, line);
     }
+    let cell = u64::from(UNIT) * (CELL_WIDTH * metrics.scale().value()) as u64;
+    let proportional = metrics.proportional();
     let mut rows = 0;
     let mut more = false;
     for (number, block) in blocks.iter().enumerate() {
@@ -3579,7 +3850,21 @@ fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Err
         let text = shown.get(start..end.max(start)).ok_or(Error::Limit)?;
         let indent = fitted_indent(block.width, wrap.columns);
         let room = wrap.columns.saturating_sub(usize::from(indent)).max(1);
-        self::wrap(text, room, &mut |from, to| {
+        let (mut look, _) = rich.look(start);
+        let mut changes = rich.changes(start, start + text.len()).peekable();
+        let mut advance = |at: usize, scalar: char| {
+            let byte = start + at;
+            while let Some(&(next_at, next, _)) = changes.peek() {
+                if next_at > byte {
+                    break;
+                }
+                look = next;
+                changes.next();
+            }
+            let style = styled_glyph(look, block.code, proportional, INK, PAPER);
+            u64::from(metrics.advance(style.family, style.font_style, prose::shown(scalar)))
+        };
+        wrap_by(text, room as u64 * cell, &mut advance, &mut |from, to| {
             if wrap.target.excerpt && rows == EXCERPT_ROWS {
                 more = true;
                 return Ok(false);
@@ -3588,7 +3873,7 @@ fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Err
             let mut line = row(
                 wrap.message,
                 wrap.section,
-                Kind::Text,
+                Kind::Styled,
                 start + from,
                 start + to,
             )?;
@@ -3608,12 +3893,36 @@ fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Err
 }
 
 /// The columns `rows` of `message` take, at most `most`: a text row's
-/// prefix and scalars, a title row's mark, space and title, a picture's
-/// width in cells at `scale`, the more row's text.
-fn laid_columns(message: &Message, rows: &[Line], most: usize, scale: usize) -> usize {
+/// prefix and scalars, a styled row's prefix and its measured width in
+/// whole cells, a title row's mark, space and title, a picture's width
+/// in cells at `scale`, the more row's text.
+fn laid_columns(
+    message: &Message,
+    rows: &[Line],
+    most: usize,
+    scale: usize,
+    metrics: &mut Metrics,
+) -> usize {
     let section = |line: &Line| message.sections.get(usize::from(line.section));
+    let cell = (CELL_WIDTH * scale.max(1)) as u64;
     rows.iter()
         .map(|line| match line.kind {
+            Kind::Styled => section(line)
+                .and_then(|section| section.rich.as_deref())
+                .map_or(0, |rich| {
+                    let mut width = 0;
+                    styled_walk(
+                        rich,
+                        line.start as usize,
+                        line.end as usize,
+                        metrics,
+                        &mut |glyph| {
+                            width = glyph.x1;
+                            true
+                        },
+                    );
+                    usize::from(line.indent) + (width.max(0) as u64).div_ceil(cell) as usize
+                }),
             Kind::Text => section(line).map_or(0, |section| {
                 let text = section
                     .shown()
@@ -3647,6 +3956,7 @@ fn layout(
     columns: usize,
     scale: usize,
     budget: usize,
+    metrics: &mut Metrics,
     out: &mut Vec<Line>,
 ) -> Result<(), Error> {
     let budget = out.len().saturating_add(budget);
@@ -3675,7 +3985,7 @@ fn layout(
                 budget,
             };
             match &section.rich {
-                Some(rich) => wrap_rich(wrap, rich, out)?,
+                Some(rich) => wrap_rich(wrap, rich, metrics, out)?,
                 None => wrap_section(wrap, 0, 0, out)?,
             }
         }
@@ -3683,22 +3993,34 @@ fn layout(
     push(out, budget, row(index, 0, Kind::Gap, 0, 0)?)
 }
 
-/// Wraps `text` into rows of at most `columns` scalars, handing each row's
-/// byte range to `row` until it answers false. A newline ends a row and
-/// belongs to none; a row breaks after the last space or tab that leaves
-/// its word whole, else within the word; a space or tab reaching past the
-/// last column stays on its row, unshown, so rows tile the text between
-/// newlines. Empty text, or text ending in a newline, ends in an empty row;
-/// text ending in such an unshown space does not.
+/// Wraps `text` into rows of at most `columns` scalars (`wrap_by`, each
+/// scalar one wide).
 fn wrap(
     text: &str,
     columns: usize,
     row: &mut dyn FnMut(usize, usize) -> Result<bool, Error>,
 ) -> Result<(), Error> {
-    let columns = columns.max(1);
+    wrap_by(text, columns as u64, &mut |_, _| 1, row)
+}
+
+/// Wraps `text` into rows at most `limit` wide, each scalar as wide as
+/// `advance` answers for it at its byte, handing each row's byte range to
+/// `row` until it answers false. A newline ends a row and belongs to none;
+/// a row breaks after the last space or tab that leaves its word whole,
+/// else within the word, and holds a scalar at least; a space or tab
+/// reaching past the limit stays on its row, unshown, so rows tile the
+/// text between newlines. Empty text, or text ending in a newline, ends in
+/// an empty row; text ending in such an unshown space does not.
+fn wrap_by(
+    text: &str,
+    limit: u64,
+    advance: &mut dyn FnMut(usize, char) -> u64,
+    row: &mut dyn FnMut(usize, usize) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let limit = limit.max(1);
     let mut start = 0;
-    let mut column = 0;
-    let mut space: Option<(usize, usize)> = None;
+    let mut column: u64 = 0;
+    let mut space: Option<(usize, u64)> = None;
     let mut overflowed = false;
     for (at, scalar) in text.char_indices() {
         // A row ended by an unshown space is ended; a newline right after
@@ -3714,7 +4036,8 @@ fn wrap(
             space = None;
             continue;
         }
-        if column >= columns {
+        let wide = advance(at, scalar);
+        if column > 0 && column.saturating_add(wide) > limit {
             if blank {
                 let next = at + scalar.len_utf8();
                 if !row(start, next)? {
@@ -3733,6 +4056,15 @@ fn wrap(
                     }
                     start = after;
                     column = column.saturating_sub(at_column);
+                    // The word carried down may leave this scalar no room
+                    // where advances differ: it starts a row of its own.
+                    if column > 0 && column.saturating_add(wide) > limit {
+                        if !row(start, at)? {
+                            return Ok(());
+                        }
+                        start = at;
+                        column = 0;
+                    }
                 }
                 _ => {
                     if !row(start, at)? {
@@ -3744,7 +4076,7 @@ fn wrap(
             }
             space = None;
         }
-        column += 1;
+        column = column.saturating_add(wide);
         if blank {
             space = Some((at + scalar.len_utf8(), column));
         }

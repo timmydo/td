@@ -1540,7 +1540,8 @@ italic, bold and struck; a code span and a fenced or indented code block
 stand on the code ground; a list item's rows sit behind its marker, a
 bullet `•` or its number, and a quotation's behind a bar `│` in quiet
 ink, both cut to td-ui's `MAX_PREFIX_CHARS`; a thematic break is a quiet
-rule; a table shows as written, row for row. A link's text is in the
+rule; a table shows as written, row for row, in the monospace face
+(`Look::MONO`) so its columns stay aligned in prose. A link's text is in the
 accent ink, underlined: the pointer resting on it shows its target in a
 tooltip, so where a link leads shows before it is followed, and a click
 asks the window to open it (`Request::OpenLink`), which hands it to
@@ -1563,6 +1564,20 @@ tool blocks and notices stay plain text; a reply with calls and no text
 stands on its reasoning's summary (above), which is drawn as the reply
 is, since summaries carry Markdown headings of their own. A heading in a
 quotation is bold in the quotation's quiet ink.
+
+The styled text is drawn in Noto Sans, code in the pinned monospace
+face, when the window finds the prose faces (td-ui DESIGN.md
+"Proportional faces", `pinned_face::prose_or_note`, under the same
+`TD_UI_FACE` setting as the monospace face): the window's raster draws
+with one copy and the transcript measures with the other
+(`App::set_prose`, td-ui's `Controller::set_prose`). With
+`TD_UI_FACE=bitmap` it stays on the cell; without the faces too, and
+the window says once on standard error why. Everything else in the
+window stays on the cell, the person's messages and the composer
+included. The driven `text` verb reads the cell grid, which prose does
+not fill, so with faces a reply does not read back from it; the native
+compositor tests run with `TD_UI_FACE=bitmap`, where it does, and an
+agent that reads the window back should too.
 
 A streaming reply's text is kept as it comes and drawn again whole,
 since a delimiter that closes later restyles what came before it: at

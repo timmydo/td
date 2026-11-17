@@ -53,6 +53,8 @@ fn build(text: &str, document: &Document) -> Result<Rich, rich::Error> {
         }
         let mut base = match block.kind {
             BlockKind::Heading(_) => Look::BOLD,
+            // Aligned by its columns as written.
+            BlockKind::Table => Look::MONO,
             _ => Look::PLAIN,
         };
         if document.levels(block).contains(&Level::Quote) {
