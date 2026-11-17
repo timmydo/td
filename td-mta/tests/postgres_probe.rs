@@ -10370,6 +10370,22 @@ fn exercise_receiving(
         receiving_capacity.get("used").unwrap().to_string(),
         sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
     );
+    // Every per-account ceiling postgres_attempt_phases enforces is reported.
+    for (name, limit) in [
+        ("attempt_phase_receipts", "2048"),
+        ("attempt_rcpt_receipts", "1024"),
+        ("attempt_command_receipts", "1024"),
+    ] {
+        let row = metrics
+            .iter()
+            .find(|r| {
+                r.get("name").and_then(td_json::Json::as_str) == Some(name)
+                    && r.get("scope").and_then(td_json::Json::as_str)
+                        == Some(&binding.account().to_string())
+            })
+            .unwrap();
+        assert_eq!(row.get("limit").unwrap().to_string(), limit, "{name}");
+    }
     assert_eq!(
         capacity
             .get("runtime_occupancy_measured")

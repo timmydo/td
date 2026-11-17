@@ -1203,7 +1203,7 @@ end-to-end delivery monitor is still required to detect that class of failure.
 Capacity rendering admits 200 KiB within the 224 KiB daily report and 256 KiB
 message bound. Repeated scope lists wrap at eight names per line so maximum
 profile names stay within SMTP line bounds. External alert bodies admit 192 KiB.
-The capacity database connection separately admits 4,096 frames, 1 MiB input
+The capacity database connection separately admits 6,144 frames, 1 MiB input
 and 256 KiB output for the fixed roster across at most sixteen accounts; it
 retains the existing ten-second operation deadline and per-frame validation.
 These cold owner/host command paths retain bounded standard collection/JSON

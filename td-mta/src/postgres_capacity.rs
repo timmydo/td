@@ -269,6 +269,10 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             ("route_owners", 1024, false),
             ("route_owner_receipts", 1024, false),
             ("attempt_final_reservations", 1024, false),
+            // postgres_attempt_phases refuses phases 2-3, 6 and 7-8 at these.
+            ("attempt_phase_receipts", 2048, false),
+            ("attempt_rcpt_receipts", 1024, false),
+            ("attempt_command_receipts", 1024, false),
             ("attempt_acceptance_receipts", 1024, true),
             ("attempt_refusal_receipts", 1024, true),
             ("attempt_recovery_receipts", 1024, true),
