@@ -2800,27 +2800,78 @@ mod serving;
 #[path = "postgres_probe/serving_relay.rs"]
 mod serving_relay;
 
+/// Runs one exercise of a bundle and reports its wall time, so a slow
+/// native leg says which exercise it spent its time in.
+fn timed(name: &str, exercise: impl FnOnce()) {
+    let start = std::time::Instant::now();
+    exercise();
+    eprintln!(
+        "postgres_probe: {name}: {:.1} s",
+        start.elapsed().as_secs_f64()
+    );
+}
+
 #[test]
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
-    unix_database::exercise();
-    real_postgres_search_extension_installs_as_unprivileged_database_owner();
-    real_postgres_schema_upgrade_preserves_explicit_service_grants();
-    search_index::scoped_candidates_do_not_materialize_the_account();
-    blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance();
-    application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
-    acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
-    recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
-    recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch();
-    exercise_configuration(ConfigurationExercise::AccountAdmin);
-    exercise_configuration(ConfigurationExercise::AccountRoutes);
-    exercise_configuration(ConfigurationExercise::Imports);
-    exercise_configuration(ConfigurationExercise::Reconcile);
-    exercise_configuration(ConfigurationExercise::Unmapped);
-    exercise_configuration(ConfigurationExercise::FolderReconcile);
-    audit_scaling::exercise();
-    exercise_configuration(ConfigurationExercise::MultiAccount);
-    exercise_configuration(ConfigurationExercise::Serving);
+    timed("unix_database::exercise", unix_database::exercise);
+    timed(
+        "real_postgres_search_extension_installs_as_unprivileged_database_owner",
+        real_postgres_search_extension_installs_as_unprivileged_database_owner,
+    );
+    timed(
+        "real_postgres_schema_upgrade_preserves_explicit_service_grants",
+        real_postgres_schema_upgrade_preserves_explicit_service_grants,
+    );
+    timed(
+        "search_index::scoped_candidates_do_not_materialize_the_account",
+        search_index::scoped_candidates_do_not_materialize_the_account,
+    );
+    timed(
+        "blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance",
+        blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance,
+    );
+    timed(
+        "application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection",
+        application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection,
+    );
+    timed(
+        "acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs",
+        acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs,
+    );
+    timed(
+        "recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch",
+        recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch,
+    );
+    timed(
+        "recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch",
+        recovery::real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch,
+    );
+    timed("configuration AccountAdmin", || {
+        exercise_configuration(ConfigurationExercise::AccountAdmin)
+    });
+    timed("configuration AccountRoutes", || {
+        exercise_configuration(ConfigurationExercise::AccountRoutes)
+    });
+    timed("configuration Imports", || {
+        exercise_configuration(ConfigurationExercise::Imports)
+    });
+    timed("configuration Reconcile", || {
+        exercise_configuration(ConfigurationExercise::Reconcile)
+    });
+    timed("configuration Unmapped", || {
+        exercise_configuration(ConfigurationExercise::Unmapped)
+    });
+    timed("configuration FolderReconcile", || {
+        exercise_configuration(ConfigurationExercise::FolderReconcile)
+    });
+    timed("audit_scaling::exercise", audit_scaling::exercise);
+    timed("configuration MultiAccount", || {
+        exercise_configuration(ConfigurationExercise::MultiAccount)
+    });
+    timed("configuration Serving", || {
+        exercise_configuration(ConfigurationExercise::Serving)
+    });
 }
 
 #[test]
