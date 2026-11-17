@@ -3825,7 +3825,8 @@ Schema version 24 adds retained expiry-operation receipts and one database-wide
 expiry progress row. A receipt binds an account/operation to its request digest,
 submission, one-to-100 recipient count, fixed nonnegative UTC cutoff, publication
 time and old/new account sequence. It has no foreign key to the
-submission; section 216 deletes a retired submission's receipts with it.
+submission; section 216 deletes a retired submission's receipts with it, and
+section 120 expires them after an hour.
 The publisher must cap retained receipts and verify exact sequence adjacency.
 
 The progress row starts with no publication time. Its singleton key and nullable
@@ -3869,7 +3870,33 @@ envelope survive. Terminal rows are excluded. Exact ordinal coverage is
 checked before updating completion; the final batch sets completedAt and
 Pending failure notice together. Retired attempts, account sequence, CHANGE,
 receipt and global progress commit with those recipient changes. Each account
-retains at most 1024 expiry receipts until a separately defined reclamation.
+holds at most 1024 expiry receipts younger than an hour.
+
+Expiry receipts are keyed by submission, not attempt, and section 216 removes
+them only a month after the submission completes. Every admission of the
+expiry receipt kind, by an expiry publication or by an AcceptancePossible
+reservation (section 142), first deletes, under the account write lock, that
+account's expiry receipts published more than an hour (`RECEIPT_RETENTION_MS`,
+section 123's margin) before the database clock, then counts the rest with
+outstanding claims against the 1,024 ceiling: a per-hour flood bound, not a
+lifetime one, and expiry publication is already serialized at one per database
+second across accounts. While an account's ceiling is full, its further
+expiries and every AcceptancePossible reservation (so every delivery reaching
+DATA) refuse Capacity until receipts age past the hour. A receipt serves only
+replay inside publication and settlement of that operation's uncertain COMMIT.
+A relay process holds one Pending for every route and account it serves, and
+refuses every expiry and phase publication while it is held, so no sweep in
+the owner's process can remove the receipt it is settling. Another relay
+process serving another route of the account sweeps only receipts older than
+the hour; a settlement that outlives it reads absent and releases custody,
+losing only the passive outcome, since the expiry itself is durable in the
+recipients and the next turn rederives from them. Capacity inspection counts
+only receipts inside the hour. The queue expiry fixture fills the ledger with
+young receipts and expects Capacity, backdates them a literal 61 minutes, then
+requires the next expiry to succeed, every expired receipt of the account to
+go, a 30-minute receipt, another account's expired one and the replayed
+operation's own receipt to stay, and capacity inspection to count only live
+receipts.
 
 The publisher rechecks ownership and the nonrenewable clock token before
 COMMIT; late clock failure rolls back staged changes. A COMMIT handed to the
@@ -5128,10 +5155,10 @@ and every inspection takes that row FOR SHARE before it reads the receipt
 under a fresh READ COMMITTED snapshot. Settlement starts only after the
 uncertain call returned, so its share lock waits until the uncertain
 transaction committed or rolled back, and a missing receipt then means it
-rolled back; a receipt kind with bounded retention (sections 52, 123 and 218)
-can also read absent once it expired. Either way the operation is not retained,
-and holding the barrier would only wedge the worker while it keeps renewing
-its lease. The caller then publishes the same passive change afresh, under
+rolled back; a receipt kind with bounded retention (sections 52, 120, 123
+and 218) can also read absent once it expired. Either way the operation is
+not retained, and holding the barrier would only wedge the worker while it
+keeps renewing its lease. The caller then publishes the same passive change afresh, under
 the same fences as any first publication, or rederives from durable state:
 the scheduler's next turn finds a committed attempt through active-attempt
 discovery and otherwise dispatches anew. The relay's route success and
@@ -5174,8 +5201,8 @@ locks it FOR SHARE before reading the receipt; lock and statement timeouts
 surface as errors, which retain custody; all of them use the single pinned
 primary, and an HTTP or SMTP receiving owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
-still be pending, beyond the bounded sweeps of sections 52, 123, 216 and
-218, an Email owner's retirement of its own confirmed receipt, and, by
+still be pending, beyond the bounded sweeps of sections 52, 120, 123, 216
+and 218, an Email owner's retirement of its own confirmed receipt, and, by
 another instance serving the same account, section 46's receiving sweep
 (section 104) and the HTTP families' sweeps (section 217).
 Any further sweep of attempt, phase, recovery, expiry, HTTP-family or
@@ -7010,8 +7037,9 @@ are also reclaimed independently, at attempt publication (section 218), so
 submissions still retrying or inside retention do not hold the attempt
 caps.
 Submission and cancellation receipts expire a minute after publication on
-their own (section 217), so the deletes below usually find none of them; the
-rest wait for this retention.
+their own (section 217) and expiry receipts an hour after (section 120), so
+the deletes below usually find none of them; the rest wait for this
+retention.
 `postgres_submission_retention::retire` deletes, in one transaction, the
 oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
 than 30 days ago (`RETENTION_MS`, against the database clock), whatever

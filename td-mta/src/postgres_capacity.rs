@@ -280,6 +280,7 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
         ] {
             let used = match table {
                 "receiving_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 AND created_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_receiving::RECEIPT_RETENTION_MS, cap).await?,
+                "submission_expiry_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_queue_expiry::RECEIPT_RETENTION_MS, cap).await?,
                 "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap).await?,
                 _ => match crate::postgres_receipt_expiry::live(table) {
                     Some(query) => live(client, id, query, crate::postgres_receipt_expiry::RETENTION_MS, cap).await?,

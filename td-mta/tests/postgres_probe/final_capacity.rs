@@ -50,7 +50,8 @@ pub(super) fn before_possible(
         ),
         (
             "submission_expiry_receipts",
-            "a.account,k.id,k.digest,a.submission_id,1,0,0,k.old,k.new".to_owned(),
+            // Young: older expiry receipts are swept (POSTGRES.md section 120).
+            "a.account,k.id,k.digest,a.submission_id,1,0,(extract(epoch FROM clock_timestamp())*1000)::bigint,k.old,k.new".to_owned(),
         ),
     ] {
         sql(fixture,&format!("INSERT INTO td_mta.{table} SELECT {fields} FROM td_mta.submission_attempts a CROSS JOIN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') id,decode(repeat('fe',32),'hex') digest,decode(repeat('00',8),'hex') old,decode('0000000000000001','hex') new FROM generate_series(1,1024) n) k WHERE a.attempt_id=decode('{attempt}','hex')"));

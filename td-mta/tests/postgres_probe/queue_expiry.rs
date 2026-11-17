@@ -363,4 +363,115 @@ pub(super) fn exercise(
         Err(expiry::Error::Conflict)
     );
     sql(fixture,&format!("UPDATE td_mta.submission_expiry_receipts SET request_digest=decode('{digest}','hex') WHERE operation=decode('{}','hex')",value.operation()));
+    ledger(
+        fixture,
+        request,
+        trust,
+        claim,
+        generation,
+        submission,
+        &value,
+        first,
+        &other_clock,
+        &other_guard,
+    );
+}
+
+// Expiry receipts last an hour (POSTGRES.md section 120): a full ledger
+// refuses only while its receipts are young, and the next expiry deletes
+// only this account's expired ones. Ages are literals, so a longer
+// retention fails here.
+#[allow(clippy::too_many_arguments)]
+fn ledger(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    claim: &Claim,
+    generation: u64,
+    source: SubmissionId,
+    value: &expiry::Expiry,
+    first: expiry::Outcome,
+    clock: &Arc<TestClock>,
+    guard: &Arc<Mutex<Guard>>,
+) {
+    const NOW: &str = "(extract(epoch FROM clock_timestamp())*1000)::bigint";
+    // "expiry" prefix: other fixtures repeat one byte.
+    const OVERDUE: &str = "6578706972790000000000000000ee01";
+    const OTHER: &str = "decode('6578706972790000000000000000ee02','hex')";
+    let overdue = format!("decode('{OVERDUE}','hex')");
+    let src = format!("decode('{source}','hex')");
+    sql(fixture, &format!("INSERT INTO td_mta.submissions SELECT account,{overdue},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,send_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{overdue},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{overdue},0,'expiry@example.test',1,0,NULL,0,NULL,0,0,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={overdue}"));
+    let account = sql(
+        fixture,
+        &format!("SELECT encode(account,'hex') FROM td_mta.submissions WHERE id={overdue}"),
+    );
+    let scope = account.clone();
+    let account = format!("decode('{account}','hex')");
+    // Fill the ledger with young receipts whose request digest is zero.
+    sql(fixture, &format!("INSERT INTO td_mta.submission_expiry_receipts SELECT account,decode('{}'||lpad(to_hex(n),20,'0'),'hex'),decode(repeat('00',32),'hex'),submission_id,recipient_count,0,{NOW},old_sequence,new_sequence FROM td_mta.submission_expiry_receipts CROSS JOIN generate_series(1,1024) n WHERE operation=decode('{}','hex')", &OVERDUE[..12], value.operation()));
+    let publish = || {
+        thread::sleep(Duration::from_millis(1100));
+        expiry::publish(
+            request,
+            trust,
+            deadline(),
+            &expiry::prepare(claim, generation, SubmissionId::parse(OVERDUE).unwrap()).unwrap(),
+            clock.clone(),
+            guard.clone(),
+        )
+    };
+    assert_eq!(publish(), Err(expiry::Error::Capacity));
+    // Backdate the filler past retention; keep a receipt 30 minutes old and
+    // another account's expired one.
+    sql(fixture, &format!("UPDATE td_mta.submission_expiry_receipts SET published_at=published_at-3660000 WHERE request_digest=decode(repeat('00',32),'hex'); INSERT INTO td_mta.accounts VALUES({OTHER},decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES({OTHER},0,0,0,0,0); INSERT INTO td_mta.submission_expiry_receipts SELECT account,decode(repeat('11',16),'hex'),decode(repeat('11',32),'hex'),submission_id,recipient_count,0,{NOW}-1800000,old_sequence,new_sequence FROM td_mta.submission_expiry_receipts WHERE operation=decode('{op}','hex'); INSERT INTO td_mta.submission_expiry_receipts SELECT {OTHER},decode(repeat('22',16),'hex'),decode(repeat('22',32),'hex'),submission_id,recipient_count,0,{NOW}-3660000,old_sequence,new_sequence FROM td_mta.submission_expiry_receipts WHERE operation=decode('{op}','hex')", op = value.operation()));
+    let epoch = td_mta::ids::StoreEpoch::parse(&sql(
+        fixture,
+        "SELECT encode(store_epoch,'hex') FROM td_mta.schema_migrations LIMIT 1",
+    ))
+    .unwrap();
+    let capacity = td_mta::postgres_capacity::inspect(request, trust, deadline(), epoch).unwrap();
+    let used = capacity
+        .get("metrics")
+        .unwrap()
+        .as_arr()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r.get("name").and_then(td_json::Json::as_str) == Some("submission_expiry_receipts")
+                && r.get("scope").and_then(td_json::Json::as_str) == Some(scope.as_str())
+        })
+        .unwrap()
+        .get("used")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        used,
+        sql(
+            fixture,
+            &format!("SELECT (SELECT count(*) FROM td_mta.submission_expiry_receipts WHERE account={account} AND published_at>={NOW}-3600000)+(SELECT count(*) FROM td_mta.attempt_final_reservations WHERE account={account})")
+        )
+    );
+    assert!(used.parse::<u64>().unwrap() < 1024);
+    let outcome = publish().unwrap();
+    assert_eq!(outcome.recipients, 1);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.submission_expiry_receipts WHERE request_digest=decode(repeat('00',32),'hex')"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.submission_expiry_receipts WHERE request_digest IN (decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'))"
+        ),
+        "2"
+    );
+    // The held operation's own young receipt still settles.
+    assert_eq!(
+        expiry::inspect(request, trust, deadline(), value).unwrap(),
+        Some(first)
+    );
+    sql(fixture, &format!("DELETE FROM td_mta.submission_expiry_receipts WHERE request_digest IN (decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex')) OR submission_id={overdue}; DELETE FROM td_mta.account_usage WHERE account={OTHER}; DELETE FROM td_mta.accounts WHERE id={OTHER}; DELETE FROM td_mta.recipients WHERE submission_id={overdue}; DELETE FROM td_mta.submission_routes WHERE submission_id={overdue}; DELETE FROM td_mta.submissions WHERE id={overdue}"));
 }

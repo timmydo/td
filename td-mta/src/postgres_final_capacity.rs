@@ -38,6 +38,16 @@ pub(crate) async fn admit_receipt(
     account: &[u8],
     kind: Receipt,
 ) -> Result<(), Error> {
+    // Expiry receipts expire by age; the others go with their attempts.
+    if matches!(kind, Receipt::Expiry) {
+        client
+            .execute(
+                "DELETE FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at<(extract(epoch FROM clock_timestamp())*1000)::bigint-$2",
+                &[&account, &crate::postgres_queue_expiry::RECEIPT_RETENTION_MS],
+            )
+            .await
+            .map_err(|_| Error::Database)?;
+    }
     let query = match kind {
         Receipt::Accepted => "SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_acceptance_receipts WHERE account=$1 LIMIT 1024) receipts",
         Receipt::Refused => "SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_refusal_receipts WHERE account=$1 LIMIT 1024) receipts",

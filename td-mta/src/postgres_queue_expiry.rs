@@ -16,6 +16,11 @@ use std::{
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
+/// An expiry receipt outlives the hour another route's settlement keeps
+/// (POSTGRES.md section 120); one Pending per relay process fences every
+/// expiry and reservation that sweeps in it.
+pub const RECEIPT_RETENTION_MS: i64 = crate::postgres_route_health::RECEIPT_RETENTION_MS;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
