@@ -53,7 +53,9 @@ unknown rules. Declaration-list at-rules are consumed and ignored. Style
 compilation evaluates nested `@media` and `@supports` groups as described
 below. Other at-rules, including `@import`, `@font-face`, `@page`,
 `@namespace`, `@container` and `@layer`, are skipped whole; their contents
-never leak into the surrounding cascade. No URL is fetched. Custom properties and `var()` follow the bounded
+never leak into the surrounding cascade. No URL is fetched: a caller
+that fetches, as td-web does, reads a sheet's imports itself and gives
+the sheets they name to the set (`StyleSet::from_sheets`, below). Custom properties and `var()` follow the bounded
 [CSS Variables Level 1 subset](https://www.w3.org/TR/2022/CR-css-variables-1-20220616/)
 in §3. Length arithmetic uses the bounded calc() subset in §4; animations,
 transitions, counters and generated content are outside this contract. Unsupported selectors invalidate their rule, unsupported

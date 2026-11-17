@@ -40,7 +40,11 @@
 // client that must carry a credential across a redirect asks for none and
 // follows the `location` it is handed itself, a relative one joined against
 // its URL; and gives the whole exchange with the origin five minutes over
-// `http.rs`'s connect deadline. A request's `public` line, for a URL a model
+// `http.rs`'s connect deadline, or less when a counted request's `deadline
+// N` line asks for N milliseconds, for a subresource worth nothing once its
+// page has gone on without it. A unit's `--workers N` serves N counted
+// requests at once in place of four, for an application whose own requests
+// out are bounded by more. A request's `public` line, for a URL a model
 // chose, judges every resolved address by the egress relay's stricter
 // predicate as well, against this machine's own networks, so that the URL
 // reaches no LAN. What it does not do otherwise is decide destinations:
@@ -97,7 +101,13 @@ const MAX_REDIRECTS: u32 = 5;
 /// bounded by the response cap (plus Vec capacity and decoder tables).
 /// A streamed request gives its worker's place back once it
 /// holds one of the `STREAM_ORIGINS`, which bound streams on their own.
+/// A unit may name more with `--workers`, up to `MAX_WORKERS`, for an
+/// application whose own requests out are bounded by more than these:
+/// td-web's navigations and their subresources (td-web/DESIGN.md §10,
+/// "Slots").
 const WORKERS: usize = 4;
+/// The most workers `--workers` may name.
+pub(crate) const MAX_WORKERS: usize = 16;
 /// The client's whole head and body must arrive within this, and its whole
 /// reply must be taken within this again: a budget for the connection, not
 /// a per-read timeout that a byte a minute would keep resetting. A streamed
@@ -111,6 +121,9 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// this, plus a name lookup, which no deadline reaches, and at most a
 /// second after a lookup that returns past it.
 const ORIGIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// The shortest `deadline` a counted request may ask for in place of
+/// `ORIGIN_TIMEOUT`.
+const MIN_DEADLINE: Duration = Duration::from_millis(1);
 /// A streamed exchange's longest wait on the origin: every read and write,
 /// from the handshake through the head to the last body byte, is given this
 /// by the socket itself, so a silent origin ends the stream within it. Twice
@@ -175,6 +188,7 @@ pub fn run(args: &[String]) {
                 run.parent,
                 run.limits,
                 run.unix_sockets,
+                run.workers,
             ) {
                 Ok(()) => 0,
                 Err(e) => {
@@ -214,7 +228,7 @@ pub fn run(args: &[String]) {
         },
         _ => {
             eprintln!(
-                "usage: td-fetchd run --socket PATH [--allow-loopback | --allow-private-loopback] [--allow-unix PATH]... [--exit-with-parent PID]\n       td-fetchd probe PATH"
+                "usage: td-fetchd run --socket PATH [--workers N] [--allow-loopback | --allow-private-loopback] [--allow-unix PATH]... [--exit-with-parent PID]\n       td-fetchd probe PATH"
             );
             2
         }
@@ -229,10 +243,13 @@ struct RunArgs {
     parent: Option<u32>,
     limits: Limits,
     unix_sockets: Vec<td_fs::SocketPath>,
+    /// Counted requests served at once.
+    workers: usize,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut socket = None;
+    let mut workers = WORKERS;
     let mut unix_sockets = Vec::new();
     let mut parent = None;
     let mut policy = Policy {
@@ -250,6 +267,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                         .ok_or_else(|| "--socket needs a path".to_string())?
                         .clone(),
                 );
+            }
+            "--workers" => {
+                workers = it
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| (1..=MAX_WORKERS).contains(n))
+                    .ok_or("--workers needs 1 to 16")?;
             }
             // For the recipe check and the unit tests, which serve on loopback:
             // never set by a unit.
@@ -294,6 +318,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         parent,
         limits,
         unix_sockets,
+        workers,
     })
 }
 
@@ -420,7 +445,18 @@ struct Request {
     /// Public destinations only: the egress relay's address predicate
     /// applied as well, for a URL a model chose.
     public: bool,
+    /// A counted exchange's budget with the origin, when the client asks
+    /// for less than `ORIGIN_TIMEOUT`.
+    deadline: Option<Duration>,
     body: Vec<u8>,
+}
+
+impl Request {
+    /// The whole exchange's budget with the origin: the service's, or
+    /// less when the request asks for less.
+    fn budget(&self, origin: Duration) -> Duration {
+        self.deadline.map_or(origin, |asked| asked.min(origin))
+    }
 }
 
 struct Reply {
@@ -466,6 +502,7 @@ fn serve(
     parent: Option<u32>,
     limits: Limits,
     unix_sockets: Vec<td_fs::SocketPath>,
+    workers: usize,
 ) -> Result<(), String> {
     let listener = bind(socket)?;
     if let Some(parent) = parent {
@@ -482,7 +519,7 @@ fn serve(
                 continue;
             }
         };
-        let slot = Slot::take(&active)?;
+        let slot = Slot::take(&active, workers)?;
         let origins = Arc::clone(&origins);
         let unix_sockets = Arc::clone(&unix_sockets);
         let spawned = std::thread::Builder::new().spawn(move || {
@@ -527,16 +564,16 @@ pub(crate) fn watch_parent(socket: &Path, parent: u32) -> Result<(), String> {
         .map_err(|e| format!("cannot watch the parent: {e}"))
 }
 
-/// One of the `WORKERS` places, given back when dropped, however the worker
+/// One of the `workers` places, given back when dropped, however the worker
 /// ends: a place leaked on an unwinding thread would be a place lost for the
-/// service's life, and four of those would be the service.
+/// service's life, and all of them would be the service.
 struct Slot(Arc<(Mutex<usize>, Condvar)>);
 
 impl Slot {
-    fn take(active: &Arc<(Mutex<usize>, Condvar)>) -> Result<Slot, String> {
+    fn take(active: &Arc<(Mutex<usize>, Condvar)>, workers: usize) -> Result<Slot, String> {
         let (count, wake) = &**active;
         let mut count = count.lock().map_err(|_| "worker count poisoned")?;
-        while *count >= WORKERS {
+        while *count >= workers {
             count = wake.wait(count).map_err(|_| "worker count poisoned")?;
         }
         *count += 1;
@@ -718,7 +755,8 @@ fn handle(
             return;
         }
         read => read.and_then(|request| {
-            perform_with_pool(request, policy, limits.origin, &origins.pool, unix_sockets)
+            let origin = request.budget(limits.origin);
+            perform_with_pool(request, policy, origin, &origins.pool, unix_sockets)
         }),
     };
     let mut writer = Bounded::new(writer, limits.client);
@@ -769,6 +807,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     let mut redirects = None;
     let mut stream = false;
     let mut public = false;
+    let mut deadline = None;
     let mut tls_ca_len = None;
     let mut unix_socket = None;
     let mut body_len = 0u64;
@@ -853,6 +892,15 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
                 }
                 public = true;
             }
+            "deadline" => {
+                let asked = value
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_millis)
+                    .filter(|asked| (MIN_DEADLINE..=ORIGIN_TIMEOUT).contains(asked))
+                    .ok_or_else(|| Fault::Malformed("deadline not 1 to 300000 ms".into()))?;
+                deadline = Some(asked);
+            }
             other => return Err(Fault::Malformed(format!("head key {other:?}"))),
         }
     }
@@ -868,6 +916,11 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     }
     if method == Method::Post && redirects.unwrap_or(0) > 0 {
         return Err(Fault::Malformed("a POST with redirects".into()));
+    }
+    if stream && deadline.is_some() {
+        return Err(Fault::Malformed(
+            "a stream has the service's deadlines, not its own".into(),
+        ));
     }
     if tls_ca_len.is_some() && (stream || public || redirects != Some(0)) {
         return Err(Fault::Malformed(
@@ -903,6 +956,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
         redirects,
         stream,
         public,
+        deadline,
         body,
     })
 }
@@ -1291,6 +1345,7 @@ fn send_origin(
         redirects: _,
         stream,
         public: _,
+        deadline: _,
         body: request_body,
     } = request;
     let response = match method {
@@ -1575,6 +1630,7 @@ fn hand_over(mut input: impl Write, request: Request) {
         redirects,
         stream: _,
         public,
+        deadline: _,
         body,
     } = request;
     let mut head = format!("{PROTOCOL}\nmethod {}\nurl {url}\n", method.as_str());
@@ -2461,6 +2517,7 @@ mod tests {
             Some(std::os::unix::process::parent_id()),
             LIMITS,
             Vec::new(),
+            WORKERS,
         )
         .unwrap();
     }
@@ -2911,7 +2968,7 @@ mod tests {
     #[test]
     fn a_slot_is_given_back_when_its_worker_ends() {
         let active = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let slot = Slot::take(&active).unwrap();
+        let slot = Slot::take(&active, WORKERS).unwrap();
         assert_eq!(*active.0.lock().unwrap(), 1);
         drop(slot);
         assert_eq!(*active.0.lock().unwrap(), 0);
@@ -2919,12 +2976,180 @@ mod tests {
         // and the count is not poisoned by it.
         let held = Arc::clone(&active);
         let worker = std::thread::spawn(move || {
-            let _slot = Slot::take(&held).unwrap();
+            let _slot = Slot::take(&held, WORKERS).unwrap();
             panic!("a worker unwinding");
         });
         assert!(worker.join().is_err());
         assert_eq!(*active.0.lock().unwrap(), 0);
-        assert!(Slot::take(&active).is_ok());
+        assert!(Slot::take(&active, WORKERS).is_ok());
+    }
+
+    /// `--workers` places are taken at once, and one more waits for one
+    /// to be given back.
+    #[test]
+    fn a_service_serves_as_many_counted_requests_as_its_workers() {
+        let active = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let held: Vec<_> = (0..8).map(|_| Slot::take(&active, 8).unwrap()).collect();
+        assert_eq!(*active.0.lock().unwrap(), 8);
+        let waiting = Arc::clone(&active);
+        let (took, taken) = std::sync::mpsc::channel();
+        let ninth = std::thread::spawn(move || {
+            let slot = Slot::take(&waiting, 8).unwrap();
+            took.send(()).unwrap();
+            drop(slot);
+        });
+        assert!(taken.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(held);
+        taken.recv_timeout(Duration::from_secs(10)).unwrap();
+        ninth.join().unwrap();
+        let run = |extra: &[&str]| {
+            let mut args = vec!["--socket".to_string(), "/s".to_string()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            parse_run_args(&args).map(|run| run.workers)
+        };
+        assert_eq!(run(&[]).unwrap(), WORKERS);
+        assert_eq!(run(&["--workers", "8"]).unwrap(), 8);
+        for refused in ["0", "17", "x"] {
+            assert!(run(&["--workers", refused]).is_err(), "{refused}");
+        }
+        assert!(run(&["--workers"]).is_err());
+        assert_eq!(MAX_WORKERS, 16, "the refusal names the bound");
+    }
+
+    /// Through the service as a unit runs it: `--workers 2` serves two
+    /// counted requests at once and a third waits for a worker; each of
+    /// the two asks a `deadline` of an origin that never answers, and is
+    /// given up at it.
+    #[test]
+    fn the_service_serves_its_workers_at_once_each_within_its_deadline() {
+        let root = td_fs::TempDir::new("fetch-workers").unwrap();
+        let socket = root.path().join("td-fetch").join("socket");
+        let serving = socket.clone();
+        // Serves until the test process ends.
+        std::thread::spawn(move || serve(&serving, LENIENT, None, LIMITS, Vec::new(), 2));
+        let until = Instant::now() + Duration::from_secs(10);
+        // Renamed into place once listening.
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the service did not bind");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let (accepted, accepts) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for socket in silent.incoming().take(2) {
+                held.push(socket);
+                let _ = accepted.send(());
+            }
+            std::thread::sleep(Duration::from_secs(15));
+            drop(held);
+        });
+        let answering = TcpListener::bind("127.0.0.1:0").unwrap();
+        let answering_port = answering.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((socket, _)) = answering.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let _ = reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+        });
+        // Each request's verdict line and how long it took.
+        let ask = |port: u16, deadline: &str| {
+            let socket = socket.clone();
+            let head = format!("method GET\nurl http://127.0.0.1:{port}/\n{deadline}body 0\n");
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let mut stream = UnixStream::connect(&socket).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream.write_all(&request_bytes(&head, b"")).unwrap();
+                let mut reply = Vec::new();
+                let _ = stream.read_to_end(&mut reply);
+                let verdict = String::from_utf8_lossy(&reply)
+                    .lines()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                (verdict, started.elapsed())
+            })
+        };
+        let first = ask(silent_port, "deadline 1500\n");
+        let second = ask(silent_port, "deadline 1500\n");
+        for _ in 0..2 {
+            accepts.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        // Both workers held: the third is served once one is given back.
+        let (verdict, took) = ask(answering_port, "").join().unwrap();
+        assert_eq!(verdict, "status 200");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        for silent in [first, second] {
+            let (verdict, took) = silent.join().unwrap();
+            assert!(verdict.starts_with("error transport"), "{verdict}");
+            assert!(took < Duration::from_secs(6), "{took:?}");
+        }
+    }
+
+    /// A counted request may ask for less than the service's five minutes
+    /// with the origin, never more, and a stream for none; an origin that
+    /// never answers is given up at what it asked.
+    #[test]
+    fn a_counted_request_may_ask_for_a_shorter_deadline() {
+        let head =
+            |line: &str| request_bytes(&format!("method GET\nurl http://h/\n{line}body 0\n"), b"");
+        let asked = parse(&head("deadline 250\n")).unwrap();
+        assert_eq!(asked.deadline, Some(Duration::from_millis(250)));
+        assert_eq!(asked.budget(ORIGIN_TIMEOUT), Duration::from_millis(250));
+        assert_eq!(
+            asked.budget(Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse(&head("")).unwrap().budget(ORIGIN_TIMEOUT),
+            ORIGIN_TIMEOUT
+        );
+        assert_eq!(
+            parse(&head("deadline 300000\n")).unwrap().deadline,
+            Some(ORIGIN_TIMEOUT)
+        );
+        for refused in ["0", "300001", "-1", "1.5", ""] {
+            let line = format!("deadline {refused}\n");
+            assert!(
+                parse(&head(&line))
+                    .unwrap_err()
+                    .starts_with("error malformed: deadline"),
+                "{refused}"
+            );
+        }
+        assert!(parse(&head("deadline 250\nstream\n"))
+            .unwrap_err()
+            .contains("a stream has the service's deadlines"));
+        // An origin that takes the request and never answers.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(socket);
+        });
+        let line = format!("method GET\nurl http://127.0.0.1:{port}/\ndeadline 300\nbody 0\n");
+        let request = parse(&request_bytes(&line, b"")).unwrap();
+        let started = Instant::now();
+        let budget = request.budget(ORIGIN_TIMEOUT);
+        assert!(perform(request, LENIENT, budget).is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            started.elapsed()
+        );
+        origin.join().unwrap();
     }
 
     /// A canned HTTP/1.1 origin on loopback: one request per accept, the

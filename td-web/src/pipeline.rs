@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fonts::Measure;
+use crate::gather::Sheets;
 use crate::memory;
 use crate::page::{Laid, Styled, Want};
 use crate::sheets::{self, Omitted};
@@ -44,8 +45,10 @@ pub struct Shown {
 /// What the status row says of how a page was made.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Notes {
-    /// The page's sheets left out or refused.
+    /// The page's sheets left out, refused or not had.
     pub omitted: usize,
+    /// The page's sheets that came after `STYLE_WAIT`.
+    pub late: usize,
     /// Its styles refused, by this limit (rung 2).
     pub styles: Option<&'static str>,
     /// Too large to lay out, by this limit (rung 3).
@@ -108,6 +111,9 @@ pub struct Page {
     /// A markup page's markup, which rung 3 reads after a relayout let
     /// the old layout go first.
     pub markup: Option<BudgetShared<BudgetString>>,
+    /// A markup page's own sheets, gathered, which a changed environment
+    /// compiles again; none on rungs 2 and 3.
+    pub sheets: Option<BudgetShared<Sheets>>,
     /// None while a relayout that let it go first runs.
     pub laid: Option<BudgetShared<Laid>>,
     pub rung: Rung,
@@ -166,8 +172,10 @@ fn stopped(cancel: &AtomicBool, step: Step) -> Result<(), Refusal> {
 /// `tree` cascaded for `want` with the page's own sheets and attributes
 /// when `own`, compiled in the sheets term and dropped once cascaded, the
 /// styled document's construction within the page term less `kept`.
+#[allow(clippy::too_many_arguments)]
 fn style(
     tree: &BudgetShared<Tree>,
+    sheets: Option<&Sheets>,
     own: bool,
     want: Want,
     input_bytes: usize,
@@ -175,11 +183,11 @@ fn style(
     cancel: &AtomicBool,
     page: &Budget,
 ) -> Result<BudgetShared<Styled>, Refusal> {
-    let terms = page.child(memory::SHEETS.saturating_add(Budget::metadata_bytes()))?;
+    let terms = terms(page, sheets)?;
     let environment = sheets::environment(want.width, want.height, u32::from(want.scale));
-    let (set, omitted) = sheets::compile(tree, own, &environment, &terms).map_err(css)?;
+    let (set, omitted) = sheets::compile(tree, sheets, own, &environment, &terms).map_err(css)?;
     stopped(cancel, Step::Compile)?;
-    let coloured = own && sheets::coloured(tree);
+    let coloured = own && sheets::coloured(tree, sheets);
     let limits = Limits {
         input: MAX_INPUT,
         bytes: MAX_PAGE_BYTES.saturating_sub(kept),
@@ -214,14 +222,47 @@ fn lay(
     Ok(BudgetShared::new(page, laid)?)
 }
 
-/// The page's own sheets' omissions, for its notes.
-fn omitted(laid: &Laid) -> Omitted {
-    laid.styled().omitted
+/// The page's own sheets not applied, for its notes: those the
+/// compilation left out or refused, and those not had.
+fn omitted(laid: &Laid, sheets: Option<&BudgetShared<Sheets>>) -> usize {
+    let had: Omitted = laid.styled().omitted;
+    had.count()
+        .saturating_add(sheets.map_or(0, |sheets| sheets.tally().not_applied()))
 }
 
-/// A markup page from `markup`, stepping down the ladder on a refusal;
-/// `Err(Cancelled)` once `cancel` is seen, `Err(Limit)` when rung 4's
-/// static notice is all there is.
+/// A markup page parsed: its tree, or, refused, rung 3's page.
+pub enum Parsed {
+    Tree {
+        tree: BudgetShared<Tree>,
+        markup: BudgetShared<BudgetString>,
+    },
+    Page(Page),
+}
+
+/// `markup` parsed; a refused tree laid as rung 3's text page.
+pub fn parse(
+    markup: BudgetShared<BudgetString>,
+    want: Want,
+    measure: &mut Measure,
+    cancel: &AtomicBool,
+    page: &Budget,
+) -> Result<Parsed, Refusal> {
+    let tree = match Tree::parse(&markup, Source::Markup, page) {
+        Ok(tree) => BudgetShared::new(page, tree)?,
+        Err(refusal) => {
+            stopped(cancel, Step::Down)?;
+            let refusal = Refusal::from(refusal);
+            return extracted(markup, refusal, want, measure, cancel, page).map(Parsed::Page);
+        }
+    };
+    stopped(cancel, Step::Parse)?;
+    Ok(Parsed::Tree { tree, markup })
+}
+
+/// A markup page from `markup` and its `style` elements alone, stepping
+/// down the ladder on a refusal; `Err(Cancelled)` once `cancel` is seen,
+/// `Err(Limit)` when rung 4's static notice is all there is.
+#[cfg(test)]
 pub fn markup_page(
     markup: BudgetShared<BudgetString>,
     want: Want,
@@ -229,37 +270,41 @@ pub fn markup_page(
     cancel: &AtomicBool,
     page: &Budget,
 ) -> Result<Page, Refusal> {
-    let tree = match Tree::parse(&markup, Source::Markup, page) {
-        Ok(tree) => BudgetShared::new(page, tree)?,
-        Err(refusal) => {
-            stopped(cancel, Step::Down)?;
-            return extracted(markup, Refusal::from(refusal), want, measure, cancel, page);
+    match parse(markup, want, measure, cancel, page)? {
+        Parsed::Tree { tree, markup } => {
+            styled_page(tree, Some(markup), None, want, measure, cancel, page)
         }
-    };
-    stopped(cancel, Step::Parse)?;
-    styled_page(tree, Some(markup), want, measure, cancel, page)
+        Parsed::Page(page) => Ok(page),
+    }
 }
 
-/// Rungs 1 and 2 of a parsed tree, then rung 3.
-fn styled_page(
+/// Rungs 1 and 2 of a parsed tree, with `sheets` gathered (none: its
+/// `style` elements alone), then rung 3.
+#[allow(clippy::too_many_arguments)]
+pub fn styled_page(
     tree: BudgetShared<Tree>,
     markup: Option<BudgetShared<BudgetString>>,
+    sheets: Option<BudgetShared<Sheets>>,
     want: Want,
     measure: &mut Measure,
     cancel: &AtomicBool,
     page: &Budget,
 ) -> Result<Page, Refusal> {
     let input = markup.as_ref().map_or(0, |markup| markup.len());
-    let mut notes = Notes::default();
+    let mut notes = Notes {
+        late: sheets.as_ref().map_or(0, |sheets| sheets.tally().late),
+        ..Notes::default()
+    };
     if want.styles {
-        let own = style(&tree, true, want, input, 0, cancel, page)
+        let own = style(&tree, sheets.as_deref(), true, want, input, 0, cancel, page)
             .and_then(|styled| lay(styled, measure, want, 0, cancel, page));
         match own {
             Ok(laid) => {
-                notes.omitted = omitted(&laid).count();
+                notes.omitted = omitted(&laid, sheets.as_ref());
                 return Ok(Page {
                     tree,
                     markup,
+                    sheets,
                     laid: Some(laid),
                     rung: Rung::Own,
                     notes,
@@ -275,11 +320,23 @@ fn styled_page(
             }
         }
     }
+    drop(sheets);
     user_agent(tree, markup, notes, want, measure, cancel, page)
 }
 
+/// The child a cascade's set is compiled in: the sheets term, less what
+/// the page's gathered sheets hold in it beside the set.
+fn terms(page: &Budget, sheets: Option<&Sheets>) -> Result<Budget, td_alloc::BudgetError> {
+    let held = sheets.map_or(0, Sheets::bytes);
+    page.child(
+        memory::SHEETS
+            .saturating_sub(held)
+            .saturating_add(Budget::metadata_bytes()),
+    )
+}
+
 /// Rung 2, then rung 3.
-fn user_agent(
+pub fn user_agent(
     tree: BudgetShared<Tree>,
     markup: Option<BudgetShared<BudgetString>>,
     notes: Notes,
@@ -289,12 +346,13 @@ fn user_agent(
     page: &Budget,
 ) -> Result<Page, Refusal> {
     let input = markup.as_ref().map_or(0, |markup| markup.len());
-    let laid = style(&tree, false, want, input, 0, cancel, page)
+    let laid = style(&tree, None, false, want, input, 0, cancel, page)
         .and_then(|styled| lay(styled, measure, want, 0, cancel, page));
     match laid {
         Ok(laid) => Ok(Page {
             tree,
             markup,
+            sheets: None,
             laid: Some(laid),
             rung: Rung::UserAgent,
             notes,
@@ -393,11 +451,12 @@ pub fn text_page(
     stopped(cancel, Step::Parse)?;
     let (tree, shown) = fitted(tree, None, want, measure, cancel, page)?;
     let input = node_text(&tree).len() + TEXT_PREFIX.len();
-    let styled = style(&tree, false, want, input, 0, cancel, page)?;
+    let styled = style(&tree, None, false, want, input, 0, cancel, page)?;
     let laid = lay(styled, measure, want, 0, cancel, page)?;
     Ok(Page {
         tree,
         markup: None,
+        sheets: None,
         laid: Some(laid),
         rung: Rung::Own,
         notes: Notes {
@@ -436,7 +495,7 @@ fn fitted(
 ) -> Result<(BudgetShared<Tree>, Option<Shown>), Refusal> {
     let text = node_text(&tree);
     let input = text.len() + TEXT_PREFIX.len();
-    let styled = style(&tree, false, want, input, 0, cancel, page)?;
+    let styled = style(&tree, None, false, want, input, 0, cancel, page)?;
     measure.forget();
     let fit = td_layout::text::fit(
         styled.styled(),
@@ -477,12 +536,13 @@ pub fn own_page(
 ) -> Result<Page, Refusal> {
     let markup = tree::own_markup(text, page)?;
     let tree = BudgetShared::new(page, Tree::parse(&markup, Source::Own, page)?)?;
-    let styled = style(&tree, false, want, markup.len(), 0, cancel, page)?;
+    let styled = style(&tree, None, false, want, markup.len(), 0, cancel, page)?;
     drop(markup);
     let laid = lay(styled, measure, want, 0, cancel, page)?;
     Ok(Page {
         tree,
         markup: None,
+        sheets: None,
         laid: Some(laid),
         rung: Rung::Own,
         notes: Notes::default(),
@@ -497,6 +557,7 @@ pub fn own_page(
 pub struct Again {
     pub tree: BudgetShared<Tree>,
     pub markup: Option<BudgetShared<BudgetString>>,
+    pub sheets: Option<BudgetShared<Sheets>>,
     pub rung: Rung,
     pub notes: Notes,
     pub budget: Budget,
@@ -569,6 +630,7 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
     let Again {
         tree,
         markup,
+        sheets,
         rung,
         mut notes,
         budget,
@@ -615,7 +677,16 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
             Some(styled) => styled,
             None => {
                 let own = want.styles && rung == Rung::Own && source == Source::Markup;
-                style(&tree, own, want, input, kept, cancel, page)?
+                style(
+                    &tree,
+                    sheets.as_deref(),
+                    own,
+                    want,
+                    input,
+                    kept,
+                    cancel,
+                    page,
+                )?
             }
         };
         let own = styled.own;
@@ -627,11 +698,12 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
         Ok((tree, laid, shown, own)) => {
             notes.shown = shown;
             if own {
-                notes.omitted = omitted(&laid).count();
+                notes.omitted = omitted(&laid, sheets.as_ref());
             }
             Ok(Page {
                 tree,
                 markup,
+                sheets,
                 laid: Some(laid),
                 rung,
                 notes,
@@ -652,9 +724,11 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
                     if let Refusal::Limit(name) = refusal {
                         notes.styles = Some(name);
                     }
+                    drop(sheets);
                     user_agent(tree, markup, notes, want, measure, cancel, page)
                 }
                 (Rung::UserAgent, Some(markup)) => {
+                    drop(sheets);
                     drop(tree);
                     extracted(markup, refusal, want, measure, cancel, page)
                 }
@@ -665,7 +739,7 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 pub(crate) mod tests {
     use super::*;
     use crate::page::tests::WANT;
@@ -771,6 +845,104 @@ pub(crate) mod tests {
         assert!(made.notes.styles.is_some());
     }
 
+    /// `text` made with its gathered sheets, `data:` ones alone, under
+    /// `page`.
+    fn with_sheets(text: &str, page: &Budget) -> Result<Page, Refusal> {
+        let cancel = AtomicBool::new(false);
+        let parsed = parse(markup(page, text), WANT, &mut measure(WANT), &cancel, page)?;
+        let Parsed::Tree { tree, markup } = parsed else {
+            panic!("not a tree");
+        };
+        let url = td_url::Url::parse("https://example.org/").unwrap();
+        let mut sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, page).unwrap();
+        sheets.finish();
+        let sheets = BudgetShared::new(page, sheets).unwrap();
+        styled_page(
+            tree,
+            Some(markup),
+            Some(sheets),
+            WANT,
+            &mut measure(WANT),
+            &cancel,
+            page,
+        )
+    }
+
+    #[test]
+    fn the_set_is_compiled_in_the_sheets_term_less_the_gathered_sheets() {
+        let page = Budget::new(256 << 20).unwrap();
+        let cancel = AtomicBool::new(false);
+        let text = "<link rel=stylesheet href='data:text/css,p{margin:0}'><p>a";
+        let parsed = parse(
+            markup(&page, text),
+            WANT,
+            &mut measure(WANT),
+            &cancel,
+            &page,
+        );
+        let Ok(Parsed::Tree { tree, .. }) = parsed else {
+            panic!("not a tree");
+        };
+        let url = td_url::Url::parse("https://example.org/").unwrap();
+        let sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, &page).unwrap();
+        assert!(sheets.bytes() > 0);
+        let metadata = Budget::metadata_bytes();
+        assert_eq!(
+            terms(&page, Some(&sheets)).unwrap().limit(),
+            memory::SHEETS - sheets.bytes() + metadata
+        );
+        assert_eq!(
+            terms(&page, None).unwrap().limit(),
+            memory::SHEETS + metadata
+        );
+    }
+
+    #[test]
+    fn rungs_two_and_three_let_the_gathered_sheets_go() {
+        let page = Budget::new(256 << 20).unwrap();
+        let link = "<link rel=stylesheet href='data:text/css,p{margin:0}'>";
+        let own = with_sheets(&format!("{link}<p>a"), &page).unwrap();
+        assert_eq!(own.rung, Rung::Own);
+        assert!(own.sheets.is_some());
+        // A set td-css refuses: rung 2, its sheets let go.
+        let mut heavy = String::from(link);
+        for group in 0..3 {
+            heavy.push_str("<style>");
+            for n in 0..7000 {
+                heavy.push_str(&format!(".c{group}x{n}{{color:red}}"));
+            }
+            heavy.push_str("</style>");
+        }
+        heavy.push_str("<p>text");
+        let made = with_sheets(&heavy, &page).unwrap();
+        assert_eq!(made.rung, Rung::UserAgent);
+        assert!(made.sheets.is_none());
+        // A relayout stepping down from rung 1 lets them go too, to rung 2
+        // and to rung 3.
+        let text = format!("{link}{}", ladder());
+        let made = with_sheets(&text, &page).unwrap();
+        assert_eq!(made.rung, Rung::Own);
+        assert!(made.sheets.is_some());
+        let lo = 2 * Budget::metadata_bytes();
+        for (rung, at_least) in [(Rung::UserAgent, 2), (Rung::Text, 1)] {
+            let limit = least(lo, page.limit(), |limit| {
+                let child = page.child(limit).unwrap();
+                rank(&relaid(again_of(
+                    &made,
+                    Rung::Own,
+                    None,
+                    false,
+                    WIDER,
+                    &child,
+                ))) >= at_least
+            });
+            let child = page.child(limit).unwrap();
+            let relaid = relaid(again_of(&made, Rung::Own, None, false, WIDER, &child)).unwrap();
+            assert_eq!(relaid.rung, rung);
+            assert!(relaid.sheets.is_none(), "{rung:?}");
+        }
+    }
+
     #[test]
     fn a_refused_tree_is_laid_as_text() {
         let page = Budget::new(256 << 20).unwrap();
@@ -838,6 +1010,7 @@ pub(crate) mod tests {
             Again {
                 tree: made.tree,
                 markup: made.markup,
+                sheets: made.sheets,
                 rung: made.rung,
                 notes: made.notes,
                 budget: made.budget,
@@ -1117,12 +1290,12 @@ pub(crate) mod tests {
         // from.
         let cancel = AtomicBool::new(false);
         let styled = cancelling(Step::Compile, When::After, 0, || {
-            style(&tree, true, WANT, 4, 0, &cancel, &page)
+            style(&tree, None, true, WANT, 4, 0, &cancel, &page)
         });
         assert_eq!(styled.err(), Some(Refusal::Cancelled));
         assert_eq!(page.used(), used);
         let cancel = AtomicBool::new(false);
-        let styled = style(&tree, true, WANT, 4, 0, &cancel, &page).unwrap();
+        let styled = style(&tree, None, true, WANT, 4, 0, &cancel, &page).unwrap();
         cancel.store(true, Ordering::SeqCst);
         let laid = lay(styled, &mut measure(WANT), WANT, 0, &cancel, &page);
         assert_eq!(laid.err(), Some(Refusal::Cancelled));
@@ -1142,6 +1315,7 @@ pub(crate) mod tests {
         Again {
             tree: made.tree.try_clone().unwrap(),
             markup: made.markup.as_ref().map(|m| m.try_clone().unwrap()),
+            sheets: made.sheets.as_ref().map(|s| s.try_clone().unwrap()),
             rung,
             notes: made.notes,
             budget: budget.try_clone().unwrap(),
@@ -1382,6 +1556,7 @@ pub(crate) mod tests {
                 Again {
                     tree: made.tree.try_clone().unwrap(),
                     markup: made.markup.as_ref().map(|m| m.try_clone().unwrap()),
+                    sheets: made.sheets.as_ref().map(|s| s.try_clone().unwrap()),
                     rung: made.rung,
                     notes: made.notes,
                     budget: page.try_clone().unwrap(),
@@ -1430,6 +1605,122 @@ pub(crate) mod tests {
                 painted.cut,
                 peak as f64 / 1048576.0,
                 laid.layout.page_bytes as f64 / 1048576.0,
+            );
+        }
+    }
+
+    /// Resident and peak resident KiB, and the peak reset to now.
+    fn resident() -> (usize, usize) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib = |name: &str| -> usize {
+            let line = status.lines().find(|l| l.starts_with(name)).unwrap();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        };
+        (kib("VmRSS:"), kib("VmHWM:"))
+    }
+
+    fn reset_peak() {
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    }
+
+    /// Increment 8's host measurement (DESIGN.md §10): each page of a
+    /// captured corpus (`fetch::tests::Corpus`) parsed, its sheets
+    /// gathered from the capture and compiled: the sheets linked and
+    /// imported, the text held, the least sheets term that compiles them
+    /// (by halving), and the resident peak's growth parsing and compiling
+    /// past the bytes td-alloc holds after the step, `WORKING`'s part, the
+    /// peak reset before each. A process a page: `TD_WEB_ONLY`.
+    #[test]
+    #[ignore = "host measurement: TD_WEB_CORPUS with a pages.tsv, release build"]
+    fn measure_sheets() {
+        use crate::fetch::{self, tests::Corpus, Fetcher};
+        use crate::gather::{Refused, Sheets};
+        let dir = std::path::PathBuf::from(std::env::var_os("TD_WEB_CORPUS").unwrap());
+        let corpus = Corpus::read(&dir).unwrap();
+        let only = std::env::var("TD_WEB_ONLY").ok();
+        let cancel = AtomicBool::new(false);
+        for (name, address) in &corpus.pages {
+            if only.as_ref().is_some_and(|only| only != name) {
+                continue;
+            }
+            let reply = corpus
+                .table
+                .get(address, fetch::Ask::navigation(true))
+                .unwrap();
+            let text = String::from_utf8_lossy(&reply.body);
+            let page = Budget::new(memory::PAGES).unwrap();
+            let markup = markup(&page, &text);
+            let held = page.used();
+            reset_peak();
+            let (before, _) = resident();
+            let parsed = parse(markup, WANT, &mut measure(WANT), &cancel, &page).unwrap();
+            let (_, peak) = resident();
+            let tree_bytes = page.used() - held;
+            let parse_over = (peak - before) as f64 / 1024.0 - tree_bytes as f64 / 1048576.0;
+            let Parsed::Tree { tree, .. } = parsed else {
+                println!("{name}: not a tree");
+                continue;
+            };
+            let url = td_url::Url::parse(address).unwrap();
+            let mut sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, &page).unwrap();
+            while let Some((at, wanted)) = sheets.wanted() {
+                let wanted = td_url::Url::parse(wanted).unwrap();
+                sheets.asked(at);
+                match fetch::subresource(
+                    &corpus,
+                    wanted,
+                    url.https,
+                    crate::subresource::SHEET,
+                    &cancel,
+                ) {
+                    Ok(loaded) if crate::subresource::acceptable(&loaded) => {
+                        let kind = loaded.reply.header("content-type");
+                        sheets
+                            .arrived(at, &loaded.url, kind, &loaded.reply.body)
+                            .unwrap();
+                    }
+                    _ => sheets.refused(at, Refused::Failed),
+                }
+            }
+            sheets.finish();
+            let environment = sheets::environment(WANT.width, WANT.height, u32::from(WANT.scale));
+            let compile = |limit: usize| {
+                let terms = page.child(limit + Budget::metadata_bytes()).unwrap();
+                let compiled = sheets::compile(&tree, Some(&sheets), true, &environment, &terms);
+                compiled.map(|(set, omitted)| (set, omitted, terms))
+            };
+            let room = memory::SHEETS - sheets.bytes();
+            reset_peak();
+            let (before, _) = resident();
+            let started = std::time::Instant::now();
+            let (set, omitted, terms) = compile(room).unwrap();
+            let took = started.elapsed();
+            let (_, peak) = resident();
+            let set_bytes = terms.used();
+            let compile_over = (peak - before) as f64 / 1024.0 - set_bytes as f64 / 1048576.0;
+            drop(set);
+            drop(terms);
+            let (mut low, mut high) = (0, room);
+            while high - low > 16 << 10 {
+                let mid = low + (high - low) / 2;
+                if compile(mid).is_ok() {
+                    high = mid;
+                } else {
+                    low = mid;
+                }
+            }
+            println!(
+                "{name}: {} sheets, {:?}, {omitted:?}; tree {:.1} MiB, parsing {:.1} MiB \
+                 past it; sheets {:.2} MiB held, set {:.1} MiB, compiled in {took:.1?} \
+                 with {:.1} MiB past it, the least term compiling them {:.1} MiB",
+                sheets.taken(),
+                sheets.tally(),
+                tree_bytes as f64 / 1048576.0,
+                parse_over,
+                sheets.bytes() as f64 / 1048576.0,
+                set_bytes as f64 / 1048576.0,
+                compile_over,
+                (high + sheets.bytes()) as f64 / 1048576.0,
             );
         }
     }

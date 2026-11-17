@@ -1747,9 +1747,9 @@ td-fat/src/lib.rs	allocation-macro	10
 td-fat/src/lib.rs	unchecked-growth-or-clone	13
 td-fetch-client/src/lib.rs	allocating-constructor	1
 td-fetch-client/src/lib.rs	allocating-conversion	12
-td-fetch-client/src/lib.rs	allocation-macro	27
+td-fetch-client/src/lib.rs	allocation-macro	28
 td-fetch-client/src/lib.rs	direct-reservation	1
-td-fetch-client/src/lib.rs	unchecked-growth-or-clone	14
+td-fetch-client/src/lib.rs	unchecked-growth-or-clone	15
 td-fido/src/fido_aes.rs	heap-owner	2
 td-fido/src/fido_cbor.rs	allocating-constructor	3
 td-fido/src/fido_cbor.rs	unchecked-growth-or-clone	8

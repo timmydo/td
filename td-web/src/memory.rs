@@ -74,10 +74,16 @@ mod tests {
         // jail's memory-high: both copied by hand and reviewed.
         const WINDOW: usize = 145_000_000;
         const MEMORY_HIGH: usize = 640 << 20;
-        // Increment 8's subresource bodies: MAX_SUBRESOURCES (4) of
-        // MAX_SUBRESOURCE (4 MiB), held in reserve before they exist.
-        const SUBRESOURCES: usize = 4 * (4 << 20);
+        // The subresource bodies in flight, before the render thread
+        // decodes them: a sheet's at most 1 MiB, a picture's (increment
+        // 9) at most MAX_SUBRESOURCE, held in reserve before it exists.
+        const MAX_SUBRESOURCE: usize = 4 << 20;
+        assert!(crate::gather::MAX_SHEET <= MAX_SUBRESOURCE);
+        let subresources = crate::subresource::MAX_SUBRESOURCES * MAX_SUBRESOURCE;
         assert_eq!(PAGE + SHEETS + PICTURES, PAGES);
+        // A page's gathered sheets and the set compiled from them share
+        // the sheets term.
+        assert!(crate::gather::MAX_HELD < SHEETS);
         assert_eq!(PAGE, td_layout::MAX_PAGE_BYTES);
         assert!(td_html::html5::MAX_TREE_BYTES < PAGE);
         // A navigated picture's peak, its decoders' bulk and the table
@@ -90,7 +96,7 @@ mod tests {
         let total = WINDOW
             + td_ui::prose::ATLAS
             + bodies
-            + SUBRESOURCES
+            + subresources
             + td_layout::WORKING_BYTES
             + root.limit();
         assert!(total + 20_000_000 <= MEMORY_HIGH, "{total}");

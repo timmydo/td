@@ -10937,7 +10937,11 @@ webpki-roots, plus td-inflate for content decoding. So:
    on every boot after firstboot, beside their jails in the account's
    session cgroup; the jail's resource cap does not count its fetch daemon.
    They share no credentials or connections with the human service, the
-   portal, each other or `web`'s `[web-fetch]` (td-web/DESIGN.md §3).
+   portal, each other or `web`'s `[web-fetch]` (td-web/DESIGN.md §3),
+   which serves eight counted requests at once (`--workers 8`, item 3):
+   td-web's four navigations and four subresource fetches, stopped ones
+   included, so a navigation never waits behind a page's sheets
+   (td-web/DESIGN.md §10, "Slots").
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds the `td-fetch` directory into the jail's runtime
    directory when it is granted, read-only like the bus and as a
@@ -10995,7 +10999,17 @@ webpki-roots, plus td-inflate for content decoding. So:
    `http.rs`'s connect deadline: ureq's whole-exchange deadline, which
    starts when the exchange is called and bounds every read and write
    under it. A bounded number of
-   connections are served at once; the rest wait.
+   connections are served at once, four, or as many as a unit's
+   `--workers N` names, at most sixteen; the rest wait.
+
+   A counted request may carry `deadline N`, N milliseconds from 1 to
+   300,000, which gives its exchange with the origin, redirects included,
+   N in place of the five minutes, by the same whole-exchange deadline;
+   a streamed request refuses the line, its bounds being the service's.
+   The name lookup stays outside it, the recorded gap below. td-web asks
+   it of each subresource hop, what is left of its page's wait for its
+   sheets, so a sheet no one will apply holds no worker past it. An older
+   service refuses the unknown line.
 
    A counted, non-public request may carry `tls-ca N`, where N is 1 to
    65536, with `redirects 0`. After the blank line it sends N bytes of
@@ -11033,7 +11047,7 @@ webpki-roots, plus td-inflate for content decoding. So:
    Every exchange supplies fresh headers and credentials. Each agent is
    exclusively checked out until its bounded response is fully consumed;
    errors or incomplete bodies discard it. A service retains at most four
-   idle agents, each with one idle connection, beside at most four active
+   idle agents, each with one idle connection, beside its active
    workers. Checkout and return retire agents after four idle seconds,
    sixty seconds of lifetime or sixteen completed exchanges; there is no
    background idle reaper. ureq still keys sockets by origin and applies
@@ -11134,7 +11148,13 @@ webpki-roots, plus td-inflate for content decoding. So:
    most six of a stream's frames are in the service at once: four
    waiting, one being read from the process and one being written. A
    client slow to read holds the process back rather than growing the
-   service. In all, the service holds at most four counted requests.
+   service. In all, the service holds at most its workers' count of
+   counted requests, four unless its unit names more. `[web-fetch]`
+   names eight, so it holds at most eight, four navigations and four
+   sheet fetches, each able to hold what any counted request may below,
+   a compressed body up to the response cap included; only a decoded or
+   identity body is held to td-web's own limit, 16 MiB for a navigation
+   and 1 MiB for a sheet.
    While decoding, each can hold a compressed body, decoded aggregate and
    one gzip member, each bounded at 64 MiB, plus allocation capacity and
    decoder tables. It also holds eight streams' request bodies
@@ -11159,7 +11179,8 @@ webpki-roots, plus td-inflate for content decoding. So:
    the grant still reaches a LAN, as `shared=network` did. An older
    service refuses the line as an unknown head key, so a client asking
    for it never gets less. The client module's `get_public` sends it
-   with `redirects 0`, its caller judging each `location`.
+   with `redirects 0`, its caller judging each `location`, and
+   `get_public_within` with a `deadline` too.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
    an unspecified-address URL and expects the exact refusal; inside the jail, the
@@ -11170,7 +11191,8 @@ webpki-roots, plus td-inflate for content decoding. So:
    oracle. Host side, the crate's
    own tests, which the `net-test` preflight runs, serve the applet
    against a std `TcpListener` on loopback under an explicit allow flag
-   and pin the framing, the caps, the header rules and the redirects,
+   and pin the framing, the caps, the header rules and the redirects, a
+   `deadline` given up at what it asked and `--workers` places taken,
    and, running the built binary as the service with test-only shortened
    bounds that only the allow flag admits, a streamed request's frames
    as they arrive, the idle deadline, the total and the memory bound
@@ -12447,7 +12469,8 @@ becomes the application, by exec, with that directory as its
 application keeps the launch's pid, terminal and exit status, so a
 shell's Ctrl-C and wait reach it as they reach any program. td-net's
 `fetchd` applet is started at `td-fetch/socket` there with
-`--exit-with-parent PID`, the launch's pid, in a process group of its
+`--exit-with-parent PID`, the launch's pid, td-web's with `--workers 8`
+as its `[web-fetch]` unit is (§W.8), in a process group of its
 own, so a terminal's signals pass it by: once its parent is no longer
 that pid, the application having ended however it ended, it removes the
 socket it bound, when that is still the one there, and the socket's

@@ -1,11 +1,11 @@
 # td-web
 
 **Status: normative; every increment of §9 has landed, and §10's
-through its cutover (increment 7), whose validation still owes what
-increment 7 lists as not yet done.** §10, styled documents, is how
-td-web makes, lays out and paints a page; its increments 8 and 9 are
-planned, normative for the work they name. The roadmap (§11) is not
-normative; each item there is its own amendment.
+through its stylesheets (increment 8); increment 7's validation still
+owes what it lists as not yet done.** §10, styled documents, is how
+td-web makes, lays out and paints a page; its increment 9 is planned,
+normative for the work it names. The roadmap (§11) is not normative;
+each item there is its own amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -272,10 +272,12 @@ the thread to take the next (td-web's build unwinds: a `compile_error!`
 refuses one that would abort on panic, by a profile's `panic` or a
 recipe's `-C panic`), and a render thread found gone is started again.
 `memory-high` throttles before `memory-max` ends the jail. The tasks
-hold the window's thread, td-ui's, the render thread and `MAX_WORKERS`
-fetches with room, since td-svc does not restart a program that exits
-on the cap. One CPU, twice news's, since a page is made and laid out
-again on the render thread while the window's paints (§10).
+hold the window's thread, td-ui's, the render thread, `MAX_WORKERS`
+fetches and `MAX_SUBRESOURCES` subresource fetches (§10,
+"Subresources"), 11, with room, since td-svc does not restart a
+program that exits on the cap. One CPU, twice news's, since a page is
+made and laid out again on the render thread while the window's paints
+(§10).
 
 td-jail gives td-web an allowlist seccomp program in place of the
 standard one, derived from its realized binary as mail's and news's
@@ -296,7 +298,15 @@ socket only from its own runtime directory, owned by its own UID
 (td-jail `sockets=fetch`). td-web therefore has its own `td-fetchd`,
 td-svc's `[web-fetch]`, run as `tda65540` with its socket at
 `/run/user/65540/td-fetch/socket`, as mail and news each have their own
-under 65537 and 65538; `[web]` requires it. It runs on every boot,
+under 65537 and 65538; `[web]` requires it. It serves eight counted
+requests at once (`td-fetchd run --workers 8`), td-web's `MAX_WORKERS`
+navigations and `MAX_SUBRESOURCES` sheet fetches, stopped ones
+included, so neither waits behind the other there (§10, "Slots");
+`subresource.rs` asserts the sum at compile time against
+`SERVICE_WORKERS`, and a recipe test holds the unit's line, that
+constant and td-launch's `WEB_FETCH_WORKERS` equal, the eight td-launch
+gives td-web's own service on a host (`./install-apps`). It runs on
+every boot,
 not on demand: a unit skipped by `unless-exists=` settles ready, which
 would satisfy `[web]`'s requirement with no socket behind it.
 td-firstboot prepares the account's home and its `/run/user/65540`, as
@@ -336,8 +346,8 @@ by who chose them:
   (`td_url::Url::same_host`): a device's `http` page sending the browser
   to its own `https` is still that device. A hop to another host is
   sent `public`, and so is every hop after it.
-- A **subresource** is a request the document chose: an inline image,
-  and later a stylesheet or a frame. It is always sent `public`, so a
+- A **subresource** is a request the document chose: a stylesheet, and
+  later an inline image or a frame. It is always sent `public`, so a
   page on the internet cannot make td-web touch a device on the local
   network. td-web makes no request the person did not cause by
   navigating. A `<meta http-equiv=refresh>` is neither followed nor
@@ -352,7 +362,8 @@ and text past `MAX_TEXT` (4 MiB), both counted in the UTF-8 they
 decode to, are not rendered, and the page says so (§5). Requests carry
 `accept: text/html, application/xhtml+xml, text/plain;q=0.9,
 image/png;q=0.8, image/jpeg;q=0.8, image/gif;q=0.8, image/webp;q=0.8, */*;q=0.1` and td-web's
-`user-agent`. Every request names its limit, so the service asks for
+`user-agent`, a stylesheet's `accept: text/css,*/*;q=0.1` (§10,
+"Subresources"). Every request names its limit, so the service asks for
 gzip and deflate itself and hands td-web the decoded body, the limit
 bounding its decoded bytes (APPLICATIONS.md, the fetch service).
 
@@ -566,7 +577,9 @@ One td-ui window: an address row on top, the page below, a status row
 at the bottom. The status row says, first that applies: what the last
 input made happen (a link not followed, a refusal, a copy), until the
 next key, click, wheel turn or paste, and what a save did, once it
-ends, until the same; what is loading; that a save runs; where the link
+ends, until the same; what is loading, `loading styles of` a URL while
+its page waits for its sheets (§10, "Subresources"); that a save runs;
+where the link
 under the pointer, else the focused link, goes; the response's status, the place in the page, the
 encoding its text was decoded from when not UTF-8 (§5), and any cut.
 The place is `N of M lines`: the last line shown whole, of the
@@ -730,9 +743,10 @@ Increments 6 onward are §10's; 6 and 7 have landed.
 ## 10. Styled documents
 
 A page is a document tree, styled by td-css, laid out by td-layout and
-painted by td-web. What increments 8 and 9 (below) add, stylesheets and
-pictures fetched as subresources, is planned, normative for the work it
-names; the rest of this section is the contract.
+painted by td-web. Increment 8 (below), stylesheets fetched as
+subresources, has landed; what increment 9 adds, pictures fetched the
+same way, is planned, normative for the work it names; the rest of this
+section is the contract.
 
 ### Pipeline and threads
 
@@ -750,7 +764,8 @@ a time:
    limit what the page's budget admits (below, "Memory"). Its storage
    retains the supplied tree budget until the last tree owner drops.
 3. **Sheets**: the user-agent sheets and the page's own (below,
-   "Sources") compiled into one `td_css::StyleSet` under td-css's
+   "Sources"), its linked and imported ones gathered first (below,
+   "Subresources"), compiled into one `td_css::StyleSet` under td-css's
    admission ceiling, set to the sheets term the page has charged
    first, and dropped once the cascade is done: the styled document
    holds none and layout takes none. The environment is screen, the
@@ -974,7 +989,7 @@ through td-alloc as well. Any refusal follows "Cuts" below.
 | index | td-dom's owned arrays and construction's per-node maps, only during construction | `MAX_INDEX_BYTES` and 80 bytes a node, within the page's |
 | layout | owned geometry, lines, fragments and td-web's indexes over them | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
-| sheets | their text, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB (estimate) |
+| sheets | their text, linked and imported sheets' kept for the page's life, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB |
 | pictures | inline pictures' pixels and fitted copies (increment 9) | 48 MiB (estimate) |
 
 The ceilings of page, sheets and pictures sum to `PAGES`, so a page
@@ -987,7 +1002,19 @@ caches, a few MiB in all and about 20 once that scratch is grown,
 which come out of `PAGES`. The sheets child bounds simultaneously live compilation layouts,
 including scratch and replacement overlap. Source-size limits alone do
 not guarantee admission: a sufficiently complex sheet can exhaust 48 MiB
-before compilation finishes, and the page follows "Cuts" below.
+before compilation finishes, and the page follows "Cuts" below. A
+page's gathered sheets (below, "Subresources") hold at most 4 MiB of
+text, their entries, at most twice `MAX_SHEET_FETCHES` and never
+grown, and their fetches' URLs, each at most `MAX_URL`,
+`gather::MAX_HELD`, in a child of the page's budget, and the
+compilation's child is the sheets term less what they hold. Measured
+(`pipeline::tests::measure_sheets`, the corpus of
+increment 8 with every sheet it links and imports, the least child
+that compiles them found by halving), a page's sheets need at most
+27.2 MiB of the term, GitHub's 23 sheets of 3.6 MiB of text, which
+compile to a set of 13.7 MiB; The Guardian's inline sheets 11.7 MiB;
+every other page 0.2 to 5.5 MiB. The term stays 48 MiB, its room
+over the corpus for hostile sheets, which it refuses.
 
 A picture reached by navigation is a page of its own, charged the shared
 decoder's conservative 200 MiB peak before decoding, including the bounded
@@ -1042,11 +1069,17 @@ relayout does not fit beside it and lets the old layout go first.
   save's among them, §5), a page's decoded text standing in its body's
   place (§3);
 - the subresources' bodies, 16 MiB (`MAX_SUBRESOURCES` of
-  `MAX_SUBRESOURCE`, below, "Subresources");
+  `MAX_SUBRESOURCE`, below, "Subresources"), a sheet's at most 1 MiB
+  and a picture's (increment 9) 4 MiB, held for pictures before they
+  exist;
 - `WORKING`, td-layout's `WORKING_BYTES` (64 MiB): a cascade's
-  candidate, wrapping scratch and the allocator's overhead, measured
-  for layout and an estimate for parsing and compiling, for the one
-  step the render thread runs at a time.
+  candidate, wrapping scratch and the allocator's overhead, for the one
+  step the render thread runs at a time, measured for layout and, for
+  parsing and compiling, the resident peak's growth over a step past
+  what td-alloc holds after it (`measure_sheets`, the peak reset before
+  each step): at most 0.3 MiB parsing a corpus page or 2 MiB spec, the
+  heap reusing what reading it freed, and at most 8.8 MiB compiling,
+  GitHub's sheets.
 
 With the root's `PAGES` (not td-ui's `prose::PAGES`) that is 145 +
 13.5 + 67.1 + 16.8 + 67.1 + 335.5 = 645.0 MB, 26 MB under
@@ -1092,13 +1125,14 @@ A page's sheets, in cascade order:
    a block in monospace, `white-space: pre-wrap`. `PAPER` is the
    canvas's default, not the root's background, so a body's background
    reaches the canvas as CSS 2.2 §14.2 has it (below, "Painting").
-3. The page's own: each `<style>` element in tree order whose `type`
-   is empty or `text/css`, its `media` attribute, if any, its media
+3. The page's own, in tree order: each `<style>` element whose `type`
+   is empty or `text/css`, and each `<link>` naming a stylesheet (below,
+   "Subresources"), its `media` attribute, if any, its media
    condition (td-css's `Sheet::with_media`, rather than wrapping its text in
-   `@media`, which a stray `}` in it would escape); then each element's
-   `style` attribute, inline, as td-layout joins it. `<link
-   rel=stylesheet>` and `@import` are subresources (increment 8);
-   until then td-css skips `@import` whole and td-web fetches no sheet.
+   `@media`, which a stray `}` in it would escape), each sheet's imports
+   before it; then each element's `style` attribute, inline, as
+   td-layout joins it. td-css skips `@import` whole: td-web reads a
+   sheet's imports itself and gives the sheets they name to the set.
 
 td-css takes no presentational attributes (`bgcolor`, `align`, a
 table's `width`, `<font>`), so none applies; an image's `width` and
@@ -1106,7 +1140,7 @@ table's `width`, `<font>`), so none applies; an image's `width` and
 at most 64 sheets in a set and 4 MiB of their text in all, the two
 user-agent sheets included, 1 MiB each, a sheet's media lists counted
 with it; a sheet past them is left out,
-in tree order, and the status row says so.
+in cascade order, and the status row says so.
 
 **Colours.** The colours a page names are applied: a page looks as its
 sheets say. An unstyled page draws td-web's defaults,
@@ -1149,15 +1183,32 @@ td-layout lays it.
 ### Subresources
 
 A page's stylesheets (increment 8) are its first subresources (§4):
-each `<link>` whose `rel` holds `stylesheet` and not `alternate`, with
-an `href`, and each `@import` at the head of a sheet (td-css's syntax
-keeps an at-rule's prelude), in the order the cascade takes them, an
-import standing at its rule's place with the media lists of its chain as
-its conditions, all of which must match: the `<style>`'s or `<link>`'s
-`media`, then each import's list, outermost first (a `<link media=print>`
-importing `x screen` applies in neither); an import naming `layer()` or
-`supports()` is skipped, as td-css skips layers. Every sheet is fetched
-whatever its media, so what is fetched says nothing of the viewport.
+each `<link>` whose `rel` holds `stylesheet` and not `alternate`
+(ASCII case-insensitively), with an `href` not blank, no `disabled`
+attribute and a `type` empty or of MIME essence `text/css` (a
+`<style>`'s `type` empty or exactly `text/css`), each in the preferred
+style sheet set: a `<style>` or such `<link>` with a `title` applies
+only when it is the first such title in tree order, an untitled one
+always, as no alternative set can be chosen; and each `@import` at the
+head of a sheet, in the
+order the cascade takes them, an import standing at its rule's place
+with the media lists of its chain as its conditions, all of which must
+match: the `<style>`'s or `<link>`'s `media`, then each import's list,
+outermost first (a `<link media=print>` importing `x screen` applies in
+neither). td-web reads a sheet's head itself (`gather.rs`), as CSS
+Syntax tokenizes it, comments, strings and blocks kept whole: an
+`@import` counts after `@charset` and `@layer` statements and before any
+other rule, an `@namespace` or an unknown statement among them; a
+string a newline breaks is the tokenizer's bad string, its statement
+going on from the newline to its `;`, and an import holding one is
+malformed and skipped; its URL is a string or `url()`, escapes
+undone. An import naming `layer()` or `supports()` is left out and
+counted not applied, as td-css skips layers; td-css's `@supports`
+evaluator could later decide a `supports()` condition, which would then
+apply it. Every sheet is fetched whatever its
+media, so what is fetched says nothing of the viewport. A `<link>`'s
+URL is joined against the page's `<base href>`, else the page's URL;
+an import's against the URL its sheet answered from, after redirects.
 Inline pictures (increment 9) are each `img` with a `src`, in tree
 order, at most `MAX_PICTURES` (64, estimate) a page.
 
@@ -1168,39 +1219,138 @@ pages' sheets and pictures so often are; an `http` one under an
 refuse mixed content; no cookie (td-web keeps none) and no `referer` is
 sent, so a host learns no more of the page than the subresource's own
 URL. A `data:` URL is taken within the same byte bounds, decoded by
-td-web on the render thread with no request: it takes no slot, and its
-decoded bytes are charged to the sheets or pictures term, whose
-ceilings bound them, until the sheet is compiled or the picture
-decoded. A reply other than `2xx` is dropped. A sheet
-asks `accept: text/css,*/*;q=0.1`, and one whose type is not
-`text/css` is not applied; its text is decoded as CSS Syntax §3.2
-orders it, through td-charset: a byte order mark, the
-`content-type`'s `charset`, an `@charset` rule, the page's encoding,
-else UTF-8. Bounds: 1 MiB a sheet decoded (td-css's per-input bound,
-asked of the service as the body's limit; a sheet in another encoding
-whose decoded text passes it is left out after decoding, the status
-row saying so), 4 MiB in all with the
-user-agent sheets, at most `MAX_SHEET_FETCHES` (32, estimate) and
-imports four deep; a picture's body at most `MAX_SUBRESOURCE` (4 MiB).
+td-web on the render thread with no request: it takes no slot; its
+decoding's scratch, at most its URL's length, is charged to the page's
+budget, as the page's text it comes from is, and dropped once decoded,
+and its decoded bytes are charged to the sheets or pictures term,
+whose ceilings bound them, until the sheet is compiled or the picture
+decoded. A `data:` sheet is parsed as WHATWG's `data:` URL processor
+has it, its fragment from `#` left out, percent-decoded and, under
+`;base64`, forgiving-base64-decoded; its type must be `text/css` and
+its `charset` is its label; one that does not decode is a sheet not
+applied; it counts toward `MAX_SHEET_FETCHES`, and since it has no URL
+to join against, its imports are taken only when absolute. A fetched
+sheet's URL is kept, as text in the sheets term, for joining its
+imports and refusing cycles, at most `MAX_URL` (td-url's 2,048 bytes), one
+longer not applied. A reply other than `2xx` is dropped. A sheet asks
+`accept: text/css,*/*;q=0.1`, and one whose type's essence is not
+`text/css` is not applied, with no quirks-mode exception, since td-web
+has no quirks mode; one with no `content-type` is taken, as Fetch
+takes a style sheet whose type is absent. Its text is decoded as CSS
+Syntax §3.2 orders it, through td-charset: a byte order mark, the
+`content-type`'s `charset`, an `@charset` rule exactly as CSS Syntax
+has it (the first 1024 bytes beginning `@charset "`, a label holding
+no `"` or `;`, then `";`; a UTF-16 one read as UTF-8), the
+environment's encoding, the page's for a `<link>` and the
+importing sheet's for an import, else UTF-8. Bounds: 1 MiB a sheet
+decoded (td-css's per-input bound, asked of the service as the body's
+limit; a sheet in another encoding whose decoded text passes it is left
+out after decoding, the status row saying so); 4 MiB in all of the
+gathered sheets' text and their imports' media lists, a sheet arriving
+past it left out; at most `MAX_SHEET_FETCHES` (32) sheets linked and
+imported, `data:` ones among them, counted as they are found, the
+`<link>`s and `<style>` imports in tree order with the page, each
+sheet's imports as it arrives, one past it left out; and imports four
+deep (`MAX_IMPORT_DEPTH`), a fifth level left out, as is an import of a
+URL in its own chain, which would import itself. The set then cuts
+them with the `<style>` elements, in cascade order, at td-css's 64
+sheets and 4 MiB with the user-agent sheets (above, "Sources"). Every
+sheet not applied, a failed fetch, a wrong type, mixed content, a
+`data:` URL that does not decode, a URL past `MAX_URL`, one left out,
+is counted in the status row's `N of the page's style sheets were not
+applied`. A page naming no sheet to gather, no `<link>` and no
+`<style>` that imports, holds no gathered sheets at all. Measured on
+the corpus of increment 8 (below), a
+page links and imports at most 23 sheets, GitHub's, holding 3.6 MiB of
+text, the nearest the corpus comes to either bound; the others 0 to
+17 sheets and at most 0.24 MiB. A picture's body at most
+`MAX_SUBRESOURCE` (4 MiB).
 
 **Slots.** Subresources have a count of their own, `MAX_SUBRESOURCES`
-(4) fetches out, stopped ones included until the service answers, as
-navigations have `MAX_WORKERS`; so a stopped page's fetches never
-take a navigation's slot, and the next page's sheets wait for one of
-these, within their `STYLE_WAIT`.
+(4) fetches out across the window, stopped ones included until the
+service answers, as navigations have `MAX_WORKERS`; so a stopped page's
+fetches never take a navigation's slot, and the next page's sheets wait
+for one of these, within their `STYLE_WAIT`. Each is a thread of its
+own, its slot held by the thread and given back when the service has
+answered and the thread ends, whether or not anyone still waits for the
+answer. A sheet's body stays on its fetch thread until it is handed to
+the render thread with its slot, and one no longer waited for is
+dropped there, as a stopped navigation's is.
+
+A sheet's answer, whether it came or was refused, holds its slot until
+its page takes it, so a page never has more answers waiting than its
+mailbox has places, one a slot, however fast its sheets are refused (a
+page on a LAN device, whose sheets the service refuses at once, as
+`public`); a page that has gone on without them drops each as it comes
+and those left as it goes, so their slots free at once.
+
+The service's workers are counted the same way: `[web-fetch]` serves
+`SERVICE_WORKERS` (8), `MAX_WORKERS` and `MAX_SUBRESOURCES` together
+(§3), as does the service td-launch starts for td-web on a host, and
+td-web never has more requests out than that, so a navigation is served
+at once whatever a page's sheets do. A sheet's fetch asks
+each hop with what is left of its page's `STYLE_WAIT` as the request's
+`deadline` (APPLICATIONS.md, the fetch service), which the service
+holds its exchange with the origin to; and before each hop it looks
+whether its page has gone on without it, stopped, styled or past its
+wait, and asks no further hop if so. So the worst a hostile page can do
+is hold all four slots, and so four of the service's workers, until
+its own `STYLE_WAIT` has passed, 3 s after its reply, plus whatever a
+name lookup takes, which no deadline bounds (the service's recorded
+gap), the resolver's own timeouts aside. A sheet's fetch waits that out
+with its slot, as the client's reply wait lets it: given its slot back
+sooner, with the service's worker still held by the lookup, td-web
+could have more requests at the service than it has workers, and a
+navigation could wait. The sheets of pages after it wait for a slot
+that long at most,
+and come too late for their own wait if it runs out first. Its
+navigations are never held: measured with a model of the service's
+eight workers and a page of six sheets whose origins never answer
+(`a_page_of_tarpit_sheets_never_holds_a_navigation_back`), the next
+navigation is served at once and its page shown within the test's
+1 s, the slots free at the tarpit's wait; at the four workers the
+service had before, the same navigation waited 1.5 s, the whole of that
+test's wait. A sheet slower than `STYLE_WAIT` is never applied, since
+its fetch is given up there; a reload asks again. The cost is the
+service's: four more of its threads at most, outside td-web's jail
+(§3), each counted request's memory bounded as the service bounds it
+and a sheet's decoded body by td-web's 1 MiB limit.
 
 **Waiting.** A page waits for its sheets, as browsers hold rendering
-for them, rather than being shown and restyled. Once the render thread
-has parsed its tree and found them, they are fetched on threads of
-their own in those slots, then their text is handed to the render
-thread for steps 3 to 5. Meanwhile the page shown stays and the status
-row says `loading styles`. At `STYLE_WAIT` (3 s, estimate) after the
-reply came, or once every sheet has settled, the page is styled with
-the sheets that came, in their order; one later is not applied, the
-status row says how many were not, and a reload asks for them again: a
-late sheet is dropped rather than restyling a page being read.
-`Escape` stops the navigation, as it stops any (§8), the page shown
-staying. A page is cascaded once, never restyled by a sheet.
+for them, rather than being shown and restyled. The render thread
+decodes and parses the page, finds its sheets and decodes its `data:`
+ones (`gather::Sheets`); when none is to be fetched it styles the page
+in the same job. Otherwise the page, its tree and sheets go back to the
+navigation's fetch thread, which asks for each sheet wanted, in order,
+as slots free, on threads of their own, none once its wait has passed;
+the answers come since the last job are handed to the render thread in
+one job, which decodes them into the page's sheets and finds their
+imports, asked for in turn. The fetch thread holds the page between
+jobs and does not drop it: stopped, it hands the page to the render
+thread to drop, as every let-go goes (above, "Handover"), held when the
+lane is full and dropped on the fetch thread only past `PENDING` of
+those. Meanwhile the page shown stays and the status row says `loading
+styles of` the URL. At `STYLE_WAIT` (3 s) after the reply came to the
+fetch thread, or once every sheet has settled, the render thread styles
+the page with the sheets that came, in their order; one later, or never
+asked for want of a slot, is not applied, the status row says `N style
+sheets did not come in time; Ctrl+R asks again`, and a reload, a
+navigation like any, asks for them anew: a late sheet is dropped rather
+than restyling a page being read. Its fetch holds its slot until the
+service gives it up at that deadline (above, "Slots"). `Escape` stops
+the navigation, as it stops any (§8): the fetch thread sees it within
+`TICK` (20 ms), tells the page's sheet fetches, and gives the page back
+to be dropped, the page shown staying; each fetch holds its slot until
+the hop it has out is answered and asks no other. A page is cascaded
+once, never restyled by a sheet.
+Its gathered sheets are kept with it, so a relayout that cascades again
+(a resize, `F9`) compiles them again; rungs 2 and 3 (below, "Cuts")
+drop them. Measured by replaying the corpus's captured answers, each
+taking the time it took from the development host (2026-11-17, a fresh
+connection each), every page's sheets were gathered and the page styled
+within 1.3 s of its reply (Debian's, a chain of imports, and the WHATWG
+specification's, whose styling alone takes 0.8 s), so none came late at
+3 s; `STYLE_WAIT` stays 3 s, a slower network's margin.
 
 **Pictures** are fetched once the page is shown, decoded on the render
 thread one at a time through the shared picture dispatch (§5), each
@@ -1370,7 +1520,9 @@ otherwise the page opens at its fragment or its top.
 **The status row** keeps §8's order. Its place is `N of M lines`: the
 line of the layout the last line shown whole is, of the layout's lines
 at this width. Its notes are the cuts below, the sheets not applied,
-the page shown without its styles (`F9`) and a paint cut short.
+those that did not come in time, the page shown without its styles
+(`F9`) and
+a paint cut short.
 
 ### Cuts
 
@@ -1797,22 +1949,64 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    on every element, 1.5 and 0.9 MiB of custom properties) and many
    families and sizes on one page; the make, relayout and paint times,
    the owned storage and the resident peaks above ("Relayout",
-   "Memory", "Painting" and "Time", and §3). Not yet done, and still
+   "Memory", "Painting" and "Time", and §3). Measured with increment 8
+   (below): the WHATWG HTML and ECMAScript specifications cut to 2 MiB,
+   SANE's list of backends and long Wikipedia articles, the sheets term
+   and `WORKING` for parsing and compiling. Not yet done, and still
    this increment's though it has landed: td-web run
    under a headless td-compositor at those outputs (td-test-compositor's
-   output is 800x600 and td-web has no native-compositor tests); the
-   WHATWG HTML and ECMAScript specifications cut to 2 MiB, SANE's list
-   of backends and long Wikipedia articles; the sheets term and
-   `WORKING` for parsing and compiling; and whether sizes rounded to
-   device pixels move a page's lines visibly against an unrounded
-   layout.
+   output is 800x600 and td-web has no native-compositor tests); and
+   whether sizes rounded to device pixels move a page's lines visibly
+   against an unrounded layout.
 8. **Stylesheets**: `<link rel=stylesheet>` and `@import` as
-   "Subresources" says. Validation through the injected fetcher: order,
-   media, import depth, the count and byte bounds, mixed content at a
-   redirect, a `data:` sheet, a `404`, a wrong type, a slow sheet past
-   `STYLE_WAIT`, stopped fetches holding the slots, `Escape`, a reload;
-   the sheets term, `STYLE_WAIT` and `MAX_SHEET_FETCHES` measured on
-   the corpus with its linked sheets.
+   "Subresources" says. Landed. Validation through the injected
+   fetcher, in-process: cascade order of links, `<style>` elements and
+   imports; media chains, every sheet fetched; imports four deep and the
+   fifth left out, a cycle left out; `MAX_SHEET_FETCHES` and one past
+   it; a sheet past the service's 1 MiB, one decoded past td-css's, the
+   4 MiB of gathered text; mixed content at a redirect, never asked; a
+   `data:` sheet, asked of no one; a `404` and a wrong type, noted; a
+   slow sheet past `STYLE_WAIT`, the page shown meanwhile, then a reload
+   applying it; stopped fetches holding the slots past the next page's
+   `STYLE_WAIT`; `Escape` while styles load, the page shown staying and
+   the root's charges returned exactly, the page dropped on the render
+   thread within a tick, both while its sheets are out and between its
+   jobs; a stopped page's sheet asking no hop past the one out; a page
+   whose sheets never answer, against a model of the service's eight
+   workers, the next navigation served at once (red at four); each
+   request's `Ask` (public, its accept, 1 MiB, its deadline); a link's
+   `disabled`, `type` essence and the preferred set; sibling imports in
+   order and imports joined against a redirect's URL; a link's
+   fallback to the page's encoding and a label beating `@charset`; the
+   head ending at another statement and a bad string; a `data:` URL's
+   fragment; a reply with no type; the compilation's child the sheets
+   term less the gathered sheets, and rungs 2 and 3 letting them go;
+   no answer lost however fast sheets are refused (32 refused at once,
+   and a good sheet among twenty refused, each page styled at once), and
+   a page gone freeing its answers' slots; a stopped page handed for its
+   styles dropped on the render thread; a page naming no sheet holding
+   none; imports naming `layer` or `supports()` counted; td-launch giving
+   td-web's service eight workers; and, in td-fetchd over its socket,
+   `--workers 2` serving two at once while a third waits, each given up
+   at the `deadline` it asked of an origin that never answers.
+   Measured on the host (`pipeline::tests::measure_sheets` and
+   `app::tests::measure_window` over a `fetch::tests::Corpus`, a
+   process a page and output, release build, the pinned faces): the
+   corpus of increment 7, GitHub's included, with the WHATWG HTML and
+   ECMAScript specifications cut to 2 MiB, SANE's list of backends and
+   Wikipedia's World War II and United States articles, each asked for
+   at its own URL with every sheet it links and imports, 84 answers
+   captured to scratch 2026-11-17 and never committed, sheets found by
+   td-web's own gathering; the sheets term, `WORKING`, `STYLE_WAIT` and
+   `MAX_SHEET_FETCHES` as "Memory" and "Subresources" say. Styled by
+   their sheets, the thirteen pages are made in 4.7 to 814 ms at
+   1920x1200 and 4.3 to 795 ms at 3840x2160, the WHATWG specification
+   the slowest, laid out again two thirds as wide in 3.3 to 758 ms and
+   3.1 to 762 ms, and painted whole in 4.2 to 6.3 ms warm (9.7 to
+   13.1 ms first) and 11.3 to 20.6 ms (30.7 to 43.5 ms first), under
+   a load average of about 7; a page holds 0.4 to 31.1 MiB of td-alloc's
+   owned storage and declares 0.9 to 56.0 MiB, and a process peaks at
+   42 to 87 MiB resident at 1920x1200 and 65 to 110 MiB at 3840x2160.
 9. **Inline pictures**, as "Subresources" says. Validation: placeholders
    becoming pictures, one relayout per settle with the top kept, a
    refused picture keeping its placeholder, an unlinked picture opened
@@ -1824,15 +2018,14 @@ No request carries a cookie until a jar is designed (§11).
 
 ### Open questions
 
-The estimates above (the sheets and pictures terms, `WORKING` for
-parsing and compiling, `STYLE_WAIT`, `MAX_SHEET_FETCHES`,
-`MAX_PICTURES`, `PICTURE_SETTLE`) stand until the increments that
-introduce them measure them. So does the value of td-layout's cascade
-work ceiling, in match steps and substitution charges together: no
-figure is set here, only that it hold a page to a few seconds of the
-render thread on the development host, which the cell measurement
-above ("Time") holds for the `:not()` sheet and increment 7's pending
-runs measure for the rest.
+The estimates above (the pictures term, `MAX_PICTURES`,
+`PICTURE_SETTLE`) stand until increment 9 measures them. So does the
+value of td-layout's cascade work ceiling, in match steps and
+substitution charges together: no figure is set here, only that it hold
+a page to a few seconds of the render thread on the development host,
+which the cell measurement above ("Time") holds for the `:not()` sheet
+and increments 7's and 8's runs for the corpus, the slowest page made
+in 0.8 s.
 
 ## 11. Roadmap (not normative)
 

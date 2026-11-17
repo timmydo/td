@@ -7,7 +7,7 @@
 
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use td_alloc::{Budget, BudgetError, BudgetShared};
+use td_alloc::{Budget, BudgetShared};
 
 pub(crate) const QUEUED: usize = 4;
 /// Items the lane holds; a post past them is refused, never waited for.
@@ -257,7 +257,7 @@ impl<I, O, L> Drop for Exit<I, O, L> {
 #[derive(Debug)]
 pub(crate) enum SubmitError<I> {
     Closed(I),
-    Memory(BudgetError, I),
+    Memory(I),
 }
 
 /// One worker; drop closes its queue and joins its bounded active operation.
@@ -430,15 +430,15 @@ impl<I: Send + 'static, O: Send + 'static, L: Send + 'static> Worker<I, O, L> {
         };
         let mailbox = match self.mailbox.try_clone() {
             Ok(mailbox) => mailbox,
-            Err(error) => return Err(SubmitError::Memory(error, input)),
+            Err(_) => return Err(SubmitError::Memory(input)),
         };
         let tail = (state.head + state.len) % QUEUED;
         let Some(queued) = state.queue.get_mut(tail) else {
-            return Err(SubmitError::Memory(BudgetError::Limit, input));
+            return Err(SubmitError::Memory(input));
         };
         *queued = at;
         let Some(slot) = state.slots.get_mut(at) else {
-            return Err(SubmitError::Memory(BudgetError::Limit, input));
+            return Err(SubmitError::Memory(input));
         };
         *slot = Slot {
             phase: Phase::Queued(input),

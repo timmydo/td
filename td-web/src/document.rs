@@ -11,9 +11,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::worker::{Process, SubmitError, Worker};
 
 use crate::fonts::Measure;
+use crate::gather::{Refused, Sheets};
 use crate::memory::{self, Resident};
 use crate::page::Want;
-use crate::pipeline::{self, Again, Page, Refusal};
+use crate::pipeline::{self, Again, Page, Parsed, Refusal};
+use crate::subresource::Arrivals;
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString};
 use td_ui::picture::Picture;
 
@@ -163,7 +165,8 @@ impl Document {
         stopped: &AtomicBool,
         root: &Budget,
     ) -> Option<Self> {
-        Self::from_reply(
+        // Sheets to be fetched are late: none come.
+        match Self::from_reply(
             url,
             status,
             content_type,
@@ -173,11 +176,37 @@ impl Document {
             stopped,
             root,
             None,
-        )
+        )? {
+            Ok(doc) => Some(doc),
+            Err(gathered) => gathered.styled(faces, stopped),
+        }
+    }
+
+    /// A page made, titled and noted; none once stopped, rung 4's notice
+    /// when it was refused at every rung.
+    fn of_page(
+        made: Result<Page, Refusal>,
+        url: Url,
+        status: u16,
+        note: Option<String>,
+    ) -> Option<Self> {
+        match made {
+            Ok(page) => {
+                let title = page.tree.title();
+                let title = (!title.is_empty()).then(|| title.to_string());
+                let mut doc = Self::with_body(Some(url), status, Body::Page(page));
+                doc.title = title;
+                doc.note = note;
+                Some(doc)
+            }
+            Err(Refusal::Cancelled) => None,
+            Err(Refusal::Limit(_)) => Some(Self::resources(Some(url), status)),
+        }
     }
 
     /// `body`, answered with `status` from `url` as `content_type`, made
-    /// into a document for `want`; none once `stopped` is seen. With
+    /// into a document for `want`, or a page parsed whose sheets are to
+    /// be fetched first; none once `stopped` is seen. With
     /// `room`, a picture the root has no room for hands its body back
     /// there, and none, so the window can let the page shown go and the
     /// picture be tried once more (DESIGN.md §10, "Memory").
@@ -192,10 +221,10 @@ impl Document {
         stopped: &AtomicBool,
         root: &Budget,
         room: Option<&mut Option<(Url, Vec<u8>)>>,
-    ) -> Option<Self> {
+    ) -> Option<Result<Self, Gathered>> {
         if body.is_empty() && !(200..300).contains(&status) {
             let why = format!("The server answered {status} and sent nothing to show.");
-            return Some(Self::own(Some(url), status, &why, want, faces, root));
+            return Some(Ok(Self::own(Some(url), status, &why, want, faces, root)));
         }
         let media = content_type
             .and_then(|value| value.split(';').next())
@@ -213,7 +242,7 @@ impl Document {
             return None;
         }
         let Ok(memory) = root.child(root.limit()) else {
-            return Some(Self::resources(Some(url), status));
+            return Some(Ok(Self::resources(Some(url), status)));
         };
         let size = body.len();
         match kind {
@@ -230,9 +259,10 @@ impl Document {
                 let declared = content_type.and_then(charset::label);
                 let declared = declared.as_ref().map(charset::Label::as_bytes);
                 let Ok(decoded) = charset::decode(body, declared, rules, most) else {
-                    return Some(Self::resources(Some(url), status));
+                    return Some(Ok(Self::resources(Some(url), status)));
                 };
                 let note = noted(decoded.encoding, decoded.read, size);
+                let encoding = decoded.encoding;
                 let mut measure = measure_for(faces, want, &memory);
                 let made = if kind == Kind::Text {
                     pipeline::text_page(&decoded.text, want, &mut measure, stopped, &memory)
@@ -240,39 +270,56 @@ impl Document {
                     let markup = BudgetString::copy(&memory, &decoded.text)
                         .and_then(|markup| BudgetShared::new(&memory, markup));
                     drop(decoded);
-                    match markup {
-                        Ok(markup) => {
-                            pipeline::markup_page(markup, want, &mut measure, stopped, &memory)
-                        }
+                    let parsed = match markup {
+                        Ok(markup) => pipeline::parse(markup, want, &mut measure, stopped, &memory),
                         Err(_) => Err(Refusal::Limit("memory")),
+                    };
+                    match parsed {
+                        Ok(Parsed::Page(page)) => Ok(page),
+                        Ok(Parsed::Tree { tree, markup }) => {
+                            let sheets = Sheets::needed(&tree)
+                                .then(|| Sheets::new(&tree, &url, encoding, &memory));
+                            let gathered = Gathered {
+                                #[cfg(test)]
+                                recorder: tests::named(&url),
+                                url,
+                                status,
+                                note,
+                                want,
+                                tree,
+                                markup,
+                                sheets,
+                                budget: memory,
+                            };
+                            // Its sheets fetched first, then styled.
+                            if gathered.sheets().is_some_and(Sheets::unsettled) {
+                                return Some(Err(gathered));
+                            }
+                            drop(measure);
+                            return gathered.styled(faces, stopped).map(Ok);
+                        }
+                        Err(refusal) => Err(refusal),
                     }
                 };
                 drop(measure);
-                match made {
-                    Ok(page) => {
-                        let title = page.tree.title();
-                        let title = (!title.is_empty()).then(|| title.to_string());
-                        let mut doc = Self::with_body(Some(url), status, Body::Page(page));
-                        doc.title = title;
-                        doc.note = note;
-                        Some(doc)
-                    }
-                    Err(Refusal::Cancelled) => None,
-                    Err(Refusal::Limit(_)) => Some(Self::resources(Some(url), status)),
-                }
+                Self::of_page(made, url, status, note).map(Ok)
             }
             Kind::Picture(format) => match picture::decode_with_budget(format, &body, &memory) {
-                Ok(picture) => Some(Self::with_body(Some(url), status, Body::Picture(picture))),
+                Ok(picture) => Some(Ok(Self::with_body(
+                    Some(url),
+                    status,
+                    Body::Picture(picture),
+                ))),
                 Err(picture::Error::Room) if room.is_some() => {
                     if let Some(room) = room {
                         *room = Some((url, body));
                     }
                     None
                 }
-                Err(why) if why.resources() => Some(Self::resources(Some(url), status)),
+                Err(why) if why.resources() => Some(Ok(Self::resources(Some(url), status))),
                 Err(why) => {
                     let why = format!("{why}");
-                    Some(Self::own(Some(url), status, &why, want, faces, root))
+                    Some(Ok(Self::own(Some(url), status, &why, want, faces, root)))
                 }
             },
             Kind::Other => {
@@ -301,14 +348,14 @@ impl Document {
                             .and_then(|charge| Resident::new(body, charge, bytes));
                         match owned {
                             Ok(body) => Some(body),
-                            Err(_) => return Some(Self::resources(Some(url), status)),
+                            Err(_) => return Some(Ok(Self::resources(Some(url), status))),
                         }
                     }
                     None => None,
                 };
                 let mut doc = Self::own(Some(url), status, &said, want, faces, &memory);
                 doc.held = held;
-                Some(doc)
+                Some(Ok(doc))
             }
         }
     }
@@ -403,7 +450,205 @@ impl Retry {
     }
 }
 
-type Rendered = Option<Result<Document, Reply>>;
+/// A markup page parsed whose sheets are to be fetched (DESIGN.md §10,
+/// "Waiting"): its tree and markup, its sheets as they come, and what its
+/// document will say, all in the page's budget.
+pub struct Gathered {
+    url: Url,
+    status: u16,
+    note: Option<String>,
+    want: Want,
+    tree: BudgetShared<crate::tree::Tree>,
+    markup: BudgetShared<BudgetString>,
+    /// None for a page that names none to gather; refused for want of
+    /// memory, the page is laid on rung 2.
+    sheets: Option<Result<Sheets, BudgetError>>,
+    budget: Budget,
+    /// Tells the thread it is dropped on, in tests.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    recorder: Option<tests::Named>,
+}
+
+impl Gathered {
+    /// The page styled with the sheets that came, the rest late, laid
+    /// for its `want` on this thread; none once `stopped` is seen.
+    fn styled(self, faces: Option<&Faces>, stopped: &AtomicBool) -> Option<Document> {
+        let Self {
+            url,
+            status,
+            note,
+            want,
+            tree,
+            markup,
+            sheets,
+            budget,
+            #[cfg(test)]
+                recorder: _recorder,
+        } = self;
+        let mut measure = measure_for(faces, want, &budget);
+        let sheets = sheets
+            .map(|sheets| {
+                sheets.and_then(|mut sheets| {
+                    sheets.finish();
+                    BudgetShared::new(&budget, sheets)
+                })
+            })
+            .transpose();
+        let made = match sheets {
+            Ok(sheets) => pipeline::styled_page(
+                tree,
+                Some(markup),
+                sheets,
+                want,
+                &mut measure,
+                stopped,
+                &budget,
+            ),
+            Err(_) => {
+                let notes = pipeline::Notes {
+                    styles: Some("memory"),
+                    ..pipeline::Notes::default()
+                };
+                pipeline::user_agent(
+                    tree,
+                    Some(markup),
+                    notes,
+                    want,
+                    &mut measure,
+                    stopped,
+                    &budget,
+                )
+            }
+        };
+        drop(measure);
+        Document::of_page(made, url, status, note)
+    }
+
+    fn sheets_mut(&mut self) -> Option<&mut Sheets> {
+        self.sheets.as_mut()?.as_mut().ok()
+    }
+
+    fn sheets(&self) -> Option<&Sheets> {
+        self.sheets.as_ref()?.as_ref().ok()
+    }
+}
+
+/// A page whose sheets are being fetched, between its render thread's
+/// jobs: what it was parsed into and what it is laid with.
+pub struct Styling {
+    gathered: Gathered,
+    faces: SharedFaces,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Styling {
+    /// The first sheet still to be fetched, and its URL's text.
+    pub fn wanted(&self) -> Option<(usize, &str)> {
+        self.gathered.sheets()?.wanted()
+    }
+
+    /// Sheet `at` is being fetched.
+    pub fn asked(&mut self, at: usize) {
+        if let Some(sheets) = self.gathered.sheets_mut() {
+            sheets.asked(at);
+        }
+    }
+
+    /// Sheet `at` was not had.
+    pub fn refused(&mut self, at: usize, why: Refused) {
+        if let Some(sheets) = self.gathered.sheets_mut() {
+            sheets.refused(at, why);
+        }
+    }
+
+    /// Whether a sheet is still to be fetched or being fetched.
+    pub fn unsettled(&self) -> bool {
+        self.gathered.sheets().is_some_and(Sheets::unsettled)
+    }
+
+    /// The page is `https`: its subresources are refused over `http`.
+    pub fn https(&self) -> bool {
+        self.gathered.url.https
+    }
+}
+
+/// What the render thread makes of a reply: a document, or a page whose
+/// sheets are to be fetched first.
+#[allow(clippy::large_enum_variant)]
+pub enum Made {
+    Document(Document),
+    Styles(Styling),
+}
+
+/// A job for the render thread: a reply, or a page's sheets as they came
+/// (`finish`: styled now, those not come late).
+#[allow(clippy::large_enum_variant)]
+enum Job {
+    Reply(Reply),
+    Styles {
+        styling: Styling,
+        arrived: Arrivals,
+        finish: bool,
+    },
+}
+
+type Rendered = Option<Result<Made, Reply>>;
+
+/// What became of a job handed to the render thread.
+enum Ran {
+    /// Its answer: none when the job panicked.
+    Done(Option<Rendered>),
+    /// Refused for memory, handed back.
+    Memory(Job),
+    /// The render thread lost and not started again, handed back.
+    Lost(Job),
+}
+
+fn render(job: Job, memory: &Budget) -> Rendered {
+    match job {
+        Job::Reply(reply) => render_reply(reply, memory),
+        Job::Styles {
+            styling,
+            arrived,
+            finish,
+        } => render_styles(styling, arrived, finish).map(Ok),
+    }
+}
+
+/// Sheets that came decoded into their page, their bodies and slots then
+/// let go; the page styled once its sheets settle or `finish` says.
+fn render_styles(mut styling: Styling, arrived: Arrivals, finish: bool) -> Option<Made> {
+    for arrived in arrived.into_iter().flatten() {
+        let Some(sheets) = styling.gathered.sheets_mut() else {
+            break;
+        };
+        let reply = &arrived.loaded.reply;
+        let content_type = reply.header("content-type");
+        if sheets
+            .arrived(arrived.at, &arrived.loaded.url, content_type, &reply.body)
+            .is_err()
+        {
+            sheets.refused(arrived.at, Refused::Skipped);
+        }
+    }
+    if styling.stopped.load(Ordering::SeqCst) {
+        return None;
+    }
+    if !finish && styling.unsettled() {
+        return Some(Made::Styles(styling));
+    }
+    let Styling {
+        gathered,
+        faces,
+        stopped,
+    } = styling;
+    let made = gathered.styled(faces.as_ref().as_ref(), &stopped)?;
+    if stopped.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(Made::Document(made))
+}
 
 fn render_reply(reply: Reply, memory: &Budget) -> Rendered {
     let Reply {
@@ -432,7 +677,12 @@ fn render_reply(reply: Reply, memory: &Budget) -> Rendered {
         return None;
     }
     match (made, room) {
-        (Some(document), _) => Some(Ok(document)),
+        (Some(Ok(document)), _) => Some(Ok(Made::Document(document))),
+        (Some(Err(gathered)), _) => Some(Ok(Made::Styles(Styling {
+            gathered,
+            faces,
+            stopped,
+        }))),
         (None, Some((url, body))) => Some(Err(Reply {
             url,
             status,
@@ -477,6 +727,8 @@ pub enum Dropped {
     Page(Page),
     /// A navigation's answer, with whatever it holds or is yet sent it.
     Arrival(Receiver<Option<(Document, Option<String>)>>),
+    /// A page stopped while its sheets were fetched.
+    Styling(Styling),
 }
 
 /// Answers a relayout that ends without answering, as one whose job
@@ -497,6 +749,7 @@ fn lane(item: Lane, _: &Budget) {
         Lane::Drop(Dropped::Document(document)) => drop(document),
         Lane::Drop(Dropped::Page(page)) => drop(page),
         Lane::Drop(Dropped::Arrival(answer)) => drop(answer),
+        Lane::Drop(Dropped::Styling(styling)) => drop(styling),
         Lane::Again {
             again,
             faces,
@@ -530,7 +783,7 @@ fn lane(item: Lane, _: &Budget) {
     }
 }
 
-type Thread = Worker<Reply, Rendered, Lane>;
+type Thread = Worker<Job, Rendered, Lane>;
 
 /// One worker serializes rendering, with a fixed queue for fetch workers
 /// and a lane the window posts to without waiting. The reusable slots are
@@ -563,7 +816,7 @@ fn render_thread(memory: &Budget) -> Result<Thread, ()> {
     Worker::start(
         memory,
         Process {
-            request: render_reply,
+            request: render,
             lane,
         },
     )
@@ -620,27 +873,39 @@ impl Renderer {
     }
 
     /// Claim a reusable slot, restarting a lost worker before retrying.
-    /// Waiting for its answer does not hold the submission lock.
-    fn run(&self, reply: Reply) -> Result<Option<Rendered>, BudgetError> {
+    /// Waiting for its answer does not hold the submission lock. A job
+    /// refused is handed back, outside that lock, to be let go.
+    fn run(&self, job: Job) -> Ran {
         let ticket = {
             let mut thread = self.0.thread.lock().unwrap_or_else(PoisonError::into_inner);
-            match thread.submit(reply) {
+            match thread.submit(job) {
                 Ok(ticket) => ticket,
-                Err(SubmitError::Memory(error, _)) => return Err(error),
-                Err(SubmitError::Closed(reply)) => {
+                Err(SubmitError::Memory(job)) => return Ran::Memory(job),
+                Err(SubmitError::Closed(job)) => {
                     let Ok(replacement) = render_thread(self.budget()) else {
-                        return Ok(None);
+                        return Ran::Lost(job);
                     };
                     *thread = replacement;
-                    match thread.submit(reply) {
+                    match thread.submit(job) {
                         Ok(ticket) => ticket,
-                        Err(SubmitError::Memory(error, _)) => return Err(error),
-                        Err(SubmitError::Closed(_)) => return Ok(None),
+                        Err(SubmitError::Memory(job)) => return Ran::Memory(job),
+                        Err(SubmitError::Closed(job)) => return Ran::Lost(job),
                     }
                 }
             }
         };
-        Ok(ticket.wait())
+        Ran::Done(ticket.wait())
+    }
+
+    /// A job the render thread did not take: a page in it let go there.
+    fn give_back(&self, job: Job) {
+        if let Job::Styles {
+            styling, arrived, ..
+        } = job
+        {
+            drop(arrived);
+            self.let_go(Dropped::Styling(styling));
+        }
     }
 
     /// Hands `item` to the render thread's lane without waiting; a full
@@ -747,7 +1012,7 @@ impl Renderer {
         body: Vec<u8>,
         want: Want,
         stopped: &Arc<AtomicBool>,
-    ) -> Option<Result<Document, Retry>> {
+    ) -> Option<Result<Made, Retry>> {
         if stopped.load(Ordering::SeqCst) {
             return None;
         }
@@ -766,12 +1031,36 @@ impl Renderer {
                 stopped: Arc::clone(stopped),
                 ask: true,
             };
-            self.run(reply)
+            Ok(self.run(Job::Reply(reply)))
         })();
         match made {
-            Ok(Some(Some(Err(reply)))) => Some(Err(Retry { reply, shown })),
-            made => self.answered(made, shown, status, want).map(Ok),
+            Ok(Ran::Done(Some(Some(Err(reply))))) => Some(Err(Retry { reply, shown })),
+            made => self.answered(made, Some(shown), status, want).map(Ok),
         }
+    }
+
+    /// A page's sheets that came handed to the render thread, decoded
+    /// into it there, and, once they settle or `finish` says, the page
+    /// styled with them; else the page again, to wait for the rest. A
+    /// page stopped is let go there.
+    pub fn styles(&self, styling: Styling, arrived: Arrivals, finish: bool) -> Option<Made> {
+        if styling.stopped.load(Ordering::SeqCst) {
+            drop(arrived);
+            self.let_go(Dropped::Styling(styling));
+            return None;
+        }
+        let gathered = &styling.gathered;
+        let (status, want) = (gathered.status, gathered.want);
+        // The address an error page names, should the job be lost with
+        // the page: its text, in the window's budget.
+        let shown = BudgetString::copy(self.budget(), &gathered.url.text()).ok();
+        let ran = self.run(Job::Styles {
+            styling,
+            arrived,
+            finish,
+        });
+        let shown = shown.and_then(|text| Url::parse(text.as_str()).ok());
+        self.answered(Ok(ran), shown, status, want)
     }
 
     /// A picture handed back made again, the page shown let go; this
@@ -782,28 +1071,44 @@ impl Renderer {
             return None;
         }
         let (status, want) = (reply.status, reply.want);
-        let made = self.run(Reply {
+        let made = self.run(Job::Reply(Reply {
             ask: false,
             ..reply
-        });
-        self.answered(made, shown, status, want)
+        }));
+        match self.answered(Ok(made), Some(shown), status, want)? {
+            Made::Document(document) => Some(document),
+            // Not reached: a picture has no sheets.
+            Made::Styles(styling) => {
+                self.let_go(Dropped::Styling(styling));
+                Some(Document::resources(None, status))
+            }
+        }
     }
 
     fn answered(
         &self,
-        made: Result<Option<Rendered>, BudgetError>,
-        shown: Url,
+        made: Result<Ran, BudgetError>,
+        shown: Option<Url>,
         status: u16,
         want: Want,
-    ) -> Option<Document> {
-        match made {
-            Ok(Some(Some(Ok(document)))) => Some(document),
+    ) -> Option<Made> {
+        let document = match made {
+            Ok(Ran::Done(Some(Some(Ok(made))))) => return Some(made),
             // Refused for room again: §5's static notice.
-            Ok(Some(Some(Err(reply)))) => Some(Document::resources(Some(reply.url), status)),
-            Ok(Some(None)) => None,
-            Ok(None) => Some(self.error(Some(shown), "the page could not be rendered", want)),
-            Err(_) => Some(Document::resources(Some(shown), status)),
-        }
+            Ok(Ran::Done(Some(Some(Err(reply))))) => Document::resources(Some(reply.url), status),
+            Ok(Ran::Done(Some(None))) => return None,
+            Ok(Ran::Done(None)) => self.error(shown, "the page could not be rendered", want),
+            Ok(Ran::Lost(job)) => {
+                self.give_back(job);
+                self.error(shown, "the page could not be rendered", want)
+            }
+            Ok(Ran::Memory(job)) => {
+                self.give_back(job);
+                Document::resources(shown, status)
+            }
+            Err(_) => Document::resources(shown, status),
+        };
+        Some(Made::Document(document))
     }
 
     /// `navigated`, a picture refused for room shown refused.
@@ -817,8 +1122,18 @@ impl Renderer {
         want: Want,
         stopped: &Arc<AtomicBool>,
     ) -> Option<Document> {
-        self.navigated(url, status, content_type, body, want, stopped)
-            .map(|made| made.unwrap_or_else(Retry::refused))
+        match self.navigated(url, status, content_type, body, want, stopped)? {
+            Ok(Made::Document(document)) => Some(document),
+            // No sheet comes: the page styled at once, those wanted late.
+            Ok(Made::Styles(styling)) => match self.styles(styling, Default::default(), true)? {
+                Made::Document(document) => Some(document),
+                Made::Styles(styling) => {
+                    self.let_go(Dropped::Styling(styling));
+                    None
+                }
+            },
+            Err(retry) => Some(retry.refused()),
+        }
     }
 
     /// The render thread stopped, as a lost one is.
@@ -910,6 +1225,38 @@ fn sniff(body: &[u8]) -> Kind {
 )]
 pub(crate) mod tests {
     use super::*;
+
+    /// Tells the name of the thread it is dropped on: a page gathering
+    /// its sheets, in tests.
+    pub(crate) struct Named(std::sync::mpsc::Sender<Option<String>>);
+
+    impl Drop for Named {
+        fn drop(&mut self) {
+            let name = std::thread::current().name().map(str::to_string);
+            let _ = self.0.send(name);
+        }
+    }
+
+    /// The pages watched, by URL: each made gathering its sheets tells
+    /// where it is dropped.
+    static WATCHED: Mutex<Vec<(String, std::sync::mpsc::Sender<Option<String>>)>> =
+        Mutex::new(Vec::new());
+
+    /// Watches the pages at `url` made from now on.
+    pub(crate) fn watch(url: &str) -> std::sync::mpsc::Receiver<Option<String>> {
+        let (tell, told) = std::sync::mpsc::channel();
+        WATCHED.lock().unwrap().push((url.to_string(), tell));
+        told
+    }
+
+    pub(crate) fn named(url: &Url) -> Option<Named> {
+        let text = url.text();
+        let watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        watched
+            .iter()
+            .find(|(watched, _)| *watched == text)
+            .map(|(_, tell)| Named(tell.clone()))
+    }
 
     /// A relayout for this width panics on the render thread.
     pub(crate) const PANICS: f64 = 12_345.0;
@@ -1626,6 +1973,56 @@ pub(crate) mod tests {
         assert_eq!(text_of(&doc), "nothing here");
     }
 
+    /// A page handed back for its styles after it was stopped is let go
+    /// on the render thread, not on the fetch thread that hands it.
+    #[test]
+    fn a_stopped_page_handed_for_its_styles_is_dropped_on_the_render_thread() {
+        let renderer = Renderer::start(None).unwrap();
+        let url = "https://stopped-styles.example/";
+        let dropped = watch(url);
+        let going = Arc::new(AtomicBool::new(false));
+        let body = b"<link rel=stylesheet href=/a.css><p>x".to_vec();
+        let made = renderer.navigated(
+            Url::parse(url).unwrap(),
+            200,
+            Some("text/html"),
+            body,
+            WANT,
+            &going,
+        );
+        let Some(Ok(Made::Styles(styling))) = made else {
+            panic!("the page does not wait for its sheet");
+        };
+        going.store(true, Ordering::SeqCst);
+        assert!(renderer
+            .styles(styling, Default::default(), false)
+            .is_none());
+        let name = dropped
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("td-web render"));
+    }
+
+    /// Only a page naming a sheet to gather holds gathered sheets.
+    #[test]
+    fn a_page_naming_no_sheet_to_gather_holds_none() {
+        let renderer = Renderer::start(None).unwrap();
+        let going = Arc::new(AtomicBool::new(false));
+        for (markup, held) in [
+            ("<style>p{}</style><p>x", false),
+            ("<style>@import 'data:text/css,p{}';</style><p>x", true),
+        ] {
+            let body = markup.as_bytes().to_vec();
+            let doc = renderer
+                .document(base(), 200, Some("text/html"), body, WANT, &going)
+                .unwrap();
+            let Body::Page(page) = &doc.body else {
+                panic!("{markup} is not a page");
+            };
+            assert_eq!(page.sheets.is_some(), held, "{markup}");
+        }
+    }
+
     #[test]
     fn renderer_handoff_refusal_keeps_the_old_page_and_returns_credit() {
         let root = memory::root().unwrap();
@@ -1757,6 +2154,7 @@ pub(crate) mod tests {
         Again {
             tree: page.tree.try_clone().unwrap(),
             markup: page.markup.as_ref().map(|m| m.try_clone().unwrap()),
+            sheets: page.sheets.as_ref().map(|s| s.try_clone().unwrap()),
             rung: page.rung,
             notes: page.notes,
             budget: page.budget.try_clone().unwrap(),

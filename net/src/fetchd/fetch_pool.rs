@@ -173,6 +173,7 @@ mod tests {
             redirects: Some(0),
             stream: false,
             public: false,
+            deadline: None,
             body: Vec::new(),
         }
     }

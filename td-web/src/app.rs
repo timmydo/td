@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use td_alloc::BudgetShared;
 use td_html::document::NodeId;
@@ -30,13 +30,14 @@ use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use td_ui::CELL_WIDTH;
 use td_url::{Reference, Url};
 
-use crate::document::{self, Answer, Body, Document, Dropped, Lane, Renderer};
-use crate::fetch::{self, Fetcher};
+use crate::document::{self, Answer, Body, Document, Dropped, Lane, Made, Renderer};
+use crate::fetch;
 use crate::fonts::Measure;
 use crate::page::{Laid, Want};
 use crate::paint::{self, Marks, Scratch};
 use crate::pipeline::{self, Again, Refusal, Rung};
 use crate::save;
+use crate::subresource::{self, Slots};
 use crate::text::{self, Move, Place};
 use crate::tree::Source;
 use crate::view::{self, Anchor, Pane, Selection, View};
@@ -115,6 +116,9 @@ struct Loading {
     /// A reload of the page let go for a picture's room: stopped or
     /// overtaken, its entry is held again.
     restores: bool,
+    /// Told once the page waits for its sheets.
+    styles: Receiver<()>,
+    styling: bool,
 }
 
 /// A navigation's stop flag, raised when its `Loading` goes.
@@ -125,6 +129,14 @@ struct Told {
     send: Sender<Option<Arrival>>,
     room: Sender<()>,
     released: Receiver<bool>,
+    styles: Sender<()>,
+}
+
+/// What a navigation's fetch thread fetches its page's sheets with.
+struct Sheets {
+    fetcher: fetch::Shared,
+    slots: Slots,
+    wait: Duration,
 }
 
 impl Drop for Stopped {
@@ -361,9 +373,13 @@ fn notice(surface: Surface, page: Rect, bounds: Rect, sink: &mut dyn FnMut(td_ui
 }
 
 pub struct App {
-    fetcher: Arc<dyn Fetcher>,
+    fetcher: fetch::Shared,
     renderer: Renderer,
     workers: Arc<AtomicUsize>,
+    /// The subresource fetches out, every page's.
+    slots: Slots,
+    /// How long a page waits for its sheets.
+    style_wait: Duration,
     surface: Surface,
     focus: Focus,
     address: EntryModel,
@@ -414,9 +430,10 @@ impl Drop for Worker {
 
 /// A navigation's fetch and its document, on its fetch thread. A
 /// picture the root has no room for asks the window for room and, given
-/// it, is tried once more.
+/// it, is tried once more. A page whose sheets are to be fetched waits
+/// for them here (DESIGN.md §10, "Waiting").
 fn arrive(
-    fetcher: &dyn Fetcher,
+    sheets: &Sheets,
     renderer: &Renderer,
     url: Url,
     fragment: Option<String>,
@@ -424,8 +441,9 @@ fn arrive(
     stopped: &Arc<AtomicBool>,
     told: &Told,
 ) -> Option<Arrival> {
-    match fetch::navigate(fetcher, url.clone()) {
+    match fetch::navigate(sheets.fetcher.as_ref(), url.clone()) {
         Ok(mut loaded) => {
+            let came = Instant::now();
             let content_type = loaded.reply.header("content-type").map(str::to_string);
             // Moved out, not copied: it names a saved file.
             let disposition = loaded
@@ -443,7 +461,18 @@ fn arrive(
                 stopped,
             )?;
             let mut doc = match made {
-                Ok(doc) => doc,
+                Ok(Made::Document(doc)) => doc,
+                Ok(Made::Styles(styling)) => {
+                    let _ = told.styles.send(());
+                    subresource::gather(
+                        &sheets.fetcher,
+                        renderer,
+                        &sheets.slots,
+                        styling,
+                        came + sheets.wait,
+                        stopped,
+                    )?
+                }
                 Err(retry) => {
                     // The window lets the page shown go before it answers.
                     let released = told.room.send(()).is_ok() && told.released.recv() == Ok(true);
@@ -487,7 +516,7 @@ const MAX_SAVED_URL: usize = 60;
 /// reload fetches it; what the status row says once it has run, none
 /// once `state` says it was stopped before it began to write.
 fn saved(
-    fetcher: &dyn Fetcher,
+    fetcher: &dyn fetch::Fetcher,
     directory: &File,
     url: Url,
     held: Option<(crate::memory::Resident<Vec<u8>>, Option<String>)>,
@@ -546,18 +575,23 @@ fn saved(
 
 impl App {
     pub fn new(
-        fetcher: Arc<dyn Fetcher>,
+        fetcher: fetch::Shared,
         surface: Surface,
         faces: Option<Faces>,
     ) -> Result<Self, String> {
         let entry = |limit| EntryModel::new(limit).map_err(|why| format!("{why:?}"));
         let metrics = Metrics::new(faces.as_ref(), surface.scale);
         let renderer = Renderer::start(faces)?;
+        let slots = Slots::new(renderer.budget()).map_err(|_| {
+            td_alloc::string("no memory for the subresource slots").unwrap_or_default()
+        })?;
         let scratch = Scratch::new_empty();
         Ok(Self {
             fetcher,
             renderer,
             workers: Arc::new(AtomicUsize::new(0)),
+            slots,
+            style_wait: subresource::STYLE_WAIT,
             surface,
             focus: Focus::Address,
             address: entry(MAX_ADDRESS)?,
@@ -755,19 +789,25 @@ impl App {
         let (send, answer) = mpsc::channel();
         let (asked, room) = mpsc::channel();
         let (released, given) = mpsc::channel();
+        let (styling, styles) = mpsc::channel();
         let channels = Told {
             send,
             room: asked,
             released: given,
+            styles: styling,
         };
-        let fetcher = Arc::clone(&self.fetcher);
-        let Ok(renderer) = self.renderer.try_clone() else {
+        let (Ok(renderer), Ok(slots)) = (self.renderer.try_clone(), self.slots.try_clone()) else {
             self.message = said(format_args!(
                 "the page could not be started: memory exhausted"
             ))
             .map(Cow::Owned);
             refused(self, url, fragment, top);
             return;
+        };
+        let sheets = Sheets {
+            fetcher: Arc::clone(&self.fetcher),
+            slots,
+            wait: self.style_wait,
         };
         let (target, named) = (url.clone(), fragment.clone());
         let stopped = Arc::new(AtomicBool::new(false));
@@ -783,15 +823,7 @@ impl App {
             .name("td-web fetch".into())
             .spawn(move || {
                 let _worker = worker;
-                let arrival = arrive(
-                    fetcher.as_ref(),
-                    &renderer,
-                    target,
-                    named,
-                    want,
-                    &told,
-                    &channels,
-                );
+                let arrival = arrive(&sheets, &renderer, target, named, want, &told, &channels);
                 // An answer the window no longer takes is let go on the
                 // render thread.
                 if let Err(mpsc::SendError(Some((doc, _)))) = channels.send.send(arrival) {
@@ -815,6 +847,8 @@ impl App {
             released,
             owed: None,
             restores,
+            styles,
+            styling: false,
         });
         self.focus = Focus::Page;
         self.show_address();
@@ -827,6 +861,11 @@ impl App {
             .is_some_and(|loading| loading.room.try_recv().is_ok())
         {
             self.make_room();
+        }
+        if let Some(loading) = &mut self.loading {
+            if loading.styles.try_recv().is_ok() {
+                loading.styling = true;
+            }
         }
         self.answer_room();
         let Some(loading) = &self.loading else {
@@ -1274,6 +1313,7 @@ impl App {
             return;
         };
         let markup = page.markup.as_ref().and_then(|m| m.try_clone().ok());
+        let sheets = page.sheets.as_ref().and_then(|s| s.try_clone().ok());
         // Kept beside: a reference goes with the request. Else the window
         // gives its own up and paints paper until the new one comes.
         let old = if keep {
@@ -1284,6 +1324,7 @@ impl App {
         let again = Again {
             tree,
             markup,
+            sheets,
             rung: page.rung,
             notes: page.notes,
             budget,
@@ -2184,7 +2225,8 @@ impl App {
             return Cow::Borrowed(message);
         }
         if let Some(loading) = &self.loading {
-            return said(format_args!("loading {}", loading.url.text()))
+            let styles = if loading.styling { "styles of " } else { "" };
+            return said(format_args!("loading {styles}{}", loading.url.text()))
                 .map_or(Cow::Borrowed("loading"), Cow::Owned);
         }
         if self.saving.is_some() {
@@ -2224,6 +2266,16 @@ impl App {
                     format_args!(
                         "{} of the page's style sheets {were} not applied",
                         notes.omitted
+                    ),
+                );
+            }
+            if notes.late > 0 {
+                let sheets = if notes.late == 1 { "sheet" } else { "sheets" };
+                add_part(
+                    &mut out,
+                    format_args!(
+                        "{} style {sheets} did not come in time; Ctrl+R asks again",
+                        notes.late
                     ),
                 );
             }
@@ -2621,6 +2673,7 @@ mod tests {
 
     use crate::fetch::tests::Table;
     use crate::fetch::Reply;
+    use crate::fetch::{Ask, Fetcher};
     use std::ops::ControlFlow;
     use std::path::Path;
 
@@ -2659,9 +2712,9 @@ mod tests {
     }
 
     impl Fetcher for Held {
-        fn get(&self, url: &str, public: bool) -> Result<Reply, String> {
+        fn get(&self, url: &str, ask: Ask) -> Result<Reply, String> {
             let _ = self.release.lock().unwrap().recv();
-            self.table.get(url, public)
+            self.table.get(url, ask)
         }
     }
 
@@ -2669,17 +2722,25 @@ mod tests {
         Surface::new(width, 600, Scale::new(1).unwrap()).unwrap()
     }
 
+    /// The window over `fetcher`, its pages waiting for their sheets
+    /// longer than any test but one about lateness takes, even in a debug
+    /// build on a loaded host.
     fn app_over(fetcher: Arc<dyn Fetcher>) -> App {
-        App::new(fetcher, surface(800), None).unwrap()
+        let mut app = App::new(fetcher, surface(800), None).unwrap();
+        app.style_wait = std::time::Duration::from_secs(60);
+        app
     }
 
     fn app(table: Table) -> App {
         app_over(Arc::new(table))
     }
 
-    /// Waits for the fetch out to answer and takes it.
+    /// Waits for the fetch out to answer and takes it: a deadline rather
+    /// than a count, since a large page made in a debug build under a
+    /// loaded host's checks takes seconds.
     fn settle(app: &mut App) {
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
             app.poll(0);
             if app.loading.is_none() {
                 return;
@@ -2691,7 +2752,8 @@ mod tests {
 
     /// Waits for the relayouts asked to come and takes them.
     fn relaid(app: &mut App) {
-        for _ in 0..2000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
             app.poll(0);
             if app.current.relayout.is_none() && !app.current.again {
                 return;
@@ -2709,7 +2771,8 @@ mod tests {
 
     /// Waits for every worker to end.
     fn idle(app: &App) {
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
             if app.workers.load(Ordering::SeqCst) == 0 {
                 return;
             }
@@ -3605,18 +3668,41 @@ mod tests {
             app.renderer = Renderer::with_budget(&root, None).unwrap();
             (app, root)
         };
+        // What the render thread holds once all it was asked is done and
+        // what it was given to let go is gone.
+        let quiet = |app: &mut App| {
+            relaid(app);
+            app.renderer.idle();
+            app.renderer.release();
+            app.renderer.idle();
+        };
         let (mut probe, root) = under(memory::PAGES);
         let alone = root.used();
         typed(&mut probe, "example.org/p");
+        // Measured with nothing else held beside it, else the limit
+        // below could leave the picture room without asking.
+        quiet(&mut probe);
         let page = root.used() - alone;
         drop(probe);
         let room = |app: &mut App| {
             // The fetches before have ended, so this one is not refused.
             idle(app);
             type_address(app, "example.org/g.gif");
-            for _ in 0..5000 {
-                app.poll(0);
-                if app.current.held.is_some() {
+            // `settle`'s first half alone: the room made and answered, the
+            // picture made again behind it never taken here, which a poll
+            // could take in the same call and so pass this state by.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                let asked = app
+                    .loading
+                    .as_ref()
+                    .is_some_and(|loading| loading.room.try_recv().is_ok());
+                if asked {
+                    app.make_room();
+                }
+                app.answer_room();
+                let answered = app.loading.as_ref().is_some_and(|l| l.owed.is_none());
+                if app.current.held.is_some() && answered {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3699,6 +3785,8 @@ mod tests {
                 released,
                 owed: None,
                 restores: false,
+                styles: mpsc::channel().1,
+                styling: false,
             });
             given
         };
@@ -5535,7 +5623,7 @@ mod tests {
     }
 
     /// Waits as long as `done` takes, polling.
-    fn wait(app: &mut App, done: fn(&App) -> bool) {
+    fn wait(app: &mut App, mut done: impl FnMut(&App) -> bool) {
         for _ in 0..600_000 {
             app.poll(0);
             if done(app) {
@@ -5552,9 +5640,13 @@ mod tests {
     /// twice, laid out again two thirds as wide and painted; then, with
     /// the last page shown, the largest made beside it. `TD_WEB_ONLY`
     /// names one page or shape and `TD_WEB_SCALE` one scale, so a process
-    /// of its own reports its resident peak. Release build:
-    /// `XDG_DATA_HOME=<install> cargo test --release measure_window --
-    /// --ignored --nocapture`.
+    /// of its own reports its resident peak. A corpus with a `pages.tsv`
+    /// (`fetch::tests::Corpus`) is asked for at its pages' own URLs, its
+    /// sheets with them, each answer taking its captured time under
+    /// `TD_WEB_REPLAY`, and `TD_WEB_STYLE_WAIT` milliseconds in place of
+    /// `STYLE_WAIT`; the URLs asked for and not captured are written to
+    /// its `missing.txt`. Release build: `XDG_DATA_HOME=<install> cargo
+    /// test --release measure_window -- --ignored --nocapture`.
     #[test]
     #[ignore = "host measurement: the pinned faces, TD_WEB_CORPUS, release build"]
     fn measure_window() {
@@ -5567,7 +5659,14 @@ mod tests {
             .unwrap();
         let font = td_ui::font::pinned().unwrap();
         let mut pages: Vec<(String, String)> = Vec::new();
-        if let Some(dir) = std::env::var_os("TD_WEB_CORPUS") {
+        let dir = std::env::var_os("TD_WEB_CORPUS").map(PathBuf::from);
+        let corpus = dir
+            .as_deref()
+            .and_then(crate::fetch::tests::Corpus::read)
+            .map(Arc::new);
+        if let Some(corpus) = &corpus {
+            pages.extend(corpus.pages.iter().cloned());
+        } else if let Some(dir) = &dir {
             let mut names: Vec<_> = std::fs::read_dir(dir)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -5580,7 +5679,9 @@ mod tests {
                 pages.push((name, String::from_utf8_lossy(&bytes).into_owned()));
             }
         }
-        pages.extend(shapes().into_iter().map(|(n, t)| (n.to_string(), t)));
+        if corpus.is_none() {
+            pages.extend(shapes().into_iter().map(|(n, t)| (n.to_string(), t)));
+        }
         let only = std::env::var("TD_WEB_ONLY").ok();
         pages.retain(|(name, _)| only.as_ref().is_none_or(|only| name == only));
         let scales: Vec<(usize, usize, u8)> = match std::env::var("TD_WEB_SCALE").as_deref() {
@@ -5588,22 +5689,57 @@ mod tests {
             Ok("2") => vec![(3840, 2160, 2)],
             _ => vec![(1920, 1200, 1), (3840, 2160, 2)],
         };
+        // A shape's address is its index; a corpus page's its URL.
         let mut table = Table::default();
+        let mut addresses = Vec::new();
         for (n, (_, text)) in pages.iter().enumerate() {
+            let url = corpus
+                .as_ref()
+                .filter(|c| c.pages.iter().any(|(_, url)| url == text));
+            if url.is_some() {
+                addresses.push(text.clone());
+                continue;
+            }
+            addresses.push(format!("example.org/{n}"));
             table = table.page(&format!("https://example.org/{n}"), "text/html", text);
         }
-        let table = Arc::new(table);
+        let table: crate::fetch::Shared = match &corpus {
+            Some(corpus) => corpus.clone(),
+            None => Arc::new(table),
+        };
+        let style_wait = std::env::var("TD_WEB_STYLE_WAIT")
+            .ok()
+            .map(|ms| std::time::Duration::from_millis(ms.parse().unwrap()));
         for (width, height, scale) in scales {
             let surface = Surface::new(width, height, Scale::new(scale).unwrap()).unwrap();
             let mut pixels = vec![0u8; width * height * 4];
             for (n, (name, _)) in pages.iter().enumerate() {
                 let mut app = App::new(table.clone(), surface, Some(faces.clone())).unwrap();
+                if let Some(style_wait) = style_wait {
+                    app.style_wait = style_wait;
+                }
                 let alone = app.renderer.budget().used();
-                type_address(&mut app, &format!("example.org/{n}"));
+                type_address(&mut app, &addresses[n]);
                 let started = Instant::now();
-                wait(&mut app, |app| app.loading.is_none());
+                let mut styles = None;
+                wait(&mut app, |app| {
+                    if styles.is_none() && app.status_text().starts_with("loading styles") {
+                        styles = Some(Instant::now());
+                    }
+                    app.loading.is_none()
+                });
                 let made = started.elapsed();
+                let waited = styles.map(|styles| styles.elapsed());
                 let held = app.renderer.budget().used() - alone;
+                if let Some(sheets) = app.current.doc.page().and_then(|p| p.sheets.as_ref()) {
+                    println!(
+                        "{name}: {} sheets linked and imported, {:?}, {:.1} KiB held, \
+                         waited for them {waited:.1?}",
+                        sheets.taken(),
+                        sheets.tally(),
+                        sheets.bytes() as f64 / 1024.0,
+                    );
+                }
                 let Some(laid) = app.current.laid().and_then(|l| l.try_clone().ok()) else {
                     println!("{name} at {scale}: no page ({})", app.status_text());
                     continue;
@@ -5647,7 +5783,7 @@ mod tests {
                 if let Ok(beside) = std::env::var("TD_WEB_BESIDE") {
                     let other = pages.iter().position(|(name, _)| *name == beside);
                     if let Some(other) = other {
-                        type_address(&mut app, &format!("example.org/{other}"));
+                        type_address(&mut app, &addresses[other]);
                         wait(&mut app, |app| app.loading.is_none());
                         let _ = paint(&mut app, &mut faces);
                         println!(
@@ -5658,6 +5794,9 @@ mod tests {
                     }
                 }
             }
+        }
+        if let (Some(corpus), Some(dir)) = (&corpus, &dir) {
+            println!("{} URLs asked for and not captured", corpus.missing(dir));
         }
     }
 
@@ -5778,5 +5917,633 @@ mod tests {
             row.chunks(4).any(|pixel| pixel != &row[..4])
         });
         assert!(ink, "the first line is drawn");
+    }
+
+    // Stylesheets (DESIGN.md §10, "Subresources"), through the injected
+    // fetcher.
+
+    /// Answers from a table, recording each request as it starts and
+    /// holding those to `held` URLs until the test releases one.
+    struct Gate {
+        table: Table,
+        held: Vec<String>,
+        started: Mutex<Vec<String>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Fetcher for Gate {
+        fn get(&self, url: &str, ask: Ask) -> Result<Reply, String> {
+            self.started.lock().unwrap().push(url.into());
+            if self.held.iter().any(|held| held == url) {
+                let _ = self.release.lock().unwrap().recv();
+            }
+            self.table.get(url, ask)
+        }
+    }
+
+    fn gate(table: Table, held: &[&str]) -> (Arc<Gate>, mpsc::Sender<()>) {
+        let (release, released) = mpsc::channel();
+        let gate = Arc::new(Gate {
+            table,
+            held: held.iter().map(|url| url.to_string()).collect(),
+            started: Mutex::new(Vec::new()),
+            release: Mutex::new(released),
+        });
+        (gate, release)
+    }
+
+    fn started(gate: &Gate) -> Vec<String> {
+        gate.started.lock().unwrap().clone()
+    }
+
+    /// The page's status row with no message over it.
+    fn notes(app: &mut App) -> String {
+        app.message = None;
+        app.status_text().into_owned()
+    }
+
+    /// Waits for every subresource fetch to end.
+    fn slots_free(app: &App) {
+        for _ in 0..1000 {
+            if app.slots.out() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("a subresource fetch did not end");
+    }
+
+    #[test]
+    fn linked_and_imported_sheets_apply_in_cascade_order() {
+        let table = Table::default()
+            .page(
+                "https://example.org/",
+                "text/html",
+                "<link rel=stylesheet href=/a.css>\
+                 <style>@import 'b.css'; .two{display:inline} .three{display:none}</style>\
+                 <link rel=stylesheet href=c.css>\
+                 <span class=one>1</span><span class=two>2</span><span class=three>3</span>",
+            )
+            .sheet(
+                "https://example.org/a.css",
+                "@import 'i.css'; .one{display:none}",
+            )
+            .sheet(
+                "https://example.org/i.css",
+                ".one{display:inline} .two{display:none}",
+            )
+            .sheet("https://example.org/b.css", ".three{display:inline}")
+            .sheet("https://example.org/c.css", ".three{display:inline}");
+        let table = Arc::new(table);
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org");
+        // i.css comes before a.css, which hides one; the style element
+        // shows two after i.css hid it, and c.css shows three again.
+        assert_eq!(page_text(&app), "23");
+        let asked = table.asked.lock().unwrap().clone();
+        let sheets: Vec<_> = asked
+            .iter()
+            .filter(|(url, _)| url.ends_with(".css"))
+            .collect();
+        assert_eq!(sheets.len(), 4, "{asked:?}");
+        for (_, ask) in sheets {
+            assert_eq!(
+                *ask,
+                Ask {
+                    public: true,
+                    accept: "text/css,*/*;q=0.1",
+                    limit: 1 << 20,
+                    deadline: ask.deadline,
+                }
+            );
+            // Within the page's STYLE_WAIT.
+            assert!(ask.deadline.is_some());
+        }
+        assert_eq!(notes(&mut app), "");
+        // Kept for a new environment: a resize compiles them again.
+        resize(&mut app, 600);
+        assert_eq!(page_text(&app), "23");
+        // And F9 leaves them out, then takes them again.
+        key(&mut app, "F9");
+        relaid(&mut app);
+        assert_eq!(page_text(&app), "123");
+        key(&mut app, "F9");
+        relaid(&mut app);
+        assert_eq!(page_text(&app), "23");
+    }
+
+    #[test]
+    fn every_sheet_is_fetched_and_applied_only_where_its_chains_media_match() {
+        let table = Table::default()
+            .page(
+                "https://example.org/",
+                "text/html",
+                "<link rel=stylesheet href=p.css media=print>\
+                 <link rel=stylesheet href=m.css media='screen'>\
+                 <span class=x>x</span><span class=y>y</span><span class=z>z</span>",
+            )
+            .sheet("https://example.org/p.css", ".x{display:none}")
+            .sheet(
+                "https://example.org/m.css",
+                "@import 'n.css' print; @import url(o.css) screen and (min-width: 1px);",
+            )
+            .sheet("https://example.org/n.css", ".y{display:none}")
+            .sheet("https://example.org/o.css", ".z{display:none}");
+        let table = Arc::new(table);
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org");
+        assert_eq!(page_text(&app), "xy");
+        let urls = table.urls();
+        for sheet in ["p.css", "m.css", "n.css", "o.css"] {
+            assert!(urls.iter().any(|url| url.ends_with(sheet)), "{urls:?}");
+        }
+    }
+
+    #[test]
+    fn imports_nest_four_deep_and_the_count_is_bounded() {
+        let mut table = Table::default().page(
+            "https://example.org/",
+            "text/html",
+            "<link rel=stylesheet href=/0.css>\
+             <b class=c0>0</b><b class=c1>1</b><b class=c2>2</b><b class=c3>3</b>\
+             <b class=c4>4</b><b class=c5>5</b>",
+        );
+        for n in 0..6 {
+            table = table.sheet(
+                &format!("https://example.org/{n}.css"),
+                &format!("@import '/{}.css'; .c{n}{{display:none}}", n + 1),
+            );
+        }
+        let table = Arc::new(table);
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org");
+        // 0.css links, 1.css to 4.css import four deep; 5.css is past.
+        assert_eq!(page_text(&app), "5");
+        assert!(!table.urls().iter().any(|url| url.ends_with("/5.css")));
+        assert_eq!(
+            notes(&mut app),
+            "1 of the page's style sheets was not applied"
+        );
+        // MAX_SHEET_FETCHES linked; one more is not fetched.
+        let mut markup = String::new();
+        let mut table = Table::default();
+        for n in 0..=crate::gather::MAX_SHEET_FETCHES {
+            markup.push_str(&format!("<link rel=stylesheet href=/s{n}.css>"));
+            table = table.sheet(&format!("https://example.org/s{n}.css"), "");
+        }
+        markup.push_str("<p>shown");
+        let table = Arc::new(table.page("https://example.org/", "text/html", &markup));
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org");
+        assert_eq!(page_text(&app), "shown");
+        let fetched = table.urls().iter().filter(|u| u.ends_with(".css")).count();
+        assert_eq!(fetched, crate::gather::MAX_SHEET_FETCHES);
+        assert_eq!(
+            notes(&mut app),
+            "1 of the page's style sheets was not applied"
+        );
+    }
+
+    #[test]
+    fn sheets_past_the_byte_bounds_are_left_out() {
+        let big = format!(".a{{display:none}}{}", " ".repeat(1 << 20));
+        // A byte of windows-1252 decodes to two of UTF-8 here: within the
+        // service's limit, past td-css's once decoded.
+        let mut wide = b".b{display:none}".to_vec();
+        wide.extend(std::iter::repeat_n(0xe9u8, (1 << 20) - wide.len()));
+        let near = format!(".c{{display:none}}/*{}*/", "x".repeat(900 << 10));
+        let mut table = Table::default()
+            .sheet("https://example.org/big.css", &big)
+            .reply(
+                "https://example.org/wide.css",
+                200,
+                &[("content-type", "text/css; charset=windows-1252")],
+                &wide,
+            );
+        let mut markup =
+            String::from("<link rel=stylesheet href=big.css><link rel=stylesheet href=wide.css>");
+        // Five of 0.9 MiB pass the 4 MiB a page's sheets hold together.
+        for n in 0..5 {
+            markup.push_str(&format!("<link rel=stylesheet href=n{n}.css>"));
+            table = table.sheet(&format!("https://example.org/n{n}.css"), &near);
+        }
+        markup.push_str("<b class=a>a</b><b class=b>b</b><b class=c>c</b>");
+        let table = table.page("https://example.org/", "text/html", &markup);
+        let mut app = app(table);
+        typed(&mut app, "example.org");
+        assert_eq!(page_text(&app), "ab");
+        assert_eq!(
+            notes(&mut app),
+            "3 of the page's style sheets were not applied"
+        );
+    }
+
+    #[test]
+    fn mixed_content_404s_and_wrong_types_are_noted_and_data_sheets_applied() {
+        let table = Table::default()
+            .page(
+                "https://example.org/",
+                "text/html",
+                "<link rel=stylesheet href=/r.css><link rel=stylesheet href=/missing.css>\
+                 <link rel=stylesheet href=/plain.css><link rel=stylesheet href=http://example.org/h.css>\
+                 <link rel=stylesheet href='data:text/css,.d%7Bdisplay:none%7D'>\
+                 <b class=r>r</b><b class=m>m</b><b class=p>p</b><b class=h>h</b><b class=d>d</b>",
+            )
+            .redirect("https://example.org/r.css", "http://example.org/r.css")
+            .sheet("http://example.org/r.css", ".r{display:none}")
+            .reply(
+                "https://example.org/missing.css",
+                404,
+                &[("content-type", "text/css")],
+                b".m{display:none}",
+            )
+            .page("https://example.org/plain.css", "text/plain", ".p{display:none}")
+            .sheet("http://example.org/h.css", ".h{display:none}");
+        let table = Arc::new(table);
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org");
+        assert_eq!(page_text(&app), "rmph");
+        let urls = table.urls();
+        assert!(
+            !urls.iter().any(|url| url.starts_with("http://")),
+            "no http hop is asked: {urls:?}"
+        );
+        assert!(!urls.iter().any(|url| url.starts_with("data:")));
+        assert_eq!(
+            notes(&mut app),
+            "4 of the page's style sheets were not applied"
+        );
+    }
+
+    #[test]
+    fn a_sheet_past_style_wait_is_late_and_a_reload_asks_for_it_again() {
+        let table = Table::default()
+            .page(
+                "https://example.org/",
+                "text/html",
+                "<link rel=stylesheet href=slow.css><b class=s>slow</b>",
+            )
+            .sheet("https://example.org/slow.css", ".s{display:none}");
+        let (gate, release) = gate(table, &["https://example.org/slow.css"]);
+        let mut app = app_over(gate.clone());
+        app.style_wait = std::time::Duration::from_millis(150);
+        type_address(&mut app, "example.org");
+        // The page shown meanwhile is the one before, the status row
+        // saying the styles are loading.
+        let mut said = false;
+        for _ in 0..1000 {
+            app.poll(0);
+            if app.status_text() == "loading styles of https://example.org/" {
+                said = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(said, "{}", app.status_text());
+        assert!(app.current.doc.url.is_none(), "the blank page stays");
+        settle(&mut app);
+        assert_eq!(page_text(&app), "slow");
+        assert_eq!(
+            notes(&mut app),
+            "1 style sheet did not come in time; Ctrl+R asks again"
+        );
+        // Let go, the late one ends and frees its slot.
+        release.send(()).unwrap();
+        slots_free(&app);
+        // A reload asks for it again; answered in time, it applies.
+        release.send(()).unwrap();
+        key(&mut app, "C-r");
+        settle(&mut app);
+        assert_eq!(page_text(&app), "");
+        assert_eq!(notes(&mut app), "");
+        let asked = started(&gate);
+        assert_eq!(
+            asked.iter().filter(|url| url.ends_with("slow.css")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn stopped_fetches_hold_their_slots_until_the_service_answers() {
+        let mut table = Table::default()
+            .page(
+                "https://example.org/b",
+                "text/html",
+                "<link rel=stylesheet href=/b.css><i class=b>b</i>",
+            )
+            .sheet("https://example.org/b.css", ".b{display:none}")
+            .page("https://example.org/", "text/html", "<p>home");
+        let mut markup = String::new();
+        let mut held = Vec::new();
+        for n in 0..subresource::MAX_SUBRESOURCES + 1 {
+            let url = format!("https://example.org/a{n}.css");
+            markup.push_str(&format!("<link rel=stylesheet href=/a{n}.css>"));
+            table = table.sheet(&url, "");
+            held.push(url);
+        }
+        let table = table.page("https://example.org/a", "text/html", &markup);
+        let held: Vec<&str> = held.iter().map(String::as_str).collect();
+        let (gate, release) = gate(table, &held);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org");
+        let used = app.renderer.budget().used();
+        type_address(&mut app, "example.org/a");
+        // Each slot's fetch asked of the service: one stopped before its
+        // first hop would ask nothing and give its slot back.
+        for n in 0..subresource::MAX_SUBRESOURCES {
+            asked(&mut app, &gate, &format!("https://example.org/a{n}.css"));
+        }
+        assert_eq!(app.slots.out(), subresource::MAX_SUBRESOURCES);
+        // Escape stops the page, which never shows; the page shown stays.
+        key(&mut app, "Escape");
+        assert_eq!(app.status_text(), "stopped");
+        assert_eq!(page_text(&app), "home");
+        idle(&app);
+        // The fifth was never asked; the four stopped hold their slots.
+        assert!(!started(&gate).iter().any(|url| url.ends_with("a4.css")));
+        assert_eq!(app.slots.out(), subresource::MAX_SUBRESOURCES);
+        // So the next page's sheet waits for a slot, past STYLE_WAIT.
+        app.style_wait = std::time::Duration::from_millis(200);
+        typed(&mut app, "example.org/b");
+        assert_eq!(page_text(&app), "b");
+        assert!(!started(&gate).iter().any(|url| url.ends_with("b.css")));
+        assert_eq!(
+            notes(&mut app),
+            "1 style sheet did not come in time; Ctrl+R asks again"
+        );
+        // Once the service answers them, the slots free and the page
+        // stopped has let everything go on the render thread.
+        for _ in 0..subresource::MAX_SUBRESOURCES {
+            release.send(()).unwrap();
+        }
+        slots_free(&app);
+        key(&mut app, "C-r");
+        settle(&mut app);
+        assert_eq!(page_text(&app), "");
+        // Back to the first page's charges: nothing of the stopped one
+        // nor of the replaced ones is held.
+        key(&mut app, "M-Left");
+        settle(&mut app);
+        app.renderer.idle();
+        app.renderer.release();
+        app.renderer.idle();
+        assert_eq!(page_text(&app), "home");
+        assert_eq!(app.renderer.budget().used(), used);
+    }
+
+    /// td-web's fetch service as its `[web-fetch]` unit runs it:
+    /// `SERVICE_WORKERS` requests served at once, the rest waiting for a
+    /// worker; an origin that never answers a `tarpit` URL, given up at
+    /// the request's deadline, as the service gives it up, or never.
+    struct Service {
+        table: Table,
+        tarpit: Vec<String>,
+        workers: Mutex<usize>,
+        free: std::sync::Condvar,
+        /// Each request as it was served, and how long it waited for a
+        /// worker.
+        served: Mutex<Vec<(String, std::time::Duration)>>,
+    }
+
+    impl Fetcher for Service {
+        fn get(&self, url: &str, ask: Ask) -> Result<Reply, String> {
+            let came = std::time::Instant::now();
+            let mut workers = self.workers.lock().unwrap();
+            while *workers >= subresource::SERVICE_WORKERS {
+                workers = self.free.wait(workers).unwrap();
+            }
+            *workers += 1;
+            drop(workers);
+            self.served
+                .lock()
+                .unwrap()
+                .push((url.into(), came.elapsed()));
+            let answer = if self.tarpit.iter().any(|tarpit| tarpit == url) {
+                // A worker held to the deadline asked for, or for good.
+                let until = ask
+                    .deadline
+                    .unwrap_or(came + std::time::Duration::from_secs(600));
+                std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+                Err("transport: the origin timed out".into())
+            } else {
+                self.table.get(url, ask)
+            };
+            *self.workers.lock().unwrap() -= 1;
+            self.free.notify_one();
+            answer
+        }
+    }
+
+    #[test]
+    fn a_page_of_tarpit_sheets_never_holds_a_navigation_back() {
+        let mut markup = String::new();
+        let mut tarpit = Vec::new();
+        for n in 0..subresource::MAX_SUBRESOURCES + 2 {
+            markup.push_str(&format!("<link rel=stylesheet href=/t{n}.css>"));
+            tarpit.push(format!("https://example.org/t{n}.css"));
+        }
+        markup.push_str("<p>tarpit");
+        let table = Table::default()
+            .page("https://example.org/t", "text/html", &markup)
+            .page("https://example.org/n", "text/html", "<p>next")
+            .page(
+                "https://example.org/s",
+                "text/html",
+                "<link rel=stylesheet href=/s.css><i class=s>styled</i>",
+            )
+            .sheet("https://example.org/s.css", ".s{display:none}");
+        let service = Arc::new(Service {
+            table,
+            tarpit,
+            workers: Mutex::new(0),
+            free: std::sync::Condvar::new(),
+            served: Mutex::new(Vec::new()),
+        });
+        let mut app = app_over(service.clone());
+        app.style_wait = std::time::Duration::from_millis(1500);
+        type_address(&mut app, "example.org/t");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let tarpits = |service: &Service| {
+            let served = service.served.lock().unwrap();
+            served
+                .iter()
+                .filter(|(url, _)| url.contains("/t") && url.ends_with(".css"))
+                .count()
+        };
+        while tarpits(&service) < subresource::MAX_SUBRESOURCES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sheets were not asked"
+            );
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Every subresource slot held by the tarpit: a navigation is
+        // served at once, a worker its own.
+        let started = std::time::Instant::now();
+        typed(&mut app, "example.org/n");
+        assert_eq!(page_text(&app), "next");
+        let waited = service
+            .served
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _)| url.ends_with("/n"))
+            .map(|(_, waited)| *waited)
+            .unwrap();
+        assert!(waited < std::time::Duration::from_millis(200), "{waited:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // The tarpit's fetches end at its STYLE_WAIT, given up by the
+        // service, and so free their slots and workers; the two it never
+        // asked are never asked.
+        slots_free(&app);
+        let served = service.served.lock().unwrap().clone();
+        let asked = served.iter().filter(|(url, _)| url.contains("/t")).count();
+        assert_eq!(asked, 1 + subresource::MAX_SUBRESOURCES, "{served:?}");
+        // So a page after it is styled within its own wait.
+        typed(&mut app, "example.org/s");
+        assert_eq!(page_text(&app), "");
+        assert_eq!(notes(&mut app), "");
+    }
+
+    #[test]
+    fn a_stopped_pages_sheet_asks_no_hop_after_the_one_out() {
+        let page = "https://next-hop.example/r";
+        let table = Table::default()
+            .page(page, "text/html", "<link rel=stylesheet href=/r0.css><p>r")
+            .redirect("https://next-hop.example/r0.css", "/r1.css")
+            .sheet("https://next-hop.example/r1.css", "p{}")
+            .page("https://next-hop.example/", "text/html", "<p>home");
+        let (gate, release) = gate(table, &["https://next-hop.example/r0.css"]);
+        let dropped = crate::document::tests::watch(page);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "next-hop.example");
+        type_address(&mut app, "next-hop.example/r");
+        asked(&mut app, &gate, "https://next-hop.example/r0.css");
+        key(&mut app, "Escape");
+        // Within a tick the page is let go and its fetch told.
+        dropped
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // The service answers the hop out with a redirect: not followed.
+        release.send(()).unwrap();
+        slots_free(&app);
+        assert!(!started(&gate).iter().any(|url| url.ends_with("r1.css")));
+        assert_eq!(page_text(&app), "home");
+    }
+
+    /// Waits for `gate` to have started `url`, polling the window.
+    fn asked(app: &mut App, gate: &Gate, url: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !started(gate).iter().any(|started| started == url) {
+            assert!(std::time::Instant::now() < deadline, "{url} not asked");
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_page_stopped_waiting_for_its_sheets_is_dropped_on_the_render_thread() {
+        // Stopped while its one sheet is out: let go within a tick, not
+        // when the sheet is answered.
+        let page = "https://drop-waiting.example/";
+        let table = Table::default()
+            .page(page, "text/html", "<link rel=stylesheet href=/w.css><p>w")
+            .sheet("https://drop-waiting.example/w.css", "p{}");
+        let (gate, release) = gate(table, &["https://drop-waiting.example/w.css"]);
+        let dropped = crate::document::tests::watch(page);
+        let mut app = app_over(gate.clone());
+        type_address(&mut app, "drop-waiting.example");
+        asked(&mut app, &gate, "https://drop-waiting.example/w.css");
+        let stopped = std::time::Instant::now();
+        key(&mut app, "Escape");
+        let name = dropped
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("td-web render"));
+        assert!(
+            stopped.elapsed() < subresource::TICK * 25,
+            "{:?}",
+            stopped.elapsed()
+        );
+        release.send(()).unwrap();
+        slots_free(&app);
+        // Stopped between its jobs: one sheet decoded into it, the other
+        // still out.
+        let page = "https://drop-between.example/";
+        let table = Table::default()
+            .page(
+                page,
+                "text/html",
+                "<link rel=stylesheet href=/a.css><link rel=stylesheet href=/b.css><p>v",
+            )
+            .sheet("https://drop-between.example/a.css", "a{}")
+            .sheet("https://drop-between.example/b.css", "b{}");
+        let (gate, release) = super::tests::gate(table, &["https://drop-between.example/b.css"]);
+        let dropped = crate::document::tests::watch(page);
+        let mut app = app_over(gate.clone());
+        type_address(&mut app, "drop-between.example");
+        asked(&mut app, &gate, "https://drop-between.example/b.css");
+        // a's slot is given back once the render thread has taken it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.slots.out() > 1 {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        key(&mut app, "Escape");
+        let name = dropped
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("td-web render"));
+        release.send(()).unwrap();
+        slots_free(&app);
+    }
+
+    /// Sheets refused at once, as a page on a LAN device's are, faster
+    /// than the page takes their answers: none is lost, so the page is
+    /// styled as soon as they settle, never at its wait's end, and a good
+    /// sheet among them is applied.
+    #[test]
+    fn sheets_refused_at_once_are_each_answered() {
+        let mut table = Table::default();
+        let mut links = String::new();
+        for n in 0..crate::gather::MAX_SHEET_FETCHES {
+            links.push_str(&format!("<link rel=stylesheet href=/f{n}.css>"));
+        }
+        for n in 0..10 {
+            table = table.page(&format!("https://example.org/p{n}"), "text/html", &links);
+        }
+        let mut around = String::new();
+        for n in 0..10 {
+            around.push_str(&format!("<link rel=stylesheet href=/g{n}.css>"));
+        }
+        let good = format!(
+            "{around}<link rel=stylesheet href=/good.css>{}<i class=x>hidden</i>",
+            around.replace("/g", "/h")
+        );
+        for n in 0..10 {
+            table = table.page(&format!("https://example.org/q{n}"), "text/html", &good);
+        }
+        let table = table.sheet("https://example.org/good.css", ".x{display:none}");
+        // `settle` gives up long before the minute's wait would end.
+        let mut app = app_over(Arc::new(table));
+        for n in 0..10 {
+            typed(&mut app, &format!("example.org/p{n}"));
+            assert_eq!(
+                notes(&mut app),
+                "32 of the page's style sheets were not applied",
+                "page {n}"
+            );
+        }
+        for n in 0..10 {
+            typed(&mut app, &format!("example.org/q{n}"));
+            assert_eq!(page_text(&app), "", "page {n}");
+            assert_eq!(
+                notes(&mut app),
+                "20 of the page's style sheets were not applied",
+                "page {n}"
+            );
+        }
     }
 }

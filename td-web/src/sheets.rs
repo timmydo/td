@@ -1,8 +1,9 @@
 //! A page's sheets (DESIGN.md §10, "Sources"): td-css's user-agent sheet,
-//! td-web's own, then the page's `style` elements in tree order with
-//! their media, compiled into one set for an environment.
+//! td-web's own, then the page's own in cascade order with their media,
+//! compiled into one set for an environment.
 
-use crate::tree::Tree;
+use crate::gather::{Given, Sheets};
+use crate::tree::{Sheet::Inline, Tree};
 use td_alloc::Budget;
 use td_css::cascade::{MAX_SHEETS, MAX_STYLE_BYTES};
 use td_css::conditions::{ColorScheme, Environment, MediaType};
@@ -43,69 +44,91 @@ pub fn environment(width: f64, height: f64, scale: u32) -> Environment {
     }
 }
 
-/// The bytes td-css counts a sheet as: its text and each media list, a
-/// list at least one.
-fn bytes(text: &str, media: Option<&str>) -> usize {
-    text.len()
-        .saturating_add(media.map_or(0, |list| list.len().max(1)))
+/// The page's own sheets in cascade order, cut at the set's count and
+/// bytes: each one past them is left out, counted, in that order.
+struct Cut<'a> {
+    kept: td_alloc::BudgetVec<Given<'a>>,
+    count: usize,
+    total: usize,
+    left_out: usize,
 }
 
-/// The user-agent sheets alone, or with the page's own when `own` is set,
-/// compiled for `environment` under `memory`. The page's sheets past the
-/// set's count or bytes are left out first, in tree order.
-pub fn compile(
-    tree: &Tree,
-    own: bool,
-    environment: &Environment,
-    memory: &Budget,
-) -> Result<(StyleSet, Omitted), td_css::Error> {
-    let mut omitted = Omitted::default();
-    let given = if own { tree.sheets() } else { &[] };
-    let mut media =
-        td_alloc::BudgetVec::with_capacity(memory, given.len()).map_err(td_css::Error::Memory)?;
-    let mut texts =
-        td_alloc::BudgetVec::with_capacity(memory, given.len()).map_err(td_css::Error::Memory)?;
-    let mut count = USER_AGENT.len();
-    let mut total = USER_AGENT
-        .iter()
-        .fold(0usize, |sum, sheet| sum.saturating_add(sheet.len()));
-    for &id in given {
-        let Some((text, list)) = tree.sheet(id) else {
-            continue;
-        };
-        let own = bytes(text, list);
+impl<'a> Cut<'a> {
+    fn new(memory: &Budget) -> Result<Self, td_alloc::BudgetError> {
+        Ok(Self {
+            kept: td_alloc::BudgetVec::with_capacity(memory, MAX_SHEETS - USER_AGENT.len())?,
+            count: USER_AGENT.len(),
+            total: USER_AGENT
+                .iter()
+                .fold(0usize, |sum, sheet| sum.saturating_add(sheet.len())),
+            left_out: 0,
+        })
+    }
+
+    fn take(&mut self, sheet: Given<'a>) -> Result<(), td_alloc::BudgetError> {
+        let own = sheet.bytes();
         // A sheet past td-css's own bound is refused alone, not counted.
         let counted = if own > td_css::MAX_INPUT_BYTES {
             0
         } else {
             own
         };
-        if count >= MAX_SHEETS || total.saturating_add(counted) > MAX_STYLE_BYTES {
-            omitted.left_out += 1;
-            continue;
+        if self.count >= MAX_SHEETS || self.total.saturating_add(counted) > MAX_STYLE_BYTES {
+            self.left_out += 1;
+            return Ok(());
         }
-        count += 1;
-        total = total.saturating_add(counted);
-        texts.try_push(text).map_err(td_css::Error::Memory)?;
-        media.try_push(list).map_err(td_css::Error::Memory)?;
+        self.count += 1;
+        self.total = self.total.saturating_add(counted);
+        self.kept.try_push(sheet)
     }
-    let mut sheets = td_alloc::BudgetVec::with_capacity(memory, USER_AGENT.len() + texts.len())
+}
+
+/// The user-agent sheets alone, or with the page's own when `own` is set,
+/// compiled for `environment` under `memory`: `sheets` in cascade order,
+/// else the tree's `style` elements. The page's sheets past the set's
+/// count or bytes are left out first, in cascade order.
+pub fn compile(
+    tree: &Tree,
+    sheets: Option<&Sheets>,
+    own: bool,
+    environment: &Environment,
+    memory: &Budget,
+) -> Result<(StyleSet, Omitted), td_css::Error> {
+    let mut cut = Cut::new(memory).map_err(td_css::Error::Memory)?;
+    match (own, sheets) {
+        (false, _) => {}
+        (true, Some(sheets)) => sheets
+            .each(tree, |sheet| cut.take(sheet))
+            .map_err(td_css::Error::Memory)?,
+        (true, None) => {
+            for &id in tree.sheets() {
+                if let Some(Inline { text, media }) = tree.sheet(id) {
+                    cut.take(Given::inline(text, media))
+                        .map_err(td_css::Error::Memory)?;
+                }
+            }
+        }
+    }
+    let mut sheets = td_alloc::BudgetVec::with_capacity(memory, USER_AGENT.len() + cut.kept.len())
         .map_err(td_css::Error::Memory)?;
     for source in USER_AGENT {
         sheets
             .try_push(Sheet::new(Origin::UserAgent, source))
             .map_err(td_css::Error::Memory)?;
     }
-    for (text, list) in texts.iter().zip(media.iter()) {
-        let sheet = Sheet::new(Origin::Author, text);
-        let sheet = match list {
-            Some(list) => sheet.with_media(std::slice::from_ref(list)),
-            None => sheet,
+    for given in cut.kept.iter() {
+        let sheet = Sheet::new(Origin::Author, given.text);
+        let sheet = match given.lists() {
+            [] => sheet,
+            lists => sheet.with_media(lists),
         };
         sheets.try_push(sheet).map_err(td_css::Error::Memory)?;
     }
     let (set, refused) = StyleSet::from_sheets(&sheets, environment, memory)?;
-    omitted.refused = refused.len();
+    let omitted = Omitted {
+        left_out: cut.left_out,
+        refused: refused.len(),
+    };
     Ok((set, omitted))
 }
 
@@ -120,15 +143,20 @@ fn names_colour(text: &str) -> bool {
     })
 }
 
-/// Whether the page's own sheets or `style` attributes set any colour,
-/// by a scan for the properties that can (DESIGN.md §10, "Colours").
-pub fn coloured(tree: &Tree) -> bool {
-    let sheets = tree
+/// Whether the page's own sheets, its `style` elements and those
+/// `sheets` gathered, or its `style` attributes set any colour, by a scan
+/// for the properties that can (DESIGN.md §10, "Colours").
+pub fn coloured(tree: &Tree, sheets: Option<&Sheets>) -> bool {
+    let inline = tree
         .sheets()
         .iter()
-        .filter_map(|&id| tree.sheet(id))
-        .any(|(text, _)| names_colour(text));
-    sheets
+        .filter_map(|&id| match tree.sheet(id) {
+            Some(Inline { text, .. }) => Some(text),
+            _ => None,
+        })
+        .any(names_colour);
+    inline
+        || sheets.is_some_and(|sheets| sheets.texts().any(names_colour))
         || tree.document().nodes().any(|(_, node)| {
             node.element()
                 .and_then(|element| element.attribute("style"))
@@ -155,14 +183,14 @@ mod tests {
         }
         let (tree, page) = parsed(&markup);
         let environment = environment(800.0, 600.0, 1);
-        let (_, omitted) = compile(&tree, true, &environment, &page).unwrap();
+        let (_, omitted) = compile(&tree, None, true, &environment, &page).unwrap();
         assert_eq!(omitted.left_out, 70 - (MAX_SHEETS - 2));
         // One sheet past td-css's own bound is refused alone; the rest of
         // the bytes still count against the set.
         let big = "a{}".repeat(td_css::MAX_INPUT_BYTES / 3 + 1);
         let markup = format!("<style>{big}</style><style>b{{color:red}}</style>");
         let (tree, page) = parsed(&markup);
-        let (_, omitted) = compile(&tree, true, &environment, &page).unwrap();
+        let (_, omitted) = compile(&tree, None, true, &environment, &page).unwrap();
         assert_eq!(
             omitted,
             Omitted {
@@ -170,18 +198,46 @@ mod tests {
                 refused: 1
             }
         );
-        let (_, omitted) = compile(&tree, false, &environment, &page).unwrap();
+        let (_, omitted) = compile(&tree, None, false, &environment, &page).unwrap();
         assert_eq!(omitted, Omitted::default(), "the user-agent sheets alone");
     }
 
     #[test]
     fn colour_is_found_in_sheets_and_style_attributes() {
-        assert!(!coloured(
-            &parsed("<style>p{margin:0}</style><p style=width:1px>").0
-        ));
-        assert!(coloured(&parsed("<style>p{COLOR:red}</style>").0));
-        assert!(coloured(&parsed("<p style='background:#fff'>").0));
-        assert!(coloured(&parsed("<p style='border:1px solid'>").0));
+        let coloured = |markup: &str| coloured(&parsed(markup).0, None);
+        assert!(!coloured("<style>p{margin:0}</style><p style=width:1px>"));
+        assert!(coloured("<style>p{COLOR:red}</style>"));
+        assert!(coloured("<p style='background:#fff'>"));
+        assert!(coloured("<p style='border:1px solid'>"));
+        // A linked sheet's text, once gathered.
+        let (tree, page) = parsed("<link rel=stylesheet href='data:text/css,p{background:red}'>");
+        let url = td_url::Url::parse("https://example.org/").unwrap();
+        let sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, &page).unwrap();
+        assert!(!super::coloured(&tree, None));
+        assert!(super::coloured(&tree, Some(&sheets)));
+    }
+
+    #[test]
+    fn a_sheets_media_chain_counts_as_td_css_counts_it() {
+        let given = Given::inline("ab", Some(""));
+        assert_eq!(given.lists(), [""]);
+        assert_eq!(given.bytes(), 2 + 1);
+        assert_eq!(Given::inline("ab", None).bytes(), 2);
+        // Filled to a few bytes short of the set's, a sheet whose list
+        // passes them is left out where its text alone would fit.
+        let memory = Budget::new(1 << 20).unwrap();
+        let mut cut = Cut::new(&memory).unwrap();
+        let room = MAX_STYLE_BYTES - cut.total;
+        let quarter = "a".repeat((room - 8) / 4);
+        for _ in 0..4 {
+            cut.take(Given::inline(&quarter, None)).unwrap();
+        }
+        let left = MAX_STYLE_BYTES - cut.total;
+        let list = "x".repeat(left);
+        cut.take(Given::inline("b", Some(&list))).unwrap();
+        assert_eq!(cut.left_out, 1);
+        cut.take(Given::inline("b", None)).unwrap();
+        assert_eq!((cut.left_out, cut.kept.len()), (1, 5));
     }
 
     #[test]

@@ -2270,7 +2270,7 @@ fn build_desktop_td_svc_conf() -> String {
          [web-fetch]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-service-as tda{web_uid} -- /bin/td-fetchd run --socket /run/user/{web_uid}/td-fetch/socket\n\
+         exec=/bin/td-login exec-service-as tda{web_uid} -- /bin/td-fetchd run --socket /run/user/{web_uid}/td-fetch/socket --workers 8\n\
          after=td-firstboot,netup\n\
          requires=td-firstboot\n\
          ready=/bin/td-login exec-service-as tda{web_uid} -- /bin/td-fetchd probe /run/user/{web_uid}/td-fetch/socket\n\
@@ -8801,13 +8801,19 @@ mod tests {
             unit_after("web-evidence"),
             vec![TD_WEB_NAME, "firefox-tls-setup"]
         );
-        for (name, uid) in [("mail", MAIL_UID), ("news", NEWS_UID), ("web", WEB_UID)] {
+        // web's serves its navigations and their subresources, eight out at
+        // once (td-web/DESIGN.md §10, "Slots").
+        for (name, uid, workers) in [
+            ("mail", MAIL_UID, ""),
+            ("news", NEWS_UID, ""),
+            ("web", WEB_UID, " --workers 8"),
+        ] {
             let fetch = format!("{name}-fetch");
             for (key, value) in [
             (
                 "exec",
                 format!(
-                    "/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket"
+                    "/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket{workers}"
                 ),
             ),
             (
@@ -8831,6 +8837,28 @@ mod tests {
             // with no socket behind it.
             assert_eq!(unit_key(&fetch, "unless-exists"), None);
         }
+        // The unit's eight are td-web's and td-launch's on a host.
+        let bound = |text: &str, prefix: &str| {
+            text.lines()
+                .find_map(|line| line.trim_start().strip_prefix(prefix))
+                .map(|rest| rest.trim_end_matches(';').trim().to_string())
+        };
+        assert_eq!(
+            bound(
+                include_str!("../../../td-web/src/subresource.rs"),
+                "pub const SERVICE_WORKERS: usize ="
+            )
+            .as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            bound(
+                include_str!("../../../net/src/launch.rs"),
+                "const WEB_FETCH_WORKERS: &str ="
+            )
+            .as_deref(),
+            Some("\"8\"")
+        );
         let exec = unit_key("placement-evidence", "exec").unwrap_or_default();
         assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
         assert!(

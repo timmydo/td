@@ -66,6 +66,17 @@ fn relays(name: &str) -> bool {
     name == "td-agent"
 }
 
+/// The counted requests td-web's fetch service serves at once, as its
+/// `[web-fetch]` unit's `--workers` has it: its navigations and its
+/// subresource fetches each a worker (td-web/DESIGN.md §10, "Slots").
+const WEB_FETCH_WORKERS: &str = "8";
+
+/// How many counted requests `name`'s fetch service serves at once, when
+/// not the service's own four.
+fn fetch_workers(name: &str) -> Option<&'static str> {
+    (name == "td-web").then_some(WEB_FETCH_WORKERS)
+}
+
 /// Every launched program's companions, each once, in order: what
 /// `./install-apps` builds and installs beside this binary.
 fn all_companions() -> Vec<&'static str> {
@@ -113,6 +124,8 @@ struct LaunchOptions {
     discover_mail_unix: bool,
     /// Give the program no display but one the session named, not the default.
     display_only_if_named: bool,
+    /// The fetch service's `--workers`, when not its default.
+    workers: Option<&'static str>,
 }
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
@@ -136,6 +149,7 @@ pub fn run(args: &[String]) {
                     allow_private_loopback: false,
                     discover_mail_unix: false,
                     display_only_if_named: false,
+                    workers: None,
                 },
             )),
             None => {
@@ -156,6 +170,7 @@ pub fn run(args: &[String]) {
                     allow_private_loopback: false,
                     discover_mail_unix: false,
                     display_only_if_named: false,
+                    workers: None,
                 },
             ))
         }
@@ -192,6 +207,7 @@ pub fn run_named(name: &str, args: &[String]) {
                     allow_private_loopback: name == "td-mail",
                     discover_mail_unix: name == "td-mail",
                     display_only_if_named: display_only_if_named(name, args),
+                    workers: fetch_workers(name),
                     ..LaunchOptions::default()
                 },
             )
@@ -459,16 +475,14 @@ const EGRESSD: Service = Service {
     probe: crate::egress::probe_within,
 };
 
-/// Starts this binary's `service` at `socket`, to end when this process's
-/// pid is no longer its parent, and waits for its probe; the child is
-/// killed when it does not answer.
-fn start_service(
-    service: &Service,
+/// How this binary's `applet` is started at `socket`, to end when this
+/// process's pid is no longer its parent.
+fn service_command(
+    applet: &str,
     socket: &Path,
     options: LaunchOptions,
     unix_sockets: &[td_fs::SocketPath],
-) -> Result<Child, String> {
-    let applet = service.applet;
+) -> Command {
     let mut command = Command::new(SELF);
     command
         .arg0(applet)
@@ -479,6 +493,9 @@ fn start_service(
         .stdin(Stdio::null())
         .process_group(0);
     if applet == FETCHD.applet {
+        if let Some(workers) = options.workers {
+            command.arg("--workers").arg(workers);
+        }
         for path in unix_sockets {
             command.arg("--allow-unix").arg(path.as_path());
         }
@@ -489,6 +506,20 @@ fn start_service(
     if options.allow_private_loopback && applet == FETCHD.applet {
         command.arg("--allow-private-loopback");
     }
+    command
+}
+
+/// Starts this binary's `service` at `socket`, to end when this process's
+/// pid is no longer its parent, and waits for its probe; the child is
+/// killed when it does not answer.
+fn start_service(
+    service: &Service,
+    socket: &Path,
+    options: LaunchOptions,
+    unix_sockets: &[td_fs::SocketPath],
+) -> Result<Child, String> {
+    let applet = service.applet;
+    let mut command = service_command(applet, socket, options, unix_sockets);
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start {applet}: {e}"))?;
@@ -756,6 +787,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// td-web's service serves its navigations and subresources at once
+    /// on a host as under td-svc; the others take the service's four.
+    #[test]
+    fn td_webs_service_serves_eight_at_once() {
+        let at = Path::new("/run/s");
+        let args = |name: &str, applet: &str| {
+            let options = LaunchOptions {
+                workers: fetch_workers(name),
+                ..LaunchOptions::default()
+            };
+            service_command(applet, at, options, &[])
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let pid = std::process::id().to_string();
+        let base = [
+            "run",
+            "--exit-with-parent",
+            pid.as_str(),
+            "--socket",
+            "/run/s",
+        ];
+        let mut web = base.to_vec();
+        web.extend(["--workers", "8"]);
+        assert_eq!(args("td-web", FETCHD.applet), web);
+        for name in ["td-mail", "td-news", "td-agent"] {
+            assert_eq!(args(name, FETCHD.applet), base, "{name}");
+        }
+        assert_eq!(args("td-web", EGRESSD.applet), base);
+        let workers: usize = WEB_FETCH_WORKERS.parse().unwrap();
+        assert!(workers <= crate::fetchd::MAX_WORKERS);
     }
 
     #[test]

@@ -36,7 +36,8 @@ pub struct Tree {
     rank: BudgetVec<u32>,
     /// Each node's nearest `a` or `area` with an `href`, itself included.
     link: BudgetVec<Option<NodeId>>,
-    /// `style` elements in tree order whose type is CSS's.
+    /// `style` elements whose type is CSS's and `<link rel=stylesheet>`s
+    /// with an `href`, in tree order.
     sheets: BudgetVec<NodeId>,
     base: Option<NodeId>,
     title: BudgetString,
@@ -76,6 +77,58 @@ fn html_element(document: &Document, id: NodeId) -> Option<&td_html::document::E
         .node(id)?
         .element()
         .filter(|element| element.namespace == Namespace::Html)
+}
+
+/// Whether a `style` element's `type`, if any, is CSS's: empty or
+/// `text/css` itself (HTML, "update a style block").
+fn css(element: &td_html::document::Element) -> bool {
+    let kind = element.attribute("type").unwrap_or("");
+    kind.is_empty() || kind.trim().eq_ignore_ascii_case("text/css")
+}
+
+/// Whether a `link` names a style sheet to apply: its `rel` holds
+/// `stylesheet` and not `alternate`, it is not `disabled`, it has an
+/// `href`, and its `type`, if any, is CSS's by its MIME essence
+/// (DESIGN.md §10, "Subresources").
+fn linked(element: &td_html::document::Element) -> bool {
+    let rel = element.attribute("rel").unwrap_or("");
+    let has = |name: &str| {
+        rel.split(|c: char| c.is_ascii_whitespace())
+            .any(|token| token.eq_ignore_ascii_case(name))
+    };
+    let kind = element.attribute("type").unwrap_or("");
+    let essence = kind.split(';').next().unwrap_or("").trim();
+    has("stylesheet")
+        && !has("alternate")
+        && element.attribute("disabled").is_none()
+        && (kind.trim().is_empty() || essence.eq_ignore_ascii_case("text/css"))
+        && element
+            .attribute("href")
+            .is_some_and(|href| !href.trim().is_empty())
+}
+
+/// Whether a sheet is in the preferred style sheet set: untitled, or
+/// titled as the first titled sheet was, which names the set.
+fn in_set<'a>(element: &'a td_html::document::Element, preferred: &mut Option<&'a str>) -> bool {
+    match element.attribute("title").filter(|title| !title.is_empty()) {
+        None => true,
+        Some(title) => *preferred.get_or_insert(title) == title,
+    }
+}
+
+/// A page's own sheet as its tree gives it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Sheet<'a> {
+    /// A `style` element's text and `media`.
+    Inline {
+        text: &'a str,
+        media: Option<&'a str>,
+    },
+    /// A `<link rel=stylesheet>`'s `href` and `media`.
+    Linked {
+        href: &'a str,
+        media: Option<&'a str>,
+    },
 }
 
 /// The next node after `id` in tree order, its subtree included unless
@@ -124,6 +177,9 @@ impl Tree {
         let mut sheets = BudgetVec::new(page)?;
         let mut base = None;
         let mut title = None;
+        // The preferred style sheet set's name: the first titled sheet's
+        // (CSSOM, "create a CSS style sheet").
+        let mut preferred: Option<&str> = None;
         let mut at = Some(document.root());
         let mut order = 0u32;
         while let Some(id) = at {
@@ -144,11 +200,11 @@ impl Tree {
                     "a" | "area" if href.is_some() => own = Some(id),
                     "base" if href.is_some() && base.is_none() => base = Some(id),
                     "title" if title.is_none() => title = Some(id),
-                    "style" => {
-                        let kind = element.attribute("type").unwrap_or("");
-                        if kind.is_empty() || kind.trim().eq_ignore_ascii_case("text/css") {
-                            sheets.try_push(id)?;
-                        }
+                    "style" if css(element) && in_set(element, &mut preferred) => {
+                        sheets.try_push(id)?
+                    }
+                    "link" if linked(element) && in_set(element, &mut preferred) => {
+                        sheets.try_push(id)?
                     }
                     _ => {}
                 }
@@ -216,20 +272,31 @@ impl Tree {
         self.title.as_str()
     }
 
-    /// The `style` elements whose type is CSS's, in tree order.
+    /// The `style` elements whose type is CSS's and the style sheet
+    /// `link`s, in tree order.
     pub fn sheets(&self) -> &[NodeId] {
         self.sheets.as_slice()
     }
 
-    /// A `style` element's text and `media` attribute.
-    pub fn sheet(&self, id: NodeId) -> Option<(&str, Option<&str>)> {
+    /// A `style` element's text, or a `link`'s `href`, with its `media`.
+    pub fn sheet(&self, id: NodeId) -> Option<Sheet<'_>> {
         let element = html_element(&self.document, id)?;
+        let media = element.attribute("media");
+        if element.name.as_str() == "link" {
+            let href = element.attribute("href")?;
+            return Some(Sheet::Linked { href, media });
+        }
         let text = self
             .document
             .children(id)
             .find_map(|(_, child)| child.text())
             .unwrap_or("");
-        Some((text, element.attribute("media")))
+        Some(Sheet::Inline { text, media })
+    }
+
+    /// An element's `media` attribute.
+    pub fn media(&self, id: NodeId) -> Option<&str> {
+        html_element(&self.document, id)?.attribute("media")
     }
 
     /// The element a URL's fragment names: the first whose `id` it is,
@@ -435,17 +502,67 @@ mod tests {
     }
 
     #[test]
-    fn only_css_style_elements_are_sheets() {
+    fn only_css_style_elements_and_style_sheet_links_are_sheets() {
         let tree = tree(
-            "<style>a{}</style><style type=TEXT/CSS media=print>b{}</style>\
-             <style type=text/less>c{}</style><template><style>d{}</style></template>",
+            "<style>a{}</style><link rel='Preload StyleSheet' href=x.css media=screen>\
+             <style type=TEXT/CSS media=print>b{}</style>\
+             <link rel='alternate stylesheet' href=alt.css><link rel=stylesheet>\
+             <link rel=stylesheet href=' '><link rel=icon href=i.png>\
+             <link rel=stylesheet type=text/less href=l.less>\
+             <style type=text/less>c{}</style><template><style>d{}</style></template>\
+             <link rel=stylesheet href=late.css>",
         );
         let sheets: Vec<_> = tree
             .sheets()
             .iter()
             .map(|&id| tree.sheet(id).unwrap())
             .collect();
-        assert_eq!(sheets, [("a{}", None), ("b{}", Some("print"))]);
+        assert_eq!(
+            sheets,
+            [
+                Sheet::Inline {
+                    text: "a{}",
+                    media: None
+                },
+                Sheet::Linked {
+                    href: "x.css",
+                    media: Some("screen")
+                },
+                Sheet::Inline {
+                    text: "b{}",
+                    media: Some("print")
+                },
+                Sheet::Linked {
+                    href: "late.css",
+                    media: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_links_are_left_out_and_only_the_preferred_set_applies() {
+        let tree = tree(
+            "<link rel=stylesheet href=off.css disabled>\
+             <link rel=stylesheet href=css.css type='Text/CSS; charset=utf-8'>\
+             <link rel=stylesheet href=u.css title=''>\
+             <link rel=stylesheet href=one.css title=One>\
+             <style title=Two>two{}</style>\
+             <link rel=stylesheet href=two.css title=Two>\
+             <style title=One>one{}</style><style>plain{}</style>\
+             <style type='text/css; charset=utf-8'>not{}</style>",
+        );
+        let sheets: Vec<_> = tree
+            .sheets()
+            .iter()
+            .map(|&id| match tree.sheet(id).unwrap() {
+                Sheet::Inline { text, .. } => text,
+                Sheet::Linked { href, .. } => href,
+            })
+            .collect();
+        // A `link`'s type is read by its essence, a `style`'s whole; a
+        // titled sheet applies only in the first title's set.
+        assert_eq!(sheets, ["css.css", "u.css", "one.css", "one{}", "plain{}"]);
     }
 
     #[test]

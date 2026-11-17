@@ -711,13 +711,14 @@ pub(crate) mod tests {
         let page = Budget::new(256 << 20).unwrap();
         let tree = BudgetShared::new(&page, Tree::parse(markup, source, &page).unwrap()).unwrap();
         let environment = sheets::environment(want.width, want.height, u32::from(want.scale));
-        let (set, omitted) = sheets::compile(&tree, want.styles, &environment, &page).unwrap();
+        let (set, omitted) =
+            sheets::compile(&tree, None, want.styles, &environment, &page).unwrap();
         let limits = Limits {
             input: td_layout::MAX_INPUT,
             style_attributes: want.styles,
             ..Limits::default()
         };
-        let coloured = sheets::coloured(&tree);
+        let coloured = sheets::coloured(&tree, None);
         let styled =
             Styled::new(tree, &set, markup.len(), limits, omitted, coloured, &page).unwrap();
         let styled = BudgetShared::new(&page, styled).unwrap();
@@ -835,7 +836,7 @@ pub(crate) mod tests {
         let tree =
             BudgetShared::new(&page, Tree::parse("<p>a", Source::Markup, &page).unwrap()).unwrap();
         let environment = sheets::environment(400.0, 300.0, 1);
-        let (set, omitted) = sheets::compile(&tree, true, &environment, &page).unwrap();
+        let (set, omitted) = sheets::compile(&tree, None, true, &environment, &page).unwrap();
         let styled = Styled::new(tree, &set, 4, Limits::default(), omitted, false, &page).unwrap();
         drop(set);
         let styled = BudgetShared::new(&page, styled).unwrap();

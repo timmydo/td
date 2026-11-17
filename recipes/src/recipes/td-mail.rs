@@ -157,4 +157,25 @@ mod tests {
         assert_eq!(client.as_deref(), Some("64 * 1024"));
         assert_eq!(client, service);
     }
+
+    /// And the longest `deadline` a client asks for, the service's own
+    /// whole-exchange budget, past which it refuses the line.
+    #[test]
+    fn the_client_deadline_ceiling_is_the_service_budget() {
+        let bound = |text: &str, prefix: &str| {
+            text.lines()
+                .find_map(|line| line.trim_start().strip_prefix(prefix))
+                .map(|rest| rest.trim_end_matches(';').trim().to_string())
+        };
+        let client = bound(
+            include_str!("../../../td-fetch-client/src/lib.rs"),
+            "const MAX_DEADLINE_MS: u128 =",
+        );
+        let service = bound(
+            include_str!("../../../net/src/fetchd.rs"),
+            "const ORIGIN_TIMEOUT: Duration =",
+        );
+        assert_eq!(client.as_deref(), Some("300_000"));
+        assert_eq!(service.as_deref(), Some("Duration::from_secs(300)"));
+    }
 }

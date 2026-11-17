@@ -53,6 +53,9 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(420);
 /// for a stream, and a minute for the service itself.
 const STREAM_HEAD_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 const NO_REPLY: &str = "the service closed without a reply";
+/// The longest `deadline` the service takes, its own whole-exchange
+/// budget with the origin, in milliseconds.
+const MAX_DEADLINE_MS: u128 = 300_000;
 
 #[derive(Debug)]
 pub struct Response {
@@ -248,6 +251,20 @@ pub fn get_public(
     headers: &[(&str, &str)],
     limit: Option<u64>,
 ) -> Result<Response, Error> {
+    get_public_within(url, headers, limit, None)
+}
+
+/// `get_public`, the service giving the exchange with the origin at most
+/// `deadline` (whole milliseconds, at least one) in place of its five
+/// minutes: a subresource worth nothing once its page has gone on
+/// without it (td-web/DESIGN.md §10, "Slots").
+#[allow(dead_code)]
+pub fn get_public_within(
+    url: &str,
+    headers: &[(&str, &str)],
+    limit: Option<u64>,
+    deadline: Option<Duration>,
+) -> Result<Response, Error> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     let (mut reader, written) = send(
         "GET",
@@ -261,6 +278,7 @@ pub fn get_public(
             redirects: Some(0),
             stream: false,
             public: true,
+            deadline,
         },
     )?;
     settle(read_reply(&mut reader, limit), written)
@@ -325,6 +343,7 @@ pub fn request_with_ca(
             redirects: Some(0),
             stream: false,
             public: false,
+            deadline: None,
             tls_ca,
         },
     )?;
@@ -354,6 +373,7 @@ pub fn request_with_unix_socket(
             redirects: Some(0),
             stream: false,
             public: false,
+            deadline: None,
         },
     )?;
     settle(read_reply(&mut reader, limit), written)
@@ -380,6 +400,7 @@ fn request(
             redirects,
             stream: false,
             public: false,
+            deadline: None,
         },
     )?;
     settle(read_reply(&mut reader, limit), written)
@@ -406,6 +427,7 @@ fn stream(
             redirects,
             stream: true,
             public: false,
+            deadline: None,
         },
     )?;
     // A streamed head may take the service's whole total to come, the
@@ -436,6 +458,9 @@ struct Shape<'a> {
     redirects: Option<u32>,
     stream: bool,
     public: bool,
+    /// The exchange's budget with the origin, when less than the
+    /// service's.
+    deadline: Option<Duration>,
 }
 
 /// Connect and write the request whole: the reader for the reply, and how
@@ -457,6 +482,7 @@ fn send(
         public,
         tls_ca,
         unix_socket,
+        deadline,
     } = shape;
     if let Some(path) = unix_socket {
         if !path.starts_with('/')
@@ -506,6 +532,11 @@ fn send(
     }
     if public {
         head.push_str("public\n");
+    }
+    if let Some(deadline) = deadline {
+        // The service takes 1 ms to its own five minutes.
+        let millis = deadline.as_millis().clamp(1, MAX_DEADLINE_MS);
+        head.push_str(&format!("deadline {millis}\n"));
     }
     if let Some(ca) = tls_ca {
         head.push_str(&format!("tls-ca {}\n", ca.len()));
@@ -1130,7 +1161,7 @@ mod tests {
         let (go, wait) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let mut asked = Vec::new();
-            for turn in 0..5 {
+            for turn in 0..6 {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(&stream);
                 asked.push(read_request(&mut reader));
@@ -1148,7 +1179,7 @@ mod tests {
                         let _ = wait.recv_timeout(Duration::from_secs(10));
                         let _ = out.write_all(b"chunk 4\nhi\n\nend\n");
                     }
-                    2 | 4 => {
+                    2 | 4 | 5 => {
                         let _ = out.write_all(b"td-fetch 1\nstatus 200\nbody 2\n\nok");
                     }
                     _ => {
@@ -1193,6 +1224,10 @@ mod tests {
         // A public GET follows nothing and asks for public addresses.
         let response = get_public("https://h/page", &[], Some(1000)).unwrap();
         assert_eq!(response.body, b"ok");
+        // And within a deadline, the one line more.
+        let within = Some(Duration::from_millis(250));
+        let response = get_public_within("https://h/page", &[], Some(1000), within).unwrap();
+        assert_eq!(response.body, b"ok");
         let asked = server.join().unwrap();
         assert_eq!(
             asked[1],
@@ -1214,6 +1249,10 @@ mod tests {
         assert_eq!(
             asked[4].0,
             format!("{PROTOCOL}\nmethod GET\nurl https://h/page\nlimit 1000\nredirects 0\npublic\nbody 0\n")
+        );
+        assert_eq!(
+            asked[5].0,
+            format!("{PROTOCOL}\nmethod GET\nurl https://h/page\nlimit 1000\nredirects 0\npublic\ndeadline 250\nbody 0\n")
         );
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&dir);
