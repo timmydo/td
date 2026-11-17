@@ -7,7 +7,7 @@ use crate::{
     ports::{self, Clock, Deadline},
     postgres_devices,
     postgres_probe::{self, Request},
-    postgres_publication as publication, postgres_schema,
+    postgres_publication as publication, postgres_receipt_expiry as expiry, postgres_schema,
     postgres_submission_input::Prepared,
 };
 use std::{
@@ -388,11 +388,10 @@ pub fn publish(
                     crate::postgres_sequence::Error::Integrity => Error::Integrity,
                     crate::postgres_sequence::Error::Database => Error::Database,
                 })?;
-            let count: i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_receipts WHERE account=$1 LIMIT $2) bounded",
-                &[&account, &MAX_RECEIPTS]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            if count >= MAX_RECEIPTS {
-                return Err(Error::Capacity);
-            }
+            // The sample is also sendAt: a receipt's age starts at publication.
+            let send_at = expiry::admit(client, expiry::Ledger::Submissions, account, MAX_RECEIPTS)
+                .await
+                .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
             let source = input.source();
             let rows = client.query("SELECT e.blob_id,e.thread_id,e.changed,b.length,b.digest,b.changed FROM td_mta.emails e LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id WHERE e.account=$1 AND e.id=$2 LIMIT 1",
                 &[&account, &source.email.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
@@ -428,15 +427,6 @@ pub fn publish(
             )
             .await
             .map_err(publication_error)?;
-            let send_at: i64 = client
-                .query_one(
-                    "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
-                    &[],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Integrity)?;
             let expires_at = send_at.checked_add(LIFETIME_MS).ok_or(Error::Capacity)?;
             publication::write_blob(
                 client,

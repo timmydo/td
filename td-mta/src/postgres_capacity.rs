@@ -166,7 +166,7 @@ async fn count(
     u64::try_from(value).map_err(|_| ())
 }
 
-// Expired rows await the account's next delivery or acquisition and refuse
+// Expired rows await the account's next publication of their kind and refuse
 // nothing.
 async fn live(
     client: &tokio_postgres::Client,
@@ -258,7 +258,11 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
                 crate::device_credentials::DEVICE_CAPACITY as u64,
                 false,
             ),
-            ("submission_cancel_receipts", 1024, false),
+            (
+                "submission_cancel_receipts",
+                crate::postgres_submission_cancel::MAX_RECEIPTS as u64,
+                false,
+            ),
             ("submission_attempts", 1024, false),
             ("route_health", 1024, false),
             ("route_health_receipts", 1024, false),
@@ -273,7 +277,10 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             let used = match table {
                 "receiving_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 AND created_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_receiving::RECEIPT_RETENTION_MS, cap).await?,
                 "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap).await?,
-                _ => count(client, table, Some(id), cap).await?,
+                _ => match crate::postgres_receipt_expiry::live(table) {
+                    Some(query) => live(client, id, query, crate::postgres_receipt_expiry::RETENTION_MS, cap).await?,
+                    None => count(client, table, Some(id), cap).await?,
+                },
             };
             rows.push(metric(
                 &scope,

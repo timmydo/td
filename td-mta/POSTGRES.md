@@ -1523,8 +1523,8 @@ authorize another mutation. The API is not a client authentication endpoint.
 COMMIT loss returns Indeterminate and requires retaining the original Change.
 A missing receipt authorizes a new operation identity only once section 165
 proves the uncertain transaction rolled back.
-At 1024 receipts per account fresh operations refuse. Cold callers retain
-receipts for historical inspection; there is no age-based or arbitrary pruning.
+Fresh operations refuse while 1024 receipts younger than a minute remain;
+publication first deletes older ones (section 217).
 The HTTP owner retires its exact receipt only after confirmed publication or
 historical settlement. Retirement checks epoch, account, operation, digest and
 complete outcome under the account writer lock. Once confirmed, the owner
@@ -1535,10 +1535,8 @@ owner fenced until retirement succeeds; the next mutation retries cleanup
 before admitting a new operation. Unknown publication outcomes retain the
 original operation and its publication endpoint until inspection there finds
 the receipt or proves its absence; the next mutation settles inline before
-admitting a new operation. A process crash may leave orphan receipts; no
-live request sweeps another owner's records.
-Existing installations at the ceiling require the fenced, backed-up operator
-procedure in PRODUCTION.md before serving the new binary. All calls retain finite worker/deadline limits.
+admitting a new operation. Receipts a crash orphans expire with the rest.
+All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
 a confirmed historical receipt as known success.
 
@@ -1641,9 +1639,9 @@ before new policy/device admission; a matching historical receipt is known
 success, not current permission to download or import. A mismatched digest or
 malformed receipt refuses. Lost COMMIT response is Indeterminate: retain the
 same prepared upload until inspection after the original transaction ended
-finds its receipt or proves its absence (section 165). The
-1024-receipt account bound is preparation-only until runtime retention and
-retry lifetimes are defined together.
+finds its receipt or proves its absence (section 165). At most 1024
+receipts younger than a minute are retained per account (section 217); the
+upload lease, not the receipt, governs access and upload expiry.
 
 Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
@@ -1680,9 +1678,9 @@ HTTPS dispatch or replace runtime connection and worker admission.
 
 Schema version 11 adds bounded historical `draft_receipts` and an index for
 Email/Thread identity collision checks against retained history. Each account
-retains at most 1024 draft receipts until runtime retry and retention policy
-are activated. Explicit PUBLIC revocation also applies when the operator has
-permissive default table privileges.
+retains at most 1024 draft receipts younger than a minute (section 217).
+Explicit PUBLIC revocation also applies when the operator has permissive
+default table privileges.
 
 `postgres_drafts` prepares the plain-text structured draft used by td-mail's
 Email/set creation. It reuses the existing composer, selected profile work
@@ -1868,8 +1866,8 @@ The complete receipt binds the canonical request and generated IDs and is
 checked before reauthorizing a fresh write. Owner-side inspection waits
 behind account publication; lost COMMIT response remains indeterminate until
 inspection of that same operation finds its receipt or proves its absence
-(section 165). Each account retains at most 1024 receipts;
-expiry/reclamation remains part of runtime integration work. Folder transactions have a
+(section 165). Each account retains at most 1024 receipts younger than a
+minute (section 217). Folder transactions have a
 one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
 
@@ -1908,7 +1906,7 @@ adapters. `deletion::prepare` accepts at most 256 unique Email IDs and retains
 one opaque operation with a separate digest domain and no password. Its
 inspect/publish entry points return ordered Destroyed/NotFound results; empty
 or entirely missing batches retain a no-op receipt. The existing flag_receipts
-relation now covers all three modes under one 1024-receipt account limit.
+relation covers all three modes under one 1024-receipt account limit.
 Receipt result decoding rejects values from another operation mode. No schema
 migration is needed, and production serving remains unchanged.
 
@@ -2063,16 +2061,16 @@ Outgoing chunks, submission, ordered initially Queued recipients, account
 sequence, submission-created history, usage and receipt commit together.
 The visible Email and its blind-recipient headers remain unchanged.
 
-Receipts are bounded to 1024 per account and retained independently of the
-source Email or queued submission. Concurrent publication of one retained
-operation serializes through the account row. Lost COMMIT responses remain
-indeterminate until receipt inspection on the publishing primary finds the
-receipt or proves its absence (section 165); a digest
-mismatch refuses replay. Historical success survives later revocation, source
-deletion or configuration replacement. Deleting the source after enqueueing
-does not cancel delivery or retire its separately owned outgoing body.
-Runtime admission, receipt reclamation, dispatch, fenced multi-instance queue
-ownership and activation remain runtime integration work.
+Receipts are bounded to 1024 per account younger than a minute (section 217)
+and expire independently of the source Email or queued submission. Concurrent
+publication of one retained operation serializes through the account row. Lost
+COMMIT responses remain indeterminate until receipt inspection on the
+publishing primary finds the receipt or proves its absence (section 165); a
+digest mismatch refuses replay. Historical success survives later revocation,
+source deletion or configuration replacement. Deleting the source after
+enqueueing does not cancel delivery or retire its separately owned outgoing
+body. Runtime admission, dispatch, fenced multi-instance queue ownership and
+activation remain runtime integration work.
 
 ## 49. Selected named-route evidence
 
@@ -2821,9 +2819,9 @@ An uncertain COMMIT retains the exact Change and its publication endpoint.
 The next flag write settles it first (section 79); while it stays uncertain,
 new flag writes get a nonfatal busy response and reads continue. No
 transparent replay replaces it. Known outcomes survive late local deadline
-expiry. The owner contains no password. Production startup, receipt
-reclamation and restart recovery remain cutover requirements; this adapter
-is not a production serving entry point.
+expiry. The owner contains no password. Production startup and restart
+recovery remain cutover requirements; this adapter is not a production serving
+entry point.
 
 The real td-mail PostgreSQL fixture now marks read, stars, marks unread and
 unstars the delivered message, querying fresh state after every result. It
@@ -2864,8 +2862,11 @@ a frontend cancellation reports the settlement failure (section 214).
 SMTP receiving's owner settles the same way (section 104), prepaying one
 connection from the job's meter; its uncached readiness check has no meter
 and is bounded only by the capped deadline.
-Restart persistence and receipt reclamation remain runtime integration
-requirements.
+Within one process settlement needs no receipt lifetime: until it settles,
+the owner refuses every publication of its family there, and only those
+sweep its receipts; another process serving the account can sweep one after
+a minute (section 217). Restart persistence remains a runtime integration
+requirement.
 
 The real-client fixture checks that absence clears uncertainty. A second
 prepared owner loses a COMMIT acknowledgement to a deadline and later settles
@@ -2933,8 +2934,8 @@ separately admitted capacity or inline before the next folder write
 (section 79), and never republishes. A found receipt or proven absence
 releases the owner and errors preserve it; confirmed outcomes survive local
 expiry. The encompassing prepared mutation owner keeps both operation
-families across requests. Restart persistence and receipt reclamation remain
-required before runtime integration.
+families across requests. Restart persistence remains required before
+runtime integration.
 
 Mailbox completion exposes only the original epoch and sequence, without a
 fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
@@ -3051,8 +3052,8 @@ This helper does not activate Submission or the HTTP sending flow.
 The local PostgreSQL submission fixture proves rollback leaves the queue and
 Email intact, exact receipt recovery after delayed COMMIT, preservation of an
 unrelated membership, missing-source refusal, clear-only/no-op behavior, and
-digest-conflict detection. Caller resource admission and bounded receipt
-reclamation remain activation obligations.
+digest-conflict detection. Caller resource admission remains an activation
+obligation.
 
 ## 88. Caller-funded submission publication preparation
 
@@ -4047,7 +4048,9 @@ same transaction. Actual replies, attempt history, diagnostic text, existing
 completion time and failure-notice state are preserved. Cancellation creates
 no notice. A wholly canceled group retains a no-change receipt without closing
 transport or advancing sequence. Ownership and deadline are checked again
-before COMMIT; unknown COMMIT resolves the same operation. Stale attempt
+before COMMIT; unknown COMMIT resolves the same operation. At most 1024
+receipts younger than a minute are retained per account, aged from their
+publication, not the group's completion (section 217). Stale attempt
 publication cannot cross into AcceptancePossible after retirement. No HTTP
 endpoint, scheduler or transport is activated by this increment.
 
@@ -5100,9 +5103,11 @@ submission and cancellation (sections 32, 35, 37, 42, 44, 48, 91 and 214).
 Each retains an uncertain operation with the endpoint its COMMIT went to
 and inspects only there, never resolving again or falling back, because
 the share lock proves nothing on another server. The next write in that
-family settles inline (section 79). A found receipt or absence releases the
-owner; the owner never republishes the absent operation, and the client
-decides whether to issue its request again.
+family settles inline (section 79). Their receipts expire after a minute
+(section 217), but only a publication of the same family sweeps them, and the
+held owner refuses every one in its process until it settles. A found receipt
+or absence releases the owner; the owner never republishes the absent
+operation, and the client decides whether to issue its request again.
 
 Once released, the family is no longer fenced, and the server does not
 deduplicate a second draft or submission of the same Email. A client whose
@@ -5130,8 +5135,9 @@ surface as errors, which retain custody; all of them use the single pinned
 primary, and an HTTP or SMTP receiving owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
 still be pending, beyond the bounded sweeps of sections 52, 123 and 216, an
-Email owner's retirement of its own confirmed receipt, and section 46's
-receiving sweep by another instance serving the same account (section 104).
+Email owner's retirement of its own confirmed receipt, and, by another
+instance serving the same account, section 46's receiving sweep (section
+104) and the HTTP families' sweeps (section 217).
 Any further sweep of attempt, phase, recovery, expiry, HTTP-family or
 receiving receipts must respect that.
 
@@ -6948,8 +6954,11 @@ be treated as a reason to resend mail.
 ## 216. Retention of settled submissions
 
 Nothing else removes a submission, so without retention every per-account
-submission, attempt and receipt cap (1,024 each, and the configured
+submission, attempt and attempt-receipt cap (1,024 each, and the configured
 `queue_submissions` quota) would be a lifetime limit on sent mail.
+Submission and cancellation receipts expire a minute after publication on
+their own (section 217), so the deletes below usually find none of them; the
+rest wait for this retention.
 `postgres_submission_retention::retire` deletes, in one transaction, the
 oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
 than 30 days ago (`RETENTION_MS`, against the database clock), every
@@ -7022,6 +7031,62 @@ final reservation and released, and three 1,000-recipient groups that need
 two batches. It checks the stale-owner and clock refusals, exactly which
 rows, blobs and receipts go and stay, the Destroyed changes, the sequence
 advance and the usage audit. A unit test pins the batch bounds.
+
+## 217. Receipt retention for HTTP writes (schema 41)
+
+Six HTTP write families keep receipts: Email update, deletion and filing
+(`flag_receipts`), folder creation and deletion (`mailbox_create_receipts`),
+drafts, uploads, submissions and cancellations (`draft_receipts`,
+`upload_receipts`, `submission_receipts`, `submission_cancel_receipts`).
+Each ceiling stays 1,024 per account. A publication samples the database
+clock once under its account write lock, stamps its receipt with it
+(`send_at` for a submission, `created_at` otherwise), first deletes only that
+account's receipts of its own family older than one minute before the
+sample, then refuses with Capacity only while 1,024 younger ones remain. A
+full ledger is a per-minute flood bound, never a lifetime one; td-mail's
+sends, attachments and folder writes are not limited over an account's
+life. The owner's retirement of a confirmed flag receipt (section 32)
+continues. Capacity inspection counts only receipts inside the minute; an
+idle account keeps expired ones until its next publication of that family.
+
+A receipt is no JMAP idempotency record: operation IDs are random per
+prepared request, and a client that lost a response reconciles (section
+165). It serves only the publication's own replay, inside its ten-second
+deadline, and settlement of an uncertain COMMIT by the owner holding it.
+That owner refuses every publication of its family in its process until
+settlement empties it, inline settlement precedes the write that met it,
+and a family sweeps only its own table, so no sweep in that process can
+remove the held receipt first, however long settlement waits and whatever
+the database clock does. Another instance selecting a profile with the same
+account (section 1) can sweep it after a minute; the owner then releases a
+committed operation as rolled back. That loses only the passive outcome:
+the owner never republishes, the reply already sent stands, and retiring an
+absent flag receipt is already a no-op. A restart releases every owner. No
+other reader exists: the upload lease, not its receipt, governs downloads
+and upload expiry; the relay and section 216 address submissions by ID; a
+cancellation receipt ages from its publication, not the group's completion.
+After expiry an operation is not replayable, and no owner republishes one.
+
+Schema 41 adds `created_at` without a default to `flag_receipts`,
+`mailbox_create_receipts` and `submission_cancel_receipts`; draft and upload
+receipts already stored the publication's database time, and submission
+receipts its `send_at`, which equals publication time only because sending
+has no delayed release (FUTURERELEASE); adding one needs a separate stamp.
+Existing rows of the three new columns read 0, and older stamped rows keep
+their time, so receipts an older binary left expire on the account's next
+publication of their family with no operator procedure. Schema-40 binaries
+cannot serve schema 41; upgrade with the fenced procedure, so no owner of the
+older binary survives to settle against them. Each publication scans at most
+the account's ledger (no stamp index), which the ceiling keeps small.
+
+The family fixtures fill each ledger with receipts stamped now and still
+expect Capacity, backdate them a literal 61 seconds, then require the next
+publication to succeed, every expired receipt of the account to go, and
+both a 30-second-old receipt and another account's expired one to stay;
+capacity inspection must count only live receipts. The HTTP submission
+owner fixture backdates a held operation's committed receipt; while inline
+settlement cannot get a read slot, the next submission is refused rather
+than published, and settlement then still finds the receipt.
 
 ## 8.121 Native ACME state and certificate pairs
 

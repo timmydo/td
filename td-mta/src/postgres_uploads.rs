@@ -7,7 +7,7 @@ use crate::{
     ports::{Clock, Deadline},
     postgres_devices,
     postgres_probe::{self, Request},
-    postgres_publication as publication,
+    postgres_publication as publication, postgres_receipt_expiry as expiry,
     postgres_runtime_profile::Binding,
     postgres_schema,
 };
@@ -362,10 +362,9 @@ pub fn publish(
                     crate::postgres_sequence::Error::Integrity => Error::Integrity,
                     crate::postgres_sequence::Error::Database => Error::Database,
                 })?;
-            let count: i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.upload_receipts WHERE account=$1 LIMIT $2) bounded", &[&account, &MAX_RECEIPTS]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            if count >= MAX_RECEIPTS {
-                return Err(Error::Capacity);
-            }
+            let created_at = expiry::admit(client, expiry::Ledger::Uploads, account, MAX_RECEIPTS)
+                .await
+                .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
             let usage = publication::charge(
                 client,
                 upload.binding.account(),
@@ -380,15 +379,6 @@ pub fn publish(
             )
             .await
             .map_err(publication_error)?;
-            let created_at: i64 = client
-                .query_one(
-                    "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
-                    &[],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Integrity)?;
             let expires_at = created_at
                 .checked_add(upload.ttl_ms)
                 .ok_or(Error::Integrity)?;

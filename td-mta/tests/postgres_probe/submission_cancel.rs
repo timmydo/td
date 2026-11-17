@@ -220,6 +220,32 @@ pub(super) fn exercise(
         (0, outcome.new_sequence, outcome.new_sequence)
     );
     assert_eq!(noop.completed_at, outcome.completed_at);
+    let account = binding.account().to_string();
+    super::receipt_expiry::fill(fixture, "submission_cancel_receipts", &account);
+    assert_eq!(
+        cancel::publish(request, trust, deadline(), &prepare(), |_| panic!(
+            "full ledger fenced"
+        )),
+        Err(cancel::Error::Capacity)
+    );
+    // `value` is replayed at the end, minutes and many sweeping cancellations
+    // later; keep its receipt a day ahead (outcomes carry no stamp).
+    sql(fixture, &format!("UPDATE td_mta.submission_cancel_receipts SET created_at=created_at+{} WHERE operation={receipt}", super::receipt_expiry::HELD_MS));
+    super::receipt_expiry::expire(
+        fixture,
+        request,
+        trust,
+        binding.epoch(),
+        "submission_cancel_receipts",
+        &account,
+    );
+    // Its no-op receipt ages from publication, not the group's completedAt.
+    let fresh = cancel::publish(request, trust, deadline(), &prepare(), |_| {
+        panic!("no-op fenced")
+    })
+    .unwrap();
+    assert_eq!(fresh.completed_at, outcome.completed_at);
+    super::receipt_expiry::swept(fixture, "submission_cancel_receipts");
     // Completed failures retain their signed observation, notice and replies.
     reset();
     sql(fixture,&format!("UPDATE td_mta.recipients SET state=5,reason=2,attempt_id=decode(repeat('01',16),'hex'),attempt_count=1,last_attempt_at=0,phase=4,next_attempt_at=NULL,rcpt_reply='550 refused' WHERE submission_id={sub}; UPDATE td_mta.submissions SET completed_at=-1,notification=2,notification_email_id=email_id WHERE id={sub}"));

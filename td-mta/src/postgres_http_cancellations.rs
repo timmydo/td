@@ -75,7 +75,8 @@ impl Pending {
 }
 /// Inspect only at the retained endpoint. Frontend and route-owner inspection
 /// both take the account lock behind the unknown COMMIT, so absence proves
-/// rollback (POSTGRES.md section 165).
+/// rollback unless another process swept the expired receipt (POSTGRES.md
+/// section 165).
 fn settle_held(
     pending: &mut Option<(Cancellation, Endpoint)>,
     loaded: &Loaded,

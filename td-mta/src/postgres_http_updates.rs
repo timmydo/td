@@ -164,7 +164,9 @@ struct Completion {
 }
 
 /// One active or uncertain mutation and the endpoint it was published to.
-/// Retain this owner across HTTP requests.
+/// Retain this owner across HTTP requests, exactly one per process: each
+/// family's receipt sweep relies on its owner fencing every publication of
+/// that family in the process (POSTGRES.md section 217).
 /// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
 pub struct Pending {
@@ -194,8 +196,9 @@ pub struct Settled {
 }
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
-    /// A found receipt becomes retirement custody and absence proves rollback;
-    /// either releases the uncertain fence. Any error retains the operation.
+    /// A found receipt becomes retirement custody and absence proves rollback
+    /// unless another process swept the expired receipt; either releases the
+    /// uncertain fence. Any error retains the operation.
     pub fn settle(
         &self,
         loaded: &Loaded,

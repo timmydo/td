@@ -463,7 +463,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 40);
+    assert_eq!(receipt.version, 41);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -540,7 +540,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        40
+        41
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -681,7 +681,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":40"));
+    assert!(initialized.contains("\"schema_version\":41"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -926,7 +926,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=40",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=41",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -934,7 +934,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=40 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=41 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1116,7 +1116,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 40);
+    assert_eq!(receipt.version, 41);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1668,7 +1668,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
         "1"
     );
     // Cancellation settlement survives independently of the submission row.
-    sql(&fixture, &format!("INSERT INTO td_mta.submission_cancel_receipts VALUES({a},{a},{digest},{a},1000,1000,-1,{high},{max}),({a},{b},{digest},{a},1000,0,-1,{high},{high})"));
+    sql(&fixture, &format!("INSERT INTO td_mta.submission_cancel_receipts VALUES({a},{a},{digest},{a},1000,1000,-1,{high},{max},0),({a},{b},{digest},{a},1000,0,-1,{high},{high},0)"));
     for assignment in [
         "recipient_count=0",
         "recipient_count=1001",
@@ -1825,7 +1825,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+        27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1869,6 +1869,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_replica_progress.sql"),
             include_str!("../src/postgres_replica_effects.sql"),
             include_str!("../src/postgres_replica_mailboxes.sql"),
+            include_str!("../src/postgres_search_index.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1928,7 +1929,10 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             38 => "replica_mailbox_observation",
             _ => "flag_receipts",
         };
-        if previous_version == 39 {
+        if previous_version == 40 {
+            // Receipts an older binary left carry no stamp: expirable at once.
+            sql(&fixture, "INSERT INTO td_mta.accounts VALUES(decode(repeat('7d',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.flag_receipts VALUES(decode(repeat('7d',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('02',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex')); INSERT INTO td_mta.mailbox_create_receipts VALUES(decode(repeat('7d',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('02',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('','hex')); ALTER TABLE td_mta.submission_cancel_receipts ADD COLUMN created_at bigint");
+        } else if previous_version == 39 {
             sql(&fixture, "CREATE SCHEMA td_mta_trgm");
         } else if previous_version == 8 {
             sql(&fixture, "INSERT INTO td_mta.accounts VALUES(decode(repeat('7f',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.flag_receipts VALUES(decode(repeat('7f',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('02',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex')); ALTER TABLE td_mta.flag_receipts ADD COLUMN results bytea");
@@ -1952,6 +1956,16 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(
                 &fixture,
                 "ALTER TABLE td_mta.flag_receipts DROP COLUMN results",
+            );
+        } else if previous_version == 40 {
+            // The failed upgrade stamped nothing.
+            assert_eq!(
+                sql(&fixture, "SELECT count(*) FROM pg_attribute WHERE attrelid IN ('td_mta.flag_receipts'::regclass,'td_mta.mailbox_create_receipts'::regclass) AND attname='created_at'"),
+                "0"
+            );
+            sql(
+                &fixture,
+                "ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at",
             );
         } else if previous_version == 39 {
             sql(&fixture, "DROP SCHEMA td_mta_trgm");
@@ -1987,7 +2001,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 40);
+        assert_eq!(receipt.version, 41);
         assert_eq!(
             sql(
                 &fixture,
@@ -2035,7 +2049,18 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"3|2|3|3|2");
         }
         if previous_version == 8 {
-            assert_eq!(sql(&fixture, "SELECT encode(results,'hex'),encode(old_sequence,'hex'),encode(new_sequence,'hex') FROM td_mta.flag_receipts"), "01|0000000000000001|0000000000000001");
+            assert_eq!(sql(&fixture, "SELECT encode(results,'hex'),encode(old_sequence,'hex'),encode(new_sequence,'hex'),created_at FROM td_mta.flag_receipts"), "01|0000000000000001|0000000000000001|0");
+        }
+        if previous_version == 40 {
+            assert_eq!(
+                sql(&fixture, "SELECT (SELECT created_at FROM td_mta.flag_receipts)||'|'||(SELECT created_at FROM td_mta.mailbox_create_receipts)"),
+                "0|0"
+            );
+            // New receipts must be stamped explicitly.
+            assert_eq!(
+                sql(&fixture, "SELECT count(*) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid IN ('td_mta.flag_receipts'::regclass,'td_mta.mailbox_create_receipts'::regclass,'td_mta.submission_cancel_receipts'::regclass) AND a.attname='created_at'"),
+                "0"
+            );
         }
         assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
         assert_eq!(
@@ -2065,7 +2090,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
     };
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 40);
+    assert_eq!(receipt.version, 41);
     assert_eq!(sql(&fixture,
         "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
         "1.6:search_owner:td_mta_trgm");
@@ -2080,7 +2105,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         td_mta::postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
         Err(td_mta::postgres_schema::Error::Owner)
     );
-    sql(&fixture, "DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version=40; ALTER DATABASE postgres OWNER TO td_probe; REVOKE TEMP ON DATABASE postgres FROM PUBLIC; GRANT CREATE ON DATABASE postgres TO search_owner");
+    sql(&fixture, "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40; ALTER DATABASE postgres OWNER TO td_probe; REVOKE TEMP ON DATABASE postgres FROM PUBLIC; GRANT CREATE ON DATABASE postgres TO search_owner");
     assert_eq!(
         sql(
             &fixture,
@@ -2103,7 +2128,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     let receipt = postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
     sql(&fixture, "CREATE ROLE service_reader; GRANT USAGE ON SCHEMA td_mta TO service_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO service_reader; GRANT UPDATE (store_epoch) ON td_mta.schema_migrations TO service_reader; REVOKE TEMP ON DATABASE postgres FROM PUBLIC");
     let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536);
-    let rewind = "DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version=40";
+    let rewind = "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40";
     sql(&fixture, rewind);
     sql(&fixture, "GRANT USAGE ON SCHEMA td_mta TO PUBLIC");
     assert_eq!(
@@ -5141,16 +5166,31 @@ fn exercise_flags(
         loser,
         Err(flags::Error::State | flags::Error::Database)
     ));
-    sql(fixture, &format!("INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex') FROM generate_series(1,1024) n"));
+    receipt_expiry::fill(fixture, "flag_receipts", &account.to_string());
     assert_eq!(
         publish(&prepare(None, Some(true), None)),
         Err(flags::Error::Capacity)
     );
     assert_eq!(publish(&first).unwrap(), first_result);
-    sql(
+    // Publication sweeps, beside the owner's retirement of its own receipts.
+    // Hold receipts this fixture replays later past every sweep that
+    // follows; flag outcomes carry no stamp, so the hold never lifts.
+    receipt_expiry::hold(fixture, "flag_receipts", &account.to_string());
+    receipt_expiry::expire(
         fixture,
-        "DELETE FROM td_mta.flag_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+        request,
+        trust,
+        binding.epoch(),
+        "flag_receipts",
+        &account.to_string(),
     );
+    let seen = sql(
+        fixture,
+        "SELECT count(*) FROM td_mta.keywords WHERE keyword='$seen'",
+    ) == "1";
+    let unchanged = publish(&prepare(None, Some(seen), None)).unwrap();
+    assert_eq!(unchanged.old_sequence, unchanged.new_sequence);
+    receipt_expiry::swept(fixture, "flag_receipts");
     sql(fixture, &format!("INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),'extra',NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,256) n; INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE name='extra'"));
     let seen = sql(
         fixture,
@@ -5254,6 +5294,8 @@ fn exercise_flag_batches(
         flags::inspect_batch(request, trust, deadline(), &mixed).unwrap(),
         Some(mixed_result)
     );
+    // `empty` and `mixed` are inspected after sweeping publications.
+    receipt_expiry::hold(fixture, "flag_receipts", &account.to_string());
     sql(fixture, &format!("BEGIN; INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n+2048),32,'0'),'hex'),'bulk',NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,255) n; INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex') FROM generate_series(1,256) n; INSERT INTO td_mta.memberships SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),CASE WHEN n=256 THEN (SELECT id FROM td_mta.mailboxes WHERE account=decode('{account}','hex') AND role='inbox') ELSE decode(lpad(to_hex(n+2048),32,'0'),'hex') END,decode('0000000000000001','hex') FROM generate_series(1,256) n; COMMIT"));
     let updates: Vec<_> = (1..=256)
         .map(|n| flags::Update {
@@ -5866,13 +5908,26 @@ fn exercise_uploads(
     );
     sql(fixture, &restore);
     let capacity = prepare(b"capacity");
-    sql(fixture,&format!("INSERT INTO td_mta.upload_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',16),'hex'),0,0,1,decode('0000000000000000','hex'),decode('0000000000000001','hex') FROM generate_series(1,1024) n"));
+    receipt_expiry::fill(fixture, "upload_receipts", &account.to_string());
     assert_eq!(publish(&capacity), Err(uploads::Error::Capacity));
     assert_eq!(publish(&first).unwrap(), first_outcome);
-    sql(
+    // Keep receipts this fixture replays later out of the sweep below.
+    receipt_expiry::hold(fixture, "upload_receipts", &account.to_string());
+    receipt_expiry::expire(
         fixture,
-        "DELETE FROM td_mta.upload_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+        request,
+        trust,
+        binding.epoch(),
+        "upload_receipts",
+        &account.to_string(),
     );
+    assert_eq!(
+        publish(&prepare(b"expired")).unwrap().old_sequence,
+        sequence
+    );
+    sequence += 1;
+    receipt_expiry::swept(fixture, "upload_receipts");
+    receipt_expiry::release(fixture, "upload_receipts", &account.to_string());
     sql(
         fixture,
         "UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')",
@@ -6172,13 +6227,23 @@ fn exercise_drafts(
         fixture,
         "UPDATE td_mta.accounts SET sequence=decode('0000000000000007','hex')",
     );
-    sql(fixture,&format!("INSERT INTO td_mta.draft_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),0,0,decode('0000000000000000','hex'),decode('0000000000000001','hex') FROM generate_series(1,1024) n"));
+    receipt_expiry::fill(fixture, "draft_receipts", &account.to_string());
     assert_eq!(publish(&capacity), Err(drafts::Error::Capacity));
     assert_eq!(publish(&first).unwrap(), outcome);
-    sql(
+    // 1,024 sends in an account's life no longer stop td-mail drafting.
+    // Keep receipts this fixture replays later out of the sweep below.
+    receipt_expiry::hold(fixture, "draft_receipts", &account.to_string());
+    receipt_expiry::expire(
         fixture,
-        "DELETE FROM td_mta.draft_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+        request,
+        trust,
+        binding.epoch(),
+        "draft_receipts",
+        &account.to_string(),
     );
+    publish(&prepare(&message("expired@example.test", &[]), None)).unwrap();
+    receipt_expiry::swept(fixture, "draft_receipts");
+    receipt_expiry::release(fixture, "draft_receipts", &account.to_string());
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
     devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
     assert_eq!(publish(&capacity), Err(drafts::Error::Unauthenticated));
@@ -9318,12 +9383,28 @@ fn exercise_folders(
         ),
         Err(Error::Capacity)
     );
-    sql(fixture,&format!("INSERT INTO td_mta.mailbox_create_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'),decode('','hex') FROM generate_series(1,1024) n"));
+    receipt_expiry::fill(fixture, "mailbox_create_receipts", &account.to_string());
     assert_eq!(
         folders::publish(request, trust, deadline(), &prepare(&[], None), password),
         Err(Error::Capacity)
     );
-    sql(fixture,"DELETE FROM td_mta.mailbox_create_receipts WHERE request_digest=decode(repeat('00',32),'hex'); UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
+    // Hold receipts this fixture replays later past every sweep that
+    // follows; folder outcomes carry no stamp, so the hold never lifts.
+    receipt_expiry::hold(fixture, "mailbox_create_receipts", &account.to_string());
+    receipt_expiry::expire(
+        fixture,
+        request,
+        trust,
+        binding.epoch(),
+        "mailbox_create_receipts",
+        &account.to_string(),
+    );
+    folders::publish(request, trust, deadline(), &prepare(&[], None), password).unwrap();
+    receipt_expiry::swept(fixture, "mailbox_create_receipts");
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
     assert_eq!(
         folders::publish(request, trust, deadline(), &prepare(&[], None), password),
         Err(Error::Policy)
@@ -9418,6 +9499,8 @@ fn exercise_moves(
         Err(flags::Error::Unauthenticated)
     );
     let result = publish(&first).unwrap();
+    // `first` replays after sweeping publications; hold it past them.
+    receipt_expiry::hold(fixture, "flag_receipts", &account.to_string());
     assert_eq!(
         result.state,
         flags::Outcome {
@@ -9718,6 +9801,8 @@ fn exercise_deletion(
         Err(mutations::Error::Unauthenticated)
     );
     let result = publish(&first).unwrap();
+    // `first` replays after sweeping publications; hold it past them.
+    receipt_expiry::hold(fixture, "flag_receipts", &account.to_string());
     assert_eq!(
         result.state,
         mutations::Outcome {
@@ -10835,6 +10920,18 @@ fn exercise_submission_publication(
         "1"
     );
     assert_eq!(first.route(), binding.route());
+    // `first` is replayed after minutes of relay sections and the publications
+    // that sweep expired receipts; keep its receipt, a day ahead, throughout.
+    receipt_expiry::hold(
+        fixture,
+        "submission_receipts",
+        &binding.account().to_string(),
+    );
+    let held = submissions::Outcome {
+        send_at: a.send_at + receipt_expiry::HELD_MS,
+        expires_at: a.expires_at + receipt_expiry::HELD_MS,
+        ..a
+    };
     use td_mta::{
         generations::GenerationSet, postgres_delivery_body as delivery_body,
         postgres_runtime_profile as runtime, tls_policy::TlsPolicies,
@@ -10997,7 +11094,7 @@ fn exercise_submission_publication(
     );
     assert_eq!(
         submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
-        a
+        held
     );
     let stale = submissions::prepare(input.clone(), deadline()).unwrap();
     assert_eq!(
@@ -11096,7 +11193,7 @@ fn exercise_submission_publication(
     assert_eq!(read_outgoing(), Err(delivery_body::Error::Policy));
     assert_eq!(
         submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
-        a
+        held
     );
     sql(
         fixture,
@@ -11257,15 +11354,27 @@ fn exercise_submission_publication(
     );
     exercise_http_submission_owner(fixture, binding, &input, password);
     let capacity = make();
-    sql(fixture,"INSERT INTO td_mta.submission_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),submission_id,blob_id,length,send_at,expires_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.submission_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
+    receipt_expiry::fill(
+        fixture,
+        "submission_receipts",
+        &binding.account().to_string(),
+    );
     assert_eq!(
         submissions::publish(request, trust, deadline(), &capacity, password),
         Err(submissions::Error::Capacity)
     );
-    sql(
+    // About 1,000 sends per 30-day submission retention no longer stop
+    // sending: receipts expire independently of their submissions.
+    receipt_expiry::expire(
         fixture,
-        "DELETE FROM td_mta.submission_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+        request,
+        trust,
+        binding.epoch(),
+        "submission_receipts",
+        &binding.account().to_string(),
     );
+    submissions::publish(request, trust, deadline(), &make(), password).unwrap();
+    receipt_expiry::swept(fixture, "submission_receipts");
 
     use td_mta::postgres_email_set::deletion;
     let destroy =
@@ -11277,7 +11386,7 @@ fn exercise_submission_publication(
     );
     assert_eq!(
         submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
-        a
+        held
     );
     assert_eq!(
         sql(
@@ -11439,6 +11548,16 @@ fn exercise_http_submission_owner(
         password,
     )
     .unwrap();
+    // A held operation's receipt outlives retention. With `foreground` holding
+    // the only read slot, inline settlement cannot run, and the owner refuses
+    // the next submission rather than publish past its held operation; that
+    // publication's sweep never runs, and settlement still finds the receipt.
+    sql(fixture, &format!("UPDATE td_mta.submission_receipts SET send_at=send_at-61000,expires_at=expires_at-61000 WHERE operation=decode('{operation}','hex')"));
+    assert_eq!(
+        worker.create(request(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert_eq!(count(), before + 2);
     let settled = pending
         .settle(&loaded, executable, &settlement, &clock, until(10_000))
         .unwrap()
@@ -13963,6 +14082,9 @@ mod route_success;
 
 #[path = "postgres_probe/submission_cancel.rs"]
 mod submission_cancel;
+
+#[path = "postgres_probe/receipt_expiry.rs"]
+mod receipt_expiry;
 
 #[path = "postgres_probe/cancel_worker.rs"]
 mod cancel_worker;

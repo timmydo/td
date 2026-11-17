@@ -74,7 +74,8 @@ impl Pending {
         settle_held(&mut pending, loaded, slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint; absence proves rollback (section 165).
+/// Inspect only at the retained endpoint. Absence proves rollback unless another
+/// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
     pending: &mut Option<(Submission, Endpoint)>,
     loaded: &Loaded,

@@ -4,6 +4,7 @@ use crate::{
     ids::{DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
     postgres_devices,
     postgres_probe::{self, Request},
+    postgres_receipt_expiry as expiry,
     postgres_route_owners::{self as owners, Claim},
     postgres_runtime_profile::Binding,
 };
@@ -17,6 +18,7 @@ use std::{
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
+pub const MAX_RECEIPTS: i64 = 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -485,10 +487,12 @@ fn publish_inner(
                 if value.expected.is_some_and(|expected| expected != old) {
                     return Err(Error::StateMismatch);
                 }
-                let count:i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_cancel_receipts WHERE account=$1 LIMIT 1024) receipts", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-                if count >= 1024 {
-                    return Err(Error::Capacity);
-                }
+                // completed_at may predate this operation; the receipt ages
+                // from its own sample.
+                let created_at =
+                    expiry::admit(client, expiry::Ledger::Cancellations, account, MAX_RECEIPTS)
+                        .await
+                        .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
                 let rows = client.query("SELECT s.email_id,s.thread_id,s.identity_id,s.transmitted_blob_id,s.reverse_path,s.send_at,s.expires_at,s.recipient_count,s.completed_at,s.notification,s.notification_email_id,s.changed FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND ($5 OR (r.route_name=$3 AND r.destination=$4)) FOR UPDATE OF s", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice(),&value.frontend()]).await.map_err(|_|Error::Database)?;
                 let row = rows.first().ok_or(Error::Missing)?;
                 let before = snapshot::submission(row)?;
@@ -552,7 +556,7 @@ fn publish_inner(
                     }
                 }
                 let changed_count = if plan.changed { count } else { 0 };
-                client.execute("INSERT INTO td_mta.submission_cancel_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", &[&account,&value.operation.as_bytes().as_slice(),&value.digest.as_slice(),&submission,&count,&changed_count,&plan.completed_at,&old.to_be_bytes().as_slice(),&changed]).await.map_err(|_|Error::Database)?;
+                client.execute("INSERT INTO td_mta.submission_cancel_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", &[&account,&value.operation.as_bytes().as_slice(),&value.digest.as_slice(),&submission,&count,&changed_count,&plan.completed_at,&old.to_be_bytes().as_slice(),&changed,&created_at]).await.map_err(|_|Error::Database)?;
                 check_locked(client, &value).await?;
                 if Instant::now() >= deadline {
                     return Err(Error::Deadline);

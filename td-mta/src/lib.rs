@@ -280,6 +280,7 @@ pub mod postgres_email_set;
 pub mod postgres_history_audit;
 pub mod postgres_imports;
 mod postgres_publication;
+mod postgres_receipt_expiry;
 pub mod postgres_receiving;
 pub mod postgres_smtp_receiving;
 pub mod postgres_smtp_storage;

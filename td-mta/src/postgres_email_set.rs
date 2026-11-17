@@ -4,6 +4,7 @@ use crate::{
     ids::{DeviceId, EmailId, EmailOperationId, MailboxId},
     postgres_devices,
     postgres_probe::{self, Request},
+    postgres_receipt_expiry as expiry,
     postgres_runtime_profile::Binding,
     postgres_schema,
 };
@@ -531,10 +532,14 @@ fn publish_record(
             if change.expected.is_some_and(|expected| expected != old) {
                 return Err(Error::State);
             }
-            let count: i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.flag_receipts WHERE account=$1 LIMIT $2) bounded", &[&account.as_bytes().as_slice(), &MAX_RECEIPTS]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            if count >= MAX_RECEIPTS {
-                return Err(Error::Capacity);
-            }
+            let created_at = expiry::admit(
+                client,
+                expiry::Ledger::Flags,
+                account.as_bytes().as_slice(),
+                MAX_RECEIPTS,
+            )
+            .await
+            .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
             let (next, results) = if change.destroy {
                 deletion::apply(client, &change, old).await?
             } else if let Some(patch) = change.filing {
@@ -746,7 +751,7 @@ fn publish_record(
                     UpdateResult::Destroyed => 4,
                 });
             }
-            client.execute("INSERT INTO td_mta.flag_receipts(account,operation,request_digest,old_sequence,new_sequence,results) VALUES($1,$2,$3,$4,$5,$6)", &[&account.as_bytes().as_slice(), &change.operation.as_bytes().as_slice(), &change.digest.as_slice(), &old.to_be_bytes().as_slice(), &next.to_be_bytes().as_slice(), &encoded]).await.map_err(|_| Error::Database)?;
+            client.execute("INSERT INTO td_mta.flag_receipts(account,operation,request_digest,old_sequence,new_sequence,results,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&account.as_bytes().as_slice(), &change.operation.as_bytes().as_slice(), &change.digest.as_slice(), &old.to_be_bytes().as_slice(), &next.to_be_bytes().as_slice(), &encoded, &created_at]).await.map_err(|_| Error::Database)?;
             marker.store(true, Ordering::Relaxed);
             client
                 .batch_execute("COMMIT")

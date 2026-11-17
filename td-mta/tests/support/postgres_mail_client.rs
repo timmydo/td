@@ -538,7 +538,9 @@ pub(super) fn exercise(
         .parse()
         .unwrap();
     let account = binding.account();
-    sql(fixture, &format!("INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex') FROM generate_series(1,{}) n", 1023 - baseline));
+    // Stamped a day ahead, so no publication below sweeps them however long
+    // this section runs; flag outcomes carry no stamp.
+    sql(fixture, &format!("UPDATE td_mta.flag_receipts SET created_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000; INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex'),(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 FROM generate_series(1,{}) n", 1023 - baseline));
     let set_flag = |flagged| {
         let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
         let mut meter = td_mta::admission::work::Meter::new(
