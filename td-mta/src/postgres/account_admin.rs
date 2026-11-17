@@ -257,6 +257,9 @@ fn classify(error: admin::Error) -> AttemptError {
         Error::Selection(postgres_selection::Error::Conflict) => {
             AttemptError::Failed("account-admin", "configuration-conflict-retain-operation")
         }
+        Error::Selection(postgres_selection::Error::Expired) => {
+            AttemptError::Failed("account-admin", "operation-expired-outcome-unknown")
+        }
         Error::Selection(postgres_selection::Error::Indeterminate)
         | Error::Account(td_mta::postgres_accounts::Error::Indeterminate)
         | Error::Version(td_mta::postgres_configuration_store::Error::Indeterminate) => {

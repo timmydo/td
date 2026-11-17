@@ -204,4 +204,47 @@ pub(super) fn exercise(
             change.operation(), selected.generation
         ),
     );
+    selection_retention(fixture, trust, binding);
+}
+
+/// Publication keeps the receipts of the latest RETAINED_GENERATIONS
+/// selections; an older retained request reports Expired, never absence.
+fn selection_retention(fixture: &Fixture, trust: &TrustStore, binding: &Binding) {
+    sql(fixture, "CREATE TABLE public.retain_selection AS TABLE td_mta.config_selection; CREATE TABLE public.retain_receipts AS TABLE td_mta.config_selection_receipts");
+    let admin = fixture.request();
+    let (selected, candidate) = selection::read(&admin, trust, deadline(), binding.epoch())
+        .unwrap()
+        .unwrap();
+    let mut changes = Vec::new();
+    let mut generation = selected.generation;
+    for _ in 0..=selection::RETAINED_GENERATIONS {
+        let change =
+            selection::prepare(binding.epoch(), generation, selected.version, &candidate).unwrap();
+        generation = selection::publish(&admin, trust, deadline(), change)
+            .unwrap()
+            .generation;
+        changes.push(change);
+    }
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.config_selection_receipts"
+        ),
+        selection::RETAINED_GENERATIONS.to_string()
+    );
+    let oldest = *changes.first().unwrap();
+    assert_eq!(
+        selection::inspect(&admin, trust, deadline(), oldest),
+        Err(selection::Error::Expired)
+    );
+    assert_eq!(
+        selection::publish(&admin, trust, deadline(), oldest),
+        Err(selection::Error::Expired)
+    );
+    // The latest RETAINED_GENERATIONS selections still resolve.
+    let kept = *changes.get(1).unwrap();
+    assert!(selection::inspect(&admin, trust, deadline(), kept)
+        .unwrap()
+        .is_some());
+    sql(fixture, "DELETE FROM td_mta.config_selection_receipts; INSERT INTO td_mta.config_selection_receipts SELECT * FROM public.retain_receipts; DELETE FROM td_mta.config_selection; INSERT INTO td_mta.config_selection SELECT * FROM public.retain_selection; DROP TABLE public.retain_selection, public.retain_receipts");
 }

@@ -20,6 +20,16 @@ mod retained;
 pub use retained::RETAINED_BYTES;
 
 pub const MAX_RECEIPTS: i64 = 1024;
+/// Receipts of the latest selections kept for retained operations; older ones
+/// are swept by the next publication. An older operation could no longer be
+/// published (its expected generation is stale), so inspecting or publishing
+/// it reports Expired instead of absence.
+pub const RETAINED_GENERATIONS: u64 = 64;
+
+/// Whether `generation`'s receipt was swept once `current` was published.
+fn expired(generation: u64, current: u64) -> bool {
+    generation <= current.saturating_sub(RETAINED_GENERATIONS)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -33,6 +43,9 @@ pub enum Error {
     Crypto,
     Database,
     Indeterminate,
+    /// The operation is older than the retained receipts; its outcome is no
+    /// longer known. Never treat this as absence.
+    Expired,
 }
 
 /// Passive selection; not policy or device authorization.
@@ -158,9 +171,10 @@ async fn receipt(
     Ok(Some(selected))
 }
 
-/// Resolve a retained operation, even after a newer selection or later material
-/// expiry. A shared policy lock excludes an earlier in-flight publication's
-/// COMMIT before reading its receipt. A lock/connection failure leaves prior
+/// Resolve a retained operation, even after newer selections (fewer than
+/// RETAINED_GENERATIONS; older reports Expired) or later material expiry. A
+/// shared policy lock excludes an earlier in-flight publication's COMMIT
+/// before reading its receipt. A lock/connection failure leaves prior
 /// uncertainty unresolved. Absence never authorizes a different operation ID.
 pub fn inspect(
     request: &Request<'_>,
@@ -177,16 +191,23 @@ pub fn inspect(
                 return Err(Error::Epoch);
             }
             client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            client.query_one("SELECT singleton FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
-            receipt(client, change).await
+            let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+            let found = receipt(client, change).await?;
+            let current = selection(&row)?.map_or(0, |selected| selected.generation);
+            let generation = change.expected.checked_add(1).ok_or(Error::Integrity)?;
+            if found.is_none() && expired(generation, current) {
+                return Err(Error::Expired);
+            }
+            Ok(found)
         })
     })
     .map_err(Error::Connection)?
 }
 
 /// Revalidate the immutable source version, then atomically select it if the
-/// generation still matches. Receipts survive newer selections. All writers
-/// take this singleton policy row before any future account/device locks.
+/// generation still matches. Receipts survive fewer than RETAINED_GENERATIONS
+/// newer selections. All writers take this singleton policy row before any
+/// future account/device locks.
 /// No service listener, runtime generation or role is activated here.
 pub fn publish(
     request: &Request<'_>,
@@ -221,9 +242,28 @@ pub fn publish(
                 return Ok(selected);
             }
             let current = selection(&row)?.map_or(0, |selected| selected.generation);
+            let generation = change.expected.checked_add(1).ok_or(Error::Capacity)?;
             if current != change.expected {
-                return Err(Error::Conflict);
+                // Under the lock, as in inspect: a swept receipt is never
+                // reported as a definite refusal either.
+                return Err(if expired(generation, current) {
+                    Error::Expired
+                } else {
+                    Error::Conflict
+                });
             }
+            // Keep the receipts of the latest RETAINED_GENERATIONS selections,
+            // this one included; big-endian bytea orders like the number.
+            let floor = generation
+                .saturating_sub(RETAINED_GENERATIONS)
+                .to_be_bytes();
+            client
+                .execute(
+                    "DELETE FROM td_mta.config_selection_receipts WHERE generation<=$1",
+                    &[&floor.as_slice()],
+                )
+                .await
+                .map_err(|_| Error::Database)?;
             let count: i64 = client.query_one("SELECT count(*) FROM (SELECT operation FROM td_mta.config_selection_receipts LIMIT 1024) bounded", &[]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
             if count >= MAX_RECEIPTS {
                 return Err(Error::Capacity);
@@ -239,7 +279,6 @@ pub fn publish(
             if digest != change.source_digest {
                 return Err(Error::Conflict);
             }
-            let generation = change.expected.checked_add(1).ok_or(Error::Capacity)?;
             let bytes = generation.to_be_bytes();
             let changed = client.execute("UPDATE td_mta.config_selection SET generation=$1,version_id=$2 WHERE singleton=true", &[&bytes.as_slice(), &change.version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
             if changed != 1 {
@@ -298,4 +337,20 @@ pub fn observe(
         let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).await.map_err(|_| Error::Database)?;
         selection(&row)
     })).map_err(Error::Connection)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_keeps_the_latest_retained_generations() {
+        // Nothing is swept before RETAINED_GENERATIONS selections exist.
+        assert!(!expired(1, 0));
+        assert!(!expired(1, RETAINED_GENERATIONS));
+        assert!(expired(1, RETAINED_GENERATIONS + 1));
+        assert!(!expired(2, RETAINED_GENERATIONS + 1));
+        assert!(!expired(u64::MAX, u64::MAX));
+        assert!(expired(u64::MAX - RETAINED_GENERATIONS, u64::MAX));
+    }
 }

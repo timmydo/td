@@ -1609,7 +1609,8 @@ validate every profile and retain an operation file before database writes.
 Creation provisions the Inbox, receiving address and one sending identity;
 alias edits change receiving only. The first account remains the implicit
 postmaster when a second is added. `account-apply` resumes the same operation;
-`account-operation-inspect` resolves its historical selection receipt.
+`account-operation-inspect` resolves its historical selection receipt
+within the latest 64 selections and reports it expired after.
 Concurrent edits conflict rather than overwriting a newer generation.
 `account-list` reports selected account, alias and identity configuration.
 `account-identity-add`, `account-identity-update` and `account-identity-remove`

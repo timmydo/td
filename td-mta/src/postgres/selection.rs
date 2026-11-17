@@ -212,6 +212,7 @@ pub(super) fn classify(error: Error) -> AttemptError {
                 Error::Crypto => "crypto",
                 Error::Database => "query-failed",
                 Error::Indeterminate => "indeterminate-retain-request",
+                Error::Expired => "request-expired-outcome-unknown",
                 Error::Connection(_) | Error::Schema(_) | Error::Configuration(_) => {
                     "connection-or-configuration"
                 }

@@ -1406,13 +1406,13 @@ an assertion that future HTTP transfer limits are already qualified.
 
 ## 30. Retained configuration selection
 
-Schema seven adds a singleton `config_selection` row and immutable
-`config_selection_receipts`. The initial row has generation zero and no
-version. `postgres_selection` supplies owner-side preparation, publication,
-receipt inspection and selected-source reads. This is still inert storage
-preparation: it opens no listener and supplies no runtime policy, role or
-device authorization. Production startup and policy fencing remain cutover
-work.
+Schema seven adds a singleton `config_selection` row and
+`config_selection_receipts`, immutable until publication sweeps them. The
+initial row has generation zero and no version. `postgres_selection` supplies
+owner-side preparation, publication, receipt inspection and selected-source
+reads. This is still inert storage preparation: it opens no listener and
+supplies no runtime policy, role or device authorization. Production startup
+and policy fencing remain cutover work.
 
 A retained change binds a random operation ID to the store epoch, expected
 full-u64 generation, immutable version ID and validated source digest.
@@ -1428,24 +1428,24 @@ both publish. A failed candidate or definite rollback leaves the pointer
 unchanged.
 
 The original ten-second operation ceiling covers every connection, validation
-and transaction; none renews it. A lost COMMIT response is indeterminate.
-The publication transaction uses the bounded mutation transport profile
-(1088 input frames, 1 MiB input, 128 KiB output), including schema ledger
+and transaction; none renews it. A lost COMMIT response is indeterminate. The
+publication transaction uses the bounded mutation transport profile (1088
+input frames, 1 MiB input, 128 KiB output), including schema ledger
 qualification and COMMIT. Receipt inspection and passive observation retain
-the smaller probe profile.
-Keep the exact retained change and resolve/retry it, never generate another
-ID from an absence observation. Lock/connection failures while resolving
-leave any previous uncertainty outstanding; they are not proof of rollback.
-The shared resolution lock is released before material validation. Historical
-receipts resolve their original
-selection even after subsequent changes or material expiry; receipt success
-does not assert that version is still selected. At most 1024 receipts can be
-published, checked under the same singleton lock. There is no receipt expiry
-or pruning API yet; capacity refusal preserves existing outcomes. This finite
-preparation limit needs an explicit retention/retry policy before runtime
-administration activation. Section 197 supplies a fixed public encoding
-for retaining the same change across process restart; callers must persist
-it before publication. Encoding support does not activate administration.
+the smaller probe profile. Keep the exact retained change and resolve/retry
+it, never generate another ID from an absence observation. Lock/connection
+failures while resolving leave any previous uncertainty outstanding; they are
+not proof of rollback. The shared resolution lock is released before material
+validation. Historical receipts resolve their original selection after up to
+63 later selections or material expiry; receipt success does not assert that
+version is still selected. Each publication deletes, under the singleton lock,
+receipts at least 64 selections older than itself; a request at or below that
+floor reports `Expired` from inspection and publication, never absence and
+never a definite conflict, even when it provably never committed. At most 1024
+receipts may exist, checked after the sweep under the same lock. Section 197
+supplies a fixed public encoding for retaining the same change across process
+restart; callers must persist it before publication. Encoding support does not
+activate administration.
 
 Selected-source reads capture a passive generation/version, then verify the
 immutable source bytes and all profiles/materials. A concurrent publication
@@ -6222,8 +6222,9 @@ Changing the operation ID asks for another operation; changing any request
 field changes its derived digest. Owner database credentials, stored receipt
 comparison, expected generation and current source/material validation keep
 their existing roles. Decoding cannot establish publication or authorize
-service. An already recorded operation still resolves after a newer selection
-or material expiry, while a changed request using its ID conflicts. Missing
+service. An already recorded operation still resolves after up to 63 newer
+selections (later reports it expired, section 198) or material expiry, while a
+changed request using its ID conflicts. Missing
 receipt observations do not authorize a replacement operation.
 
 This supplies the bounded recovery representation used by section 198’s
@@ -6257,13 +6258,19 @@ explicitly retry the original retained request, never prepare a replacement
 from an absence observation. Historical receipts remain resolvable after a
 newer selection or expired material, while new publication revalidates the
 version and compares the expected generation. An altered request using a
-recorded operation ID conflicts.
+recorded operation ID conflicts. Each publication deletes receipts at least
+64 selections older than itself, so the ledger never fills; inspecting or
+publishing a request whose generation is that old reports
+`request-expired-outcome-unknown` (`operation-expired-outcome-unknown` for
+account administration), never absence and never a new selection. Resolve a
+retained request before 64 further selections.
 
 These commands operate on the preparation database. They do not activate a
 listener, runtime generation or PostgreSQL production backend. Receipt success
 does not assert that its version is still selected or that current materials
-are usable. The finite 1024-receipt ceiling and lack of pruning remain exact;
-these commands add no receipt-retention or automatic deployment policy.
+are usable. Publication keeps the receipts of the latest 64 selections, as
+above, under the backstop 1024-receipt ceiling; these commands add no
+automatic deployment policy.
 
 ## 199. Historical account usage audit
 
@@ -7532,9 +7539,11 @@ Successful selection fences old instances; restart **every affected mail
 instance** before considering the account available. Output always says
 `profile_activated:false` and marks receipts historical. Reapplying an old
 successful operation reports its original receipt without replacing a newer
-selection. It does not prove that version is still selected. Credentials use
-the existing `device-create`, `device-list` and `device-revoke` commands; a
-username change does not revoke them.
+selection while fewer than 64 selections followed it, and
+`operation-expired-outcome-unknown` after (section 30). It does not prove that
+version is still selected. Credentials use the existing `device-create`,
+`device-list` and `device-revoke` commands; a username change does not revoke
+them.
 
 Native tests exercise executable create/list/alias commands, protected
 operation permissions, first-to-second postmaster preservation, exact replay,
