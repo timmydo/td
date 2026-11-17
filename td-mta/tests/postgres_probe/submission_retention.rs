@@ -118,12 +118,16 @@ pub(super) fn exercise(
     let canceled = "6,0,NULL,0,NULL,0,NULL,NULL,NULL,7";
     let failed = "5,0,NULL,0,NULL,0,NULL,NULL,NULL,2";
     let queued = "1,0,NULL,0,NULL,0,0,NULL,NULL,0";
-    for b in [0xa4, 0xb2, 0xb3] {
+    for b in [0xa4, 0xb2, 0xb3, 0xb4, 0xb5] {
         blob(fixture, &src, b, 100);
     }
     blob(fixture, &src, 0xa5, 32 * 1024 * 1024);
-    // The second blob stays leased after its only submission retires.
-    sql(fixture, &format!("INSERT INTO td_mta.leases SELECT account,{},decode(repeat('77',16),'hex'),0,1,changed FROM td_mta.submissions WHERE id={src}", id(0xb2)));
+    // The second blob stays leased after its only submission retires; its
+    // lease has expired, so lease reclamation then retires the body. 0xb4's
+    // expired lease is its only reference; 0xb5's expires later.
+    for (b, expires_at) in [(0xb2, "0"), (0xb4, "0"), (0xb5, "9000000000000000000")] {
+        sql(fixture, &format!("INSERT INTO td_mta.leases SELECT account,{},decode(repeat('77',16),'hex'),{expires_at},1,changed FROM td_mta.submissions WHERE id={src}", id(b)));
+    }
     let source_blob =
         format!("(SELECT transmitted_blob_id FROM td_mta.submissions WHERE id={src})");
     let (a4, b2, b3, a5) = (id(0xa4), id(0xb2), id(0xb3), id(0xa5));
@@ -507,7 +511,62 @@ pub(super) fn exercise(
     assert!(before.blob_count >= after.blob_count + 2);
     assert!(before.body_bytes >= after.body_bytes + 100 + 32 * 1024 * 1024);
     assert!(before.queue_bytes >= after.queue_bytes + 200 + 32 * 1024 * 1024);
-    assert_eq!(after.upload_bytes, before.upload_bytes);
+    assert_eq!(
+        after.upload_bytes, before.upload_bytes,
+        "retirement keeps leases"
+    );
+
+    // Lease reclamation is its own transaction under the same claim, fence
+    // and clock guard.
+    let reclaim =
+        || retention::reclaim_uploads(request, trust, deadline(), &claim, grant.generation, now());
+    assert_eq!(
+        retention::reclaim_uploads(
+            request,
+            trust,
+            deadline(),
+            &claim,
+            grant.generation + 1,
+            now()
+        ),
+        Err(retention::Error::Owner(owners::Error::Stale))
+    );
+    assert_eq!(
+        retention::reclaim_uploads(
+            request,
+            trust,
+            deadline(),
+            &claim,
+            grant.generation,
+            now() - 2 * retention::CLOCK_SLACK_MS
+        ),
+        Err(retention::Error::Clock)
+    );
+    let (b4, b5) = (id(0xb4), id(0xb5));
+    assert_eq!(
+        count(
+            fixture,
+            &format!("td_mta.leases WHERE blob_id IN ({b2},{b4})")
+        ),
+        "2"
+    );
+    // Both expired leases go; 0xb2's body, which its retired submission no
+    // longer reaches, goes with 0xb4's, while 0xb5's live lease stays.
+    assert_eq!(reclaim(), Ok(2));
+    let reclaimed = usage();
+    assert_eq!(after.upload_bytes - reclaimed.upload_bytes, 200);
+    assert_eq!(after.body_bytes - reclaimed.body_bytes, 200);
+    assert_eq!(after.blob_count - reclaimed.blob_count, 2);
+    assert_eq!(after.queue_bytes, reclaimed.queue_bytes);
+    for (query, expected) in [
+        (format!("td_mta.leases WHERE blob_id IN ({b2},{b4})"), "0"),
+        (format!("td_mta.blobs WHERE id IN ({b2},{b4})"), "0"),
+        (format!("td_mta.blob_ids WHERE id IN ({b2},{b4})"), "2"),
+        (format!("td_mta.leases WHERE blob_id={b5}"), "1"),
+    ] {
+        assert_eq!(count(fixture, &query), expected, "{query}");
+    }
+    assert_eq!(reclaim(), Ok(0));
 
     // Releasing the active attempt and the final reservation admits both.
     sql(fixture, &format!("UPDATE td_mta.submission_attempts SET active=false WHERE attempt_id={}; DELETE FROM td_mta.attempt_final_reservations WHERE attempt_id={}", id(0xee), id(0xef)));
@@ -521,11 +580,26 @@ pub(super) fn exercise(
     );
     assert_eq!(before.queue_submissions - usage().queue_submissions, total);
     assert_eq!(retire(), Ok(0));
+    // With nothing left to retire, a lease that expires is still reclaimed
+    // and committed: an idle account recovers its upload quota.
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.leases SET expires_at=0 WHERE blob_id={b5}"),
+    );
+    let upload = usage().upload_bytes;
+    assert_eq!(reclaim(), Ok(1));
+    assert_eq!(
+        count(fixture, &format!("td_mta.leases WHERE blob_id={b5}")),
+        "0"
+    );
+    assert_eq!(count(fixture, &format!("td_mta.blobs WHERE id={b5}")), "0");
+    assert_eq!(upload - usage().upload_bytes, 100);
     owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
     assert!(
         matches!(retire(), Err(retention::Error::Owner(_))),
         "released owner fenced"
     );
+    assert!(matches!(reclaim(), Err(retention::Error::Owner(_))));
 
     // Later fixtures see none of these rows.
     let rest = ids(&[0xe4, 0xe6, 0xe7, 0xeb, 0xec, 0xed]);

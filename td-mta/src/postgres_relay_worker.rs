@@ -394,10 +394,11 @@ impl Worker<'_, '_> {
         state.retry = !state.retry;
         Ok(buffers)
     }
-    /// Retire settled submissions (POSTGRES.md section 216) when
-    /// `retention_due` returned the stable observation. Failure is logged and
-    /// retried later, as retention only frees capacity; the caller has
-    /// closed its idle reader.
+    /// Retire settled submissions (POSTGRES.md section 216) and reclaim
+    /// expired upload leases (section 35), as separate transactions sharing
+    /// one deadline, when `retention_due` returned the stable observation.
+    /// Either failure is logged and retried later, as both only free
+    /// capacity; the caller has closed its idle reader.
     fn retain(
         &self,
         worker: &Dispatches<'_, '_>,
@@ -410,40 +411,59 @@ impl Worker<'_, '_> {
         let Some(observed_at) = stable_at else {
             return Ok(());
         };
-        let retired = match worker.connection.slots.acquire() {
-            Ok(_slot) => crate::postgres_submission_retention::retire(
+        // One budget for both steps keeps the turn within a single deadline
+        // of the owner lease; a fast failure of either still leaves the
+        // other its run.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (retired, reclaimed) = match worker.connection.slots.acquire() {
+            Ok(_slot) => {
+                use crate::postgres_submission_retention as retention;
+                let retired = retention::retire(
+                    self.request,
+                    self.trust,
+                    deadline,
+                    claim,
+                    generation,
+                    observed_at,
+                )
+                .ok();
+                let reclaimed = retention::reclaim_uploads(
+                    self.request,
+                    self.trust,
+                    deadline,
+                    claim,
+                    generation,
+                    observed_at,
+                )
+                .ok();
+                (retired, reclaimed)
+            }
+            Err(_) => (None, None),
+        };
+        if retired.is_none() || reclaimed.is_none() {
+            control.log(
+                crate::observability::Kind::RelayStepFailed {
+                    stage: crate::observability::RelayStep::Retention,
+                },
+                None,
+                None,
+            );
+            // Serialize behind COMMIT or rollback before short-lock reads.
+            database(owners::renew(
                 self.request,
                 self.trust,
                 Instant::now() + Duration::from_secs(10),
                 claim,
                 generation,
-                observed_at,
-            )
-            .ok(),
-            Err(_) => None,
-        };
-        let wait = match retired {
-            // A full batch may leave more for the next turn.
-            Some(count) if count > 0 => Duration::ZERO,
-            Some(_) => RETENTION_PAUSE,
-            None => {
-                control.log(
-                    crate::observability::Kind::RelayStepFailed {
-                        stage: crate::observability::RelayStep::Retention,
-                    },
-                    None,
-                    None,
-                );
-                // Serialize behind COMMIT or rollback before short-lock reads.
-                database(owners::renew(
-                    self.request,
-                    self.trust,
-                    Instant::now() + Duration::from_secs(10),
-                    claim,
-                    generation,
-                ))?;
-                RETENTION_PAUSE
-            }
+            ))?;
+        }
+        // Committed progress may leave more for the next turn; otherwise,
+        // including after a failure, wait.
+        let progress = retired.is_some_and(|n| n > 0) || reclaimed.is_some_and(|n| n > 0);
+        let wait = if progress {
+            Duration::ZERO
+        } else {
+            RETENTION_PAUSE
         };
         state.retention_at = Instant::now() + wait;
         Ok(())

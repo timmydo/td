@@ -369,7 +369,7 @@ pub fn publish(
             let created_at = expiry::admit(client, expiry::Ledger::Uploads, account, MAX_RECEIPTS)
                 .await
                 .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
-            let reclaimed = reclaim(client, account, created_at).await?;
+            let reclaimed = reclaim(client, account, created_at).await? > 0;
             let usage = match publication::charge(
                 client,
                 upload.binding.account(),
@@ -497,12 +497,13 @@ fn fits(taken: usize, bytes: i64) -> bool {
 
 /// Under the caller's account lock, delete one bounded batch of this account's
 /// leases expired at database time `now`, oldest first, release their upload
-/// bytes and retire each body nothing else reaches. Returns whether it
-/// reclaimed any lease.
-async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<bool, Error> {
+/// bytes and retire each body nothing else reaches. Returns how many leases
+/// it reclaimed. Upload publication and relay retention both call it, so an
+/// account need not upload again to recover its quota.
+pub(crate) async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
     let rows = client.query("SELECT l.blob_id,b.length FROM td_mta.leases l JOIN td_mta.blobs b ON b.account=l.account AND b.id=l.blob_id WHERE l.account=$1 AND l.expires_at<=$2 ORDER BY l.expires_at,l.blob_id LIMIT $3", &[&account, &now, &RECLAIM_LEASES]).await.map_err(|_| Error::Database)?;
     if rows.is_empty() {
-        return Ok(false);
+        return Ok(0);
     }
     let budget = td_alloc::Budget::new(16 * 1024).map_err(|_| Error::Capacity)?;
     let mut blobs: td_alloc::BudgetVec<&[u8]> =
@@ -539,7 +540,7 @@ async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<bool, Erro
     publication::release(client, account, [body, count, bytes, 0, 0])
         .await
         .map_err(publication_error)?;
-    Ok(true)
+    u64::try_from(blobs.len()).map_err(|_| Error::Integrity)
 }
 
 fn publication_error(error: publication::Error) -> Error {

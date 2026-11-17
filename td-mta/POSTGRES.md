@@ -1603,8 +1603,9 @@ reclamation or serving. Those remain prerequisites for the runtime integration.
 Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
 one usage row per account from existing bodies, leases and submissions in the
 same transaction as its ledger entry. Expired leases and completed submissions
-remain charged while retained (the account's next upload reclaims expired
-leases, below; section 216 releases retired submissions); a body shared by
+remain charged while retained (the account's next upload or relay
+retention reclaims expired leases, below; section 216 releases retired
+submissions); a body shared by
 submissions is charged once for queue bytes. New account
 bootstrap writes an all-zero usage row atomically.
 Every future body/reference mutation must adjust these counters under the
@@ -1648,7 +1649,8 @@ Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
 current usage exceeds its cap. Logical counters do not reserve server disk.
 
-Nothing else removes a lease, and no Email or submission takes over an
+Nothing but this reclamation (here and on relay retention turns) removes a
+lease, and no Email or submission takes over an
 uploaded body (a draft copies attachment bytes into its own body), so without
 reclamation `upload_bytes` would only grow and the upload quota would be a
 lifetime budget. After device authentication and its receipt sweep, upload
@@ -1674,9 +1676,15 @@ repeats it, and small uploads still drain a backlog. Reclamation is
 idempotent.
 Expired leases already refuse downloads and draft attachment use (sections 36
 and 37); deleting them changes neither, and a historical upload receipt still
-answers its own replay inside its minute. An idle account keeps expired leases,
-and the body bytes and blob count they hold, until its next upload. Their bytes
-never exceed the upload quota, though zero-length uploads can hold blob count.
+answers its own replay inside its minute. Relay retention (section 216) also
+runs the same batch, in a transaction of its own, on each retention turn, so an
+account a relay route serves recovers expired leases, and the body bytes and
+blob count they hold, without another upload: typically within ten minutes of
+expiry while the relay runs with a stable queue clock, and a backlog drains a
+batch per round. An account no relay worker serves keeps them until its next
+upload.
+Their bytes never exceed the upload quota, though zero-length uploads can hold
+blob count.
 The candidate scan reads the account's leases (no expiry index), which the
 upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
 grant of section 55.
@@ -1966,8 +1974,9 @@ Lost COMMIT response remains indeterminate until inspection of the same
 retained operation finds its receipt or proves its absence (section 165).
 Historical receipts remain inspectable after later policy change,
 revocation, object deletion or body retirement. This does not grant a fresh
-write or a new body read. The account's next upload reclaims expired
-upload leases (section 35), section 216 retires settled submissions and
+write or a new body read. The account's next upload or relay retention
+reclaims expired upload leases (section 35), section 216 retires settled
+submissions and
 section 217 expires HTTP write receipts.
 
 ## 45. Shared receiving header preparation
@@ -2280,8 +2289,9 @@ The exact table privilege roster lives in `postgres_runtime_access::TABLES`.
 All current tables require SELECT. Mail data and receipt tables require
 INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
 receipts, bootstrap receipts and reserved import tables are read-only.
-Upload leases require SELECT, INSERT and DELETE, so upload publication can
-reclaim expired ones (section 35); any UPDATE, which could extend a lease,
+Upload leases require SELECT, INSERT and DELETE, so upload publication and
+relay retention can reclaim expired ones (section 35); any UPDATE, which could
+extend a lease,
 refuses. The replica reader keeps SELECT and INSERT only.
 The selection singleton permits only column-level UPDATE on `singleton`,
 which allows FOR SHARE policy fencing without changing its generation/version.
@@ -6352,8 +6362,8 @@ and device authorization. No account row lock, write or repair is performed.
 
 Body bytes and blob count include every live blob manifest, including a
 zero-length blob. Upload bytes count each manifest with an existing lease;
-expired leases count until the account's next upload reclaims them (section
-35). Queue bytes count each manifest
+expired leases count until the account's next upload or relay retention
+reclaims them (section 35). Queue bytes count each manifest
 referenced as a transmitted blob by a submission, once even if several
 submissions reference it. Queue submission count includes every durable
 submission, including completed ones retained in the database. Reserved blob
@@ -7077,6 +7087,16 @@ Integrity rather than underflow, writes a Destroyed EmailSubmission change
 per submission and advances the account sequence, so state strings change
 and the submission ID collision check still finds the ID.
 
+On the same turn `reclaim_uploads` takes the same claim, fence and clock
+guard in a transaction of its own and reclaims one batch of expired upload
+leases exactly as upload publication does (section 35), so an account that
+stopped uploading still recovers that quota. A batch that reclaims nothing
+rolls back; a non-empty one commits with no change row or sequence step,
+since leases carry no JMAP state. Keeping the two transactions apart means
+neither failure holds back the other's progress (an account whose usage
+counters disagree with its leases still retires submissions), and neither
+holds the account lock longer than its own bounded batch.
+
 Deletion is irreversible and time-driven, so the relay calls it only right
 after a queue clock observation whose guard reports the stable status retry
 dispatch needs (no discontinuity, five minutes of UTC/monotonic progress),
@@ -7086,12 +7106,16 @@ expiry it does not wait for administrator confirmation, so an unattended
 relay still reclaims; a clock step that predates the relay's start is no
 more detectable here than for dispatch.
 
-The relay calls it on idle and active account turns: again on the next
-round after a non-empty batch, otherwise ten minutes later. A failure
-records `relay_step_failed` at `retention`, renews the lease to serialize
-behind any interrupted transaction, and retries after the same pause; only a
-failed renewal stops the relay, as everywhere. Retirement is idempotent, so
-an uncertain COMMIT needs no Pending custody. A first pass over a long
+The relay calls both on idle and active account turns, sharing one
+10-second deadline so the turn stays well inside the 30-second owner
+lease (a slow retirement leaves reclamation no time; a fast failure of
+either leaves the other its run): again on the next round after either
+made progress, otherwise ten minutes later. A failure of either records
+`relay_step_failed` at `retention` and renews the lease to serialize
+behind any interrupted transaction; only a failed renewal stops the
+relay, as everywhere. Retirement and
+lease reclamation are idempotent, so an uncertain COMMIT needs no Pending
+custody. A first pass over a long
 history drains it at 64 submissions per round. The candidate scan reads all
 of the account's submissions (no completed_at index), bounded by the
 `queue_submissions` quota, once per pass.
@@ -7114,7 +7138,12 @@ every receipt kind, shared, leased and 32 MiB blobs, 900 attempts on one
 submission, a group inside retention, groups held by an active attempt or a
 final reservation and released, and three 1,000-recipient groups that need
 two batches; Failed, mixed and OutcomeUnknown groups with stored notices
-retire. It checks the stale-owner and clock refusals, exactly which
+retire. An expired lease on a retiring submission's blob keeps the body
+through retirement; reclamation then retires it with a standalone expired
+lease's body, releasing exactly their upload bytes, body bytes and blob
+count while a live lease stays, and once nothing remains to retire a lease
+that expires is still reclaimed and committed alone. It checks the
+stale-owner, clock and released-owner refusals of both steps, exactly which
 rows, blobs and receipts go and stay, the Destroyed changes, the sequence
 advance and the usage audit. A unit test pins the batch bounds.
 

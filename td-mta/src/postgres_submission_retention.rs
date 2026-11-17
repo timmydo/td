@@ -1,4 +1,5 @@
-//! Retire completed submissions once their retention ends.
+//! Retire completed submissions once their retention ends, and reclaim
+//! expired upload leases on the same relay turns.
 use crate::{
     postgres_probe::{self, Request},
     postgres_publication as publication,
@@ -46,11 +47,118 @@ pub fn retire(
     generation: u64,
     stable_at: i64,
 ) -> Result<u64, Error> {
+    run(
+        Step::Retire,
+        request,
+        trust,
+        deadline,
+        claim,
+        generation,
+        stable_at,
+    )
+}
+
+/// Reclaim one bounded batch of the account's expired upload leases
+/// (POSTGRES.md section 35) under the relay's route claim, in a transaction
+/// of its own, so an account that never uploads again still recovers that
+/// quota and a failure here never holds back submission retirement, nor the
+/// reverse. Idempotent like `retire`; returns how many leases it reclaimed.
+pub fn reclaim_uploads(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+    stable_at: i64,
+) -> Result<u64, Error> {
+    run(
+        Step::Reclaim,
+        request,
+        trust,
+        deadline,
+        claim,
+        generation,
+        stable_at,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Step {
+    Retire,
+    Reclaim,
+}
+
+fn run(
+    step: Step,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+    stable_at: i64,
+) -> Result<u64, Error> {
     let claim = claim.clone();
     postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move { retire_locked(client, &claim, generation, stable_at).await })
+        Box::pin(async move {
+            match step {
+                Step::Retire => retire_locked(client, &claim, generation, stable_at).await,
+                Step::Reclaim => reclaim_locked(client, &claim, generation, stable_at).await,
+            }
+        })
     })
     .map_err(Error::Connection)?
+}
+
+/// Begin the relay's account transaction: the account row FOR UPDATE under
+/// a current owner fence, returning database time near the stable sample.
+async fn lock(
+    client: &Client,
+    claim: &Claim,
+    generation: u64,
+    stable_at: i64,
+) -> Result<i64, Error> {
+    if !owners::begin(client, claim, true, true)
+        .await
+        .map_err(Error::Owner)?
+    {
+        return Err(Error::Policy);
+    }
+    let now = owners::check_locked(client, claim, generation)
+        .await
+        .map_err(Error::Owner)?;
+    if now.abs_diff(stable_at) > CLOCK_SLACK_MS.unsigned_abs() {
+        return Err(Error::Clock);
+    }
+    Ok(now)
+}
+
+async fn reclaim_locked(
+    client: &Client,
+    claim: &Claim,
+    generation: u64,
+    stable_at: i64,
+) -> Result<u64, Error> {
+    let now = lock(client, claim, generation, stable_at).await?;
+    let account = claim.binding().account();
+    let leases = crate::postgres_uploads::reclaim(client, account.as_bytes().as_slice(), now)
+        .await
+        .map_err(|error| match error {
+            crate::postgres_uploads::Error::Database => Error::Database,
+            crate::postgres_uploads::Error::Capacity => Error::Capacity,
+            _ => Error::Integrity,
+        })?;
+    // Nothing reclaimed leaves the transaction to roll back.
+    if leases == 0 {
+        return Ok(0);
+    }
+    owners::check_locked(client, claim, generation)
+        .await
+        .map_err(Error::Owner)?;
+    client
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|_| Error::Database)?;
+    Ok(leases)
 }
 
 /// Whether a candidate fits after earlier ones, with `recipients` and
@@ -66,18 +174,7 @@ async fn retire_locked(
     generation: u64,
     stable_at: i64,
 ) -> Result<u64, Error> {
-    if !owners::begin(client, claim, true, true)
-        .await
-        .map_err(Error::Owner)?
-    {
-        return Err(Error::Policy);
-    }
-    let now = owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
-    if now.abs_diff(stable_at) > CLOCK_SLACK_MS.unsigned_abs() {
-        return Err(Error::Clock);
-    }
+    let now = lock(client, claim, generation, stable_at).await?;
     let cutoff = now.checked_sub(RETENTION_MS).ok_or(Error::Integrity)?;
     let binding = claim.binding();
     let account_id = binding.account();
