@@ -1418,10 +1418,18 @@ says.
   schedules, labelled with their source; and a divider where compaction
   ran (§14).
   So the transcript scans at a glance, the person's own messages are
-  bubbles on the right and the replies (a sub-agent's too) and other
-  conversations' messages bubbles on the left (td-ui's `Side`); tool
-  blocks, notices, schedules and the rest stay across the list. Each
-  bubble shows its event's time beside its header, `HH:MM` in the
+  bubbles on the right, the replies (a sub-agent's too) lie on the paper
+  across the list as the page's own text under a quiet header (td-ui's
+  `Side::Plain`), and other conversations' messages are bubbles on the
+  left (td-ui's `Side`); tool blocks, schedules and the rest stay across
+  the list. td-agent's own notices are dividers (`Side::Divider`): a
+  quiet label naming what the notice is about (`notice`, `turn`,
+  `review`, `compaction` or `compacted`, `NAME sub-agent`), a rule after
+  it and the notice in the page's ink, since a notice may report a
+  failure, with a status only for what went wrong (`not compacted`);
+  focused, its header is the selected row's, with no rule. A `td-agent` notice or message elsewhere in this
+  document is such a divider. Each reply and bubble shows its event's
+  time beside or in its header, `HH:MM` in the
   machine's zone (td-civil's `Zone::local`, read once as the window
   starts; UTC before it, and in the tests), its tooltip the whole date and
   time; a streamed reply has none until its logged reply settles it, which
@@ -1672,8 +1680,16 @@ away with its conversation's processes.
 a turn is under way. A reply shows as an `assistant` message: its
 reasoning in a collapsed section, its text, and its usage as the
 message's status (prompt tokens with cached and written, completion
-tokens, and cost). A turn that ends other than `replied` adds a
-`td-agent` message saying why. One that may pass (a 502 or 503, a
+tokens, and cost). It carries a verdict only when it ended otherwise
+than by answering or calling tools (`stop`, or `tool_calls` with
+calls). A turn whose outcome is `replied`, or `replied` qualified,
+leaves the person's message unmarked; any other marks it (`no model`,
+`stopped at a limit`, else `not answered`), and one a restart cut short
+marks it `interrupted`. A turn that ended other than plainly `replied`
+or `no model` adds a notice saying why (`turn`, or `review` or
+`compaction` for those), a qualified `replied` included, but for a
+compaction that ended `compacted` or a review that ended `reviewed`;
+one a restart cut short adds none unless it was a compaction. One that may pass (a 502 or 503, a
 transport failure, an error inside a 200) adds that `C-r` asks again,
 and the status row says so until it does; `retry` is the driven
 action. The status row is the state, the retry hint and a notice, then
@@ -1736,7 +1752,8 @@ an approval the mode, a rule or the classifier gave says nothing, and
 the person's answer, a refusal and a question are said as before. A reply
 with calls and no text stands on its reasoning's summary, the
 `reasoning.summary` entries of its `reasoning_details` or else the last
-paragraph of its reasoning, in place of `(tool calls)`. Conversation →
+paragraph of its reasoning; with neither it has no text, its calls'
+line saying what it did. Conversation →
 `Show tool activity`, checked while it shows, draws the open
 conversation again from its log with each call whole: a `tool calls`
 excerpt naming each call with its arguments, each result a `tool NAME`

@@ -295,8 +295,8 @@ fn messages_and_titled_sections_collapse_to_one_row() {
     );
 }
 
-/// Thirty one-line messages: each a header, a text row and a gap, 48 font
-/// pixels, five to a 240-pixel view.
+/// Thirty one-line messages: each a header, a text row and a gap, 56 font
+/// pixels, four and a bit to a 240-pixel view.
 fn long(scale: u8) -> Controller {
     let mut list = list(scale, 30, 240);
     for n in 0..30 {
@@ -317,7 +317,7 @@ fn the_list_scrolls_pages_and_follows_its_end() {
         // Following, the last message ends the view.
         assert!(list.following());
         assert_eq!(rows(&list).last().unwrap(), "G29");
-        assert_eq!(rows(&list).len(), 15);
+        assert_eq!(rows(&list).len(), 13);
         assert_eq!(key(&mut list, &mut board, Key::End), Outcome::Consumed);
         assert_eq!(key(&mut list, &mut board, Key::Home), Outcome::Changed);
         assert!(!list.following());
@@ -327,7 +327,7 @@ fn the_list_scrolls_pages_and_follows_its_end() {
         assert_eq!(first(&list), "line 0");
         // A page moves to the first row the view did not hold whole.
         key(&mut list, &mut board, Key::PageDown);
-        assert_eq!(first(&list), "line 5");
+        assert_eq!(first(&list), "G4");
         key(&mut list, &mut board, Key::PageUp);
         assert_eq!(first(&list), "line 0");
         list.event(Event::Wheel { rows: 4 }, &mut board);
@@ -1980,7 +1980,8 @@ fn icon_buttons_are_lit_and_named_under_the_pointer() {
     // the pointer there lights and names nothing.
     for scale in 1..=4 {
         let s = i64::from(scale);
-        let mut list = list(scale, 40, 49);
+        // A message is 56 pixels: its header, its row and the gap.
+        let mut list = list(scale, 40, 57);
         for _ in 0..6 {
             list.push(text("assistant", "a reply").action("Debug").unwrap())
                 .unwrap();
@@ -2055,9 +2056,9 @@ fn covered(draws: &[Draw], color: u32, (x, y): (i64, i64)) -> bool {
     }) == Some(color)
 }
 
-/// A bubble sits flush to its side, as wide as its widest row or what its
-/// header shows needs, a cell each side, up to the list's text columns
-/// less a fifth; a full message stays across the list. A bubble's text is
+/// A bubble sits eight pixels in from its side, as wide as its widest row
+/// or what its header shows needs, a cell each side, up to the list's text
+/// columns less a fifth; a full message stays across the list. A bubble's text is
 /// laid a cell in from its own edge, and a press, a double click and its
 /// buttons and fold mark act within it; a press beside it folds nothing.
 #[test]
@@ -2067,7 +2068,8 @@ fn bubbles_sit_on_their_side_as_wide_as_they_need() {
         let mut board = Board::default();
         let mut list = list(scale, 60, 300);
         let view = view(&list, scale);
-        let right = view.x + i64::from(view.width);
+        let margin = 8 * i64::from(scale);
+        let right = view.x + i64::from(view.width) - margin;
         list.push(text("you", "a question").side(Side::Right))
             .unwrap();
         list.push(text("assistant", &"x".repeat(100)).side(Side::Left))
@@ -2082,7 +2084,10 @@ fn bubbles_sit_on_their_side_as_wide_as_they_need() {
         assert_eq!((body.x, body.width), (header.x, header.width));
         // The long one wraps to 48 columns, a fifth of 60 left free.
         let (header, body) = bubble(&list, 1);
-        assert_eq!((header.x, i64::from(header.width)), (view.x, 50 * cell));
+        assert_eq!(
+            (header.x, i64::from(header.width)),
+            (view.x + margin, 50 * cell)
+        );
         assert_eq!(
             rows(&list)
                 .iter()
@@ -2168,6 +2173,125 @@ fn bubbles_sit_on_their_side_as_wide_as_they_need() {
     }
 }
 
+/// A plain message and a divider lie across the list on the paper: no
+/// band and no rule over their headers, whose fold mark and label are in
+/// quiet ink, the time after the label; their text is the page's ink. A
+/// divider's header runs a rule from a cell past what it shows (its
+/// label, status and time) to a cell before its verdict, or before its
+/// buttons without one, and none when it shows up to that limit.
+/// Focused, either header is the selected row's, and a divider draws no
+/// rule over it.
+#[test]
+fn plain_messages_and_dividers_lie_across_on_the_paper() {
+    for scale in 1..=4 {
+        let s = i64::from(scale);
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let mut list = list(scale, 60, 360);
+        let view = view(&list, scale);
+        list.push(
+            text("bot", "gg")
+                .side(Side::Plain)
+                .time("14:05", "today")
+                .unwrap(),
+        )
+        .unwrap();
+        list.push(text("zz", "ww").side(Side::Divider)).unwrap();
+        list.push(
+            text("kk", "vv")
+                .side(Side::Divider)
+                .status("failed", Tone::Bad)
+                .unwrap()
+                .time("09:17", "today")
+                .unwrap()
+                .verdict("held", Tone::Neutral)
+                .unwrap(),
+        )
+        .unwrap();
+        list.push(text(&"x".repeat(60), "uu").side(Side::Divider))
+            .unwrap();
+        let draws = drawn(&list, scale);
+        for message in 0..4 {
+            let (header, body) = bubble(&list, message);
+            assert_eq!((header.x, header.width), (view.x, view.width));
+            assert_eq!(body.unwrap().x, view.x, "{scale}");
+            assert!(covered(&draws, PAPER, (header.x + 2 * s, header.y + 2 * s)));
+            assert!(!covered(&draws, BORDER, (header.x + 2 * s, header.y)));
+            assert!(!covered(
+                &draws,
+                CHROME,
+                (header.x + 2 * s, header.y + 2 * s)
+            ));
+        }
+        let glyph = |scalar: char, ink: u32| {
+            draws.iter().any(|draw| {
+                matches!(draw.primitive,
+                    Primitive::Glyph { scalar: c, style, .. }
+                        if c == scalar && style == GlyphStyle::medium(ink, PAPER))
+            })
+        };
+        let only = |scalar: char, ink: u32, not: u32| glyph(scalar, ink) && !glyph(scalar, not);
+        // The fold marks, the labels and the times quiet; every text the
+        // page's ink, a divider's too.
+        assert!(only('\u{25be}', LINE_NUMBER, INK), "{scale}");
+        for label in ['b', 't', 'z', 'k', 'x'] {
+            assert!(only(label, LINE_NUMBER, INK), "{label} {scale}");
+        }
+        assert!(glyph('4', LINE_NUMBER) && glyph('7', LINE_NUMBER));
+        for body in ['g', 'w', 'v', 'u'] {
+            assert!(only(body, INK, LINE_NUMBER), "{body} {scale}");
+        }
+        let rule = |list: &Controller, message: usize| {
+            let (header, _) = bubble(list, message);
+            (header, header.y + i64::from(header.height) / 2)
+        };
+        // A bare divider: from a cell past its label to a cell before
+        // the cell before its copy button, at the middle, a pixel high.
+        let (header, middle) = rule(&list, 1);
+        let from = header.x + (3 + 2 + 1) * cell;
+        let to = list.copy_button(1).unwrap().x - 2 * cell;
+        assert!(covered(&draws, BORDER, (from, middle)), "{scale}");
+        assert!(!covered(&draws, BORDER, (from - 1, middle)), "{scale}");
+        assert!(covered(&draws, BORDER, (to - 1, middle)), "{scale}");
+        assert!(!covered(&draws, BORDER, (to, middle)), "{scale}");
+        assert!(!covered(&draws, BORDER, (from, middle + s)), "{scale}");
+        // With a status, a time and a verdict: from a cell past the time
+        // (after the label, two cells, the status and two more) to a cell
+        // before the verdict's mark.
+        let (header, middle) = rule(&list, 2);
+        let from = header.x + (3 + 2 + 2 + 6 + 2 + 5 + 1) * cell;
+        let to = list.copy_button(2).unwrap().x - cell - (4 + 2) * cell - cell;
+        assert!(covered(&draws, BORDER, (from, middle)), "{scale}");
+        assert!(!covered(&draws, BORDER, (from - 1, middle)), "{scale}");
+        assert!(covered(&draws, BORDER, (to - 1, middle)), "{scale}");
+        assert!(!covered(&draws, BORDER, (to, middle)), "{scale}");
+        // A label up to the limit leaves no room for a rule.
+        let (header, middle) = rule(&list, 3);
+        let copy = list.copy_button(3).unwrap();
+        for x in (header.x..copy.x).step_by(cell as usize) {
+            assert!(!covered(&draws, BORDER, (x, middle)), "{x} {scale}");
+        }
+        // A plain message has no rule.
+        let (header, middle) = rule(&list, 0);
+        assert!(!covered(&draws, BORDER, (header.x + 30 * cell, middle)));
+        // Focused, a header on the paper is the selected row's, and a
+        // divider's rule gives way to it.
+        for message in 0..3 {
+            assert!(list.focus_on(message));
+            let draws = drawn(&list, scale);
+            let (header, middle) = rule(&list, message);
+            assert!(covered(
+                &draws,
+                SELECTED_ROW,
+                (header.x + 2 * s, header.y + 2 * s)
+            ));
+            assert!(
+                !covered(&draws, BORDER, (header.x + 30 * cell, middle)),
+                "{message} {scale}"
+            );
+        }
+    }
+}
+
 /// A bubble's text wraps to its own columns; streamed text widens it, and
 /// a resize lays it out again at its new columns.
 #[test]
@@ -2198,6 +2322,8 @@ fn a_bubble_widens_as_its_text_streams_in() {
         assert_eq!(body.unwrap().width, header.width);
         assert!(rows(&list).iter().all(|row| row.chars().count() <= 32));
         assert!(!list.hover(Some((header.x + i64::from(header.width) - 2, header.y + 6))));
+        // As wide as the view, it has no room for its margin: flush.
+        assert_eq!(header.x, view(&list, scale).x);
         assert!(!drawn(&list, scale)
             .iter()
             .any(|draw| matches!(draw.primitive, Primitive::Glyph { scalar: ':', .. })));
@@ -2227,7 +2353,7 @@ fn a_bubble_is_its_sides_ground_with_stepped_corners() {
         )
         .unwrap();
         let draws = drawn(&list, scale);
-        let radius = 4 * s;
+        let radius = 8 * s;
         for (message, ground) in [(0, BUBBLE), (1, CHROME), (2, CHROME)] {
             let (header, _) = bubble(&list, message);
             let last = list
@@ -2240,8 +2366,8 @@ fn a_bubble_is_its_sides_ground_with_stepped_corners() {
                 .unwrap()
                 .0;
             let (left, right) = (header.x, header.x + i64::from(header.width) - 1);
-            // Its foot, four pixels of the gap below, ends it.
-            let bottom = last.y + i64::from(last.height) + 4 * s - 1;
+            // Its foot, eight pixels of the gap below, ends it.
+            let bottom = last.y + i64::from(last.height) + 8 * s - 1;
             for corner in [
                 (left, header.y),
                 (right, header.y),
@@ -2258,7 +2384,7 @@ fn a_bubble_is_its_sides_ground_with_stepped_corners() {
                 (left, header.y + radius),
                 (right - radius, bottom),
                 (right, bottom - radius),
-                (left + 2 * s, header.y + 2 * s),
+                (left + 4 * s, header.y + 4 * s),
             ] {
                 assert!(
                     covered(&draws, ground, inside),
@@ -2273,7 +2399,7 @@ fn a_bubble_is_its_sides_ground_with_stepped_corners() {
         assert!(covered(
             &draws,
             SELECTED_ROW,
-            (header.x + 2 * s, header.y + 2 * s)
+            (header.x + 4 * s, header.y + 4 * s)
         ));
         assert!(covered(
             &draws,

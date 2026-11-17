@@ -43,7 +43,7 @@ pub const MAX_PICTURE_BYTES: usize = 256 << 20;
 /// The text columns a layout needs, besides a cell each side.
 pub const MIN_COLUMNS: usize = 16;
 /// The space below each message, in font pixels.
-pub const GAP: usize = 8;
+pub const GAP: usize = 16;
 /// The longest wait between a click's release and the next press that
 /// makes the two a double click.
 pub const MULTI_CLICK_MS: u64 = 500;
@@ -73,7 +73,10 @@ const NEAR: i64 = 4;
 /// side, as a divisor (a fifth), where its time goes.
 const ROOM_DIVISOR: usize = 5;
 /// A bubble's corner radius, in font pixels.
-const CORNER: i64 = 4;
+const CORNER: i64 = 8;
+/// How far a bubble stands in from its side of the view, in font pixels,
+/// where the view holds it beside the bubble.
+const MARGIN: i64 = 8;
 /// The ground a bubble takes from the gap below its last row, in font
 /// pixels, so its text clears its foot: as tall as a corner is round.
 const FOOT: i64 = CORNER;
@@ -222,12 +225,31 @@ impl Section {
 /// wide as its text and header need, up to the list's less a fifth.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Side {
+    /// Across the list, its header a `CHROME` band under a rule.
     #[default]
     Full,
     /// The others' side: a `CHROME` bubble.
     Left,
     /// The person's own: a `BUBBLE` bubble.
     Right,
+    /// Across the list on the paper, its header quiet and unbanded: a
+    /// reply that reads as the page's own text.
+    Plain,
+    /// Across the list on the paper, its header a quiet label followed by
+    /// a rule: a notice between the others.
+    Divider,
+}
+
+impl Side {
+    /// Whether it lies across the list rather than as a bubble.
+    fn across(self) -> bool {
+        matches!(self, Self::Full | Self::Plain | Self::Divider)
+    }
+
+    /// Whether its header is drawn on the paper, with no band of its own.
+    fn on_paper(self) -> bool {
+        matches!(self, Self::Plain | Self::Divider)
+    }
 }
 
 /// What a tooltip names (`Tip`): a header's copy button, its action, a
@@ -321,8 +343,8 @@ impl Message {
     }
 
     /// The time it was written: `text`, at most `MAX_TIME_CHARS`, beside
-    /// a bubble's header or in a full message's after its status, and
-    /// `tip` its tooltip (the whole date).
+    /// a bubble's header or in a header across the list after its status,
+    /// and `tip` its tooltip (the whole date).
     pub fn time(mut self, text: &str, tip: &str) -> Result<Self, Error> {
         if text.chars().count() > MAX_TIME_CHARS {
             return Err(Error::Limit);
@@ -1553,9 +1575,10 @@ impl Controller {
     /// The columns `message`'s text wraps to: the list's, or a bubble's,
     /// less the room.
     fn wrap_columns(&self, message: &Message) -> usize {
-        match message.side {
-            Side::Full => self.columns(),
-            Side::Left | Side::Right => self.columns().saturating_sub(self.room()),
+        if message.side.across() {
+            self.columns()
+        } else {
+            self.columns().saturating_sub(self.room())
         }
     }
 
@@ -1592,14 +1615,15 @@ impl Controller {
     }
 
     /// Where message `index`'s row at `row` (the view's width) is drawn:
-    /// across the view, or its bubble's part of it, flush to its side: as
-    /// wide as its rows, which wrap short of the far side's room, or as its
-    /// header needs, up to the whole view, so a long status is not cut.
+    /// across the view, or its bubble's part of it, `MARGIN` in from its
+    /// side as far as the view holds that beside it: as wide as its rows,
+    /// which wrap short of the far side's room, or as its header needs, up
+    /// to the whole view, so a long status is not cut.
     fn frame(&self, index: usize, row: Rect) -> Rect {
         let Some(message) = self.messages.get(index) else {
             return row;
         };
-        if message.side == Side::Full {
+        if message.side.across() {
             return row;
         }
         let view = self.view();
@@ -1610,9 +1634,13 @@ impl Controller {
             .max(self.header_columns(message))
             .min(self.columns());
         let width = ((columns + 2) as i64 * cell).min(i64::from(view.width)) as u32;
+        let s = self.surface.scale.value() as i64;
+        let margin = (MARGIN * s)
+            .min(i64::from(view.width) - i64::from(width))
+            .max(0);
         let x = match message.side {
-            Side::Right => view.x + i64::from(view.width) - i64::from(width),
-            Side::Left | Side::Full => view.x,
+            Side::Right => view.x + i64::from(view.width) - i64::from(width) - margin,
+            _ => view.x + margin,
         };
         Rect { x, width, ..row }
     }
@@ -1636,9 +1664,9 @@ impl Controller {
     }
 
     /// Where message `index`'s time shows, given its header's frame:
-    /// beside a bubble when the view beside it holds it and a cell each
-    /// side, or in a full header after the label and status when it ends
-    /// before the header's limit.
+    /// beside a bubble when the view on its far side holds it and a cell
+    /// each side, or in a header across the list after the label and
+    /// status when it ends before the header's limit.
     fn time_rect(&self, index: usize, header: Rect) -> Option<Rect> {
         let message = self.messages.get(index)?;
         let (text, _) = message.time.as_ref()?;
@@ -1647,7 +1675,7 @@ impl Controller {
         let chars = text.chars().count();
         let width = chars as i64 * cell;
         let x = match message.side {
-            Side::Full => {
+            side if side.across() => {
                 let status = message
                     .status
                     .as_ref()
@@ -1658,11 +1686,21 @@ impl Controller {
                 }
                 x
             }
-            _ if i64::from(self.view().width) - i64::from(header.width) < width + 2 * cell => {
-                return None
+            side => {
+                // The view's room on the bubble's far side.
+                let view = self.view();
+                let beside = match side {
+                    Side::Right => header.x - view.x,
+                    _ => view.x + i64::from(view.width) - (header.x + i64::from(header.width)),
+                };
+                if beside < width + 2 * cell {
+                    return None;
+                }
+                match side {
+                    Side::Right => header.x - cell - width,
+                    _ => header.x + i64::from(header.width) + cell,
+                }
             }
-            Side::Left => header.x + i64::from(header.width) + cell,
-            Side::Right => header.x - cell - width,
         };
         Some(Rect {
             x,
@@ -2731,11 +2769,11 @@ impl Controller {
             };
             let side = self.messages.get(index).map_or(Side::Full, |m| m.side);
             let paper = match side {
-                Side::Full => PAPER,
+                Side::Full | Side::Plain | Side::Divider => PAPER,
                 Side::Left => CHROME,
                 Side::Right => BUBBLE,
             };
-            if side != Side::Full {
+            if !side.across() {
                 // A bubble's ground, its top corners stepped round on its
                 // header and its bottom ones on its foot, the top of the
                 // gap below it.
@@ -2946,8 +2984,8 @@ impl Controller {
         with(&fitted);
     }
 
-    /// Message `index`'s time, beside its bubble's header or in its full
-    /// header, in line-number ink: `row_clip` is the header row's, since
+    /// Message `index`'s time, beside its bubble's header or in its
+    /// header across the list, in line-number ink: `row_clip` is the header row's, since
     /// beside a bubble is outside its frame.
     fn paint_time(&self, index: usize, header: Rect, row_clip: Rect, sink: &mut dyn FnMut(Draw)) {
         let (Some(message), Some(at)) = (self.messages.get(index), self.time_rect(index, header))
@@ -2958,9 +2996,9 @@ impl Controller {
             return;
         };
         let ground = match message.side {
-            Side::Full if self.focus == Some(index) => SELECTED_ROW,
+            side if side.across() && self.focus == Some(index) => SELECTED_ROW,
             Side::Full => CHROME,
-            Side::Left | Side::Right => PAPER,
+            _ => PAPER,
         };
         text_run(
             self.surface.scale,
@@ -3198,10 +3236,20 @@ impl Controller {
             (true, _) => SELECTED_ROW,
             (false, Side::Right) => BUBBLE,
             (false, Side::Full | Side::Left) => CHROME,
+            (false, Side::Plain | Side::Divider) => PAPER,
         };
-        // A full header is a band under a rule; a bubble's is its top,
-        // its ground already painted round.
-        if message.side == Side::Full {
+        // A header on the paper is quiet, so the text below it leads.
+        let ink = if message.side.on_paper() {
+            LINE_NUMBER
+        } else {
+            INK
+        };
+        // A full header is a band under a rule; one on the paper is its
+        // ground alone; a bubble's is its top, its ground already painted
+        // round.
+        if message.side.on_paper() {
+            fill(rect, ground, clip, sink);
+        } else if message.side == Side::Full {
             fill(rect, ground, clip, sink);
             fill(
                 Rect {
@@ -3244,7 +3292,7 @@ impl Controller {
             &mut std::iter::once(mark),
             rect.x + cell,
             buttons,
-            INK,
+            ink,
             sink,
         );
         // The verdict ends a cell before the buttons; the label and status
@@ -3253,10 +3301,35 @@ impl Controller {
         let limit = self.header_limit(line.message as usize, rect);
         let verdict_x = limit + cell;
         let label_x = rect.x + 3 * cell;
-        glyphs(&mut message.label.chars(), label_x, limit, INK, sink);
+        glyphs(&mut message.label.chars(), label_x, limit, ink, sink);
+        let mut end = label_x + message.label.chars().count() as i64 * cell;
         if let Some((status, tone)) = &message.status {
             let x = label_x + (message.label.chars().count() as i64 + 2) * cell;
             glyphs(&mut status.chars(), x, limit, tone.ink(), sink);
+            end = x + status.chars().count() as i64 * cell;
+        }
+        if message.side == Side::Divider && !focused {
+            // The rule runs from a cell past what the header shows
+            // (its time included) to a cell before its verdict; a
+            // focused header is the selected row's band alone.
+            let shown = self
+                .time_rect(line.message as usize, rect)
+                .map_or(end, |time| time.x + i64::from(time.width));
+            let from = shown.min(limit) + cell;
+            let to = limit;
+            if to > from {
+                fill(
+                    Rect {
+                        x: from,
+                        y: rect.y + i64::from(rect.height) / 2,
+                        width: (to - from) as u32,
+                        height: s as u32,
+                    },
+                    BORDER,
+                    clip,
+                    sink,
+                );
+            }
         }
         if let Some((verdict, tone)) = &message.verdict {
             glyphs(
@@ -3268,7 +3341,7 @@ impl Controller {
             );
         }
         // An icon button is flat: its icon half a cell in, on the
-        // header's ground, or lit `BORDER`, which stands off both grounds
+        // header's ground, or lit `BORDER`, which stands off every ground
         // a header has, while the pointer hovers over it.
         let icon = |scalar: char, at: Rect, sink: &mut dyn FnMut(Draw)| {
             let lit = self.hovered().is_some_and(|(x, y)| at.contains(x, y));

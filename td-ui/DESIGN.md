@@ -3396,8 +3396,8 @@ it past the fold mark's three cells (a narrower header neither draws it
 nor takes its press, so the mark still folds); the label and status
 stop a cell short of the verdict, so at the narrowest layouts the
 buttons may leave the label no room.
-Headers are `CHROME` under a `BORDER` rule, the focused message's
-`SELECTED_ROW`; text is `INK` on `PAPER`, selected text the text entry's
+A full message's header is `CHROME` under a `BORDER` rule, the focused
+message's `SELECTED_ROW`; text is `INK` on `PAPER`, selected text the text entry's
 `SELECTED` with paper ink while the list has focus and
 `INACTIVE_SELECTION` without; titles and the more row are
 `LINE_NUMBER`. A rectangle narrower than `MIN_COLUMNS` and the gutter,
@@ -3475,8 +3475,8 @@ hovers with no button held (`hover`, from the window's
 `Handler::motion`), which answers whether the button under it changed;
 only a point inside the view counts, so a header cut off at the view's
 foot has no button below it. An icon button under it is lit `BORDER`,
-which stands off both a header's `CHROME` and a focused one's
-`SELECTED_ROW`; a captioned button is not lit. `tip` names the button
+which stands off every ground a header has (`CHROME`, `PAPER`, `BUBBLE`
+and a focused one's `SELECTED_ROW`); a captioned button is not lit. `tip` names the button
 under it, icon or caption: its message, its `Target`, its
 rectangle and its tooltip's text, `COPY_TIP` (naming the list's own
 `CopyMessage` chord), the action's tip, or its caption without one;
@@ -3489,14 +3489,28 @@ icon is a non-control scalar and its tip a label, counted in the list's
 bytes.
 
 A message sits on a `Side`: `Full`, across the list as above, the
-default, or as a bubble, `Left` for the others' messages and `Right` for
-the person's own. A bubble's text wraps short of its far side by a fifth
+default; `Plain` or `Divider`, across the list as `Full` is but on the
+paper; or as a bubble, `Left` for the others' messages and `Right` for
+the person's own. A plain message is a reply that reads as the page's
+own text: its header has no band and no rule, its ground `PAPER`, its
+fold mark and label in `LINE_NUMBER` ink, so the text below leads, and
+its text is `INK` on `PAPER`. A divider is a notice between the others:
+its header is a plain one's with a `BORDER` rule a scale pixel high
+across the header's middle, from a cell past what the header shows (its
+label, status and time) to its label's limit, a cell before its
+verdict, and none where the header shows up to that limit; its text,
+plain or styled, is a plain message's, since a notice may report a
+failure. A focused plain or divider header is the selected row's, as a
+full one is, and a focused divider draws no rule over it. A bubble's text wraps short of its far side by a fifth
 of the list's text columns, its room, and it is as wide as its widest
 laid row, a title row's mark and title and the more row included, kept
 as the message is laid out and widened as text streams in, or as its
 header needs for its label, status, verdict and buttons spaced as a full
 header spaces them, up to the whole view, so a long status is not cut; a
-cell each side, flush to its side of the view. Its rows are drawn, hit
+cell each side, `MARGIN` (eight pixels, scaled) in from its side of the
+view, or as far as the view holds beside a bubble that wide; a bubble
+wrapped to its room keeps the room less that margin beside it for its
+time. Its rows are drawn, hit
 and read back (`shown`) within it: its text a cell in from its own edge,
 a press and a double click at their columns there, its buttons and fold
 mark at its own right and left; a press beside it on its header or a
@@ -3505,13 +3519,14 @@ side's ground, `CHROME` for the others' and the palette's `BUBBLE` for
 the person's own, its header the selected row's when focused, and its
 foot too when the header is its only row, its title and more rows in
 line-number ink on that ground; its top corners are stepped round on its
-header and its bottom ones on a foot of `CORNER` pixels taken from the
-gap below it, a pixel row a fill. A message may carry a time
+header and its bottom ones on a foot of `CORNER` pixels (eight, scaled)
+taken from the `GAP` (sixteen) below it, a pixel row a fill. A message may carry a time
 (`Message::time`, `set_time` on one shown), at most `MAX_TIME_CHARS` of
 a label and a tip, counted in the list's bytes: beside a bubble's
-header, a cell from it on its far side, when the view beside it holds it
-and a cell each side; in a full header after its label and status, when
-it ends before the verdict; in line-number ink. The pointer on it names
+header, a cell from it on its far side, when the view on that side of
+the bubble holds it and a cell each side; in a header across the list
+after its label and status, when it ends before the verdict; in
+line-number ink. The pointer on it names
 it to `tip` as a `Target::Time` with its tip, beside `Target::Copy` and
 `Target::Action`. The list keeps no clock: its owner formats the time.
 

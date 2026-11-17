@@ -244,6 +244,12 @@ fn reply_body(message: Message, text: &str) -> Result<Message, MessagesError> {
     }
 }
 
+/// A notice of td-agent's own: a divider across the transcript labelled
+/// by what it is about (DESIGN.md §4, Notices).
+fn divider(topic: &str) -> Result<Message, MessagesError> {
+    Message::new(topic).map(|m| m.side(Side::Divider))
+}
+
 /// What the open picker chooses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Picking {
@@ -2508,18 +2514,20 @@ impl App {
                 self.relist();
                 let replied = outcome.starts_with("replied");
                 // "no model" is how an older td-agent's turns ended.
+                // A reply speaks for itself: only a turn that did not
+                // reply is marked on the person's message.
                 let status = if replied {
-                    ("replied", Tone::Good)
+                    None
                 } else if outcome == "no model" {
-                    ("no model", Tone::Neutral)
+                    Some(("no model", Tone::Neutral))
                 } else if outcome.starts_with(crate::conversation::LIMIT) {
                     // A limit the human set, reached: not a failure.
-                    ("stopped at a limit", Tone::Neutral)
+                    Some(("stopped at a limit", Tone::Neutral))
                 } else {
-                    ("not answered", Tone::Bad)
+                    Some(("not answered", Tone::Bad))
                 };
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
-                    let _ = self.transcript.set_status(index, Some(status));
+                    let _ = self.transcript.set_status(index, status);
                 }
                 // The summary says a compaction that stood; one that did
                 // not says why here.
@@ -2540,8 +2548,7 @@ impl App {
                     } else {
                         "turn"
                     };
-                    let pushed = Message::new("td-agent")
-                        .and_then(|m| m.status(effect, Tone::Neutral))
+                    let pushed = divider(effect)
                         .and_then(|m| m.text(&text))
                         .map_err(|e| e.to_string())
                         .and_then(|m| self.push_message(m));
@@ -2570,8 +2577,7 @@ impl App {
                     .any(|(turn, of)| *turn == started && *of == 0)
                     && self.transcript_task.is_none()
                 {
-                    let pushed = Message::new("td-agent")
-                        .and_then(|m| m.status("compaction", Tone::Neutral))
+                    let pushed = divider("compaction")
                         .and_then(|m| {
                             m.text("the compaction was cut short by a restart; nothing it asked for stands")
                         })
@@ -2601,17 +2607,20 @@ impl App {
                     && content.as_deref().is_some_and(|c| !c.trim().is_empty());
                 let (status, said) = if stands {
                     (
-                        ("compacted", Tone::Neutral),
+                        None,
                         "from here the model's view begins with this summary, the state carried over and its most recent steps",
                     )
                 } else {
                     (
-                        ("not compacted", Tone::Bad),
+                        Some(("not compacted", Tone::Bad)),
                         "this summary does not stand; the model's view is as it was",
                     )
                 };
-                let pushed = Message::new("td-agent")
-                    .and_then(|m| m.status(status.0, status.1))
+                let pushed = divider(if stands { "compacted" } else { "compaction" })
+                    .and_then(|m| match status {
+                        Some((status, tone)) => m.status(status, tone),
+                        None => Ok(m),
+                    })
                     .and_then(|m| m.text(said))
                     .and_then(|m| m.section("summary", content.as_deref().unwrap_or_default(), true))
                     .map_err(|e| e.to_string())
@@ -2646,7 +2655,7 @@ impl App {
                 let text = match (text.is_empty(), calls.is_empty(), &thought) {
                     (true, true, _) => "(no text)",
                     (true, false, Some(thought)) => thought,
-                    (true, false, None) => "(tool calls)",
+                    (true, false, None) => "",
                     _ => &text,
                 };
                 // Each call whole while tool activity shows; else one line
@@ -2667,19 +2676,25 @@ impl App {
                 };
                 let verdict = if incomplete {
                     Some(("incomplete", Tone::Bad))
-                } else if finish == "stop" {
+                } else if finish == "stop" || (finish == "tool_calls" && !calls.is_empty()) {
+                    // How a reply ends when it answers or calls tools.
                     None
                 } else {
                     Some((finish.as_str(), Tone::Neutral))
                 };
                 let mut message = Message::new(self.author(request))
-                    .map(|m| m.side(Side::Left))
+                    .map(|m| m.side(Side::Plain))
                     .and_then(|m| self.stamped(m, event.time));
                 if let Some(reasoning) = &reasoning {
                     message = message.and_then(|m| m.section("reasoning", reasoning, true));
                 }
+                // A reply of calls alone has no body: its calls' line
+                // says what it did.
                 let message = message
-                    .and_then(|m| reply_body(m, text))
+                    .and_then(|m| match text {
+                        "" => Ok(m),
+                        text => reply_body(m, text),
+                    })
                     .and_then(|m| match (calls.is_empty(), folded) {
                         (true, _) => Ok(m),
                         (false, true) => m.section(&title, &called, true),
@@ -2762,8 +2777,7 @@ impl App {
                 ..
             } => {
                 self.system(Ok(&prefix), false);
-                let pushed = Message::new("td-agent")
-                    .and_then(|m| m.status(&format!("{agent} sub-agent"), Tone::Neutral))
+                let pushed = divider(&format!("{agent} sub-agent"))
                     .and_then(|m| m.text(&format!("the {agent} sub-agent runs on {model}")))
                     .and_then(|m| m.section("prompt", &prompt, true))
                     .map_err(|e| e.to_string())
@@ -3032,8 +3046,7 @@ impl App {
 
     /// A notice of td-agent's in the transcript.
     fn notice_message(&mut self, text: &str) {
-        let pushed = Message::new("td-agent")
-            .and_then(|m| m.status("notice", Tone::Neutral))
+        let pushed = divider("notice")
             .and_then(|m| m.text(text))
             .map_err(|e| e.to_string())
             .and_then(|m| self.push_message(m));
@@ -3236,7 +3249,7 @@ impl App {
         styled: bool,
     ) -> Result<Message, String> {
         let mut message = Message::new(who)
-            .map(|m| m.side(Side::Left))
+            .map(|m| m.side(Side::Plain))
             .and_then(|m| m.status("streaming", Tone::Neutral));
         if let Some(reasoning) = reasoning {
             message = message.and_then(|m| m.section("reasoning", reasoning, true));
@@ -8837,7 +8850,12 @@ pub mod tests {
             shown.contains("in 12k (cached 11k, written 0) out 30 $0.0123"),
             "{shown}"
         );
-        assert!(shown.contains("replied"), "{shown}");
+        // A turn that replied leaves the person's message unmarked, its
+        // `running` taken off.
+        assert!(
+            !shown.contains("replied") && !shown.contains("you  running"),
+            "{shown}"
+        );
         assert!(app.status_line().contains("ctx 12k/200k | cost $0.0123"));
         assert_eq!(app.rows()[0].state, RowState::Idle);
         // The same events again, as a reopened conversation's process may
@@ -9000,8 +9018,13 @@ pub mod tests {
             of: 1,
         };
         app.update(at(4, compaction()), 0);
-        // The row runs; the message stays as its turn left it.
-        assert!(text(&app).contains("you  replied"), "{}", text(&app));
+        // The row runs; the message stays as its turn left it, a reply
+        // marking it no more.
+        let shown = text(&app);
+        assert!(
+            !shown.contains("you  running") && !shown.contains("you  replied"),
+            "{shown}"
+        );
         app.update(
             at(
                 5,
@@ -9110,10 +9133,11 @@ pub mod tests {
         );
     }
 
-    /// The person's messages sit on the right and replies on the left,
-    /// each with its event's time beside it, in the window's zone, and
-    /// the whole date its tooltip; a streamed reply gets its time as it
-    /// settles; a notice stays across the list.
+    /// The person's messages sit on the right, a bubble in from the
+    /// edge, and replies across the list on the paper, each with its
+    /// event's time, in the window's zone, and the whole date its
+    /// tooltip; a streamed reply gets its time as it settles; a notice is
+    /// a divider across the list, its header ruled.
     #[test]
     fn messages_sit_on_their_sides_with_their_times() {
         let mut app = app();
@@ -9162,16 +9186,49 @@ pub mod tests {
             .collect();
         let list = app.transcript.rect();
         let view_right = list.x + i64::from(list.width) - 16;
-        let [mine, theirs, notice] = headers[..] else {
+        let [mine, reply, notice] = headers[..] else {
             panic!("three headers: {headers:?}");
         };
-        assert_eq!(mine.x + i64::from(mine.width), view_right);
+        // Mine a bubble on the right, in from the edge; the reply and the
+        // notice across the list.
+        assert_eq!(mine.x + i64::from(mine.width), view_right - 8);
         assert!(mine.x > list.x);
-        assert_eq!(theirs.x, list.x);
-        assert!(theirs.x + i64::from(theirs.width) < view_right);
+        for across in [reply, notice] {
+            assert_eq!(
+                (across.x, across.x + i64::from(across.width)),
+                (list.x, view_right)
+            );
+        }
+        // The reply's header on the paper, unbanded and unruled; the
+        // notice a divider labelled by what it is, ruled.
+        assert_eq!(app.transcript().message(2).unwrap().label(), "notice");
+        let mut draws = Vec::new();
+        app.transcript
+            .emit(app.surface.bounds(), &mut |draw| draws.push(draw));
+        let last_fill = |(x, y): (i64, i64)| {
+            draws.iter().rev().find_map(|draw| match draw.primitive {
+                Primitive::Fill { rect, color }
+                    if rect.contains(x, y) && draw.clip.contains(x, y) =>
+                {
+                    Some(color)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(last_fill((reply.x + 2, reply.y + 2)), Some(PAPER));
+        assert_eq!(last_fill((reply.x + 2, reply.y)), Some(PAPER));
+        let middle = notice.y + i64::from(notice.height) / 2;
+        assert_eq!(last_fill((notice.x + 2, notice.y + 2)), Some(PAPER));
         assert_eq!(
-            (notice.x, notice.x + i64::from(notice.width)),
-            (list.x, view_right)
+            last_fill((notice.x + 20 * td_ui::CELL_WIDTH as i64, middle)),
+            Some(BORDER)
+        );
+        assert_ne!(
+            last_fill((
+                reply.x + 20 * td_ui::CELL_WIDTH as i64,
+                reply.y + i64::from(reply.height) / 2
+            )),
+            Some(BORDER)
         );
         // The time before mine, its tooltip the whole date.
         let cell = td_ui::CELL_WIDTH as i64;
@@ -9186,6 +9243,50 @@ pub mod tests {
         app.tick(1_000);
         app.tick(1_500);
         assert!(text(&app).contains("2025-10-09 08:53:20"), "{}", text(&app));
+    }
+
+    /// A reply that ends `tool_calls` without calls says so, as any end
+    /// other than `stop` does; with calls it is the usual end, unsaid.
+    #[test]
+    fn a_reply_says_an_unusual_end() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: Some("odd".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: Vec::new(),
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(shown.contains("tool_calls"), "{shown}");
+        // A reply logged without a stream lies on the paper too: its
+        // header unbanded.
+        let header = app
+            .transcript
+            .shown()
+            .filter(|(_, shown)| matches!(shown, td_ui::messages::Shown::Header { message: 1 }))
+            .map(|(rect, _)| rect)
+            .next()
+            .unwrap();
+        let mut ground = None;
+        app.transcript.emit(app.surface.bounds(), &mut |draw| {
+            if let Primitive::Fill { rect, color } = draw.primitive {
+                if rect.contains(header.x + 2, header.y + 2) {
+                    ground = Some(color);
+                }
+            }
+        });
+        assert_eq!(ground, Some(PAPER));
     }
 
     /// Deltas draw the reply into one message as they come; the logged
@@ -10071,7 +10172,6 @@ pub mod tests {
             "the build is green",
             "held: wake budget",
             "running",
-            "(tool calls)",
             "history_search({\"query\":\"green\"})",
             "tool history_search",
             "No event matches.",
@@ -10079,6 +10179,13 @@ pub mod tests {
         ] {
             assert!(shown.contains(said), "{said} in {shown}");
         }
+        // A reply of calls alone has no body and no verdict: its calls
+        // say what it did.
+        assert!(
+            !shown.contains("(tool calls)") && !shown.contains("tool_calls"),
+            "{shown}"
+        );
+        assert_eq!(app.transcript().message(1).unwrap().sections(), 1);
         // A notice in the background is said in the status row.
         app.background(
             &id(2),
