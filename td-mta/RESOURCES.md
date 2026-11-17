@@ -4588,6 +4588,13 @@ does not reserve an additional read slot per message. No transaction is retained
 while a sender supplies DATA, and worker shutdown closes the connection before
 releasing its permit.
 
+The accepted-mail rate table (DESIGN.md section 9) is a fixed array of 256
+keys, about 8 KiB, owned by the network loop and created once per receiving
+run. It never allocates, takes no lock and is not multiplied by listeners,
+sessions or accounts. Every network turn of every session scans it once to
+decide the next MAIL; charging an acceptance scans it up to three more times
+(known key, reusable entry, eviction choice). Each scan is 256 comparisons.
+
 
 ## Relay account registry
 

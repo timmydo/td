@@ -313,6 +313,20 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
     }
 }
 
+/// Charge the peer's last acceptance, then decide its next MAIL.
+fn rate_turn(
+    rates: &mut crate::smtp_rate::PeerRates,
+    peer: IpAddr,
+    network: &mut Network<'_>,
+    now: Tick,
+) {
+    let key = crate::smtp_rate::PeerKey::from(peer);
+    if let Some(charge) = network.take_accepted() {
+        rates.charge(key, charge, now);
+    }
+    network.set_rate_limited(rates.limited(key, now));
+}
+
 /// Run with one immutable routing/TLS snapshot and a shared monotonic clock.
 /// Startup storage checks precede readiness; no gateway is enabled, and a reload
 /// replaces the whole snapshot with a new generation.
@@ -326,6 +340,8 @@ pub struct Receiving<'s, 'cfg, B: Storage> {
     pub handshakes: &'cfg HandshakePool,
     pub listeners: &'cfg [BoundListener<'cfg>],
     pub clock: Arc<dyn Clock>,
+    /// Accepted-mail rate per peer key; production passes `Policy::DEFAULT`.
+    pub rates: crate::smtp_rate::Policy,
 }
 
 fn after(now: Tick, seconds: u64) -> Result<Deadline, Error> {
@@ -460,6 +476,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }));
             occupied.push(None);
         }
+        // Owned by this network loop alone, like `occupied`.
+        let mut rates = crate::smtp_rate::PeerRates::new(self.rates);
         let finished = AtomicBool::new(false);
         let started = AtomicU8::new(0);
         let main = std::thread::current();
@@ -603,6 +621,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     let peer = slot.peer;
                                     let connection = slot.connection()?;
                                     let network = connection.network_mut()?;
+                                    rate_turn(&mut rates, peer, network, now);
                                     if let Some(reply) = network.take_rejection() {
                                         if let Some(logger) = control.logging() {
                                             logger.smtp_rejection(

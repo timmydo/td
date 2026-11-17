@@ -235,7 +235,8 @@ SMTP DATA residency has separate fixed bounds: four jobs total, at most two
 per socket peer address, including peers behind a shared NAT. Raising
 `smtp_sessions` or `smtp_per_peer` does not raise those DATA bounds. Saturation
 waits before 354 within the existing admission deadline and then temporarily
-refuses; it does not allocate an extra message buffer.
+refuses; it does not allocate an extra message buffer. The per-peer accepted-mail
+rate (DESIGN.md section 9) is likewise fixed and has no operator key.
 
 ### `[limits]`
 

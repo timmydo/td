@@ -51,6 +51,16 @@ Five processes use the selected MTA executable:
 The inbound SMTP listener permits eight simultaneous sessions. DATA admission
 remains bounded to four jobs overall and two per peer. These are separate
 limits: increasing listener capacity does not remove the per-peer DATA bound.
+Each peer key (an IPv4 address or IPv6 /64) may also deliver bursts of 100
+messages and 256 MiB, then 120 messages an hour and about 1 GiB a day; beyond
+that its MAIL commands receive `421 4.7.0` until the balance refills, and the
+sender retries. `smtp_rate_refused` performance counters show refusals (busy)
+and forgotten keys of a full table (unavailable). A legitimate high-volume
+sender that is throttled still delivers, only more slowly. A large provider
+sending over one IPv6 /64 shares one budget, so sustained busy counts with
+delayed mail from that provider mean its traffic, or one of its users, has
+reached the limit. The bounds are fixed constants, so raising them is a code
+change (DESIGN.md section 9).
 
 `td-mta-postgres.service` separately runs PostgreSQL 17 on loopback port 35432.
 Its cluster is `/var/lib/td-mta/mail/postgres`, its configuration is

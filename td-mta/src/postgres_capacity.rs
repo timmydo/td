@@ -135,14 +135,32 @@ fn configured(sources: &versions::Sources) -> Result<(Vec<Json>, [u64; 5]), Erro
             rows.push(metric(profile.name, name, None, value, "setting"));
         }
         for (name, value) in [
-            ("smtp_data_jobs", crate::limits::SMTP_DATA_JOBS),
-            ("smtp_data_per_peer", crate::limits::SMTP_DATA_PER_PEER),
+            ("smtp_data_jobs", crate::limits::SMTP_DATA_JOBS as u64),
+            (
+                "smtp_data_per_peer",
+                crate::limits::SMTP_DATA_PER_PEER as u64,
+            ),
             (
                 "outbound_recipient_batch",
-                crate::limits::OUTBOUND_RECIPIENT_BATCH,
+                crate::limits::OUTBOUND_RECIPIENT_BATCH as u64,
             ),
+            ("smtp_rate_peers", crate::limits::SMTP_RATE_PEERS as u64),
+            (
+                "smtp_rate_message_burst",
+                crate::limits::SMTP_RATE_MESSAGE_BURST,
+            ),
+            ("smtp_rate_message_ms", crate::limits::SMTP_RATE_MESSAGE_MS),
+            (
+                "smtp_rate_block_bytes",
+                crate::limits::SMTP_RATE_BLOCK as u64,
+            ),
+            (
+                "smtp_rate_block_burst",
+                crate::limits::SMTP_RATE_BLOCK_BURST,
+            ),
+            ("smtp_rate_block_ms", crate::limits::SMTP_RATE_BLOCK_MS),
         ] {
-            rows.push(metric(profile.name, name, None, value as u64, "setting"));
+            rows.push(metric(profile.name, name, None, value, "setting"));
         }
     }
     Ok((rows, quotas.ok_or_else(failed)?))

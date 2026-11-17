@@ -388,6 +388,14 @@ fn copy_during_publication(
     command(&mut copying, b"QUIT\r\n", "221");
 }
 
+/// What follows the first accepted message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ending {
+    Drain,
+    Backstop,
+    Rate,
+}
+
 pub(super) fn exercise(
     fixture: &Fixture,
     binding: &Binding,
@@ -395,8 +403,10 @@ pub(super) fn exercise(
     policies: &GenerationLease<TlsPolicies>,
     socket: TcpListener,
     tls: bool,
-    backstop: bool,
+    ending: Ending,
 ) {
+    let backstop = ending == Ending::Backstop;
+    let rate = ending == Ending::Rate;
     let address = socket.local_addr().unwrap();
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
@@ -449,6 +459,14 @@ pub(super) fn exercise(
             storage: &storage, routes: records.routes(), resources: validated.resources(),
             admission: validated.admission(), timeouts: validated.timeouts(), policies,
             handshakes: &pool, listeners: &bound, clock: clock.clone(),
+            rates: if rate {
+                td_mta::smtp_rate::Policy {
+                    messages: td_mta::smtp_rate::Bucket { burst: 2, interval_ms: 3_600_000 },
+                    ..td_mta::smtp_rate::Policy::DEFAULT
+                }
+            } else {
+                td_mta::smtp_rate::Policy::DEFAULT
+            },
         };
         let control = Control::default();
         std::thread::scope(|scope| {
@@ -524,6 +542,45 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"), "0");
             assert_eq!(pending.operation().unwrap(), None);
+
+            if rate {
+                // The second acceptance spends a two-message burst, so a MAIL
+                // pipelined behind its final dot is refused and the session closes.
+                envelope(&mut client);
+                client.get_mut().write_all(b"Subject: second\r\n\r\nbody\r\n.\r\nMAIL FROM:<sender@example.test>\r\n").unwrap();
+                client.get_mut().flush().unwrap();
+                reply(&mut client, "250");
+                reply(&mut client, "421 4.7.0");
+                let mut rest = Vec::new();
+                assert_eq!(client.read_to_end(&mut rest).unwrap(), 0);
+                // Closing ends the server's drain, so the slot frees promptly.
+                drop(client);
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+                // A new session from the address is greeted, then refused at MAIL.
+                let greeted = Instant::now() + Duration::from_secs(20);
+                let mut again = loop {
+                    let stream = TcpStream::connect(address).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+                    let mut again = BufReader::new(stream);
+                    let mut line = String::new();
+                    let read = again.read_line(&mut line);
+                    if line.starts_with("220") {
+                        break again;
+                    }
+                    // A slot not yet reclaimed refuses with a best-effort 421.
+                    assert!(
+                        (read.is_err() || line.is_empty() || line.starts_with("421 4.3.2"))
+                            && Instant::now() < greeted,
+                        "{line:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                command(&mut again, b"EHLO sender.example.test\r\n", "250");
+                command(&mut again, b"MAIL FROM:<sender@example.test>\r\n", "421 4.7.0");
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+                assert_eq!(control.state(), State::Ready);
+                return;
+            }
 
             if backstop {
                 // A retained delivery that cannot settle past the backstop

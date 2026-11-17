@@ -447,6 +447,7 @@ fn run_once(
                 handshakes: &handshakes,
                 listeners: &listeners,
                 clock: clock.clone(),
+                rates: td_mta::smtp_rate::Policy::DEFAULT,
             });
             super::signal_sys::block().map_err(|_| config_failure("signals", "io"))?;
             if endpoint.is_none() {

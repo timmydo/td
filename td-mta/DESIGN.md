@@ -1366,6 +1366,7 @@ Initial default ceilings (validated together at startup):
 | Resource | Default limit |
 | --- | --- |
 | Simultaneous inbound SMTP sessions | 8, at most 2 per peer address |
+| Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
 | Active HTTPS connections | 8, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
@@ -1835,6 +1836,43 @@ address across the four total jobs, independent of connection limits. A peer
 behind NAT shares that allowance; this is address fairness, not sender identity
 or a defense against distributed senders. It uses the existing bounded
 pre-354 retry path and leaves HTTPS connection limits unchanged.
+
+Accepted mail is also rate-limited per peer key: the exact IPv4 address
+(IPv4-mapped IPv6 included) or the IPv6 /64, which one host can hold
+entirely. A key may spend a burst of 100 messages and 4,096 64 KiB blocks
+(256 MiB), refilled at one message per 30 seconds and one block per 5,273
+ms (about 1 GiB a day). A message counts once however many local accounts
+it reached: each account's intake from the key is bounded alike, and a
+list post to several accounts does not spend the budget several times.
+The largest message is 512 blocks, so one message cannot keep a key
+refused for more than its own 45-minute refill. Charges follow acceptance,
+so refused, uncertain and unreportable deliveries cost nothing, and a
+transaction already past MAIL completes. While either balance exceeds its
+burst, MAIL receives `421 4.7.0 Too much mail from this address, try again
+later` and the session closes, freeing its slot; senders keep the mail and
+retry. The network loop alone owns a fixed 256-key table (about 8 KiB,
+allocated once), charges each acceptance before reading the session's next
+command and decides that command from the result. A full table forgets
+an unthrottled key first, then the throttled key nearest admission; it
+never refuses mail, because failing closed would let anyone holding many
+addresses stop receiving for everyone.
+
+The limit is address fairness, not sender identity. Distributed senders
+defeat it, and so does one holder of a routed IPv6 prefix: a /56 is 256
+keys, a /48 65,536, each with its own burst, so account quotas remain the
+backstop. Senders behind one key share its budget: a NAT pool, or a large
+provider sending from one /64, where one of its users can delay (never
+lose) the provider's other mail here, as filling an account's quota would
+refuse everyone's. Session and DATA bounds count exact addresses, so the
+in-flight overshoot past a throttled key is the per-peer session limit
+(two by default) for an IPv4 key but up to the listener's session limit
+for an IPv6 /64. State
+is per process and resets on restart or reload, so several receiving
+processes multiply the budget. There is no per-account aggregate rate,
+which any distributed sender could use to block one account's mail. A
+future gateway listener, whose socket peer is not the sender (section
+4.2), must exempt or re-key this limit. The bounds are fixed, not
+configuration; `postgres capacity-inspect` reports them.
 
 Global, per-listener and per-peer counts include queued, handshaking,
 closing and retiring connections. Saturation attempts one bounded 421

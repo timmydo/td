@@ -120,7 +120,9 @@ keep it. Begin-DATA ticket contention may retry only before admission,
 under the original queued admission cap. The PostgreSQL adapter admits four
 resident DATA jobs across all listeners and accounts, at most two per actual
 socket peer address; the fixed storage worker
-continues to serialize publication. A paused DATA sender consumes one permit,
+continues to serialize publication. Accepted mail is
+rate-limited per peer key, refusing MAIL with 421 4.7.0
+and closing (DESIGN.md section 9). A paused DATA sender consumes one permit,
 and exhaustion waits before 354 without allocating another incoming body.
 
 For an HTTP transfer of admitted maximum B bytes, use

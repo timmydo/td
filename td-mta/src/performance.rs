@@ -57,6 +57,7 @@ pub enum Phase {
     ReplicaMetadata,
     ResponseLedgerLock,
     ResponseLedgerQuota,
+    SmtpRateRefused,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -109,6 +110,7 @@ impl Phase {
         Self::ReplicaMetadata,
         Self::ResponseLedgerLock,
         Self::ResponseLedgerQuota,
+        Self::SmtpRateRefused,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -161,6 +163,7 @@ impl Phase {
             Self::ReplicaMetadata => "replica_metadata",
             Self::ResponseLedgerLock => "response_ledger_lock",
             Self::ResponseLedgerQuota => "response_ledger_quota",
+            Self::SmtpRateRefused => "smtp_rate_refused",
         }
     }
 }

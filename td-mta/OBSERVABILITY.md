@@ -377,7 +377,9 @@ rate bucket.
 including `smtp_status`, a fixed `reason`, `peer_ip` and `reply_queued:true`.
 It does not prove that the peer received the reply. DATA reasons distinguish
 framing, header/message size and storage unavailability; other command syntax
-refusals have `command_refused`. Historical `data_line_too_long` and
+refusals have `command_refused`. `rate_limited` is a MAIL
+refused because the peer key exceeded its accepted-mail rate
+(DESIGN.md section 9). Historical `data_line_too_long` and
 `undeclared_8bit_data` reasons remain readable; current local receiving tolerates
 long lines and undeclared non-NUL 8-bit DATA.
 For `unknown_recipient`, `routing_unavailable` and `recipient_limit`, the
@@ -462,8 +464,8 @@ severity filter, global ingestion limit, retention ring and physical-pressure
 stop apply. There is no synchronous journal fallback and no per-request event
 flood. These info records require `minimum_severity = info`. Additional summaries
 can shorten history under the existing ring; 30 days remains an age ceiling,
-not a guaranteed retention interval. At the current 49-phase ceiling, four
-profiles add at most 4,704 hourly summary rows per day (plus initial snapshots).
+not a guaranteed retention interval. At the current 50-phase ceiling, four
+profiles add at most 4,800 hourly summary rows per day (plus initial snapshots).
 The 65,536-row ring can hold about 14 days of those rows alone; other events,
 frequent restarts and physical pressure can shorten that interval.
 
@@ -561,6 +563,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
 | `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
+| `smtp_rate_refused` | Zero-duration accepted-mail rate decisions: busy counts a MAIL refused with 421 4.7.0, unavailable counts a full rate table forgetting another key's debt |
 
 For timed HTTP endpoint spans, `busy` means a flushed 429 response and
 `unavailable` means a flushed 503. The two zero-duration admission counters

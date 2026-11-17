@@ -195,6 +195,7 @@ pub mod replica_source;
 pub mod root_headers;
 pub mod row_references;
 pub mod smtp_network;
+pub mod smtp_rate;
 pub mod smtp_receiving;
 pub mod smtp_session;
 pub mod smtp_starttls;

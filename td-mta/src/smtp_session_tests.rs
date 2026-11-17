@@ -775,6 +775,70 @@ fn data_refusals_have_content_free_diagnostics() {
     });
 }
 
+#[test]
+fn rate_limit_refuses_the_next_mail_and_charges_only_acceptance() {
+    fixture(|routes| {
+        let mut s = session(routes);
+        begin(&mut s, "");
+        // A decision made mid-transaction leaves that transaction alone.
+        s.set_rate_limited(true);
+        assert_eq!(s.feed(b"body\r\n").unwrap(), 6);
+        assert!(matches!(s.pending(), Pending::Data(b"body\r\n")));
+        s.data_written(Ok(())).unwrap();
+        s.feed(b".\r\n").unwrap();
+        assert_eq!(s.take_accepted(), None);
+        s.committed(Ok(Commits::new([receipt()]).unwrap())).unwrap();
+        assert!(reply(&s).starts_with("250 2.0.0"));
+        s.reply_sent().unwrap();
+        assert_eq!(s.take_accepted(), Some(Charge::accepted(6)));
+        assert_eq!(s.take_accepted(), None);
+        let refused = || {
+            crate::performance::snapshot(crate::performance::Phase::SmtpRateRefused)
+                .unwrap()
+                .busy
+        };
+        let before = refused();
+        s.feed(b"MAIL FROM:<>\r\n").unwrap();
+        assert!(refused() > before);
+        assert_eq!(
+            reply(&s),
+            "421 4.7.0 Too much mail from this address, try again later\r\n"
+        );
+        assert_eq!(s.rejection().unwrap().reason(), "rate_limited");
+        assert_eq!(s.rejection().unwrap().status(), 421);
+        assert!(s.envelope().is_none());
+        s.reply_sent().unwrap();
+        assert_eq!(s.pending(), Pending::Closed);
+
+        // Refused, uncertain and unreportable deliveries are not charged.
+        for outcome in [
+            Err(CommitFailure::Indeterminate(Error::Busy)),
+            Ok(Commit {
+                account: AccountId::from_bytes([9; 16]),
+                ..receipt()
+            }),
+        ] {
+            let mut s = session(routes);
+            begin(&mut s, "");
+            s.feed(b".\r\n").unwrap();
+            s.committed(outcome.map(|commit| Commits::new([commit]).unwrap()))
+                .unwrap();
+            assert_eq!(s.take_accepted(), None);
+        }
+        // A cleared decision admits MAIL.
+        let mut s = session(routes);
+        begin(&mut s, "");
+        s.feed(b".\r\n").unwrap();
+        s.committed(Err(CommitFailure::Rejected(Error::Quota)))
+            .unwrap();
+        s.reply_sent().unwrap();
+        assert_eq!(s.take_accepted(), None);
+        s.set_rate_limited(true);
+        s.set_rate_limited(false);
+        command(&mut s, "MAIL FROM:<>\r\n", "250 ");
+    });
+}
+
 #[cfg(test)]
 mod data_envelope_diagnostics {
     use super::*;

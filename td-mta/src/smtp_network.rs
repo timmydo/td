@@ -95,6 +95,13 @@ impl<'a> Network<'a> {
         &self.session
     }
 
+    pub fn set_rate_limited(&mut self, limited: bool) {
+        self.session.set_rate_limited(limited);
+    }
+    pub fn take_accepted(&mut self) -> Option<crate::smtp_rate::Charge> {
+        self.session.take_accepted()
+    }
+
     /// Reports a queued refusal once, without claiming that the peer received it.
     pub fn take_rejection(&mut self) -> Option<crate::smtp_session::Rejection> {
         if self.refusal_reported {

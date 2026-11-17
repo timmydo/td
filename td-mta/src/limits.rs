@@ -35,6 +35,27 @@ pub const SMTP_DATA_JOBS: usize = 4;
 /// Keep capacity for another socket peer independently of connection limits.
 pub const SMTP_DATA_PER_PEER: usize = 2;
 const _: () = assert!(SMTP_DATA_PER_PEER > 0 && SMTP_DATA_PER_PEER < SMTP_DATA_JOBS);
+/// Remembered accepted-mail rate keys (DESIGN.md section 9).
+pub const SMTP_RATE_PEERS: usize = 256;
+/// Accepted messages per local account a peer may send at once ...
+pub const SMTP_RATE_MESSAGE_BURST: u64 = 100;
+/// ... then one more each interval: 120 per hour.
+pub const SMTP_RATE_MESSAGE_MS: u64 = 30_000;
+/// Byte charges round each accepted body up to whole blocks.
+pub const SMTP_RATE_BLOCK: usize = 64 * KIB;
+/// 256 MiB at once, then about 1 GiB per day.
+pub const SMTP_RATE_BLOCK_BURST: u64 = 4096;
+pub const SMTP_RATE_BLOCK_MS: u64 = 5_273;
+const _: () = assert!(
+    SMTP_RATE_PEERS > 0
+        && SMTP_RATE_MESSAGE_BURST > 0
+        && SMTP_RATE_MESSAGE_MS > 0
+        && SMTP_RATE_BLOCK > 0
+        && SMTP_RATE_BLOCK_BURST > 0
+        && SMTP_RATE_BLOCK_MS > 0
+        && (SMTP_RATE_MESSAGE_BURST as u128) * (SMTP_RATE_MESSAGE_MS as u128) < u64::MAX as u128
+        && (SMTP_RATE_BLOCK_BURST as u128) * (SMTP_RATE_BLOCK_MS as u128) < u64::MAX as u128
+);
 const _: () = assert!(
     crate::config::identities::MAX_ACCOUNTS * crate::format::row::MAX_RECEIPT_BYTES
         + 3 * (crate::format::row::MAX_RECEIPT_BYTES + 128 * KIB)

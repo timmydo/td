@@ -2775,6 +2775,12 @@ fn real_postgres_smtp_worker_stops_when_settlement_cannot_heal() {
     exercise_configuration(ConfigurationExercise::ReceivingBackstop);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_worker_throttles_one_peers_accepted_mail() {
+    exercise_configuration(ConfigurationExercise::ReceivingRate);
+}
+
 #[path = "postgres_probe/multi_account.rs"]
 mod multi_account;
 #[path = "postgres_probe/multi_receiving.rs"]
@@ -2853,6 +2859,7 @@ enum ConfigurationExercise {
     Performance,
     ReceivingTls,
     ReceivingBackstop,
+    ReceivingRate,
     ReceivingTransport,
     ReceivingOwner,
     HttpUploads,
@@ -3049,6 +3056,7 @@ per_peer_limit = 1
         ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingBackstop
+            | ConfigurationExercise::ReceivingRate
             | ConfigurationExercise::Serving
             | ConfigurationExercise::ReplicaPublication
             | ConfigurationExercise::Performance
@@ -3066,6 +3074,7 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingBackstop
+            | ConfigurationExercise::ReceivingRate
     ) {
         let limits = "session_limit = 1\nper_peer_limit = 1\n";
         assert_eq!(cloud.matches(limits).count(), 1, "cloud listener limits");
@@ -3620,6 +3629,7 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingBackstop
+            | ConfigurationExercise::ReceivingRate
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -3753,7 +3763,8 @@ per_peer_limit = 1
                 | ConfigurationExercise::ReceivingOwner
                 | ConfigurationExercise::ReceivingTransport
                 | ConfigurationExercise::ReceivingTls
-                | ConfigurationExercise::ReceivingBackstop => {}
+                | ConfigurationExercise::ReceivingBackstop
+                | ConfigurationExercise::ReceivingRate => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -3864,6 +3875,7 @@ per_peer_limit = 1
                 ConfigurationExercise::ReceivingTransport
                     | ConfigurationExercise::ReceivingTls
                     | ConfigurationExercise::ReceivingBackstop
+                    | ConfigurationExercise::ReceivingRate
             )
         {
             smtp_transport::exercise(
@@ -3873,7 +3885,11 @@ per_peer_limit = 1
                 &active,
                 smtp_socket.take().unwrap(),
                 matches!(exercise, ConfigurationExercise::ReceivingTls),
-                matches!(exercise, ConfigurationExercise::ReceivingBackstop),
+                match exercise {
+                    ConfigurationExercise::ReceivingBackstop => smtp_transport::Ending::Backstop,
+                    ConfigurationExercise::ReceivingRate => smtp_transport::Ending::Rate,
+                    _ => smtp_transport::Ending::Drain,
+                },
             );
             return;
         }

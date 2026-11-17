@@ -5,6 +5,7 @@ use crate::{
     ids::AccountId,
     limits::MAX_MESSAGE_BYTES,
     ports::{CommitFailure, Error},
+    smtp_rate::Charge,
     smtp_storage::Commits,
 };
 use std::{
@@ -115,6 +116,7 @@ impl Rejection {
             b"451 4.3.0 Routing unavailable\r\n" => "routing_unavailable",
             b"421 4.3.2 Service unavailable\r\n" => "service_unavailable",
             b"421 4.3.2 Transaction limit reached\r\n" => "transaction_limit",
+            b"421 4.7.0 Too much mail from this address, try again later\r\n" => "rate_limited",
             b"452 4.5.3 Too many recipients\r\n" => "recipient_limit",
             b"554 5.5.0 Buffered plaintext at STARTTLS\r\n" => "starttls_buffered_plaintext",
             _ => "command_refused",
@@ -295,6 +297,8 @@ pub struct Session<'a> {
     rejected_envelope: Option<Envelope>,
     recipient_bytes: usize,
     transactions: u64,
+    rate_limited: bool,
+    accepted: Option<Charge>,
 }
 impl<'a> Session<'a> {
     pub fn new(routes: &'a Routing<'a>, settings: Settings<'a>) -> Result<Self, Error> {
@@ -327,6 +331,8 @@ impl<'a> Session<'a> {
             rejected_envelope: None,
             recipient_bytes: 0,
             transactions: 0,
+            rate_limited: false,
+            accepted: None,
         })
     }
     pub(crate) fn delivery_context(&self) -> Result<(&Settings<'a>, &Envelope, bool), Error> {
@@ -338,6 +344,14 @@ impl<'a> Session<'a> {
             self.envelope.as_ref().ok_or(Error::Invalid)?,
             self.extended,
         ))
+    }
+    /// The receiving loop's per-peer rate decision for the next MAIL.
+    pub(crate) fn set_rate_limited(&mut self, limited: bool) {
+        self.rate_limited = limited;
+    }
+    /// The rate charge of the last accepted message, reported once.
+    pub(crate) fn take_accepted(&mut self) -> Option<Charge> {
+        self.accepted.take()
     }
     pub(crate) fn rejection(&self) -> Option<Rejection> {
         let Pending::Reply { bytes, .. } = self.pending() else {
@@ -528,6 +542,7 @@ impl<'a> Session<'a> {
                     })
                 }) =>
             {
+                self.accepted = Some(Charge::accepted(self.data_bytes));
                 self.reset();
                 self.respond("250 2.0.0 Message accepted\r\n", Next::Command);
             }
@@ -750,6 +765,15 @@ impl<'a> Session<'a> {
         }
         if size.is_some_and(|n| n > self.incoming_limit() as u64) {
             self.respond("552 5.3.4 Message too large\r\n", Next::Command);
+            return Ok(());
+        }
+        // Closing frees the session slot a refused peer could otherwise hold.
+        if self.rate_limited {
+            crate::smtp_rate::refused();
+            self.respond(
+                "421 4.7.0 Too much mail from this address, try again later\r\n",
+                Next::Closed,
+            );
             return Ok(());
         }
         if self.transactions >= crate::admission::timers::CONNECTION_OPERATIONS {

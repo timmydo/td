@@ -2013,8 +2013,9 @@ deletes only that account's receipts older than one minute before the sample.
 It then refuses with Capacity only while 16,384 younger receipts remain.
 
 Retention is short so the ledger cannot be used to deny service. Receiving
-admission bounds concurrent sessions and per-peer DATA jobs, not message
-rate, so any sender can drive an account's receipt count; a full ledger may
+admission bounds concurrent sessions, per-peer DATA jobs and each peer key's
+accepted-mail rate (DESIGN.md section 9), but many peers together can still
+drive an account's receipt count; a full ledger may
 refuse that account's mail only while more than 16,384 deliveries arrive
 within one minute, and for at most a minute after they stop. That rate is at
 or beyond what the single publication worker sustains for every account, so
