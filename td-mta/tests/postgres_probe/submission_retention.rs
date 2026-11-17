@@ -136,7 +136,7 @@ pub(super) fn exercise(
         (0xe4, b3.as_str(), 1, accepted(0xe4), kept.as_str(), 0),
         // Retired: the shared blob stays queued for the kept group.
         (0xe5, b3.as_str(), 1, accepted(0xe5), expired.as_str(), 0),
-        // Kept: failures wait for explicit deletion.
+        // Retired: a failure whose notice is stored.
         (
             0xe6,
             source_blob.as_str(),
@@ -179,7 +179,7 @@ pub(super) fn exercise(
             expired.as_str(),
             0,
         ),
-        // Kept: one Accepted and one Failed recipient (made below).
+        // Retired: one Accepted and one Failed recipient (made below).
         (
             0xeb,
             source_blob.as_str(),
@@ -188,7 +188,7 @@ pub(super) fn exercise(
             expired.as_str(),
             2,
         ),
-        // Kept: OutcomeUnknown.
+        // Retired: OutcomeUnknown with its notice stored.
         (
             0xec,
             source_blob.as_str(),
@@ -394,8 +394,10 @@ pub(super) fn exercise(
         }
     };
     let mut total = first + drain();
-    let gone = ids(&[0xe2, 0xe3, 0xe5, 0xe8, 0xe9, 0xea, 0xf0, 0xf1, 0xf2, 0xf3]);
-    let stay = ids(&[0xe4, 0xe6, 0xe7, 0xeb, 0xec, 0xed, 0xee, 0xef]);
+    let gone = ids(&[
+        0xe2, 0xe3, 0xe5, 0xe6, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xf0, 0xf1, 0xf2, 0xf3,
+    ]);
+    let stay = ids(&[0xe4, 0xe7, 0xed, 0xee, 0xef]);
     for (query, expected) in [
         (format!("td_mta.submissions WHERE id IN ({gone})"), "0"),
         (
@@ -412,12 +414,12 @@ pub(super) fn exercise(
         ),
         (
             format!("td_mta.changes WHERE kind=5 AND action=3 AND object IN ({gone})"),
-            "10",
+            "13",
         ),
-        (format!("td_mta.submissions WHERE id IN ({stay})"), "8"),
+        (format!("td_mta.submissions WHERE id IN ({stay})"), "5"),
         (
             format!("td_mta.recipients WHERE submission_id IN ({stay})"),
-            "9",
+            "5",
         ),
         (
             format!("td_mta.changes WHERE kind=5 AND action=3 AND object IN ({stay})"),

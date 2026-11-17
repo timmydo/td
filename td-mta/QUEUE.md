@@ -327,8 +327,8 @@ Manual retry may move an eligible pending recipient earlier only after the
 route and recipient minimum intervals; it cannot resend Accepted, bypass
 expiry, resume a permanent refusal, or erase uncertainty. A new deliberate
 submission is required to resend a terminal failure. Terminal OutcomeUnknown
-requires operator acknowledgement before explicit deletion, with duplicate
-risk visible; it is not silently retried after expiry.
+keeps its duplicate risk visible until ordinary retention retires it 30 days
+after completion; it is not silently retried after expiry.
 
 Cancellation is submission-wide and atomic. Serialize against the worker
 through the PostgreSQL account/attempt fence and retire every Prepared/Body
@@ -351,9 +351,9 @@ long reply history may require explicit refusal. Failed recipients with no
 uncertainty can become Canceled together
 with all remaining recipients: the guarantee is that no recipient received
 the message. This also permits canceling an already completed, wholly Failed
-submission; the resulting Canceled retention category applies, but the
-cancellation does not itself authorize record deletion or a rewritten
-retention timestamp. Cancellation preserves an existing Pending or Stored failure
+submission; the record keeps its completedAt and retires on the same
+schedule, and the cancellation does not itself authorize record deletion or
+a rewritten retention timestamp. Cancellation preserves an existing Pending or Stored failure
 notice and its historical Email ID. It does not create a new notice merely
 because a recipient became Canceled; recovery therefore permits all three
 notification states on a completed, wholly Canceled submission.
@@ -364,12 +364,14 @@ completedAt is set once every recipient has no future dispatch obligation;
 it is a wall-clock observation and can precede sendAt after a clock step.
 Once present, preserve that exact timestamp in every subsequent submission
 update, including cancellation and failure-notice updates.
-Retain accepted/canceled submission records and their blobs for at least
-30 days after completion by default; the relay then retires them, with
-their attempts and receipts (POSTGRES.md section 216). Failed and terminal
-OutcomeUnknown records remain until explicit administrator deletion;
-storing a notice does not resolve them. Ordinary retention never deletes
-pending responsibility.
+Retain completed submission records and their blobs for at least 30 days
+after completion by default, whatever their recipients' outcomes; the relay
+then retires them, with their attempts and receipts (POSTGRES.md section
+216). Failed and terminal OutcomeUnknown records retire once their failure
+notice is stored, so an outcome-unknown record's evidence is kept for that
+window only. Ordinary retention never deletes pending responsibility: an
+uncompleted record, a pending notice, an active attempt or a final
+reservation.
 Manual JMAP destruction is forbidden for all submission records; record
 destruction does not mean cancellation (RFC 8621 §7.5).
 
@@ -381,8 +383,9 @@ historical after user deletion, so a deleted notice is not generated again.
 The foreground PostgreSQL publisher implements these notices as unread Inbox
 mail, with bounded publication and restart semantics in POSTGRES.md section
 213. It never schedules a notice for SMTP delivery.
-Never notify an external inbound reverse path. Administrative acknowledgement
-and deletion are explicit, durably committed actions subject to the same worker fence.
+Never notify an external inbound reverse path. Retention retires a Failed or
+OutcomeUnknown record only after its notice is stored; a notice that can never
+be stored keeps the record and its quota slot until an operator intervenes.
 
 ## 5. Standard JMAP projection
 

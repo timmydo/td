@@ -1,4 +1,4 @@
-//! Retire accepted or canceled submissions once their retention ends.
+//! Retire completed submissions once their retention ends.
 use crate::{
     postgres_probe::{self, Request},
     postgres_publication as publication,
@@ -8,7 +8,7 @@ use std::time::Instant;
 use td_crypto::TrustStore;
 use tokio_postgres::Client;
 
-/// QUEUE.md: accepted and canceled records stay 30 days after completion.
+/// QUEUE.md: completed records stay 30 days after completion.
 pub const RETENTION_MS: i64 = 30 * 86_400_000;
 /// One retirement transaction stays far inside the statement timeout and
 /// the account lock stays short: blob chunks cascade in one statement.
@@ -29,12 +29,13 @@ pub enum Error {
     Clock,
 }
 
-/// Delete one bounded batch of wholly Accepted or wholly Canceled submissions
-/// completed more than `RETENTION_MS` ago with no pending failure notice, their
-/// recipients, attempts and every receipt keyed by them, and release their
-/// transmitted blobs as Email deletion does. Failed and OutcomeUnknown records
-/// and anything still pending stay. Idempotent: a lost COMMIT is redone or
-/// found finished by the next call. Returns how many submissions it retired.
+/// Delete one bounded batch of submissions completed more than
+/// `RETENTION_MS` ago, whatever their recipients' outcomes, with no pending
+/// failure notice, active attempt or final reservation, their recipients,
+/// attempts and every receipt keyed by them, and release their transmitted
+/// blobs as Email deletion does. Anything not yet completed stays.
+/// Idempotent: a lost COMMIT is redone or found finished by the next call.
+/// Returns how many submissions it retired.
 /// `stable_at` is database UTC the queue clock guard found stable; a database
 /// clock that has since moved away from it refuses with Clock.
 pub fn retire(
@@ -81,7 +82,7 @@ async fn retire_locked(
     let binding = claim.binding();
     let account_id = binding.account();
     let account = account_id.as_bytes().as_slice();
-    let candidates = client.query("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND (NOT EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.account=s.account AND r.submission_id=s.id AND r.state<>4) OR NOT EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.account=s.account AND r.submission_id=s.id AND r.state<>6)) AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s", &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
+    let candidates = client.query("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s", &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
     if candidates.is_empty() {
         return Ok(0);
     }

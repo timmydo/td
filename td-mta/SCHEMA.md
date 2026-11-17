@@ -874,6 +874,7 @@ high-port bypass is added to the schema. M18 adds a dedicated HTTP-01
 readiness event before activating that role; existing `listener_ready`
 SMTP/JMAP records must not mislabel it.
 
-V1 uses the existing fixed 30-day successful/canceled submission retention
-policy; it has no operator retention field. Unresolved failures remain
-governed by QUEUE.md and are never erased by that timer.
+V1 uses the existing fixed 30-day submission retention policy for every
+completed outcome; it has no operator retention field. A failed or
+outcome-unknown record retires only after its failure notice is stored
+(QUEUE.md).

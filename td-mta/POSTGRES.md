@@ -3824,8 +3824,8 @@ scheduler/authenticated confirmation wiring remain separate work.
 Schema version 24 adds retained expiry-operation receipts and one database-wide
 expiry progress row. A receipt binds an account/operation to its request digest,
 submission, one-to-100 recipient count, fixed nonnegative UTC cutoff, publication
-time and old/new account sequence. It deliberately has no foreign key to the
-submission, so later retention cannot erase historical settlement evidence.
+time and old/new account sequence. It has no foreign key to the
+submission; section 216 deletes a retired submission's receipts with it.
 The publisher must cap retained receipts and verify exact sequence adjacency.
 
 The progress row starts with no publication time. Its singleton key and nullable
@@ -7009,13 +7009,16 @@ their own (section 217), so the deletes below usually find none of them; the
 rest wait for this retention.
 `postgres_submission_retention::retire` deletes, in one transaction, the
 oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
-than 30 days ago (`RETENTION_MS`, against the database clock), every
-recipient Accepted (uncertain or not) or every recipient Canceled, no
-Pending failure notice, and no active attempt or final reservation.
-Failed and OutcomeUnknown records, pending notices and anything not yet
-completed stay until explicit administration. A completed Failed group
-canceled later keeps its completedAt and so retires with the Canceled
-category, possibly on the next pass.
+than 30 days ago (`RETENTION_MS`, against the database clock), whatever
+their recipients' outcomes (Accepted, Failed, Canceled or OutcomeUnknown,
+uncertain or not), no Pending failure notice, and no active attempt or
+final reservation. Pending notices and anything not yet completed stay. A
+Failed, OutcomeUnknown or Restored record therefore keeps its replies and
+uncertainty for 30 days after completion, retiring only once its notice is
+stored and the account owner was told; an operator who needs it longer must
+copy it out first. A notice that can never be stored (a full account) keeps
+its record and quota slot until an operator intervenes. A completed group
+canceled later keeps its completedAt.
 
 A batch holds at most 64 submissions, 2,048 recipients and 64 MiB of
 transmitted blobs, admitting its first submission whatever its size, so
@@ -7076,7 +7079,8 @@ failed, mixed, OutcomeUnknown, unfinished and notice-pending groups with
 every receipt kind, shared, leased and 32 MiB blobs, 900 attempts on one
 submission, a group inside retention, groups held by an active attempt or a
 final reservation and released, and three 1,000-recipient groups that need
-two batches. It checks the stale-owner and clock refusals, exactly which
+two batches; Failed, mixed and OutcomeUnknown groups with stored notices
+retire. It checks the stale-owner and clock refusals, exactly which
 rows, blobs and receipts go and stay, the Destroyed changes, the sequence
 advance and the usage audit. A unit test pins the batch bounds.
 

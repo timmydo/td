@@ -2432,13 +2432,14 @@ not have occurred.
 
 Local retry/cancel operations are serialized with the worker. Cancellation
 is successful only before an irrevocable remote attempt; never report a
-message recalled after it may have been accepted. Keep final submission records
-for at least 30 days by default and do not automatically expire unresolved
-failures. Expired/permanent failures retain inspectable metadata and notify
-the account through a locally generated failure message plus health/log state;
+message recalled after it may have been accepted. Keep final submission
+records, whatever their outcome, for at least 30 days by default; a failed
+or outcome-unknown record retires only after its failure notice is stored.
+Expired/permanent failures retain inspectable metadata and notify the
+account through a locally generated failure message plus health/log state;
 never send unsolicited error mail to an unverified inbound reverse path.
 If failure notification cannot be committed, retain a pending notification
-record and retry locally. Explicit deletion/retention operations reclaim data.
+record and retry locally. Retention then reclaims the record and its data.
 
 ## 12. Logs and observability
 
