@@ -1,6 +1,7 @@
 //! The chrome bands td-owned windows share, over `raster`: the menu bar
 //! with its panel, a wrapped text block, a tab strip, a button strip, a
-//! slider, a status row, a scrolling list and a single-line text entry.
+//! slider, a status row (one line, or segments), a scrolling list and a
+//! single-line text entry.
 //! Each is a geometry over a `Surface` in the reference renderer's units
 //! (24-pixel rows of 8x16 cells, scaled by the surface) and a painter
 //! that streams the complete band inside a damage rectangle. Nothing
@@ -8,7 +9,7 @@
 
 use crate::raster::{
     hint_run, text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER,
-    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
+    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, WARNING,
 };
 use crate::{hint, CELL_HEIGHT, CELL_WIDTH};
 
@@ -1732,6 +1733,232 @@ impl Status {
             sink,
         );
     }
+
+    /// Paints the row: its `frame`, then `segments` laid on it (the free
+    /// function `segments`), fitted by the consumer to `columns`.
+    pub fn emit_segments(
+        &self,
+        segments: &[Segment<'_>],
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        self.frame(damage, sink);
+        let Some(damage) = damage.intersection(self.surface.bounds()) else {
+            return;
+        };
+        self::segments(self.rect(), self.surface.scale, segments, damage, sink);
+    }
+}
+
+/// The cells between two segments of a status row: a space, a rule and a
+/// space, as wide as the ` | ` a one-line status puts between its items.
+pub const SEGMENT_GAP: usize = 3;
+/// A segment's meter, under its value: its height and its rise above the
+/// row's foot, in font pixels.
+const METER_HEIGHT: i64 = 2;
+const METER_RISE: i64 = 2;
+/// The rule between two segments stands this far in from the row's top
+/// and foot, in font pixels.
+const SEGMENT_RULE_INSET: i64 = 5;
+
+/// How a status segment's value is inked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Emphasis {
+    /// The row's ink.
+    #[default]
+    Plain,
+    /// `WARNING`: something to keep in mind, such as what runs unasked.
+    Warning,
+    /// `MISSPELLED`: something that went wrong.
+    Alert,
+}
+
+impl Emphasis {
+    fn ink(self) -> u32 {
+        match self {
+            Self::Plain => INK,
+            Self::Warning => WARNING,
+            Self::Alert => MISSPELLED,
+        }
+    }
+
+    /// A meter's fill: the selection's ground for plain, else the ink.
+    fn meter(self) -> u32 {
+        match self {
+            Self::Plain => SELECTED,
+            other => other.ink(),
+        }
+    }
+}
+
+/// One item of a segmented status row (`segments`): a label in quiet ink,
+/// empty for none, and its value; at the row's end when `end`, else from
+/// its start; and a meter under its value when it measures a share,
+/// `used` of `whole`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Segment<'a> {
+    pub label: &'a str,
+    pub value: &'a str,
+    pub emphasis: Emphasis,
+    pub end: bool,
+    pub meter: Option<(u64, u64)>,
+}
+
+impl Segment<'_> {
+    /// The cells it takes: its label, a space when it has a value too,
+    /// and its value. A meter takes none: it lies under the value.
+    pub fn cells(&self) -> usize {
+        let label = self.label.chars().count();
+        let value = self.value.chars().count();
+        label + usize::from(label > 0 && value > 0) + value
+    }
+}
+
+/// The cells `segments` take on a status row: each one's, and
+/// `SEGMENT_GAP` between any two, so a row is as wide as its items joined
+/// by ` | ` and a consumer fits it to its columns (`Status::columns`, or
+/// its own row's width less a cell each side) as it would that line.
+pub fn segments_cells<'s>(segments: impl IntoIterator<Item = Segment<'s>>) -> usize {
+    let (cells, count) = segments
+        .into_iter()
+        .fold((0, 0usize), |(cells, count), segment| {
+            (cells + segment.cells(), count + 1)
+        });
+    cells + count.saturating_sub(1) * SEGMENT_GAP
+}
+
+/// Paints `segments` on the status row `rect`, over the ground its owner
+/// painted (`CHROME`, as `Status::frame` paints it): those not at the end
+/// from a cell in, in order, and those at the end so the last ends a cell
+/// short of the right, in order, the start ones stopping `SEGMENT_GAP`
+/// short of the first end one and cut there, with no rule after the
+/// last they hold and none started with less than a cell left; an end
+/// group wider than the row lies from a cell in, cut at its right, and
+/// no start segment is drawn. Each segment draws its
+/// label in `LINE_NUMBER` ink and a space, then its value in its
+/// emphasis's ink, on `CHROME`; a meter is a `BORDER` track
+/// `METER_HEIGHT` pixels high under its value's cells, `METER_RISE`
+/// above the row's foot, filled from its left to its share (`used` past
+/// `whole` full, a `whole` of 0 empty) in `SELECTED`, or the value's ink
+/// when it is emphasised. A `BORDER` rule a scaled pixel wide, inset
+/// `SEGMENT_RULE_INSET` from the row's top and foot, stands in the middle
+/// cell of the gap between two segments of one group.
+pub fn segments(
+    rect: Rect,
+    scale: Scale,
+    segments: &[Segment<'_>],
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let Some(damage) = rect.intersection(damage) else {
+        return;
+    };
+    let s = scale.value() as i64;
+    let cw = (CELL_WIDTH * scale.value()) as i64;
+    let left = rect.x + INSET.0 * s;
+    let right = rect.x + i64::from(rect.width) - INSET.0 * s;
+    let ends = |end: bool| segments.iter().filter(move |segment| segment.end == end);
+    let end_cells = segments_cells(ends(true).copied());
+    let has_end = ends(true).next().is_some();
+    let end_x = (right - end_cells as i64 * cw).max(left);
+    let start_limit = if has_end {
+        end_x - SEGMENT_GAP as i64 * cw
+    } else {
+        right
+    };
+    let group = |items: &mut dyn Iterator<Item = &Segment<'_>>,
+                 from: i64,
+                 limit: i64,
+                 sink: &mut dyn FnMut(Draw)| {
+        if limit <= from {
+            return;
+        }
+        let bounds = Rect {
+            x: from,
+            width: (limit - from) as u32,
+            ..rect
+        };
+        let Some(clip) = bounds.intersection(damage) else {
+            return;
+        };
+        let mut x = from;
+        for (at, segment) in items.enumerate() {
+            // A segment with not a cell left before the limit, and the
+            // rule before it, are not drawn.
+            let gap = if at > 0 { SEGMENT_GAP as i64 * cw } else { 0 };
+            if x + gap + cw > limit {
+                return;
+            }
+            if at > 0 {
+                fill(
+                    Rect {
+                        x: x + cw + cw / 2,
+                        y: rect.y + SEGMENT_RULE_INSET * s,
+                        width: s as u32,
+                        height: (i64::from(rect.height) - 2 * SEGMENT_RULE_INSET * s).max(0) as u32,
+                    },
+                    BORDER,
+                    clip,
+                    sink,
+                );
+                x += gap;
+            }
+            let y = rect.y + INSET.1 * s;
+            if !segment.label.is_empty() {
+                text_run(
+                    scale,
+                    segment.label.chars(),
+                    (x, y),
+                    bounds,
+                    GlyphStyle::medium(LINE_NUMBER, CHROME),
+                    clip,
+                    sink,
+                );
+                x += segment.label.chars().count() as i64 * cw;
+                if !segment.value.is_empty() {
+                    x += cw;
+                }
+            }
+            let value = segment.value.chars().count() as i64 * cw;
+            text_run(
+                scale,
+                segment.value.chars(),
+                (x, y),
+                bounds,
+                GlyphStyle::medium(segment.emphasis.ink(), CHROME),
+                clip,
+                sink,
+            );
+            if let Some((used, whole)) = segment.meter {
+                let track = Rect {
+                    x,
+                    y: rect.y + i64::from(rect.height) - (METER_RISE + METER_HEIGHT) * s,
+                    width: value.max(0) as u32,
+                    height: (METER_HEIGHT * s) as u32,
+                };
+                fill(track, BORDER, clip, sink);
+                let share = if whole == 0 {
+                    0
+                } else {
+                    u128::from(used.min(whole)) * u128::from(track.width) / u128::from(whole)
+                };
+                fill(
+                    Rect {
+                        width: u32::try_from(share).unwrap_or(track.width),
+                        ..track
+                    },
+                    segment.emphasis.meter(),
+                    clip,
+                    sink,
+                );
+            }
+            x += value;
+        }
+    };
+    group(&mut ends(false), left, start_limit, sink);
+    if has_end {
+        group(&mut ends(true), end_x, right, sink);
+    }
 }
 
 #[cfg(test)]
@@ -1763,6 +1990,259 @@ mod tests {
             assert!(Panel::new(ample, header, 0).is_none());
             assert!(Panel::new(ample, header, PANEL_ROWS + 1).is_none());
         }
+    }
+
+    /// The glyphs drawn, each with its x and ink, and the fills, in order.
+    type Drawn = (Vec<(i64, char, u32)>, Vec<(Rect, u32)>);
+
+    fn drawn(draw: impl FnOnce(&mut dyn FnMut(Draw))) -> Drawn {
+        let (mut glyphs, mut fills) = (Vec::new(), Vec::new());
+        draw(&mut |draw| match draw.primitive {
+            Primitive::Glyph {
+                x, scalar, style, ..
+            } => glyphs.push((x, scalar, style.ink)),
+            Primitive::Fill { rect, color } => fills.push((rect, color)),
+            _ => {}
+        });
+        (glyphs, fills)
+    }
+
+    /// A row's segments are as wide as their items joined by ` | `: each
+    /// its label, a space and its value, a meter taking no cells.
+    #[test]
+    fn segments_are_as_wide_as_their_line() {
+        let segments = [
+            Segment {
+                value: "idle",
+                ..Segment::default()
+            },
+            Segment {
+                label: "mode",
+                value: "ask",
+                ..Segment::default()
+            },
+            Segment {
+                label: "ctx",
+                value: "12k/200k",
+                end: true,
+                meter: Some((12, 200)),
+                ..Segment::default()
+            },
+            Segment {
+                label: "lonely",
+                ..Segment::default()
+            },
+        ];
+        let line = "idle | mode ask | ctx 12k/200k | lonely";
+        assert_eq!(segments_cells(segments), line.chars().count());
+        assert_eq!(segments_cells([]), 0);
+    }
+
+    /// The start group from a cell in, the end group ending a cell short
+    /// of the right; labels quiet, values in their emphasis's ink; a rule
+    /// in the middle cell of the gap between two segments of a group and
+    /// none between the groups; a meter under its value filled to its
+    /// share; the start group cut short of the end group.
+    #[test]
+    fn segments_lay_their_groups_at_either_end() {
+        for scale in 1..=4u8 {
+            let s = i64::from(scale);
+            let cw = CELL_WIDTH as i64 * s;
+            let rect = Rect {
+                x: 100 * s,
+                y: 10 * s,
+                width: (60 * CELL_WIDTH as u32 + 16) * s as u32,
+                height: (ROW as u32) * s as u32,
+            };
+            let bounds = Rect {
+                x: 0,
+                y: 0,
+                width: 2000 * s as u32,
+                height: 200 * s as u32,
+            };
+            let segments = [
+                Segment {
+                    value: "idle",
+                    emphasis: Emphasis::Alert,
+                    ..Segment::default()
+                },
+                Segment {
+                    label: "mode",
+                    value: "ask",
+                    ..Segment::default()
+                },
+                Segment {
+                    label: "ctx",
+                    value: "50/200",
+                    end: true,
+                    meter: Some((50, 200)),
+                    ..Segment::default()
+                },
+                Segment {
+                    value: "jail",
+                    emphasis: Emphasis::Warning,
+                    end: true,
+                    meter: Some((300, 200)),
+                    ..Segment::default()
+                },
+            ];
+            let (glyphs, fills) = drawn(|sink| {
+                super::segments(rect, Scale::new(scale).unwrap(), &segments, bounds, sink)
+            });
+            let left = rect.x + 8 * s;
+            let right = rect.x + i64::from(rect.width) - 8 * s;
+            let at = |x: i64| glyphs.iter().find(|(gx, _, _)| *gx == x).copied();
+            // idle, a gap, `mode` quiet, a space, `ask`.
+            assert_eq!(at(left), Some((left, 'i', MISSPELLED)));
+            assert_eq!(at(left + 7 * cw), Some((left + 7 * cw, 'm', LINE_NUMBER)));
+            assert_eq!(at(left + 12 * cw), Some((left + 12 * cw, 'a', INK)));
+            // The end group: `ctx 50/200`, a gap, `jail`, ending a cell in.
+            let end = right - (10 + 3 + 4) * cw;
+            assert_eq!(at(end), Some((end, 'c', LINE_NUMBER)));
+            assert_eq!(at(end + 4 * cw), Some((end + 4 * cw, '5', INK)));
+            assert_eq!(at(right - 4 * cw), Some((right - 4 * cw, 'j', WARNING)));
+            assert!(glyphs.iter().all(|(x, _, _)| *x < right));
+            // A rule in each group's gap, none between the groups.
+            let rules: Vec<i64> = fills
+                .iter()
+                .filter(|(r, c)| *c == BORDER && r.width == s as u32)
+                .map(|(r, _)| r.x)
+                .collect();
+            assert_eq!(
+                rules,
+                [left + 4 * cw + cw + cw / 2, end + 10 * cw + cw + cw / 2]
+            );
+            // The meter: a track under `50/200`, a quarter filled; one of
+            // nothing is empty.
+            let value = end + 4 * cw;
+            let foot = rect.y + i64::from(rect.height) - 2 * s;
+            // Clear of the glyph cell, four pixels down and sixteen tall.
+            assert!(foot - 2 * s >= rect.y + 20 * s);
+            let track = (
+                Rect {
+                    x: value,
+                    y: foot - 2 * s,
+                    width: (6 * cw) as u32,
+                    height: 2 * s as u32,
+                },
+                BORDER,
+            );
+            assert!(fills.contains(&track), "{scale}");
+            assert!(fills.contains(&(
+                Rect {
+                    width: (6 * cw / 4) as u32,
+                    ..track.0
+                },
+                SELECTED
+            )));
+            // An emphasised meter in its ink, past its whole full.
+            let jail = right - 4 * cw;
+            assert!(fills.contains(&(
+                Rect {
+                    x: jail,
+                    width: (4 * cw) as u32,
+                    ..track.0
+                },
+                WARNING
+            )));
+            // Of nothing, a meter is its track alone.
+            let empty = [Segment {
+                value: "none",
+                meter: Some((5, 0)),
+                ..Segment::default()
+            }];
+            let (_, fills) = drawn(|sink| {
+                super::segments(rect, Scale::new(scale).unwrap(), &empty, bounds, sink)
+            });
+            assert_eq!(
+                fills.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+                [BORDER],
+                "{scale}"
+            );
+            // A start group too long for the room is cut a gap short of
+            // the end group.
+            let long = "x".repeat(80);
+            let crowded = [
+                Segment {
+                    value: &long,
+                    ..Segment::default()
+                },
+                Segment {
+                    value: "end",
+                    end: true,
+                    ..Segment::default()
+                },
+            ];
+            let (glyphs, _) = drawn(|sink| {
+                super::segments(rect, Scale::new(scale).unwrap(), &crowded, bounds, sink)
+            });
+            let end = right - 3 * cw;
+            let xs: Vec<i64> = glyphs
+                .iter()
+                .filter(|(_, c, _)| *c == 'x')
+                .map(|(x, _, _)| *x)
+                .collect();
+            assert_eq!(xs.len(), 60 - 3 - 3, "{scale}");
+            assert!(xs.iter().all(|x| x + cw <= end - 3 * cw));
+            assert!(glyphs.iter().any(|(x, c, _)| *x == end && *c == 'e'));
+            // A start segment with no cell left is not drawn, nor the
+            // rule before it.
+            let crowded_start = "x".repeat(51);
+            let cut = [
+                Segment {
+                    value: &crowded_start,
+                    ..Segment::default()
+                },
+                Segment {
+                    value: "late",
+                    ..Segment::default()
+                },
+                Segment {
+                    value: "end",
+                    end: true,
+                    ..Segment::default()
+                },
+            ];
+            let (glyphs, fills) =
+                drawn(|sink| super::segments(rect, Scale::new(scale).unwrap(), &cut, bounds, sink));
+            assert!(!glyphs.iter().any(|(_, c, _)| *c == 'l'), "{scale}");
+            assert!(!fills.iter().any(|(_, c)| *c == BORDER), "{scale}");
+            // An end group wider than the row: from a cell in, cut at
+            // the right, and no start segment drawn.
+            let wide = "y".repeat(80);
+            let over = [
+                Segment {
+                    value: "start",
+                    ..Segment::default()
+                },
+                Segment {
+                    value: &wide,
+                    end: true,
+                    ..Segment::default()
+                },
+            ];
+            let (glyphs, _) = drawn(|sink| {
+                super::segments(rect, Scale::new(scale).unwrap(), &over, bounds, sink)
+            });
+            assert!(!glyphs.iter().any(|(_, c, _)| *c == 's'), "{scale}");
+            assert_eq!(glyphs.first().map(|g| g.0), Some(left));
+            assert!(glyphs.iter().all(|(x, _, _)| x + cw <= right));
+        }
+    }
+
+    /// The status row's segments: its frame, then the segments on it.
+    #[test]
+    fn the_status_row_frames_its_segments() {
+        let surface = surface(640, 400, 1);
+        let status = Status::new(surface);
+        let segments = [Segment {
+            label: "mode",
+            value: "ask",
+            ..Segment::default()
+        }];
+        let (glyphs, fills) = drawn(|sink| status.emit_segments(&segments, surface.bounds(), sink));
+        assert_eq!(fills.first(), Some(&(status.rect(), CHROME)));
+        assert_eq!(glyphs.first().map(|g| (g.0, g.1)), Some((8, 'm')));
     }
 
     #[test]

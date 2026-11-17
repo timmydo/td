@@ -1041,7 +1041,7 @@ td-agent/src/tools.rs	allocating-conversion	96
 td-agent/src/tools.rs	allocation-macro	141
 td-agent/src/tools.rs	unchecked-growth-or-clone	30
 td-agent/src/ui.rs	allocating-conversion	109
-td-agent/src/ui.rs	allocation-macro	157
+td-agent/src/ui.rs	allocation-macro	154
 td-agent/src/ui.rs	heap-owner	2
 td-agent/src/ui.rs	unchecked-growth-or-clone	235
 td-agent/src/upstream.rs	allocating-conversion	6

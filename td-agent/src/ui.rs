@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use td_ui::chrome::ROW;
+use td_ui::chrome::{segments_cells, Emphasis, Segment, ROW};
 use td_ui::editor::{Event as PaneEvent, Outcome as PaneOutcome};
 use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
@@ -347,9 +347,52 @@ struct Tasks {
 /// lets it go (the highest first, 0 never), and which it is, for the
 /// shortenings that rename it.
 struct StatusPart {
+    /// What it is, drawn quiet before its text: empty for none.
+    label: &'static str,
     text: String,
     rank: u8,
     kind: StatusKind,
+    emphasis: Emphasis,
+    /// Whether it sits in the row's end group (DESIGN.md §4).
+    end: bool,
+    /// The share its meter shows, used of whole.
+    meter: Option<(u64, u64)>,
+}
+
+impl StatusPart {
+    /// An item of the start group, plain, with no label.
+    fn plain(text: String, rank: u8) -> Self {
+        Self {
+            label: "",
+            text,
+            rank,
+            kind: StatusKind::Other,
+            emphasis: Emphasis::Plain,
+            end: false,
+            meter: None,
+        }
+    }
+
+    /// As the one-line status says it: its label, a space when it has
+    /// text too, and its text, as wide as its segment's cells.
+    fn line(&self) -> String {
+        let gap = if self.label.is_empty() || self.text.is_empty() {
+            ""
+        } else {
+            " "
+        };
+        format!("{}{gap}{}", self.label, self.text)
+    }
+
+    fn segment(&self) -> Segment<'_> {
+        Segment {
+            label: self.label,
+            value: &self.text,
+            emphasis: self.emphasis,
+            end: self.end,
+            meter: self.meter,
+        }
+    }
 }
 
 /// The status row's items a narrow row shortens rather than lets go.
@@ -1203,12 +1246,14 @@ impl App {
 
     /// The status row's line, whole.
     pub fn status_line(&self) -> String {
-        let items: Vec<String> = self.status_items().into_iter().map(|p| p.text).collect();
+        let items: Vec<String> = self.status_items().iter().map(StatusPart::line).collect();
         items.join(" | ")
     }
 
-    /// The status row's line in at most `cells` cells (DESIGN.md §4, As
-    /// built (the Messages window)): whole items, never one cut. A narrow
+    /// The status row's items fitted to at most `cells` cells (DESIGN.md
+    /// §4, the Messages window), measured as `segments_cells` measures
+    /// the segments drawn, which is the width of the line they say: whole
+    /// items, never one cut. A narrow
     /// row lets go of the background count, `no limits`, the credit and
     /// today; leaves the provider off the model's name; lets go of the
     /// cost and the context, then the hints to keys (the workspace card,
@@ -1217,15 +1262,12 @@ impl App {
     /// `no key: F10`, then the model, whole, then the network, then the
     /// mode; and cuts the state with an ellipsis only when it alone does
     /// not fit.
-    fn status_fitted(&self, cells: usize) -> String {
+    fn status_fitted_parts(&self, cells: usize) -> Vec<StatusPart> {
         if cells == 0 {
-            return String::new();
+            return Vec::new();
         }
         let mut parts = self.status_items();
-        let width = |parts: &[StatusPart]| {
-            parts.iter().map(|p| p.text.chars().count()).sum::<usize>()
-                + parts.len().saturating_sub(1) * 3
-        };
+        let width = |parts: &[StatusPart]| segments_cells(parts.iter().map(StatusPart::segment));
         let model = self.model();
         let name = model
             .split_once('/')
@@ -1237,7 +1279,7 @@ impl App {
             name
         };
         let effort = self.status_effort(model);
-        let mode = format!("mode {}", self.shown_mode().word());
+        let mode = self.shown_mode().word().to_string();
         // Each shortening takes its turn once every item it outranks
         // has gone: the rank below which it runs, and what it does.
         let mut shortenings: Vec<(u8, StatusKind, String)> = vec![
@@ -1269,14 +1311,17 @@ impl App {
                 None => break,
             }
         }
-        let line: Vec<String> = parts.into_iter().map(|p| p.text).collect();
-        let line = line.join(" | ");
-        if line.chars().count() <= cells {
-            return line;
+        // Only the state is left, too wide: cut it.
+        if width(&parts) > cells {
+            if let Some(first) = parts.first_mut() {
+                let line = first.line();
+                let mut cut: String = line.chars().take(cells - 1).collect();
+                cut.push('\u{2026}');
+                first.label = "";
+                first.text = cut;
+            }
         }
-        let mut cut: String = line.chars().take(cells - 1).collect();
-        cut.push('\u{2026}');
-        cut
+        parts
     }
 
     /// The effort the status row names beside model `model`.
@@ -1308,14 +1353,15 @@ impl App {
             1 => "1 new message: C-S-m".to_string(),
             n => format!("{n} new messages: C-S-m"),
         };
-        let retry = if self.chooser_coming() {
-            "reading folders: Escape cancels"
+        // The hint, and whether it is the retry hint, a warning.
+        let (retry, retrying) = if self.chooser_coming() {
+            ("reading folders: Escape cancels", false)
         } else if self.meter.retry {
-            "C-r asks again"
+            ("C-r asks again", true)
         } else if self.running() {
-            "Escape stops"
+            ("Escape stops", false)
         } else {
-            ""
+            ("", false)
         };
         let keyless = if self.keyed { "" } else { "no key: F10" };
         let card = if self.repositories().is_some() {
@@ -1331,105 +1377,124 @@ impl App {
             .find(|(id, _)| id == model)
             .map(|(_, length)| *length);
         let context = match (self.meter.context, length) {
-            (Some(used), Some(length)) => format!("ctx {}/{}", tokens(used), tokens(length)),
-            (Some(used), None) => format!("ctx {}", tokens(used)),
-            (None, Some(length)) => format!("ctx 0/{}", tokens(length)),
-            (None, None) => "ctx -".to_string(),
+            (Some(used), Some(length)) => format!("{}/{}", tokens(used), tokens(length)),
+            (Some(used), None) => tokens(used),
+            (None, Some(length)) => format!("0/{}", tokens(length)),
+            (None, None) => "-".to_string(),
         };
         // A spent amount, and the limit on it when one is set.
         let of = |spent: u64, limit: Option<u64>| match limit {
             Some(limit) => format!("{}/{}", cost::show(spent), cost::show(limit)),
             None => cost::show(spent),
         };
-        let part = |text: String, rank: u8| StatusPart {
-            text,
-            rank,
-            kind: StatusKind::Other,
-        };
+        // The state is an alert when the conversation failed or its far
+        // side cannot be reached.
+        let alert = self.away.is_some() || row.is_some_and(|r| r.state == RowState::Failed);
         let mut parts: Vec<StatusPart> = [
-            (state, 0),
-            (retry, 7),
-            (keyless, 4),
-            (unread.as_str(), 8),
-            (card, 9),
+            (state, 0, alert),
+            (retry, 7, retrying),
+            (keyless, 4, true),
+            (unread.as_str(), 8, false),
+            (card, 9, false),
         ]
         .into_iter()
-        .filter(|(text, _)| !text.is_empty())
-        .map(|(text, rank)| part(text.to_string(), rank))
+        .filter(|(text, _, _)| !text.is_empty())
+        .map(|(text, rank, emphasised)| StatusPart {
+            emphasis: match (emphasised, rank) {
+                (false, _) => Emphasis::Plain,
+                (true, 0) => Emphasis::Alert,
+                (true, _) => Emphasis::Warning,
+            },
+            ..StatusPart::plain(text.to_string(), rank)
+        })
         .collect();
         // That no jail holds its tools, kept as long as the mode is.
         if self.unconfined() {
             parts.push(StatusPart {
-                text: UNCONFINED_STATUS.to_string(),
-                rank: 1,
-                kind: StatusKind::Other,
+                emphasis: Emphasis::Warning,
+                ..StatusPart::plain(UNCONFINED_STATUS.to_string(), 1)
             });
         }
         if self.all_allowed() == Some(true) {
             parts.push(StatusPart {
-                text: ALL_ALLOWED_STATUS.to_string(),
-                rank: 1,
-                kind: StatusKind::Other,
+                emphasis: Emphasis::Warning,
+                ..StatusPart::plain(ALL_ALLOWED_STATUS.to_string(), 1)
             });
         }
         // The mode and the network policy before the model, and kept
         // after it, as they say what runs unasked.
         parts.push(StatusPart {
-            text: format!(
-                "mode {}{}",
-                self.shown_mode().word(),
-                if self.without_jev {
-                    ", classifier without Jev"
-                } else {
-                    ""
-                }
-            ),
-            rank: 1,
+            label: "mode",
             kind: StatusKind::Mode,
+            ..StatusPart::plain(
+                format!(
+                    "{}{}",
+                    self.shown_mode().word(),
+                    if self.without_jev {
+                        ", classifier without Jev"
+                    } else {
+                        ""
+                    }
+                ),
+                1,
+            )
         });
-        parts.push(part(
-            format!(
-                "network {}; web {}{}",
-                if self
-                    .book
-                    .active
-                    .as_ref()
-                    .and_then(|id| self.book.rows.iter().find(|r| &r.id == id))
-                    .and_then(|row| row.workspace.as_ref())
-                    .and_then(|workspace| self.networks.sandbox_for(workspace))
-                    .is_some()
-                {
-                    "sandbox profile"
-                } else {
-                    "host"
-                },
-                self.shown_network().name(),
-                if self.networks.host_commands {
-                    "; host execution enabled"
-                } else {
-                    ""
-                }
-            ),
-            2,
-        ));
         parts.push(StatusPart {
-            text: format!("{model} {effort}"),
-            rank: 3,
-            kind: StatusKind::Model,
+            label: "network",
+            ..StatusPart::plain(
+                format!(
+                    "{}; web {}{}",
+                    if self
+                        .book
+                        .active
+                        .as_ref()
+                        .and_then(|id| self.book.rows.iter().find(|r| &r.id == id))
+                        .and_then(|row| row.workspace.as_ref())
+                        .and_then(|workspace| self.networks.sandbox_for(workspace))
+                        .is_some()
+                    {
+                        "sandbox profile"
+                    } else {
+                        "host"
+                    },
+                    self.shown_network().name(),
+                    if self.networks.host_commands {
+                        "; host execution enabled"
+                    } else {
+                        ""
+                    }
+                ),
+                2,
+            )
         });
-        parts.push(part(context, 10));
-        parts.push(part(
-            format!("cost {}", of(self.meter.spent, self.limits.conversation)),
+        parts.push(StatusPart {
+            kind: StatusKind::Model,
+            ..StatusPart::plain(format!("{model} {effort}"), 3)
+        });
+        // What it costs and holds, at the row's end.
+        let end = |label: &'static str, text: String, rank: u8| StatusPart {
+            label,
+            end: true,
+            ..StatusPart::plain(text, rank)
+        };
+        parts.push(StatusPart {
+            meter: self.meter.context.zip(length),
+            ..end("ctx", context, 10)
+        });
+        parts.push(end(
+            "cost",
+            of(self.meter.spent, self.limits.conversation),
             11,
         ));
         if let Some(t) = self.today {
-            parts.push(part(format!("today {}", of(t, self.limits.day)), 12));
+            parts.push(end("today", of(t, self.limits.day), 12));
         }
         if let Some(credit) = self.credit.as_deref() {
-            parts.push(part(credit.to_string(), 13));
+            parts.push(end("", credit.to_string(), 13));
         }
-        parts.push(part("no limits".to_string(), 14));
-        parts.push(part(
+        parts.push(end("", "no limits".to_string(), 14));
+        parts.push(end(
+            "",
             format!(
                 "{} background",
                 self.processes.values().map(Vec::len).sum::<usize>()
@@ -7398,16 +7463,9 @@ impl App {
             },
         });
         let cells = (rect.width as usize / (CELL_WIDTH * s)).saturating_sub(2);
-        let line = self.status_fitted(cells);
-        raster::text_run(
-            self.surface.scale,
-            line.chars(),
-            (rect.x + (CELL_WIDTH * s) as i64, rect.y + (4 * s) as i64),
-            rect,
-            GlyphStyle::regular(INK, CHROME),
-            damage,
-            sink,
-        );
+        let parts = self.status_fitted_parts(cells);
+        let segments: Vec<Segment<'_>> = parts.iter().map(StatusPart::segment).collect();
+        td_ui::chrome::segments(rect, self.surface.scale, &segments, damage, sink);
     }
 }
 
@@ -7585,6 +7643,17 @@ pub mod tests {
         app
     }
 
+    /// The status row's line in at most `cells` cells, as
+    /// `status_fitted_parts` fits it.
+    fn status_fitted(app: &App, cells: usize) -> String {
+        let items: Vec<String> = app
+            .status_fitted_parts(cells)
+            .iter()
+            .map(StatusPart::line)
+            .collect();
+        items.join(" | ")
+    }
+
     fn key(app: &mut App, chord: &str) {
         app.key(chord, false, &mut NoClipboard);
     }
@@ -7747,11 +7816,13 @@ pub mod tests {
             app.status_line()
         );
         // The drawn row, narrower than the line, keeps the model whole,
-        // its provider left off before anything is cut.
+        // its provider left off before anything is cut; its items stand
+        // a ruled gap apart, drawn as no text.
+        let shown = text(&app);
         assert!(
-            text(&app).contains("| network host; web off | default medium"),
-            "{}",
-            text(&app)
+            shown.contains("network host; web off   default medium")
+                && !shown.contains("m/default"),
+            "{shown}"
         );
     }
 
@@ -11487,6 +11558,82 @@ pub mod tests {
         }
     }
 
+    /// The status row's segments: a failed state an alert; an unconfined
+    /// workspace, the retry hint and a missing key warnings; the mode
+    /// labelled at the start; the context labelled at the end with a
+    /// meter of its tokens used of the model's length, and the cost after
+    /// it; and the drawn row in those inks with that meter. With no
+    /// length known, the context has no meter.
+    #[test]
+    fn the_status_rows_segments_mark_what_matters() {
+        let mut app = app();
+        // Wide enough to keep every item.
+        app.resize(Surface::new(2400, 640, Scale::default()).unwrap());
+        app.meter.retry = true;
+        app.set_keyed(false);
+        let open = app.active().cloned().unwrap();
+        let mut rows = app.rows().to_vec();
+        for row in &mut rows {
+            if row.id == open {
+                row.state = RowState::Failed;
+                row.unconfined = true;
+            }
+        }
+        app.set_rows(rows);
+        app.meter.context = Some(50_000);
+        let parts = app.status_items();
+        let find = |label: &str, text: &str| {
+            parts
+                .iter()
+                .find(|p| p.label == label && p.text.starts_with(text))
+                .unwrap()
+        };
+        let state = parts.first().unwrap();
+        assert_eq!(
+            (state.text.as_str(), state.emphasis),
+            ("failed", Emphasis::Alert)
+        );
+        assert_eq!(find("", UNCONFINED_STATUS).emphasis, Emphasis::Warning);
+        let mode = find("mode", "");
+        assert!(!mode.end && mode.emphasis == Emphasis::Plain);
+        let ctx = find("ctx", "50k/200k");
+        assert!(ctx.end);
+        assert_eq!(ctx.meter, Some((50_000, 200_000)));
+        assert!(find("cost", "$").end);
+        assert!(app.status_line().contains("| ctx 50k/200k | cost $"));
+        assert_eq!(find("", "C-r asks again").emphasis, Emphasis::Warning);
+        assert_eq!(find("", "no key: F10").emphasis, Emphasis::Warning);
+        // Drawn: the state in the alert's ink, a warning in its own, and
+        // the context's meter filled under its value.
+        let mut draws = Vec::new();
+        app.emit(app.surface.bounds(), &mut |draw| draws.push(draw));
+        let inked = |scalar: char, ink: u32| {
+            draws.iter().any(|draw| {
+                matches!(draw.primitive, Primitive::Glyph { scalar: c, style, .. }
+                    if c == scalar && style.ink == ink && style.background == CHROME)
+            })
+        };
+        assert!(inked('f', td_ui::raster::MISSPELLED) && inked('j', td_ui::raster::WARNING));
+        // The meter's fill: a quarter of `50k/200k`'s eight cells, two
+        // pixels high, two above the foot of the window's status row.
+        let s = Scale::default().value() as u32;
+        let foot = app.surface.height as i64 - 2 * i64::from(s);
+        let meter = |rect: Rect, color: u32| {
+            color == td_ui::raster::SELECTED
+                && rect.height == 2 * s
+                && rect.width == 2 * td_ui::CELL_WIDTH as u32 * s
+                && rect.y + i64::from(rect.height) == foot
+        };
+        assert!(draws.iter().any(|draw| match draw.primitive {
+            Primitive::Fill { rect, color } => meter(rect, color),
+            _ => false,
+        }));
+        // A model of no known length: no meter.
+        app.set_models("m/other", Vec::new());
+        let parts = app.status_items();
+        assert_eq!(parts.iter().find(|p| p.label == "ctx").unwrap().meter, None);
+    }
+
     /// A narrow status row lets whole items go and never cuts one, in the
     /// order DESIGN.md §4 gives: at every width the row is the first of
     /// the steps below that fits, and only the state, alone, is cut.
@@ -11565,7 +11712,10 @@ pub mod tests {
         }
         assert_eq!(steps.last(), Some(&state));
         for cells in 0..=whole.chars().count() + 4 {
-            let fitted = app.status_fitted(cells);
+            let fitted = status_fitted(&app, cells);
+            // The segments drawn fit the cells the line does.
+            let parts = app.status_fitted_parts(cells);
+            assert!(segments_cells(parts.iter().map(StatusPart::segment)) <= cells);
             let expected = steps
                 .iter()
                 .find(|line| line.chars().count() <= cells)

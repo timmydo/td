@@ -236,7 +236,8 @@ mod tests {
         // selected row, an unfocused selection, selected text on its band,
         // line numbers, a disabled entry and button, borders, the status
         // inks, which also band paper-ink rows, and the message list's
-        // tone inks on chrome and on a selected row; and on the person's
+        // tone inks on chrome and on a selected row, a status row's
+        // warning on chrome among them; and on the person's
         // own bubble, ink, line numbers, the tone inks and the border a
         // lit icon is.
         let pairs = [
@@ -259,6 +260,7 @@ mod tests {
             (4, 2, 400),
             (4, 8, 310),
             (7, 2, 390),
+            (11, 2, 390),
             (7, 8, 300),
             (6, 8, 230),
             (1, 13, 600),

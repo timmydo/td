@@ -1869,16 +1869,28 @@ not yet read (`2 new messages: C-S-m`), `workspace: C-S-w` for a
 repository workspace (§7, "The workspace card"), the mode and the
 network policy (§10), the model and effort, the context, the cost, today
 and the credit, `no limits` and `0 background`. A row too narrow for
-them all keeps whole items and never cuts one (`status_fitted`): it lets
-go of the background count, `no limits`, the credit and today, from the
-last; leaves the provider off the model's name (`claude-opus-5.5` for
+them all keeps whole items and never cuts one
+(`status_fitted_parts`): it lets go of the background count, `no
+limits`, the credit and today, from the last; leaves the provider off the model's name (`claude-opus-5.5` for
 `anthropic/claude-opus-5.5`); lets go of the cost and the context, then
 the hints to keys (the workspace card, the unread count, `Escape stops`
 or `C-r asks again`); leaves off the effort, then the mode's `classifier
 without Jev`; lets go of `no key: F10`, then the model, whole, then the
 network, then the mode, which say what runs unasked and so outlast it;
 and cuts the state with an ellipsis only when it alone does not fit. The
-control socket reports the whole line. A note (a refusal said by name, a
+row is drawn as td-ui's segments (td-ui/DESIGN.md, `chrome`), as wide
+as that line, so it fits as the line does: the state, the hints,
+`unconfined: no jail` and `all allowed`, the mode, the network and the
+model from its start; the context, the cost,
+today, the credit, `no limits` and the background count at its end.
+The mode, the network, the context, the cost and today carry their
+word as a quiet label (`mode`, `network`, `ctx`, `cost`, `today`)
+before their value; the context has a meter under it, its tokens used
+of the model's length, once both are known. The state is an alert
+while the conversation has failed or its far side cannot be reached;
+the retry hint, `no key: F10`, `unconfined: no jail` and `all allowed`
+are warnings. The control socket reports the whole line, each item with
+its label, joined by ` | `. A note (a refusal said by name, a
 step done, a background conversation's notice under its title) goes to a
 log of the last 500, each with the time it came and kept whole up to 16
 KiB, a longer one cut and saying so. `C-S-m` or File → `Messages…` opens

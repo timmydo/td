@@ -589,6 +589,28 @@ of its own files may name each module.
   and at most `STATUS_COLUMNS` (512), a control scalar blank and the last
   cell an ellipsis when the line is longer, under a top border; `frame`
   paints the row without a line for a consumer laying out its own status.
+  A status row may instead be `Segment`s (`Status::emit_segments`, or
+  `segments` on any `ROW`-tall rectangle over a `CHROME` ground its
+  owner paints): each a label, drawn in `LINE_NUMBER` ink and empty for
+  none, a value in its `Emphasis`'s ink (`INK`, `WARNING` or
+  `MISSPELLED`), a group (from the row's start, or at its `end`) and an
+  optional meter, a share `used` of `whole`. `segments_cells` is their
+  width: each one's label, a space when it has a value too, and value,
+  with `SEGMENT_GAP` (3) cells between any two, so a row is exactly as
+  wide as its items joined by ` | ` and its owner fits it to its
+  columns, dropping or shortening items, as it would that line. The
+  start group lies from a cell in, the end group so its last ends a cell
+  short of the right, and the start group is cut `SEGMENT_GAP` short of
+  the end group's first, with no rule after the last segment it holds
+  and no segment started with less than a cell left; an end group wider
+  than the row lies from a cell in, cut at its right, and no start
+  segment is drawn. A `BORDER` rule a scaled pixel wide stands in
+  the middle cell of each gap within a group, inset five pixels from the
+  row's top and foot; none stands between the groups. A meter takes no
+  cells: a `BORDER` track two pixels high under its value's cells, two
+  above the row's foot, clear of the glyph cell, filled from its left to
+  the share (`used` past `whole` full, a `whole` of nothing empty) in
+  `SELECTED`, or the value's ink when it is emphasised.
   `TextEntry` is one `ROW`-tall paper field inside a `BORDER` bezel a
   scaled pixel wide, as a `Button`'s, so a field's bounds show against
   the list or pane under it; the bezel lies in the text's cell inset, so
@@ -2598,7 +2620,8 @@ status ink on paper (4.5:1); line numbers on paper (3:1) and on chrome,
 and disabled ink on chrome (2.8:1); borders on paper (1.6:1) and chrome
 (1.4:1); disabled ink on paper (3.4:1), the panel's disabled button, and
 on the selected row (2.3:1); and the message list's tone inks, the
-selection and the misspelling ink on chrome (4:1, 3.9:1) and on the
+selection and the misspelling ink on chrome (4:1, 3.9:1), with a
+status row's warning ink on chrome (3.9:1), and on the
 selected row (3.1:1, 3:1), and line numbers on the selected row (2.3:1);
 and on the person's own bubble, set off in hue from chrome, the others'
 bubble, ink (6:1), line numbers (2.8:1), the selection, the misspelling
