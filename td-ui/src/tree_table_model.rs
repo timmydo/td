@@ -63,9 +63,27 @@ impl Heading {
         self.numeric
     }
 }
+/// How a cell's first scalar, a mark before its text such as a state,
+/// stands out from the row's ink. On a selected row the mark takes the
+/// row's ink, but for a badge, which keeps its own ground.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lead {
+    /// `LINE_NUMBER`: a state that asks nothing.
+    Quiet,
+    /// `ACCENT`: something under way.
+    Accent,
+    /// `WARNING`: something to keep in mind.
+    Warning,
+    /// `MISSPELLED`: something that went wrong.
+    Alert,
+    /// `PAPER` on an `ACCENT` box the mark's cell: something waiting on
+    /// the person.
+    Badge,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cell<'a> {
     text: &'a str,
+    lead: Option<Lead>,
 }
 impl<'a> Cell<'a> {
     pub fn new(text: &'a str) -> Result<Self, Error> {
@@ -75,13 +93,26 @@ impl<'a> Cell<'a> {
         if text.chars().any(char::is_control) {
             return Err(Error::InvalidText);
         }
-        Ok(Self { text })
+        Ok(Self { text, lead: None })
     }
     pub fn empty() -> Self {
-        Self { text: "" }
+        Self {
+            text: "",
+            lead: None,
+        }
+    }
+    /// The cell with its first scalar drawn as `lead` says.
+    pub fn with_lead(self, lead: Lead) -> Self {
+        Self {
+            lead: Some(lead),
+            ..self
+        }
     }
     pub fn text(self) -> &'a str {
         self.text
+    }
+    pub fn lead(self) -> Option<Lead> {
+        self.lead
     }
 }
 #[derive(Debug)]

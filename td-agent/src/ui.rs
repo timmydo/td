@@ -40,7 +40,7 @@ use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER,
 };
 use td_ui::split;
-use td_ui::tree_table::{self, Cell, Column, Model, Row as TreeRow};
+use td_ui::tree_table::{self, Cell, Column, Lead, Model, Row as TreeRow};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
@@ -298,26 +298,36 @@ pub const UNCONFINED_MARK: &str = "[no jail]";
 /// What the status row says of a conversation whose calls are all allowed.
 pub const ALL_ALLOWED_STATUS: &str = "all allowed";
 
-/// Monochrome symbols keep the state small without needing emoji fonts.
+/// A state's mark in the list and how it stands out (DESIGN.md §4), in
+/// one table so a mark and its lead never part: monochrome symbols keep
+/// the state small without needing emoji fonts; what runs is in the
+/// accent, a failure an alert, a restart a warning, what waits on the
+/// person a badge, and the rest quiet. No state, no mark.
+fn state_mark(state: &str) -> Option<(&'static str, Lead)> {
+    Some(match state {
+        "starting" => ("…", Lead::Quiet),
+        "idle" => ("○", Lead::Quiet),
+        "running" => ("▶", Lead::Accent),
+        "restarting" => ("↻", Lead::Warning),
+        "failed" => ("!", Lead::Alert),
+        "paused" => ("‖", Lead::Quiet),
+        "archived" => ("□", Lead::Quiet),
+        "deleting" => ("×", Lead::Quiet),
+        "archiving" => ("↓", Lead::Quiet),
+        ASKS => ("?", Lead::Badge),
+        _ => return None,
+    })
+}
+
 fn state_label(state: &str, title: &str) -> String {
-    let icon = match state {
-        "starting" => "…",
-        "idle" => "○",
-        "running" => "▶",
-        "restarting" => "↻",
-        "failed" => "!",
-        "paused" => "‖",
-        "archived" => "□",
-        "deleting" => "×",
-        "archiving" => "↓",
-        ASKS => "?",
-        _ => "",
-    };
-    if icon.is_empty() {
-        title.to_string()
-    } else {
-        format!("{icon} {title}")
+    match state_mark(state) {
+        Some((icon, _)) => format!("{icon} {title}"),
+        None => title.to_string(),
     }
+}
+
+fn state_lead(state: &str) -> Option<Lead> {
+    state_mark(state).map(|(_, lead)| lead)
 }
 
 /// What one of the list's rows is (DESIGN.md §4): a way to start a
@@ -767,8 +777,9 @@ pub struct App {
     item_ids: BTreeMap<Item, usize>,
     /// The last id given an item.
     next_item: usize,
-    /// Each row's title with its state prefix, rebuilt when state changes.
-    item_labels: BTreeMap<usize, String>,
+    /// Each row's title with its state prefix, rebuilt when state
+    /// changes, and how that prefix stands out.
+    item_labels: BTreeMap<usize, (String, Option<Lead>)>,
     /// When a group last started a conversation, and which.
     started_in: Option<(Instant, Group)>,
     /// A conversation started since, its composer focused.
@@ -3552,7 +3563,7 @@ impl App {
         };
         let mut tree: Vec<TreeRow<usize>> = Vec::new();
         let mut items: BTreeMap<usize, Item> = BTreeMap::new();
-        let mut labels: BTreeMap<usize, String> = BTreeMap::new();
+        let mut labels: BTreeMap<usize, (String, Option<Lead>)> = BTreeMap::new();
         for group in groups {
             let conversations = under.get(&group).map_or(&[][..], Vec::as_slice);
             let item = Item::Group(group.clone());
@@ -3565,7 +3576,7 @@ impl App {
                 children: !conversations.is_empty(),
                 expanded: open && !conversations.is_empty(),
             });
-            labels.insert(parent, self.group_label(&group));
+            labels.insert(parent, (self.group_label(&group), None));
             items.insert(parent, item);
             if !open {
                 continue;
@@ -3590,14 +3601,18 @@ impl App {
                     children: under,
                     expanded: open && under,
                 });
-                let label = state_label(self.conversation_state(row), &row.title);
+                let state = self.conversation_state(row);
+                let label = state_label(state, &row.title);
                 labels.insert(
                     conversation,
-                    if row.unconfined {
-                        format!("{label} {UNCONFINED_MARK}")
-                    } else {
-                        label
-                    },
+                    (
+                        if row.unconfined {
+                            format!("{label} {UNCONFINED_MARK}")
+                        } else {
+                            label
+                        },
+                        state_lead(state),
+                    ),
                 );
                 items.insert(conversation, item);
                 if !open {
@@ -3616,9 +3631,12 @@ impl App {
                     });
                     labels.insert(
                         process,
-                        state_label(
-                            "running",
-                            &format!("p{number} {}", crate::tools::visible(&cut)),
+                        (
+                            state_label(
+                                "running",
+                                &format!("p{number} {}", crate::tools::visible(&cut)),
+                            ),
+                            state_lead("running"),
                         ),
                     );
                     items.insert(process, item);
@@ -3639,10 +3657,8 @@ impl App {
                         && row.state == RowState::Running;
                     let title =
                         crate::tools::visible(&format!("{}: {}", start.agent, start.prompt));
-                    labels.insert(
-                        task,
-                        state_label(if running { "running" } else { "" }, &title),
-                    );
+                    let state = if running { "running" } else { "" };
+                    labels.insert(task, (state_label(state, &title), state_lead(state)));
                     items.insert(task, item);
                 }
                 let more = starts
@@ -3658,7 +3674,10 @@ impl App {
                         children: false,
                         expanded: false,
                     });
-                    labels.insert(earlier, format!("{more} earlier sub-agent(s), in its log"));
+                    labels.insert(
+                        earlier,
+                        (format!("{more} earlier sub-agent(s), in its log"), None),
+                    );
                     items.insert(earlier, item);
                 }
             }
@@ -7397,7 +7416,13 @@ impl App {
         }
         self.item_labels
             .get(&index)
-            .and_then(|label| Cell::new(label).ok())
+            .and_then(|(label, lead)| {
+                let cell = Cell::new(label).ok()?;
+                Some(match lead {
+                    Some(lead) => cell.with_lead(*lead),
+                    None => cell,
+                })
+            })
             .unwrap_or_else(Cell::empty)
     }
 
@@ -10650,6 +10675,8 @@ pub mod tests {
         // Return on one starts one.
         assert_eq!(app.focus(), Focus::List);
         let at = row_of(&app, &Item::Group(Group::Template("td".into())));
+        // A heading has no state, so no lead.
+        assert_eq!(app.cell(at, 0).lead(), None);
         app.list.select(Some(at), true);
         key(&mut app, "Up");
         key(&mut app, "Down");
@@ -10691,13 +10718,13 @@ pub mod tests {
             .find(|r| r.id == id(1))
             .unwrap()
             .title = title.into();
-        for (state, prefix) in [
-            (RowState::Closed, ""),
-            (RowState::Starting, "… "),
-            (RowState::Idle, "○ "),
-            (RowState::Running, "▶ "),
-            (RowState::Restarting, "↻ "),
-            (RowState::Failed, "! "),
+        for (state, prefix, lead) in [
+            (RowState::Closed, "", None),
+            (RowState::Starting, "… ", Some(Lead::Quiet)),
+            (RowState::Idle, "○ ", Some(Lead::Quiet)),
+            (RowState::Running, "▶ ", Some(Lead::Accent)),
+            (RowState::Restarting, "↻ ", Some(Lead::Warning)),
+            (RowState::Failed, "! ", Some(Lead::Alert)),
         ] {
             app.book
                 .rows
@@ -10708,8 +10735,45 @@ pub mod tests {
             app.refresh_list();
             let at = row_of(&app, &Item::Conversation(id(1)));
             assert_eq!(app.cell(at, 0).text(), format!("{prefix}{title}"));
+            assert_eq!(app.cell(at, 0).lead(), lead, "{state:?}");
             assert!(text(&app).contains(title), "{}", text(&app));
         }
+        // The lead is the state's, never the title's: a closed row whose
+        // title starts as a mark would has none; one waiting on the
+        // person is a badge.
+        let row = app.book.rows.iter_mut().find(|r| r.id == id(1)).unwrap();
+        row.state = RowState::Closed;
+        row.title = "! not a state".into();
+        app.refresh_list();
+        let at = row_of(&app, &Item::Conversation(id(1)));
+        assert_eq!(app.cell(at, 0).lead(), None);
+        assert_eq!(state_lead(ASKS), Some(Lead::Badge));
+        // A lead exactly when a mark, over every state word.
+        for state in [
+            "",
+            "starting",
+            "idle",
+            "running",
+            "restarting",
+            "failed",
+            "paused",
+            "archived",
+            "deleting",
+            "archiving",
+            ASKS,
+            "unknown",
+        ] {
+            let marked = state_label(state, "t") != "t";
+            assert_eq!(state_lead(state).is_some(), marked, "{state:?}");
+        }
+        assert_eq!(state_lead("paused"), Some(Lead::Quiet));
+        app.book
+            .rows
+            .iter_mut()
+            .find(|r| r.id == id(1))
+            .unwrap()
+            .title = title.into();
+        app.refresh_list();
         for width in [720, 1024, 1500] {
             app.resize(Surface::new(width, 640, Scale::default()).unwrap());
             assert_eq!(app.list.model().columns().len(), 1);
@@ -11924,6 +11988,8 @@ pub mod tests {
         app.background(&id(2), &process(10, 7, "sleep 60"), 0);
         app.background(&id(2), &process(11, 8, "sleep 60"), 0);
         let seven = row_of(&app, &Item::Process(id(2), 7));
+        // A background process is running, in the accent.
+        assert_eq!(app.cell(seven, 0).lead(), Some(Lead::Accent));
         app.list.select(Some(seven), true);
         app.remove_row(&id(3));
         let selected = app.list.selected().unwrap();
@@ -11993,6 +12059,7 @@ pub mod tests {
         assert_eq!(shown(&app), [id(1), id(3), id(2)]);
         let at = row_of(&app, &Item::Conversation(id(3)));
         assert_eq!(app.cell(at, 0).text(), "□ title 3");
+        assert_eq!(app.cell(at, 0).lead(), Some(Lead::Quiet));
         let (x, y) = row_at(&app, 3);
         press(&mut app, x, y);
         assert!(app.take_requests().is_empty());
@@ -14315,6 +14382,7 @@ pub mod tests {
         assert!(shown.contains(confirm::REMOVE_TITLE), "{shown}");
         assert!(shown.contains("2 changed or untracked files"), "{shown}");
         assert_eq!(app.cell(index, 0).text(), "? title 1");
+        assert_eq!(app.cell(index, 0).lead(), Some(Lead::Badge));
         // Set aside with the keyboard, and asked again when it is back.
         app.input(Input::Focus(false), &mut NoClipboard);
         assert!(app.confirm().is_none());
@@ -14350,6 +14418,7 @@ pub mod tests {
         app.set_closing(&id(2), Some("archiving"));
         let index = row_of(&app, &Item::Conversation(id(2)));
         assert_eq!(app.cell(index, 0).text(), "↓ title 2");
+        assert_eq!(app.cell(index, 0).lead(), Some(Lead::Quiet));
         app.open(id(2));
         assert!(app
             .notice()

@@ -1,10 +1,11 @@
 //! Visible-cell-only semantic painting for the tree table.
 use crate::raster::{
-    self, fill, Draw, GlyphStyle, Rect, BORDER, CHROME, INACTIVE_SELECTION, INK, PAPER, SELECTED,
+    self, fill, Draw, GlyphStyle, Rect, ACCENT, BORDER, CHROME, INACTIVE_SELECTION, INK,
+    LINE_NUMBER, MISSPELLED, PAPER, SELECTED, WARNING,
 };
 use crate::tree_table::{Controller, Focus};
 use crate::tree_table_geometry::{CellRect, INDENT};
-use crate::tree_table_model::Cell;
+use crate::tree_table_model::{Cell, Lead};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Direction {
     Ascending,
@@ -198,7 +199,8 @@ impl<I: Copy + Ord> Controller<I> {
                 if cell.clip.intersection(damage).is_none() {
                     continue;
                 }
-                let text = values(row.id, column).text();
+                let value = values(row.id, column);
+                let text = value.text();
                 let indent = if column == 0 {
                     i64::from((u32::from(row.depth) + 1) * INDENT * scale)
                 } else {
@@ -212,7 +214,49 @@ impl<I: Copy + Ord> Controller<I> {
                 } else {
                     cell.rect.x + indent + inset
                 };
-                self.text(text, cell, origin, style, damage, sink);
+                // A lead's mark, its first scalar, apart from the rest.
+                let mut rest = text.chars();
+                match (value.lead(), rest.next()) {
+                    (Some(lead), Some(scalar)) => {
+                        let mark = text.get(..scalar.len_utf8()).unwrap_or_default();
+                        let rest = rest.as_str();
+                        let cw = i64::from(crate::CELL_WIDTH as u32 * scale);
+                        let mark_style = match lead {
+                            Lead::Badge => {
+                                // Inverted on a focused selection, where an
+                                // accent box would all but vanish.
+                                let (box_ink, glyph) = if background == SELECTED {
+                                    (PAPER, SELECTED)
+                                } else {
+                                    (ACCENT, PAPER)
+                                };
+                                let badge = Rect {
+                                    x: origin,
+                                    y: cell.rect.y + i64::from(4 * scale),
+                                    width: cw as u32,
+                                    height: crate::CELL_HEIGHT as u32 * scale,
+                                };
+                                // Exactly when its glyph is: a run drops a
+                                // glyph cut at the right, and clips one cut
+                                // at the left, as the box is.
+                                let drawn = origin + cw <= cell.clip.x + i64::from(cell.clip.width);
+                                if let Some(clip) = cell.clip.intersection(damage).filter(|_| drawn)
+                                {
+                                    fill(badge, box_ink, clip, sink);
+                                }
+                                GlyphStyle::medium(glyph, box_ink)
+                            }
+                            _ if selected => style,
+                            Lead::Quiet => GlyphStyle::medium(LINE_NUMBER, background),
+                            Lead::Accent => GlyphStyle::medium(ACCENT, background),
+                            Lead::Warning => GlyphStyle::medium(WARNING, background),
+                            Lead::Alert => GlyphStyle::medium(MISSPELLED, background),
+                        };
+                        self.text(mark, cell, origin, mark_style, damage, sink);
+                        self.text(rest, cell, origin + cw, style, damage, sink);
+                    }
+                    _ => self.text(text, cell, origin, style, damage, sink),
+                }
                 if column == 0 && row.children {
                     if let Some(clip) = g
                         .disclosure(index, row.depth)

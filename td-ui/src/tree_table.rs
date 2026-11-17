@@ -6,8 +6,8 @@ pub use crate::tree_table_geometry::{
     CellRect, Error as GeometryError, Geometry, Hit as GeometryHit, GUTTER, INDENT, ROW,
 };
 pub use crate::tree_table_model::{
-    Cell, Column, Error as ModelError, Heading, Model, Row, CELL_BYTES, COLUMNS, COLUMN_WIDTH,
-    DEPTH, LABEL_BYTES, MODEL_BYTES, ROWS,
+    Cell, Column, Error as ModelError, Heading, Lead, Model, Row, CELL_BYTES, COLUMNS,
+    COLUMN_WIDTH, DEPTH, LABEL_BYTES, MODEL_BYTES, ROWS,
 };
 pub use crate::tree_table_paint::{Direction, Sort};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

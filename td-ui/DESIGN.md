@@ -3292,7 +3292,17 @@ minima hold their complete headings, insets, sort mark and border. The first min
 least 32 pixels; consumers can widen it to reveal deeper indentation.
 
 Cell values remain in the consumer. `Cell::new` validates control-free
-text through 4096 bytes, with an explicit empty-cell fallback. `emit`
+text through 4096 bytes, with an explicit empty-cell fallback.
+`Cell::with_lead` draws the cell's first scalar, a mark such as a state
+before its text, as a `Lead` says, and the rest a cell on in the row's
+ink: `Quiet` in `LINE_NUMBER`, `Accent` in `ACCENT`, `Warning` in
+`WARNING` and `Alert` in `MISSPELLED` on an unselected row, where the
+mark takes the row's ink on a selected one, focused or not; `Badge` in
+`PAPER` on an `ACCENT` box its glyph cell, inverted (`SELECTED` on a
+`PAPER` box) on a focused selection, where the accent would all but
+vanish, and drawn exactly when its glyph is, clipped with it. Each
+pair is one the theme floors already hold: line numbers and the status
+inks on paper, paper on the accent and the selection. `emit`
 requests borrowed values only for rows and columns intersecting both the
 visible viewport and damage, then streams clipped draws without allocation
 or I/O. Returned text must outlive the complete emit call; a callback cannot

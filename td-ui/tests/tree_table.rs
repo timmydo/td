@@ -799,6 +799,228 @@ fn disclosure_is_a_drawn_box_with_a_plus_or_minus_at_every_scale() {
     }
 }
 
+/// A cell's lead draws its first scalar apart (marks no heading has), at
+/// every scale: quiet, accent, warning and alert in their inks on an
+/// unselected row, a badge in paper on an accent box its glyph cell; the
+/// rest of the text in the row's ink, a cell on. On a selection, focused
+/// or not, the mark takes the row's ink; a badge keeps an accent box on
+/// an unfocused one and is inverted, a paper box, on a focused one. A
+/// column cut short of the badge's cell draws no sliver of its box.
+#[test]
+fn a_cells_lead_marks_its_first_scalar() {
+    use td_ui::raster::{
+        Primitive, ACCENT, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
+        WARNING,
+    };
+    use td_ui::tree_table::{Cell, Lead};
+    use td_ui::{CELL_HEIGHT, CELL_WIDTH};
+    type Glyph = (i64, i64, char, u32, u32);
+    let leads = [
+        None,
+        Some(Lead::Quiet),
+        Some(Lead::Accent),
+        Some(Lead::Warning),
+        Some(Lead::Alert),
+        Some(Lead::Badge),
+    ];
+    let texts = ["g xyz", "h xyz", "i xyz", "j xyz", "k xyz", "l xyz"];
+    let rows = (0..6).map(row).collect::<Vec<_>>();
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let surface = Surface::new(
+            700 * scale as usize,
+            400 * scale as usize,
+            Scale::new(scale).unwrap(),
+        )
+        .unwrap();
+        let rect = Rect {
+            x: 20 * s,
+            y: 20 * s,
+            width: 640 * scale as u32,
+            height: 320 * scale as u32,
+        };
+        let mut c = Controller::new(model(&rows), surface, rect).unwrap();
+        let paint = |c: &Controller<u32>| {
+            let (mut glyphs, mut fills): (Vec<Glyph>, Vec<(Rect, u32)>) = (Vec::new(), Vec::new());
+            c.emit(
+                None,
+                surface.bounds(),
+                &mut |id, column| {
+                    let cell = match column {
+                        0 => Cell::new(texts[id as usize]).unwrap(),
+                        _ => Cell::empty(),
+                    };
+                    match leads[id as usize] {
+                        Some(lead) => cell.with_lead(lead),
+                        None => cell,
+                    }
+                },
+                &mut |draw| match draw.primitive {
+                    Primitive::Glyph {
+                        x,
+                        y,
+                        scalar,
+                        style,
+                    } => glyphs.push((x, y, scalar, style.ink, style.background)),
+                    Primitive::Fill { rect, color } => fills.push((rect, color)),
+                    _ => {}
+                },
+            );
+            (glyphs, fills)
+        };
+        let ink = |glyphs: &[Glyph], scalar: char| {
+            glyphs
+                .iter()
+                .find(|g| g.2 == scalar)
+                .map(|g| (g.3, g.4))
+                .unwrap()
+        };
+        let badge_box = |glyphs: &[Glyph], color: u32| {
+            let badge = glyphs.iter().find(|g| g.2 == 'l').unwrap();
+            (
+                Rect {
+                    x: badge.0,
+                    y: badge.1,
+                    width: CELL_WIDTH as u32 * u32::from(scale),
+                    height: CELL_HEIGHT as u32 * u32::from(scale),
+                },
+                color,
+            )
+        };
+        let (glyphs, fills) = paint(&c);
+        assert_eq!(ink(&glyphs, 'g'), (INK, PAPER), "{scale}");
+        assert_eq!(ink(&glyphs, 'h'), (LINE_NUMBER, PAPER), "{scale}");
+        assert_eq!(ink(&glyphs, 'i'), (ACCENT, PAPER), "{scale}");
+        assert_eq!(ink(&glyphs, 'j'), (WARNING, PAPER), "{scale}");
+        assert_eq!(ink(&glyphs, 'k'), (MISSPELLED, PAPER), "{scale}");
+        assert_eq!(ink(&glyphs, 'l'), (PAPER, ACCENT), "{scale}");
+        // The rest of every row in the row's ink, its first a cell past
+        // the mark.
+        for g in glyphs.iter().filter(|g| "xyz".contains(g.2)) {
+            assert_eq!((g.3, g.4), (INK, PAPER));
+        }
+        for mark in "ghijkl".chars() {
+            let mark = glyphs.iter().find(|g| g.2 == mark).unwrap();
+            let x = glyphs
+                .iter()
+                .find(|g| g.2 == 'x' && g.1 == mark.1)
+                .map(|g| g.0)
+                .unwrap();
+            assert_eq!(x, mark.0 + 2 * CELL_WIDTH as i64 * s, "{scale}");
+        }
+        // The badge: an accent box exactly the mark's glyph cell, alone.
+        assert!(fills.contains(&badge_box(&glyphs, ACCENT)), "{scale}");
+        assert_eq!(fills.iter().filter(|f| f.1 == ACCENT).count(), 1);
+        // An unfocused selection: the mark in the row's ink, the badge's
+        // accent box its own.
+        for (id, mark) in [(2, 'i'), (4, 'k')] {
+            c.select(Some(id), true);
+            let (glyphs, _) = paint(&c);
+            assert_eq!(ink(&glyphs, mark), (INK, INACTIVE_SELECTION), "{scale}");
+        }
+        c.select(Some(5), true);
+        let (glyphs, fills) = paint(&c);
+        assert_eq!(ink(&glyphs, 'l'), (PAPER, ACCENT), "{scale}");
+        assert!(fills.contains(&badge_box(&glyphs, ACCENT)), "{scale}");
+        // A focused selection: the mark in the row's ink, the badge
+        // inverted.
+        c.set_focus(Focus::Rows).unwrap();
+        c.select(Some(2), true);
+        let (glyphs, _) = paint(&c);
+        assert_eq!(ink(&glyphs, 'i'), (PAPER, SELECTED), "{scale}");
+        c.select(Some(5), true);
+        let (glyphs, fills) = paint(&c);
+        assert_eq!(ink(&glyphs, 'l'), (SELECTED, PAPER), "{scale}");
+        assert!(fills.contains(&badge_box(&glyphs, PAPER)), "{scale}");
+        assert!(!fills.iter().any(|f| f.1 == ACCENT), "{scale}");
+    }
+
+    // A column cut inside the badge's glyph cell, on a row deep enough
+    // to reach it: never a box without its glyph, whatever the width.
+    let tree = [
+        Row {
+            children: true,
+            expanded: true,
+            ..row(0)
+        },
+        Row {
+            parent: Some(0),
+            depth: 1,
+            children: true,
+            expanded: true,
+            ..row(1)
+        },
+        Row {
+            parent: Some(1),
+            depth: 2,
+            ..row(2)
+        },
+    ];
+    let narrow = Model::new(
+        &tree,
+        &[Column {
+            title: "N",
+            minimum: 32,
+            preferred: 200,
+            numeric: false,
+        }],
+    )
+    .unwrap();
+    let mut c = Controller::new(narrow, surface(), rect()).unwrap();
+    let (mut drawn, mut cut) = (false, false);
+    for width in 32..=120 {
+        c.set_width(0, width).unwrap();
+        let (mut glyph, mut boxed) = (false, false);
+        c.emit(
+            None,
+            surface().bounds(),
+            &mut |id, _| match id {
+                2 => Cell::new("l").unwrap().with_lead(Lead::Badge),
+                _ => Cell::empty(),
+            },
+            &mut |draw| match draw.primitive {
+                Primitive::Glyph { scalar: 'l', .. } => glyph = true,
+                Primitive::Fill { color, .. } if color == ACCENT => boxed = true,
+                _ => {}
+            },
+        );
+        assert_eq!(boxed, glyph, "{width}");
+        drawn |= glyph;
+        cut |= !glyph;
+    }
+    assert!(drawn && cut);
+    // Scrolled so the column's left edge cuts the badge's cell at every
+    // pixel: the glyph clipped there, and its box with it.
+    let mut c = controller(&[row(0)]);
+    c.set_width(0, 200).unwrap();
+    let mut clipped = 0;
+    for second in 400..=520 {
+        c.set_width(1, second).unwrap();
+        c.event(Event::Scroll {
+            rows: 0,
+            columns: 1000,
+        });
+        let (mut glyph, mut boxed) = (None, false);
+        c.emit(
+            None,
+            surface().bounds(),
+            &mut |_, column| match column {
+                0 => Cell::new("l").unwrap().with_lead(Lead::Badge),
+                _ => Cell::empty(),
+            },
+            &mut |draw| match draw.primitive {
+                Primitive::Glyph { x, scalar: 'l', .. } => glyph = Some(x),
+                Primitive::Fill { color, .. } if color == ACCENT => boxed = true,
+                _ => {}
+            },
+        );
+        assert_eq!(boxed, glyph.is_some(), "{second}");
+        if glyph.is_some_and(|x| x < rect().x) {
+            clipped += 1;
+        }
+    }
+    assert!(clipped > 0);
+}
 #[test]
 fn the_default_chords_name_the_keys() {
     for (chord, key) in [

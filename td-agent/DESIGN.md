@@ -1396,18 +1396,24 @@ using its full width for titles. Each conversation's title has a compact
 state prefix: `…` starting, `○` idle, `▶` running, `↻` restarting, `!`
 failed, `‖` paused, `□` archived, `×` deleting, `↓` archiving, and `?`
 waiting for the person (approval, question or removal card). A closed
-conversation has no prefix. Workspace headings provide the grouping;
-there are no separate State or Workspace columns. The row opens to
-its worktrees with their state (fetching, checking out, ready, failed),
-any forked conversations, its background processes and the sub-agents it
-started (§12). A row waiting for approval is marked distinctly, so a run
-left in the background is visible from the list, and the notifications
-of §3 are shown on their conversation's row. A row's context menu
-archives the conversation or deletes it
-(below); archiving hides it from the list, which shows archived
-conversations when the human asks, each with a context menu that
-unarchives it. A repository workspace's worktrees go with either as §7
-says.
+conversation has no prefix. The prefix is the row's td-ui lead
+(td-ui/DESIGN.md, "Shared tree table"), taken from its state, never
+its title, one table giving each state its mark and lead (`state_mark`):
+`▶` in the accent, `!` an alert, `↻` a warning, `?` a badge, so what
+waits on the person stands out in the list, and the others quiet; a
+background process and a running sub-agent are `▶` too. The selected
+row, often the open conversation, draws its mark in the row's ink but
+for a badge; its state is on the status row. Workspace headings provide
+the grouping; there are no separate State or Workspace columns. The row
+opens to its worktrees with their state (fetching, checking out, ready,
+failed), any forked conversations, its background processes and the
+sub-agents it started (§12). A row waiting for approval is marked
+distinctly, so a run left in the background is visible from the list,
+and the notifications of §3 are shown on their conversation's row. A
+row's context menu archives the conversation or deletes it (below);
+archiving hides it from the list, which shows archived conversations
+when the human asks, each with a context menu that unarchives it. A
+repository workspace's worktrees go with either as §7 says.
 
 **Right: the active conversation.** From top to bottom:
 
