@@ -44,13 +44,19 @@ pub(crate) async fn charge(
     {
         let used: i64 = usage.try_get(index).map_err(|_| Error::Integrity)?;
         let used = u64::try_from(used).map_err(|_| Error::Integrity)?;
-        let value = used
-            .checked_add(charge)
-            .filter(|value| *value <= limit)
-            .ok_or(Error::Quota)?;
-        *total = i64::try_from(value).map_err(|_| Error::Integrity)?;
+        *total = i64::try_from(admit(used, charge, limit)?).map_err(|_| Error::Integrity)?;
     }
     Ok(Usage(totals))
+}
+
+/// A compact failure notice may leave usage past a cap; a charge that does
+/// not grow that column must still pass, or the overshoot would block it.
+fn admit(used: u64, charge: u64, limit: u64) -> Result<u64, Error> {
+    let value = used.checked_add(charge).ok_or(Error::Integrity)?;
+    if charge > 0 && value > limit {
+        return Err(Error::Quota);
+    }
+    Ok(value)
 }
 
 impl Usage {
@@ -225,4 +231,18 @@ pub(crate) async fn select_thread(
         crate::ids::ThreadId::from_bytes(thread.try_into().map_err(|_| Error::Integrity)?),
         false,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_growth_past_a_cap_is_refused() {
+        assert_eq!(admit(90, 10, 100), Ok(100));
+        assert_eq!(admit(90, 11, 100), Err(Error::Quota));
+        assert_eq!(admit(120, 0, 100), Ok(120));
+        assert_eq!(admit(120, 1, 100), Err(Error::Quota));
+        assert_eq!(admit(120, 30, u64::MAX), Ok(150));
+        assert_eq!(admit(u64::MAX, 1, u64::MAX), Err(Error::Integrity));
+    }
 }

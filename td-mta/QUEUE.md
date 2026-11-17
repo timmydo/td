@@ -387,8 +387,10 @@ The foreground PostgreSQL publisher implements these notices as unread Inbox
 mail, with bounded publication and restart semantics in POSTGRES.md section
 213. It never schedules a notice for SMTP delivery.
 Never notify an external inbound reverse path. Retention retires a Failed or
-OutcomeUnknown record only after its notice is stored; a notice that can never
-be stored keeps the record and its quota slot until an operator intervenes.
+OutcomeUnknown record only after its notice is stored. A full account still
+stores it as a compact report, charged within a fixed margin past the quota
+(POSTGRES.md section 213), so while that margin lasts the notice does not
+hold the record and its quota back.
 
 ## 5. Standard JMAP projection
 

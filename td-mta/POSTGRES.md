@@ -6834,7 +6834,9 @@ records per read. There is no complete-message allocation.
 The shared foreground relay worker attempts at most one pending local notice
 per account every five seconds, independently of route backoff, repair holds and expiry clock
 confirmation. Only already completed submissions with notification Pending
-qualify. The current selected relay profile and live route lease authorize
+qualify. Each turn picks one of them at random, so a notice whose storage
+keeps failing delays the others only in proportion, never indefinitely. The
+current selected relay profile and live route lease authorize
 its account; an older submission destination does not strand local notices
 when the smart host changes. No notice enters the outgoing submission queue.
 
@@ -6847,14 +6849,38 @@ that delivery may have occurred. Peer control characters are replaced with
 question marks in the text body; no peer text becomes a header. The generated
 message uses a local system sender, its own Message-ID and a fresh thread.
 
+That full report is attempted only within a day of completion, longer
+than a maximal burst of notices takes at one per five seconds. A compact
+report replaces it when the submission completed earlier, when the full
+report's work or size bound refuses it, or when the shared body/blob quota
+refuses its charge. The compact report keeps the identifying heading, counts
+recipients by outcome and names at most the first eight Failed or unknown
+recipients with their reasons, without replies; its text is at most 4 KiB
+and its message at most 16 KiB. It makes the full report's per-recipient
+integrity checks in one aggregate query. Late notices, including restored
+ones released more than a day before the relay runs, are compact. A notice
+stored more than 30 days after completion lets retention retire its record,
+replies included, at the next turn; the compact text says the delivery
+status may already be retired. Its charge is checked against body/blob caps raised by a fixed
+margin: 16 KiB of body and one blob per configured `queue_submissions`, so
+one queue's worth of failures still stores its notices in a full account,
+whose submissions can then retire and release their quota. Usage stays
+exact. Past the margin a notice stays Pending until the owner deletes mail;
+16 KiB of room then suffices. Every charge refuses only a column it grows
+past its cap, so a column already past a cap (an operator lowered it, or
+this margin was used) does not refuse a charge that leaves it unchanged; a
+lowered queue cap therefore cannot hold back a notice either. A replica of
+the account (REPLICATION.md) refuses such a source unless its own body/blob
+limits allow the same margin.
+
 One transaction writes the immutable blob, unread Inbox Email, membership,
 thread/anchor, quota charge and CHANGE rows for Email, Thread, Mailbox and
 Submission, then changes Pending to Stored with its historical Email ID.
 It preserves completedAt, recipients, their replies and uncertainty. Account
-sequence admission preserves outstanding final-result reservations. The
-existing shared body/blob quotas apply; missing Inbox, quota/storage failures
-or bounded-work refusal leave Pending for a later turn and do not stop SMTP
-scheduling. Errors are redacted fixed enums in the service log.
+sequence admission preserves outstanding final-result reservations. A
+missing Inbox, an exhausted quota margin, a storage failure or a deadline
+leaves Pending for a later turn and does not stop SMTP scheduling. Errors are redacted fixed enums in the
+service log.
 
 Stored is the durable receipt. Every subsequent scan first obtains the same
 account lock, so it waits for any older commit/rollback before selecting
@@ -7060,9 +7086,10 @@ final reservation. Pending notices and anything not yet completed stay. A
 Failed, OutcomeUnknown or Restored record therefore keeps its replies and
 uncertainty for 30 days after completion, retiring only once its notice is
 stored and the account owner was told; an operator who needs it longer must
-copy it out first. A notice that can never be stored (a full account) keeps
-its record and quota slot until an operator intervenes. A completed group
-canceled later keeps its completedAt.
+copy it out first. A full account does not hold a notice back while its
+quota margin lasts: past a day, or on a quota refusal, it is stored compact
+(section 213). A completed group canceled later keeps its
+completedAt.
 
 A batch holds at most 64 submissions, 2,048 recipients and 64 MiB of
 transmitted blobs, admitting its first submission whatever its size, so

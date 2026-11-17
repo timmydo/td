@@ -20,7 +20,19 @@ use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::{Client, Row};
 
 const MAX_TEXT: usize = 10 * 1024 * 1024;
+const RECIPIENT_PAGE: &str = "SELECT ordinal,address,state,uncertain,next_attempt_at,rcpt_reply,data_reply,reason,diagnostic,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3 ORDER BY ordinal LIMIT 100";
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+/// A compact notice's text and message stay this small, so storing one past
+/// the account's quota overshoots it by a fixed amount.
+const COMPACT_TEXT: usize = 4 * 1024;
+const COMPACT_MESSAGE: usize = 16 * 1024;
+/// Failed or unknown recipients a compact notice names.
+const COMPACT_ADDRESSES: i64 = 8;
+/// Older completed submissions get a compact notice even when a full one
+/// would fit, so a full report that keeps failing still ends in a notice. A
+/// day outlasts a maximal burst (10,000 notices at one per five seconds) and
+/// ordinary relay downtime.
+const FULL_WINDOW_MS: i64 = 24 * 3_600_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -111,17 +123,8 @@ struct Recipient<'a> {
     reason: i64,
     diagnostic: &'a str,
 }
-fn render_recipient(text: &mut String, row: Recipient<'_>) -> Result<(), Error> {
-    let status = match (row.state, row.uncertain) {
-        (4, 0 | 1) => "Accepted by the relay; final mailbox delivery is not confirmed.\n",
-        (5, 0) => "Failed; no further delivery attempts are scheduled.\n",
-        (6, 0) => "Canceled.\n",
-        (7, 1) => "Delivery outcome unknown; the recipient may have received this message.\n",
-        _ => return Err(Error::Integrity),
-    };
-    detail(text, "\nRecipient: ", row.address, 254)?;
-    append(text, status)?;
-    let reason = match row.reason {
+fn reason_text(reason: i64) -> Result<&'static str, Error> {
+    Ok(match reason {
         0 => "None",
         1 => "Temporary SMTP refusal",
         2 => "Permanent SMTP refusal",
@@ -134,8 +137,20 @@ fn render_recipient(text: &mut String, row: Recipient<'_>) -> Result<(), Error> 
         9 => "Uncertain delivery",
         10 => "Restored backup; delivery uncertain; resend disabled",
         _ => return Err(Error::Integrity),
+    })
+}
+
+fn render_recipient(text: &mut String, row: Recipient<'_>) -> Result<(), Error> {
+    let status = match (row.state, row.uncertain) {
+        (4, 0 | 1) => "Accepted by the relay; final mailbox delivery is not confirmed.\n",
+        (5, 0) => "Failed; no further delivery attempts are scheduled.\n",
+        (6, 0) => "Canceled.\n",
+        (7, 1) => "Delivery outcome unknown; the recipient may have received this message.\n",
+        _ => return Err(Error::Integrity),
     };
-    detail(text, "Reason: ", reason, 64)?;
+    detail(text, "\nRecipient: ", row.address, 254)?;
+    append(text, status)?;
+    detail(text, "Reason: ", reason_text(row.reason)?, 64)?;
     for (reply, label) in [(row.rcpt, "RCPT reply: "), (row.data, "Message reply: ")] {
         if let Some(reply) = reply {
             detail(text, label, reply, 4096)?;
@@ -193,7 +208,8 @@ pub fn publish_next(
             let binding = claim.binding();
             let account_id = binding.account();
             let account = account_id.as_bytes().as_slice();
-            let rows = client.query("SELECT id,email_id,recipient_count FROM td_mta.submissions WHERE account=$1 AND notification=1 AND completed_at IS NOT NULL ORDER BY id LIMIT 1", &[&account]).await.map_err(|_| Error::Database)?;
+            // Random order: one notice that keeps failing never blocks the rest.
+            let rows = client.query("SELECT id,email_id,recipient_count,completed_at FROM td_mta.submissions WHERE account=$1 AND notification=1 AND completed_at IS NOT NULL ORDER BY random() LIMIT 1", &[&account]).await.map_err(|_| Error::Database)?;
             let Some(row) = rows.first() else {
                 return Ok(false);
             };
@@ -211,6 +227,7 @@ pub fn publish_next(
             if !(1..=1000).contains(&count) {
                 return Err(Error::Integrity);
             }
+            let completed_at: i64 = field(row, 3)?;
             let state = client
                 .query_one(
                     "SELECT sequence FROM td_mta.accounts WHERE id=$1",
@@ -235,38 +252,59 @@ pub fn publish_next(
             if mailbox.len() != 16 || number(field(inbox, 1)?)? > old {
                 return Err(Error::Integrity);
             }
+            let heading = format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n");
+            // A recent notice reports every recipient in full; an older one, or
+            // one its size or the account's quota refuses, is stored compact.
             let mut text = String::new();
-            append(&mut text, &format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n"))?;
-            for start in (0..count).step_by(100) {
-                let rows = client.query("SELECT ordinal,address,state,uncertain,next_attempt_at,rcpt_reply,data_reply,reason,diagnostic,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3 ORDER BY ordinal LIMIT 100", &[&account,&submission.as_bytes().as_slice(),&start]).await.map_err(|_| Error::Database)?;
-                if rows.len() != (count - start).min(100) as usize {
-                    return Err(Error::Integrity);
+            let mut full = now.saturating_sub(completed_at) <= FULL_WINDOW_MS;
+            if full {
+                append(&mut text, &heading)?;
+                let built = async {
+                    for start in (0..count).step_by(100) {
+                        let rows = client
+                            .query(
+                                RECIPIENT_PAGE,
+                                &[&account, &submission.as_bytes().as_slice(), &start],
+                            )
+                            .await
+                            .map_err(|_| Error::Database)?;
+                        if rows.len() != (count - start).min(100) as usize {
+                            return Err(Error::Integrity);
+                        }
+                        for (offset, row) in rows.iter().enumerate() {
+                            if Instant::now() >= deadline {
+                                return Err(Error::Work(ports::Error::Deadline));
+                            }
+                            if number(field(row, 9)?)? > old {
+                                return Err(Error::Integrity);
+                            }
+                            meter
+                                .charge(
+                                    clock.sample().map_err(Error::Work)?.monotonic,
+                                    Charge {
+                                        io_bytes: 10 * 1024,
+                                        output_bytes: 10 * 1024,
+                                        records: 1,
+                                        ..Charge::default()
+                                    },
+                                )
+                                .map_err(|stop| {
+                                    Error::Work(if stop == crate::admission::work::Stop::Deadline {
+                                        ports::Error::Deadline
+                                    } else {
+                                        ports::Error::Capacity
+                                    })
+                                })?;
+                            recipient(&mut text, row, start as usize + offset)?;
+                        }
+                    }
+                    Ok::<(), Error>(())
                 }
-                for (offset, row) in rows.iter().enumerate() {
-                    if Instant::now() >= deadline {
-                        return Err(Error::Work(ports::Error::Deadline));
-                    }
-                    if number(field(row, 9)?)? > old {
-                        return Err(Error::Integrity);
-                    }
-                    meter
-                        .charge(
-                            clock.sample().map_err(Error::Work)?.monotonic,
-                            Charge {
-                                io_bytes: 10 * 1024,
-                                output_bytes: 10 * 1024,
-                                records: 1,
-                                ..Charge::default()
-                            },
-                        )
-                        .map_err(|stop| {
-                            Error::Work(if stop == crate::admission::work::Stop::Deadline {
-                                ports::Error::Deadline
-                            } else {
-                                ports::Error::Capacity
-                            })
-                        })?;
-                    recipient(&mut text, row, start as usize + offset)?;
+                .await;
+                match built {
+                    Ok(()) => {}
+                    Err(error) if fallback(error) => full = false,
+                    Err(error) => return Err(error),
                 }
             }
             let extra: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=$2 AND active)", &[&account,&submission.as_bytes().as_slice(),&count]).await.map_err(|_| Error::Database)?,0)?;
@@ -283,48 +321,55 @@ pub fn publish_next(
             let blob = BlobId::from_bytes(id()?);
             let thread = ThreadId::from_bytes(id()?);
             let message_id = format!("notice-{email}@localhost.invalid");
-            let mut bytes = Vec::new();
-            compose_text::compose(
-                &Message {
-                    from: Address {
-                        name: "Mail Delivery System",
-                        email: "postmaster@localhost.invalid",
+            let mut prepared = None;
+            if full {
+                match render(&text, &message_id, now, MAX_MESSAGE, &clock, &mut meter) {
+                    // Charge first: a full account must not pay for hashing and
+                    // MIME evidence of a report it will not store.
+                    Ok(bytes) => match publication::charge(
+                        client,
+                        account_id,
+                        binding.quotas(),
+                        [bytes.len() as u64, 1, 0, 0, 0],
+                    )
+                    .await
+                    {
+                        Ok(usage) => {
+                            let (digest, interpretation) = seal(&bytes, deadline)?;
+                            prepared = Some((bytes, digest, interpretation, usage));
+                        }
+                        Err(publication::Error::Quota) => {}
+                        Err(error) => return Err(publication_error(error)),
                     },
-                    to: &[],
-                    cc: &[],
-                    bcc: &[],
-                    reply_to: &[],
-                    subject: "Delivery status report",
-                    message_id: &message_id,
-                    in_reply_to: &[],
-                    references: &[],
-                    sent_at_ms: now,
-                    text: &text,
-                },
-                MAX_MESSAGE as u64,
-                &clock,
-                &mut meter,
-                |chunk| {
-                    bytes
-                        .try_reserve(chunk.len())
-                        .map_err(|_| ports::Error::Capacity)?;
-                    bytes.extend_from_slice(chunk);
-                    Ok(())
-                },
-            )
-            .map_err(Error::Work)?;
-            let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
-            hash.update(&bytes).map_err(|_| Error::Crypto)?;
-            let digest = hash.finish().map_err(|_| Error::Crypto)?;
-            let interpretation = crate::postgres_mime_evidence::prepare(&bytes, &digest, deadline);
-            let usage = publication::charge(
-                client,
-                account_id,
-                binding.quotas(),
-                [bytes.len() as u64, 1, 0, 0, 0],
-            )
-            .await
-            .map_err(publication_error)?;
+                    Err(error) if fallback(error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let (bytes, digest, interpretation, usage) = match prepared {
+                Some(prepared) => prepared,
+                None => {
+                    let compact =
+                        compact_text(client, account, submission, &heading, count, old).await?;
+                    let bytes = render(
+                        &compact,
+                        &message_id,
+                        now,
+                        COMPACT_MESSAGE,
+                        &clock,
+                        &mut meter,
+                    )?;
+                    let (digest, interpretation) = seal(&bytes, deadline)?;
+                    let usage = publication::charge(
+                        client,
+                        account_id,
+                        compact_caps(binding.quotas()),
+                        [bytes.len() as u64, 1, 0, 0, 0],
+                    )
+                    .await
+                    .map_err(publication_error)?;
+                    (bytes, digest, interpretation, usage)
+                }
+            };
             let used: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$3) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND ((kind=3 AND object=$2) OR (kind=2 AND object=$3)))", &[&account,&email.as_bytes().as_slice(),&thread.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?,0)?;
             if used {
                 return Err(Error::Integrity);
@@ -407,6 +452,165 @@ pub fn publish_next(
         Err(error) => Err(Error::Connection(error)),
     }
 }
+/// A full account still stores compact notices, past its body/blob caps by
+/// at most one per configured queued submission (POSTGRES.md section 213).
+fn compact_caps(
+    caps: crate::postgres_configuration::SharedQuotas,
+) -> crate::postgres_configuration::SharedQuotas {
+    crate::postgres_configuration::SharedQuotas {
+        body_bytes: caps.body_bytes.saturating_add(
+            caps.queue_submissions
+                .saturating_mul(COMPACT_MESSAGE as u64),
+        ),
+        blob_count: caps.blob_count.saturating_add(caps.queue_submissions),
+        ..caps
+    }
+}
+
+/// Whether the full report's size, rather than a fault, refused it.
+fn fallback(error: Error) -> bool {
+    matches!(
+        error,
+        Error::Capacity | Error::Work(ports::Error::Capacity | ports::Error::Quota)
+    )
+}
+
+fn render(
+    text: &str,
+    message_id: &str,
+    now: i64,
+    maximum: usize,
+    clock: &RuntimeClock,
+    meter: &mut Meter,
+) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    compose_text::compose(
+        &Message {
+            from: Address {
+                name: "Mail Delivery System",
+                email: "postmaster@localhost.invalid",
+            },
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            reply_to: &[],
+            subject: "Delivery status report",
+            message_id,
+            in_reply_to: &[],
+            references: &[],
+            sent_at_ms: now,
+            text,
+        },
+        maximum as u64,
+        clock,
+        meter,
+        |chunk| {
+            bytes
+                .try_reserve(chunk.len())
+                .map_err(|_| ports::Error::Capacity)?;
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        },
+    )
+    .map_err(Error::Work)?;
+    Ok(bytes)
+}
+
+fn seal(
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<([u8; 32], Option<crate::postgres_mime_evidence::Prepared>), Error> {
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    hash.update(bytes).map_err(|_| Error::Crypto)?;
+    let digest = hash.finish().map_err(|_| Error::Crypto)?;
+    let interpretation = crate::postgres_mime_evidence::prepare(bytes, &digest, deadline);
+    Ok((digest, interpretation))
+}
+
+fn decimal(mut value: u64, buffer: &mut [u8; 20]) -> &str {
+    let mut start = buffer.len();
+    loop {
+        start -= 1;
+        if let Some(digit) = buffer.get_mut(start) {
+            *digit = b'0' + (value % 10) as u8;
+        }
+        value /= 10;
+        if value == 0 || start == 0 {
+            break;
+        }
+    }
+    buffer
+        .get(start..)
+        .and_then(|digits| std::str::from_utf8(digits).ok())
+        .unwrap_or("0")
+}
+
+fn outcome(state: i64, uncertain: i64) -> Result<&'static str, Error> {
+    Ok(match (state, uncertain) {
+        (4, 0) => "Accepted by the relay: ",
+        (4, 1) => "Accepted by the relay, outcome uncertain: ",
+        (5, 0) => "Failed: ",
+        (6, 0) => "Canceled: ",
+        (7, 1) => "Delivery outcome unknown: ",
+        _ => return Err(Error::Integrity),
+    })
+}
+
+const COMPACT_INTRO: &str = "\nThis compact report omits per-recipient replies. The submission's\ndelivery status keeps them until the submission is retired, which may\nalready have happened.\n\n";
+
+fn count_line(text: &mut String, state: i64, uncertain: i64, number: i64) -> Result<(), Error> {
+    append(text, outcome(state, uncertain)?)?;
+    let mut buffer = [0; 20];
+    let number = u64::try_from(number).map_err(|_| Error::Integrity)?;
+    append(text, decimal(number, &mut buffer))?;
+    append(text, "\n")
+}
+
+/// Counts by outcome and the first Failed or unknown recipients: never more
+/// than `COMPACT_TEXT`, however many recipients or how long their replies.
+async fn compact_text(
+    client: &Client,
+    account: &[u8],
+    submission: SubmissionId,
+    heading: &str,
+    count: i64,
+    old: u64,
+) -> Result<String, Error> {
+    let submission = submission.as_bytes().as_slice();
+    // The checks the full report's pages make on every recipient.
+    let old = old.to_be_bytes();
+    let faulty: i64 = field(&client.query_one("SELECT count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND (next_attempt_at IS NOT NULL OR reason NOT BETWEEN 0 AND 10 OR changed > $3)", &[&account, &submission, &old.as_slice()]).await.map_err(|_| Error::Database)?, 0)?;
+    if faulty != 0 {
+        return Err(Error::Integrity);
+    }
+    let mut text = String::new();
+    append(&mut text, heading)?;
+    append(&mut text, COMPACT_INTRO)?;
+    let groups = client.query("SELECT state,uncertain,count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 GROUP BY state,uncertain ORDER BY state,uncertain", &[&account, &submission]).await.map_err(|_| Error::Database)?;
+    let mut total = 0i64;
+    for row in &groups {
+        let number: i64 = field(row, 2)?;
+        count_line(&mut text, field(row, 0)?, field(row, 1)?, number)?;
+        total = total.checked_add(number).ok_or(Error::Integrity)?;
+    }
+    if total != count {
+        return Err(Error::Integrity);
+    }
+    let listed = client.query("SELECT address,state,uncertain,reason FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state IN (5,7) ORDER BY ordinal LIMIT $3", &[&account, &submission, &COMPACT_ADDRESSES]).await.map_err(|_| Error::Database)?;
+    if !listed.is_empty() {
+        append(&mut text, "\n")?;
+    }
+    for row in &listed {
+        let label = outcome(field(row, 1)?, field(row, 2)?)?;
+        detail(&mut text, label, field(row, 0)?, 254)?;
+        detail(&mut text, "  Reason: ", reason_text(field(row, 3)?)?, 64)?;
+    }
+    if text.len() > COMPACT_TEXT {
+        return Err(Error::Integrity);
+    }
+    Ok(text)
+}
+
 async fn execute(
     client: &Client,
     sql: &str,
@@ -437,6 +641,102 @@ mod tests {
             data: Some("550 refused"),
             reason: 2,
             diagnostic: "remote refusal",
+        }
+    }
+    #[test]
+    fn compact_worst_case_fits_its_fixed_bounds() {
+        let submission = SubmissionId::from_bytes([0xff; 16]);
+        let original = EmailId::from_bytes([0xff; 16]);
+        let heading = format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n");
+        let mut text = String::new();
+        append(&mut text, &heading).unwrap();
+        append(&mut text, COMPACT_INTRO).unwrap();
+        for (state, uncertain) in [(4, 0), (4, 1), (5, 0), (6, 0), (7, 1)] {
+            count_line(&mut text, state, uncertain, 1000).unwrap();
+        }
+        let address = format!("{}\u{1b}", "a".repeat(253));
+        for _ in 0..COMPACT_ADDRESSES {
+            detail(&mut text, outcome(7, 1).unwrap(), &address, 254).unwrap();
+            detail(&mut text, "  Reason: ", reason_text(10).unwrap(), 64).unwrap();
+        }
+        assert!(text.contains("resend disabled"));
+        assert!(text.len() <= COMPACT_TEXT, "{}", text.len());
+        assert!(text.contains("Delivery outcome unknown: 1000\n"));
+        assert!(!text.contains('\u{1b}'));
+        let clock = RuntimeClock::new();
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let mut meter = Meter::new(
+            until,
+            Charge {
+                io_bytes: 1024 * 1024,
+                output_bytes: 1024 * 1024,
+                records: 1024,
+                ..Charge::default()
+            },
+        );
+        let id = format!("notice-{original}@localhost.invalid");
+        let bytes = render(
+            &text,
+            &id,
+            1_800_000_000_000,
+            COMPACT_MESSAGE,
+            &clock,
+            &mut meter,
+        )
+        .unwrap();
+        assert!(bytes.len() <= COMPACT_MESSAGE);
+        assert_eq!(outcome(5, 1), Err(Error::Integrity));
+        assert_eq!(
+            count_line(&mut String::new(), 5, 0, -1),
+            Err(Error::Integrity)
+        );
+    }
+    #[test]
+    fn compact_margin_is_one_message_per_queued_submission() {
+        let caps = crate::postgres_configuration::SharedQuotas {
+            body_bytes: 1000,
+            blob_count: 10,
+            upload_bytes: 7,
+            queue_bytes: 8,
+            queue_submissions: 3,
+        };
+        let raised = compact_caps(caps);
+        assert_eq!(raised.body_bytes, 1000 + 3 * 16 * 1024);
+        assert_eq!(raised.blob_count, 13);
+        assert_eq!(
+            (
+                raised.upload_bytes,
+                raised.queue_bytes,
+                raised.queue_submissions
+            ),
+            (7, 8, 3)
+        );
+        let huge = crate::postgres_configuration::SharedQuotas {
+            body_bytes: u64::MAX - 1,
+            queue_submissions: u64::MAX,
+            ..caps
+        };
+        assert_eq!(compact_caps(huge).body_bytes, u64::MAX);
+    }
+    #[test]
+    fn decimal_renders_every_width() {
+        for value in [0, 7, 10, 1000, u64::MAX] {
+            let mut buffer = [0; 20];
+            assert_eq!(decimal(value, &mut buffer), value.to_string());
+        }
+    }
+    #[test]
+    fn only_size_refusals_fall_back_to_compact() {
+        assert!(fallback(Error::Capacity));
+        assert!(fallback(Error::Work(ports::Error::Capacity)));
+        assert!(fallback(Error::Work(ports::Error::Quota)));
+        for error in [
+            Error::Quota,
+            Error::Integrity,
+            Error::Database,
+            Error::Work(ports::Error::Deadline),
+        ] {
+            assert!(!fallback(error));
         }
     }
     #[test]

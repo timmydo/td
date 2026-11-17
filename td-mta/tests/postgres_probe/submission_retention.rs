@@ -8,7 +8,7 @@ use td_mta::{
     postgres_submission_retention as retention, postgres_usage_audit as audit,
 };
 
-const NOW: &str = "(extract(epoch FROM clock_timestamp())*1000)::bigint";
+pub(super) const NOW: &str = "(extract(epoch FROM clock_timestamp())*1000)::bigint";
 const PREFIX: &str = "72657461696e";
 
 // "retain" prefix: other fixtures repeat one byte, and blob IDs stay
@@ -17,7 +17,7 @@ fn hex(byte: u8) -> String {
     format!("{PREFIX}000000000000000000{byte:02x}")
 }
 
-fn id(byte: u8) -> String {
+pub(super) fn id(byte: u8) -> String {
     format!("decode('{}','hex')", hex(byte))
 }
 
@@ -58,17 +58,17 @@ fn blob(fixture: &Fixture, src: &str, blob: u8, length: i64) {
     }
 }
 
-struct Group<'a> {
-    id: u8,
-    blob: &'a str,
-    recipients: i64,
+pub(super) struct Group<'a> {
+    pub(super) id: u8,
+    pub(super) blob: &'a str,
+    pub(super) recipients: i64,
     // state, uncertain, attempt, count, last, phase, next, replies, reason
-    recipient: &'a str,
-    completed: &'a str,
-    notification: i64,
+    pub(super) recipient: &'a str,
+    pub(super) completed: &'a str,
+    pub(super) notification: i64,
 }
 
-fn submission(fixture: &Fixture, src: &str, group: Group<'_>) {
+pub(super) fn submission(fixture: &Fixture, src: &str, group: Group<'_>) {
     let sub = id(group.id);
     let notice = if group.notification == 2 {
         id(group.id ^ 0xff)
@@ -88,13 +88,13 @@ fn attempt(fixture: &Fixture, attempt: u8, sub: u8, extra: &[(&str, String)]) {
     clone(fixture, "submission_attempts", &fields);
 }
 
-fn count(fixture: &Fixture, query: &str) -> String {
+pub(super) fn count(fixture: &Fixture, query: &str) -> String {
     sql(fixture, &format!("SELECT count(*) FROM {query}"))
 }
 
 // Earlier fixtures insert queue rows without charging them; start from the
 // audited truth so every decrement is checked exactly.
-fn resync(fixture: &Fixture, account: &str) {
+pub(super) fn resync(fixture: &Fixture, account: &str) {
     sql(fixture, &format!("UPDATE td_mta.account_usage u SET body_bytes=o.body,blob_count=o.blobs,upload_bytes=o.upload,queue_bytes=o.queue,queue_submissions=o.submissions FROM (SELECT coalesce(sum(b.length),0)::bigint body,count(*) blobs,coalesce(sum(b.length) FILTER (WHERE EXISTS (SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id)),0)::bigint upload,coalesce(sum(b.length) FILTER (WHERE EXISTS (SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id)),0)::bigint queue,(SELECT count(*) FROM td_mta.submissions s WHERE s.account={account}) submissions FROM td_mta.blobs b WHERE b.account={account}) o WHERE u.account={account}"));
 }
 

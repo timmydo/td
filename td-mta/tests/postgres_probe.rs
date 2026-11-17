@@ -12574,6 +12574,8 @@ mod attempt_retry;
 mod body_checks;
 #[path = "postgres_probe/envelope_checks.rs"]
 mod envelope_checks;
+#[path = "postgres_probe/failure_notice.rs"]
+mod failure_notice;
 #[path = "postgres_probe/final_capacity.rs"]
 mod final_capacity;
 #[path = "postgres_probe/final_work.rs"]
@@ -12904,6 +12906,7 @@ fn exercise_attempt_recovery(
     submission_cancel::exercise(fixture, request, trust, binding, submission, policies);
     submission_retention::exercise(fixture, request, trust, binding, submission);
     attempt_reclamation::exercise(fixture, request, trust, binding, submission);
+    failure_notice::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(

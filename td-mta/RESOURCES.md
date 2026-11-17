@@ -4490,8 +4490,10 @@ text, 16 MiB of encoded MIME and one 100-recipient SQL page. It runs serially
 with SMTP attempts using one ordinary slot, with a five-second deadline and
 at most one turn every five seconds. POSTGRES.md section 213 records its
 separate aggregate database framing and composition work ceilings. The
-shared account body/blob quotas include generated notices. Failure retains
-only the database Pending marker; no unbounded local retry queue is added.
+shared account body/blob quotas include generated notices; compact notices
+(at most 16 KiB each) may pass them by up to 16 KiB and one blob per
+configured `queue_submissions` (POSTGRES.md section 213). Failure retains only the database Pending marker; no unbounded
+local retry queue is added.
 
 
 ## PostgreSQL attachment composition

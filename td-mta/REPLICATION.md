@@ -603,7 +603,10 @@ Prepare a fresh schema and bind it with `postgres replica-source-init` first.
 `postgres replica-account-init` takes the owner connection, local epoch,
 source origin/epoch, preserved account ID, username, protected password file,
 optional CA file and explicit positive `--body-bytes`, `--blobs`, `--emails`
-and `--receipts` quotas. It authenticates discovery and obtains the initial
+and `--receipts` quotas. A td source's account may hold up to its
+`queue_submissions` × 16 KiB of body and that many blobs past its own caps
+in compact failure notices (POSTGRES.md section 213); replica quotas equal
+to the source caps stall on such an account. It authenticates discovery and obtains the initial
 inventory and mailbox graph before atomically creating the account. Existing
 matching source/account/quotas are reported without reseeding, resetting work
 or asserting that a newly fetched seed matches an older request. Inspect an
