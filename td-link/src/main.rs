@@ -178,14 +178,26 @@ mod tests {
         let output = OsString::from(dir.join("out with space"));
         let seen = dir.join("seen");
         let fake = dir.join("lld");
-        std::fs::write(
-            &fake,
+        // A child writes the script: a writable descriptor to it held in
+        // this process would pass to a sibling test's fork until that
+        // child's exec, and our exec of the script inside that window fails
+        // with ETXTBSY.
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\"", "sh"])
+            .arg(&fake)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut writer.stdin.take().unwrap(),
             format!(
                 "#!/bin/sh\n[ \"$1 $2\" = '-flavor gnu' ] || exit 3\ncat \"${{3#@}}\" > '{}'\n",
                 seen.display()
-            ),
+            )
+            .as_bytes(),
         )
         .unwrap();
+        assert!(writer.wait().unwrap().success());
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let args = vec![
