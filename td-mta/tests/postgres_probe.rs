@@ -109,9 +109,13 @@ impl Fixture {
             queue_runtime: None,
         };
         fs::write(fixture.root.join("password"), PASSWORD).unwrap();
+        // No test examines a disposable cluster across an OS crash, so its
+        // creation is not synchronized; the server still runs with fsync and
+        // full_page_writes on, as the probe requires.
         fixture.run(
             "initdb",
             &[
+                "--no-sync",
                 "-D",
                 fixture.data().to_str().unwrap(),
                 "-U",
@@ -180,8 +184,8 @@ impl Fixture {
             .stderr(log)
             .spawn()
             .unwrap();
-        // initdb synchronizes a fresh cluster; concurrent host builds can
-        // delay that filesystem work without changing any client deadline.
+        // initdb bootstraps a fresh cluster; concurrent host builds can
+        // delay that work without changing any client deadline.
         let seconds = if program == "initdb" { 60 } else { 20 };
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {

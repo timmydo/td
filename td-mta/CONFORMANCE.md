@@ -360,6 +360,13 @@ PostgreSQL 17's `initdb`, `postgres`, `pg_ctl` and `psql` must be on `PATH` in o
 directory, the first `initdb`'s; the wrapper refuses before any test runs
 when they are not, and no variable names them. Each fixture owns its
 disposable cluster and process cleanup; it contacts no public endpoint.
+`initdb --no-sync` creates each cluster without synchronizing it to disk,
+since no test examines one across an operating-system crash; the server
+then runs with fsync and full_page_writes on, which the probe requires,
+so per-commit WAL flushes and crash recovery after an immediate stop are
+still exercised, and the first restart after one also synchronizes the
+data directory. A test that crosses an operating-system crash or power
+loss must create its cluster with a synchronized `initdb`.
 
 The private CA enters only the existing fetch test process. This establishes
 client/server compatibility for the flows described below, not production
