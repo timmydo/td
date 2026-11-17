@@ -1,0 +1,12 @@
+/* td-web's own sheet, a user-agent sheet after td-css's HTML_UA_CSS
+   (DESIGN.md §10, "Sources"): td's look and what HTML_UA_CSS lacks.
+   Its colours are td-ui's palette keys INK, ACCENT, CHROME and BORDER,
+   which themes map; PAPER is the canvas's, not the root's. */
+html { color: #48453f; font-family: "td-body"; font-size: 16px }
+a:link { color: #7a4d74 }
+code, kbd, samp { background-color: #e1dbcf }
+[hidden] { display: none }
+hr {
+  display: block; margin: 0.5em 0;
+  border-top-width: 1px; border-top-style: solid; border-top-color: #b5ada0 }
+plaintext { display: block; font-family: monospace; white-space: pre-wrap }

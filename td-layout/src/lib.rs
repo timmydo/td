@@ -24,6 +24,11 @@ pub const MAX_BOXES: usize = 262_144;
 pub const MAX_DEPTH: usize = 256;
 pub const MAX_LAYOUT_WORK: usize = 64_000_000;
 pub const MAX_LINE_SCALARS: usize = 65_536;
+/// The most scalars one text fragment holds: contiguous source past it
+/// starts another fragment, so a painter skips by fragments' x what lies
+/// before its clip and replays at most this many scalars to find it
+/// (DESIGN.md §3).
+pub const MAX_FRAGMENT_SCALARS: usize = 1_024;
 pub const MAX_LINES: usize = 1_048_576;
 pub const MAX_FRAGMENTS: usize = 1_048_576;
 pub const MAX_COORDINATE: f64 = 1_000_000_000.0;

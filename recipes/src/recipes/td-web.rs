@@ -3,7 +3,8 @@ use crate::types::Recipe;
 /// td-web, td's own document browser (td-web/DESIGN.md) and the program the
 /// `web` application packages. Built as the other toolkit consumers are: a
 /// static Cargo build of its own tree with its path dependencies staged
-/// beside it, td-compositor for the font and wire sources td-ui mounts,
+/// beside it (td-css, td-dom and td-layout among them, which style and
+/// lay out its pages), td-compositor for the font and wire sources td-ui mounts,
 /// engine for td-png's checksums, td-inflate for its decoder and td-util for its DEFLATE
 /// encoder, the dev-only td-fs its tests' scratch comes from, the
 /// `td-web-source` seed pinned by the compiled local-source roster, and the
@@ -15,11 +16,14 @@ pub fn recipe() -> Recipe {
             "td-av1",
             "td-avif",
             "td-charset",
+            "td-css",
+            "td-dom",
             "td-fetch-client",
             "td-fs",
             "td-gif",
             "td-html",
             "td-jpeg",
+            "td-layout",
             "td-png",
             "td-alloc",
             "td-ui",
@@ -54,11 +58,14 @@ mod tests {
                 "td-av1".into(),
                 "td-avif".into(),
                 "td-charset".into(),
+                "td-css".into(),
+                "td-dom".into(),
                 "td-fetch-client".into(),
                 "td-fs".into(),
                 "td-gif".into(),
                 "td-html".into(),
                 "td-jpeg".into(),
+                "td-layout".into(),
                 "td-png".into(),
                 "td-alloc".into(),
                 "td-ui".into(),
@@ -98,11 +105,14 @@ mod tests {
                 "td-av1",
                 "td-avif",
                 "td-charset",
+                "td-css",
+                "td-dom",
                 "td-fetch-client",
                 "td-fs",
                 "td-gif",
                 "td-html",
                 "td-jpeg",
+                "td-layout",
                 "td-png",
                 "td-ui",
                 "td-url",

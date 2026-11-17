@@ -29,6 +29,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-css"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
+name = "td-dom"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-css",
+ "td-html",
+]
+
+[[package]]
 name = "td-fetch-client"
 version = "0.1.0"
 
@@ -58,6 +74,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-layout"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-css",
+ "td-dom",
+ "td-html",
+]
+
+[[package]]
 name = "td-png"
 version = "0.1.0"
 dependencies = [
@@ -82,11 +108,13 @@ dependencies = [
  "td-alloc",
  "td-avif",
  "td-charset",
+ "td-css",
  "td-fetch-client",
  "td-fs",
  "td-gif",
  "td-html",
  "td-jpeg",
+ "td-layout",
  "td-png",
  "td-ui",
  "td-url",

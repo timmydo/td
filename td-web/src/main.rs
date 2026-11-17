@@ -7,10 +7,17 @@ mod app;
 mod charset;
 mod document;
 mod fetch;
+mod fonts;
 mod memory;
+mod page;
+mod paint;
 mod picture;
+mod pipeline;
 mod save;
 mod search;
+mod sheets;
+mod text;
+mod tree;
 mod view;
 mod worker;
 

@@ -1,10 +1,11 @@
 # td-web
 
-**Status: normative; every increment of §9 has landed.** §10, styled
-documents, is a plan: normative for the work it names, its increments
-landing in order; until its cutover lands, §3's memory, §5's rendering
-and §8's places describe td-web. The roadmap (§11) is not normative;
-each item there is its own amendment.
+**Status: normative; every increment of §9 has landed, and §10's
+through its cutover (increment 7), whose validation still owes what
+increment 7 lists as not yet done.** §10, styled documents, is how
+td-web makes, lays out and paints a page; its increments 8 and 9 are
+planned, normative for the work they name. The roadmap (§11) is not
+normative; each item there is its own amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -38,8 +39,10 @@ td-web is a zone-one program (TRUST.md "Trust zones"): the `td-web`
 crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
 and td's own crates by path: `td-ui` for the window, `td-html` for
-markup, `td-charset` for text in other encodings, `td-fetch-client`
-for the network, `td-url` for URLs, and the shared decoders (`td-png`,
+markup's tree, `td-css` for style sheets, `td-dom` for the tree's HTML
+projection and `td-layout` for layout (§10), `td-charset` for text in
+other encodings, `td-fetch-client` for the network, `td-url` for URLs,
+and the shared decoders (`td-png`,
 `td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. td-charset's
 tables are WHATWG data under BSD-3-Clause, so the `web` package carries
 its notice, td-charset's `data/LICENSE-WHATWG` byte for byte, at
@@ -52,8 +55,9 @@ td-web does. It follows AGENTS.md's production-code rules (no panicking
 calls or indexing; bounded inputs).
 
 Web content is hostile input. Every parser td-web feeds is bounded by
-the limits below and by its crate's own (td-html's depth and element
-caps and output budget, the picture decoders' pixel caps), and a
+the limits below and by its crate's own (td-html's tree limits,
+td-css's sheet and rule bounds, td-layout's page and work ceilings, the
+picture decoders' pixel caps), and a
 refused or malformed document is shown as an error page, never a
 crash.
 
@@ -130,63 +134,44 @@ view's mountpoint and leaves it after a revoke, so td-web takes
 `/home/td/Downloads` for the human's only while its own mount table
 shows a mount there.
 
-**Memory.** The bounds hold td-web's own memory; a body at
-`MAX_DOCUMENT` (16 MiB) for each fetch out, held at its own length; one
-rendering of markup within `HTML_LIMITS` (§5) or one decoding of a
-picture; and what is shown, a page with the lines of it laid or a
-picture with its copy fitted to the pane. Renderings and decodings run
-on one render thread, for every fetch thread, one at a time; a
-navigation stopped or overtaken before its turn takes neither, and a
-document made for one stopped while it was made is dropped there before
-the next reply is taken, so it never stands beside that one's rendering.
-Measured on a development host, release build: td-web started under a
-headless td-compositor with the pinned faces and the blank page holds 23
-MB resident at 1920x1200, 34 MB at 2880x1800 and 47 MB at 3840x2160, the
-largest output td supports, beside its window's shared-memory buffers,
-9, 20 or 32 MB each, of which td-ui keeps up to three: 50, 95 or 144 MB
-in all. The most it holds while a reply is made into a document beside
-the one shown is then those 144 MB; 67 MB of bodies (`MAX_WORKERS` of
-`MAX_DOCUMENT`, a save's among them, §5); on the render thread the
-larger of td-html's rule for a rendering's peak, 100 bytes a byte of
-input read and 1.25 a byte of budget (td-html/DESIGN.md, "Resident
-rendering cost"), 252 MB at
-`HTML_LIMITS` (238 MB at most measured), and the costliest decoding, a
-16-bit RGBA PNG of 16 Mi pixels inflated at 8 bytes a pixel beside its
-4-byte RGBA, 201 MB (201 measured; a JPEG of as many pixels some 112
-MB); and the larger of what may be shown: a page, which holds no more
-than td-html's output for it, so no more than the budget's 34 MB (at
-most 19 MB measured), or a text page, whose tabs are expanded, at most
-46 MB (eight bytes a byte of `MAX_TEXT` and 120 a line; 43 MB measured,
-tabs 41 to a line), with the lines of it laid on the window's thread,
-only those near the ones shown however long the page, 19.3 MB at most
-measured and taken as 24 (§5), 70 MB; or a picture's 67 MB with its copy
-fitted to the pane, 33 MB at 3840x2160, 100 MB; or a reply td-web does
-not show, whose body it keeps for a save, at most `MAX_DOCUMENT` beside
-a page of a few lines, 18 MB; the largest: 564 MB. That
-is why `memory-high` is 640 MiB (671 MB), 107 MB above the sum, so that
-pages as large as long Wikipedia articles render whole: under 512 MiB
-(537 MB) with the same room the sum fits only with markup cut at some
-1.5 MiB, the wrap no longer weighing in it; `memory-max` stays 768 MiB
-(805 MB). A test (`the_html_limits_fit_the_jail`) holds the sum at least
-20 MB under `memory-high`, the measured figures and the jail's copied by
-hand and reviewed when `web.rs` or the limits change. A page's text is
-decoded (§5) on the render thread before it is rendered: sent in valid
-UTF-8 it is its body, cut in place; sent in another encoding, or in
-UTF-8 holding malformed bytes or ending unfinished, it is decoded into a
-string of at most `MAX_MARKUP` or `MAX_TEXT` bytes, had at once, and the
-body is dropped before td-html or the text's lines are given it. While
-it is decoded the body and the string are both alive, the string beside
-a body the bodies already count; that is within the sum because the
-render thread's term, a rendering or a picture's decoding, holds nothing
-then: the decoding is that thread's work before its rendering starts.
-After it, the text stands in its body's place and adds no term.
+**Memory.** The bounds hold td-web's own memory. A page, its tree,
+styled document and layout with the decoded markup it keeps, is held to
+§10's page budgets under one td-alloc root of `PAGES` (320 MiB), and
+what td-alloc does not hold is a fixed term beside it: the window,
+td-ui's atlas pages, the bodies of the fetches out and `WORKING` (§10,
+"Memory" and "The jail"). Every heavy step runs on one render thread,
+for every fetch thread, one job at a time; a navigation stopped or
+overtaken before its turn takes none, and a document made for one
+stopped while it was made is dropped there before the next reply is
+taken. Measured on a development host, release build: td-web started
+under a headless td-compositor with the pinned faces and the blank page
+holds 23 MB resident at 1920x1200, 34 MB at 2880x1800 and 47 MB at
+3840x2160, the largest output td supports, beside its window's
+shared-memory buffers, 9, 20 or 32 MB each, of which td-ui keeps up to
+three: 50, 95 or 144 MB in all, §10's window term. `memory-high` is
+640 MiB (671 MB) and `memory-max` 768 MiB (805 MB); a test
+(`the_page_budgets_fit_the_jail`) holds §10's sum at least 20 MB under
+`memory-high`. Measured in-process over the pinned faces
+(`app::tests::measure_window`, one frame buffer and no fetch client,
+§10's "Increments"), the costliest page td-layout measures, 2 MiB of
+blocks (115.9 MiB declared), shown with the same made beside it peaks at
+171 MiB resident (VmHWM) at 1920x1200 and 193 MiB (202 MB) at
+3840x2160: with td-ui's two further buffers, about 266 MB, under
+`memory-high` by about 400 MB. A page's text is decoded (§5) on the render thread: sent
+in valid UTF-8 it is its body, cut in place; sent in another encoding,
+or in UTF-8 holding malformed bytes or ending unfinished, it is decoded
+into a string of at most `MAX_MARKUP` or `MAX_TEXT` bytes, had at once,
+and the body is dropped. The text then stands in its body's place among
+the bodies; a markup page's is copied into the page's budget and
+dropped before it is parsed (§10, "Pipeline and threads"), a text
+page's once its page is made.
 
 **Page admission and ownership.** The window's Renderer owns one shared
-td-alloc root of 320 MiB plus sixteen budget control blocks. A reply takes
-a child when its render job begins. Displayed and incoming pages both
-count while both live; cancellation returns credit only when the worker
-actually drops its work or result. Shared page references use fallible
-BudgetShared ownership. Empty renderings need no allocation.
+td-alloc root of `PAGES` plus sixteen budget control blocks. A reply
+takes a child when its render job begins. Displayed and incoming pages
+both count while both live; cancellation returns credit only when the
+worker actually drops its work or result. Shared page references use
+fallible BudgetShared ownership. The blank page needs no allocation.
 
 The renderer's typed handoff has four reusable request/result slots,
 matching `MAX_WORKERS`, in one BudgetShared mailbox admitted at startup.
@@ -198,7 +183,12 @@ without truncation. Nested bodies and URLs retain their existing
 fetch/metadata limits. Ordinary handoffs allocate no backing storage.
 Admission/refcount refusal returns the static resource notice, and an
 already cancelled reply allocates no handoff. The worker drops cancelled
-rendered output before taking another request.
+rendered output before taking another request. Beside the slots, a
+lane of `LANE` (4) items holds what the window posts without waiting, a
+relayout (§10, "Relayout") or a page or layout let go to be dropped on
+the render thread (§10, "Handover"); the worker takes the lane's items
+before the slots', and a post to a full lane is refused, never waited
+for.
 
 A dropped ticket abandons only its slot. Queued/running slots stay occupied
 until the worker releases them; a completed result is released by its
@@ -211,49 +201,28 @@ still uses std/OS allocation machinery outside the owned-allocation
 guarantee. The handoff module has a strict source guard against standard
 heap owners, recognized unchecked allocation operations and std channels.
 
-The legacy path admits conservative working allowances before starting:
-256 MiB for HTML, 64 MiB for plain text, and 200 MiB for picture decoding.
-A small notice takes 1 MiB, and an unshown reply also admits its held body.
-After success Charge::shrink_to releases excess admission without a gap;
-a page retains the capacities of its line/run/link arrays and strings,
-plus a bounded allowance for its base URL. Decoded pictures retain their
-actual RGBA capacity. A held save body owns its capacity charge through
-the save worker, even after its Document is dropped. A wrapper frees its
-value before releasing its charge.
+A navigated picture admits `PICTURE_WORK` (200 MiB) before decoding
+and, decoded, keeps its actual RGBA capacity, Charge::shrink_to
+releasing the excess without a gap. A held save body owns its capacity
+charge through the save worker, even after its Document is dropped. A
+wrapper frees its value before releasing its charge.
 
-Each Rendered instance creates a child budget capped at 24 MiB, including
-its metadata. Its wrapping scratch, sliced runs, glyphs, pieces, navigation
-checkpoints and retained row ring own their actual capacities against that
-child. It reserves no blanket working allowance. A default empty rendering
-allocates nothing. The browser's optional measurement cache shares the
-renderer root across pages; cache refusal computes uncached measurements.
-Wrapping is strictly source-guarded against standard heap owners and
-recognized unchecked allocations. A fitted picture admits at most
-64 MiB before fitting, then retains its actual buffer capacity. Overlapping
-owners keep both charges. The current resize path drops its old wrap or
-fit before asking for the replacement. A refused page, fit or wrap shows
-a static resource notice; cap refusal does not abort or panic. A refused
-navigation action preserves the logical viewport, focus and selection;
-partially filled caches remain valid. Its refusal latches through that
-action and paints a notice without allocating error text. The next user
-navigation action retries. Resize drops the old wrap first, preserves the
-page and logical position on refusal, and retries creation on a later
-relayout or scroll. Failed cache filling never changes the immutable page. Error-page
-text is bounded to 4096 UTF-8 bytes before plain-text conversion.
+A fitted picture admits at most 64 MiB before fitting, then retains its
+actual buffer capacity. Overlapping owners keep both charges. A refused
+fit paints a static resource notice, tried again after a resize or a
+navigation; a page refused at every rung paints the same notice (§10,
+"Cuts"), and a refused relayout keeps the old layout or steps down
+(§10, "Relayout"); none aborts or panics. The text of td-web's own pages
+is bounded to `MAX_OWN_TEXT` (4096) UTF-8 bytes.
 
-Find owns its query scalars, prefix table, position ring and match arrays
-under a 2 MiB child of the page budget, including metadata, scratch and
-old/new result overlap. Its query is bounded to 256 Unicode scalar values
-and its matches to 10,000. Scratch and alternate result buffers retain their
-capacity for reuse; clearing find releases them. Changing pages rebinds the
-cache to the new page's budget identity. The search module has a strict
-allocation source guard. Results are staged until searching and revealing
-the chosen match both succeed. A refused search preserves the old marks,
-current-match index, viewport, focus and selection, and shows the static
-resource notice. Enter in find, or n/N on the page, retries a refused query
-without skipping its first selected result. Unrelated scrolling, resizing and font changes do not
-dismiss that search refusal or replace the old marks. A resize stages its replacement marks until
-the whole reflow succeeds, retaining the previous marks on refusal.
+Find owns its folded query, failure table, position ring and matches
+under a 2 MiB child of the page's budget (`SEARCH_BYTES`), including
+metadata, taken for each search and returned with its matches. Its
+query is bounded to 256 Unicode scalar values and its matches to
+10,000. A refused search keeps the old marks, current-match index,
+viewport, focus and selection; Enter in find, or n/N on the page,
+retries it. A relayout finds again on the new layout; refused there, it
+keeps the old marks, whose places outlive a layout (§10, "Places").
 
 Selection copies measure their UTF-8 pieces before allocating, refuse above
 1 MiB, and retain their byte storage against the page's budget. Up to
@@ -282,35 +251,31 @@ tables; WebP's working bound is below 145 MiB; AVIF's codec plus its at-most
 200 MiB allowance covers these decoder layouts, apart from allocator/RSS
 bookkeeping. A raw RGBA or fitted pixel allocation is at most 64 MiB.
 
-These legacy allowances are an admission model, distinct from exact
-ownership of the new parser, CSS and layout storage in §10. They do not
-instrument every std allocation inside the legacy rich renderer, font and raster
-ownership, fetch/window IPC or URL/response metadata. Those source-inventory entries
-remain migration debt; this is not a whole-process allocation-failure
-guarantee. The root cap supplements the per-input/work limits and the
-jail's process-wide limit; it does not replace them. The memory ownership
+The picture allowance is an admission model, distinct from the exact
+ownership of the parser, CSS and layout storage in §10. td-alloc does
+not instrument font and raster ownership, fetch/window IPC or
+URL/response metadata. Those source-inventory entries remain migration
+debt; this is not a whole-process allocation-failure guarantee. The
+root cap supplements the per-input/work limits and the jail's
+process-wide limit; it does not replace them. The memory ownership
 module has a strict guard against unchecked allocation operations and
-standard heap owners. No visual renderer cutover happens here.
+standard heap owners.
 
 The allocator (glibc's) gives a thread that allocates beside another an
-arena of its own and keeps much of a rendering's peak in it after, for
-that arena's next rendering to reuse. Renderings on the fetch threads
-kept it once per thread alive at the time: the worst page rendered in
-turn on three fetch threads alive together peaked at 243, 325 and
-417 MB within `HTML_LIMITS` (364, 567 and 659 MB within td-html's
-defaults), where on the one render thread four peak
-at 243 to 250 MB. So the sum counts one rendering or decoding, and the
-fetch threads allocate only their requests and bodies. A panic while a
-reply is made answers an error page and leaves the thread to take the
-next (td-web's build unwinds: a `compile_error!` refuses one that would
-abort on panic, by a profile's `panic` or a recipe's `-C panic`), and
-a render thread found gone is started again. `memory-high` throttles
-before `memory-max` ends the jail. The tasks hold the window's
-thread, td-ui's, the render thread and `MAX_WORKERS` fetches with
-room, since td-svc does not
-restart a program that exits on the cap. One CPU, twice news's, since
-a page is rendered on the render thread and laid out on the window's
-(§8).
+arena of its own and keeps much of a step's peak in it after, for that
+arena's next step to reuse, so heavy steps spread over the fetch
+threads would keep that peak once per thread alive. So every heavy step
+runs on the one render thread, a page's last drop happens there (§10,
+"Handover"), and the fetch threads allocate only their requests and
+bodies. A panic while a reply is made answers an error page and leaves
+the thread to take the next (td-web's build unwinds: a `compile_error!`
+refuses one that would abort on panic, by a profile's `panic` or a
+recipe's `-C panic`), and a render thread found gone is started again.
+`memory-high` throttles before `memory-max` ends the jail. The tasks
+hold the window's thread, td-ui's, the render thread and `MAX_WORKERS`
+fetches with room, since td-svc does not restart a program that exits
+on the cap. One CPU, twice news's, since a page is made and laid out
+again on the render thread while the window's paints (§10).
 
 td-jail gives td-web an allowlist seccomp program in place of the
 standard one, derived from its realized binary as mail's and news's
@@ -375,8 +340,8 @@ by who chose them:
   and later a stylesheet or a frame. It is always sent `public`, so a
   page on the internet cannot make td-web touch a device on the local
   network. td-web makes no request the person did not cause by
-  navigating. A `<meta http-equiv=refresh>` is not followed; td-html
-  drops `<meta>`, so neither is it shown.
+  navigating. A `<meta http-equiv=refresh>` is neither followed nor
+  shown.
 
 **Bounds.** A body is taken up to `MAX_DOCUMENT` (16 MiB), a picture's
 too; a larger body is refused by the service and shown as an error. A
@@ -400,44 +365,12 @@ order mark, or no byte of binary data in its first 1445 bytes, the
 resource header (MIME Sniffing, "Rules for distinguishing if a resource
 is text or binary"), text:
 
-- `text/html` and `application/xhtml+xml` are rendered through td-html
-  (`to_rich_within`, within `HTML_LIMITS`) once, unwrapped (width 0),
-  on the render thread (§3), into the page's logical lines, the runs
-  td-html gives each word joined where they look and link alike.
-  td-web wraps those by
-  pixel width with td-ui's `prose::wrap_at_most` at the page pane's
-  width less a cell's inset each side, but never narrower than
-  `MIN_WRAP_EMS` (8) ems, 128 pixels at scale one, a narrower pane
-  showing each line's start, cut at its edge; measured with the faces
-  the window draws with, and again when the width, the scale or the
-  body face changes; and only the lines near those shown (below).
-  Body text is in Noto Sans, or Noto Serif after `F8` (not kept between
-  runs); `<strong>` and `<em>` in its bold and italic styles; code and
-  preformatted text in the monospace face on the prose line (td-ui's
-  `Mono`), code on a ground of its own. A line holding preformatted
-  text, and one of a table's rules or rows (a line with a run of
-  box-drawing characters alone, U+2500 to U+257F, as td-html draws a
-  table's rules and column bars), is never wrapped: it is cut at the
-  pane's edge and kept, when td-web renders it, to its first
-  `MAX_PRE_CHARS` (4096) characters, a link left with no text no link,
-  and laid out only as far as the pane shows it, its edge and td-ui's
-  `OVERHANG` past it, again at each width: without horizontal scrolling
-  (§10) a pane shows no more. Find matches, and the pointer, the focus
-  and the selection mark, only what of such a line is laid: a match
-  past the edge is not found, and a link whose text is all past it is
-  focused on its line with nothing marked, the status row naming where
-  it goes; a selection spanning such a line copies its kept text whole
-  (§8).
-  Without the proportional faces (none installed, `TD_UI_FACE=bitmap`,
-  every in-process test) td-ui measures every glyph a cell and the page
-  draws on the cell. Links keep their looks; colours named by the
-  document are not applied, so text is always the theme's ink on the
-  theme's ground. An image with `alt` text shows that text as a link to
-  the image; td-html drops one without. td-html keeps no element ids,
-  so a link's `#fragment` is kept in the address but not scrolled to.
-- `text/*` is shown as it is, its tabs expanded every eight
-  characters, wrapped at the pane's width in the monospace face on
-  prose lines.
+- `text/html` and `application/xhtml+xml` are made into a page as §10
+  says: parsed into a tree, styled with td's sheets and the page's own,
+  and laid out on the render thread (§3), then painted by td-web on the
+  window's.
+- `text/*` is a text page (§10, "Cuts"): its text laid `pre-wrap` in
+  the monospace face, with tab stops every eight columns.
 - `image/png`, `image/jpeg` (`image/pjpeg` included), `image/gif`,
   `image/webp` and `image/avif`
   reached by navigation use one `picture` dispatch module and are shown
@@ -577,7 +510,8 @@ Standard's page-load model for text does not say.
 the XML declaration is not read. A label td-charset does not know (Big5,
 EUC-JP, ISO-2022-JP) is passed over as if absent. Malformed bytes, and a
 sequence the body ends in, are each U+FFFD and the page renders on: only
-want of memory for its text fails a page, as an error page. `MAX_MARKUP`
+want of memory for its text fails a page, as the static resource notice
+(§3). `MAX_MARKUP`
 and `MAX_TEXT` bound the text decoded, in bytes of UTF-8, not the bytes
 sent, and the scalars a byte completes are left out whole when the bound
 would cut them: td-html is handed at most `MAX_MARKUP` bytes whatever
@@ -591,155 +525,26 @@ at once, and the body dropped (§3). The status row names the encoding
 when it is not UTF-8 (§8). Find, the selection and copying see the
 decoded text alone. No encoding is chosen by hand (§11).
 
-Control characters other than the tab (C0, DEL and C1), which prose
-would show as U+FFFD, are dropped before the page is wrapped, a CR
-before an LF among them. Markup past `MAX_MARKUP` (2 MiB) and text past
-`MAX_TEXT` (4 MiB) are not rendered, a page keeps at most `MAX_LINES`
-(100,000) logical lines, an unwrapped line at most `MAX_PRE_CHARS`
-characters, and the status row says when any of these, or td-html's
-output budget (below), cut the page short. The wrapped lines are not
-counted or cut: however many a page wraps to, only those near the ones
-shown are laid (below). A status other than `2xx` with a body is shown
-with its status in the status row; one without a body is an error page.
+Markup past `MAX_MARKUP` (2 MiB) and text past `MAX_TEXT` (4 MiB) are
+not parsed, and the status row says how much of the reply is shown. A
+status other than `2xx` with a body is shown with its status in the
+status row; one without a body is an error page.
 
-td-html builds a rendering whole before td-web cuts it, so
-`HTML_LIMITS` (td-html/DESIGN.md, "Resident rendering cost") bound that
-work, which runs on the render thread (§3), one rendering or picture
-decoding at a time: td-web gives td-html the first `MAX_MARKUP` bytes,
-cutting them itself so td-html's notice (below) means only its budget,
-and td-html stops once it has built 32 MiB of runs and lines, 16 bytes
-a byte of that. Measured at width 0, real pages spend 2 to 11 bytes of
-budget a byte (HTML manuals and specifications, Wikipedia articles,
-the first 2 MiB of the WHATWG HTML and ECMAScript specifications at
-some 14 MiB), and dense tables 16.4 (SANE's list of backends, 11 MiB
-at its 670 KiB), so every real page tried, cut to `MAX_MARKUP`,
-renders whole, and only 2 MiB of tables that dense would be cut;
-2 MiB at 11 bytes a byte needs 22 MiB. td-html composes the marks
-of the quotes and lists around a line into it once, as it emits the
-line, but as a run per level, so its output still grows with how
-deeply they nest, and the budget cuts such a page short. Measured on a
-development host, release build, through td-web's rendering: 2 MiB of
-one-letter paragraphs left open inside 62 quotes, the costliest of
-td-html/DESIGN.md's hostile shapes, takes 0.35 s and peaks at 238 MB,
-keeping some 8,000 of their lines; inside 8 quotes 236 MB, keeping
-54,000; in none 222 MB, which the budget does not cut; list items
-inside 62 quotes 198 MB; 2 MiB of empty paragraphs 48 MB. td-html
-ends a rendering it cut short
-with a line of notice (`td_html::CUT_NOTICE`), which td-web leaves out
-of the page, saying in the status row that the rest is too large to
-render; a page whose own last line is that text is taken for one cut,
-and one whose first block alone is past the budget (a paragraph of
-some 2 MiB of words, say) renders empty but for that note. A page
-td-web cuts at `MAX_LINES` before the notice never reaches it, so its
-status row shows only the `MAX_LINES` note.
-
-What runs on the window's thread is the wrap, and only of the lines
-near those shown. Where the reader is, the top of the pane, is a place
-in the logical lines (`Place`: a logical line, and a run and a byte in
-it where one of its wrapped lines starts), as the history keeps it
-(§8). The lines laid are consecutive wrapped lines, from a screenful,
-or `STRIDE` (64) lines if more, above the top to as many past the
-bottom, laid `STRIDE` at a time as the reader moves and forgotten past
-that, so what the wrap holds is bounded by the pane, not by the page.
-A logical line is wrapped from its start, or again from where one of
-its wrapped lines starts, since a line's breaks depend only on its text
-from there on; it is handed to `prose` a slice at a time, 4 KiB
-(`FIRST_SLICE`) and twice that while a slice holds no whole line, at
-most `MAX_ROW_BYTES` (64 KiB, with a byte more for each run), each
-slice's last line laid again from its start by the next. A slice of
-`MAX_ROW_BYTES` holding no whole line, none of its text overflowing
-the width at a break, is one line, and the next starts at the first
-character after it that is no space, as after any break, a line of
-spaces alone being none. A line never breaks at a space, so when it is
-spaces that run past the slice that is the line a wrap of the whole
-logical line makes. A slice starting with spaces that its wrap drops
-as a line of their own, as indentation or the text after a hang's
-structure may, is laid again from the first character after them, the
-wrap starting afresh there as the whole wrap does, so a word crossing
-the slice's end is not cut. Only characters of no advance, which never
-fill the width, end a line there that the whole wrap would not (a
-test, `a_page_laid_a_slice_at_a_time_is_its_whole_lines_wrapped`,
-holds words, runs of spaces and tabs, leading ones before a word
-crossing a slice's end included, to the whole wrap). Moving down lays on
-from the last line laid. Moving up lays a logical line from its start,
-or from the nearest of the starts a walk along it last found, every
-`STRIDE`th of its wrapped lines, kept for the last two logical lines
-walked, keeping the lines before where it is going. `End` lays back
-from the last logical line; a place found again after a resize, `F8`
-or a history step, a link focused or a match shown lays its logical
-line up to it from the nearest start remembered. So a resize or a jump
-costs the lines shown and at most one logical line, not the page: the
-costliest logical line, one word of `MAX_MARKUP` alone, in quotes or
-in alternating bold runs of eight letters, takes 29 to 54 ms to walk
-to its end, a screenful's scroll about half a millisecond, and a jump
-back and forth between two logical lines of 1 MiB each, once walked,
-0.06 to 0.2 ms. There is no count of the page's wrapped lines: the
-status row says where the reader is in logical lines (§8).
-Measured on a development host, release build, with Noto's metrics at
-1920x1200 and 3840x2160 (scale one and two) and at 300 pixels, by what
-the window's thread grew to: a word of `MAX_MARKUP` alone or inside 3,
-8 or 38 quotes whose marks each continuation repeats, one-letter
-paragraphs in 62 quotes, a paragraph of the document's own starting
-with 100 quote marks, a list of eight-word items nested eight deep, a
-table whose first cell pads every row past `MAX_PRE_CHARS`,
-preformatted and plain lines of tabs, and 100,000 lines of text each
-hold at most 1 MB of wrap; a paragraph of 2 MiB of combining marks,
-whose 32 lines of 64 KiB are all near the top, 6.2 MB; paragraphs of
-combining marks in runs of four to eight, bold and plain, bold and
-italic, or bold, italic and plain, 13 to 18 MB; and the costliest, a
-paragraph of combining marks in alternating bold and plain runs of
-four, 19.3 MB, a piece for each run of the page in the lines laid
-(taken as 24 MB, some 4.7 MB of room). That is the wrap the memory
-bounds count (§3), and the page they count as at most the budget: a
-run keeps its text at its own length, so a page held at most 19 MB of
-the 32 MiB in the shapes tried, and a text page at most 46 MB, its
-tabs expanded. A paint walks
-only the lines shown, each up to the pane's edge, and draws at most
-eight glyphs at one pen (`MAX_STACKED`), so a pile of combining marks
-costs a walk rather than a glyph each (§11).
-
-Each character takes the advance of the face that draws it: Noto's
-for body text, the monospace face's one advance for code, preformatted
-and plain text and for a scalar Noto lacks, a cell's for one neither
-has (drawn from Unifont), and a combining mark its own, zero in Noto's
-faces. Text is unkerned and unshaped (td-ui/DESIGN.md, "Proportional
-faces"). td-html's own stroke marks are dropped from struck text, which
-td-web strikes itself over each glyph's extent.
-
-td-html lays the page out unwrapped and in characters. td-web hangs a
-wrapped line from what td-html starts it with, as it does a list, a
-nested list, a quote, a heading or a definition: whole runs, at most
-256 characters, each holding only spaces, a quote's mark (`> `), a
-heading's (one to six `#` and a space) and a list's marker (`*`, `-`,
-`+`, `•`, `◦` or `▪` and a space, or digits, after a `-` or not, then
-`.` or `)` and a space), in any order. The rest of the line is wrapped
-at the width less that prefix's, measured as the line is, and every
-line of it starts that far in: the first after the whole prefix, each
-continuation after the quote's and heading's marks alone, drawn where
-the first line has them, and no list marker, one piece for each run
-of them however deeply they nest. A prefix wider than half
-the width does not hang, so the text keeps room. Marks that share a
-run with text, as every line of plain text does, do not hang; but
-td-html's rich output gives each word of a paragraph a run of its own,
-so a paragraph of the document's own that begins `> `, `# ` or `- `
-hangs as td-html's structure does, which nothing in that output tells
-apart. What else td-html lays out by width does not carry into pixels:
-a table's columns, padded with spaces between box-drawing rules, line
-up only on the cell, which is why its lines are not wrapped, and a
-rule is three dashes (§10).
-
-The rendered page is td-web's own model, independent of how it was
-produced: a page of logical lines of styled runs with link targets,
-filled once from td-html's rich output, and its rendering, those lines
-near the ones shown wrapped into prose lines whose pieces carry their
-run's link as their tag. §10 replaces that model whole, the producer
-and the places of the view above it with it.
+What a page is and how it is shown is §10's: the sheets that style it
+("Sources"), its faces ("Faces"), its places, find, selection, copying,
+links, title and scrolling ("Places, find, selection and links"), what
+is shown of a page too large to lay out, a text page cut by the lines
+it lays among it ("Cuts"), and its paint ("Painting"). Without the
+proportional faces (none installed, `TD_UI_FACE=bitmap`, every
+in-process test) td-ui measures every glyph a cell and the page draws
+on the cell. Text is unkerned and unshaped (td-ui/DESIGN.md,
+"Proportional faces").
 
 ## 6. State
 
 A td-web window keeps, in memory only: its back and forward history
-(each entry a URL and the scroll position it was left at), the current
-document and its rendering. Nothing is written to disk in the first
+(each entry a URL and the place its top was left at), the current
+document and its layout. Nothing is written to disk in the first
 increments, no cookie, cache, history or bookmark, but a file the
 person saves into Downloads (§5, "Saving"), which is the human's, not
 td-web's state. Closing the window forgets everything. A later
@@ -764,11 +569,10 @@ next key, click, wheel turn or paste, and what a save did, once it
 ends, until the same; what is loading; that a save runs; where the link
 under the pointer, else the focused link, goes; the response's status, the place in the page, the
 encoding its text was decoded from when not UTF-8 (§5), and any cut.
-The place, said only of a page not shown whole, is `N of M lines`: the
-logical line the last line shown is part of, of the page's
-logical lines, which needs nothing laid but the lines shown (§5). Its
-app id is `td-web`; its title is the document's `<title>`, else its
-URL, then ` - td-web`.
+The place is `N of M lines`: the last line shown whole, of the
+layout's lines at this width (§10, "The status row"). Its app id is
+`td-web`; its title is the document's `<title>` (§10, "Links"), else
+its URL, then ` - td-web`.
 
 | Key | Does |
 |---|---|
@@ -781,74 +585,55 @@ URL, then ` - td-web`.
 | `Ctrl+R`, `F5` | reload |
 | `Ctrl+F`, `/` | find in page, the current match selected; `Enter`/`Shift+Enter`, then `n`/`N`, next/previous |
 | `Up`, `Down`, `PageUp`, `PageDown`, `Space`, `Home`, `End` | scroll |
+| `Left`, `Right` (page) | scroll across a page wider than the pane |
 | `Shift+Left`, `Shift+Right` (page) | move the selection's end a character; with `Ctrl`, to the word before's start or the word after's end |
-| `Shift+Up`, `Shift+Down` (page) | move it to its logical line's start or end, from there the line before's start or the line after's end |
+| `Shift+Up`, `Shift+Down` (page) | move it to its paragraph's start or end, from there the paragraph before's start or the one after's end |
 | `Ctrl+A` (page) | select the page |
 | `Escape` (page) | stop loading, else a save still fetching (§5), else clear the focused link, find's marks and the selection |
 | `Ctrl+C` | copy the address or find row's selection while it has focus, else the page's selection, else the focused link's URL, else the page's |
 | `Ctrl+S` | save the document into Downloads (§5, "Saving") |
 | `F8` | body text in Noto Sans or Noto Serif, for this run |
+| `F9` | the page without its own styles, or with them (§10, "Without the page's styles") |
 | `Ctrl+Q`, `Ctrl+W` | close |
 | `?`, `F1` | the key list (`F1` is the window's own) |
 
-A click on a link follows it at the button's release (below), the
-pointer over one says where it goes, and the wheel scrolls; which link
-a point is on is the piece of its
-line under it, by pixel, never in the inset left of the lines or on a
-line not shown whole. Find searches the page's logical lines, all of
-them however few are laid (§5), and matches within one, across its
-runs and the ends of its wrapped lines and ignoring case, looking at
-each character once (Knuth, Morris and Pratt), so a search costs the
-text searched whatever the query. The ignored `document::search_bench::find`
-benchmark exercises sparse and dense matches, a repeated-prefix query,
-Unicode and short pages in release builds. Showing a match lays the lines around
-it and shows it whole where the pane holds it, from the line its last
-character is on up to the one its first drawn glyph is on, a space a
-wrapped line ends with being dropped there; each line it is on marks
-it by the pixels its glyphs span there. `Tab` and `Shift+Tab` go
-through every link of the page, a link's place being where its text
-starts on the logical line it starts on. A navigation's fetch runs on
-a thread of its own, which hands the reply
-to the render thread (§3) for its decoding, a picture's and a page's
-rendering into logical lines included, and waits for it there, so
-the window stays responsive while a page loads, and `Escape` on the
-page stops waiting for it; laying out the lines near those shown at
-the page's width, again on a resize or `F8`, is the window's. A
-stopped fetch runs on until the service answers or times out, so
-td-web keeps at most `MAX_WORKERS` (4)
+A click on a link follows it at the button's release (below); the
+pointer over one says where it goes and marks it as the focused link
+is marked. The wheel scrolls up and down, a line for each row it turns,
+and across, four cells for each column it turns, as `Left` and `Right`
+do a press. Which link or place a point is on, what find
+matches, how a match or a link is shown and how far each key scrolls
+are §10's "Places, find, selection and links". A navigation's fetch
+runs on a thread of its own, which hands the reply to the render thread
+(§3) for its decoding and its making into a page or a picture, and
+waits for it there, so the window stays responsive while a page loads,
+and `Escape` on the page stops waiting for it; laying the page out
+again at a new width, scale or face, or for `F9`, is the render
+thread's too (§10, "Relayout"). A stopped fetch runs on until the
+service answers or times out, so td-web keeps at most `MAX_WORKERS` (4)
 fetches out, stopped ones included, a save among them (§5), and asks
 the person to wait past that; a navigation overtaken by another is
-stopped. The history keeps
-at most 100 pages each way, each at the text its top line began with,
-and moves only when a page arrives: a step back or forward that is
-stopped, refused or overtaken leaves it as it was. A resize or `F8`
-keeps the text at the top, inside a long paragraph too, and the
-focused link; find's marks are made again on the new lines, the
-current match's index kept as far as there are as many matches,
-without moving to it. Coming back to a page opens it
-at the text its top line began with, however it is wrapped now.
+stopped. The history keeps at most 100 pages each way, each at its
+top's place (§10, "The top's place"), and moves only when a page
+arrives: a step back or forward that is stopped, refused or overtaken
+leaves it as it was. A relayout keeps the text at the top, as shown
+when the new layout comes, and the focused link, by its element; with
+find's marks shown it finds again on the new layout and marks the
+matches, the current one's index kept as far as there are as many,
+nothing moved to or selected. A relayout that steps down to another
+rung's tree (§10, "Cuts") lets the selection, the marks and the focused
+link go, places of the old tree naming nothing in the new.
 
-**Selection.** Text in the page is selected as two places in its
-logical lines (§5's `Place`, here any character's, not only where a
-wrapped line starts): where it was begun and where it is now, in either
-order. So it is kept unchanged however far the page scrolls, the wrap
-forgetting the lines far from those shown, and through a resize, `F8`
-and anything else that wraps the page again, as the place at the top
-is.
+**Selection.** Text in the page is selected as two places (§10,
+"Places"): where it was begun and where it is now, in either order. So
+it is kept unchanged however far the page scrolls, and through a
+relayout that keeps the page's tree, as the place at the top is.
 
 - **Pointer.** A press on the page and a drag select from the place
-  between characters nearest the press, by the halves of the glyphs
-  drawn there, to the one nearest the pointer: left of a line's text
-  is its start, a continuation's repeated marks included; right of it,
-  or in the inset right of the lines, its end, a line not wrapped
-  ending where its logical line does, past what is laid of it; above
-  the page, the first line shown's start; below its last line shown
-  whole, the last's end; with no line shown whole, a pane shorter than
-  a line, the first line shown's start. No place falls before a glyph
-  of no width after one with width, so a combining mark is never parted
-  from its base, while a line that begins with marks keeps its start.
-  Once the pointer has moved from where it was pressed, held above the page or below that line it
-  scrolls it once each `DRAG_SCROLL_MS` (50 ms), a line for each
+  nearest the press to the one nearest the pointer, as §10's
+  "Selection" places a point. Once the pointer has moved from where it
+  was pressed, held above the page or below its last line shown whole
+  it scrolls it once each `DRAG_SCROLL_MS` (50 ms), a line for each
   line's height it is past the edge and at most `DRAG_SCROLL_LINES`
   (4), so at most 80 lines a second, the selection following to the
   lines then shown, as it does when the wheel turns during a drag; a
@@ -859,58 +644,49 @@ is.
   that are a click, which follows the link under the press, and a
   press on a link dragged further selects and follows nothing. A
   second press within td-ui's `MULTI_CLICK_MS` (500 ms) of a click's
-  release and within `NEAR` of it selects the word of letters and
-  digits under it, across runs and wrapped lines but not past its
-  logical line (off a word, nothing); a third selects the logical line
-  whole; a fourth is a first again, and the drag of a double or triple
-  click moves nothing. The window reports no click count, a pointer
-  input carries no time, and inputs are handled before the turn's
-  `poll` is told one, so td-web counts clicks on its own monotonic
-  clock, read at each press and release. A
-  click that follows a link, a drag, a Shift press and a press the
-  pointer's leaving cancels are no click a later press pairs with. A
-  Shift press moves the selection's end there from its anchor, and its
-  drag goes on moving it; with nothing selected it begins there. A
-  Shift press follows no link.
+  release and within `NEAR` of it selects the word of letters, digits
+  and `_` under it, across fragments and lines but not past its
+  paragraph (off a word, nothing); a third selects the paragraph whole;
+  a fourth is a first again, and the drag of a double or triple click
+  moves nothing. The window reports no click count, a pointer input
+  carries no time, and inputs are handled before the turn's `poll` is
+  told one, so td-web counts clicks on its own monotonic clock, read at
+  each press and release. A click that follows a link, a drag, a Shift
+  press and a press the pointer's leaving cancels are no click a later
+  press pairs with. A Shift press moves the selection's end there from
+  its anchor, and its drag goes on moving it; with nothing selected it
+  begins there. A Shift press follows no link.
 - **Keyboard.** td-web has no caret; the keys move the selection's
   end. Find's current match is the selection whenever find moves to
   one, as the query is typed, by `Enter` or by `n`, and a query that
   matches nothing leaves none. On the page `Shift+Left` and
-  `Shift+Right` move the end a character, from a logical line's end to
-  the next's start and back; `Ctrl+Shift+Left` and `Ctrl+Shift+Right`
-  to the start of the word before or the end of the word after, within
-  the logical line, and across a line's end a step, as a character;
-  `Shift+Up` and `Shift+Down` to the logical line's start or end, and
-  from there to the start of the line before or the end of the line
-  after; the page scrolls as little as shows where the end went. With
-  nothing selected they begin at the focused link's start, else the
-  first line shown's. `Ctrl+A` selects the page.
+  `Shift+Right` move the end a scalar, an image whole or the white
+  space a wrap left, from a paragraph's end to the next's start and
+  back; `Ctrl+Shift+Left` and `Ctrl+Shift+Right` to the start of the
+  word before or the end of the word after; `Shift+Up` and
+  `Shift+Down` to the paragraph's start or end, and from there to the
+  start of the paragraph before or the end of the one after; the page
+  scrolls as little as shows where the end went. With nothing selected
+  they begin at the focused link's start, else the top's place.
+  `Ctrl+A` selects the page.
 - **One of a selection and a focused link.** Selecting lets the
   focused link go and `Tab` clears the selection, so `Ctrl+C` copies
   the one there is (the precedence in the table above). `Escape` on
   the page clears the selection with the focus and find's marks,
-  unless it stops a load or a save still fetching. A page arriving, by any
-  navigation, reload or history step, starts with none, a press held over the page before
-  it is dropped, and the history keeps no selection.
-- **Painting.** Each glyph of a line laid whose character lies between
-  the two places is drawn on `SELECTED` in paper ink, as the focused
-  link is. Find's current match is drawn so because it is the
-  selection; once another selection replaces it, it is drawn on
-  `INACTIVE_SELECTION` like every other match. Nothing is laid for it,
-  so a
-  selection reaching lines far from those shown costs nothing until
-  they are shown; a continuation's repeated marks and the space a wrap
-  drops at a line's end show no ground.
-- **Copying.** `Ctrl+C` copies the page's text between the two places,
-  each logical line's runs joined and the lines joined by a newline:
-  the space a wrap drops is copied, and the marks a continuation
-  repeats are not, being td-web's drawing rather than the page's text.
-  A logical line's own leading structure, td-html's quote, heading and
-  list marks, is copied with it, as its first wrapped line shows it and
-  as td-html's text has it. A line not wrapped copies what td-web keeps
-  of it, up to `MAX_PRE_CHARS`, past the pane's edge. A copy holds at
-  most `MAX_COPY`, td-ui's clipboard ceiling (`clipboard::MAX_BYTES`,
-  1 MiB), which the window keeps for its sends: a selection past it is
+  unless it stops a load or a save still fetching. A page arriving, by
+  any navigation, reload or history step, starts with none, a press
+  held over the page before it is dropped, and the history keeps no
+  selection.
+- **Painting.** Each glyph between the two places is drawn on
+  `SELECTED` in paper ink, as the focused link is (§10, "Painting").
+  Find's current match is drawn so because it is the selection; once
+  another selection replaces it, it is drawn on `INACTIVE_SELECTION`
+  like every other match. A selection reaching lines far from those
+  shown costs nothing until they are shown.
+- **Copying.** `Ctrl+C` copies the page's text between the two places
+  as §10's "Copying" gathers it. A copy holds at most `MAX_COPY`,
+  td-ui's clipboard ceiling (`clipboard::MAX_BYTES`, 1 MiB), which the
+  window keeps for its sends: a selection past it is
   not copied and the status row says so. The selection's text is
   measured before any of it is gathered and gathered into budget-owned
   storage retained through delivery: at most 80 inline bytes per owner,
@@ -949,30 +725,26 @@ is.
    monospace one, a missing one said once and the page drawn on the
    cell. Landed.
 
-Increments 6 onward are §10's.
+Increments 6 onward are §10's; 6 and 7 have landed.
 
 ## 10. Styled documents
 
-td-web moves from td-html's flat rendering (§5) to a document tree,
-styled by td-css, laid out by td-layout and painted by td-web. This
-section is the plan and, once its cutover (increment 7, below) lands,
-the contract: that landing replaces §3's memory, §5's rendering and
-§8's places with what this section says, so the document never
-describes two producers.
+A page is a document tree, styled by td-css, laid out by td-layout and
+painted by td-web. What increments 8 and 9 (below) add, stylesheets and
+pictures fetched as subresources, is planned, normative for the work it
+names; the rest of this section is the contract.
 
 ### Pipeline and threads
 
 A reply shown as a page is made on the render thread (§3), one job at
-a time as now:
+a time:
 
-1. **Decode** (§5, "Encodings"), unchanged: at most `MAX_MARKUP` bytes
-   of UTF-8, the body dropped. The decoded markup is kept until the
-   page's first layout succeeds, since the text-only rung reads it
-   (below, "Cuts"). td-web charges it at its length from decoding
-   until the cascade; td-layout's styled document then counts it as
-   its input, so td-web's own charge is returned, and td-layout's
-   stays once the markup is dropped, an overcharge of at most
-   `MAX_MARKUP`.
+1. **Decode** (§5, "Encodings"): at most `MAX_MARKUP` bytes of UTF-8,
+   the body dropped. A markup page's decoded markup is copied into the
+   page's budget, charged at its length, and kept, shared, for the
+   page's life, so the text-only rung (below, "Cuts") can read it after
+   a relayout that let the old layout go first; td-layout's styled
+   document also counts it as its input.
 2. **Parse** with td-html's document parser (`parse_with_budget`,
    td-html/DESIGN.md "Document tree") into an immutable tree, its byte
    limit what the page's budget admits (below, "Memory"). Its storage
@@ -1004,24 +776,29 @@ finishes the one it is in and then sees its flag. td-layout tests its
 limits before the flag, and a flag set during the last element or after
 layout's last read can still return the result, so td-web tests its own
 flag after each step, before taking a result or stepping down on a
-refusal.
+refusal: a step refused by a limit after its job was stopped gives the
+job's cancellation, never a lower rung. td-web's own walk over a new
+layout, up from each box to its nearest ancestor with geometry, reads
+the flag at its first step and every 4,096 after (`WALK_INTERVAL`),
+since a deep nest of elements without geometry over many boxes makes
+that walk long.
 
 The viewport, in CSS pixels, is the page pane less a cell's inset each
 side, divided by the scale, and never narrower than `MIN_WRAP_EMS` ems;
 a narrower pane shows the page's left and scrolls across it. The
 render thread measures with its own clone of the faces the window
-draws with, as td-web's window thread does now (td-ui/DESIGN.md,
-"Measuring and wrapping"), and the window thread replays advances with
+draws with (td-ui/DESIGN.md, "Measuring and wrapping"), and the
+window thread replays advances with
 its own: the same faces at the same scale, so the two agree.
 
-A page then holds the tree; its sheets' text, kept so a changed
-environment can compile them again, but no compiled set until §11's
-environment answer needs one kept; the styled
-document, its pool and boxes; a table of each node's place in tree
-order; and one layout with what td-web indexes over it, made for a
-viewport size, a scale and a body family. It no longer holds the body,
-td-dom's index or any cascade scratch, nor the decoded markup once the
-first layout is in. td-web's own tables are td-alloc `BudgetVec`s in
+A page then holds the tree; a markup page's decoded markup (step 1);
+its sheets' text, kept so a changed environment can compile them
+again, but no compiled set until §11's environment answer needs one
+kept; the styled document, its pool and boxes; a table of each node's
+place in tree order; and one layout with what td-web indexes over it,
+made for a viewport size, a scale, a body family and whether the
+page's own styles apply (`F9`). It holds no body, td-dom's index or
+cascade scratch. td-web's own tables are td-alloc `BudgetVec`s in
 the page's budget. The tree, sheets and styled document are immutable
 and shared (`Arc`) between the window thread, which paints, hit-tests,
 finds and copies from them, and the render thread, which lays them out
@@ -1035,11 +812,29 @@ happens on the render thread, whose arena holds it (§3), never in a
 paint. When a relayout lets the old one go first (below), the window
 thread decides so as it asks and gives up its references by sending
 them with the request, and the render thread drops them before it
-charges anything for the new one.
+charges anything for the new one. The same holds for everything else
+the window lets go: a relayout's answer it no longer wants (a
+navigation's page arriving first), the page a refused let-go relayout
+leaves, and a navigation stopped or overtaken, whose answer channel,
+with whatever it holds or is yet sent, is handed over whole; a fetch
+thread whose answer the window no longer takes lets the document go
+there too. A let-go the full lane refuses is held, `PENDING` (8) of
+them, and posted at the window's next poll; only past those is one
+dropped on the window thread, which takes a burst of let-goes while
+one relayout runs. A post to a render thread that was lost starts
+another, as a reply's submission does, and a relayout whose job ends
+without answering, as one that panicked does, is answered refused, so
+the window never waits on it. The window cancels a relayout it lets go
+and takes its answer under the answer's lock, under which the render
+thread writes it: a page made after that is written refused and
+dropped there.
 
 **Relayout.** What changed decides what is done again:
 
 - `F8` changes the body family (below, "Faces"): a layout only.
+- `F9` cascades the page again with or without its own sheets and
+  `style` attributes (below, "Without the page's styles"), then lays it
+  out.
 - A picture arriving (below, "Subresources") changes its image's
   intrinsic size, which td-layout takes with each layout request: a
   layout only.
@@ -1064,26 +859,44 @@ charges anything for the new one.
 A recompiled set is charged to the sheets term while it lives, and the
 new styled document and layout are charged beside the old ones, which
 the window paints meanwhile. td-web decides that as it asks, from what
-the old ones hold and the page's headroom, not by trying: when the new
-ceilings do not fit beside the old, the old styled document and layout
-are let go first (above, "Handover"), the pane showing paper and the
-status row `laying out` until the new ones come. A relayout refused
-then has no old layout to keep, and the page steps down from rung 2
-(below, "Cuts").
+the old ones hold and the root's headroom, not by trying: it predicts
+the new output as the old output times the old viewport's width over the
+new one's, at least once and at most 64 times, plus the old styled
+document when it cascades again, and the new ones fit beside the old
+when the tree, the old styled document, the old output and that
+prediction come to at most `MAX_PAGE_BYTES` and the prediction is within
+the root's headroom (`fits_beside`). When they do not, the old styled
+document and layout are let go first (above, "Handover"), the pane
+showing paper and the status row `laying out` until the new ones come. A
+relayout refused beside the old ones is refused whole: the old layout
+stays shown and the page on its rung. One refused after the old ones
+were let go has no old layout to keep, and the page steps down from its
+rung (below, "Cuts").
 
 td-layout measures the whole flow on every layout (td-layout/DESIGN.md
 §6): a width change of 2 MiB of synthetic markup takes 54 to 67 ms
-(medians, synthetic metrics; 105 to 194 ms under a heavier load) and
-the eight corpus pages 0.4 to 8.5 ms,
-on top of the cascade above. So a relayout runs on the render thread,
-never the window's, and a resize no longer costs only the lines shown,
-as §5's wrap does. The window thread asks for one and goes on painting
+(medians, synthetic metrics; 105 to 194 ms under a heavier load) and the
+eight corpus pages 0.4 to 8.5 ms, on top of the cascade above. Measured
+on the cell (a development host, release build,
+`pipeline::tests::measure_pages`), seven of the corpus pages (GitHub's
+not fetched) are made, parsed, compiled, cascaded and laid out at 400
+CSS px, in 1.7 to 225 ms, and laid out again at 1200 px with the old
+layout kept in 1.4 to 207 ms. Over the pinned faces, through the whole
+window (`app::tests::measure_window`, a process a page and output),
+they are made in 2.5 to 249 ms at 1920x1200 and 2.8 to 251 ms at
+3840x2160, and laid out again two thirds as wide, the old layout kept,
+in 2.0 to 225 ms and 2.1 to 229 ms, The Guardian's front page the
+slowest; td-layout's 2 MiB shapes are made in 78 to 587 ms and laid out
+again in 59 to 519 ms at 1920x1200, and in 82 to 646 ms and 89 to 521
+ms at 3840x2160, blocks the slowest. So a relayout runs on the render thread,
+never the window's, and a resize costs a layout of the whole page, not
+of the lines shown. The window thread asks for one and goes on painting
 the layout it has, at its own width, cut at the pane's edge or with
 paper past it, the status row saying `laying out` until the new one
 comes. Requests coalesce: a page has at most one waiting, a newer one
-replacing it, and one running is cancelled by its flag when a newer
-one is asked for, between elements of its cascade or its layout. The
-text at the top of the pane is kept (below, "Places").
+replacing it, and one running is cancelled by its flag when a newer one
+is asked for, between elements of its cascade or its layout. The text at
+the top of the pane is kept (below, "Places").
 
 **Whole, not windowed.** td-layout can keep only the lines meeting a
 window but measures the whole flow for it all the same (its windowed
@@ -1113,7 +926,7 @@ budget as that page's tree is, and returned when a save takes it, its
 worker's body then one of the navigations' bodies below.
 
 **Owned storage and declared charges.** td-html's document parser holds
-its storage in td-alloc owners. The cutover passes a child of the page
+its storage in td-alloc owners. td-web passes a child of the page
 budget to `parse_with_budget`, capped at `MAX_TREE_BYTES` plus its
 control block; it takes no second reservation for that storage. The
 parser's cumulative `charged_bytes` remains a separate complexity bound.
@@ -1122,15 +935,15 @@ td-dom indexes likewise use the supplied page budget through
 `HtmlTree::with_budget`; they keep both array charges until dropped.
 
 td-css owns syntax, compiled rules, compute scratch and retained styles
-through td-alloc. The cutover passes the sheets child to
+through td-alloc. td-web passes the sheets child to
 StyleSet::new_with_budget and the page child to compute_with_budget and
 StylePool::with_budget. Shared strings and custom tokens retain their
 original child's admission until their last owner drops, including a
 computed style that outlives its StyleSet. Dropping the set cannot return
 that still-owned charge or move it to the styled term.
 
-td-layout owns its arrays and scratch through td-alloc. The cutover passes
-the page budget to StyledDocument::shared and a selected child to
+td-layout owns its arrays and scratch through td-alloc. td-web passes
+the page budget to StyledDocument::shared and to
 block::layout_with_budget. The shared styled document owns the immutable
 Document without a self-referential borrow. Its arrays and retained styles
 keep their charges until dropped; the temporary DOM index returns its
@@ -1157,6 +970,7 @@ through td-alloc as well. Any refusal follows "Cuts" below.
 |---|---|---:|
 | tree | td-html's owned allocation layouts, including parser scratch and growth overlap | 128 MiB, `MAX_TREE_BYTES`, plus budget metadata |
 | styled | owned input, boxes, CSS pool and td-web tree-order table; excludes independently owned tree and DOM storage | the page's |
+| markup | a markup page's decoded markup, at its length, for the page's life; `styled` declares it again as td-layout's input | `MAX_MARKUP` |
 | index | td-dom's owned arrays and construction's per-node maps, only during construction | `MAX_INDEX_BYTES` and 80 bytes a node, within the page's |
 | layout | owned geometry, lines, fragments and td-web's indexes over them | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
@@ -1164,7 +978,13 @@ through td-alloc as well. Any refusal follows "Cuts" below.
 | pictures | inline pictures' pixels and fitted copies (increment 9) | 48 MiB (estimate) |
 
 The ceilings of page, sheets and pictures sum to `PAGES`, so a page
-alone is refused only by its own terms. The sheets child bounds simultaneously live compilation layouts,
+alone is refused only by its own terms and what the root holds beside
+the pages: the render thread's reusable slots and lane, the faces'
+handle, each relayout's cancel flag and answer slot, the paint order's
+scratch (4.5 MiB taken at the first paint, grown to at most 18 MiB by
+a paint that fills it, "Painting" below) and the window's measure
+caches, a few MiB in all and about 20 once that scratch is grown,
+which come out of `PAGES`. The sheets child bounds simultaneously live compilation layouts,
 including scratch and replacement overlap. Source-size limits alone do
 not guarantee admission: a sufficiently complex sheet can exhaust 48 MiB
 before compilation finishes, and the page follows "Cuts" below.
@@ -1172,12 +992,27 @@ before compilation finishes, and the page follows "Cuts" below.
 A picture reached by navigation is a page of its own, charged the shared
 decoder's conservative 200 MiB peak before decoding, including the bounded
 table/row overhead above its 192 MiB bulk ceiling, then shrunk to the
-retained RGBA capacity. Refused only because the page shown holds too much, it lets the shown page go, the pane showing paper, and tries once
-more. Its fitted copy is made on the window thread at its first paint
-at a size, as now, the one heavy step that runs there, and charged to
-the picture's budget there; a charge refused paints §5's static notice
-in its place, tried again after a resize or a navigation, as a failed
-fit is now. A
+retained RGBA capacity. One whose working charge the root refuses is
+handed back to its fetch thread with its body, which asks the window for
+room: the window lets the page or picture shown go on the render
+thread, the pane showing paper that holds the page's history entry,
+and answers once that drop has left it for the lane (a let-go the full
+lane holds is posted first; a render thread lost and not started again
+takes none, and the room is then answered refused); the fetch thread
+then has the picture made once more, behind that drop, and one refused
+again shows §5's static notice, as one does at once when nothing was
+shown to let go. Only the root's refusal of that charge asks for room,
+not a failure to keep the decoded picture. The entry the paper holds
+is the page's for history: a navigation that overtakes the picture's
+puts it on Back, a reload loads it, and stopping the picture's shows
+the page again by loading it. That reload gives the entry back to the
+paper if it is stopped or overtaken before its page arrives, so a
+second stop leaves the paper, saying so, its entry still held. The body
+never leaves its fetch thread's slot, so `MAX_WORKERS` bodies still
+bound it. Its fitted copy is made on the window thread at its
+first paint at a size, the one heavy step that runs there, and charged
+to the picture's budget there; a charge refused paints §5's static
+notice in its place, tried again after a resize or a navigation. A
 relayout's output is charged beside the one it replaces (td-layout's
 `retained_output_bytes`, set from the old layout's `output_bytes`), or
 the old one is let go first, as "Relayout" decides. Measured
@@ -1187,7 +1022,11 @@ together, and a page is cut down (below, "Cuts") only when the page
 shown leaves it too little or its own layout is past td-layout's
 `MAX_PAGE_BYTES`, which 4 MiB of markup can be (up to 222.4 MiB
 measured at the narrowest pane, others refused by name, not in order of
-density).
+density). On the cell (above, "Relayout"), the seven corpus pages hold
+0.3 to 14.6 MiB of td-alloc's owned storage at their peak and declare
+0.6 to 35.9 MiB (`page_bytes`); 2 MiB of sixteen-letter paragraphs is
+made in 641 ms, holds 78.9 MiB at its peak and declares 131.6 MiB, so a
+relayout does not fit beside it and lets the old layout go first.
 
 **The jail.** What td-alloc does not hold is a fixed term:
 
@@ -1211,18 +1050,16 @@ density).
 
 With the root's `PAGES` (not td-ui's `prose::PAGES`) that is 145 +
 13.5 + 67.1 + 16.8 + 67.1 + 335.5 = 645.0 MB, 26 MB under
-`memory-high` (671 MB); `memory-max` stays 768 MiB, and the jail's
-keyfile is unchanged. A test,
+`memory-high` (671 MB), with `memory-max` 768 MiB, §3's keyfile. A
+test,
 `the_page_budgets_fit_the_jail`, holds that sum at least 20 MB under
 `memory-high`, the term ceilings summing to `PAGES` and the root's
 limit at `PAGES` and its control blocks, its terms taken from the
 crates' constants (`MAX_TREE_BYTES`, `MAX_PAGE_BYTES`, `WORKING_BYTES`,
 the caller's sheets ceiling, the 200 MiB picture working allowance checked
 against td-ui's `MAX_PICTURE_PIXELS` and the decoder bounds), and the
-window's term and the jail's copied by hand and reviewed as §3's are. It replaces
-`the_html_limits_fit_the_jail`: the terms that test sums,
-td-html's rendering (252 MB), a page at its output budget, the wrap
-(24 MB) and the text page (46 MB), go with the renderer they measure.
+window's term and the jail's copied by hand and reviewed when
+`web.rs` or the limits change.
 
 **What td-alloc does not bound**, and how it is kept: td-layout's
 remaining std storage, whose external charge is a conservative admission
@@ -1232,10 +1069,14 @@ and the fetch client's bodies. Every heavy step but a navigated
 picture's fit runs on the one render thread, and a page's last drop
 happens there, so one arena keeps their
 peak (§3's reason); `WORKING` holds room for what the charges leave
-out; the fixed terms are measured; and the cutover measures the
-resident peak with a page shown and one made, both at their largest,
-under the jail's limits. `memory-high` throttles before `memory-max`
-ends the jail.
+out; and the fixed terms are measured. The resident peak with a page
+shown and one made, both at their largest, is §3's: 193 MiB at
+3840x2160 with one frame buffer, about 266 MB with td-ui's three. Each
+page alone peaks at 28 to 68 MiB at 1920x1200 and 51 to 90 MiB at
+3840x2160 for the corpus, and at most 141 and 164 MiB for 2 MiB of
+blocks, which holds 71.9 MiB of td-alloc's owned storage and declares
+115.9 MiB. `memory-high` throttles before
+`memory-max` ends the jail.
 
 ### Sources
 
@@ -1267,8 +1108,8 @@ user-agent sheets included, 1 MiB each, a sheet's media lists counted
 with it; a sheet past them is left out,
 in tree order, and the status row says so.
 
-**Colours.** The colours a page names are applied, unlike §5's: a page
-looks as its sheets say. An unstyled page draws td-web's defaults,
+**Colours.** The colours a page names are applied: a page looks as its
+sheets say. An unstyled page draws td-web's defaults,
 `PAPER`, `INK`, `ACCENT` and `CHROME`, as td-ui's palette keys, which a
 test holds equal to td-ui's constants, so td-ui's themes map them
 (td-ui/DESIGN.md, "Themes"). Once a page's own sheets or attributes set
@@ -1282,8 +1123,10 @@ td-ui's theme map gives a handler no theme to report.
 **Without the page's styles.** `F9` shows the page with the user-agent
 sheets alone and no `style` attributes, cascading it again, for a page
 whose styles hide or garble its text; `F9` again restores them. It
-holds for that page until the next navigation, and the cutover adds it
-to §8's key table.
+holds for that page until the next navigation, which starts with the
+page's own styles. It is refused, the status row saying so, on a text
+page, td-web's own pages, a picture and a page already on rung 2 or 3
+(below, "Cuts"), none of which has styles of its own to leave out.
 
 **Faces.** A computed family list names one of td-ui's prose families
 by its first entry td-web knows, an entry it does not know passed
@@ -1378,7 +1221,7 @@ four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
 normal flow and tables, in tree order, so its lines and the fragments
 in each are in tree order: relative offsets move what is drawn, not the
 order. A **paragraph**, the unit find matches within and `Shift+Up` and
-`Shift+Down` move by, as §5's logical line is, is a run of consecutive
+`Shift+Down` move by, is a run of consecutive
 lines one block container lays: text either side of a child block is
 two paragraphs, and a preserved newline or a `<br>` ends one. td-web
 reads both from td-layout, each line naming the block that laid it
@@ -1386,12 +1229,14 @@ and how it ended (`Line::block`, `Line::end`, td-layout/DESIGN.md §4,
 "Line ends"), not from gaps between lines.
 
 **Find** searches each paragraph's text as td-layout displays it,
-spaces collapsed and a replaced scalar as U+FFFD, with the white
+spaces collapsed, a tab taken as a space, as in the query, and a
+replaced scalar as U+FFFD, with the white
 space a `Wrap` end leaves between lines put back as Copying puts it
 (none at an edge, nor across a `Split`) and an image's `alt` text in
 its place, in tree order and
 not past a paragraph, ignoring case, each character looked at once
-(Knuth, Morris and Pratt) as now, at most `MAX_HITS` matches. Text with
+(Knuth, Morris and Pratt), so a search costs the text searched whatever
+the query, at most `MAX_HITS` matches, which do not overlap. Text with
 no fragment (`display: none`) or not painted (`visibility: hidden`) is
 not found, nor is a list marker, which is no fragment's text. Matches
 are places, so they outlive a relayout; showing one
@@ -1402,9 +1247,11 @@ td-layout keeps no glyphs.
 **Selection** is two places, kept unchanged by scrolling, a relayout,
 `F8` and a resize. A point of the pane falls on a line by its height
 (an index of the layout's lines by height, which cannot be a binary
-search of their order inside a table, where line order is not y order:
-it scans a table's run of lines by y and then x, td-layout/DESIGN.md
-§5, "Tables"), on a fragment by its x,
+search of their order inside a table, where line order is not y order,
+td-layout/DESIGN.md §5, "Tables": each run of 64 lines keeps the span
+its boxes cover, which bounds how near any of them is, so the nearest
+run's lines are scanned by y and then x, and then only those of runs
+no further), on a fragment by its x,
 and between scalars by the halves of their advances, replayed through
 td-layout's `inline::replay` with the layout's metrics and the style of
 the block that laid the line (`Line::block`, td-layout §3), which sets
@@ -1414,14 +1261,24 @@ advances do not sum to its width, an untabbed one only after reporting
 its scalars, so the window thread gathers a fragment's scalars before
 it acts on them; left of
 a line is its start and right of it its end, above the page the first
-line's start and below it the last's end, as §8 says of wrapped lines.
-§8's keys keep their meaning, a paragraph standing for a logical line,
-scalars and words taken in tree order across fragments; a double click
-selects a word and a triple click a paragraph.
+line's start and below it the last's end.
+§8's keys move by scalars, words and paragraphs taken in tree order
+across fragments; a double click selects a word and a triple click a
+paragraph. A scalar laid with no advance, a combining mark, is never
+parted from the scalar before it: no place falls between them, a point
+past the base's middle falls after its marks, the keys step over the
+two as one and a word holds its letters' marks. Text not painted
+(`visibility: hidden`) is not selected: the keys and a word step over
+it, and a copy leaves it out. A line laying nothing (a text page's last
+newline, a paragraph's last `<br>`) holds no place: a place at the end
+of the line before it is on that line.
 
 **Copying** takes the text between the two places in tree order as it
-is shown: fragments' displayed text; after a `Wrap` end the white
-space laid between its line and the next line with a fragment, as
+is shown: fragments' painted text, neither `visibility: hidden` text
+nor a hidden item's marker; after a `Wrap` end the white
+space laid between its line and the next line with a fragment, read
+from the source between them, or across two text nodes from the
+first's tail when that is white space, else from the next's head, as
 laid: one space where spaces collapse, the preserved run in pre-wrap,
 none at an edge, and past a cut only what td-layout dropped as space,
 never the tree's bytes between, which can hold hidden text or runs
@@ -1430,13 +1287,18 @@ that gap is copied once, however many `Wrap` ends lie in it. After a
 `Split` nothing is copied; after each paragraph one newline, whether a
 newline, a `<br>` or its block ended it; and for a replaced element its
 `alt` text when the selection holds it whole; at
-most `MAX_COPY`, measured before it is gathered, as now. A list item's
+most `MAX_COPY`, measured before it is gathered. A list item's
 marker, td-layout's `MarkerFragment` (generated text naming its item and
 no byte, td-layout/DESIGN.md §5, "List markers"), is copied as its
 `text()` shows it at the start of the paragraph its line begins, when
 the selection holds that start, an outer item's before an inner one's
 where they share a line; one whose item laid no line, an empty item, is
-copied as a paragraph of its own where its item begins. A marker is no
+copied as a paragraph of its own, its trailing space dropped, when the
+selection spans its item in tree order (it has no place of its own),
+before the line after it; no place lies before the empty items ahead of
+the page's first place, or after those past its last, so only a
+selection of the whole page, from its first place to its last, holds
+them. A marker is no
 place: a point on an outside marker, left of its line, falls on the
 line's start, and one on an inside marker, before the line's first
 fragment, on the same start, and the keys step over it. A table is
@@ -1445,29 +1307,33 @@ a space, whatever ended them, `<br>` included, and cells by a tab, and
 each row ends in a newline, so a copied table pastes into a spreadsheet
 a row a line. An empty cell lays no line, so td-web takes a row's cells
 from the box tree (its `table_role` children) rather than from lines,
-and an empty one still gives its tab. Cells come in tree order,
-as td-layout lays them (row by row, each row's cells left to right,
+and an empty one between two laid cells still gives its tab; empty
+cells before a row's first laid cell give none. Cells come in tree
+order, as td-layout lays them (row by row, each row's cells left to right,
 td-layout/DESIGN.md §5, "Tables"), and td-web tells a cell's and a row's
 boundaries from each line's `Line::block` and its box parents, by
 `StyledDocument::table_role`. A row or cell CSS left anonymous has no
 box (td-layout/DESIGN.md §5, "Anonymous objects"): an anonymous cell's
 lines name the box holding its run, so a CSS table's anonymous ones give
-no cell boundary and their content is copied as the paragraphs it lays;
+no cell boundary and their content is copied as the paragraphs it lays,
+and cells in a row CSS left anonymous are one row by the box holding
+them, so the cells of two CSS tables are two rows;
 a selection that starts or ends inside a table and holds more than one
 cell copies the cells it holds, partly held ones from or to its place,
 with the same separators, and one within a single cell copies it as
 ordinary paragraphs, joined by newlines.
-What §5 copies and td-web no longer does: a quote's marks, which nothing
-draws now; and a table's row, which §5's renderer copies a cell a line,
-the rule this one replaces at the cutover.
 
 **Links** are `a` and `area` elements with an `href` (td-dom's rule),
 joined against the page's base: the first `<base href>` in tree order,
 joined against the page's URL, else that URL. A fragment's or replaced
 box's link is its nearest such ancestor, and a point's link that of
 the fragment or replaced box under it; an image with no link opens its
-`src` on a click, as §5's image text does. `Tab` goes through the links
-in tree order that laid a fragment or a replaced box, a link's place
+`src` on a click, and the status row names it while the pointer is
+over it. `Tab` goes through the links
+in tree order that laid a fragment or a replaced box, from the
+focused link, else from the screen: `Tab` the first link on a line
+shown or after it and `Shift+Tab` the last on a line shown or before
+it, each going round the page; a link's place
 being its first. td-web draws the focused link itself (below,
 "Painting") and never tells the cascade, so `:focus` and `:hover` match
 nothing and neither the pointer nor the focus costs a cascade; a page
@@ -1482,9 +1348,10 @@ at most `MAX_TITLE` characters.
 overflow rectangle): `Up` and `Down` a body line (td-ui's prose line at
 the scale, 22 pixels at scale one), `PageUp`, `PageDown` and `Space`
 the pane less a line, `Home` and `End`, the wheel a line for each row
-it turns; and, when the page is wider than the pane, `Left`, `Right`
-and the wheel with `Shift` across it. Unwrapped lines are laid whole,
-within td-layout's bounds, and scrolled to: `MAX_PRE_CHARS` goes. A
+it turns; and, when the page is wider than the pane, `Left` and `Right`
+four cells across it, as the wheel does for each column td-ui reports
+it turning. Unwrapped lines are laid whole, within td-layout's
+bounds, and scrolled to. A
 line that does not wrap (`pre`, `nowrap`) past td-layout's
 `MAX_LINE_SCALARS` is cut there, the rest of it to its end not laid,
 td-layout counting the cut lines and placing the first (`Layout::cuts`,
@@ -1502,16 +1369,14 @@ otherwise the page opens at its fragment or its top.
 
 **The status row** keeps §8's order. Its place is `N of M lines`: the
 line of the layout the last line shown whole is, of the layout's lines
-at this width. Its notes are the cuts below, the sheets not applied
-and a paint cut short.
+at this width. Its notes are the cuts below, the sheets not applied,
+the page shown without its styles (`F9`) and a paint cut short.
 
 ### Cuts
 
 td-html and td-layout return no partial result, so a page is laid
-whole or not at all. At the cutover this ladder replaces §5's cut
-page, the lines rendered before td-html's budget ran out followed by
-the status row's note that the rest is too large: no page is shown as
-a prefix. A refusal, by a crate's limit or by the page's budget, steps
+whole or not at all: no page is shown as a prefix of itself. A
+refusal, by a crate's limit or by the page's budget, steps
 down, each rung on the render thread:
 
 1. The page with its own sheets. A sheet past a per-sheet bound of
@@ -1535,12 +1400,14 @@ down, each rung on the render thread:
 4. On a refusal of that, a notice painted from static text, as a
    picture's resource failure is (§5).
 
-Markup past `MAX_MARKUP` is cut before it is parsed, as now, and the
-status row says how much was shown. A relayout refused once a page is
+Markup past `MAX_MARKUP` is cut before it is parsed, and the status
+row says how much was shown. A relayout refused once a page is
 shown, at a new width, scale or face, keeps the old layout, painted at
 its own width, and the status row says the page could not be laid out
 again; one whose old layout was let go first has none to keep, and the
-page steps down from rung 2.
+page steps down from its rung: from its own sheets to rung 2, from
+rung 2 to rung 3, and from a text page, rung 3's among them, or
+td-web's own to rung 4's notice.
 
 A **text page** takes the same pipeline: its text, its controls but
 the tab dropped, follows `<!doctype html><plaintext>`, which td-html's
@@ -1558,9 +1425,9 @@ styles the text whole within `MAX_TEXT`, counts it, and if the count
 passes, builds the page again from its text up to the cut, which falls
 within the source line that passes, where its first laid line past the
 count would start, or, when that line's first laid line passes, at the
-end of the line before. The status row's note says, as `MAX_LINES`'s
-does now, how many of its lines are shown, and that the last is shown
-in part when it is. The cut is an offset in the page's text node, and
+end of the line before. The status row's note says how many of its
+source lines are shown, and that the last is shown in part when it is.
+The cut is an offset in the page's text node, and
 td-web's text, its newlines made LF and its controls but the tab
 dropped as td-html would have them, is that node's byte for byte; it
 meets `text::fit`'s precondition, no control scalar a line could not
@@ -1586,36 +1453,48 @@ monospace faces (td-layout §6), the count takes 44 to 83 ms for a full
 to 73 for a 4 MiB page of 46-byte lines and 57 to 72 for a licence
 banner and a 4 MiB minified line, half to two thirds of laying what it
 keeps. Rung 3's text takes the same bounds, its controls but the tab
-dropped as a text page's are. td-web's own pages,
-an error, the start page and the note for a type it does not show, are
-markup it writes with their text escaped; want of memory for one
-paints the static notice.
+dropped as a text page's are. td-web's own pages, an error and the
+note for a type it does not show, are markup it writes with their text
+escaped, laid on the thread that makes them, a fetch thread or the
+window's, being a few lines; want of memory for one paints the static
+notice.
 
 ### Painting
 
 The window thread paints from the page and its layout. td-ui gives the
 raster: opaque fills, prose glyphs in Sans, Serif and Mono at a style
 and a size, fitted pictures (`Image`), a clip on every draw, and the
-theme's map. td-web decides what is drawn, in this order:
+theme's map. td-web decides what is drawn: every fill first, in this
+order, then every glyph.
 
-1. The canvas: the root's background colour, else the body's (CSS 2.2
-   §14.2), else `PAPER`, over the whole pane.
+1. The canvas: the root element's background colour, else that of the
+   HTML body element, the root's first `body` or `frameset` child (CSS
+   2.2 §14.2), else `PAPER`, over the whole pane.
 2. Each box in tree order: its background colour over its border box,
    then each border side as a fill of its width, every style but `none`
    and `hidden` drawn solid.
 3. Each line's content: the backgrounds of a fragment's inline
-   ancestors behind its extent; the glyphs in the fragment's colour,
-   face and size, at most `MAX_STACKED` at one pen as now; the
-   underlines, overlines and line-throughs it takes from itself and its
-   ancestors, as CSS propagates them, as fills across the fragment, a
-   pixel thick at scale one; a replaced element's picture fitted to its
-   box, else a frame in `BORDER` holding its `alt` text, clipped to it;
-   and the list markers on the line, their text in their item's colour,
-   face and size at their baseline, those without a line with their
-   item's box.
-4. Over the page, as §8 paints them by the glyphs' extents: find's
-   matches on `INACTIVE_SELECTION`, the selection and the focused link
-   on `SELECTED` in paper ink.
+   ancestors behind its extent, as one fill, since all lie over that
+   extent: the innermost opaque one with the translucent ones inside it
+   blended over it, however deep; the grounds of what is marked, by the
+   glyphs' extents, find's matches on `INACTIVE_SELECTION` and the
+   selection and the link under the pointer, else the focused link, on
+   `SELECTED`; the underlines, overlines and line-throughs it takes
+   from itself and its ancestors, as CSS propagates them, as fills
+   across the fragment, a pixel thick at scale one; and a replaced
+   element's picture fitted to its box, else a frame in `BORDER`
+   (`SELECTED` when its link is marked) holding its `alt` text,
+   clipped to it.
+4. The glyphs: each fragment's in its colour, face and size, marked
+   ones in the theme's pairs, `PAPER` on `SELECTED` and `INK` on
+   `INACTIVE_SELECTION`, which no page colour moves, so a mark is as
+   legible on a dark page as on paper; at most `MAX_STACKED` at one pen
+   in a line, across the fragments td-layout splits a run into;
+   an `alt` text's, its first `MAX_ALT_SCALARS` scalars; and the list
+   markers', their text in their item's colour, face and size at their
+   baseline, those without a line with their item's box. They are drawn
+   ordered by family, then size, then the order they came in, so a
+   later box's background never covers an earlier box's glyphs.
 
 `visibility: hidden` paints nothing of its box, and a hidden item's
 marker, drawn in its item's style, is not painted. `opacity` is not
@@ -1627,25 +1506,118 @@ glyph's ink is blended so over the ground it is drawn on, and a colour
 whose alpha is zero draws nothing. Every draw is clipped to the pane
 and the damage; a box whose `overflow` is `hidden` or `clip` clips its
 descendants to its padding box, and `auto` and `scroll` draw as
-`visible`: there is no scroll container
-inside a page. A paint visits only the boxes and lines meeting the
-damage, through an index by height made with each layout and charged
-with it; td-web derives that index and the boxes' tree order from
-td-layout's postorder geometry. A line's glyphs are drawn up to one em
-of its largest size past the pane, td-ui's `prose::overhang` at that
-size (increment 6). Ink also passes a line's box vertically, by td-ui's
-`Metrics::reach_at` at its largest size above and below, so the index
-by height widens each line's box by that reach before culling. A
-line of several sizes puts each piece's glyphs on its baseline with
-`Metrics::top_at`; td-ui's `draw` alone top-aligns them. td-ui
-remakes a page of another size whenever more than `prose::PAGES`
+`visible`: there is no scroll container inside a page. A paint visits
+only the boxes, lines and markers meeting the damage, through an index
+by height made with each layout and charged with it: each run of 64
+entries keeps the span its ink covers, and of a run meeting the damage
+each entry is looked at again, a line by its box widened by the
+greatest reach of its run (below), and one that does not meet it is
+passed by. td-web derives that index and the boxes' tree order from
+td-layout's postorder geometry. A
+line's glyphs are drawn up to one em of its largest size past its clip
+(the pane, or the box that clips it), td-ui's `prose::overhang` at that
+size (increment 6). A line of several sizes puts each piece's glyphs
+on its baseline with `Metrics::top_at`; td-ui's `draw` alone
+top-aligns them. Ink so passes a line's box vertically: each glyph is
+drawn down td-ui's line box at its size from that top, which a tight
+or overlapping `line-height` makes taller than td-layout's, and its
+ink passes that by `Metrics::reach_at` at the size, so the index by
+height takes for each line, and each list marker, the span of its box
+and its glyphs' ink so placed, a device pixel more each way for the
+pen's rounding, and culls by it. A marker is drawn on its own
+baseline, td-layout's absolute `MarkerFragment::baseline`.
+
+A paint is bounded three times on the window thread. It takes at most
+`MAX_PAINT` (262,144) fills, glyphs and visits, each box, line and
+marker meeting the damage counting one, so that ones laid on one
+another end it though they draw nothing; it charges at most `PANES`
+(8) times the pane's area in pixels: a fill what it covers within its
+clip, a glyph its em square within its clip; and it takes at most
+`MAX_PAINT_WORK` (1,048,576) steps of other work: each entry of the
+index passed by, each fragment and replaced box looked at, each scalar
+replayed or measured, a tabbed fragment's bytes, which td-layout scans
+whole before replaying it, and each ancestor stepped through for a
+ground. Past any bound it stops, walks no further box, line or
+marker, and the status row says the page was painted in part.
+`MAX_PAINT` is four times the glyphs a 3840x2160 pane of 8 px cells
+shows, about 62,600, so a pane of text, its lines' visits and its
+fills are painted whole. `MAX_PAINT_WORK` is four steps a draw:
+td-layout lays a run of more than `MAX_FRAGMENT_SCALARS` (1,024)
+scalars as several fragments (td-layout/DESIGN.md §3), so a line
+passes by their x those wholly before its clip and replays at most
+1,024 scalars to find it, however far it is scrolled; a pane of text
+meets `MAX_PAINT` first, and what meets this bound is lines laid on one
+another, each replaying to its clip, at about 20 ns a step, 20 ms. The
+grounds a paint blends over, the nearest
+opaque background under a box, a line's block or a marker's item, and
+the inline backgrounds behind a fragment, are kept down the path from
+the root to the last asked for, so a paint, asking in tree order,
+steps through each ancestor once rather than once an item, and a box
+walks to its ground only for a translucent colour.
+
+Eight panes is room for what a page shows: a pane of text charges
+about two (ems overlap at their advances), the canvas and each nested
+background one, find's and the selection's grounds one; the corpus
+charges 1.0 to 3.2. It holds a paint to td-ui's fill rate over eight
+panes, tens of milliseconds even at 3840x2160, where without it 2,000
+boxes laid over one another filled 2,000 panes, 7.4 s a paint. A fill
+a later fill wholly covers is not drawn: the last 16 fills are held
+back, the oldest drawn when a seventeenth comes, and each new fill
+drops, and gives back the charge of, those it covers, so boxes stacked
+at one place, borders included, cost one pane. A fill refused by the
+bound drops nothing.
+
+td-ui remakes a page of another size whenever more than `prose::PAGES`
 family and size pairs interleave, at up to 47 µs a glyph at the largest
-sizes, so a paint orders its glyphs by family and size, or `MAX_PAINT`
-is set with that worst case in mind. A paint draws at most `MAX_PAINT`
-(estimate) fills and glyphs on the window thread; the rest is skipped
-and the status row
-says so. Nothing animates: a paint is a function of the page, its
-layout, the view and the damage, and no timer asks for one.
+sizes, which ordering the glyphs avoids. Their order's scratch,
+`MAX_UNORDERED` (65,536) entries of 72 bytes, 4.5 MiB, is taken from
+the root at the first paint, grown by doubling as a paint fills it, to
+`MAX_PAINT` entries, 18 MiB, and kept for every later paint; where it
+is refused or not grown, the glyphs past it are drawn unordered, as
+they come, the fills held back drawn before each, and a paint draws at
+most `MAX_UNORDERED` so and is cut past them. Pixels do not bound that:
+a glyph whose em square misses its clip, its pen within an em of it,
+charges none, and td-ui makes a glyph's page before it clips the
+glyph, so each of those could remake a page, about 65,500 × 47 µs, 3.1
+s, at worst.
+
+On the cell (above, "Relayout") a paint of a whole 1920x1200 pane of a
+corpus page takes 66 to 157 µs and at most 1,651 draws. Over the pinned
+faces, the whole window (its rows included) is drawn into its buffer,
+the pinned faces rasterised by td-ui's `Raster`, at 1920x1200 in 2.1 to
+5.7 ms once its glyphs are in the atlas and 2.8 to 9.2 ms at the first
+paint, for every corpus page and shape but many families and sizes on
+one page, 27.4 ms (38.1 ms first), whose sizes overrun td-ui's atlas
+pages so that glyphs are covered again every frame; at 3840x2160 8.0
+to 16.4 ms (8.6 to 25.7 ms first) and many families and sizes 35.4 ms
+(56.8 ms first). The hostile shapes the bounds meet take at most, first
+paint, at 1920x1200 and at 3840x2160 (scale 2), medians of three on a
+host under a load average of 15 (2026-11-16): 2,000 boxes laid over
+one another, each a pane, 4.3 and 30.0 ms (150,000 of them, cut at
+`MAX_PAINT`, 11.2 and 35.4 ms); boxes each a row lower than the last,
+or their top borders, cut by pixels, 12.0 and 58.6 ms; 500,000 lines
+of one glyph at `line-height: 0`, cut at `MAX_PAINT` by their visits
+and glyphs, 39.4 and 87.0 ms (35.8 and 69.6 ms once in the atlas);
+255,000 empty boxes in 100 nested boxes, 12.2 and 36.8 ms, or 150,000
+empty list items there, cut by their visits, 22.0 and 52.4 ms, where
+walking each one's ancestors for its ground took 93 and 113 ms; glyphs
+of 200 px on lines 4 px apart, cut by pixels at 1920x1200, 13.4 and
+37.2 ms; 20,000 fragments in 200 nested spans, 15.8 and 44.3 ms, where
+walking each one's spans took 76 and 102 ms; and 2,000 lines of 1,024 scalars laid
+on one another, scrolled to their ends, cut at `MAX_PAINT_WORK`, 30.8
+and 50.0 ms. A fragment is replayed only to its clip's right edge
+(td-layout's `replay_until`) and from the first fragment meeting its
+clip, so 30 lines of 60,000 scalars at 6 px take 6.2 and 28.9 ms
+unscrolled and 6.4 and 28.0 ms scrolled to their right ends, tabbed
+7.0 and 30.8 ms and 7.9 and 29.9 ms, none cut, where with each line one
+fragment the scrolled and tabbed ones were cut at the bound; 60 lines
+of 20,000 scalars scrolled to their ends 7.6 and 35.6 ms; and a
+`pre` of 464-column lines at 3840x2160 and scale one, 95 lines in the
+pane, 41.6 ms, and scrolled 64 lines down 45.2 ms, whole, where
+before the lines of a run above the pane spent `MAX_PAINT` first. The
+worst paint is so about 90 ms at 3840x2160 and 40 ms at 1920x1200.
+Nothing animates: a paint is a function of the page, its layout, the
+view and the damage, and no timer asks for one.
 
 ### Out, and the security posture
 
@@ -1678,9 +1650,19 @@ accepts cascades in about 3.5 s on the development host, and its
 costliest element, which bounds how late a cancel flag is seen, takes
 17 to 21 ms (td-layout/DESIGN.md §3 and §6). With its layout work ceiling
 (`MAX_LAYOUT_WORK`) it is sized so a page costs the render thread a few
-seconds at most, measured again at the cutover; a page past it steps
-down (above, "Cuts") rather than being endured, and the cancel flag ends
-superseded or stopped work between elements.
+seconds at most; a page past it steps down (above, "Cuts") rather than
+being endured, and the cancel flag ends superseded or stopped work
+between elements. On the cell (above, "Relayout"), 5,000 universal
+`:not()` rules over 5,000 paragraphs are refused by `MAX_CASCADE_WORK`
+and the page laid on rung 2, 1.58 s in all (1.9 to 2.5 s through the
+window over the faces). A `var()` of 30,000 tokens on every element of
+5,000 paragraphs is refused by `MAX_CASCADE_WORK` too, rung 2 in 1.2 to
+1.3 s; 1.5 MiB of custom properties in one sheet is left out by
+td-css's `MAX_INPUT_BYTES` (1 MiB a sheet) and the page made in 69 ms,
+and 0.9 MiB of them, inherited by every element, applied in 61 to 64
+ms. td-html's hostile shapes step
+down to text: one-letter paragraphs in 62 quotes by `MAX_NODES` in 212
+to 235 ms, list items in 62 by `MAX_WORK` in 269 to 282 ms.
 
 No new syscall: td-css, td-dom and td-layout are std-only computation
 in td-web's process, so its allowlist (§3) is derived as before and
@@ -1694,9 +1676,9 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
 
 ### Increments
 
-6. **This design**, documentation only. Each prerequisite below is a
-   landing of its own in its crate, with that crate's design and
-   validation, before the cutover:
+6. **This design**, documentation only. Landed, with each
+   prerequisite below a landing of its own in its crate, with that
+   crate's design and validation, before the cutover:
    - **td-ui** (available): prose at a size (td-ui/DESIGN.md,
      "Sizes"): a glyph's `prose::Size` (`GlyphStyle::with_size`,
      `Size::clamped`), 6 to 192 device pixels per em
@@ -1725,8 +1707,8 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      at a width through layout's own sizing and breaking, without laying
      it out, and the page cut where they would pass a cap
      (`text::fit`, td-layout/DESIGN.md §6, "Text pages"); a basic table
-     layout, so a page's tables line up as
-     §5's do rather than stacking as blocks: the automatic and fixed
+     layout, so a page's tables line up rather than stacking as
+     blocks: the automatic and fixed
      width algorithms, rows and cells with `colspan` and `rowspan`
      within HTML's bounds, refused past `MAX_TABLE_COLUMNS`, border
      spacing with collapsed borders approximated, cells' vertical
@@ -1779,58 +1761,51 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
      `list-style` shorthand; and `StyleSet::from_sheets`, media
      conditions for each sheet given to a set, and one compilation that
      leaves out each sheet a per-sheet bound refuses and names it
-     (td-css/DESIGN.md §3, §4 and §5). Nothing of td-css remains before the
-     cutover; whether a changed environment changes which rules apply is
-     §11's.
+     (td-css/DESIGN.md §3, §4 and §5). Whether a changed environment
+     changes which rules apply is §11's.
    - **td-alloc** (available): `Charge::shrink_to`, which returns the difference
      between a charged ceiling and the actual, so td-web need not
      return the whole charge and charge the actual anew.
-7. **The cutover**, one landing: the steps above behind `Document`,
-   which stays the boundary between the render and window threads,
-   with its page, picture and resource-failure bodies; the user-agent
-   sheet, `<style>` and `style`; the budgets, places, find, selection,
-   copying, links, scrolling, cuts and painting above, and `F9`; td-css,
-   td-dom and td-layout joining §2's closure. It deletes td-web's use of
-   td-html's rich renderer (`to_rich_within`, `HTML_LIMITS`), the page
-   of logical lines, `Rendered` and its wrap, places in logical lines,
-   the hang, `MAX_LINES`, `MAX_PRE_CHARS`, the cut-page notice, the
-   title scan and the old jail test; amends §3, §5 and §8 to this
-   section; and amends what says nothing consumes the new crates
-   (td-layout/DESIGN.md §1 and §7, td-css/DESIGN.md's opening,
-   td-html/DESIGN.md "Styling boundary", td-dom/DESIGN.md's opening),
-   the memory comment in `recipes/src/recipes/web.rs`, and
-   APPLICATIONS.md's list of crates whose change re-derives an
-   allowlist. A staged cutover would put two producers behind one
-   view, or a view over geometry its places cannot name, for as long
-   as the stages took, which AGENTS.md's principle 4 forbids; what can
-   land first without a second mechanism is the other crates' work in
-   increment 6, which is why it is theirs. td-mail and td-news keep
-   td-html's renderer, which this does not change. A text page is cut
-   by the lines it lays at the least width (above, "Cuts"), so a cut
-   text page fits two layouts at every width with its tabs.
-   Validation: tests
-   of each of the above in-process on the cell, §8's behaviours carried
-   over, each rung of the cuts by a lowered limit, a cancelled job, and
-   each step's charge refused and shrunk; td-web run under a headless
-   td-compositor with the pinned faces at 1920x1200 and 3840x2160 over
-   the eight corpus pages (td-dom/DESIGN.md's URLs; td-css's style
-   pool admits The Guardian's front page, td-layout/DESIGN.md §6), the
-   real pages §5 rests on (the WHATWG HTML and ECMAScript specifications cut to 2
-   MiB, SANE's list of backends, long Wikipedia articles), td-layout's
-   2 MiB shapes, td-html's hostile ones (one-letter paragraphs in 62
-   quotes, list items in 62, a 2 MiB word), hostile sheets for time and
-   memory (thousands of universal `:not()` rules, a `var()` of tens of
-   thousands of tokens on every element, megabytes of custom
-   properties) and many families and sizes on one page (the atlas
-   reset every frame), all captured to scratch, never committed; its
-   resident peak with a page shown and one made at their largest and
-   its cascade, relayout and paint times recorded here in place of §3's
-   figures, with the estimates measured: the sheets term, `WORKING`
-   for parsing and compiling, the cascade ceiling's time,
-   `MAX_PAINT`, and whether sizes rounded to device pixels move a
-   page's lines visibly against an unrounded layout; the allowlist
-   derived again and unchanged; and main's system boot still printing
-   `TD-WEB-RUNNING`.
+7. **The cutover**, one landing. Landed: the steps above behind
+   `Document`, which stays the boundary between the render and window
+   threads, with its page, picture and resource-failure bodies; the
+   user-agent sheet, `<style>` and `style`; the budgets, places, find,
+   selection, copying, links, scrolling, cuts and painting above, and
+   `F9`; td-css, td-dom and td-layout joining §2's closure. td-mail and
+   td-news keep td-html's renderer. A staged cutover would have put two
+   producers behind one view, or a view over geometry its places cannot
+   name, which AGENTS.md's principle 4 forbids; so the other crates'
+   work came first, in increment 6. Validation: tests of each of the
+   above in-process on the cell, §8's behaviours carried over, each
+   rung of the cuts by a lowered limit, a page's and a let-go
+   relayout's, and a relayout kept beside refused whole; a job
+   cancelled at each step, at td-layout's reads and between rungs; and
+   each step's charge refused, the last reservation of its own refused
+   in turn (`td_alloc::with_reservation_limit`) and every charge
+   returned, and shrunk once the step is done to what the page keeps;
+   the cell measurements above (in "Relayout", "Memory", "Painting" and
+   "Time"); the allowlist derived again and unchanged; and main's system boot still printing
+   `TD-WEB-RUNNING`. Measured on the host over the pinned faces
+   (`./install-fonts` into a scratch `XDG_DATA_HOME`), through the
+   whole window in-process (`app::tests::measure_window`, release
+   build, a process a page and output) at 1920x1200 and 3840x2160:
+   seven of the eight corpus pages (td-dom/DESIGN.md's URLs, captured
+   to scratch 2026-11-16, never committed; GitHub's not fetched),
+   td-layout's 2 MiB shapes, td-html's hostile ones (one-letter
+   paragraphs in 62 quotes, list items in 62, a 2 MiB word), hostile
+   sheets (5,000 universal `:not()` rules, a `var()` of 30,000 tokens
+   on every element, 1.5 and 0.9 MiB of custom properties) and many
+   families and sizes on one page; the make, relayout and paint times,
+   the owned storage and the resident peaks above ("Relayout",
+   "Memory", "Painting" and "Time", and §3). Not yet done, and still
+   this increment's though it has landed: td-web run
+   under a headless td-compositor at those outputs (td-test-compositor's
+   output is 800x600 and td-web has no native-compositor tests); the
+   WHATWG HTML and ECMAScript specifications cut to 2 MiB, SANE's list
+   of backends and long Wikipedia articles; the sheets term and
+   `WORKING` for parsing and compiling; and whether sizes rounded to
+   device pixels move a page's lines visibly against an unrounded
+   layout.
 8. **Stylesheets**: `<link rel=stylesheet>` and `@import` as
    "Subresources" says. Validation through the injected fetcher: order,
    media, import depth, the count and byte bounds, mixed content at a
@@ -1850,13 +1825,14 @@ No request carries a cookie until a jar is designed (§11).
 ### Open questions
 
 The estimates above (the sheets and pictures terms, `WORKING` for
-parsing and compiling, `MAX_PAINT`, `STYLE_WAIT`,
-`MAX_SHEET_FETCHES`, `MAX_PICTURES`, `PICTURE_SETTLE`) stand until the
-increments that introduce them measure them. So does the value of
-td-layout's cascade work ceiling, in match steps and substitution
-charges together: no figure is set here, only that it hold a page to a
-few seconds of the render thread on the development host, which the
-cutover measures with the hostile sheets above.
+parsing and compiling, `STYLE_WAIT`, `MAX_SHEET_FETCHES`,
+`MAX_PICTURES`, `PICTURE_SETTLE`) stand until the increments that
+introduce them measure them. So does the value of td-layout's cascade
+work ceiling, in match steps and substitution charges together: no
+figure is set here, only that it hold a page to a few seconds of the
+render thread on the development host, which the cell measurement
+above ("Time") holds for the `:not()` sheet and increment 7's pending
+runs measure for the rest.
 
 ## 11. Roadmap (not normative)
 

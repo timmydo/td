@@ -3716,7 +3716,7 @@ none, in a headless compositor through a fetch service.
 what the binaries can call changes: a change to the Rust toolchain or the Debian root's
 glibc, and more often an ordinary change to a program in those packages or a crate
 they link, such as td-mail, td-news, td-open, td-secret, td-web, td-ui, td-fs,
-td-kv, td-html, td-charset, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
+td-kv, td-html, td-css, td-dom, td-layout, td-charset, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
 operating-system facility is a question for this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
 `UnixListener`, td-ui's PTY and its `Connection::waker` datagram pair are all off
 these lists today. Deriving them again is

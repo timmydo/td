@@ -6,9 +6,9 @@ standalone library using std and td-alloc, with no external dependencies,
 no unsafe code and no
 production panics or unchecked indexing. The standalone
 [td-dom adapter](../td-dom/DESIGN.md) connects its Element boundary to
-td-html documents; no application consumes it yet. td-css itself has no
-dependency on td-html, td-web, td-news, td-mail or td-ui. A later td-web
-layout engine may consume its values.
+td-html documents. td-web consumes it (td-web/DESIGN.md §10): it
+compiles a page's sheets and td-layout cascades them. td-css itself has
+no dependency on td-html, td-web, td-news, td-mail or td-ui.
 
 ## 1. Scope and standards
 
@@ -713,10 +713,10 @@ exclude the charge that refused. td-layout sums them into its page-wide
 cascade ceiling (td-layout/DESIGN.md §6). `compute`
 uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
-td-web's styled pages (td-web/DESIGN.md §10) will compile through
-`from_sheets` once its cutover adds td-css to its dependencies, and will
-use an answer to whether a changed environment changes which of a set's
-rules apply (td-web/DESIGN.md §11), which td-css does not give yet.
+td-web's styled pages (td-web/DESIGN.md §10) compile through
+`from_sheets`, and would use an answer to whether a changed environment
+changes which of a set's rules apply (td-web/DESIGN.md §11), which
+td-css does not give yet.
 
 `cascade` exports `StyleSet`, `Sheet`, `Refused`, `Refusal`, `Origin`,
 `ComputeStats` and `HTML_UA_CSS`; these and

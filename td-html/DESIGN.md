@@ -242,13 +242,15 @@ and a budget of some 11 times its input limit cuts only hostile ones.
 
 ## Document tree
 
-The document API is a separate, bounded HTML parser for future layout.
-The resident renderer and streaming extractor keep their existing parsers:
-`to_text`, `to_rich` and both `_within` forms retain byte-identical output,
-including malformed markup, invalid UTF-8, nesting and budget cutoffs.
-Moving them onto the document tree is outside this contract. Building a
-new tree must not silently change mail, news, agent or browser rendering.
-The resident cost figures above apply to those APIs, not to this tree.
+The document API is a separate, bounded HTML parser for layout: td-web
+renders through its tree (td-web/DESIGN.md §10). The resident renderer
+and streaming extractor keep their existing parsers: `to_text`,
+`to_rich` and both `_within` forms retain byte-identical output,
+including malformed markup, invalid UTF-8, nesting and budget cutoffs,
+and td-mail and td-news keep rendering through them. Moving them onto
+the document tree is outside this contract. Building a new tree must
+not silently change mail, news or agent rendering. The resident cost
+figures above apply to those APIs, not to this tree.
 
 ### Parsing model
 
@@ -430,10 +432,10 @@ stable during a cascade; visited history is never exposed.
 
 An end-to-end test parses a document and computes parents before children,
 using td-css's HTML user-agent sheet, an author sheet, inline styles and
-inherited values. No existing application consumes this adapter yet.
-The future layout consumer chooses when to compute styles and retains
-only the computed values it needs; the adapter does not cache every
-property on every node.
+inherited values. td-web consumes this adapter through td-layout
+(td-web/DESIGN.md §10), which chooses when to compute styles and
+retains only the computed values it needs; the adapter does not cache
+every property on every node.
 
 ### Test contract and work order
 

@@ -5,7 +5,7 @@ use crate::{
     MAX_COORDINATE,
 };
 use std::mem::size_of;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
 use td_css::values::Length;
@@ -1056,6 +1056,8 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             let mut fragments: Fragments<TextFragment> = Fragments::with(());
             let mut replaced = Fragments::with(LineTag::new(self.block, line_end)?);
             let mut marker = None;
+            // Scalars in the last text fragment.
+            let mut run = 0usize;
             for p in pending {
                 if let Some(Atomic::Marker(kind, ordinal)) = p.atomic {
                     if counters.fragments >= counters.limits.fragments {
@@ -1102,9 +1104,11 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                         && f.display == DisplayText::Source
                         && p.display == DisplayText::Source
                         && f.range.end == p.range.start
+                        && run < crate::MAX_FRAGMENT_SCALARS
                 }) {
                     last.range.end = p.range.end;
                     last.width = (p.pen + p.advance) as f64 / 64.0 - last.x;
+                    run += 1;
                 } else {
                     if counters.fragments >= counters.limits.fragments {
                         return Err(Error::Limit("MAX_FRAGMENTS"));
@@ -1122,6 +1126,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                         self.memory,
                         counters,
                     )?;
+                    run = 1;
                 }
             }
             sink.line(
@@ -1159,6 +1164,22 @@ pub fn replay(
     fragment: &TextFragment,
     block: StyleId,
     mut each: impl FnMut(Replayed),
+) -> Result<(), Error> {
+    replay_until(styled, metrics, fragment, block, |replayed| {
+        each(replayed);
+        ControlFlow::Continue(())
+    })
+}
+/// `replay`, which stops when `each` breaks: Ok at once, the scalars it
+/// did not reach neither measured nor checked against the fragment's
+/// width. A painter stops at its clip's edge so; what it was told is
+/// what `replay` would have told it so far.
+pub fn replay_until(
+    styled: &StyledDocument<'_>,
+    metrics: &mut impl FontMetrics,
+    fragment: &TextFragment,
+    block: StyleId,
+    mut each: impl FnMut(Replayed) -> ControlFlow<()>,
 ) -> Result<(), Error> {
     let text = styled
         .document()
@@ -1223,12 +1244,16 @@ pub fn replay(
         };
         // Within the node's text, which `get` bounded above.
         let start = fragment.range.start + at;
-        each(Replayed {
+        if each(Replayed {
             range: start..start + scalar.len_utf8(),
             shown,
             pen,
             advance,
-        });
+        })
+        .is_break()
+        {
+            return Ok(());
+        }
         pen = add(pen, advance)?;
     }
     if pen != width {
@@ -1728,8 +1753,18 @@ mod tests {
             let result = wrap_text(&styled, &mut Metrics(0), &runs, 0, runs[0].style).unwrap();
             assert_eq!(result.lines.len(), 1);
             let laid = 2 * crate::MAX_LINE_SCALARS;
-            assert_eq!(result.lines[0].fragments.len(), 1);
-            assert_eq!(result.lines[0].fragments[0].range, 0..laid);
+            // Laid as fragments of at most MAX_FRAGMENT_SCALARS, each
+            // starting where the last ended.
+            let fragments = &result.lines[0].fragments;
+            let most = crate::MAX_FRAGMENT_SCALARS;
+            assert_eq!(fragments.len(), crate::MAX_LINE_SCALARS / most);
+            let mut end = (0, 0.0);
+            for f in fragments.iter() {
+                assert_eq!((f.range.start, f.x), end);
+                assert_eq!(f.range.len(), 2 * most);
+                end = (f.range.end, f.x + f.width);
+            }
+            assert_eq!(end.0, laid);
             assert_eq!(result.cuts.lines, usize::from(cut));
             assert_eq!(
                 result.cuts.first,
@@ -1986,6 +2021,42 @@ mod tests {
             1000,
         );
         assert_eq!(result.lines[0].fragments.len(), 3);
+    }
+    /// `replay_until` tells what `replay` does up to where it breaks, and
+    /// stops there: the scalars after it, which would not sum to the
+    /// width, are neither measured nor checked.
+    #[test]
+    fn replay_until_stops_where_it_is_told() {
+        let html = "<pre>abcd</pre>";
+        let dom = td_html::document::parse(html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(""), html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, &mut Metrics(64), &runs, 100, runs[0].style).unwrap();
+        let fragment = &result.lines[0].fragments[0];
+        let mut all = Vec::new();
+        replay(&styled, &mut Metrics(64), fragment, runs[0].style, |r| {
+            all.push((r.range, r.pen))
+        })
+        .unwrap();
+        let mut told = Vec::new();
+        replay_until(&styled, &mut Metrics(64), fragment, runs[0].style, |r| {
+            told.push((r.range, r.pen));
+            if told.len() == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(told, all[..2]);
+        // Metrics that would be refused at the end are not, stopped first.
+        assert!(
+            replay_until(&styled, &mut Metrics(32), fragment, runs[0].style, |_| {
+                ControlFlow::Break(())
+            })
+            .is_ok()
+        );
+        assert!(replay(&styled, &mut Metrics(32), fragment, runs[0].style, |_| {}).is_err());
     }
     #[test]
     fn replay_refuses_other_metrics_and_other_documents() {
@@ -2251,6 +2322,35 @@ mod tests {
                 ('c', 64.0, 8.0),
                 ('\t', 72.0, 56.0),
                 ('d', 128.0, 8.0)
+            ]
+        );
+    }
+    /// Source past MAX_FRAGMENT_SCALARS starts another fragment, which
+    /// replays as one would have: a tab that starts it meets its stop.
+    #[test]
+    fn a_long_run_is_laid_as_fragments_that_replay_as_one() {
+        let most = crate::MAX_FRAGMENT_SCALARS;
+        let html = format!("<pre>{}\tb\tc</pre>", "a".repeat(most));
+        let dom = td_html::document::parse(&html).unwrap();
+        let styled = StyledDocument::new(&dom, &sheets(""), html.len(), Limits::default()).unwrap();
+        let runs = runs(&styled);
+        let result = wrap_text(&styled, &mut Widths, &runs, 100_000, runs[0].style).unwrap();
+        let line = &result.lines[0];
+        assert_eq!(line.fragments.len(), 2);
+        assert_eq!(
+            line.fragments[1].range.start - line.fragments[0].range.start,
+            most
+        );
+        let scalars = replayed(&styled, &mut Widths, line, runs[0].style);
+        let at: Vec<_> = scalars.iter().skip(most).map(|s| (s.1, s.2, s.3)).collect();
+        let pen = 8.0 * most as f64;
+        assert_eq!(
+            at,
+            [
+                ('\t', pen, 64.0),
+                ('b', pen + 64.0, 8.0),
+                ('\t', pen + 72.0, 56.0),
+                ('c', pen + 128.0, 8.0)
             ]
         );
     }

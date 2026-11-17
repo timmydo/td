@@ -280,8 +280,15 @@ const UI_STORAGE_SOURCES: &[&str] = &[
     "td-ui/src/prose/items.rs",
     "td-ui/src/prose/pages.rs",
     "td-ui/src/prose/wrap.rs",
-    "td-web/src/wrap.rs",
+    "td-web/src/fonts.rs",
+    "td-web/src/page.rs",
+    "td-web/src/paint.rs",
+    "td-web/src/pipeline.rs",
     "td-web/src/search.rs",
+    "td-web/src/sheets.rs",
+    "td-web/src/text.rs",
+    "td-web/src/tree.rs",
+    "td-web/src/view.rs",
     "td-ui/src/clipboard_text.rs",
 ];
 

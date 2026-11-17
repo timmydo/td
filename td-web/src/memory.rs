@@ -2,13 +2,13 @@
 use td_alloc::{Budget, BudgetError, Charge};
 
 pub(crate) const PAGES: usize = 320 << 20;
-// These are the legacy renderer's separate conservative working allowances,
-// not exact allocator/RSS measurements. See DESIGN.md §3.
-pub(crate) const HTML_WORK: usize = 256 << 20;
-pub(crate) const TEXT_WORK: usize = 64 << 20;
-pub(crate) const WRAP_WORK: usize = 24 << 20;
+/// A page's terms (DESIGN.md §10, "Memory"): its tree, styled document
+/// and layouts; its sheets; its inline pictures. They sum to `PAGES`.
+pub(crate) const PAGE: usize = td_layout::MAX_PAGE_BYTES;
+pub(crate) const SHEETS: usize = 48 << 20;
+pub(crate) const PICTURES: usize = 48 << 20;
+const _: () = assert!(PAGE + SHEETS + PICTURES == PAGES);
 pub(crate) const PICTURE_WORK: usize = 200 << 20;
-pub(crate) const SMALL_WORK: usize = 1 << 20;
 
 pub(crate) fn root() -> Result<Budget, BudgetError> {
     Budget::new(PAGES + 16 * Budget::metadata_bytes())
@@ -62,5 +62,37 @@ mod tests {
         assert_eq!(root.used(), base + 64);
         drop(resident);
         assert_eq!(root.used(), base);
+    }
+
+    /// DESIGN.md §10, "The jail": what td-alloc holds (the root, `PAGES`
+    /// and its control blocks) and the fixed terms beside it stay at least
+    /// 20 MB under the jail's `memory-high`.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_page_budgets_fit_the_jail() {
+        // The window at 3840x2160, §3's measured 144 MB rounded up, and the
+        // jail's memory-high: both copied by hand and reviewed.
+        const WINDOW: usize = 145_000_000;
+        const MEMORY_HIGH: usize = 640 << 20;
+        // Increment 8's subresource bodies: MAX_SUBRESOURCES (4) of
+        // MAX_SUBRESOURCE (4 MiB), held in reserve before they exist.
+        const SUBRESOURCES: usize = 4 * (4 << 20);
+        assert_eq!(PAGE + SHEETS + PICTURES, PAGES);
+        assert_eq!(PAGE, td_layout::MAX_PAGE_BYTES);
+        assert!(td_html::html5::MAX_TREE_BYTES < PAGE);
+        // A navigated picture's peak, its decoders' bulk and the table
+        // overhead, fits the root.
+        assert!(PICTURE_WORK >= td_ui::picture::MAX_PICTURE_PIXELS * 12);
+        assert!(PICTURE_WORK <= PAGES);
+        let root = root().unwrap();
+        assert_eq!(root.limit(), PAGES + 16 * Budget::metadata_bytes());
+        let bodies = crate::app::MAX_WORKERS * crate::fetch::MAX_DOCUMENT as usize;
+        let total = WINDOW
+            + td_ui::prose::ATLAS
+            + bodies
+            + SUBRESOURCES
+            + td_layout::WORKING_BYTES
+            + root.limit();
+        assert!(total + 20_000_000 <= MEMORY_HIGH, "{total}");
     }
 }

@@ -93,7 +93,10 @@ mod confinement {
     #[test]
     fn standalone_uses_only_owned_allocation_dependency() {
         let manifest = include_str!("../Cargo.toml");
-        assert!(manifest.contains(r#"td-alloc = { path = "../td-alloc" }"#));
+        // Spelled with escapes: the recipes' source-closure scanner
+        // (recipes/src/source_closure.rs) takes a path key followed by an
+        // unescaped quote in a source file for a file it names.
+        assert!(manifest.contains("td-alloc = { path = \"../td-alloc\" }"));
         assert!(!manifest.contains("[dev-dependencies]"));
         assert_eq!(
             include_str!("../Cargo.lock").matches("[[package]]").count(),

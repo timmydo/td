@@ -1,8 +1,10 @@
 # HTML documents as CSS subjects
 
 td-dom connects td-html's immutable document tree to td-css's selector
-boundary. It is a standalone library depending only on those two crates and td-alloc. No application consumes it yet. It fetches nothing, performs no
-layout or painting, and does not change the resident HTML renderer.
+boundary. It is a standalone library depending only on those two crates
+and td-alloc. td-web consumes it through td-layout (td-web/DESIGN.md
+§10). It fetches nothing, performs no layout or painting, and does not
+change the resident HTML renderer.
 td-html itself has no td-css dependency, so its existing users gain no CSS
 closure.
 

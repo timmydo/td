@@ -63,6 +63,9 @@ fn fits(width: usize, height: usize) -> bool {
 #[derive(Debug)]
 pub(crate) enum Error {
     Resources,
+    /// The page root refused the decoder's working charge: room another
+    /// page holds may free it.
+    Room,
     Input(Format),
     Size(Format, usize, usize),
     Read(Format, Cause),
@@ -105,7 +108,7 @@ impl std::fmt::Display for Cause {
 impl Error {
     pub(crate) fn resources(&self) -> bool {
         match self {
-            Self::Resources => true,
+            Self::Resources | Self::Room => true,
             Self::Read(_, c) | Self::Decode(_, c) => c.resources(),
             _ => false,
         }
@@ -114,7 +117,9 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Resources => f.write_str("There is not the memory to show this picture."),
+            Self::Resources | Self::Room => {
+                f.write_str("There is not the memory to show this picture.")
+            }
             Self::Input(format) => write!(f, "The {} is too large to read.", format.name()),
             Self::Size(format, w, h) => write!(
                 f,
@@ -144,8 +149,18 @@ pub(crate) fn decode_with_budget(
 ) -> Result<crate::memory::Resident<Picture>, Error> {
     let charge = memory
         .charge(crate::memory::PICTURE_WORK)
-        .map_err(|_| Error::Resources)?;
+        .map_err(|_| Error::Room)?;
     let (picture, capacity) = decoded(format, body)?;
+    resident(picture, charge, capacity)
+}
+
+/// A decoded picture kept at its capacity within `charge`: refused, it
+/// is out of resources, not room another page could give.
+fn resident(
+    picture: Picture,
+    charge: td_alloc::Charge,
+    capacity: usize,
+) -> Result<crate::memory::Resident<Picture>, Error> {
     crate::memory::Resident::new(picture, charge, capacity).map_err(|_| Error::Resources)
 }
 
@@ -236,6 +251,24 @@ pub(crate) mod tests {
     pub(crate) const WEBP: &[u8] = include_bytes!("../../td-webp/tests/fixtures/palette.webp");
 
     pub(crate) const GIF: &[u8] = b"GIF89a\x02\0\x01\0\x80\0\0\0\0\0\xff\0\0\x21\xf9\x04\x01\0\0\0\0\x2c\0\0\0\0\x02\0\x01\0\0\x02\x02\x44\x0a\0\x3b";
+
+    /// Only the root's refusal of the working charge is a want of room;
+    /// a picture that cannot then be kept is out of resources.
+    #[test]
+    fn a_picture_not_kept_within_its_charge_is_out_of_resources() {
+        let root = td_alloc::Budget::new(4096).unwrap();
+        let (picture, _) = decoded(Format::Gif, GIF).unwrap();
+        let charge = root.charge(16).unwrap();
+        let _full = root.charge(root.limit() - root.used()).unwrap();
+        assert!(matches!(
+            resident(picture, charge, 1024),
+            Err(Error::Resources)
+        ));
+        assert!(matches!(
+            decode_with_budget(Format::Gif, GIF, &root),
+            Err(Error::Room)
+        ));
+    }
 
     #[test]
     fn decoded_pixels_keep_credit_and_all_refusals_return_scratch() {

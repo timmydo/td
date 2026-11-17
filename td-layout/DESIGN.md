@@ -5,8 +5,9 @@
 td-layout lays out td-html's immutable document with td-css computed values.
 It is a library with path dependencies on td-alloc, td-html, td-css and
 td-dom, with no external dependencies. It does not fetch, decode images, paint, run scripts, handle input,
-or depend on td-ui. Nothing in td-web consumes it yet. The existing HTML
-text and rich renderers remain independent and byte-identical.
+or depend on td-ui. td-web consumes it (td-web/DESIGN.md §10). td-html's
+text and rich renderers, which td-mail and td-news keep, remain
+independent of it and byte-identical.
 
 The first formatting model is horizontal, left-to-right normal flow. Its
 references are CSS 2.2 [box generation and normal flow][flow], [used sizes
@@ -48,11 +49,10 @@ is private. It acquires no dependency on a DOM or layout.
 The target is approximately 300 MB for a page's DOM, retained styles and
 layout, including a working allowance, whatever its input within the
 input limit (2 MiB of markup by default, at most 4 MiB): MAX_PAGE_BYTES,
-not the input, bounds what is charged. This is the share used
-by td-html rendering and the kept page in td-web/DESIGN.md §3, within the
-640 MiB memory-high and 768 MiB memory-max jail. It is not an additional
-300 MB on top of the old rendered page. A future consumer must release or
-account for the old representation before admitting a replacement.
+not the input, bounds what is charged. It is td-web's page term
+(td-web/DESIGN.md §10, "Memory"), within its 640 MiB memory-high and
+768 MiB memory-max jail. A consumer must release or account for a
+page's old representation before admitting a replacement.
 
 MAX_PAGE_BYTES is 224 MiB of charged retained storage. Admission includes
 the document's conservative charged_bytes, style-pool allocations, box
@@ -201,11 +201,15 @@ document keeps no flag, as `limits()` shows: each layout names its own.
 Every TextFragment carries a DOM **text NodeId and UTF-8 byte range** into
 that node, its StyleId, position and extent. Offsets are into decoded DOM
 text, not source HTML bytes. A fragment cannot cross text nodes. Contiguous
-unaltered source may coalesce; a collapsed space or replacement scalar
-retains the original byte range and an explicit display transformation.
-A preserved tab is unaltered source: it coalesces with its neighbours,
-so a line's fragment count does not depend on its tabs (§4, "Tab
-stops"). Suppressed whitespace, and what a cut line does not lay (§4,
+unaltered source may coalesce, up to `MAX_FRAGMENT_SCALARS` (1,024)
+scalars a fragment, past which the run starts another fragment where
+the last ended: a painter then finds its clip by fragments' x and
+width, skipping those wholly before it, and replays at most that many
+scalars before the clip in a line, however long the line. A collapsed
+space or replacement scalar retains the original byte range and an
+explicit display transformation. A preserved tab is unaltered source:
+it coalesces with its neighbours, so a line's fragment count does not
+depend on its tabs (§4, "Tab stops"). Suppressed whitespace, and what a cut line does not lay (§4,
 "Long lines"), has no fragment. Generated markers, line breaks and
 replaced-element records are distinct kinds and never pretend to be DOM
 text: a marker is a `MarkerFragment` in `Layout::markers`, naming its
@@ -236,7 +240,8 @@ fragment's x and its advance, so a painter, hit-testing and selection
 place a point on a scalar, a tab included, as layout laid it (§4, "Tab
 stops"). Box geometry names
 the originating element and its style, including backgrounds and borders
-for a future painter; no display list or pixel buffer is allocated here.
+for td-web's painter (td-web/DESIGN.md §10, "Painting"); no display
+list or pixel buffer is allocated here.
 
 ## 4. Fonts and inline flow
 
@@ -247,15 +252,12 @@ caller-bounded metrics cache. Font
 selection uses the computed family, size, weight and style. A deterministic
 test provider makes layout tests independent of installed fonts.
 
-An adapter around td-ui::prose::Metrics maps family/style, calls advance,
-and multiplies line().height and line().baseline by 64. At scale one and
-16 px this is a direct adapter of a few lines. Other device scales divide
-the returned device units by scale. Since prose::Metrics currently measures
-only its fixed 16 CSS px face, an adapter for other font sizes must scale
-both advances and the line box by font_size / 16, or supply a face measured
-at that size. This mathematical adapter does not claim that td-ui's current
-fixed-size painter can draw arbitrary sizes. Painting that agrees with
-these metrics belongs to the later consumer workstream.
+td-web's adapter around td-ui::prose::Metrics (td-web/DESIGN.md §10,
+"Faces") maps a computed family, style and size to a prose family,
+style and device size, calls advance_at and line_at at that size, and
+divides the returned device units, line height and baseline multiplied
+by 64, by the scale. td-web paints at the same sizes with the same
+metrics, so what it draws agrees with what was laid out.
 
 After whitespace processing, breaking follows prose::wrap: a space is a
 break opportunity after that space; a word moves intact when it fits alone;
@@ -310,7 +312,8 @@ again from the new line's start for a tab in a word tail a break moves
 
 A preserved tab is shown as itself, `DisplayText::Source`, and coalesces
 with the source text around it in one fragment, so `name\tvalue\tthird`
-in one text node is one fragment whatever its tabs, and a copy of the
+in one text node is one fragment whatever its tabs (one a 1,024
+scalars), and a copy of the
 fragment's bytes keeps them. A fragment keeps no pen of its line, so
 `inline::replay`, given the style of the block that laid the line
 (`Line::block`'s, or the first box's where it names none; with another
@@ -325,7 +328,12 @@ within that, metrics that differ from the layout's are not detected for
 a fragment with a tab, whose first tab absorbs the difference. A tabbed
 fragment is checked before any scalar is reported, an untabbed one only
 at its end, after its scalars were: a caller that must not act on a
-refused fragment gathers them first.
+refused fragment gathers them first. `inline::replay_until` is the same
+replay with a callback that may break: it returns Ok at once, the
+scalars it did not reach neither measured nor checked against the
+width, and what it reported before is what `replay` reports. A painter
+stops so at its clip's right edge, which a line of tens of thousands of
+scalars otherwise replays whole for every paint.
 
 **Long lines.** `Limits::line_scalars` (`MAX_LINE_SCALARS`, clamped to
 at least 1) bounds the scalars, replaced elements and inside list
@@ -964,6 +972,7 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_LINE_SCALARS | 65,536 | pending single-line scratch; a line past it breaks or is cut (§4) |
 | MAX_LINES | 1,048,576 | counted lines, emitted or not |
 | MAX_FRAGMENTS | 1,048,576 | emitted text, replaced and marker fragments |
+| MAX_FRAGMENT_SCALARS | 1,024 | scalars one text fragment coalesces (§3) |
 | MAX_MARKER_BYTES | 17 | one list marker's text (§5, "List markers") |
 | MAX_TABLE_COLUMNS | 4,096 | one table's grid columns (§5, "Tables") |
 | MAX_COLSPAN, MAX_ROWSPAN | 1,000, 65,534 | HTML's clamps on a cell's spans |
@@ -980,22 +989,22 @@ because its decoded text cannot recover the original byte count.
 Resizing width reuses the DOM and shared styles when the caller's media
 environment is unchanged. Changed media queries require a new StyleSet
 and recascade. Exact block heights require an O(nodes + text scalars)
-measurement pass on every width change. This is **not** td-web's current
-viewport-only resize cost. In the release-mode 2 MiB fixtures below,
-a width-only resize from 1280 to 832 px took median **54–67 ms** with
-synthetic font metrics; individual runs ranged from **53 to 69 ms** on
-the measured host, under a load average of 1 to 2 (105–194 ms medians
-under a heavier load when first measured). These figures exclude HTML
-parsing, cascade and the release of the previous output. A full
-recascade is much more expensive for many-element pages. This is
-synchronous O(page) work, not a guarantee of an interactive frame time;
-the caller's flag (§3) can stop it, and scheduling belongs to the
-consumer.
+measurement pass on every width change, which td-web pays at every
+resize (td-web/DESIGN.md §10, "Relayout"). In the release-mode 2 MiB
+fixtures below, a width-only resize from 1280 to 832 px took median
+**54–67 ms** with synthetic font metrics; individual runs ranged from
+**53 to 69 ms** on the measured host, under a load average of 1 to 2
+(105–194 ms medians under a heavier load when first measured). These
+figures exclude HTML parsing, cascade and the release of the previous
+output. A full recascade is much more expensive for many-element pages.
+This is synchronous O(page) work, not a guarantee of an interactive
+frame time; the caller's flag (§3) can stop it, and scheduling belongs
+to the consumer.
 
 Line boxes can be emitted lazily for a half-open vertical window: measure
 the whole flow, retain block geometry, emit only intersecting logical line
 boxes. Empty windows emit none. This is line-box intersection, not a glyph
-ink query; a future painter must account for overhang in its overscan.
+ink query; a painter must account for overhang in its overscan.
 Every line is measured for overflow even when not retained. Bounds include
 signed image margins and fractional replaced geometry, rounded outward to
 1/64 px. A line's content advance can be negative with negative image
@@ -1234,7 +1243,9 @@ bytes a line at 199,999 lines is the 68 MiB step. A line holding more
 than one fragment adds its fragment array, in the same steps: 224 bytes
 for two fragments, 448 for three or four, 864 for five to eight. A
 preserved tab coalesces with the source text around it (§4, "Tab
-stops"), so a line of one text node is one fragment whatever its tabs,
+stops"), so a line of one text node is one fragment whatever its tabs
+(one a 1,024 scalars, so at most `MAX_TEXT` / 1,024, 4,096, more in a
+text page, under 1 MiB a layout),
 and a tabbed page costs what an untabbed one of its laid lines does,
 plus its bytes in the tree's and styled document's charges (about 1
 MiB a tab a line at 199,999 lines). Measured on 2026-11-15 with the
@@ -1647,8 +1658,9 @@ distinct maps.
 5. Real-page and 2 MiB cost validation, synthetic regressions and measured
    memory/latency table. Reconcile the 132 MiB baseline after interning.
 
-Flexbox, float exclusion, advanced text, painting and td-web
-integration need subsequent designs. Open for tables: a windowed layout
+Flexbox, float exclusion and advanced text need subsequent designs;
+painting and td-web's integration are td-web/DESIGN.md §10's. Open for
+tables: a windowed layout
 holds the lines above its window in the row being laid and in rows a
 rowspan holds open (§5, "Tables", "Windows"). A window past 524,288
 lines held in one row is refused `MAX_PAGE_BYTES`, as the lines vector
@@ -1656,12 +1668,11 @@ would double past the page budget: on a page that is one cell of a
 million lines, any window past 10,485,763 px, about 52% of it.
 Filtering a cell's lines at its row's end whatever rowspans remain
 open would bound that to the open spans' own lines; a row's own lines
-above the window cannot be dropped before the row's height is known. No existing
-consumer switches to this
-library as part of these increments. td-web's integration
-(td-web/DESIGN.md §10, increment 6) needs a style pool
-that admits The Guardian's front page, as td-css's does (§6,
-"Style-pool work on The Guardian"). Basic table layout, the automatic and fixed algorithms,
+above the window cannot be dropped before the row's height is known.
+td-web consumes this library (td-web/DESIGN.md §10, increment 7); its
+integration (increment 6) needed a style pool that admits The Guardian's
+front page, as td-css's does (§6, "Style-pool work on The Guardian").
+Basic table layout, the automatic and fixed algorithms,
 `colspan` and `rowspan` within HTML's bounds and MAX_TABLE_COLUMNS,
 separated borders with collapse approximated, vertical alignment and
 captions, is §5's "Tables". List markers as a fragment kind of their own, outside and

@@ -1,12 +1,17 @@
 //! Bounded render handoff. Four reusable request/result slots are admitted
 //! once at startup. Payloads own nested storage separately. Thread creation
 //! remains std/OS machinery; ordinary handoffs allocate no backing storage.
+//! Beside the slots, a lane of `LANE` items the window thread posts without
+//! waiting (a relayout, a page let go to be dropped here): the worker takes
+//! the lane's items before the slots' and answers none of them through it.
 
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use td_alloc::{Budget, BudgetError, BudgetShared};
 
 pub(crate) const QUEUED: usize = 4;
+/// Items the lane holds; a post past them is refused, never waited for.
+pub(crate) const LANE: usize = 4;
 
 enum Phase<I, O> {
     Free,
@@ -19,26 +24,43 @@ struct Slot<I, O> {
     abandoned: bool,
     waiting: bool,
 }
-struct State<I, O> {
+struct State<I, O, L> {
     slots: [Slot<I, O>; QUEUED],
     queue: [usize; QUEUED],
     head: usize,
     len: usize,
+    lane: [Option<L>; LANE],
+    lane_head: usize,
+    lane_len: usize,
     closed: bool,
     worker_waiting: bool,
     producers_waiting: usize,
     #[cfg(test)]
     active: bool,
 }
-struct Mailbox<I, O> {
-    state: Mutex<State<I, O>>,
+struct Mailbox<I, O, L> {
+    state: Mutex<State<I, O, L>>,
     work: Condvar,
     space: Condvar,
     results: [Condvar; QUEUED],
 }
 
-impl<I, O> Mailbox<I, O> {
-    fn space<'a>(&self, mut state: MutexGuard<'a, State<I, O>>) -> MutexGuard<'a, State<I, O>> {
+/// The lane's oldest item, if any.
+fn take_lane<I, O, L>(state: &mut State<I, O, L>) -> Option<L> {
+    if state.lane_len == 0 {
+        return None;
+    }
+    let item = state.lane.get_mut(state.lane_head).and_then(Option::take);
+    state.lane_head = (state.lane_head + 1) % LANE;
+    state.lane_len -= 1;
+    item
+}
+
+impl<I, O, L> Mailbox<I, O, L> {
+    fn space<'a>(
+        &self,
+        mut state: MutexGuard<'a, State<I, O, L>>,
+    ) -> MutexGuard<'a, State<I, O, L>> {
         state.producers_waiting += 1;
         state = self
             .space
@@ -80,11 +102,39 @@ impl<I, O> Mailbox<I, O> {
         }
     }
 
+    /// A lane item is done: wake whoever waits for the worker to idle.
+    fn lane_done(&self) {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            state.active = false;
+        }
+        let producers = state.producers_waiting != 0;
+        drop(state);
+        if producers {
+            self.space.notify_all();
+        }
+    }
+
+    /// Closed under the lock `post` checks, so no item enters the lane
+    /// once its items are being drained here.
     fn close(&self) {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.closed = true;
             state.len = 0;
+        }
+        // Lane items are dropped one at a time, outside the lock.
+        loop {
+            let item = {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                take_lane(&mut state)
+            };
+            if item.is_none() {
+                break;
+            }
+            drop(item);
         }
         self.work.notify_all();
         self.space.notify_all();
@@ -116,12 +166,12 @@ impl<I, O> Mailbox<I, O> {
 
 /// One result owner. Dropping it abandons only its own request/result;
 /// a queued/running slot cannot be reused before the worker releases it.
-pub(crate) struct Ticket<I, O> {
-    mailbox: BudgetShared<Mailbox<I, O>>,
+pub(crate) struct Ticket<I, O, L> {
+    mailbox: BudgetShared<Mailbox<I, O, L>>,
     at: usize,
     taken: bool,
 }
-impl<I, O> Ticket<I, O> {
+impl<I, O, L> Ticket<I, O, L> {
     pub(crate) fn wait(mut self) -> Option<O> {
         let mut state = self
             .mailbox
@@ -148,7 +198,7 @@ impl<I, O> Ticket<I, O> {
         }
     }
 }
-impl<I, O> Drop for Ticket<I, O> {
+impl<I, O, L> Drop for Ticket<I, O, L> {
     fn drop(&mut self) {
         if self.taken {
             return;
@@ -179,26 +229,26 @@ impl<I, O> Drop for Ticket<I, O> {
 
 // Even an unexpected unwind outside the rendering's catch completes its
 // active ticket; the outer exit guard cancels queued tickets too.
-struct Active<'a, I, O> {
-    mailbox: &'a Mailbox<I, O>,
+struct Active<'a, I, O, L> {
+    mailbox: &'a Mailbox<I, O, L>,
     at: usize,
     finished: bool,
 }
-impl<I, O> Active<'_, I, O> {
+impl<I, O, L> Active<'_, I, O, L> {
     fn finish(mut self, output: Option<O>) {
         self.finished = true;
         self.mailbox.finish(self.at, output);
     }
 }
-impl<I, O> Drop for Active<'_, I, O> {
+impl<I, O, L> Drop for Active<'_, I, O, L> {
     fn drop(&mut self) {
         if !self.finished {
             self.mailbox.finish(self.at, None);
         }
     }
 }
-struct Exit<I, O>(BudgetShared<Mailbox<I, O>>);
-impl<I, O> Drop for Exit<I, O> {
+struct Exit<I, O, L>(BudgetShared<Mailbox<I, O, L>>);
+impl<I, O, L> Drop for Exit<I, O, L> {
     fn drop(&mut self) {
         self.0.close();
     }
@@ -212,12 +262,17 @@ pub(crate) enum SubmitError<I> {
 
 /// One worker; drop closes its queue and joins its bounded active operation.
 /// Four slots include queued, running and completed-but-unclaimed results.
-pub(crate) struct Worker<I, O> {
-    mailbox: BudgetShared<Mailbox<I, O>>,
+pub(crate) struct Worker<I, O, L> {
+    mailbox: BudgetShared<Mailbox<I, O, L>>,
     thread: Option<JoinHandle<()>>,
 }
-impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
-    pub(crate) fn start(memory: &Budget, process: fn(I, &Budget) -> O) -> Result<Self, ()> {
+/// What the worker does with a request, and with a lane item.
+pub(crate) struct Process<I, O, L> {
+    pub request: fn(I, &Budget) -> O,
+    pub lane: fn(L, &Budget),
+}
+impl<I: Send + 'static, O: Send + 'static, L: Send + 'static> Worker<I, O, L> {
+    pub(crate) fn start(memory: &Budget, process: Process<I, O, L>) -> Result<Self, ()> {
         let mailbox = BudgetShared::new(
             memory,
             Mailbox {
@@ -230,6 +285,9 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
                     queue: [0; QUEUED],
                     head: 0,
                     len: 0,
+                    lane: std::array::from_fn(|_| None),
+                    lane_head: 0,
+                    lane_len: 0,
                     closed: false,
                     worker_waiting: false,
                     producers_waiting: 0,
@@ -247,9 +305,9 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
         let thread = std::thread::Builder::new()
             .name(name)
             .spawn(move || loop {
-                let (at, input, abandoned) = {
+                let (lane, slot) = {
                     let mut state = exit.0.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    while state.len == 0 && !state.closed {
+                    while state.len == 0 && state.lane_len == 0 && !state.closed {
                         state.worker_waiting = true;
                         state = exit
                             .0
@@ -261,20 +319,36 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
                     if state.closed {
                         return;
                     }
-                    let Some(&at) = state.queue.get(state.head) else {
-                        return;
-                    };
-                    state.head = (state.head + 1) % QUEUED;
-                    state.len -= 1;
                     #[cfg(test)]
                     {
                         state.active = true;
                     }
-                    let Some(slot) = state.slots.get_mut(at) else {
-                        return;
-                    };
-                    let input = std::mem::replace(&mut slot.phase, Phase::Running);
-                    (at, input, slot.abandoned)
+                    // The lane goes first: what it holds is the window's.
+                    if let Some(item) = take_lane(&mut state) {
+                        (Some(item), None)
+                    } else {
+                        let Some(&at) = state.queue.get(state.head) else {
+                            return;
+                        };
+                        state.head = (state.head + 1) % QUEUED;
+                        state.len -= 1;
+                        let Some(slot) = state.slots.get_mut(at) else {
+                            return;
+                        };
+                        let input = std::mem::replace(&mut slot.phase, Phase::Running);
+                        (None, Some((at, input, slot.abandoned)))
+                    }
+                };
+                if let Some(item) = lane {
+                    // A lane item's panic, as a request's, leaves the worker.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (process.lane)(item, exit.0.budget())
+                    }));
+                    exit.0.lane_done();
+                    continue;
+                }
+                let Some((at, input, abandoned)) = slot else {
+                    continue;
                 };
                 let active = Active {
                     mailbox: &exit.0,
@@ -284,7 +358,7 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
                 let output = match input {
                     Phase::Queued(input) if !abandoned => {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            process(input, exit.0.budget())
+                            (process.request)(input, exit.0.budget())
                         }))
                         .ok()
                     }
@@ -299,9 +373,43 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
         })
     }
 
+    /// Whether the worker has closed, its thread gone.
+    pub(crate) fn closed(&self) -> bool {
+        self.mailbox
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed
+    }
+
+    /// Hands `item` to the lane without waiting: refused, and returned,
+    /// when the lane is full or the worker has closed.
+    pub(crate) fn post(&self, item: L) -> Result<(), L> {
+        let mut state = self
+            .mailbox
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.closed || state.lane_len >= LANE {
+            return Err(item);
+        }
+        let tail = (state.lane_head + state.lane_len) % LANE;
+        let Some(slot) = state.lane.get_mut(tail) else {
+            return Err(item);
+        };
+        *slot = Some(item);
+        state.lane_len += 1;
+        let waiting = state.worker_waiting;
+        drop(state);
+        if waiting {
+            self.mailbox.work.notify_one();
+        }
+        Ok(())
+    }
+
     /// Wait for a free slot; closed/refcount refusal returns the untouched
     /// input. Replacing a dead worker can retry it without another copy.
-    pub(crate) fn submit(&self, input: I) -> Result<Ticket<I, O>, SubmitError<I>> {
+    pub(crate) fn submit(&self, input: I) -> Result<Ticket<I, O, L>, SubmitError<I>> {
         let mut state = self
             .mailbox
             .state
@@ -357,7 +465,7 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        while !state.closed && (state.active || state.len != 0) {
+        while !state.closed && (state.active || state.len != 0 || state.lane_len != 0) {
             state = self.mailbox.space(state);
         }
     }
@@ -369,7 +477,7 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
         }
     }
 }
-impl<I, O> Drop for Worker<I, O> {
+impl<I, O, L> Drop for Worker<I, O, L> {
     fn drop(&mut self) {
         self.mailbox.close();
         if let Some(thread) = self.thread.take() {
@@ -389,21 +497,74 @@ mod tests {
         Budget::new(1 << 20).unwrap()
     }
 
+    /// A worker with `request` and a lane that drops what it is posted.
+    fn start<I: Send + 'static, O: Send + 'static>(
+        memory: &Budget,
+        request: fn(I, &Budget) -> O,
+    ) -> Result<Worker<I, O, td_alloc::BudgetVec<u8>>, ()> {
+        Worker::start(
+            memory,
+            Process {
+                request,
+                lane: |item, _| drop(item),
+            },
+        )
+    }
+
+    /// Lane items are taken before queued requests, a post never waits,
+    /// and what the lane holds is dropped on the worker, or at its close.
+    #[test]
+    fn the_lane_goes_first_never_waits_and_drops_on_the_worker() {
+        let root = memory();
+        let worker = Worker::start(
+            &root,
+            Process {
+                request: held,
+                lane: |(id, sent): (u8, mpsc::Sender<(u8, std::thread::ThreadId)>), _| {
+                    sent.send((id, std::thread::current().id())).unwrap();
+                },
+            },
+        )
+        .unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let active = worker.submit((0, gate.clone())).unwrap();
+        gate.wait();
+        let queued = worker.submit((1, gate.clone())).unwrap();
+        let (send, seen) = mpsc::channel();
+        for id in 0..LANE as u8 {
+            assert!(worker.post((id, send.clone())).is_ok());
+        }
+        assert!(worker.post((9, send.clone())).is_err(), "full: refused");
+        gate.wait();
+        assert_eq!(active.wait(), Some(0));
+        // The lane drained before the queued request ran.
+        let order: Vec<u8> = (0..LANE).map(|_| seen.recv().unwrap().0).collect();
+        assert_eq!(order, [0, 1, 2, 3]);
+        assert_eq!(queued.wait(), Some(1));
+        drop(worker);
+        assert_eq!(root.used(), Budget::metadata_bytes());
+        // Closed: a post is refused and handed back.
+        let mut worker = start(&root, held).unwrap();
+        worker.stop();
+        let bytes = td_alloc::BudgetVec::filled(&root, 64, 1u8).unwrap();
+        assert!(worker.post(bytes).is_err());
+        drop(worker);
+        assert_eq!(root.used(), Budget::metadata_bytes());
+    }
+
     #[test]
     fn startup_refusals_return_credit_and_handoffs_reuse_admission() {
         let root = memory();
         let baseline = root.used();
         for allowance in 0..2 {
-            assert!(
-                td_alloc::with_reservation_limit(allowance, || Worker::start(
-                    &root,
-                    |x: u8, _: &Budget| x
-                ))
-                .is_err()
-            );
+            assert!(td_alloc::with_reservation_limit(allowance, || start(
+                &root,
+                |x: u8, _: &Budget| x
+            ))
+            .is_err());
             assert_eq!(root.used(), baseline);
         }
-        let worker = Worker::start(&root, |x: u8, _: &Budget| x).unwrap();
+        let worker = start(&root, |x: u8, _: &Budget| x).unwrap();
         let idle = root.used();
         let blocker = root.charge(root.limit() - root.used()).unwrap();
         for n in 0..100 {
@@ -422,7 +583,7 @@ mod tests {
     #[test]
     fn all_calls_use_one_thread_and_a_panic_does_not_replace_it() {
         let root = memory();
-        let worker = Worker::start(&root, |panic: bool, _: &Budget| {
+        let worker = start(&root, |panic: bool, _: &Budget| {
             assert!(!panic, "a rendering panics");
             std::thread::current().id()
         })
@@ -455,7 +616,7 @@ mod tests {
     #[test]
     fn all_slots_include_active_and_completed_results_and_apply_backpressure() {
         let root = memory();
-        let worker = Worker::start(&root, held).unwrap();
+        let worker = start(&root, held).unwrap();
         let gate = Arc::new(Barrier::new(2));
         let active = worker.submit((0, gate.clone())).unwrap();
         gate.wait();
@@ -490,7 +651,7 @@ mod tests {
     #[test]
     fn closure_wakes_submitters_and_cancels_only_queued_calls() {
         let root = memory();
-        let worker = Worker::start(&root, held).unwrap();
+        let worker = start(&root, held).unwrap();
         let gate = Arc::new(Barrier::new(2));
         let active = worker.submit((0, gate.clone())).unwrap();
         gate.wait();
@@ -520,7 +681,7 @@ mod tests {
             }
         }
         let root = memory();
-        let mut worker = Worker::start(&root, |(n, gate): (u8, Arc<Barrier>), _: &Budget| -> u8 {
+        let mut worker = start(&root, |(n, gate): (u8, Arc<Barrier>), _: &Budget| -> u8 {
             if n == 0 {
                 gate.wait();
                 gate.wait();
@@ -548,7 +709,7 @@ mod tests {
     #[test]
     fn abandoned_queued_running_and_completed_slots_are_reusable() {
         let root = memory();
-        let worker = Worker::start(&root, held).unwrap();
+        let worker = start(&root, held).unwrap();
         let gate = Arc::new(Barrier::new(2));
         for _ in 0..20 {
             let active = worker.submit((0, gate.clone())).unwrap();
@@ -569,8 +730,7 @@ mod tests {
     #[test]
     fn ticket_and_output_keep_their_respective_owners_after_worker_drop() {
         let root = memory();
-        let worker =
-            Worker::start(&root, |bytes: td_alloc::BudgetVec<u8>, _: &Budget| bytes).unwrap();
+        let worker = start(&root, |bytes: td_alloc::BudgetVec<u8>, _: &Budget| bytes).unwrap();
         let bytes = td_alloc::BudgetVec::filled(&root, 4096, 7).unwrap();
         let ticket = worker.submit(bytes).unwrap();
         worker.idle();

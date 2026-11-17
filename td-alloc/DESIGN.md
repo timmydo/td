@@ -76,23 +76,25 @@ production sources reject recognized unchecked allocations and standard
 heap collection names. Layout outputs retain their own charges while
 overlapping replacements are constructed. CSS tokens may outlive their
 stylesheet through computed-style references; that lifetime retains the
-original budget charge. td-web's displayed/incoming legacy pages, wrapping, decoded pictures,
-fitted copies and held save bodies retain shared admissions through their
-owners; its legacy page-production and picture-decoding allowances remain
-conservative external models. Prose measurement caches and browser wrapping
-scratch, line arrays and navigation caches own actual capacity, under the
-page root and a 24 MiB per-wrap child respectively. Cache admission failure
-falls back to uncached measurement; wrapping refusal preserves logical
-navigation state and paints a static notice. td-ui's prose pages of
-other sizes are a fixed array of at most `prose::PAGES` faces sharing one
-coverage scratch; each place's 1 MiB atlas page is allocated once, by
+original budget charge. td-web's displayed and incoming pages, decoded
+pictures, fitted copies and held save bodies retain shared admissions
+through their owners (td-web/DESIGN.md §3 and §10, "Memory"); its
+picture-decoding allowance remains a conservative external model. Prose
+measurement caches own actual capacity: the render thread's, which make
+and lay out a page, under that page's budget; the window's, which hit
+test and paint, under td-web's page root. Cache admission failure falls
+back to uncached measurement. td-ui's
+prose pages of other sizes are a fixed array of at most `prose::PAGES`
+faces sharing one coverage scratch; each place's 1 MiB atlas page is
+allocated once, by
 the atlas's inventoried infallible `vec!`, and reused by every face made
 in that place after, so a page is allocated at most `PAGES` times a
 scale, whatever is drawn. Their dedicated modules have
-strict source guards. Browser find scratch and both generations of match
-results share a 2 MiB child of the page budget. Scratch and alternate result
-buffers are reused; search and reveal must both succeed before new matches
-replace the old state. Browser selection copies and the UI clipboard's owned
+strict source guards. Each browser find takes a fresh 2 MiB child of the
+page budget for its scratch and its matches; the scratch is dropped when
+the search ends, and the old matches keep their own child until new ones
+replace them, so at most two such children live. Search and reveal must
+both succeed before new matches replace the old state. Browser selection copies and the UI clipboard's owned
 text payload retain byte and shared-control-block charges through delivery
 (short text fits inline in its containing value, without a heap allocation),
 including sends that outlive their source page. Construction refuses above

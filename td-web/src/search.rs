@@ -1,188 +1,35 @@
-//! Bounded, fallible search over a page's displayed characters. Results are
-//! staged separately so a refused search never replaces the current marks.
+//! Find (DESIGN.md §10, "Places, find, selection and links"): each
+//! paragraph's text as td-layout displays it, spaces collapsed, a tab
+//! taken as a space, a replaced scalar as U+FFFD, an image's `alt` text
+//! in its place and a wrap's white space put back as a copy puts it,
+//! hidden text left out, searched ignoring case with each character
+//! looked at once (Knuth, Morris and Pratt), never past a paragraph, at
+//! most `MAX_HITS` matches, all in a scratch budget of the page's.
+
+use std::ops::ControlFlow;
+
+use crate::page::Laid;
+use crate::text::{self, Event, Place};
 use td_alloc::{Budget, BudgetError, BudgetVec};
-use td_ui::prose::{self, Items, Metrics};
+use td_ui::prose;
 
-use crate::document::{Place, Rendered};
-use crate::view::Hit;
+pub const MAX_QUERY: usize = 256;
+pub const MAX_HITS: usize = 10_000;
+/// Find's scratch and matches, a child of the page's budget.
+pub const SEARCH_BYTES: usize = 2 << 20;
 
-/// The find entry's maximum number of Unicode scalar values.
-pub(crate) const MAX_QUERY: usize = 256;
-pub(crate) const MAX_HITS: usize = 10_000;
-/// Scratch, result capacity and growth overlap, including budget metadata.
-const SEARCH_BYTES: usize = 2 << 20;
-
-#[derive(Default)]
-pub(crate) struct Search(Option<Scratch>);
-struct Scratch {
-    parent: Budget,
-    memory: Budget,
-    needle: BudgetVec<char>,
-    borders: BudgetVec<usize>,
-    places: BudgetVec<Place>,
-    hits: Items<Hit>,
-    compiled: bool,
-}
-// Scratch is a cache, not part of a view's logical state.
-impl PartialEq for Search {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-impl Eq for Search {}
-impl std::fmt::Debug for Search {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Search")
-            .field(&self.0.as_ref().map(|s| s.memory.used()))
-            .finish()
-    }
-}
-impl Search {
-    pub(crate) fn prepare(
-        &mut self,
-        query: &str,
-        rendered: &Rendered,
-        metrics: &mut Metrics,
-    ) -> Result<Items<Hit>, BudgetError> {
-        if query.len() > MAX_QUERY * 4 {
-            return Err(BudgetError::Limit);
-        }
-        let count = query.chars().count();
-        if count > MAX_QUERY {
-            return Err(BudgetError::Limit);
-        }
-        if count == 0 || rendered.page.lines.is_empty() {
-            self.0 = None;
-            return Ok(Items::default());
-        }
-        let parent = rendered.page.budget().ok_or(BudgetError::Limit)?;
-        if !self.0.as_ref().is_some_and(|s| s.parent.ptr_eq(parent)) {
-            let memory = parent.child(SEARCH_BYTES)?;
-            self.0 = Some(Scratch {
-                parent: parent.try_clone()?,
-                compiled: false,
-                needle: BudgetVec::new(&memory)?,
-                borders: BudgetVec::new(&memory)?,
-                places: BudgetVec::new(&memory)?,
-                hits: Items::new(&memory)?,
-                memory,
-            });
-        }
-        let scratch = self.0.as_mut().ok_or(BudgetError::Limit)?;
-        let Scratch {
-            memory,
-            needle,
-            borders,
-            places,
-            hits,
-            compiled,
-            ..
-        } = scratch;
-        hits.clear();
-        if hits.budget().is_none() {
-            *hits = Items::new(memory)?;
-        }
-        if !*compiled
-            || !needle
-                .iter()
-                .copied()
-                .eq(query.chars().map(|c| fold(prose::shown(c))))
-        {
-            *compiled = false;
-            needle.clear();
-            borders.clear();
-            places.clear();
-            td_alloc::BudgetVec::try_reserve(needle, count)?;
-            td_alloc::BudgetVec::try_reserve(borders, count)?;
-            td_alloc::BudgetVec::try_reserve(places, count)?;
-            for c in query.chars() {
-                needle.try_push(fold(prose::shown(c)))?;
-                borders.try_push(0)?;
-                places.try_push(Place::default())?;
-            }
-            let mut k = 0;
-            for i in 1..count {
-                while k > 0 && needle.get(i) != needle.get(k) {
-                    k = borders.get(k - 1).copied().unwrap_or(0);
-                }
-                if needle.get(i) == needle.get(k) {
-                    k += 1;
-                }
-                if let Some(slot) = borders.get_mut(i) {
-                    *slot = k;
-                }
-            }
-            *compiled = true;
-        }
-        // Only the last `count` positions can begin a complete match. A ring
-        // avoids moving a suffix or allocating while characters are scanned.
-        for logical in 0..rendered.page.lines.len() {
-            let (mut matched, mut next) = (0, 0);
-            let mut failed = None;
-            rendered.searched(metrics, logical, |scalar, place| {
-                let seen = fold(prose::shown(scalar));
-                while matched > 0 && needle.get(matched) != Some(&seen) {
-                    matched = borders.get(matched - 1).copied().unwrap_or(0);
-                }
-                if needle.get(matched) == Some(&seen) {
-                    matched += 1;
-                }
-                if let Some(slot) = places.get_mut(next) {
-                    *slot = place;
-                }
-                next += 1;
-                if next == count {
-                    next = 0;
-                }
-                if matched < count {
-                    return true;
-                }
-                let hit = Hit {
-                    start: places.get(next).copied().unwrap_or(place),
-                    end: Place {
-                        at: place.at + scalar.len_utf8(),
-                        ..place
-                    },
-                };
-                let stored = (|| {
-                    if hits.len() == hits.capacity() {
-                        let capacity = hits.capacity().saturating_mul(2).clamp(4, MAX_HITS);
-                        Items::try_reserve_exact(hits, capacity - hits.len())?;
-                    }
-                    hits.try_push(hit)
-                })();
-                if let Err(error) = stored {
-                    failed = Some(error);
-                    return false;
-                }
-                matched = 0; // Matches never overlap.
-                hits.len() < MAX_HITS
-            });
-            if let Some(error) = failed {
-                return Err(error);
-            }
-            if hits.len() == MAX_HITS {
-                break;
-            }
-        }
-        Ok(std::mem::take(hits))
-    }
-
-    /// Keep one reusable, empty result buffer only when it belongs to this
-    /// search budget. A view reused on another page cannot charge that page's
-    /// search to the previous page's allowance.
-    pub(crate) fn recycle(&mut self, mut hits: Items<Hit>) {
-        if let Some(scratch) = &mut self.0 {
-            if hits.budget().is_some_and(|b| b.ptr_eq(&scratch.memory)) {
-                hits.clear();
-                scratch.hits = hits;
-            }
-        }
-    }
+/// A match, from the place its first scalar starts to where its last
+/// ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hit {
+    pub start: Place,
+    pub end: Place,
 }
 
-/// Preserve the existing single-scalar case-folding semantics.
+/// One scalar folded for matching: a tab as a space, another control as
+/// U+FFFD, then its lowercase when that is one scalar.
 fn fold(c: char) -> char {
+    let c = prose::shown(c);
     let mut lower = char::to_lowercase(c);
     match (lower.next(), lower.next()) {
         (Some(single), None) => single,
@@ -190,253 +37,166 @@ fn fold(c: char) -> char {
     }
 }
 
+/// The matches of `query` in `laid`, in tree order; none for an empty
+/// query. A refusal of the scratch budget leaves nothing behind.
+pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, BudgetError> {
+    let memory = page.child(SEARCH_BYTES.saturating_add(Budget::metadata_bytes()))?;
+    let mut hits = BudgetVec::new(&memory)?;
+    let count = query.chars().take(MAX_QUERY).count();
+    if count == 0 {
+        return Ok(hits);
+    }
+    let mut needle = td_alloc::BudgetVec::with_capacity(&memory, count)?;
+    for c in query.chars().take(MAX_QUERY) {
+        needle.try_push(fold(c))?;
+    }
+    // Knuth, Morris and Pratt's failure function.
+    let mut borders = BudgetVec::filled(&memory, count, 0usize)?;
+    let mut k = 0usize;
+    for i in 1..count {
+        let c = needle.get(i).copied();
+        while k > 0 && needle.get(k).copied() != c {
+            k = borders.get(k - 1).copied().unwrap_or(0);
+        }
+        if needle.get(k).copied() == c {
+            k += 1;
+        }
+        if let Some(slot) = borders.get_mut(i) {
+            *slot = k;
+        }
+    }
+    // Where each of the last `count` scalars started, by position mod count.
+    let mut starts = BudgetVec::filled(&memory, count, Place::default())?;
+    let mut matched = 0usize;
+    let mut seen = 0usize;
+    let mut failed = None;
+    // A scalar, or none where a paragraph ends, which no match crosses.
+    let mut step = |c: Option<char>, start: Place, end: Place| -> ControlFlow<()> {
+        let Some(c) = c.map(fold) else {
+            matched = 0;
+            return ControlFlow::Continue(());
+        };
+        if let Some(slot) = starts.get_mut(seen % count) {
+            *slot = start;
+        }
+        seen += 1;
+        while matched > 0 && needle.get(matched).copied() != Some(c) {
+            matched = borders.get(matched - 1).copied().unwrap_or(0);
+        }
+        if needle.get(matched).copied() == Some(c) {
+            matched += 1;
+        }
+        if matched == count {
+            let first = starts.get((seen - count) % count).copied().unwrap_or(start);
+            if hits.len() >= MAX_HITS {
+                return ControlFlow::Break(());
+            }
+            if let Err(error) = hits.try_push(Hit { start: first, end }) {
+                failed = Some(error);
+                return ControlFlow::Break(());
+            }
+            // Matches do not overlap.
+            matched = 0;
+        }
+        ControlFlow::Continue(())
+    };
+    let _ = text::walk(laid, None, 0, |event| match event {
+        Event::Scalar(c, s, e, _) => step(Some(c), s, e),
+        Event::Alt(alt, s, e) => {
+            for c in alt.chars() {
+                step(Some(c), s, e)?;
+            }
+            ControlFlow::Continue(())
+        }
+        Event::Gap(gap, s, e) => {
+            for c in gap.chars() {
+                step(Some(c), s, e)?;
+            }
+            ControlFlow::Continue(())
+        }
+        Event::Begin(_) => ControlFlow::Continue(()),
+        Event::End => step(None, Place::END, Place::END),
+    });
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(hits),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::document::{Document, Renderer};
-    use crate::view::{Selection, View};
-    use std::sync::{atomic::AtomicBool, Arc};
-    use td_alloc::{with_reservation_limit, Budget};
-    use td_ui::raster::{Scale, TextFamily};
-    use td_url::Url;
+    use crate::page::tests::laid;
 
-    fn matches(
-        query: &str,
-        rendered: &Rendered,
-        metrics: &mut Metrics,
-        _: usize,
-    ) -> Result<Items<Hit>, BudgetError> {
-        Search::default().prepare(query, rendered, metrics)
-    }
-    fn metrics() -> Metrics {
-        Metrics::new(None, Scale::new(1).unwrap())
-    }
-    fn document(text: &str) -> Document {
-        Document::from_reply(
-            Url::parse("https://search.invalid/").unwrap(),
-            200,
-            Some("text/html; charset=utf-8"),
-            text.as_bytes().to_vec(),
-        )
-    }
-    fn state(view: &View) -> (Place, Option<usize>, usize, Option<Selection>, Vec<Hit>) {
-        (
-            view.top,
-            view.focus,
-            view.at,
-            view.selection,
-            view.hits.to_vec(),
-        )
+    fn found(markup: &str, query: &str) -> Vec<String> {
+        let laid = laid(markup);
+        let page = Budget::new(64 << 20).unwrap();
+        let hits = find(&laid, query, &page).unwrap();
+        hits.iter()
+            .map(|hit| {
+                let mut out = String::new();
+                let _ = text::copy(&laid, hit.start, hit.end, &mut |t| {
+                    out.push_str(t);
+                    ControlFlow::Continue(())
+                });
+                out
+            })
+            .collect()
     }
 
     #[test]
-    fn bounded_search_agrees_with_a_naive_nonoverlapping_oracle() {
-        let mut seed = 9u64;
-        for _ in 0..80 {
-            let mut text = String::from("<p>");
-            for i in 0..300 {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                text.push(
-                    ['a', 'b', 'A', 'é', 'É', 'İ', '界', '\u{301}', ' '][(seed >> 32) as usize % 9],
-                );
-                if i % 7 == 0 {
-                    text.push_str("<b>x</b>");
-                }
-                if i % 61 == 0 {
-                    text.push_str("</p><p>");
-                }
-            }
-            text.push_str("</p><pre>a\tb aaab abab needle</pre>");
-            let doc = document(&text);
-            let rendered = doc.render(100, TextFamily::Sans).unwrap();
-            let mut search = Search::default();
-            let mut previous = Items::default();
-            for query in [
-                "a", "aa", "aab", "aba", "abab", "é", "İ", "界", "a b", "x", "needle",
-            ] {
-                let needle: Vec<_> = query.chars().map(|c| fold(prose::shown(c))).collect();
-                let mut expected = Vec::new();
-                for logical in 0..rendered.page.lines.len() {
-                    let mut chars = Vec::new();
-                    rendered.searched(&mut metrics(), logical, |c, p| {
-                        chars.push((c, p));
-                        true
-                    });
-                    let mut at = 0;
-                    while at + needle.len() <= chars.len() {
-                        let part = &chars[at..at + needle.len()];
-                        if part
-                            .iter()
-                            .map(|(c, _)| fold(prose::shown(*c)))
-                            .eq(needle.iter().copied())
-                        {
-                            let (c, end) = part.last().copied().unwrap();
-                            expected.push(Hit {
-                                start: part[0].1,
-                                end: Place {
-                                    at: end.at + c.len_utf8(),
-                                    ..end
-                                },
-                            });
-                            at += needle.len();
-                        } else {
-                            at += 1;
-                        }
-                    }
-                }
-                let hits = search.prepare(query, &rendered, &mut metrics()).unwrap();
-                assert_eq!(&*hits, expected, "{query}");
-                search.recycle(previous);
-                previous = hits;
-            }
-        }
+    fn matches_ignore_case_and_stay_within_a_paragraph() {
+        assert_eq!(found("<p>Aba ABA aba", "aba"), ["Aba", "ABA", "aba"]);
+        assert_eq!(found("<p>aaa", "aa"), ["aa"]);
+        assert!(found("<p>ab<p>cd", "bc").is_empty());
+        assert_eq!(found("<p>a <b>b</b>  c", "a b c"), ["a b c"]);
+        assert_eq!(
+            found("<p>see <img alt=Picture> here", "picture here"),
+            ["Picture here"]
+        );
+        assert!(found("<p>hidden <span style=display:none>gone</span>", "gone").is_empty());
+        assert!(found("<p>x", "").is_empty());
+    }
+
+    /// Text laid but not painted is not found, as text not laid is not.
+    #[test]
+    fn hidden_text_is_not_found() {
+        let markup = "<p>seen needle<p style=visibility:hidden>hidden needle\
+                      <p style=display:none>gone needle";
+        assert_eq!(found(markup, "needle"), ["needle"]);
+        assert!(found("<p>a <span style=visibility:hidden>b</span> c", "b").is_empty());
+        assert!(found("<p><img alt=picture style=visibility:hidden>", "picture").is_empty());
+    }
+
+    /// A tab is found as a space, as td-ui shows one, and a query's tab
+    /// as one too.
+    #[test]
+    fn a_tab_is_found_as_a_space() {
+        assert_eq!(found("<pre>a\tb c</pre>", "a b"), ["a\tb"]);
+        assert_eq!(found("<pre>a b\tc</pre>", "b\tc"), ["b\tc"]);
+        // A paragraph's end still stops a match.
+        assert!(found("<pre>a\nb</pre>", "a b").is_empty());
     }
 
     #[test]
-    fn every_search_allocation_refuses_cleanly_and_returns_credit() {
-        let doc = document(&format!("<p>{}</p>", "a ".repeat(MAX_HITS + 10)));
-        let rendered = doc.render(800, TextFamily::Sans).unwrap();
-        let memory = rendered.page.budget().unwrap();
-        let base = memory.used();
-        let mut passed = false;
-        for n in 0..64 {
-            let result = with_reservation_limit(n, || matches("a", &rendered, &mut metrics(), 0));
-            if let Ok(hits) = result {
-                assert_eq!(hits.len(), MAX_HITS);
-                assert_eq!(hits.capacity(), MAX_HITS);
-                assert!(memory.used() > base);
-                assert!(hits.budget().unwrap().used() <= SEARCH_BYTES);
-                drop(hits);
-                passed = true;
-            }
-            assert_eq!(memory.used(), base, "allowance {n}");
-            if passed {
-                break;
-            }
-        }
-        assert!(passed);
-        let hits = matches("a", &rendered, &mut metrics(), 0).unwrap();
-        let held = memory.used();
-        let other = matches("a", &rendered, &mut metrics(), hits.len()).unwrap();
-        assert!(memory.used() > held, "both generations remain charged");
-        drop(other);
-        assert_eq!(memory.used(), held);
+    fn a_refusal_leaves_nothing_charged() {
+        let laid = laid("<p>abc abc");
+        let page = Budget::new(64 << 20).unwrap();
+        let before = page.used();
+        assert!(td_alloc::with_reservation_limit(0, || find(&laid, "abc", &page)).is_err());
+        assert_eq!(page.used(), before);
+        let hits = find(&laid, "abc", &page).unwrap();
+        assert_eq!(hits.len(), 2);
         drop(hits);
-        assert_eq!(memory.used(), base);
-        assert!(matches(&"界".repeat(MAX_QUERY), &rendered, &mut metrics(), 0).is_ok());
-        assert_eq!(
-            matches(&"界".repeat(MAX_QUERY + 1), &rendered, &mut metrics(), 0),
-            Err(BudgetError::Limit)
-        );
-        assert!(
-            with_reservation_limit(0, || matches("", &rendered, &mut metrics(), MAX_HITS))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(page.used(), before);
     }
 
     #[test]
-    fn a_refused_find_preserves_marks_and_navigation_even_during_reveal() {
-        let doc = document(&format!(
-            "<p>alpha</p>{}<p>beta beta</p>",
-            "<p>spacer spacer</p>".repeat(30)
-        ));
-        let snapshot = |view: &View| state(view);
-        let mut expected = View::default();
-        let mut laid = doc.render(120, TextFamily::Sans).unwrap();
-        expected.find("alpha", &mut laid, &mut metrics(), 4);
-        expected.find("beta", &mut laid, &mut metrics(), 4);
-        let wanted = snapshot(&expected);
-        let mut passed = false;
-        let mut late = false;
-        for n in 0..1024 {
-            let mut rendered = doc.render(120, TextFamily::Sans).unwrap();
-            let mut view = View::default();
-            view.find("alpha", &mut rendered, &mut metrics(), 4);
-            let before = snapshot(&view);
-            with_reservation_limit(n, || view.find("beta", &mut rendered, &mut metrics(), 4));
-            if rendered.refused() {
-                assert_eq!(snapshot(&view), before, "allowance {n}");
-                late |= n > 5;
-                view.find("beta", &mut rendered, &mut metrics(), 4);
-                assert!(!rendered.refused());
-            } else {
-                passed = true;
-            }
-            assert_eq!(snapshot(&view), wanted, "allowance {n}");
-            if passed {
-                break;
-            }
-        }
-        assert!(passed && late);
-    }
-
-    #[test]
-    fn warmed_search_reuses_capacity_and_rebinds_on_a_different_page() {
-        let first = document("<p>alpha beta beta</p>");
-        let mut rendered = first.render(800, TextFamily::Sans).unwrap();
-        let mut view = View::default();
-        view.find("alpha", &mut rendered, &mut metrics(), 4);
-        view.find("beta", &mut rendered, &mut metrics(), 4);
-        let used = rendered.page.budget().unwrap().used();
-        with_reservation_limit(0, || {
-            view.find("alpha", &mut rendered, &mut metrics(), 4);
-            assert!(!rendered.refused());
-            view.find("beta", &mut rendered, &mut metrics(), 4);
-            assert!(!rendered.refused());
-        });
-        assert_eq!(rendered.page.budget().unwrap().used(), used);
-        let parent = rendered.page.budget().unwrap().try_clone().unwrap();
-        let second = document("<p>beta</p>");
-        let mut other = second.render(800, TextFamily::Sans).unwrap();
-        let before = state(&view);
-        with_reservation_limit(0, || view.find("beta", &mut other, &mut metrics(), 4));
-        assert!(other.refused());
-        assert_eq!(state(&view), before);
-        view.find("beta", &mut other, &mut metrics(), 4);
-        assert!(!other.refused());
-        assert_eq!(view.hits.len(), 1);
-        drop(first);
-        drop(rendered);
-        assert_eq!(
-            parent.used(),
-            Budget::metadata_bytes(),
-            "no buffer charged to the old page survives"
-        );
-        view.clear_marks();
-        assert!(view.hits.budget().is_none());
-    }
-
-    #[test]
-    fn root_pressure_and_surviving_result_owners_keep_their_charges() {
-        let root = crate::memory::root().unwrap();
-        let renderer = Renderer::with_budget(&root).unwrap();
-        let baseline = root.used();
-        let doc = renderer
-            .document(
-                Url::parse("https://search.invalid/").unwrap(),
-                200,
-                Some("text/plain"),
-                b"alpha beta".to_vec(),
-                &Arc::new(AtomicBool::new(false)),
-            )
-            .unwrap();
-        let rendered = doc.render(800, TextFamily::Sans).unwrap();
-        let blocker = root.charge(root.limit() - root.used()).unwrap();
-        assert_eq!(
-            matches("alpha", &rendered, &mut metrics(), 0),
-            Err(BudgetError::Limit)
-        );
-        drop(blocker);
-        let hits = matches("alpha", &rendered, &mut metrics(), 0).unwrap();
-        drop(rendered);
-        drop(doc);
-        assert_eq!(hits.len(), 1);
-        assert!(root.used() > baseline);
-        drop(hits);
-        assert_eq!(root.used(), baseline);
-        drop(renderer);
-        assert_eq!(root.used(), Budget::metadata_bytes());
+    fn at_most_max_hits() {
+        let markup = format!("<p>{}", "a ".repeat(MAX_HITS + 10));
+        let laid = laid(&markup);
+        let page = Budget::new(64 << 20).unwrap();
+        assert_eq!(find(&laid, "a", &page).unwrap().len(), MAX_HITS);
     }
 }
