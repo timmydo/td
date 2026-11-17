@@ -6258,48 +6258,131 @@ fn group_by_root(
 /// the module tree it finds from each target, and the files that compile only
 /// through build.rs-generated `include!`/`#[path]` modules (the recipes, the
 /// gate definitions) are outside it. `write` formats instead of checking.
+/// A check runs the roots beside each other, as many at once as
+/// `format_width` says. `--write` runs them one at a time: rustfmt also
+/// rewrites the `#[path]` modules a root reaches, several roots reach the
+/// same shared file (td-fs's temp_dir.rs among them), and its rewrite is a
+/// truncate and write another rustfmt could read half done.
 fn check_format(root: &Path, write: bool) -> Result<(), String> {
-    let groups = group_by_root(&tracked_rust_files(root)?, &format_roots(root)?)?;
-    let mut drifted = Vec::new();
-    for (dir, edition, files) in groups {
+    let mut groups = group_by_root(&tracked_rust_files(root)?, &format_roots(root)?)?;
+    for (_, _, files) in &mut groups {
         // A tracked file deleted from the working tree has nothing to check.
-        let files: Vec<String> = files
-            .into_iter()
-            .filter(|file| root.join(file).is_file())
-            .collect();
-        if files.is_empty() {
-            continue;
-        }
+        files.retain(|file| root.join(file).is_file());
+    }
+    groups.retain(|(_, _, files)| !files.is_empty());
+    let width = if write { 1 } else { format_width(groups.len()) };
+    rustfmt_roots(root, &groups, write, width)
+}
+
+/// rustfmt over each (root, edition, files) group, `width` at a time with
+/// the calling thread among them, each group's output printed whole and in
+/// group order. The error is the first failure to run rustfmt, in group
+/// order, or else names every root rustfmt reported, in that order.
+fn rustfmt_roots(
+    root: &Path,
+    groups: &[(String, String, Vec<String>)],
+    write: bool,
+    width: usize,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, PoisonError};
+    // Whose turn it is to print, the roots that drifted and the first
+    // failure to run rustfmt, all in group order.
+    struct Report<'a> {
+        turn: usize,
+        drifted: Vec<&'a str>,
+        failed: Option<std::io::Error>,
+    }
+    let next = AtomicUsize::new(0);
+    let report = Mutex::new(Report {
+        turn: 0,
+        drifted: Vec::new(),
+        failed: None,
+    });
+    let printed = Condvar::new();
+    // Groups are claimed in order, so the group whose turn it is has been
+    // claimed by a worker that is not waiting: no worker waits forever.
+    let work = || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        let Some((dir, edition, files)) = groups.get(i) else {
+            return;
+        };
         let mut rustfmt = Command::new("rustfmt");
         rustfmt.args(["--edition", edition.as_str()]);
         if !write {
             rustfmt.arg("--check");
         }
-        let status = rustfmt
-            .args(&files)
+        let got = rustfmt
+            .args(files)
             .current_dir(root)
-            .status()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "rustfmt is not on PATH, and the format check needs it (td's own Rust \
-                     toolchain does not ship it yet)"
-                        .to_string()
-                } else {
-                    format!("rustfmt: {e}")
-                }
-            })?;
-        if !status.success() {
-            drifted.push(dir);
+            .stdin(Stdio::null())
+            .output();
+        let mut held = report.lock().unwrap_or_else(PoisonError::into_inner);
+        while held.turn != i {
+            held = printed.wait(held).unwrap_or_else(PoisonError::into_inner);
         }
+        match got {
+            Ok(out) => {
+                let _ = std::io::stdout().write_all(&out.stdout);
+                let _ = std::io::stderr().write_all(&out.stderr);
+                if !out.status.success() {
+                    held.drifted.push(dir.as_str());
+                }
+            }
+            Err(e) => {
+                if held.failed.is_none() {
+                    held.failed = Some(e);
+                }
+            }
+        }
+        held.turn = i.saturating_add(1);
+        printed.notify_all();
+    };
+    std::thread::scope(|scope| {
+        // A thread the system refuses is one fewer worker; this one works
+        // the queue too, so the run finishes on however many it has.
+        for _ in 1..width {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
+    });
+    let report = report.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if let Some(e) = report.failed {
+        return Err(if e.kind() == std::io::ErrorKind::NotFound {
+            "rustfmt is not on PATH, and the format check needs it (td's own Rust \
+             toolchain does not ship it yet)"
+                .to_string()
+        } else {
+            format!("rustfmt: {e}")
+        });
     }
-    match (drifted.is_empty(), write) {
+    match (report.drifted.is_empty(), write) {
         (true, _) => Ok(()),
-        (false, true) => Err(format!("rustfmt failed in {}", drifted.join(", "))),
+        (false, true) => Err(format!("rustfmt failed in {}", report.drifted.join(", "))),
         (false, false) => Err(format!(
             "not rustfmt-formatted: {}; `td-builder gate-crates fmt --all --write` formats them",
-            drifted.join(", ")
+            report.drifted.join(", ")
         )),
     }
+}
+
+/// How many rustfmt processes the format check runs at once: the caller's
+/// `CARGO_BUILD_JOBS` when it set one, as a hosted run's cargo groups do,
+/// the CPUs otherwise; at least one and never more than there are roots.
+fn format_width(roots: usize) -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let jobs = std::env::var("CARGO_BUILD_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|j| *j > 0)
+        .unwrap_or(cpus);
+    jobs.min(roots).max(1)
 }
 
 /// The cargo commands gate 325 runs IN the loop sandbox, derived from the same
@@ -9578,6 +9661,38 @@ mod tests {
         assert!(edition("[package]\nedition = \"next\"\n").is_err());
         assert!(edition("[dependencies]\nedition = \"2021\"\n").is_err());
         assert!(edition("[package]\nname = \"x\"\n").is_err());
+    }
+
+    /// The roots' rustfmt checks run side by side, and the verdict still
+    /// names exactly the drifted roots in root order, whatever order they
+    /// finish in, at any width; `write` fixes what `--check` refused.
+    #[test]
+    fn parallel_rustfmt_names_every_drifted_root_in_order() {
+        let probe = Command::new("rustfmt").arg("--version").output();
+        if !probe.is_ok_and(|out| out.status.success()) {
+            eprintln!("SKIP: no rustfmt on PATH (the in-sandbox gate)");
+            return;
+        }
+        let dir = crate::test_temp::TempDir::new("td-fmt-roots").unwrap();
+        let root = dir.join("fixture");
+        let tidy = "fn main() {}\n";
+        let messy = "fn  main( ){ }\n";
+        let mut groups = Vec::new();
+        for (name, body) in [("a", messy), ("b", tidy), ("c", messy), ("d", tidy)] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            let file = format!("{name}/m.rs");
+            std::fs::write(root.join(&file), body).unwrap();
+            groups.push((name.to_string(), "2021".to_string(), vec![file]));
+        }
+        for width in [0, 1, 2, 9] {
+            let err = rustfmt_roots(&root, &groups, false, width).unwrap_err();
+            assert!(err.starts_with("not rustfmt-formatted: a, c;"), "{err}");
+        }
+        rustfmt_roots(&root, &groups, true, 1).unwrap();
+        rustfmt_roots(&root, &groups, false, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("c/m.rs")).unwrap(), tidy);
+        assert_eq!(rustfmt_roots(&root, &[], false, 0), Ok(()));
+        assert!(format_width(0) >= 1 && format_width(3) <= 3);
     }
 
     #[test]
