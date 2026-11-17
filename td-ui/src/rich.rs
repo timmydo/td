@@ -62,6 +62,10 @@ impl Look {
     /// Monospace without code's ground, so text laid out by its columns
     /// (a table as written) stays aligned in prose.
     pub const MONO: Self = Self(32);
+    /// A quarter larger than the prose size, in prose faces: a heading.
+    pub const LARGE: Self = Self(64);
+    /// Half larger than the prose size, in prose faces: a title.
+    pub const LARGER: Self = Self(128);
 
     pub fn has(self, other: Self) -> bool {
         other.0 != 0 && self.0 & other.0 == other.0
@@ -450,6 +454,12 @@ impl Rich {
         let start = self.start_of(from);
         let end = self.end_of(to).max(start);
         self.source.get(start..end).unwrap_or("")
+    }
+
+    /// How shown byte `at` looks: what its owner gave the piece showing
+    /// it, for the owner's own checks.
+    pub fn look_at(&self, at: usize) -> Look {
+        self.look(at).0
     }
 
     /// How shown byte `at` looks, and its link.

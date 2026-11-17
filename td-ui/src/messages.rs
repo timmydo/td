@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use crate::chrome::{Button, BUTTON_MARGIN, ROW, SELECTED_ROW};
-use crate::prose::{self, Faces, Metrics, UNIT};
+use crate::prose::{self, Faces, Metrics, Size, UNIT};
 use crate::raster::{
     text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, TextFamily, ACCENT,
     BORDER, BUBBLE, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
@@ -560,20 +560,27 @@ enum Kind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Line {
     message: u32,
-    section: u16,
+    /// Within `MAX_SECTIONS`, so a byte, leaving one for `size`.
+    section: u8,
     kind: Kind,
     indent: u8,
+    /// A styled row's size class, its largest text's (`size_class`).
+    size: u8,
     start: u32,
     end: u32,
 }
 
+// A laid-out row is sixteen bytes: there may be `MAX_LINES` of them.
+const _: () = assert!(std::mem::size_of::<Line>() == 16);
+const _: () = assert!(MAX_SECTIONS <= u8::MAX as usize + 1);
+
 impl Line {
-    /// The row's height in font pixels, a styled row's `styled`.
-    fn height(self, styled: u64) -> u64 {
+    /// The row's height in font pixels, a styled row's by its size class.
+    fn height(self, styled: Rows) -> u64 {
         (match self.kind {
             Kind::Header => ROW,
             Kind::Gap => GAP,
-            Kind::Styled => return styled,
+            Kind::Styled => return styled.height(self.size),
             Kind::Title | Kind::Text | Kind::Image | Kind::More => CELL_HEIGHT,
         }) as u64
     }
@@ -811,11 +818,10 @@ pub struct Controller {
     /// and their measures at the surface's scale: the cell's without them.
     faces: Option<Faces>,
     metrics: Mutex<Metrics>,
-    /// A styled row's height in font pixels, its baseline below its top in
-    /// pixels, and whether faces measure it: a cell's height and baseline
-    /// on the cell. Kept outside `metrics`, so asking takes no lock.
-    styled: u64,
-    baseline: i64,
+    /// A styled row's height and baseline by its size class, and whether
+    /// faces measure it: the cell's on the cell. Kept outside `metrics`,
+    /// so asking takes no lock.
+    styled: Rows,
     prose: bool,
     /// Where the pointer hovers with no button held, for the button under
     /// it: lit, and its tooltip `tip`.
@@ -863,8 +869,7 @@ impl Controller {
             icons: false,
             faces: None,
             metrics: Mutex::new(Metrics::new(None, surface.scale)),
-            styled: CELL_HEIGHT as u64,
-            baseline: (prose::CELL_BASELINE * surface.scale.value()) as i64,
+            styled: Rows::cell(surface.scale.value()),
             prose: false,
             hover_at: None,
         };
@@ -1339,21 +1344,24 @@ impl Controller {
         self.prose
     }
 
-    /// Measures in the faces at `scale`: a styled row as tall as a prose
-    /// line, on its baseline.
+    /// Measures in the faces at `scale`: a styled row as tall as the prose
+    /// line of its size class, on its baseline.
     fn measure(&mut self, scale: Scale) {
         let metrics = Metrics::new(self.faces.as_ref(), scale);
-        let line = metrics.line();
         let s = scale.value();
-        self.styled = u64::from(line.height)
-            .div_ceil(s as u64)
-            .max(CELL_HEIGHT as u64);
         self.prose = metrics.proportional();
-        self.baseline = if self.prose {
-            i64::from(line.baseline)
-        } else {
-            (prose::CELL_BASELINE * s) as i64
-        };
+        let mut rows = Rows::cell(s);
+        if self.prose {
+            let classes = rows.height.iter_mut().zip(rows.baseline.iter_mut());
+            for (class, (height, baseline)) in (0u8..).zip(classes) {
+                let line = metrics.line_at(class_size(class, scale));
+                *height = u64::from(line.height)
+                    .div_ceil(s as u64)
+                    .max(CELL_HEIGHT as u64);
+                *baseline = i64::from(line.baseline);
+            }
+        }
+        self.styled = rows;
         *self
             .metrics
             .get_mut()
@@ -1898,7 +1906,7 @@ impl Controller {
             return Ok(());
         }
         let (start, end) = self.span(index)?;
-        let wanted = u16::try_from(section).map_err(|_| Error::NoSection)?;
+        let wanted = u8::try_from(section).map_err(|_| Error::NoSection)?;
         let rows = self.lines.get(start..end).unwrap_or(&[]);
         // Backward from the message's end, past later sections only, so
         // streaming into the last section finds its last row at once.
@@ -3283,6 +3291,10 @@ impl Controller {
         let code_block = block.is_some_and(|block| block.code);
         let proportional = self.proportional();
         let left = shown.x + indent as i64 * cell;
+        // The row's baseline, its largest text's; text of another size
+        // stands on it.
+        let baseline = self.styled.baseline(line.size);
+        let top = |class: u8| rect.y + baseline - self.styled.baseline(class);
         if let Some(block) = block {
             let prefix = rich.prefix(block, start == block.start as usize);
             let style = GlyphStyle::medium(LINE_NUMBER, paper);
@@ -3299,7 +3311,7 @@ impl Controller {
                             clip: area,
                             primitive: Primitive::Glyph {
                                 x: shown.x + column as i64 * cell,
-                                y: rect.y,
+                                y: top(0),
                                 scalar: prose::shown(scalar),
                                 style: style.with_family(TextFamily::Mono),
                             },
@@ -3354,7 +3366,15 @@ impl Controller {
             } else {
                 INK
             };
-            let style = styled_glyph(look, glyph.code, proportional, ink, ground);
+            let style = styled_glyph(
+                look,
+                glyph.code,
+                proportional,
+                self.surface.scale,
+                ink,
+                ground,
+            );
+            let class = size_class(look);
             if proportional {
                 // A prose glyph at its pen, the raster setting it on the
                 // line's baseline, clipped to the text area.
@@ -3363,7 +3383,7 @@ impl Controller {
                         clip: area,
                         primitive: Primitive::Glyph {
                             x,
-                            y: rect.y,
+                            y: top(class),
                             // What was measured: a tab as a space, another
                             // control as the replacement.
                             scalar: prose::shown(glyph.scalar),
@@ -3387,11 +3407,13 @@ impl Controller {
                 );
             }
             // A link's underline on the baseline, a strike's line through
-            // the middle of the lowercase, each under its advance.
+            // the middle of the lowercase, as high as the glyph's size, each
+            // under its advance.
             let middle = (prose::CELL_BASELINE - CELL_HEIGHT / 2) as i64 * s;
+            let middle = middle * self.styled.baseline(class) / self.styled.baseline(0).max(1);
             for (on, y) in [
-                (link.is_some(), self.baseline),
-                (look.has(Look::STRIKE), self.baseline - middle),
+                (link.is_some(), baseline),
+                (look.has(Look::STRIKE), baseline - middle),
             ] {
                 let line = Rect {
                     y: rect.y + y,
@@ -3668,9 +3690,10 @@ fn row(
 ) -> Result<Line, Error> {
     Ok(Line {
         message: u32::try_from(message).map_err(|_| Error::Limit)?,
-        section: u16::try_from(section).map_err(|_| Error::Limit)?,
+        section: u8::try_from(section).map_err(|_| Error::Limit)?,
         kind,
         indent: 0,
+        size: 0,
         start: u32::try_from(start).map_err(|_| Error::Limit)?,
         end: u32::try_from(end).map_err(|_| Error::Limit)?,
     })
@@ -3733,11 +3756,88 @@ fn common_prefix(a: &str, b: &str) -> usize {
     same
 }
 
+/// How many size classes a styled row's text takes: the prose size,
+/// `Look::LARGE`'s and `Look::LARGER`'s.
+const SIZES: usize = 3;
+
+/// The size class of text in `look`: 0 the prose size, 1 `LARGE`, 2
+/// `LARGER`, the larger when both.
+fn size_class(look: Look) -> u8 {
+    if look.has(Look::LARGER) {
+        2
+    } else if look.has(Look::LARGE) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Size class `class` at `scale`: the prose size, a quarter larger, a
+/// half larger.
+fn class_size(class: u8, scale: Scale) -> Size {
+    let pixels = u32::from(prose::SIZE) * scale.value() as u32;
+    // Another class is none, the prose size, as `Rows` reads it.
+    match class {
+        1 => Size::clamped(pixels * 5 / 4),
+        2 => Size::clamped(pixels * 3 / 2),
+        _ => Size::DEFAULT,
+    }
+}
+
+/// A styled row's height in font pixels and its baseline below its top
+/// in pixels, by the size class of its largest text: the cell's at every
+/// class on the cell.
+#[derive(Clone, Copy, Debug)]
+struct Rows {
+    height: [u64; SIZES],
+    baseline: [i64; SIZES],
+}
+
+impl Rows {
+    fn cell(scale: usize) -> Self {
+        Self {
+            height: [CELL_HEIGHT as u64; SIZES],
+            baseline: [(prose::CELL_BASELINE * scale) as i64; SIZES],
+        }
+    }
+
+    fn height(self, class: u8) -> u64 {
+        self.height
+            .get(usize::from(class))
+            .copied()
+            .unwrap_or(CELL_HEIGHT as u64)
+    }
+
+    fn baseline(self, class: u8) -> i64 {
+        self.baseline
+            .get(usize::from(class))
+            .or(self.baseline.first())
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The size class of the largest text shown from `from` to `to`.
+fn largest(rich: &Rich, from: usize, to: usize) -> u8 {
+    let first = size_class(rich.look(from).0);
+    rich.changes(from, to)
+        .map(|(_, look, _)| size_class(look))
+        .fold(first, u8::max)
+}
+
 /// A styled character's glyph style in `ink` on `ground`: bold and italic
 /// as its look says, and with prose faces in Mono when it is code (a code
-/// block's or a code span's) and Sans otherwise; on the cell without them.
-/// Wrapping measures by it and painting draws by it, so the two agree.
-fn styled_glyph(look: Look, code: bool, proportional: bool, ink: u32, ground: u32) -> GlyphStyle {
+/// block's or a code span's) and Sans otherwise, at its look's size at
+/// `scale`; on the cell without them. Wrapping measures by it and
+/// painting draws by it, so the two agree.
+fn styled_glyph(
+    look: Look,
+    code: bool,
+    proportional: bool,
+    scale: Scale,
+    ink: u32,
+    ground: u32,
+) -> GlyphStyle {
     let mut style = GlyphStyle::medium(ink, ground);
     if look.has(Look::BOLD) {
         style = style.bold();
@@ -3748,11 +3848,13 @@ fn styled_glyph(look: Look, code: bool, proportional: bool, ink: u32, ground: u3
     if !proportional {
         return style;
     }
-    style.with_family(if code || look.has(Look::CODE) || look.has(Look::MONO) {
-        TextFamily::Mono
-    } else {
-        TextFamily::Sans
-    })
+    style
+        .with_family(if code || look.has(Look::CODE) || look.has(Look::MONO) {
+            TextFamily::Mono
+        } else {
+            TextFamily::Sans
+        })
+        .with_size(class_size(size_class(look), scale))
 }
 
 /// A styled row's scalar as `styled_walk` measures it: its shown byte, its
@@ -3783,6 +3885,7 @@ fn styled_walk(
     let text = rich.shown().get(start..end).unwrap_or("");
     let code = rich.block_at(start).is_some_and(|block| block.code);
     let proportional = metrics.proportional();
+    let scale = metrics.scale();
     let (mut look, mut link) = rich.look(start);
     let mut changes = rich.changes(start, end).peekable();
     let mut pen = 0u64;
@@ -3795,9 +3898,14 @@ fn styled_walk(
             (look, link) = (next, next_link);
             changes.next();
         }
-        let style = styled_glyph(look, code, proportional, INK, PAPER);
+        let style = styled_glyph(look, code, proportional, scale, INK, PAPER);
         let x0 = i64::from(prose::pixels(pen));
-        let wide = metrics.advance(style.family, style.font_style, prose::shown(scalar));
+        let wide = metrics.advance_at(
+            style.size,
+            style.family,
+            style.font_style,
+            prose::shown(scalar),
+        );
         pen = pen.saturating_add(u64::from(wide));
         let x1 = i64::from(prose::pixels(pen));
         let walked = Walked {
@@ -3839,6 +3947,7 @@ fn wrap_rich(
     }
     let cell = u64::from(UNIT) * (CELL_WIDTH * metrics.scale().value()) as u64;
     let proportional = metrics.proportional();
+    let scale = metrics.scale();
     let mut rows = 0;
     let mut more = false;
     for (number, block) in blocks.iter().enumerate() {
@@ -3861,8 +3970,13 @@ fn wrap_rich(
                 look = next;
                 changes.next();
             }
-            let style = styled_glyph(look, block.code, proportional, INK, PAPER);
-            u64::from(metrics.advance(style.family, style.font_style, prose::shown(scalar)))
+            let style = styled_glyph(look, block.code, proportional, scale, INK, PAPER);
+            u64::from(metrics.advance_at(
+                style.size,
+                style.family,
+                style.font_style,
+                prose::shown(scalar),
+            ))
         };
         wrap_by(text, room as u64 * cell, &mut advance, &mut |from, to| {
             if wrap.target.excerpt && rows == EXCERPT_ROWS {
@@ -3878,6 +3992,9 @@ fn wrap_rich(
                 start + to,
             )?;
             line.indent = indent;
+            if proportional {
+                line.size = largest(rich, start + from, start + to);
+            }
             push(out, wrap.budget, line)?;
             Ok(true)
         })?;

@@ -51,7 +51,16 @@ fn build(text: &str, document: &Document) -> Result<Rich, rich::Error> {
             rich.put(RULE, block.source.clone(), Look::QUIET, None)?;
             continue;
         }
+        let atx = text
+            .get(block.source.start..block.source.end)
+            .is_some_and(atx);
         let mut base = match block.kind {
+            // An ATX heading's top two levels larger, where the faces have
+            // sizes. Not a setext one: a streaming paragraph that ends in
+            // a line of `-` or `=` is one until the next delta, and would
+            // reflow everything below it for that frame.
+            BlockKind::Heading(1) if atx => Look::BOLD.with(Look::LARGER),
+            BlockKind::Heading(2) if atx => Look::BOLD.with(Look::LARGE),
             BlockKind::Heading(_) => Look::BOLD,
             // Aligned by its columns as written.
             BlockKind::Table => Look::MONO,
@@ -107,6 +116,18 @@ fn prefixes(levels: &[Level], first: &mut String, rest: &mut String) {
             prefix.truncate(cut);
         }
     }
+}
+
+/// Whether a heading's source opens as an ATX heading: up to three
+/// spaces, one to six `#`, then a space, a tab or its end.
+fn atx(source: &str) -> bool {
+    let rest = source.trim_start_matches(' ');
+    if source.len() - rest.len() > 3 {
+        return false;
+    }
+    let after = rest.trim_start_matches('#');
+    let marks = rest.len() - after.len();
+    (1..=6).contains(&marks) && (after.is_empty() || after.starts_with([' ', '\t']))
 }
 
 fn look(style: Style, base: Look) -> Look {
@@ -220,6 +241,23 @@ mod tests {
              \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
              fn x() {}\nlet y;"
         );
+    }
+
+    /// ATX headings of the top two levels are larger, a setext one only
+    /// bold, a table monospace.
+    #[test]
+    fn headings_and_tables_take_their_looks() {
+        let reply = "# One\n\n## Two\n\n### Three\n\nFour\n----\n\n\
+                     | a | b |\n|---|---|\n| c | d |";
+        let rich = rich(reply).unwrap();
+        let at = |text: &str| rich.look_at(rich.shown().find(text).unwrap());
+        assert_eq!(at("One"), Look::BOLD.with(Look::LARGER));
+        assert_eq!(at("Two"), Look::BOLD.with(Look::LARGE));
+        assert_eq!(at("Three"), Look::BOLD);
+        assert_eq!(at("Four"), Look::BOLD);
+        assert_eq!(at("| c"), Look::MONO);
+        assert!(atx("   ###### x") && atx("#") && !atx("####### x"));
+        assert!(!atx("#hashtag") && !atx("    # code"));
     }
 
     #[test]

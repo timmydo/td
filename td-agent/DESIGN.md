@@ -1535,7 +1535,15 @@ copyable:
 drawn as Markdown: `markdown.rs` parses it with td-markdown and maps the
 document onto td-ui's styled text (td-ui DESIGN.md "Styled sections"),
 so a copy of a reply, or of any part of it, is the Markdown as written.
-Headings are bold; emphasis, strong emphasis and strikethrough are
+Headings are bold, a first-level ATX one (`#`) half again the text's
+size and a second-level one (`##`) a quarter (`Look::LARGER`,
+`Look::LARGE`) where the prose faces draw it, and as the text on the
+cell; a setext heading stays the text's size, since a streaming
+paragraph followed by a line of `-` or `=` is one until the next delta
+and would reflow what follows it for that frame. The two sizes take
+the window's raster up to four more atlas pages (Sans and Mono at
+each), within td-ui's `prose::ATLAS` bound. Emphasis, strong emphasis
+and strikethrough are
 italic, bold and struck; a code span and a fenced or indented code block
 stand on the code ground; a list item's rows sit behind its marker, a
 bullet `•` or its number, and a quotation's behind a bar `│` in quiet

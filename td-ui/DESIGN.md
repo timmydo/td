@@ -508,8 +508,9 @@ of its own files may name each module.
   Under "Key list" below.
 - `rich`: `Rich`, a styled section's text built piece by piece from
   its source (`new`; `block`, `gap`, `text`, `put`, `line` and `link`;
-  `source`, `shown` and `target`), `Look` (`BOLD`, `ITALIC`, `STRIKE`,
-  `CODE`, `QUIET`), `Error` and the bounds `MAX_BYTES`,
+  `source`, `shown`, `target` and `look_at`), `Look` (`BOLD`,
+  `ITALIC`, `STRIKE`, `CODE`, `QUIET`, `MONO`, `LARGE`, `LARGER`),
+  `Error` and the bounds `MAX_BYTES`,
   `MAX_PREFIX_CHARS`, `MAX_LINK_BYTES` and `MAX_RECORDS`; under "Styled
   sections".
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
@@ -1896,8 +1897,10 @@ the scalar before it and a control drawn as the replacement; a link's
 press and tip over its measured glyphs and a code span in `Mono`;
 a prefix in `Mono` on the row's line, clipped off the text, and an
 underline on the prose baseline; a bubble as wide as its text measures;
-`Look::MONO` in `Mono` with no ground, plain on the cell; and a new
-scale measured again.
+`Look::MONO` in `Mono` with no ground, plain on the cell; a new
+scale measured again; `Look::LARGER` text wrapped by its sized advances
+on rows its line's height in glyphs of its size, two sizes on one row
+on the larger's baseline, and both size looks plain on the cell.
 
 For pictures `tests/picture.rs` holds a picture's bounds and its
 pixels' length, the fit size keeping the aspect, bound by either axis,
@@ -3435,8 +3438,9 @@ until a trim makes room.
 
 The layout is rows in the cell model: a `ROW`-tall header, title, text
 and more rows a cell high, and a `GAP` below each message, all scaled;
-a styled section's rows are a prose line tall while the list has prose
-faces (Styled sections, below), a cell without them.
+a styled section's rows are as tall as the prose line of the largest
+size on them while the list has prose faces (Styled sections, below), a
+cell without them.
 The rectangle less a `chrome::List`-sized scrollbar gutter holds the
 rows, text a cell in from each side. Text wraps at the columns that
 leave: a newline ends a row, a row breaks after the last space or tab
@@ -3631,8 +3635,10 @@ break's space, an entity's character, an image's stand-in), standing
 for a range of the source whole. Each piece has a `Look`: bold and
 italic through the glyph's font style, struck through, code on a ground
 of its own, monospace without it (`MONO`, for text aligned by its
-columns, such as a table as written), or quiet ink, and it may be in a
-link, whose target `link`
+columns, such as a table as written), quiet ink, or larger in prose
+faces (`LARGE` a quarter, `LARGER` a half again the prose size, for
+headings; the larger when both), and it may be in a link, whose target
+`link`
 records. Blocks give rows their shape: each starts on a row of its own
 behind a prefix, a first row's and its later rows' of as many
 characters (a bullet and spaces, a quote's bar on both), the block
@@ -3661,13 +3667,20 @@ the surface's scale, measured again when a resize changes the scale,
 since it paints through `Composition` and never sees the raster's.
 Each styled scalar is measured in the glyph style it is drawn in: bold
 and italic as its look says, in `Mono` when it is code (a code block's
-or a code span's) and `Sans` otherwise; without faces every scalar is
+or a code span's) and `Sans` otherwise, at its look's size
+(`prose::Size`, the prose size's pixels at the scale times five
+quarters or three halves, measured by `Metrics::advance_at`); without
+faces every scalar is
 the cell's, and the layout, the draw stream and every hit are the cell
 model's exactly. A block's text wraps to the pixels its prefix leaves
 by the same rule as plain text, a scalar's advance in place of a
 column, a row holding a scalar at least, so its rows still tile the
-shown text; a row is a prose line tall (`Metrics::line`, in font
-pixels rounded up), a cell at the least. Pens are summed in `prose::UNIT`s
+shown text; a row is as tall as the prose line of the largest size on
+it (`Metrics::line_at`, in font pixels rounded up), a cell at the least,
+its baseline that line's, and text of a smaller size stands on it (as
+`Metrics::top_at` places it, from baselines the list keeps per size so
+painting takes no lock), so a heading's row is taller and a word of another
+size on a row keeps the row's baseline. Pens are summed in `prose::UNIT`s
 and rounded to pixels as prose rounds them, so one walk of a row
 (`styled_walk`) gives painting, a press's byte, a link under the
 pointer and its tooltip's span, and a message's laid width in whole
@@ -3708,9 +3721,13 @@ the selection's ground over both under each scalar's advance, a link in
 struck text with a line through its middle, quiet text in
 `LINE_NUMBER`, a tab as a space and another control scalar as the
 raster's replacement, as on plain rows. With faces a glyph is a prose
-`Glyph` at its pen and the row's top, clipped to the text area and
-the row, which the raster sets on the line's baseline, so ink reaching
-past the line box or behind the next glyph's ground is cut; without
+`Glyph` at its pen and size, its top where its size's baseline meets
+the row's, clipped to the text area and the row, which the raster sets
+on its line's baseline (a strike as high above it as its size's
+baseline is to the prose size's), so ink reaching past the line box
+(at a half again the prose size at scale one, the top two pixels of a
+bitmap stand-in for a scalar the faces lack) or behind the next
+glyph's ground is cut; without
 them it is the cell's text run. A click on a link answers `Outcome::Link` with its
 message, section and link, whose target `Controller::link` gives: a
 press on text, not extending and not paired with the click before, and
@@ -4311,7 +4328,7 @@ glyphs it shows, once.
 
 ## Proportional faces
 
-**Status: increments 38 to 41 landed: the faces are pinned, delivered,
+**Status: increments 38 to 42 landed: the faces are pinned, delivered,
 found and loaded, and td-ui measures, wraps and draws prose in them, at
 the prose size or any size within a bound (see "Sizes").
 td-web, its first consumer, draws its pages in prose (td-web/DESIGN.md
@@ -4960,6 +4977,11 @@ regressions. Those increments extend the original sequence below.
     model exactly.
     td-agent's transcript is its first consumer (td-agent/DESIGN.md §4,
     Markdown). Landed.
+42. Sizes in the message list ("Styled sections"): `Look::LARGE` and
+    `Look::LARGER`, a styled row's size class its largest text's, its
+    height and baseline that size's line, a smaller glyph on the row's
+    baseline (`top_at`), measured by `advance_at`; plain on the cell.
+    td-agent's top two heading levels are its first consumer. Landed.
 
 ## Foreground terminal relay
 

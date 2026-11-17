@@ -25,7 +25,7 @@ use td_ui::messages::{
     MIN_COLUMNS, MORE,
 };
 use td_ui::picture::{Fitted, Picture};
-use td_ui::prose::{Faces, Metrics};
+use td_ui::prose::{Faces, Metrics, Size};
 use td_ui::raster::{
     Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily, ACCENT,
     BORDER, BUBBLE, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
@@ -3940,4 +3940,156 @@ fn draws(list: &Controller, scale: u8) -> Vec<Draw> {
     let mut out = Vec::new();
     list.emit(surface(scale).bounds(), &mut |draw| out.push(draw));
     out
+}
+
+/// `size` pixels an em at `scale`, as a heading's class takes it.
+fn sized(pixels: u32, scale: u8) -> Size {
+    Size::new(pixels * u32::from(scale)).unwrap()
+}
+
+/// In prose `Look::LARGER` text is half again the prose size: measured
+/// and wrapped at it, its row as tall as its line, its glyphs that size.
+#[test]
+fn larger_text_wraps_and_stands_at_its_size() {
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        // 18 columns: 144 pixels; an 'm' is 24 at 24 pixels an em.
+        let mut list = list(scale, 18, 300);
+        let mut rich = Rich::new("mmmmmmm").unwrap();
+        rich.text(0..7, Look::LARGER, None).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        list.set_prose(Some(prose_faces())).unwrap();
+        assert_eq!(rows(&list), ["H0", "mmmmmm", "m", "G0"], "scale {scale}");
+        let metrics = Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap());
+        let line = metrics.line_at(sized(24, scale));
+        let row = text_row(&list, 0);
+        assert_eq!(
+            row.height,
+            line.height.div_ceil(u32::from(scale)) * u32::from(scale),
+            "scale {scale}"
+        );
+        assert!(row.height > metrics.line().height);
+        let left = row.x + CELL_WIDTH as i64 * s;
+        let mut glyphs = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph { x, y, style, .. } = draw.primitive {
+                if y == row.y {
+                    glyphs.push((x, style.size));
+                }
+            }
+        });
+        assert_eq!(glyphs.len(), 6, "scale {scale}");
+        for (nth, (x, size)) in glyphs.into_iter().enumerate() {
+            assert_eq!(x, left + 24 * s * nth as i64, "scale {scale}");
+            assert_eq!(size, sized(24, scale));
+        }
+        // The wrapped row, starting inside the run, is as large.
+        let next = text_row(&list, 1);
+        assert_eq!(next.height, row.height, "scale {scale}");
+        let mut last = None;
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph { y, style, .. } = draw.primitive {
+                if y == next.y {
+                    last = Some(style.size);
+                }
+            }
+        });
+        assert_eq!(last, Some(sized(24, scale)), "scale {scale}");
+    }
+}
+
+/// Text of two sizes on one row shares its baseline: the row is the
+/// larger's line, and the smaller glyph's top sits lower by the
+/// difference of their baselines.
+#[test]
+fn sizes_on_one_row_share_a_baseline() {
+    for scale in 1..=4u8 {
+        let mut list = list(scale, 30, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        let mut rich = Rich::new("i m").unwrap();
+        rich.text(0..2, Look::PLAIN, None).unwrap();
+        rich.text(2..3, Look::LARGE, None).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        let metrics = Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap());
+        let large = metrics.line_at(sized(20, scale));
+        let row = text_row(&list, 0);
+        assert_eq!(
+            row.height,
+            large.height.div_ceil(u32::from(scale)) * u32::from(scale)
+        );
+        let (mut small, mut big) = (None, None);
+        list.emit(surface(scale).bounds(), &mut |draw| {
+            if let Primitive::Glyph { scalar, y, .. } = draw.primitive {
+                match scalar {
+                    'i' => small = Some(y),
+                    'm' => big = Some(y),
+                    _ => {}
+                }
+            }
+        });
+        assert_eq!(big, Some(row.y), "scale {scale}");
+        let drop = i64::from(large.baseline) - i64::from(metrics.line().baseline);
+        assert!(drop > 0);
+        assert_eq!(small, Some(row.y + drop), "scale {scale}");
+    }
+}
+
+/// On the cell the size looks change nothing: the rows and the draw
+/// stream are plain text's.
+#[test]
+fn size_looks_are_plain_on_the_cell() {
+    for scale in 1..=4u8 {
+        let mut large = Rich::new("mm ii").unwrap();
+        large.text(0..2, Look::LARGER, None).unwrap();
+        large.text(2..5, Look::LARGE, None).unwrap();
+        let mut plain = Rich::new("mm ii").unwrap();
+        plain.text(0..5, Look::PLAIN, None).unwrap();
+        let (large, plain) = (list_of(scale, large), list_of(scale, plain));
+        assert_eq!(rows(&large), rows(&plain));
+        assert_eq!(draws(&large, scale), draws(&plain, scale), "scale {scale}");
+    }
+}
+
+/// On a heading row, a prefix at the prose size stands on the row's
+/// baseline, and a strike through larger text sits as high above it as
+/// that size's baseline is to the prose size's; both size looks together
+/// are the larger.
+#[test]
+fn a_heading_row_keeps_its_prefix_and_strike_on_its_baseline() {
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 30, 300);
+        list.set_prose(Some(prose_faces())).unwrap();
+        let mut rich = Rich::new("- mm").unwrap();
+        rich.block("\u{2022} ", "  ", false).unwrap();
+        let look = Look::LARGE.with(Look::LARGER).with(Look::STRIKE);
+        rich.text(2..4, look, None).unwrap();
+        list.push(Message::new("a").unwrap().rich(rich).unwrap())
+            .unwrap();
+        let metrics = Metrics::new(Some(&prose_faces()), Scale::new(scale).unwrap());
+        let (large, prose) = (
+            i64::from(metrics.line_at(sized(24, scale)).baseline),
+            i64::from(metrics.line().baseline),
+        );
+        let row = text_row(&list, 0);
+        let (mut bullet, mut sizes, mut strikes) = (None, Vec::new(), Vec::new());
+        list.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+            Primitive::Glyph {
+                scalar: '\u{2022}',
+                y,
+                ..
+            } => bullet = Some(y),
+            Primitive::Glyph {
+                scalar: 'm', style, ..
+            } => sizes.push(style.size),
+            Primitive::Fill { rect, color } if color == INK => strikes.push(rect.y),
+            _ => {}
+        });
+        assert_eq!(bullet, Some(row.y + large - prose), "scale {scale}");
+        assert_eq!(sizes, [sized(24, scale); 2], "scale {scale}");
+        let middle = 6 * s * large / prose;
+        assert_eq!(strikes, [row.y + large - middle; 2], "scale {scale}");
+    }
 }
