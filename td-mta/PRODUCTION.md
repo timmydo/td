@@ -335,6 +335,31 @@ retained under `/var/lib/td-mta/operator/*/deployment-*`. Those are historical
 receipts, not scripts to rerun: they pin old commits, configuration versions
 and staging locations. This runbook does not depend on them to build or update.
 
+## Shorten a schema maintenance window
+
+While mail is serving, stage the reviewed executable and rollback binary.
+Prepare the private restore cluster and its bootstrap roles, check extension
+availability and free space, and stage the queries that compare the restored
+database with the fenced source. Rehearse the migration and database checks
+on an isolated restore of a recent backup with mail services disabled.
+Prepare the cutover commands to advance on each successful check and stop
+on failure. Keep the fresh backup at the writer fence for rollback so it
+includes mail accepted during preparation.
+
+Start a timestamped SMTP and JMAP probe before stopping services. Use a probe
+location that can reach each listener while it is healthy. Record the SMTP
+greeting and EHLO after STARTTLS, and the expected HTTPS authentication
+challenge for JMAP. For each protocol, retain the last success before the
+interruption and the first success after restart, with the probe interval
+and location. These bound the interruption observed by clients on that path.
+
+During the fence, verify the fresh backup, run the migration and qualify the
+candidate against the upgraded database. Start the mail services as soon as
+these checks pass.
+Record elapsed times for backup, restore, comparison, migration and restart
+in the activation receipt. Verify ACME, timers and aggregate health as usual
+and record their completion separately from listener recovery.
+
 ## Preflight and stage the binary
 
 This procedure is for a **binary-only** update with a compatible database and
