@@ -204,6 +204,13 @@ pub(super) fn exercise(
         .collect();
     uncertain_upload(fixture, &published, [(a, &devices[0]), (b, &devices[1])]);
     let (held, grant) = super::multi_relay::leases(fixture, request, trust, &published);
+    let fill_health = |account: AccountId| {
+        sql(fixture, &format!("DELETE FROM td_mta.route_health WHERE account=decode('{account}','hex') AND failure_count=0"));
+        sql(fixture, &format!("INSERT INTO td_mta.route_health SELECT decode('{account}','hex'),'held-'||i,decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),1,4,0,300000,decode('0000000000000001','hex') FROM generate_series(1,1024) i"));
+    };
+    let release_health = |account: AccountId| {
+        sql(fixture, &format!("UPDATE td_mta.route_health SET repair_generation=NULL WHERE account=decode('{account}','hex') AND route_name LIKE 'held-%'"));
+    };
     let held_live = std::cell::Cell::new(true);
     let relay = super::serving_relay::Relay::multi(fixture, relay_socket, relay_dns);
     let local = td_fs::TempDir::new("ma").unwrap();
@@ -261,6 +268,27 @@ pub(super) fn exercise(
         child
     };
     let mut child = start_worker();
+    let stop_worker = |child: &mut ProbeChild, custody_outstanding: bool| {
+        let stopped = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["stop", "--runtime"])
+            .arg(&runtime)
+            .output()
+            .unwrap();
+        assert!(stopped.status.success());
+        if custody_outstanding {
+            let end = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert_eq!(status.code(), Some(1));
+                    break;
+                }
+                assert!(Instant::now() < end, "worker did not stop");
+                thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            super::wait_command(child);
+        }
+    };
     super::multi_receiving::smtp(fixture, smtp_address, false);
     let basic = |name: &str, password: &[u8]| {
         let input = [name.as_bytes(), b":", password].concat();
@@ -372,100 +400,94 @@ pub(super) fn exercise(
         String::from_utf8(result.stdout).unwrap()
     };
     assert!(queue_command("queue-route-repair").contains("requested"));
-    let submit_both = || {
-        for (index, name, account, identity, email) in [
-            (
-                0,
-                "user",
-                a,
-                IdentityId::from_bytes([0xbb; 16]),
-                "main@example.test",
-            ),
-            (
-                1,
-                "user-b",
-                b,
-                IdentityId::from_bytes([0xdd; 16]),
-                "second@example.test",
-            ),
-        ] {
-            let authorization = basic(name, devices[index].password());
-            let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-            let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
-            let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-            let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
-            let mailboxes = query(&authorization, "POST", "/jmap/api", "application/json",
+    let submit = |index: usize,
+                  name: &str,
+                  account: AccountId,
+                  identity: IdentityId,
+                  email: &str| {
+        let authorization = basic(name, devices[index].password());
+        let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
+        let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
+        let mailboxes = query(&authorization, "POST", "/jmap/api", "application/json",
             &td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":account},"m"]]}).to_string());
-            let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
-            let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
-                .as_str()
-                .unwrap();
-            let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
+        let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
+            .as_str()
+            .unwrap();
+        let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
             ["Email/set",{"accountId":account,"create":{"draft":{
                 "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":email}],"to":[{"email":"recipient@example.test"}],"subject":"Account relay","messageId":["multi-relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Private sender.","isEncodingProblem":false,"isTruncated":false}}
             }}},"0"],
             ["EmailSubmission/set",{"accountId":account,"create":{"submission":{"emailId":"#draft","identityId":identity}}},"1"]
         ]}).to_string();
-            let reply = query(
-                &authorization,
-                "POST",
-                "/jmap/api",
-                "application/json",
-                &body,
-            );
-            let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let reply = query(
+            &authorization,
+            "POST",
+            "/jmap/api",
+            "application/json",
+            &body,
+        );
+        let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        value["methodResponses"][1][1]["created"]["submission"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{reply}"))
+            .to_string()
+    };
+    let submit_a = || {
+        submit(
+            0,
+            "user",
+            a,
+            IdentityId::from_bytes([0xbb; 16]),
+            "main@example.test",
+        )
+    };
+    let submit_b = || {
+        submit(
+            1,
+            "user-b",
+            b,
+            IdentityId::from_bytes([0xdd; 16]),
+            "second@example.test",
+        )
+    };
+    submit_a();
+    submit_b();
+    let wait_for = |query: &str, expected: &str| {
+        let stop = Instant::now() + Duration::from_secs(45);
+        while sql(fixture, query) != expected {
             assert!(
-                value["methodResponses"][1][1]["created"]["submission"]["id"]
-                    .as_str()
-                    .is_some(),
-                "{reply}"
+                Instant::now() < stop,
+                "timed out waiting for {query} = {expected}"
             );
+            thread::sleep(Duration::from_millis(100));
         }
     };
+    let b_claim = "SELECT count(*) FROM td_mta.route_owners WHERE account=decode(repeat('cc',16),'hex') AND owner_boot IS NOT NULL";
+    let a_done = "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('aa',16),'hex') AND state=4";
+    let b_done = "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('cc',16),'hex') AND state=4";
+    let b_attempts = "SELECT count(*) FROM td_mta.submission_attempts a JOIN td_mta.recipients r ON a.account=r.account AND a.submission_id=r.submission_id WHERE a.account=decode(repeat('cc',16),'hex') AND r.state<>4";
     // A competing owner holds A while B must still make forward progress.
-    submit_both();
     let stop = Instant::now() + Duration::from_secs(30);
-    while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('cc',16),'hex') AND state=4") != "1" {
+    while sql(fixture, b_done) != "1" {
         assert!(Instant::now() < stop);
         owners::renew(request, trust, deadline(), &held, grant.generation).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('aa',16),'hex') AND state=4"), "0");
+    assert_eq!(sql(fixture, a_done), "0");
     assert!(queue_command("queue-route-status").contains("requested"));
     owners::release(request, trust, deadline(), &held, grant.generation).unwrap();
     held_live.set(false);
-    let stop = Instant::now() + Duration::from_secs(30);
-    while sql(
-        fixture,
-        "SELECT count(*) FROM td_mta.recipients WHERE state=4",
-    ) != "2"
-    {
-        assert!(Instant::now() < stop);
-        thread::sleep(Duration::from_millis(100));
-    }
+    wait_for(a_done, "1");
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 2);
     let stop = Instant::now() + Duration::from_secs(30);
     while !queue_command("queue-route-status").contains("repaired") {
         assert!(Instant::now() < stop);
         thread::sleep(Duration::from_millis(100));
     }
-    // Repeated idle scheduling renews leases without manufacturing claim receipts.
-    let receipts = sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts");
-    thread::sleep(Duration::from_secs(6));
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts"),
-        receipts
-    );
-    let stop_worker = |child: &mut ProbeChild| {
-        let stopped = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(["stop", "--runtime"])
-            .arg(&runtime)
-            .output()
-            .unwrap();
-        assert!(stopped.status.success());
-        super::wait_command(child);
-    };
-    stop_worker(&mut child);
+    stop_worker(&mut child, false);
 
     // A full ledger must leave B queued while A delivers. The idle owner
     // cleanup rolls back on capacity, so its row marks every retry up to
@@ -484,24 +506,137 @@ pub(super) fn exercise(
         CREATE TRIGGER time_claim BEFORE DELETE ON td_mta.route_owners FOR EACH ROW WHEN (OLD.route_name='capacity-probe') EXECUTE FUNCTION public.time_claim();
         GRANT SELECT,UPDATE ON SEQUENCE public.claim_time TO mail_runtime");
     child = start_worker();
-    submit_both();
-    let stop = Instant::now() + Duration::from_secs(30);
-    while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('aa',16),'hex') AND state=4") != "2"
-        || sql(fixture, "SELECT is_called FROM public.claim_time") != "t" {
-        assert!(Instant::now() < stop, "A did not deliver while B was full");
-        thread::sleep(Duration::from_millis(100));
-    }
+    submit_a();
+    submit_b();
+    wait_for(a_done, "2");
+    wait_for("SELECT is_called FROM public.claim_time", "t");
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 3);
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_attempts a JOIN td_mta.recipients r ON a.account=r.account AND a.submission_id=r.submission_id WHERE a.account=decode(repeat('cc',16),'hex') AND r.state<>4"), "0");
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.route_owners WHERE account=decode(repeat('cc',16),'hex') AND owner_boot IS NOT NULL"), "0");
+    assert_eq!(sql(fixture, b_attempts), "0");
+    assert_eq!(sql(fixture, b_claim), "0");
     sql(fixture, "DELETE FROM td_mta.route_owner_receipts WHERE account=decode(repeat('cc',16),'hex') AND operation=decode(md5('1'),'hex')");
-    let stop = Instant::now() + Duration::from_secs(30);
-    while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('cc',16),'hex') AND state=4") != "2" {
-        assert!(Instant::now() < stop, "B did not resume after one slot opened");
-        thread::sleep(Duration::from_millis(100));
-    }
+    wait_for(b_done, "2");
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 4);
-    stop_worker(&mut child);
+    stop_worker(&mut child, false);
+
+    // B can acquire its route, but cannot reserve a health row before SMTP.
+    sql(fixture, "DELETE FROM td_mta.route_owner_receipts WHERE account=decode(repeat('cc',16),'hex') AND claimed_at=0");
+    fill_health(b);
+    child = start_worker();
+    wait_for(b_claim, "1");
+    submit_b();
+    submit_a();
+    wait_for(a_done, "3");
+    assert_eq!(sql(fixture, b_attempts), "0");
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 5);
+    // Keep 256 latched destinations and four repair receipts at each. Releasing
+    // state capacity alone must not permit SMTP before receipt capacity returns.
+    sql(fixture, "BEGIN; DELETE FROM td_mta.route_health WHERE account=decode(repeat('cc',16),'hex') AND route_name LIKE 'held-%' AND substring(route_name FROM 6)::integer>256; INSERT INTO td_mta.route_health_receipts SELECT h.account,decode(md5(h.route_name||':'||i),'hex'),h.destination,h.route_name,h.destination,2,int8send(i::bigint),int8send(i::bigint+1),h.failure_count,h.reason,h.failed_at,h.next_at,NULL FROM td_mta.route_health h CROSS JOIN generate_series(1,4) i WHERE h.account=decode(repeat('cc',16),'hex') AND h.route_name LIKE 'held-%'; COMMIT");
+    submit_a();
+    wait_for(a_done, "4");
+    assert_eq!(sql(fixture, b_attempts), "0");
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 6);
+    release_health(b);
+    wait_for(b_done, "3");
+    wait_for("SELECT count(*) FROM td_mta.route_health_receipts WHERE account=decode(repeat('cc',16),'hex') AND action=3", "1");
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 7);
+    // Stop once acceptance commits while the health reset is still outstanding.
+    // A replacement owner must deliver the next submission without replay.
+    sql(fixture, "CREATE FUNCTION public.hold_reset() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=3 THEN RAISE EXCEPTION 'fixture holds reset'; END IF; RETURN NEW; END $$; CREATE TRIGGER hold_reset BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.hold_reset()");
+    submit_b();
+    wait_for(b_done, "4");
+    stop_worker(&mut child, true);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.attempt_acceptance_receipts f WHERE account=decode(repeat('cc',16),'hex') AND NOT EXISTS(SELECT 1 FROM td_mta.route_health_receipts h WHERE h.account=f.account AND h.operation=f.attempt_id AND h.action=3)"), "1");
+    sql(
+        fixture,
+        "DROP TRIGGER hold_reset ON td_mta.route_health_receipts",
+    );
+    child = start_worker();
+    submit_b();
+    wait_for(b_done, "5");
+    wait_for("SELECT count(*) FROM td_mta.route_health_receipts WHERE account=decode(repeat('cc',16),'hex') AND action=3", "1");
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 9);
+    let cancel_b = |id: &str| {
+        let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let account = td_mta::wire::encode_id(b, &mut account_bytes).unwrap();
+        let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/set",{"accountId":account,"update":{id:{"undoStatus":"canceled"}}},"cancel"]]});
+        let reply = query(
+            &basic("user-b", devices[1].password()),
+            "POST",
+            "/jmap/api",
+            "application/json",
+            &body.to_string(),
+        );
+        let reply = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(
+            reply["methodResponses"][0][1]["updated"].get(id).is_some(),
+            "{reply}"
+        );
+    };
+    cancel_during_body_verification(fixture, submit_b, cancel_b, wait_for);
+    let cancel_at_reply = |refuse: &std::sync::atomic::AtomicBool| {
+        use std::sync::atomic::Ordering::Release;
+        relay.cancel_release.store(false, Release);
+        relay.cancel_waiting.store(false, Release);
+        refuse.store(true, Release);
+        let canceled = submit_b();
+        let stop = Instant::now() + Duration::from_secs(30);
+        while !relay
+            .cancel_waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(Instant::now() < stop);
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel_b(&canceled);
+        relay
+            .cancel_release
+            .store(true, std::sync::atomic::Ordering::Release);
+    };
+    cancel_at_reply(&relay.refuse_mail);
+    wait_for("SELECT count(*) FROM td_mta.submission_attempts WHERE account=decode(repeat('cc',16),'hex') AND active", "0");
+    cancel_at_reply(&relay.refuse_auth);
+    wait_for("SELECT count(*) FROM td_mta.route_health_receipts h JOIN td_mta.submission_attempts a ON a.account=h.account AND a.attempt_id=h.operation JOIN td_mta.recipients r ON r.account=a.account AND r.attempt_id=a.attempt_id WHERE h.account=decode(repeat('cc',16),'hex') AND h.action=1 AND h.reason=5 AND h.repair_generation IS NOT NULL AND NOT a.active AND r.state=6", "1");
+    submit_a();
+    wait_for(a_done, "5");
+    assert_eq!(
+        relay.accepted.load(std::sync::atomic::Ordering::Acquire),
+        10
+    );
+    // Repeated idle scheduling renews leases without manufacturing claim receipts.
+    let receipts = sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts");
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts"),
+        receipts
+    );
+    stop_worker(&mut child, false);
+    // A removed route will never be claimed again. Its dead owner's
+    // canceled custody must drain during another route's ordinary upkeep.
+    sql(fixture, "UPDATE td_mta.submission_attempts a SET route_name='removed',active=true FROM td_mta.route_health_receipts h WHERE a.account=h.account AND a.attempt_id=h.operation AND h.action=1 AND h.reason=5; INSERT INTO td_mta.route_owners SELECT account,route_name,destination,generation,owner_boot,owner_operation,0,1 FROM td_mta.submission_attempts WHERE route_name='removed' AND active");
+    sql(fixture, "DELETE FROM td_mta.route_owners WHERE account=decode(repeat('cc',16),'hex') AND owner_boot IS NULL; INSERT INTO td_mta.route_owners SELECT account,'recent-'||i,destination,generation,NULL,NULL,(extract(epoch FROM clock_timestamp())*1000)::bigint,NULL FROM td_mta.route_owners CROSS JOIN generate_series(1,1023) i WHERE route_name='removed'");
+    let claim = owners::prepare(
+        published.binding_for(b).unwrap(),
+        td_mta::ids::BootId::from_bytes([93; 16]),
+    )
+    .unwrap();
+    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    td_mta::postgres_submission_retention::reclaim_uploads(
+        request,
+        trust,
+        deadline(),
+        &claim,
+        grant.generation,
+        grant.claimed_at,
+    )
+    .unwrap();
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_attempts WHERE route_name='removed' AND NOT active"), "1");
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.route_owners WHERE route_name='removed'"
+        ),
+        "0"
+    );
     assert_eq!(
         sql(
             fixture,
@@ -509,6 +644,45 @@ pub(super) fn exercise(
         ),
         "2"
     );
+}
+
+// Pause the body snapshot after Prepared commits. Frontend cancellation
+// must retain custody until the worker sees it at fresh body admission.
+fn cancel_during_body_verification(
+    fixture: &Fixture,
+    submit: impl Fn() -> String,
+    cancel: impl Fn(&str),
+    wait: impl Fn(&str, &str),
+) {
+    let mut blocker = ProbeChild(
+        super::sql_command(fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    writeln!(input, "SELECT pg_advisory_lock(82419);").unwrap();
+    wait(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=82419 AND granted",
+        "1",
+    );
+    sql(fixture, "CREATE FUNCTION public.hold_prepared() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(82419); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER hold_prepared AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.hold_prepared()");
+    let submission = submit();
+    wait(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=82419 AND NOT granted",
+        "1",
+    );
+    writeln!(input, "BEGIN; LOCK TABLE td_mta.blob_chunks IN ACCESS EXCLUSIVE MODE; SELECT pg_advisory_unlock(82419);").unwrap();
+    wait("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.relation='td_mta.blob_chunks'::regclass AND NOT l.granted AND a.query LIKE 'SELECT a.sequence,a.floor,b.length%'", "1");
+    cancel(&submission);
+    let retained = "SELECT count(*) FROM td_mta.submission_attempts a JOIN td_mta.recipients r ON a.account=r.account AND a.attempt_id=r.attempt_id WHERE a.account=decode(repeat('cc',16),'hex') AND r.state=6 AND a.active";
+    assert_eq!(sql(fixture, retained), "1");
+    writeln!(input, "COMMIT;").unwrap();
+    drop(input);
+    super::wait_command(&mut blocker);
+    wait(retained, "0");
+    sql(fixture, "DROP TRIGGER hold_prepared ON td_mta.submission_attempts; DROP FUNCTION public.hold_prepared()");
 }
 
 // Account A's deferred COMMIT keeps its row locked after the HTTP worker has

@@ -11,6 +11,7 @@ pub(super) struct AccountState {
     pub retention_first: RetentionStep,
     pub retention_makeup: bool,
     pub repaired: bool,
+    pub dispatch_at: Instant,
 }
 // Only a complete empty pass increases the wait; no lease or custody lives here.
 struct IdlePause(Duration);
@@ -297,6 +298,7 @@ pub(super) fn run(
             retention_first: RetentionStep::Retire,
             retention_makeup: false,
             repaired: false,
+            dispatch_at: Instant::now(),
         });
     }
     let registry = Registry {

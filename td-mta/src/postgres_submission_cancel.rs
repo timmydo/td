@@ -533,9 +533,13 @@ fn publish_inner(
                 let changed = next.to_be_bytes();
                 let changed = changed.as_slice();
                 if plan.changed {
+                    // A Prepared connection may still owe its route an AUTH/TLS
+                    // result. Completion fences transport; recovery releases custody.
+                    client.execute("UPDATE td_mta.submission_attempts a SET active=false WHERE account=$1 AND submission_id=$2 AND active AND (NOT $3 OR
+                        NOT EXISTS(SELECT 1 FROM td_mta.route_owners o WHERE o.account=a.account AND o.route_name=a.route_name AND o.destination=a.destination AND o.generation=a.generation AND o.owner_boot=a.owner_boot AND o.operation=a.owner_operation)
+                        OR EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.account=a.account AND r.submission_id=a.submission_id AND r.attempt_id=a.attempt_id AND (r.state<>2 OR r.phase<>1)))", &[&account,&submission,&value.frontend()]).await.map_err(|_|Error::Database)?;
                     if client.execute("UPDATE td_mta.recipients SET state=6,uncertain=0,phase=CASE WHEN attempt_count=0 THEN 0 ELSE 4 END,next_attempt_at=NULL,reason=7,changed=$3 WHERE account=$1 AND submission_id=$2", &[&account,&submission,&changed]).await.map_err(|_|Error::Database)? != u64::from(before.recipient_count) { return Err(Error::Integrity); }
                     if client.execute("UPDATE td_mta.submissions SET changed=$3,completed_at=$4 WHERE account=$1 AND id=$2", &[&account,&submission,&changed,&plan.completed_at]).await.map_err(|_|Error::Database)? != 1 { return Err(Error::Integrity); }
-                    client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND submission_id=$2 AND active", &[&account,&submission]).await.map_err(|_|Error::Database)?;
                     client
                         .execute(
                             "INSERT INTO td_mta.changes VALUES($1,$2,0,5,2,$3)",

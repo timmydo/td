@@ -852,7 +852,7 @@ fn publish_inner(
             let account_id = binding.account();
             let account = account_id.as_bytes().as_slice();
             let attempt = value.attempt.as_bytes().as_slice();
-            let rows = client.query("SELECT submission_id,ordinals FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND generation=$5 AND owner_boot=$6 AND owner_operation=$7 AND active FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            let rows = client.query("SELECT submission_id,ordinals FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND generation=$5 AND owner_boot=$6 AND owner_operation=$7 AND active AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=$1 AND s.id=td_mta.submission_attempts.submission_id AND s.completed_at IS NULL) FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
             let row = rows.first().ok_or(Error::Missing)?;
             let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
             let encoded: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;

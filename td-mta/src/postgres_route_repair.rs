@@ -178,11 +178,7 @@ pub fn publish(
             }
             let account = binding.account();
             let account = account.as_bytes().as_slice();
-            health::expire_receipts(client, &value.claim, timestamp).await?;
-            let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health_receipts WHERE account=$1 LIMIT 1024) r", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-            if count >= 1024 {
-                return Err(Error::Capacity);
-            }
+            health::reserve_write(client, &value.claim, timestamp, false).await?;
             let old = state.revision;
             state.revision = old.checked_add(1).ok_or(Error::Capacity)?;
             state.repair_generation = None;

@@ -28,6 +28,7 @@ const OLD: u8 = 0x14;
 const FOREIGN: u8 = 0x15;
 const ACCOUNT: u8 = 0x20;
 const RECOVERY: u8 = 0x30;
+const HEALTH_FILLER: u8 = 0x31;
 
 fn hex(tag: u8, n: i64) -> String {
     format!("{PREFIX}{tag:02x}{n:016x}")
@@ -351,6 +352,42 @@ pub(super) fn exercise(
     assert_eq!(attempts_of(FOREIGN), 2);
     assert_eq!(receipted(fixture, FOREIGN, 1, 2), 2 * PER_ATTEMPT);
     assert_eq!(recipients(), held);
+
+    // Fill the health ledger with unprotected receipts so the next dispatch
+    // sweeps under pressure. The final reservation still owns its receipt.
+    let filler = series(HEALTH_FILLER);
+    sql(
+        fixture,
+        &format!(
+            "INSERT INTO td_mta.route_health_receipts
+             SELECT account,{filler},request_digest,route_name,destination,action,
+                    old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation
+             FROM td_mta.route_health_receipts
+             CROSS JOIN generate_series(1,1024-(SELECT count(*) FROM td_mta.route_health_receipts WHERE account={account})) n
+             WHERE account={account} AND operation={}",
+            id(RESERVED, 1)
+        ),
+    );
+    assert_eq!(
+        count(
+            fixture,
+            &format!("td_mta.route_health_receipts WHERE account={account}")
+        ),
+        1024
+    );
+    let outcome = publish().unwrap();
+    assert_eq!(receipted(fixture, RESERVED, 1, 1), PER_ATTEMPT);
+    assert_eq!(
+        count(
+            fixture,
+            &format!(
+                "td_mta.route_health_receipts WHERE operation={}",
+                id(HEALTH_FILLER, 1)
+            )
+        ),
+        0
+    );
+    retire(&outcome);
     owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
 
     // Later fixtures see none of these rows.

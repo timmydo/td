@@ -42,6 +42,7 @@ enum LivePhase {
 pub enum Error {
     Admission(ports::Error),
     Publication(attempts::Error),
+    Body(attempts::ReadError),
     Phase(phases::Error),
     Recovery(recovery::Error),
     RouteFailure(health::Error),
@@ -651,12 +652,13 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
     }
 
     /// Classify the verified immutable body before MAIL without renewing the
-    /// Prepared limit. The same source will be reopened for DATA after 354.
+    /// Prepared limit. A canceled submission has no outgoing body mode.
+    /// The same source will be reopened for DATA after 354.
     pub(crate) fn body_mode(
         &self,
         maximum: u64,
         meter: &mut Meter,
-    ) -> Result<crate::smtp_data_encode::Body, Error> {
+    ) -> Result<Option<crate::smtp_data_encode::Body>, Error> {
         let bytes = maximum
             .checked_mul(3)
             .and_then(|n| n.checked_add(ATTEMPT_IO))
@@ -672,7 +674,7 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        attempts::with_body(
+        match attempts::with_body(
             self.worker.connection.request,
             self.worker.connection.trust,
             limit,
@@ -713,8 +715,11 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
                 }
                 Ok(mode)
             },
-        )
-        .map_err(|_| Error::Admission(ports::Error::Corrupt))
+        ) {
+            Ok(mode) => Ok(Some(mode)),
+            Err(attempts::ReadError::Attempt(attempts::Error::Canceled)) => Ok(None),
+            Err(error) => Err(Error::Body(error)),
+        }
     }
 
     /// Bind the first untouched envelope and its observed cap to this owner.

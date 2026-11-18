@@ -106,11 +106,94 @@ pub(super) fn exercise(
         fixture,
         &format!("UPDATE td_mta.route_health SET revision=decode('{revision}','hex')"),
     );
+    // A competing repair cannot spend the final receipt of an outstanding
+    // attempt. A settled failure releases the reservation even while retained.
+    let active = sql(
+        fixture,
+        "SELECT encode(attempt_id,'hex') FROM td_mta.submission_attempts WHERE active",
+    );
+    sql(fixture, "CREATE TABLE public.saved_fence AS SELECT attempt_id,owner_boot,owner_operation,generation FROM td_mta.submission_attempts WHERE active; UPDATE td_mta.submission_attempts a SET owner_boot=o.owner_boot,owner_operation=o.operation,generation=o.generation FROM td_mta.route_owners o WHERE a.active AND o.account=a.account AND o.route_name=a.route_name");
+    sql(fixture, "CREATE TABLE public.saved_health AS SELECT * FROM td_mta.route_health_receipts; DELETE FROM td_mta.route_health_receipts");
+    sql(fixture, "INSERT INTO td_mta.route_health SELECT account,'reserved-'||i,destination,revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health CROSS JOIN generate_series(0,255) i");
+    sql(fixture, "INSERT INTO td_mta.route_health_receipts SELECT h.account,decode(md5(h.route_name||':'||i),'hex'),h.destination,h.route_name,h.destination,2,int8send(i::bigint),int8send(i::bigint+1),h.failure_count,h.reason,h.failed_at,h.next_at,NULL FROM td_mta.route_health h CROSS JOIN generate_series(1,4) i WHERE h.route_name LIKE 'reserved-%' AND NOT(h.route_name='reserved-255' AND i=4)");
     sql(fixture,"CREATE FUNCTION public.reject_repair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=2 THEN RAISE EXCEPTION 'fixture refusal'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_repair BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_repair()");
+    assert_eq!(
+        repair::publish(request, trust, deadline(), &value),
+        Err(Error::Capacity)
+    );
+    sql(fixture, &format!("UPDATE td_mta.submission_attempts a SET active=false,owner_boot=f.owner_boot,owner_operation=f.owner_operation,generation=f.generation FROM public.saved_fence f WHERE a.attempt_id=f.attempt_id AND a.attempt_id=decode('{active}','hex'); DROP TABLE public.saved_fence"));
+    // The accepting owner was replaced before it could reset the route;
+    // its retired receipt cannot require capacity from the current owner.
+    sql(fixture, &format!("INSERT INTO td_mta.attempt_acceptance_receipts SELECT account,attempt_id,4,request_digest,1,old_sequence,new_sequence FROM td_mta.submission_attempts WHERE attempt_id=decode('{active}','hex')"));
     assert_eq!(
         repair::publish(request, trust, deadline(), &value),
         Err(Error::Database)
     );
+    // A still-owned acceptance on a different route occupies the last slot.
+    // Only a completed reset outside the cross-route window can release it.
+    sql(fixture, &format!("UPDATE td_mta.submission_attempts SET active=true WHERE attempt_id=decode('{active}','hex');
+        INSERT INTO td_mta.route_owners SELECT account,'sibling',destination,generation,owner_boot,operation,last_clock,expires_at
+          FROM td_mta.route_owners WHERE route_name='{}';
+        INSERT INTO td_mta.submission_attempts
+          SELECT a.account,decode(repeat('72',16),'hex'),a.request_digest,a.submission_id,o.route_name,o.destination,
+            o.owner_boot,o.operation,o.generation,o.last_clock-1800000,a.ordinals,a.old_sequence,a.new_sequence,false
+          FROM td_mta.submission_attempts a JOIN td_mta.route_owners o ON o.account=a.account
+          WHERE a.attempt_id=decode('{active}','hex') AND o.route_name='sibling';
+        INSERT INTO td_mta.attempt_acceptance_receipts SELECT account,attempt_id,4,request_digest,1,old_sequence,new_sequence
+          FROM td_mta.submission_attempts WHERE route_name='sibling'", loaded.binding().route().name()));
+    let reset = "INSERT INTO td_mta.route_health_receipts SELECT account,attempt_id,request_digest,route_name,destination,3,
+        int8send(1::bigint),int8send(2::bigint),0,0,NULL,NULL,NULL FROM td_mta.submission_attempts WHERE route_name='sibling'";
+    sql(fixture, reset);
+    assert_eq!(
+        repair::publish(request, trust, deadline(), &value),
+        Err(Error::Capacity)
+    );
+    sql(fixture, "UPDATE td_mta.submission_attempts SET prepared_at=prepared_at-3600000 WHERE route_name='sibling';
+        DELETE FROM td_mta.route_health_receipts WHERE route_name='sibling'");
+    assert_eq!(
+        repair::publish(request, trust, deadline(), &value),
+        Err(Error::Capacity)
+    );
+    sql(fixture, reset);
+    assert_eq!(
+        repair::publish(request, trust, deadline(), &value),
+        Err(Error::Database)
+    );
+    // The injected repair refusal rolled back its reclaim. Maintenance commits it independently.
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.submission_attempts WHERE route_name='sibling'"
+        ),
+        "1"
+    );
+    let now = sql(
+        fixture,
+        "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+    )
+    .parse()
+    .unwrap();
+    let reclaimed = td_mta::postgres_submission_retention::reclaim_account(
+        request,
+        trust,
+        deadline(),
+        &claim,
+        grant.generation,
+        now,
+    )
+    .unwrap();
+    assert!(
+        reclaimed > 0,
+        "attempt cleanup schedules another retention round"
+    );
+    assert_eq!(sql(fixture, "SELECT (SELECT count(*) FROM td_mta.submission_attempts WHERE route_name='sibling'),
+        (SELECT count(*) FROM td_mta.route_health_receipts WHERE route_name='sibling'),
+        (SELECT count(*) FROM td_mta.attempt_acceptance_receipts WHERE attempt_id=decode(repeat('72',16),'hex'))"), "0|0|0");
+    sql(
+        fixture,
+        "DELETE FROM td_mta.route_owners WHERE route_name='sibling'",
+    );
+    sql(fixture, &format!("UPDATE td_mta.submission_attempts SET active=true WHERE attempt_id=decode('{active}','hex'); DELETE FROM td_mta.attempt_acceptance_receipts WHERE attempt_id=decode('{active}','hex'); DELETE FROM td_mta.route_health WHERE route_name LIKE 'reserved-%'; DELETE FROM td_mta.route_health_receipts WHERE route_name LIKE 'reserved-%'; INSERT INTO td_mta.route_health_receipts SELECT * FROM public.saved_health; DROP TABLE public.saved_health"));
     assert_eq!(
         sql(
             fixture,

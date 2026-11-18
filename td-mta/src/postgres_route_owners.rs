@@ -312,13 +312,55 @@ fn current(
 /// this long; a selected route's relay renews it every few seconds.
 pub const IDLE_OWNER_MS: i64 = 7 * 24 * 3_600_000;
 
+/// The account and its current or superseded route owner are write-locked.
+pub(crate) async fn release_canceled(
+    client: &Client,
+    claim: &Claim,
+    current_route: Option<&str>,
+) -> Result<u64, Error> {
+    let binding = claim.binding();
+    let account = binding.account();
+    client.execute(
+        "UPDATE td_mta.submission_attempts a SET active=false
+         WHERE a.account=$1 AND a.active AND (
+             a.route_name=$2::text OR ($2 IS NULL AND NOT EXISTS(
+                 SELECT 1 FROM td_mta.route_owners o WHERE o.account=a.account AND o.route_name=a.route_name
+                 AND o.destination=a.destination AND o.owner_boot=a.owner_boot AND o.operation=a.owner_operation AND o.generation=a.generation)))
+         AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=a.account AND s.id=a.submission_id AND s.completed_at IS NOT NULL)
+         AND EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.account=a.account AND r.submission_id=a.submission_id AND r.attempt_id=a.attempt_id AND r.state=6)
+         AND NOT EXISTS(SELECT 1 FROM td_mta.recipients r WHERE r.account=a.account AND r.submission_id=a.submission_id AND r.state<>6)
+         AND NOT EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id)",
+        &[&account.as_bytes().as_slice(), &current_route],
+    ).await.map_err(|_| Error::Database)
+}
+
+/// Under the account write lock, fence expired owners before freeing their
+/// reservations. A wall-clock step cannot restore a cleared operation.
+pub(crate) async fn reclaim_abandoned(
+    client: &Client,
+    claim: &Claim,
+    now: i64,
+) -> Result<u64, Error> {
+    let account = claim.binding().account();
+    let expired = client
+        .execute(
+            "UPDATE td_mta.route_owners SET owner_boot=NULL,operation=NULL,expires_at=NULL
+         WHERE account=$1 AND expires_at<=$2",
+            &[&account.as_bytes().as_slice(), &now],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let canceled = release_canceled(client, claim, None).await?;
+    Ok(expired + canceled)
+}
+
 /// Under the account lock, delete rows of routes no relay is using: owner rows
 /// idle for `IDLE_OWNER_MS`, then health rows no remaining owner row holds,
 /// with their repair receipts. Rows an active attempt or uncompleted submission
 /// names stay, and so does any health row with a repair latch or an unelapsed
 /// backoff. A recreated owner restarts its generation, which fences nothing
 /// old: every fence also compares the random claim operation and boot.
-async fn retire_obsolete(client: &Client, claim: &Claim, now: i64) -> Result<(), Error> {
+pub(crate) async fn retire_obsolete(client: &Client, claim: &Claim, now: i64) -> Result<(), Error> {
     let account = claim.binding.account();
     let account = account.as_bytes().as_slice();
     let route = claim.binding.route();
@@ -422,6 +464,9 @@ pub fn acquire(
             } else {
                 1
             };
+            // A full ledger can prevent this account from obtaining any lease
+            // to run its ordinary upkeep. Reclaim before counting owner slots.
+            reclaim_abandoned(client, &claim, timestamp).await?;
             // A claim replays its receipt only while it has no grant, so one
             // whose first lease ended an hour ago is settled or abandoned.
             let cutoff = timestamp

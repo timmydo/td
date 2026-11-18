@@ -72,7 +72,28 @@ pub fn reclaim_uploads(
     stable_at: i64,
 ) -> Result<u64, Error> {
     run(
-        Step::Reclaim,
+        Step::UploadLeases,
+        request,
+        trust,
+        deadline,
+        claim,
+        generation,
+        stable_at,
+    )
+}
+
+/// Return the number of reclaimed leases, abandoned owners or attempts, and
+/// retired attempts, so the relay runs another round after any progress.
+pub fn reclaim_account(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    claim: &Claim,
+    generation: u64,
+    stable_at: i64,
+) -> Result<u64, Error> {
+    run(
+        Step::AccountResources,
         request,
         trust,
         deadline,
@@ -85,7 +106,8 @@ pub fn reclaim_uploads(
 #[derive(Clone, Copy)]
 enum Step {
     Retire,
-    Reclaim,
+    UploadLeases,
+    AccountResources,
 }
 
 fn run(
@@ -102,7 +124,15 @@ fn run(
         Box::pin(async move {
             match step {
                 Step::Retire => retire_locked(client, &claim, generation, stable_at).await,
-                Step::Reclaim => reclaim_locked(client, &claim, generation, stable_at).await,
+                Step::UploadLeases | Step::AccountResources => {
+                    let (leases, other) =
+                        reclaim_locked(client, &claim, generation, stable_at).await?;
+                    Ok(if matches!(step, Step::UploadLeases) {
+                        leases
+                    } else {
+                        leases + other
+                    })
+                }
             }
         })
     })
@@ -137,7 +167,7 @@ async fn reclaim_locked(
     claim: &Claim,
     generation: u64,
     stable_at: i64,
-) -> Result<u64, Error> {
+) -> Result<(u64, u64), Error> {
     let now = lock(client, claim, generation, stable_at).await?;
     let account = claim.binding().account();
     let leases = crate::postgres_uploads::reclaim(client, account.as_bytes().as_slice(), now)
@@ -148,8 +178,22 @@ async fn reclaim_locked(
             _ => Error::Integrity,
         })?;
     // Nothing reclaimed leaves the transaction to roll back.
-    if leases == 0 {
-        return Ok(0);
+    let abandoned = owners::reclaim_abandoned(client, claim, now)
+        .await
+        .map_err(Error::Owner)?;
+    let retired = crate::postgres_attempt_reclamation::reclaim(
+        client,
+        account.as_bytes().as_slice(),
+        None,
+        now,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::postgres_attempts::Error::Database => Error::Database,
+        _ => Error::Integrity,
+    })?;
+    if leases == 0 && abandoned == 0 && retired == 0 {
+        return Ok((0, 0));
     }
     owners::check_locked(client, claim, generation)
         .await
@@ -158,7 +202,7 @@ async fn reclaim_locked(
         .batch_execute("COMMIT")
         .await
         .map_err(|_| Error::Database)?;
-    Ok(leases)
+    Ok((leases, abandoned + retired))
 }
 
 /// Whether a candidate fits after earlier ones, with `recipients` and
@@ -179,7 +223,7 @@ async fn retire_locked(
     let binding = claim.binding();
     let account_id = binding.account();
     let account = account_id.as_bytes().as_slice();
-    let candidates = client.query("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s", &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
+    let candidates = client.query(concat!("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR ",include_str!("postgres_pending_route_reset.sql")," OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s"), &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
     if candidates.is_empty() {
         return Ok(0);
     }

@@ -32,6 +32,7 @@ pub enum Error {
     Clock(queue_clock::Error),
     Policy,
     Missing,
+    Canceled,
     NotDue,
     Busy,
     Conflict,
@@ -247,7 +248,16 @@ async fn receipt(client: &Client, value: &Dispatch) -> Result<Option<Outcome>, E
 async fn active_receipt(client: &Client, value: &Dispatch) -> Result<Outcome, Error> {
     let outcome = receipt(client, value).await?.ok_or(Error::Missing)?;
     let binding = value.claim.binding();
-    let rows=client.query("SELECT active,owner_boot,owner_operation,generation,route_name,destination FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows = client.query(
+        "SELECT a.active,a.owner_boot,a.owner_operation,a.generation,a.route_name,a.destination,
+            CASE WHEN s.completed_at IS NOT NULL THEN
+                (SELECT bool_and(r.state=6) AND bool_or(r.attempt_id=a.attempt_id)
+                 FROM td_mta.recipients r WHERE r.account=a.account AND r.submission_id=a.submission_id) IS TRUE
+            END
+         FROM td_mta.submission_attempts a JOIN td_mta.submissions s ON s.account=a.account AND s.id=a.submission_id
+         WHERE a.account=$1 AND a.attempt_id=$2",
+        &[&binding.account().as_bytes().as_slice(), &value.attempt.as_bytes().as_slice()],
+    ).await.map_err(|_| Error::Database)?;
     let row = rows.first().ok_or(Error::Missing)?;
     let active: bool = row.try_get(0).map_err(|_| Error::Integrity)?;
     let boot: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -265,6 +275,18 @@ async fn active_receipt(client: &Client, value: &Dispatch) -> Result<Outcome, Er
         || destination != binding.route().destination()
     {
         return Err(Error::Conflict);
+    }
+    if let Some(canceled) = row
+        .try_get::<_, Option<bool>>(6)
+        .map_err(|_| Error::Integrity)?
+    {
+        // The frontend fences transport but leaves its live Prepared owner
+        // to release custody after observing the cancellation.
+        return Err(if canceled {
+            Error::Canceled
+        } else {
+            Error::Integrity
+        });
     }
     Ok(outcome)
 }
@@ -368,10 +390,13 @@ fn publish_inner(
             crate::postgres_attempt_reclamation::reclaim(
                 client,
                 account,
-                binding.route().name(),
+                Some(binding.route().name()),
                 timestamp,
             )
             .await?;
+            crate::postgres_route_health::reserve_write(client, &value.claim, timestamp, true)
+                .await
+                .map_err(Error::RouteHealth)?;
             let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 LIMIT 1024) attempts", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
             if count >= 1024 {
                 return Err(Error::Capacity);

@@ -387,8 +387,28 @@ pub fn publish(
             let row = rows.first().ok_or(Error::Integrity)?;
             let expires: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
             let completed: Option<i64> = row.try_get(1).map_err(|_| Error::Integrity)?;
-            if completed.is_some() || number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old {
+            if number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
+            }
+            if completed.is_some() {
+                // Cancellation already committed the terminal recipients and
+                // change sequence. Release only the retained Prepared custody.
+                let released =
+                    owners::release_canceled(client, &value.claim, Some(binding.route().name()))
+                        .await
+                        .map_err(Error::Owner)?;
+                if released != 1 {
+                    return Err(Error::Integrity);
+                }
+                owners::check_locked(client, &value.claim, value.generation)
+                    .await
+                    .map_err(Error::Owner)?;
+                marker.store(true, Ordering::Relaxed);
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .map_err(|_| Error::Indeterminate)?;
+                return Err(Error::Missing);
             }
             let rows=client.query("SELECT ordinal,uncertain,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
             if rows.is_empty() || rows.len() > 100 {

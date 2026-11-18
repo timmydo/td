@@ -3890,7 +3890,8 @@ The attempt ID is the operation key: preparing it again cannot double-count a
 failure or replace its classification. The request digest binds the claim,
 fence, route, attempt and failure. Historical settlement precedes current-owner
 checks. It remains available after takeover or subsequent health changes while
-its attempt is active; once the attempt is retired, it lasts only until the
+its attempt is active or holds a final reservation. Once the attempt retires
+and releases any final reservation, settlement lasts only until the
 route's next publication (on another route, up to an hour after the attempt
 was prepared; see below).
 
@@ -3910,13 +3911,15 @@ the single active attempt per account/route keeps that ordering across new dispa
 
 Receipt retention is bounded, not a lifetime ledger. Every failure, success
 and repair publication, holding the account write lock and its route, first
-deletes from the account's receipts: the publishing route's failure and
-success receipts whose attempt is retired or gone; another route's whose
-attempt is gone, or retired and prepared more than one hour before the locked
-database time; and all but the four newest repair receipts of each route
-destination, before the publication adds its own. Active attempts keep their
-receipts. Only the route's current owner, holding an unexpired lease, sweeps
-it without margin, and that single-threaded owner settles each operation
+deletes failure and success receipts whose attempt is gone. It deletes
+failure receipts of retired attempts on the publishing route and on other
+routes where the attempt was prepared more than one hour before the locked
+database time. It keeps the four newest repair receipts of each route
+destination before adding its own. Active attempts and attempts
+with a final reservation retain their failure and success receipts during
+every sweep, including pre-dispatch reclamation under capacity pressure.
+Only the route's current owner, holding an unexpired lease, sweeps it
+without margin, and that single-threaded owner settles each operation
 (Pending barrier, FailedPrepared continuation or the success and repair
 retry) before it publishes the next. An owner superseded on its route can
 lose a pending receipt. This relies on the relay stopping on any lease
@@ -3932,15 +3935,35 @@ Attempt rows on another route must outlive that hour after preparation;
 section 218 reclaims the publishing route's retired attempts at once and
 another route's only after it.
 
-Expiry cannot let an attempt change route health twice. Failure needs an
-active attempt of the current owner, so a retired attempt never records a
-failure again. Success needs a retired attempt with final acceptance and
-refuses one prepared before the latest route failure, so repeating an expired
-success only resets an already healthy route once more. The worker reports
+A route-success receipt stays with its accepted attempt until both are
+reclaimed. A live owner that has committed acceptance keeps its evidence
+and its reserved slot until it records the reset. Failure needs an active
+attempt of the current owner, so a retired attempt never records a failure again. The worker reports
 no failure for an accepted attempt; the database does not check that, but a
 later failure refuses success for every attempt prepared before it.
 
-Fresh and retry attempt publication now inspect durable route health under
+Fresh and retry attempt publication reserve space for a health state and
+receipt before SMTP. Under the account write lock, each attempt of a matching route owner
+that is active or has committed final acceptance counts as one receipt
+keyed by its attempt ID, and attempts sharing a
+route name and destination count as one state. A published row with the
+same key occupies that reservation. Explicit repair also counts reserved
+receipts when admitting its own write. When capacity is tight, admission
+reclaims abandoned custody and expires receipts before recounting. An
+account still at capacity waits for room before
+creating an attempt. A full owner ledger delays that account's next claim;
+the relay continues scheduling and renewing other accounts. The ordinary
+failure, success and uncertain-commit settlement run inline while the
+worker still holds custody. If a frontend cancels while a connection is
+in Prepared, submission completion immediately fences its transport. The
+untouched Prepared attempt stays active solely for the connection's
+route-health result and recovery. Recovery releases it after checking the fully canceled group;
+it leaves the cancellation sequence and recipients intact. A replacement
+owner releases the same custody if the original process stopped. Account
+maintenance clears expired owner operations before releasing abandoned
+reservations and canceled custody, including on removed route names.
+
+Fresh and retry attempt publication inspect durable route health under
 those same locks. Backward database time, an outstanding repair latch or a
 future shared retry time refuses new dispatch. Receipt replay remains historical
 and does not acquire new transport authority. The local queue-clock guard and
@@ -4019,7 +4042,8 @@ migration remain private. This increment provides no cancellation API or
 transport fence. The future publisher must lock current policy/account/route,
 reject any Accepted, uncertain or AcceptancePossible recipient, reserve the
 whole mutation before fencing, preserve replies and existing notice/completion
-state, and atomically publish canceled recipients, retired attempts, CHANGE
+state, and atomically publish canceled recipients, attempt custody as
+described in section 123, CHANGE
 and settlement. Already wholly canceled submissions are idempotent successes.
 
 ## 127. Whole-submission cancellation publication
@@ -4046,7 +4070,8 @@ logical transaction capacity and staging memory, not a reservation of physical
 PostgreSQL disk or WAL space. The connection has two MiB aggregate input and
 2048 frames, unchanged per-frame/authentication limits and 128 KiB output.
 
-Publication changes the whole group to Canceled, retires active attempts,
+Publication changes the whole group to Canceled, retires the locally
+fenced owner’s attempt,
 advances the account sequence once and records CHANGE and settlement in the
 same transaction. Actual replies, attempt history, diagnostic text, existing
 completion time and failure-notice state are preserved. Cancellation creates
@@ -4265,8 +4290,8 @@ admissions release account/route locks before replay. After the second
 admission, a fresh check of the original snapshot and deadline precedes the
 callback, so snapshot loss during admission cannot enter it. The callback retains one
 immutable snapshot under the original absolute deadline, even if later
-cancellation retires the attempt. It receives passive metadata and a bounded
-BlobReader, not transport authority: current transport ownership and durable
+cancellation completes the submission and fences the attempt. It receives
+passive metadata and a bounded BlobReader, not transport authority: current transport ownership and durable
 Body/AcceptancePossible phase publications remain prerequisites for SMTP.
 
 The caller reserves connection and body-work capacity. The existing ten-second
@@ -6850,7 +6875,9 @@ recipient validation, attempt retirement, change record and receipt as the
 route-owner API. It can cancel old route destinations belonging to the same
 account. Any Accepted, uncertain or AcceptancePossible recipient refuses the
 whole operation as cannotUnsend. It never promises recall of delivered mail.
-An eligible Prepared or Body attempt becomes inactive in that transaction.
+An untouched Prepared attempt of a matching remote owner retains settlement custody
+as described in section 123. A fenced or progressed attempt becomes
+inactive in the cancellation transaction.
 Every later relay phase/terminator admission uses that same account fence,
 so a remote worker cannot publish AcceptancePossible after cancellation.
 The worker closes on its next failed admission; already buffered partial
@@ -7174,7 +7201,12 @@ stay in the database, never sent to the client; a reclaimed attempt ID is not
 reserved against reuse (fresh IDs are random). The attempt cap is counted
 afterwards, so an account already full recovers on its next publication, and
 each publication reclaims more than it adds, so a backlog drains. A
-publication refused later rolls its reclaim back.
+publication refused later rolls its reclaim back. Under receipt pressure,
+repair also reclaims eligible attempts before admitting its write. Account
+maintenance commits a bounded batch independently from repair or dispatch.
+Maintenance applies the one-hour window to every route. A live owner that
+still owes a health reset keeps its acceptance evidence (section 123),
+including during the longer submission-retention sweep.
 
 Lock order is unchanged: configuration selection FOR SHARE and the account
 row FOR UPDATE (`owners::begin`), the route owner fence, route-health

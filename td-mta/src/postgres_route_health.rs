@@ -197,7 +197,8 @@ pub(crate) const REPAIR_RECEIPTS: i64 = 4;
 /// Caller holds the account write lock and owns the route; `timestamp` is the
 /// locked database time. The owner settles each operation before publishing
 /// the next, so its own route's retired settlement is no longer needed; other
-/// routes keep theirs for the retention margin. Active attempts keep theirs.
+/// routes keep theirs for the retention margin. Active attempts and attempts
+/// with a final reservation keep their health receipts.
 /// A superseded owner that lost a receipt must already be stopping: this
 /// relies on the relay stopping on any lease renewal error and renewing well
 /// inside `LEASE_MS` (POSTGRES.md section 123).
@@ -210,9 +211,115 @@ pub(crate) async fn expire_receipts(
     let cutoff = timestamp
         .checked_sub(RECEIPT_RETENTION_MS)
         .ok_or(Error::Clock)?;
-    client.execute("DELETE FROM td_mta.route_health_receipts r WHERE r.account=$1 AND ((r.action IN (1,3) AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=r.account AND a.attempt_id=r.operation AND (a.active OR (r.route_name<>$2 AND a.prepared_at>=$3)))) OR (r.action=2 AND r.operation NOT IN (SELECT k.operation FROM td_mta.route_health_receipts k WHERE k.account=r.account AND k.route_name=r.route_name AND k.destination=r.destination AND k.action=2 ORDER BY k.new_revision DESC LIMIT $4)))", &[&binding.account().as_bytes().as_slice(),&binding.route().name(),&cutoff,&REPAIR_RECEIPTS]).await.map_err(|_|Error::Database)?;
+    client
+        .execute(
+            "DELETE FROM td_mta.route_health_receipts r WHERE r.account=$1 AND (
+                (r.action IN (1,3)
+                 AND NOT EXISTS (SELECT 1 FROM td_mta.attempt_final_reservations f
+                                 WHERE f.account=r.account AND f.attempt_id=r.operation)
+                 AND NOT EXISTS (SELECT 1 FROM td_mta.submission_attempts a
+                                 WHERE a.account=r.account AND a.attempt_id=r.operation
+                                   AND (a.active OR r.action=3 OR (r.route_name<>$2 AND a.prepared_at>=$3))))
+                OR (r.action=2 AND r.operation NOT IN (
+                    SELECT k.operation FROM td_mta.route_health_receipts k
+                    WHERE k.account=r.account AND k.route_name=r.route_name
+                      AND k.destination=r.destination AND k.action=2
+                    ORDER BY k.new_revision DESC LIMIT $4)))",
+            &[
+                &binding.account().as_bytes().as_slice(),
+                &binding.route().name(),
+                &cutoff,
+                &REPAIR_RECEIPTS,
+            ],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
     Ok(())
 }
+/// Count each reserved key once, including when its health write is visible.
+pub(crate) async fn occupancy(
+    client: &Client,
+    account: &[u8],
+    proposed: Option<(&str, &[u8])>,
+) -> Result<(u64, u64), Error> {
+    let (name, destination) = proposed.unzip();
+    let row = client
+        .query_one(
+            "WITH reserved AS (
+             SELECT a.attempt_id,a.route_name,a.destination FROM td_mta.submission_attempts a
+             JOIN td_mta.route_owners o ON o.account=a.account AND o.route_name=a.route_name
+                 AND o.destination=a.destination AND o.generation=a.generation
+                 AND o.owner_boot=a.owner_boot AND o.operation=a.owner_operation
+             WHERE a.account=$1 AND (a.active OR EXISTS(
+                 SELECT 1 FROM td_mta.attempt_acceptance_receipts f
+                 WHERE f.account=a.account AND f.attempt_id=a.attempt_id AND f.phase=4)))
+         SELECT
+            (SELECT count(*) FROM (
+                SELECT route_name,destination FROM td_mta.route_health WHERE account=$1
+                UNION SELECT route_name,destination FROM reserved
+                UNION SELECT $2::text COLLATE \"C\",$3::bytea WHERE $2 IS NOT NULL
+                LIMIT 1025) states),
+            (SELECT count(*) FROM (
+                SELECT operation FROM td_mta.route_health_receipts WHERE account=$1
+                UNION SELECT attempt_id FROM reserved
+                LIMIT 1025) receipts)",
+            &[&account, &name, &destination],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let count = |column| {
+        let value: i64 = row.try_get(column).map_err(|_| Error::Integrity)?;
+        u64::try_from(value).map_err(|_| Error::Integrity)
+    };
+    Ok((count(0)?, count(1)?))
+}
+
+/// Hold the account write lock until the new attempt or repair receipt commits.
+pub(crate) async fn reserve_write(
+    client: &Client,
+    claim: &Claim,
+    timestamp: i64,
+    for_attempt: bool,
+) -> Result<(), Error> {
+    let binding = claim.binding();
+    let account = binding.account();
+    let route = binding.route();
+    let proposed = for_attempt.then_some((route.name(), route.destination().as_slice()));
+    for after_reclaim in [false, true] {
+        // An ordinary dispatch preserves the remaining settlement history.
+        // Repair has always swept receipts; dispatch sweeps only for room.
+        if !for_attempt || after_reclaim {
+            expire_receipts(client, claim, timestamp).await?;
+        }
+        let (states, receipts) = occupancy(client, account.as_bytes(), proposed).await?;
+        if (!for_attempt || states <= 1024) && receipts < 1024 {
+            return Ok(());
+        }
+        if !after_reclaim {
+            owners::reclaim_abandoned(client, claim, timestamp)
+                .await
+                .map_err(Error::Owner)?;
+            if !for_attempt {
+                crate::postgres_attempt_reclamation::reclaim(
+                    client,
+                    account.as_bytes().as_slice(),
+                    Some(route.name()),
+                    timestamp,
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_attempts::Error::Database => Error::Database,
+                    _ => Error::Integrity,
+                })?;
+            }
+            owners::retire_obsolete(client, claim, timestamp)
+                .await
+                .map_err(Error::Owner)?;
+        }
+    }
+    Err(Error::Capacity)
+}
+
 async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
     let binding = value.claim.binding();
     let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;

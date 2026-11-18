@@ -214,6 +214,10 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
     }
     for row in accounts {
         let id: &[u8] = row.try_get(0).map_err(|_| ())?;
+        let (health_states, health_receipts) =
+            crate::postgres_route_health::occupancy(client, id, None)
+                .await
+                .map_err(|_| ())?;
         let scope = crate::ids::AccountId::from_bytes(id.try_into().map_err(|_| ())?).to_string();
         for (i, name) in [
             "body_bytes",
@@ -297,6 +301,8 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             ("submission_expiry_receipts", 1024, true),
         ] {
             let used = match table {
+                "route_health" => health_states,
+                "route_health_receipts" => health_receipts,
                 "active_devices" => {
                     let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
                     let row = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND revoked_at IS NULL LIMIT $2) bounded", &[&id, &n]).await.map_err(|_| ())?;

@@ -34,6 +34,7 @@ type Buffers = (Box<[u8; TLS_WIRE_BYTES]>, Box<[u8; TLS_WIRE_BYTES]>);
 #[derive(Debug)]
 pub enum Error {
     Admission(ports::Error),
+    Body(dispatch::Error),
     Database,
     Custody,
     Worker,
@@ -59,6 +60,14 @@ fn meter(until: Deadline) -> Meter {
             ..Default::default()
         },
     )
+}
+const CAPACITY_PAUSE: Duration = Duration::from_secs(5);
+fn log_capacity(control: &Control, stage: crate::observability::RelayStep) {
+    control.log(
+        crate::observability::Kind::RelayStepFailed { stage },
+        None,
+        None,
+    );
 }
 /// Between empty retention passes for one account.
 const RETENTION_PAUSE: Duration = Duration::from_secs(600);
@@ -297,13 +306,17 @@ impl Worker<'_, '_> {
             let repaired = !needed
                 || health(
                     control,
-                    || {
-                        crate::postgres_route_repair::publish(
-                            self.request,
-                            self.trust,
-                            Instant::now() + Duration::from_secs(10),
-                            &value,
-                        )
+                    || match crate::postgres_route_repair::publish(
+                        self.request,
+                        self.trust,
+                        Instant::now() + Duration::from_secs(10),
+                        &value,
+                    ) {
+                        Err(crate::postgres_route_health::Error::Capacity) => {
+                            log_capacity(control, crate::observability::RelayStep::HealthCapacity);
+                            Err(crate::postgres_route_health::Error::RepairRequired)
+                        }
+                        other => other,
                     },
                     || {
                         crate::postgres_route_repair::inspect(
@@ -375,6 +388,9 @@ impl Worker<'_, '_> {
             recover(worker, settlement, control, value)?;
             return Ok(buffers);
         }
+        if Instant::now() < state.dispatch_at {
+            return Ok(buffers);
+        }
         let cap = until(&self.clock, 10_000)?;
         let page = match worker.candidates(
             claim,
@@ -436,6 +452,14 @@ impl Worker<'_, '_> {
                         generation,
                     )?;
                 }
+                Err(dispatch::Error::Publication(
+                    crate::postgres_attempts::Error::RouteHealth(
+                        crate::postgres_route_health::Error::Capacity,
+                    ),
+                )) => {
+                    state.dispatch_at = Instant::now() + CAPACITY_PAUSE;
+                    log_capacity(control, crate::observability::RelayStep::HealthCapacity);
+                }
                 Err(_) => {
                     settle(worker, settlement, control)?;
                 }
@@ -470,7 +494,7 @@ impl Worker<'_, '_> {
             use crate::postgres_submission_retention as retention;
             let run = match step {
                 RetentionStep::Retire => retention::retire,
-                RetentionStep::Uploads => retention::reclaim_uploads,
+                RetentionStep::Uploads => retention::reclaim_account,
             };
             run(
                 self.request,
@@ -585,7 +609,11 @@ impl Worker<'_, '_> {
     ) -> Result<Buffers, Error> {
         let id = prepared.attempt();
         let submission = prepared.outcome().submission;
-        let mode = database(prepared.body_mode(self.maximum, db))?;
+        let Some(mode) = prepared.body_mode(self.maximum, db).map_err(Error::Body)? else {
+            let value = database(recovery::interrupted(claim, generation, id))?;
+            recover(worker, settlement, control, value)?;
+            return Ok(buffers);
+        };
         let mut wire = meter(cap);
         let (mut input, mut first, mut second, mut third, mut command) =
             ([0; 512], [0; 512], [0; 512], [0; 512], [0; 512]);

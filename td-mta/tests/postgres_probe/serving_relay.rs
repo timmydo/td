@@ -20,6 +20,8 @@ pub(super) struct Relay {
     done: Arc<AtomicBool>,
     pub accepted: Arc<AtomicUsize>,
     pub interrupted: Arc<AtomicBool>,
+    pub refuse_auth: Arc<AtomicBool>,
+    pub refuse_mail: Arc<AtomicBool>,
     pub cancel_waiting: Arc<AtomicBool>,
     pub cancel_release: Arc<AtomicBool>,
     pub cancel_closed: Arc<AtomicBool>,
@@ -92,6 +94,10 @@ impl Relay {
         let server_done = done.clone();
         let delivered = accepted.clone();
         let interrupt = interrupted.clone();
+        let refuse_auth = Arc::new(AtomicBool::new(false));
+        let refuse = refuse_auth.clone();
+        let refuse_mail = Arc::new(AtomicBool::new(false));
+        let mail_refusal = refuse_mail.clone();
         let cancel_waiting = Arc::new(AtomicBool::new(false));
         let cancel_release = Arc::new(AtomicBool::new(false));
         let cancel_closed = Arc::new(AtomicBool::new(false));
@@ -143,12 +149,30 @@ impl Relay {
                     line(&mut peer),
                     b"AUTH PLAIN AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n"
                 );
+                let wait_for_cancel = || {
+                    waiting.store(true, Ordering::Release);
+                    let end = Instant::now() + Duration::from_secs(15);
+                    while !release.load(Ordering::Acquire) {
+                        assert!(Instant::now() < end);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                };
+                if refuse.swap(false, Ordering::AcqRel) {
+                    wait_for_cancel();
+                    write(&mut peer, b"535 authentication refused\r\n");
+                    continue;
+                }
                 write(&mut peer, b"235 authenticated\r\n");
                 let mail = line(&mut peer);
                 assert!(
                     mail.starts_with(b"MAIL FROM:<main@example.test>")
                         || (multi && mail.starts_with(b"MAIL FROM:<second@example.test>"))
                 );
+                if mail_refusal.swap(false, Ordering::AcqRel) {
+                    wait_for_cancel();
+                    write(&mut peer, b"550 sender refused\r\n");
+                    continue;
+                }
                 connections += 1;
                 if !multi && connections == 2 {
                     assert!(mail
@@ -229,6 +253,8 @@ impl Relay {
             done,
             accepted,
             interrupted,
+            refuse_auth,
+            refuse_mail,
             cancel_waiting,
             cancel_release,
             cancel_closed,
