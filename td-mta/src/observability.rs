@@ -242,11 +242,6 @@ pub enum Kind {
     ServiceStopped {
         failed: bool,
     },
-    /// A retained uncertain SMTP delivery failed inline settlement; with
-    /// `stopping`, it was held past the backstop and the run stops.
-    ReceivingUnsettled {
-        stopping: bool,
-    },
     BootStarted,
     ConfigActivated,
     ListenerReady {
@@ -300,7 +295,6 @@ impl Kind {
             Self::RelayConnectionFailed { .. } => "relay_connection_failed",
             Self::RelayStepFailed { .. } => "relay_step_failed",
             Self::ServiceStopped { .. } => "service_stopped",
-            Self::ReceivingUnsettled { .. } => "receiving_unsettled",
             Self::BootStarted => "boot_started",
             Self::ConfigActivated => "config_activated",
             Self::ListenerReady { .. } => "listener_ready",
@@ -329,7 +323,6 @@ impl Kind {
             | Self::RelayConnectionFailed { .. }
             | Self::RelayStepFailed { .. }
             | Self::AdmissionRefused { .. }
-            | Self::ReceivingUnsettled { stopping: false }
             | Self::TlsFailed { .. }
             | Self::AuthenticationFailed
             | Self::CertificateRenewalFailed
@@ -337,9 +330,7 @@ impl Kind {
             | Self::RelayOutcome {
                 outcome: Delivery::Retry | Delivery::PermanentFailure | Delivery::Unknown,
             } => Severity::Warning,
-            Self::LogWriteFailed { .. }
-            | Self::ServiceStopped { failed: true }
-            | Self::ReceivingUnsettled { stopping: true } => Severity::Error,
+            Self::LogWriteFailed { .. } | Self::ServiceStopped { failed: true } => Severity::Error,
             Self::RelayPollDeferred
             | Self::Performance { .. }
             | Self::ServiceStopped { failed: false }
@@ -367,7 +358,6 @@ impl Kind {
             | Self::RelayConnectionFailed { .. }
             | Self::RelayStepFailed { .. } => Some("inspect_relay"),
             Self::ServiceStopped { failed: true } => Some("inspect_service"),
-            Self::ReceivingUnsettled { .. } => Some("inspect_recovery"),
             Self::ServiceStopped { failed: false } => None,
             Self::AdmissionRefused { reason } => Some(reason.action()),
             Self::RelayOutcome {
@@ -441,7 +431,6 @@ impl fmt::Display for EventJson<'_> {
                 write!(f, ",\"error\":\"{}\"", notice_error(error))?
             }
             Kind::ServiceStopped { failed } => write!(f, ",\"failed\":{failed}")?,
-            Kind::ReceivingUnsettled { stopping } => write!(f, ",\"stopping\":{stopping}")?,
             Kind::RelayStepFailed { stage } => write!(f, ",\"stage\":\"{}\"", stage.code())?,
             Kind::RelayConnectionFailed { stage, error } => write!(
                 f,
@@ -738,8 +727,6 @@ mod tests {
             },
             Kind::ServiceStopped { failed: false },
             Kind::ServiceStopped { failed: true },
-            Kind::ReceivingUnsettled { stopping: false },
-            Kind::ReceivingUnsettled { stopping: true },
             Kind::RelayPollDeferred,
             Kind::RelayStepFailed {
                 stage: RelayStep::IdlePoll,
@@ -1050,12 +1037,6 @@ mod tests {
             Kind::ServiceStopped { failed: false } => ("service_stopped", "info", "[]"),
             Kind::ServiceStopped { failed: true } => {
                 ("service_stopped", "error", "[\"inspect_service\"]")
-            }
-            Kind::ReceivingUnsettled { stopping: false } => {
-                ("receiving_unsettled", "warning", "[\"inspect_recovery\"]")
-            }
-            Kind::ReceivingUnsettled { stopping: true } => {
-                ("receiving_unsettled", "error", "[\"inspect_recovery\"]")
             }
             Kind::RelayConnectionFailed { .. } => {
                 ("relay_connection_failed", "warning", "[\"inspect_relay\"]")

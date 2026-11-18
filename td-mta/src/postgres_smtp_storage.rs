@@ -12,12 +12,10 @@ use crate::{
     postgres_smtp_receiving::{self as owner, Receiving},
     smtp_storage::{Begin, Commits, Completion, Failure, Job, Storage},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     net::IpAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, TryLockError,
-    },
+    sync::{Arc, Mutex, TryLockError},
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -27,9 +25,6 @@ pub struct Backend<'a> {
     clock: Arc<RuntimeClock>,
     generation: u64,
     admitted: Admissions,
-    // Set only by the settlement backstop (POSTGRES.md section 104).
-    stopped: AtomicBool,
-    unsettled: AtomicBool,
     session: Mutex<SessionState<'a>>,
 }
 struct SessionState<'a> {
@@ -63,8 +58,6 @@ impl<'a> Backend<'a> {
             clock,
             generation,
             admitted: Admissions::new(),
-            stopped: AtomicBool::new(false),
-            unsettled: AtomicBool::new(false),
             session: Mutex::new(SessionState {
                 owner: None,
                 connection: None,
@@ -124,24 +117,6 @@ impl Backend<'_> {
             return Err(Error::Invalid.into());
         }
         state.owner = Some(owner);
-        // Settle a retained delivery before this session holds a foreground
-        // slot; the uncertain delivery's own session closed on its error.
-        if self.owner.pending.operation()?.is_some() {
-            state.close(deadline);
-            if let Err(error) = self.owner.settle_retained(deadline, meter) {
-                match error {
-                    owner::Error::Admission(Error::WriterStopped) => {
-                        self.unsettled.store(true, Ordering::Release);
-                        self.stopped.store(true, Ordering::Release);
-                    }
-                    owner::Error::Admission(Error::Busy) => {
-                        self.unsettled.store(true, Ordering::Release);
-                    }
-                    _ => (),
-                }
-                return Err(error);
-            }
-        }
         if state
             .connection
             .as_ref()
@@ -308,20 +283,12 @@ impl<'b> Storage for Backend<'b> {
     fn capacity(&self) -> u64 {
         self.owner.binding.upload_maximum().min(32 * 1024 * 1024) as u64
     }
-    /// A lost COMMIT does not stop the adapter; only a retained delivery that
-    /// still cannot settle past the backstop does (POSTGRES.md section 104).
     fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-    }
-    fn take_unsettled(&self) -> bool {
-        self.unsettled.swap(false, Ordering::AcqRel)
+        false
     }
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error> {
         if self.owner.binding_for(account).is_none() {
             return Err(Error::Forbidden);
-        }
-        if self.stopped() {
-            return Err(Error::WriterStopped);
         }
         self.owner.ready(deadline).map_err(owner_error)
     }
@@ -352,9 +319,6 @@ impl<'b> Storage for Backend<'b> {
         {
             return Err(Failure::Refused(Error::Invalid));
         }
-        if self.stopped() {
-            return Err(Failure::Refused(Error::WriterStopped));
-        }
         let permit = self.admitted.acquire(input.peer)?;
         let limits = self.owner.binding.work();
         let maximum = input.session.incoming_limit();
@@ -380,10 +344,6 @@ impl<'b> Storage for Backend<'b> {
                 ..Charge::default()
             },
         )?;
-        self.with_session(input.deadline, &mut meter, |session, cap, _| {
-            self.owner.ready_cached(session, cap)
-        })
-        .map_err(|error| Failure::Refused(owner_error(error)))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(maximum)
@@ -439,6 +399,14 @@ impl<'b> Storage for Backend<'b> {
             encoded.truncate(length);
             account_recipients.push((recipient.account, encoded));
         }
+        self.with_session(input.deadline, &mut meter, |session, cap, _| {
+            self.owner.ready_cached(
+                session,
+                account_recipients.iter().map(|(account, _)| *account),
+                cap,
+            )
+        })
+        .map_err(|error| Failure::Refused(owner_error(error)))?;
         let time = self.clock.sample().map_err(Failure::Refused)?;
         charge(&self.clock, &mut meter, Charge::default())?;
         Ok(Delivery {
@@ -465,9 +433,6 @@ impl<'b> Storage for Backend<'b> {
 }
 impl Delivery<'_, '_> {
     fn write_inner(&mut self, bytes: &[u8]) -> Result<(), Failure> {
-        if self.backend.stopped() {
-            return Err(Failure::Refused(Error::WriterStopped));
-        }
         if !matches!(self.stage, Stage::Writing) || bytes.len() > 1000 || bytes.is_empty() {
             return Err(Failure::Refused(Error::Invalid));
         }
@@ -505,9 +470,6 @@ impl Job for Delivery<'_, '_> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        if self.backend.stopped() {
-            return Err(Failure::Refused(Error::WriterStopped));
-        }
         if !matches!(self.stage, Stage::Writing) {
             return Err(Failure::Refused(Error::Conflict));
         }
@@ -527,9 +489,6 @@ impl Job for Delivery<'_, '_> {
         let Stage::Prepared(deadline) = self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
-        if self.backend.stopped() {
-            return Err(Failure::Refused(Error::WriterStopped));
-        }
         self.stage = Stage::Done;
         charge(
             &self.backend.clock,
@@ -601,7 +560,7 @@ impl Job for Delivery<'_, '_> {
                     outcome: commits.map_err(CommitFailure::Indeterminate),
                 })
             }
-            // The owner retains the operation; the next job settles it.
+            // The uncertain session is discarded; SMTP can retry the delivery.
             Err(owner::Error::Publication(postgres_receiving::Error::Indeterminate)) => {
                 Ok(Completion {
                     outcome: Err(CommitFailure::Indeterminate(Error::Busy)),

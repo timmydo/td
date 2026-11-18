@@ -78,7 +78,6 @@ object_ids!(
     EmailOperationId,
     UploadOperationId,
     DraftOperationId,
-    ReceivingOperationId,
     SubmissionOperationId,
     SubmissionExpiryId,
     SubmissionCancelId,

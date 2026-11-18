@@ -64,19 +64,7 @@ pub(super) fn exercise(
     };
     let first = prepare();
     assert_eq!(first.count(), 2);
-    assert_eq!(
-        receiving::inspect_fanout(request, trust, deadline(), &first).unwrap(),
-        None
-    );
-    let (left, right) = std::thread::scope(|scope| {
-        let left = scope.spawn(|| receiving::publish_fanout(request, trust, deadline(), &first));
-        let right = scope.spawn(|| receiving::publish_fanout(request, trust, deadline(), &first));
-        (
-            left.join().unwrap().unwrap(),
-            right.join().unwrap().unwrap(),
-        )
-    });
-    assert_eq!(left, right);
+    let left = receiving::publish_fanout(request, trust, deadline(), &first).unwrap();
     assert_eq!(
         left.accounts
             .iter()
@@ -120,12 +108,8 @@ pub(super) fn exercise(
         Err(receiving::Error::Quota)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
-    assert_eq!(
-        receiving::inspect_fanout(request, trust, deadline(), &fresh).unwrap(),
-        None
-    );
     sql(fixture, &format!("UPDATE td_mta.account_usage SET body_bytes={used} WHERE account=decode(repeat('cc',16),'hex')"));
-    sql(fixture, "CREATE FUNCTION public.delay_multi_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_multi_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_multi_receiving()");
+    sql(fixture, "CREATE FUNCTION public.delay_multi_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_multi_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_multi_receiving()");
     assert_eq!(
         receiving::publish_fanout(
             request,
@@ -138,17 +122,9 @@ pub(super) fn exercise(
     std::thread::sleep(std::time::Duration::from_secs(9));
     sql(
         fixture,
-        "DROP TRIGGER delay_multi_receiving ON td_mta.receiving_receipts",
+        "DROP TRIGGER delay_multi_receiving ON td_mta.emails",
     );
-    let settled = receiving::inspect_fanout(request, trust, deadline(), &fresh)
-        .unwrap()
-        .unwrap();
-    assert_eq!(settled.accounts.len(), 2);
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
-    assert_eq!(
-        receiving::publish_fanout(request, trust, deadline(), &fresh).unwrap(),
-        settled
-    );
     // Two account-scoped copies exceed the old single-upload 40-MiB wire cap.
     let mut bytes = b"Subject: Large fanout\r\n\r\n".to_vec();
     let mut line = vec![b'x'; 998];
@@ -197,7 +173,7 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
     use std::io::{BufRead, BufReader, Write};
     let stream = std::net::TcpStream::connect(address).unwrap();
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
         .unwrap();
     stream
         .set_write_timeout(Some(std::time::Duration::from_secs(10)))
@@ -237,7 +213,6 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
                 "Subject: SMTP fanout\r\n\r\nBoth local accounts\r\n.\r\n",
                 "250",
             ),
-            ("QUIT\r\n", "221"),
         ]
         .into_iter()
         .map(|(line, code)| (line.to_owned(), code)),
@@ -252,4 +227,50 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
         if many { "24" } else { "8" }
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE (account=decode(repeat('aa',16),'hex') AND address NOT IN ('main@example.test','alias@example.test')) OR (account=decode(repeat('cc',16),'hex') AND address<>'second@example.test')"), "0");
+    if many {
+        // Sequence increments are visible even while A's deferred trigger holds COMMIT.
+        sql(fixture, "CREATE SEQUENCE public.release_smtp_commit; GRANT SELECT ON SEQUENCE public.release_smtp_commit TO mail_runtime;
+            CREATE FUNCTION public.extend_smtp_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM set_config('statement_timeout','70s',true);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER extend_smtp_commit BEFORE INSERT ON td_mta.emails
+            FOR EACH ROW WHEN (NEW.account=decode(repeat('aa',16),'hex'))
+            EXECUTE FUNCTION public.extend_smtp_commit();
+            CREATE FUNCTION public.hold_smtp_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                FOR i IN 1..600 LOOP
+                    IF (SELECT is_called FROM public.release_smtp_commit) THEN RETURN NEW; END IF;
+                    PERFORM pg_sleep(0.1);
+                END LOOP;
+                RAISE EXCEPTION 'SMTP fixture release timed out';
+            END $$;
+            CREATE CONSTRAINT TRIGGER hold_smtp_commit AFTER INSERT ON td_mta.emails
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.account=decode(repeat('aa',16),'hex'))
+            EXECUTE FUNCTION public.hold_smtp_commit()");
+        for (recipient, expected) in [("main@example.test", "451"), ("second@example.test", "250")]
+        {
+            for (line, code) in [
+                ("MAIL FROM:<sender@example.test>\r\n".to_string(), "250"),
+                (format!("RCPT TO:<{recipient}>\r\n"), "250"),
+                ("DATA\r\n".to_string(), "354"),
+                (
+                    "Subject: independent delivery\r\n\r\nbody\r\n.\r\n".to_string(),
+                    expected,
+                ),
+            ] {
+                stream.get_mut().write_all(line.as_bytes()).unwrap();
+                stream.get_mut().flush().unwrap();
+                reply(&mut stream, code);
+            }
+        }
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "25");
+        sql(fixture, "SELECT nextval('public.release_smtp_commit')");
+        sql(fixture, "DROP TRIGGER hold_smtp_commit ON td_mta.emails");
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "26");
+    }
+    stream.get_mut().write_all(b"QUIT\r\n").unwrap();
+    stream.get_mut().flush().unwrap();
+    reply(&mut stream, "221");
 }

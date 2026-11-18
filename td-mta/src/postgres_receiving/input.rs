@@ -27,7 +27,6 @@ pub(super) struct Provenance {
     pub ehlo: String,
     pub reverse: String,
     pub recipients: Vec<String>,
-    pub encoded: Vec<u8>,
     pub received_at: i64,
 }
 
@@ -217,13 +216,7 @@ pub(super) fn provenance(
         received_at: message.received_at,
         origin: EmailOrigin::Smtp(message.receipt),
     });
-    let size = row.encoded_len().map_err(|_| Error::Integrity)?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(size)
-        .map_err(|_| Error::Capacity)?;
-    encoded.resize(size, 0);
-    row.encode(&mut encoded).map_err(|_| Error::Integrity)?;
+    row.encoded_len().map_err(|_| Error::Integrity)?;
     let mut recipients = Vec::new();
     for address in message
         .receipt
@@ -245,7 +238,6 @@ pub(super) fn provenance(
         ehlo: copy(message.receipt.ehlo)?,
         reverse: copy(message.receipt.reverse_path)?,
         recipients,
-        encoded,
         received_at: message.received_at,
     })
 }

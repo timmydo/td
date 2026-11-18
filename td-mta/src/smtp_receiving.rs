@@ -1056,8 +1056,6 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     .map(|entry| entry.sequence),
                             );
                         }
-                        // An uncertain publication stays retained by storage
-                        // and answers 451; only an explicit stop fails the run.
                         if completion.stop {
                             control.fail();
                             // A committed outcome the reply cannot describe
@@ -1180,15 +1178,6 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 network.committed(Err(CommitFailure::Rejected(error)), self.clock.as_ref())?
             }
             Work::Tls => return Err(Error::Conflict),
-        }
-        if self.storage.take_unsettled() {
-            control.log(
-                crate::observability::Kind::ReceivingUnsettled {
-                    stopping: self.storage.stopped(),
-                },
-                None,
-                None,
-            );
         }
         if self.storage.stopped() {
             control.fail();

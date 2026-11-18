@@ -196,7 +196,7 @@ transparently replaced halfway through a response. End incomplete output
 rather than splice a different snapshot into it. Download digest verification
 and byte replay retain the same immutable blob and snapshot.
 
-Every potentially ambiguous publication has a random operation ID and a
+A publication that supports internal recovery has a random operation ID and a
 request digest, recorded transactionally with its result. On lost COMMIT
 response, discard the connection and resolve that operation on the primary.
 Reexecution uses the same ID under a unique-key/transaction fence, so a still
@@ -2003,9 +2003,9 @@ Message-ID/References/In-Reply-To selection used by receiving. Its
 charges are unchanged. The module grants no recipient, gateway or publication
 authority and performs no database access. PostgreSQL receiving owns publication and runtime authorization.
 
-## 46. Retained SMTP receiving publication
+## 46. Atomic inbound SMTP publication
 
-Schema version 13 adds `receiving_receipts`. The owner-side `postgres_receiving`
+The owner-side `postgres_receiving`
 adapter prepares completed decoded DATA outside its write transaction. The
 trusted connection owner supplies envelope/socket facts and must already have
 admitted the peer, gateway and recipient routes under the selected profile.
@@ -2019,63 +2019,23 @@ root identifiers and keep body bytes unchanged. The header scanner borrows the a
 field-name bytes that become body consume work but no extra header backing
 or recognized-header allowance. Original work/deadline limits
 cover filtering and identifier replay. Input reserves the trace allowance
-within the message ceiling. Prepared bytes, IDs, provenance and the request
-digest remain immutable across retries; no network input occurs under a lock.
+within the message ceiling. The worker prepares bytes, IDs and envelope provenance before taking any database lock.
 
 Publication takes the configuration share lock before the account write lock,
 rechecks epoch and selected profile generation, and requires its receiving
 role. It resolves exactly one Inbox, selects the thread using the shared draft
 anchor lookup, and publishes body chunks, SMTP provenance and ordered envelope
 recipients, one unread/unstarred Email, membership, anchor, history, shared
-quota effects and the operation receipt in one synchronous transaction.
-Each delivery advances account state once; repeated envelope recipients still
-produce one Email. Body and blob quotas are charged once. Receipts survive
-deletion of the delivered Email and are kept for at least one minute, measured
-by the database clock that stamped them. Each publication samples that clock
-once, stamps its receipt with it and, under its account write lock, first
-deletes only that account's receipts older than one minute before the sample.
-It then refuses with Capacity only while 16,384 younger receipts remain.
+quota effects in one synchronous transaction. Each delivery advances account
+state and charges body and blob quotas once per target account. Repeated
+envelope recipients for an account produce one Email.
 
-Retention is short so the ledger cannot be used to deny service. Receiving
-admission bounds concurrent sessions, per-peer DATA jobs and each peer key's
-accepted-mail rate (DESIGN.md section 9), but many peers together can still
-drive an account's receipt count; a full ledger may
-refuse that account's mail only while more than 16,384 deliveries arrive
-within one minute, and for at most a minute after they stop. That rate is at
-or beyond what the single publication worker sustains for every account, so
-the ledger is not the binding ingest limit; body and blob quotas remain an
-account's real exposure to flooding. A minute is six publication phase
-deadlines (ten seconds each), and an operation identity is random per
-prepared delivery, so a receipt never dedupes a sender's retry; only
-in-process settlement of that one delivery needs it. An idle account keeps
-expired receipts until its next publication; capacity inspection counts only
-unexpired ones. Receipts stamped while the clock ran ahead expire once it
-catches up. No operator procedure is needed for receipts left by an older
-binary.
-
-Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
-account publisher and uses the retained operation/digest; known success stays
-success after policy replacement. This is internal delivery recovery, not
-cross-session SMTP deduplication. A retry of an operation, and any
-settlement after restart, must finish within one minute of its publication
-attempt. Today publish inspects and writes within its own ten-second
-deadline, an indeterminate commit stays with the in-process owner (section
-104), and no durable custody carries an operation across restart; restart
-custody must keep that bound, so after a database outage or failover longer
-than a minute it cannot rely on the receipt and must keep the operation
-fenced instead.
-In-process settlement (section 104) needs no such bound: the owner holding
-the uncertain operation refuses every publication in its process, so that
-process's sweep cannot delete the receipt first. A database clock stepped
-forward by more than a minute during a publication can expire its receipt early;
-that only turns a replay into the refusals below, never into a second
-delivery. Once the account's next publication has swept an expired receipt,
-the operation is not replayable: a single delivery inspects as absent and a
-republication refuses with Conflict on its retained Email identity, while a
-fanout may inspect as Integrity because each account expires lazily. A
-database clock stepped backward lengthens a flood refusal by the step.
-Runtime connection/gateway authorization, ingress reservations and
-activation remain runtime integration work.
+Only a confirmed COMMIT permits a final 250. If its acknowledgment is lost,
+discard the database session and return 451. A sender retry is a fresh
+delivery and can duplicate a committed message. New requests can proceed
+as soon as database locks and ordinary worker capacity permit. Schema 43
+drops the schema-13 recovery ledger. This migration preserves message bodies,
+envelope provenance, recipient rows, Inbox membership, history and quota usage.
 
 ## 47. Verified submission input preparation
 
@@ -2952,9 +2912,6 @@ worker and a foreground slot for the whole request, and that slot is
 released before the write takes its own. The write is admitted only if
 settlement empties the owner; otherwise it is refused as busy, except that
 a frontend cancellation reports the settlement failure (section 214).
-SMTP receiving's owner settles the same way (section 104), prepaying one
-connection from the job's meter; its uncached readiness check has no meter
-and is bounded only by the capped deadline.
 The monotonic limit only bounds local admission. Receipt expiry uses database
 time, and another process serving the same account can sweep an expired
 receipt (section 217).
@@ -3422,7 +3379,7 @@ separate requirements.
 
 `postgres_receiving::prepare_with_meter` prepares completed DATA under the
 connection owner's original meter and runtime clock. Header filtering,
-identifier copies, body hashing and request-digest construction share that
+identifier copies and body hashing share that
 allowance. A bounded phase clock cannot extend its deadline. The cold owner
 entry point wraps the same path with profile work limits and a bounded body
 plus 1 MiB metadata output allowance; it does not admit network peers.
@@ -3433,15 +3390,15 @@ Line discovery prepays at most 1001 bytes and a record per turn, retaining
 no unused credit; a missing newline cannot cause a whole-body scan. Existing
 header and output accounting remains separate. Exhaustion stays sticky across
 retries. The caller still owns body and scratch memory admission, gateway and
-recipient authority, publication and durable uncertain-operation custody.
+recipient authority and publication.
 The real PostgreSQL receiving fixture exercises shared-meter exhaustion,
 expiry and successful publication with unchanged provenance and threading.
 
 
 ## 104. Fixed-worker receiving publication ownership
 
-`postgres_smtp_receiving` publishes completed, caller-admitted DATA with one
-retained operation and the original work meter. It validates the receiving
+`postgres_smtp_receiving` publishes completed, caller-admitted DATA under
+the original work meter. It validates the receiving
 profile and configured header/recipient bounds, reserves a foreground
 connection before resolution, and uses runtime-qualified primary connections.
 A ten-second phase and original deadline cover preparation and publication;
@@ -3450,65 +3407,9 @@ count. Known outcomes
 survive later time/accounting refusal. Connection failures before publication
 may try the next bounded resolved address; unknown COMMIT is never replayed.
 
-The fixed owner retains uncertain Delivery bytes, IDs and provenance with the
-endpoint its COMMIT went to: the resolved address of an uncached publication,
-or the endpoint a cached session (section 105) was opened on. It refuses
-another preparation until settled. Settlement inspects only that endpoint,
-never resolving again or falling back, and takes every target account's row
-FOR SHARE, which waits out the old publisher's FOR UPDATE under the 1 s lock
-timeout. A found receipt or the absence of all of them releases the owner;
-any error, Transport included, or a partial set retains it. The owner never
-republishes the operation. `Pending::settle` uses separate connection
-capacity and the ten-second phase.
-
-Absence proves rollback although receipts expire after a minute (section
-46): only a later receiving publication deletes one, under that account's
-write lock, and the held owner refuses every publication in its process, so
-its own sweep cannot remove the receipt first. Another instance selecting a
-profile with the same account (section 1) can sweep it once expired; the
-owner then releases a committed delivery as if it rolled back, which loses
-only the passive outcome: nothing is republished, and the reply already sent
-stands.
-
-The uncertain job answers `451 4.3.0`, as a refused publication does, and
-the service keeps serving. The sender's retry is a new delivery, so it
-duplicates one that did commit: the at-least-once tradeoff every SMTP retry
-already carries, since operation IDs are random per prepared delivery
-(section 46).
-
-The next readiness check or publication that meets a retained delivery
-settles it inline under the owner lock, with the caller's deadline capped at
-three seconds, on a foreground slot it releases before taking its own; a
-publication first prepays one settlement connection (section 79). It
-proceeds only if the owner is then empty, and otherwise refuses as busy, a
-temporary SMTP refusal; JMAP and relay keep serving meanwhile. The cached
-route settles before its session takes a slot, so it never holds two.
-
-A failure that never heals (a pinned endpoint gone after failover, a deleted
-account row, an epoch change, a partial receipt set) would otherwise refuse
-every delivery forever. The owner records when it took custody; once an
-inline settlement fails for a delivery held longer than 30 seconds, it
-returns WriterStopped, the storage adapter stops and the receiving run fails
-as a lost COMMIT used to, so the supervisor's restart releases the fence.
-That is no less safe than before: the restart starts with an empty owner, as
-it always did. Each failed inline settlement logs `receiving_unsettled`, and
-the stopping one sets `stopping` (OBSERVABILITY.md). Until settlement or that
-restart, deliveries get the busy refusal.
-Passive SMTP receipt facts confer no peer, gateway or recipient authority:
-the trusted connection owner still owes those checks.
-
-This remains prepared integration. SMTP ingress/transport wiring, durable
-restart custody, maintenance and runtime integration are not activated.
-The PostgreSQL runtime-role fixture covers known success, rollback, delayed
-COMMIT, refusal while pending, historical settlement, absence clearing
-directly and inline, a rolled-back COMMIT settled by the next delivery, a
-committed one found inline, and stale-policy refusal. The storage fixture
-answers a cached lost COMMIT with 451, refuses a prepared sibling's commit
-as busy while that COMMIT runs, and lets another prepared sibling's commit
-settle the found receipt on one foreground slot and publish. A worker
-fixture with the backstop shortened stops the run when settlement keeps
-failing.
-
+An unconfirmed COMMIT gets 451 and the serving process continues. Each
+subsequent delivery checks its own policy, obtains its own account locks,
+and publishes under its own deadline. The sender controls any retry.
 
 ## 105. SMTP worker storage boundary
 
@@ -3520,15 +3421,10 @@ memory per connection turn, under the same slot ownership and original
 deadline. `Job::write` is bounded and performs no database, filesystem or
 peer I/O; it does not wait on another slot's publication. Routing, TLS,
 retry, fail-stop and shutdown behavior retain their existing fences. A known durable result remains
-separate from cleanup/accounting stop flags. An uncertain publication stops
-neither the adapter nor the serving run until the settlement backstop
-(section 104); a committed account set the reply cannot represent still
-stops the service and closes the connection without a reply. The adapter
-keeps one cached mutation session and its foreground slot across jobs, and
-an uncertain job's error closes it. Before a job's readiness check or
-publication uses a session, the adapter settles a retained delivery (section
-104) under the job's meter and deadline, first closing any cached session so
-that settlement holds the only slot.
+separate from cleanup/accounting stop flags. A committed account set the
+reply cannot represent still stops the service and closes the connection.
+The adapter keeps one cached mutation session and its foreground slot
+across successful jobs. A publication error discards that session.
 
 The foreground service constructs the PostgreSQL adapter behind this
 interface. Its readiness, ingress capacity, authorization fences, contention
@@ -3546,11 +3442,11 @@ Inbox with a valid ID and change sequence. Publication uses the same Inbox
 validator under its account write lock. Readiness writes no mail or receipt
 and does not replace fresh publication authorization or reserve quota.
 
-The owner refuses readiness while an uncertain delivery is retained, reserves
+The owner reserves
 foreground capacity before fresh resolution and retains one ten-second phase
 under the caller's deadline. Errors remain typed; no local fallback or listener
 activation is introduced. The runtime-role PostgreSQL fixture covers success,
-missing Inbox, incoherent Inbox history, stale selection and pending delivery,
+missing Inbox, incoherent Inbox history, stale selection,
 including unchanged account state and absent publication effects.
 
 ## 107. Prepared SMTP DATA storage
@@ -3569,8 +3465,7 @@ waiting in DATA does not hold another sender's permit or the storage worker.
 The original absolute deadline and profile work allowance cover bounded DATA
 copies, receipt metadata, preparation and publication. Admission prepays one
 incoming buffer of at most 32 MiB per admitted job; preparation may retain one
-additional filtered body under the same meter. The single storage worker and
-publication owner serialize preparation and publication. Four full-capacity
+additional filtered body under the same meter. The single storage worker serializes preparation and publication. Four full-capacity
 incoming buffers plus that filtered body have a 160-MiB payload ceiling;
 allocator capacity and native protocol buffers are additional. This finite
 bound is not qualification of the provisional 128-MiB workload RSS goal.
@@ -3583,19 +3478,8 @@ The trusted connection owner still supplies routing and observed peer/TLS
 facts; no gateway authority is inferred from message content.
 
 Known publication yields the account, epoch and sequence required for SMTP's
-final success reply. Unknown COMMIT retains the original operation in the
-publication owner and answers 451; the backend keeps serving (section 104).
-An admitted sibling's publication first settles the retained operation and
-is refused as busy until that succeeds; the backend stops, refusing further
-writes, preparation and publication, only when settlement still fails past
-the 30-second backstop. The foreground service constructs this PostgreSQL
-storage adapter; durable restart custody for uncertain operations remains a separate requirement. The runtime
-PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
-including discarded ingress, sticky refusal, generation/clock mismatch,
-four-job mixed-peer ingress capacity, two-job same-peer capacity,
-release after refusal/discard, success, delayed
-COMMIT, a busy admitted sibling and one that settles then publishes, and
-historical settlement.
+final success reply. An unknown COMMIT receives 451. Another admitted job
+can use the worker and a fresh connection (section 104).
 
 ## 108. Real SMTP worker qualification
 
@@ -3604,19 +3488,16 @@ prepared PostgreSQL storage adapter together on an ephemeral TCP listener.
 Its database-loaded profile supplies routing, resource limits and retained
 TLS policy. The runtime database role supplies readiness and publication.
 The fixture checks the SMTP greeting, envelope admission, DATA and final
-success reply against durable receiving receipts and Email rows. A known
+success reply against committed Email rows. A known
 database rollback produces 451, preserves the ready worker and permits a
 later successful transaction on that connection. A partial DATA sender stays
 paused until another connection has received final success, with exactly that
 second delivery durable before the paused sender completes. Shutdown discards
-two unfinished same-peer DATA jobs, joins the workers and leaves no additional message
-or receipt. A third same-peer DATA attempt receives 451 without 354 while
+two unfinished same-peer DATA jobs, joins the workers and leaves no additional message. A third same-peer DATA attempt receives 451 without 354 while
 the two unfinished jobs remain admitted. These concurrency regressions run
 over plaintext and STARTTLS. Another
 regression holds one admitted job immediately before publication and proves
-that a second job consumes its DATA line before that gate is released. No
-receipt exists for either message until publication proceeds; both final
-successes must correspond to durable receipts.
+that a second job consumes its DATA line before that gate is released. Both final successes must correspond to durable deliveries.
 
 This qualifies the plaintext direct-SMTP transport path in the prepared
 runtime. It does not activate a production PostgreSQL listener, qualify a new
@@ -5239,28 +5120,16 @@ td-mail does for submissions by querying its identity and sendAt interval
 account during the one-minute inspection window. Releasing the local
 slot leaves the original result indeterminate.
 
-SMTP receiving's single owner obeys the same order and treats absence the
-same way (section 104): a fanout publication locks every target account row
-FOR UPDATE before writing receipts and COMMIT, and inspection locks each FOR
-SHARE before reading them. The owner pins the endpoint its COMMIT went to,
-uncached or through the cached session; the uncertain job answers 451, the
-service keeps serving, and the next delivery or readiness check settles
-inline, refusing as busy until it succeeds or, past a 30-second backstop,
-stopping the run so a restart releases the fence. Its one-minute receipts
-outlive the hold, since only a receiving publication sweeps them and the held owner refuses every one in its process.
-
 The proof needs four things this design must keep: every publisher of these
 kinds locks the account row FOR UPDATE before COMMIT and every inspector
 locks it FOR SHARE before reading the receipt; lock and statement timeouts
 surface as errors, which retain custody; all of them use the single pinned
-primary, and an HTTP or SMTP receiving owner inspects only the endpoint it
+primary, and an HTTP owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
 still be pending, beyond the bounded sweeps of sections 52, 120, 123, 216
-and 218 and, by
-another instance serving the same account, section 46's receiving sweep
-(section 104) and the HTTP families' sweeps (section 217).
-Any further sweep of attempt, phase, recovery, expiry, HTTP-family or
-receiving receipts must respect that.
+and 218 and the HTTP families' sweeps by another instance serving the same
+account (section 217). Any further sweep of attempt, phase, recovery,
+expiry or HTTP-family receipts must respect that.
 
 This is a bounded settlement job, not a renewal of any expired transport owner.
 No production scheduler or backend is activated.
@@ -7593,24 +7462,17 @@ bounded connection and transaction, holding the selection and sorted account
 locks. Account count does not multiply authentication connections or extend
 admission deadlines.
 
-`postgres_receiving::Fanout` retains one operation, shared prepared DATA and
+`postgres_receiving::Fanout` uses shared prepared DATA and
 header-anchor storage, and private provenance for at most sixteen accounts.
-Preparation validates the complete recipient partition, sorts account IDs and
-binds every account and its encoded provenance into one request digest. Each
+Preparation validates the complete recipient partition, and sorts account IDs for locking. Each
 account receives only its own recipient metadata. Original body preparation,
 work meter and deadlines remain shared; SQL publication charges body I/O for
 every target before opening the transaction.
 
 Publication locks the current selection, then every account in ID order before
-reading receipts or writing any email. It uses the existing account write path
-for quotas, Inbox, thread, body, history and receiving receipts, and commits
-once after every target succeeds. A quota or Inbox refusal rolls everything
-back. Receipt lookup holds all account locks in the same order and requires
-either all matching receipts or none; a subset or digest mismatch refuses.
-Historical complete receipts remain settlement evidence after selection changes.
-The owner retains the entire operation after an uncertain COMMIT and stops new
-SMTP publication until settlement, which the next delivery attempts inline
-and which the absence of every receipt also completes (section 104). Final
+writing any email. It uses the existing account write path for quotas,
+Inbox, thread, body and history, and commits once after every target succeeds.
+A quota or Inbox refusal rolls everything back. Final
 protocol success verifies that the returned account set exactly covers the
 accepted envelope.
 
@@ -7618,7 +7480,7 @@ The closed fanout driver admits 40 MiB outgoing bytes, 1 MiB incoming bytes
 and 1088 response frames per target account, for at most sixteen accounts.
 These are cumulative transport limits, not resident allocations; the existing
 per-frame, authentication, TLS and ten-second connection limits remain intact.
-Receipt inspection uses the same bounded account-count allowance. The DATA
+The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
 
@@ -7961,16 +7823,16 @@ The backend mutex refuses another thread and never queues a waiter. Jobs carry
 resident DATA and a backend reference, not the connection. Startup readiness
 uses the one-shot path before worker startup. Idle maintenance and shutdown
 retire the connection on the owning worker; its read-slot permit is released
-only after disposal. Independent pending-receipt settlement retains its own
-one-shot capacity.
+only after disposal.
 
 Admission fully qualifies schema, Runtime privileges and the shared session
 migration lock once. Each SQL job begins a fresh READ COMMITTED transaction,
 checks epoch and the current maintenance barrier, and uses the existing current
-configuration, account and Inbox checks. Publication preserves sorted account
-locks, receipt matching before stale-selection rejection, quota enforcement and
-synchronous COMMIT. It performs no separate pre-publication receipt connection:
-matching receipts are checked inside the publication transaction. No transaction
+configuration, account and Inbox checks. Startup checks every bound account.
+Before 354, the worker checks only accounts in the accepted envelope.
+Publication preserves sorted account
+locks, rejects stale selections, enforces quotas and uses synchronous
+COMMIT. No transaction
 or account/policy lock survives between jobs or while DATA arrives.
 
 A session lasts at most 60 seconds and 16 SQL jobs, counting readiness and
@@ -7984,11 +7846,9 @@ These wire-work allowances do not allocate equivalent resident buffers.
 
 Only an observed idle failure before starting a new job may replace the
 connection transparently. Once a job starts, failure does not replay its SQL.
-COMMIT attempted without acknowledged success remains Indeterminate, retains
-Pending custody, stops the backend and emits no final 250. A confirmed COMMIT
-or matching historical receipt remains success even if later rollback,
-deadline, framing completion or retirement fails; such failure discards the
-connection separately. Ordinary refused jobs conservatively retire it. The
+If the worker cannot confirm COMMIT, it discards the connection and returns
+451. The next job can open a fresh connection. A confirmed COMMIT remains
+success even if subsequent connection cleanup fails. Ordinary refused jobs conservatively retire it. The
 next job reuses a connection only after acknowledged transaction termination
 and successful deadline and protocol-window checks. Expiry maintenance and
 clean idle retirement use the existing bounded termination allowance; an

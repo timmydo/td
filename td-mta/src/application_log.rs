@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use td_crypto::{Entropy, SystemEntropy};
 
 const QUEUE: usize = 384;
-const KINDS: usize = 31 + crate::performance::Phase::ALL.len();
+const KINDS: usize = 29 + crate::performance::Phase::ALL.len();
 pub struct Producer {
     sender: SyncSender<Event>,
     clock: Arc<RuntimeClock>,
@@ -208,7 +208,7 @@ fn bucket(kind: Kind) -> usize {
     match kind {
         Kind::SmtpRejected { .. } | Kind::SmtpEnvelopeAddress { .. } => 27,
         Kind::SmtpDataInterrupted { .. } => 28,
-        Kind::Performance { phase, .. } => 31 + phase as usize,
+        Kind::Performance { phase, .. } => 29 + phase as usize,
         Kind::DeliveryNoticeDeferred { .. } => 25,
         Kind::RelayPollDeferred => 26,
         Kind::BootStarted => 0,
@@ -247,8 +247,6 @@ fn bucket(kind: Kind) -> usize {
         Kind::RelayConnectionFailed { .. } => 17,
         Kind::ServiceStopped { failed: false } => 18,
         Kind::ServiceStopped { failed: true } => 23,
-        Kind::ReceivingUnsettled { stopping: false } => 29,
-        Kind::ReceivingUnsettled { stopping: true } => 30,
         Kind::RelayStepFailed { .. } => 19,
     }
 }

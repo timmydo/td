@@ -69,7 +69,6 @@ const TABLES: &[(&str, Access)] = &[
     ("upload_receipts", Access::Mail),
     ("draft_receipts", Access::Mail),
     ("mailbox_create_receipts", Access::Mail),
-    ("receiving_receipts", Access::Mail),
     ("submission_receipts", Access::Mail),
     ("submission_routes", Access::Mail),
     ("route_owners", Access::Mail),

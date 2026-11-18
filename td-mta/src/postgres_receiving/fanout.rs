@@ -1,4 +1,4 @@
-//! One retained SMTP publication spanning all accepted local accounts.
+//! One atomic SMTP publication spanning all accepted local accounts.
 use super::*;
 use crate::{format::row::ReceiptRecipients, ids::AccountId};
 
@@ -8,7 +8,6 @@ pub struct Target<'a> {
 }
 #[derive(Clone)]
 pub struct Fanout {
-    operation: ReceivingOperationId,
     length: u64,
     deliveries: Vec<Delivery>,
 }
@@ -22,9 +21,6 @@ impl Fanout {
             .first()
             .map(|delivery| delivery.binding.epoch())
             .ok_or(Error::Integrity)
-    }
-    pub fn operation(&self) -> ReceivingOperationId {
-        self.operation
     }
     pub fn count(&self) -> usize {
         self.deliveries.len()
@@ -125,106 +121,22 @@ pub fn prepare_fanout(
         };
         deliveries.push(Delivery {
             binding: target.binding.clone(),
-            operation: prepared.operation,
             email: prepared.email,
             blob: prepared.blob,
             new_thread: prepared.new_thread,
             bytes: prepared.bytes.clone(),
             body_digest: prepared.body_digest,
             interpretation: prepared.interpretation.clone(),
-            request_digest: [0; 32],
             message_id: copy(&prepared.message_id)?,
             anchors: prepared.anchors.clone(),
             provenance: input::provenance(&private, prepared.blob, prepared.new_thread)?,
         });
     }
     deliveries.sort_unstable_by_key(|delivery| delivery.binding.account());
-    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
-    for part in [
-        b"td-mta PostgreSQL receiving fanout v1\0".as_slice(),
-        prepared.operation.as_bytes(),
-        &prepared.request_digest,
-        &(deliveries.len() as u64).to_be_bytes(),
-    ] {
-        hash.update(part).map_err(|_| Error::Crypto)?;
-    }
-    for delivery in &deliveries {
-        for part in [
-            delivery.binding.account().as_bytes().as_slice(),
-            &(delivery.provenance.encoded.len() as u64).to_be_bytes(),
-            &delivery.provenance.encoded,
-        ] {
-            charge(&clock, meter, part.len(), 0)?;
-            hash.update(part).map_err(|_| Error::Crypto)?;
-        }
-    }
-    let digest = hash.finish().map_err(|_| Error::Crypto)?;
-    for delivery in &mut deliveries {
-        delivery.request_digest = digest;
-    }
     Ok(Fanout {
-        operation: prepared.operation,
         length: prepared.length(),
         deliveries,
     })
-}
-
-async fn receipts(client: &Client, fanout: &Fanout) -> Result<Option<FanoutOutcome>, Error> {
-    let mut accounts = Vec::new();
-    accounts
-        .try_reserve_exact(fanout.deliveries.len())
-        .map_err(|_| Error::Capacity)?;
-    for delivery in &fanout.deliveries {
-        if let Some(outcome) = receipt(client, delivery).await? {
-            accounts.push((delivery.binding.account(), outcome));
-        }
-    }
-    if accounts.is_empty() {
-        return Ok(None);
-    }
-    if accounts.len() != fanout.deliveries.len() {
-        return Err(Error::Integrity);
-    }
-    Ok(Some(FanoutOutcome { accounts }))
-}
-
-pub fn inspect_fanout(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    fanout: &Fanout,
-) -> Result<Option<FanoutOutcome>, Error> {
-    let fanout = fanout.clone();
-    let result = postgres_probe::with_fanout_client(
-        request,
-        trust,
-        deadline,
-        fanout.count(),
-        move |client| {
-            Box::pin(async move {
-                begin(
-                    client,
-                    &fanout.deliveries.first().ok_or(Error::Integrity)?.binding,
-                )
-                .await?;
-                for delivery in &fanout.deliveries {
-                    client
-                        .query_one(
-                            "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-                            &[&delivery.binding.account().as_bytes().as_slice()],
-                        )
-                        .await
-                        .map_err(|_| Error::Database)?;
-                }
-                receipts(client, &fanout).await
-            })
-        },
-    )
-    .map_err(Error::Connection)?;
-    if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
-    }
-    result
 }
 
 pub fn publish_fanout(
@@ -233,9 +145,6 @@ pub fn publish_fanout(
     deadline: Instant,
     fanout: &Fanout,
 ) -> Result<FanoutOutcome, Error> {
-    if let Some(outcome) = inspect_fanout(request, trust, deadline, fanout)? {
-        return Ok(outcome);
-    }
     let fanout = fanout.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
@@ -248,9 +157,7 @@ pub fn publish_fanout(
             Box::pin(async move {
                 let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
                 begin(client, binding).await?;
-                publish_body(client, &fanout, deadline, &marker)
-                    .await
-                    .map(Publication::outcome)
+                publish_body(client, &fanout, deadline, &marker).await
             })
         },
     );
@@ -261,23 +168,12 @@ pub fn publish_fanout(
     }
 }
 
-pub(crate) enum Publication {
-    Existing(FanoutOutcome),
-    Committed(FanoutOutcome),
-}
-impl Publication {
-    pub(crate) fn outcome(self) -> FanoutOutcome {
-        match self {
-            Self::Existing(value) | Self::Committed(value) => value,
-        }
-    }
-}
 pub(crate) async fn publish_body(
     client: &Client,
     fanout: &Fanout,
     deadline: Instant,
     marker: &AtomicBool,
-) -> Result<Publication, Error> {
+) -> Result<FanoutOutcome, Error> {
     let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
     let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
@@ -286,7 +182,7 @@ pub(crate) async fn publish_body(
     states
         .try_reserve_exact(fanout.deliveries.len())
         .map_err(|_| Error::Capacity)?;
-    // All account locks precede every receipt or publication observation.
+    // Acquire all account locks before writing any delivery.
     // Preparation sorts the targets, independent of envelope RCPT order.
     for delivery in &fanout.deliveries {
         states.push(
@@ -298,9 +194,6 @@ pub(crate) async fn publish_body(
                 .await
                 .map_err(|_| Error::Database)?,
         );
-    }
-    if let Some(outcome) = receipts(client, fanout).await? {
-        return Ok(Publication::Existing(outcome));
     }
     if generation != binding.selection().generation
         || version != Some(binding.selection().version.as_bytes().as_slice())
@@ -322,7 +215,7 @@ pub(crate) async fn publish_body(
         .batch_execute("COMMIT")
         .await
         .map_err(|_| Error::Indeterminate)?;
-    Ok(Publication::Committed(FanoutOutcome { accounts }))
+    Ok(FanoutOutcome { accounts })
 }
 
 /// Check all configured Inboxes under one connection and original deadline.

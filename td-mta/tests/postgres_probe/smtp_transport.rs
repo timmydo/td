@@ -13,7 +13,7 @@ use td_mta::{
     ports::{Clock, Deadline, FlushProgress, IoProgress, Transport},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
-    postgres_smtp_receiving::{Pending, Receiving as Owner},
+    postgres_smtp_receiving::Receiving as Owner,
     postgres_smtp_storage::Backend,
     smtp_receiving::{BoundListener, Control, Receiving, State},
     smtp_storage::{self, Job, Storage},
@@ -92,9 +92,6 @@ impl<B: Storage> Storage for ObservedStorage<'_, B> {
     }
     fn stopped(&self) -> bool {
         self.inner.stopped()
-    }
-    fn take_unsettled(&self) -> bool {
-        self.inner.take_unsettled()
     }
     fn begin(
         &self,
@@ -305,7 +302,7 @@ fn concurrent_data(
     tls: bool,
     clock: Arc<RuntimeClock>,
 ) {
-    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.emails")
         .parse()
         .unwrap();
     let mut slow = connect(fixture, address, tls, clock.clone());
@@ -323,12 +320,12 @@ fn concurrent_data(
         "250",
     );
     assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        sql(fixture, "SELECT count(*) FROM td_mta.emails"),
         (initial + 1).to_string()
     );
     command(&mut slow, b".\r\n", "250");
     assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        sql(fixture, "SELECT count(*) FROM td_mta.emails"),
         (initial + 2).to_string()
     );
     for subject in ["concurrent slow", "concurrent fast"] {
@@ -349,7 +346,7 @@ fn copy_during_publication(
     probe: Arc<CopyProbe>,
 ) {
     let release = ReleaseCopy(probe.clone());
-    let initial: usize = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+    let initial: usize = sql(fixture, "SELECT count(*) FROM td_mta.emails")
         .parse()
         .unwrap();
     let mut held = connect(fixture, address, tls, clock.clone());
@@ -374,14 +371,14 @@ fn copy_during_publication(
         "DATA copy waited behind publication"
     );
     assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        sql(fixture, "SELECT count(*) FROM td_mta.emails"),
         initial.to_string()
     );
     drop(release);
     reply(&mut held, "250");
     command(&mut copying, b".\r\n", "250");
     assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        sql(fixture, "SELECT count(*) FROM td_mta.emails"),
         (initial + 2).to_string()
     );
     command(&mut held, b"QUIT\r\n", "221");
@@ -392,7 +389,6 @@ fn copy_during_publication(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Ending {
     Drain,
-    Backstop,
     Rate,
 }
 
@@ -405,7 +401,6 @@ pub(super) fn exercise(
     tls: bool,
     ending: Ending,
 ) {
-    let backstop = ending == Ending::Backstop;
     let rate = ending == Ending::Rate;
     let address = socket.local_addr().unwrap();
     let loaded = td_mta::postgres_input::Loaded {
@@ -422,12 +417,6 @@ pub(super) fn exercise(
     };
     let clock = Arc::new(RuntimeClock::new());
     let slots = ReadSlots::new(1).unwrap();
-    // The backstop case stops on the first failed settlement.
-    let pending = if backstop {
-        Pending::with_backstop(Duration::ZERO)
-    } else {
-        Pending::default()
-    };
     let storage = Backend::new(
         Owner {
             loaded: &loaded,
@@ -436,7 +425,6 @@ pub(super) fn exercise(
             additional: &[],
             slots: &slots,
             clock: &clock,
-            pending: &pending,
         },
         clock.clone(),
         policies.id().get(),
@@ -532,16 +520,14 @@ pub(super) fn exercise(
             let long_body = format!("{}\r\n..dot\r\n", "b".repeat(8192));
             client.get_mut().write_all(long_header.as_bytes()).unwrap();
             client.get_mut().write_all(long_body.as_bytes()).unwrap();
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "0");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
             command(&mut client, b".\r\n", "250");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
             let preserved = format!("{long_header}{}\r\n.dot\r\n", "b".repeat(8192));
             let hex: String = preserved.bytes().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.blob_chunks WHERE position(decode('{hex}','hex') in bytes)>0")), "1");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"), "0");
-            assert_eq!(pending.operation().unwrap(), None);
 
             if rate {
                 // The second acceptance spends a two-message burst, so a MAIL
@@ -555,7 +541,7 @@ pub(super) fn exercise(
                 assert_eq!(client.read_to_end(&mut rest).unwrap(), 0);
                 // Closing ends the server's drain, so the slot frees promptly.
                 drop(client);
-                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
                 // A new session from the address is greeted, then refused at MAIL.
                 let greeted = Instant::now() + Duration::from_secs(20);
                 let mut again = loop {
@@ -577,61 +563,32 @@ pub(super) fn exercise(
                 };
                 command(&mut again, b"EHLO sender.example.test\r\n", "250");
                 command(&mut again, b"MAIL FROM:<sender@example.test>\r\n", "421 4.7.0");
-                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
                 assert_eq!(control.state(), State::Ready);
                 return;
             }
 
-            if backstop {
-                // A retained delivery that cannot settle past the backstop
-                // stops the run, so a restart releases its fence.
-                sql(fixture, "CREATE FUNCTION public.lose_wire_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'lost'; END $$; CREATE CONSTRAINT TRIGGER lose_wire_commit AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_wire_commit()");
-                envelope(&mut client);
-                command(&mut client, b"Subject: uncertain\r\n\r\nbody\r\n.\r\n", "451");
-                assert_eq!(control.state(), State::Ready);
-                assert!(pending.operation().unwrap().is_some());
-                // Runtime connections now refuse, so settlement keeps failing.
-                sql(fixture, "DROP TRIGGER lose_wire_commit ON td_mta.receiving_receipts; UPDATE td_mta.runtime_barrier SET blocked=true WHERE singleton=true");
-                command(&mut client, b"MAIL FROM:<sender@example.test>\r\n", "250");
-                command(&mut client, b"RCPT TO:<main@example.test>\r\n", "250");
-                command(&mut client, b"DATA\r\n", "4");
-                let failed = Instant::now() + Duration::from_secs(5);
-                while control.state() != State::Failed {
-                    assert!(Instant::now() < failed, "backstop did not fail the run");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                assert!(storage.stopped());
-                assert!(pending.operation().unwrap().is_some());
-                sql(fixture, "UPDATE td_mta.runtime_barrier SET blocked=false WHERE singleton=true");
-                drop(stop);
-                assert!(server.join().unwrap().is_err());
-                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
-                return;
-            }
 
             // A known rollback refuses the transaction without retiring the worker.
-            sql(fixture, "CREATE FUNCTION public.reject_wire_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject'; END $$; CREATE TRIGGER reject_wire_receiving BEFORE INSERT ON td_mta.receiving_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_receiving()");
+            sql(fixture, "CREATE FUNCTION public.reject_wire_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject'; END $$; CREATE TRIGGER reject_wire_receiving BEFORE INSERT ON td_mta.emails FOR EACH ROW EXECUTE FUNCTION public.reject_wire_receiving()");
             envelope(&mut client);
             command(&mut client, b"Subject: refused\r\n\r\nbody\r\n.\r\n", "451");
             assert_eq!(control.state(), State::Ready);
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "1");
-            sql(fixture, "DROP TRIGGER reject_wire_receiving ON td_mta.receiving_receipts");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+            sql(fixture, "DROP TRIGGER reject_wire_receiving ON td_mta.emails");
             envelope(&mut client);
             command(&mut client, b"Subject: after refusal\r\n\r\nbody\r\n.\r\n", "250");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "2");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
 
-            // A lost COMMIT answers 451 and the run keeps serving; the next
-            // message settles the absent receipt inline and is delivered.
-            sql(fixture, "CREATE FUNCTION public.lose_wire_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'lost'; END $$; CREATE CONSTRAINT TRIGGER lose_wire_commit AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_wire_commit()");
+            // Rejecting COMMIT returns 451 and leaves the next message admissible.
+            sql(fixture, "CREATE FUNCTION public.lose_wire_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'lost'; END $$; CREATE CONSTRAINT TRIGGER lose_wire_commit AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.lose_wire_commit()");
             envelope(&mut client);
             command(&mut client, b"Subject: uncertain\r\n\r\nbody\r\n.\r\n", "451");
             assert_eq!(control.state(), State::Ready);
-            assert!(pending.operation().unwrap().is_some());
-            sql(fixture, "DROP TRIGGER lose_wire_commit ON td_mta.receiving_receipts");
+            sql(fixture, "DROP TRIGGER lose_wire_commit ON td_mta.emails");
             envelope(&mut client);
-            assert_eq!(pending.operation().unwrap(), None);
             command(&mut client, b"Subject: after uncertain\r\n\r\nbody\r\n.\r\n", "250");
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "3");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
 
             concurrent_data(fixture, address, tls, clock.clone());
             copy_during_publication(fixture, address, tls, clock.clone(), probe.clone());
@@ -665,8 +622,6 @@ pub(super) fn exercise(
             }
             drop(client);
             assert_eq!(control.state(), State::Stopped);
-            assert_eq!(pending.operation().unwrap(), None);
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"), "7");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "7");
             assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE tls={version} AND ehlo='sender.example.test' AND reverse_path='sender@example.test'")), "7");
         });

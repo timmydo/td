@@ -467,7 +467,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 42);
+    assert_eq!(receipt.version, 43);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -544,7 +544,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        42
+        43
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -685,7 +685,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":42"));
+    assert!(initialized.contains("\"schema_version\":43"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -935,7 +935,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=42",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=43",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -943,7 +943,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=42 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=43 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1126,7 +1126,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 42);
+    assert_eq!(receipt.version, 43);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -2011,7 +2011,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 42);
+        assert_eq!(receipt.version, 43);
         assert_eq!(
             sql(
                 &fixture,
@@ -2100,7 +2100,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
     };
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 42);
+    assert_eq!(receipt.version, 43);
     assert_eq!(sql(&fixture,
         "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
         "1.6:search_owner:td_mta_trgm");
@@ -2116,6 +2116,11 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         Err(td_mta::postgres_schema::Error::Owner)
     );
     sql(&fixture, "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40; ALTER DATABASE postgres OWNER TO td_probe; REVOKE TEMP ON DATABASE postgres FROM PUBLIC; GRANT CREATE ON DATABASE postgres TO search_owner");
+    sql(&fixture, include_str!("../src/postgres_receiving.sql"));
+    sql(
+        &fixture,
+        "ALTER TABLE td_mta.receiving_receipts OWNER TO search_owner",
+    );
     assert_eq!(
         sql(
             &fixture,
@@ -2138,8 +2143,22 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     let receipt = postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
     sql(&fixture, "CREATE ROLE service_reader; GRANT USAGE ON SCHEMA td_mta TO service_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO service_reader; GRANT UPDATE (store_epoch) ON td_mta.schema_migrations TO service_reader; REVOKE TEMP ON DATABASE postgres FROM PUBLIC");
     let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536);
+    // Exercise the deployed table with its runtime grants and a retained
+    // operation. Upgrade must leave the account state and other grants intact.
+    sql(
+        &fixture,
+        "DELETE FROM td_mta.schema_migrations WHERE version=43",
+    );
+    sql(&fixture, include_str!("../src/postgres_receiving.sql"));
+    sql(&fixture, "GRANT SELECT,INSERT,DELETE ON td_mta.receiving_receipts TO service_reader; INSERT INTO td_mta.accounts VALUES(decode(repeat('12',16),'hex'),decode('0000000000000001','hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.receiving_receipts SELECT id,id,decode(repeat('01',32),'hex'),id,id,id,id,0,0,floor,sequence FROM td_mta.accounts");
+    assert_eq!(
+        postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    assert_eq!(sql(&fixture, "SELECT to_regclass('td_mta.receiving_receipts') IS NULL, encode(sequence,'hex') FROM td_mta.accounts"), "t|0000000000000001");
     let rewind = "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40";
     sql(&fixture, rewind);
+    sql(&fixture, include_str!("../src/postgres_receiving.sql"));
     sql(&fixture, "GRANT USAGE ON SCHEMA td_mta TO PUBLIC");
     assert_eq!(
         postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
@@ -2760,7 +2779,7 @@ fn real_postgres_http_upload_owner_settles_and_releases() {
 
 #[test]
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
-fn real_postgres_smtp_owner_retains_and_settles() {
+fn real_postgres_smtp_owner_accepts_after_uncertain_commit() {
     exercise_configuration(ConfigurationExercise::ReceivingOwner);
 }
 
@@ -2777,12 +2796,6 @@ mod smtp_transport;
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
 fn real_postgres_smtp_worker_preserves_starttls_receipts() {
     exercise_configuration(ConfigurationExercise::ReceivingTls);
-}
-
-#[test]
-#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
-fn real_postgres_smtp_worker_stops_when_settlement_cannot_heal() {
-    exercise_configuration(ConfigurationExercise::ReceivingBackstop);
 }
 
 #[test]
@@ -2872,12 +2885,16 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
         exercise_configuration(ConfigurationExercise::FolderReconcile)
     });
     timed("audit_scaling::exercise", audit_scaling::exercise);
-    timed("configuration MultiAccount", || {
-        exercise_configuration(ConfigurationExercise::MultiAccount)
-    });
+    timed("configuration MultiAccount", real_postgres_multi_account);
     timed("configuration Serving", || {
         exercise_configuration(ConfigurationExercise::Serving)
     });
+}
+
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_multi_account() {
+    exercise_configuration(ConfigurationExercise::MultiAccount);
 }
 
 #[test]
@@ -2919,7 +2936,6 @@ enum ConfigurationExercise {
     ReplicaPublication,
     Performance,
     ReceivingTls,
-    ReceivingBackstop,
     ReceivingRate,
     ReceivingTransport,
     ReceivingOwner,
@@ -3116,7 +3132,6 @@ per_peer_limit = 1
         exercise,
         ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
-            | ConfigurationExercise::ReceivingBackstop
             | ConfigurationExercise::ReceivingRate
             | ConfigurationExercise::Serving
             | ConfigurationExercise::ReplicaPublication
@@ -3134,7 +3149,6 @@ per_peer_limit = 1
         ConfigurationExercise::Performance
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
-            | ConfigurationExercise::ReceivingBackstop
             | ConfigurationExercise::ReceivingRate
     ) {
         let limits = "session_limit = 1\nper_peer_limit = 1\n";
@@ -3689,7 +3703,6 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingOwner
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
-            | ConfigurationExercise::ReceivingBackstop
             | ConfigurationExercise::ReceivingRate
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
@@ -3824,7 +3837,6 @@ per_peer_limit = 1
                 | ConfigurationExercise::ReceivingOwner
                 | ConfigurationExercise::ReceivingTransport
                 | ConfigurationExercise::ReceivingTls
-                | ConfigurationExercise::ReceivingBackstop
                 | ConfigurationExercise::ReceivingRate => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
@@ -3935,7 +3947,6 @@ per_peer_limit = 1
                 exercise,
                 ConfigurationExercise::ReceivingTransport
                     | ConfigurationExercise::ReceivingTls
-                    | ConfigurationExercise::ReceivingBackstop
                     | ConfigurationExercise::ReceivingRate
             )
         {
@@ -3947,7 +3958,6 @@ per_peer_limit = 1
                 smtp_socket.take().unwrap(),
                 matches!(exercise, ConfigurationExercise::ReceivingTls),
                 match exercise {
-                    ConfigurationExercise::ReceivingBackstop => smtp_transport::Ending::Backstop,
                     ConfigurationExercise::ReceivingRate => smtp_transport::Ending::Rate,
                     _ => smtp_transport::Ending::Drain,
                 },
@@ -10094,7 +10104,7 @@ fn exercise_deletion(
 
 #[test]
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
-fn real_postgres_receiving_publishes_inbox_provenance_and_retained_outcomes() {
+fn real_postgres_receiving_publishes_inbox_provenance_atomically() {
     exercise_configuration(ConfigurationExercise::Receiving);
 }
 
@@ -10235,32 +10245,12 @@ fn exercise_receiving(
         Err(receiving::Error::Input(td_mta::ports::Error::Invalid))
     ));
     assert!(capacity.io_bytes - bounded.remaining().io_bytes >= long_line.len() as u64);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "0"
-    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
     assert!(prepare(b"broken\n").is_err());
     assert!(prepare(&[b'x'; 1001]).is_err());
     let first = prepare(b"Return-Path: <forged@example.test>\r\nMessage-ID: <root@example.test>\r\nSubject: Inbox\r\n\r\nhello\r\n").unwrap();
-    assert_eq!(
-        receiving::inspect(request, trust, deadline(), &first).unwrap(),
-        None
-    );
-    let (left, right) = thread::scope(|scope| {
-        let left = scope.spawn(|| receiving::publish(request, trust, deadline(), &first));
-        let right = scope.spawn(|| receiving::publish(request, trust, deadline(), &first));
-        (
-            left.join().unwrap().unwrap(),
-            right.join().unwrap().unwrap(),
-        )
-    });
-    assert_eq!(left, right);
-    let outcome = left;
+    let outcome = receiving::publish(request, trust, deadline(), &first).unwrap();
     assert_eq!((outcome.old_sequence, outcome.new_sequence), (1, 2));
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "1"
-    );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "0");
     assert_eq!(sql(fixture,"SELECT origin,peer_family,encode(peer_octets,'hex'),tls,ehlo,reverse_path,receipt_count FROM td_mta.emails"),"1|4|c0000201|2|sender.example.test|sender@example.test|2");
@@ -10340,21 +10330,17 @@ fn exercise_receiving(
         fixture,
         &format!("UPDATE td_mta.account_usage SET body_bytes={used}"),
     );
-    sql(fixture,"CREATE FUNCTION public.reject_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse'; END $$; CREATE TRIGGER reject_receiving BEFORE INSERT ON td_mta.receiving_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_receiving()");
+    sql(fixture,"CREATE FUNCTION public.reject_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse'; END $$; CREATE TRIGGER reject_receiving BEFORE INSERT ON td_mta.emails FOR EACH ROW EXECUTE FUNCTION public.reject_receiving()");
     assert_eq!(
         receiving::publish(request, trust, deadline(), &pending),
         Err(receiving::Error::Database)
-    );
-    assert_eq!(
-        receiving::inspect(request, trust, deadline(), &pending).unwrap(),
-        None
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
     assert_eq!(
         sql(fixture, "SELECT body_bytes FROM td_mta.account_usage"),
         used
     );
-    sql(fixture,"DROP TRIGGER reject_receiving ON td_mta.receiving_receipts; CREATE FUNCTION public.delay_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_receiving()");
+    sql(fixture,"DROP TRIGGER reject_receiving ON td_mta.emails; CREATE FUNCTION public.delay_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_receiving()");
     assert_eq!(
         receiving::publish(
             request,
@@ -10365,18 +10351,8 @@ fn exercise_receiving(
         Err(receiving::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let recovered = receiving::inspect(request, trust, deadline(), &pending)
-        .unwrap()
-        .unwrap();
-    assert_eq!(recovered.new_sequence, 4);
-    sql(
-        fixture,
-        "DROP TRIGGER delay_receiving ON td_mta.receiving_receipts",
-    );
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &pending).unwrap(),
-        recovered
-    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
+    sql(fixture, "DROP TRIGGER delay_receiving ON td_mta.emails");
     let fresh = prepare(b"\r\nfresh\r\n").unwrap();
     sql(
         fixture,
@@ -10386,21 +10362,10 @@ fn exercise_receiving(
         receiving::publish(request, trust, deadline(), &fresh),
         Err(receiving::Error::Policy)
     );
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &first).unwrap(),
-        outcome
-    );
     sql(
         fixture,
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
     );
-    let original=sql(fixture,&format!("SELECT encode(request_digest,'hex') FROM td_mta.receiving_receipts WHERE operation=decode('{}','hex')",first.operation()));
-    sql(fixture,&format!("UPDATE td_mta.receiving_receipts SET request_digest=decode(repeat('00',32),'hex') WHERE operation=decode('{}','hex')",first.operation()));
-    assert_eq!(
-        receiving::inspect(request, trust, deadline(), &first),
-        Err(receiving::Error::Conflict)
-    );
-    sql(fixture,&format!("UPDATE td_mta.receiving_receipts SET request_digest=decode('{original}','hex') WHERE operation=decode('{}','hex')",first.operation()));
     // Exercise a near-ceiling message and the full envelope recipient count.
     let addresses = vec!["alice@example.test"; 1000];
     let mut packed = vec![0; td_mta::format::row::MAX_RECEIPT_BYTES];
@@ -10439,33 +10404,12 @@ fn exercise_receiving(
     assert!(bulk_outcome.length > large.len() as u64);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE email_id=decode('{}','hex')",bulk_outcome.email)),"1000");
     assert_eq!(sql(fixture,&format!("SELECT sum(octet_length(bytes)) FROM td_mta.blob_chunks WHERE blob_id=decode('{}','hex')",bulk_outcome.blob)),bulk_outcome.length.to_string());
-    // Crossing the former lifetime cap must still publish a fresh delivery.
-    // Restamp earlier receipts so time spent in the earlier sections cannot
-    // expire them while this one runs.
-    sql(
-        fixture,
-        "UPDATE td_mta.receiving_receipts SET created_at=(extract(epoch FROM clock_timestamp())*1000)::bigint",
-    );
-    sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
     let capacity =
         td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
     let metrics = capacity.get("metrics").unwrap().as_arr().unwrap();
-    let receiving_capacity = metrics
+    assert!(metrics
         .iter()
-        .find(|r| {
-            r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts")
-                && r.get("scope").and_then(td_json::Json::as_str)
-                    == Some(&binding.account().to_string())
-        })
-        .unwrap();
-    assert_eq!(
-        receiving_capacity.get("limit").unwrap().to_string(),
-        receiving::MAX_RECEIPTS.to_string()
-    );
-    assert_eq!(
-        receiving_capacity.get("used").unwrap().to_string(),
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
-    );
+        .all(|r| r.get("name").and_then(td_json::Json::as_str) != Some("receiving_receipts")));
     // Every per-account ceiling postgres_attempt_phases enforces is reported.
     for (name, limit) in [
         ("attempt_phase_receipts", "2048"),
@@ -10499,114 +10443,14 @@ fn exercise_receiving(
             .as_arr()
             .unwrap()
             .iter()
-            .filter(|r| r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts"))
+            .filter(|r| {
+                r.get("name").and_then(td_json::Json::as_str) == Some("body_bytes")
+                    && r.get("kind").and_then(td_json::Json::as_str) == Some("capacity")
+            })
             .count(),
         16
     );
     sql(fixture,"DELETE FROM td_mta.account_usage WHERE account IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n); DELETE FROM td_mta.accounts WHERE id IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n)");
-    let above_old_limit = prepare(b"\r\nabove old receipt limit\r\n").unwrap();
-    let accepted = receiving::publish(request, trust, deadline(), &above_old_limit).unwrap();
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &above_old_limit).unwrap(),
-        accepted
-    );
-    sql(
-        fixture,
-        "DELETE FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
-    );
-    sql(fixture,&format!("INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,(extract(epoch FROM clock_timestamp())*1000)::bigint,old_sequence,new_sequence FROM (SELECT * FROM td_mta.receiving_receipts LIMIT 1) r CROSS JOIN generate_series(1,{}) n",receiving::MAX_RECEIPTS));
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &fresh),
-        Err(receiving::Error::Capacity)
-    );
-    assert_eq!(
-        receiving::inspect(request, trust, deadline(), &fresh).unwrap(),
-        None
-    );
-    // A full ledger is no lockout: receipts past a one-minute retention expire,
-    // so a flood refuses an account's mail for at most a minute. Literals, so a
-    // longer retention fails here; the boundary receipt is 30 seconds old.
-    sql(fixture,"UPDATE td_mta.receiving_receipts SET created_at=created_at-61000 WHERE request_digest=decode(repeat('00',32),'hex')");
-    // Expiry is scoped to the publishing account and stops at retention.
-    sql(fixture,"INSERT INTO td_mta.accounts VALUES(decode(lpad(to_hex(2001),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES(decode(lpad(to_hex(2001),32,'0'),'hex'),0,0,0,0,0)");
-    sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT decode(lpad(to_hex(2001),32,'0'),'hex'),operation,decode(repeat('22',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 1");
-    sql(fixture,"INSERT INTO td_mta.receiving_receipts SELECT account,decode(lpad(to_hex(1),32,'1'),'hex'),decode(repeat('11',32),'hex'),email_id,blob_id,thread_id,mailbox_id,length,(extract(epoch FROM clock_timestamp())*1000)::bigint-30000,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 1");
-    let after_expiry = receiving::publish(request, trust, deadline(), &fresh).unwrap();
-    assert_eq!(
-        sql(
-            fixture,
-            "SELECT count(*) FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex')"
-        ),
-        "0"
-    );
-    assert_eq!(
-        sql(
-            fixture,
-            "SELECT count(*) FROM td_mta.receiving_receipts WHERE request_digest IN (decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'))"
-        ),
-        "2"
-    );
-    let capacity =
-        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
-    let live = capacity
-        .get("metrics")
-        .unwrap()
-        .as_arr()
-        .unwrap()
-        .iter()
-        .find(|r| {
-            r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts")
-                && r.get("scope").and_then(td_json::Json::as_str)
-                    == Some(&binding.account().to_string())
-        })
-        .unwrap()
-        .get("used")
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        live,
-        sql(
-            fixture,
-            &format!(
-                "SELECT count(*) FROM td_mta.receiving_receipts WHERE account=decode('{}','hex')",
-                binding.account()
-            )
-        )
-    );
-    // An expired row awaiting the next delivery is not reported as used.
-    sql(fixture,&format!("UPDATE td_mta.receiving_receipts SET created_at=created_at-{} WHERE request_digest=decode(repeat('11',32),'hex')",receiving::RECEIPT_RETENTION_MS));
-    let capacity =
-        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
-    assert_eq!(
-        capacity
-            .get("metrics")
-            .unwrap()
-            .as_arr()
-            .unwrap()
-            .iter()
-            .find(|r| {
-                r.get("name").and_then(td_json::Json::as_str) == Some("receiving_receipts")
-                    && r.get("scope").and_then(td_json::Json::as_str)
-                        == Some(&binding.account().to_string())
-            })
-            .unwrap()
-            .get("used")
-            .unwrap()
-            .to_string()
-            .parse::<u64>()
-            .unwrap()
-            + 1,
-        live.parse::<u64>().unwrap()
-    );
-    sql(fixture,"DELETE FROM td_mta.receiving_receipts WHERE request_digest IN (decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex')); DELETE FROM td_mta.account_usage WHERE account=decode(lpad(to_hex(2001),32,'0'),'hex'); DELETE FROM td_mta.accounts WHERE id=decode(lpad(to_hex(2001),32,'0'),'hex')");
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &fresh).unwrap(),
-        after_expiry
-    );
-    assert_eq!(
-        receiving::publish(request, trust, deadline(), &above_old_limit).unwrap(),
-        accepted
-    );
 }
 
 #[test]
@@ -13575,7 +13419,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         format::row::ReceiptTls,
         ports::{Clock, CommitFailure, Deadline, Error},
         postgres_read::ReadSlots,
-        postgres_smtp_receiving::{Pending, Receiving},
+        postgres_smtp_receiving::Receiving,
         postgres_smtp_storage::Backend,
         smtp_session::{Pending as Action, Session, Settings},
         smtp_storage::{Begin, Failure, Job, Storage},
@@ -13595,7 +13439,6 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
     let clock = Arc::new(RuntimeClock::new());
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
     let slots = ReadSlots::new(1).unwrap();
-    let pending = Pending::default();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let storage = Backend::new(
         Receiving {
@@ -13605,7 +13448,6 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             additional: &[],
             slots: &slots,
             clock: &clock,
-            pending: &pending,
         },
         clock.clone(),
         7,
@@ -13625,7 +13467,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         .alias("alice@example.test", binding.account(), at)
         .unwrap();
     let routes = builder.finish().unwrap();
-    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.emails")
         .parse()
         .unwrap();
     let mut random = td_crypto::SystemEntropy::try_new().unwrap();
@@ -13666,7 +13508,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         header_bytes: 16384,
         deadline: until(20_000),
     };
-    let sibling_sessions = [data_session(), data_session()];
+    let sibling_session = data_session();
     for case in 0..4 {
         let mut session = data_session();
         let deadline = until(if case == 3 { 3000 } else { 10_000 });
@@ -13749,7 +13591,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         if case == 0 {
             drop(job);
             assert_eq!(
-                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                sql(fixture, "SELECT count(*) FROM td_mta.emails"),
                 initial.to_string()
             );
             continue;
@@ -13795,34 +13637,25 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             session.data_written(Ok(())).unwrap();
         }
         assert_eq!(
-            sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+            sql(fixture, "SELECT count(*) FROM td_mta.emails"),
             (initial + u64::from(case == 3)).to_string()
         );
         assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND usename='mail_runtime' AND state LIKE 'idle in transaction%'"), "0");
         session.feed(b".\r\n").unwrap();
         assert!(matches!(session.pending(), Action::Commit));
         job.prepare(until(10_000)).unwrap();
-        // Two siblings with live deadlines, admitted and prepared before the
-        // uncertain job commits.
-        let mut siblings = Vec::new();
+        // An already admitted sibling can use a fresh session after uncertainty.
+        let mut sibling = None;
         if case == 3 {
             others.clear();
-            for (subject, sibling_session) in ["fenced sibling", "settling sibling"]
-                .into_iter()
-                .zip(&sibling_sessions)
-            {
-                let mut input = fresh_begin(sibling_session);
-                input.peer = "192.0.2.3".parse().unwrap();
-                let mut sibling = storage.begin(input, &mut random).unwrap();
-                sibling
-                    .write(format!("Subject: {subject}\r\n").as_bytes())
-                    .unwrap();
-                sibling.write(b"\r\n").unwrap();
-                sibling.write(b"body\r\n").unwrap();
-                sibling.prepare(until(20_000)).unwrap();
-                siblings.push(sibling);
-            }
-            sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(8); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
+            let mut input = fresh_begin(&sibling_session);
+            input.peer = "192.0.2.3".parse().unwrap();
+            let mut next = storage.begin(input, &mut random).unwrap();
+            next.write(b"Subject: next delivery\r\n\r\nbody\r\n")
+                .unwrap();
+            next.prepare(until(20_000)).unwrap();
+            sibling = Some(next);
+            sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(8); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
         }
         let completed = job.commit().unwrap();
         assert!(matches!(
@@ -13841,7 +13674,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
                 matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"250"))
             );
             assert_eq!(
-                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                sql(fixture, "SELECT count(*) FROM td_mta.emails"),
                 (initial + 1).to_string()
             );
         } else {
@@ -13855,42 +13688,22 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             assert!(
                 matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"451"))
             );
-            assert!(pending.operation().unwrap().is_some());
-            // While the 8 s COMMIT still runs (past the 3 s job deadline), a
-            // sibling's commit settles first, waits out the 1 s lock timeout
-            // and is refused as busy, never published.
-            assert!(matches!(
-                siblings.first_mut().unwrap().commit(),
-                Err(Failure::Refused(Error::Busy))
-            ));
-            assert!(pending.operation().unwrap().is_some());
-            assert!(!storage.stopped());
             thread::sleep(Duration::from_secs(7));
             sql(
                 fixture,
-                "DROP TRIGGER delay_storage_receiving ON td_mta.receiving_receipts",
+                "DROP TRIGGER delay_storage_receiving ON td_mta.emails",
             );
             assert_eq!(
-                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                sql(fixture, "SELECT count(*) FROM td_mta.emails"),
                 (initial + 2).to_string()
             );
-            // The other sibling's commit settles the found receipt at the
-            // pinned endpoint before opening a session (one foreground slot:
-            // holding both would refuse), then publishes.
-            let delivered = siblings.get_mut(1).unwrap().commit().unwrap();
+            let delivered = sibling.as_mut().unwrap().commit().unwrap();
             assert!(!delivered.stop);
             assert_eq!(delivered.outcome.unwrap().iter().count(), 1);
-            assert_eq!(pending.operation().unwrap(), None);
-            siblings.clear();
             assert_eq!(
-                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                sql(fixture, "SELECT count(*) FROM td_mta.emails"),
                 (initial + 3).to_string()
             );
-            let settlement = ReadSlots::new(1).unwrap();
-            assert!(pending
-                .settle(&loaded, executable, &settlement, &clock, until(10_000))
-                .unwrap()
-                .is_none());
         }
     }
     storage.close().unwrap();
@@ -13901,7 +13714,6 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         additional: &[],
         slots: &slots,
         clock: &clock,
-        pending: &pending,
     }
     .ready(until(10_000))
     .unwrap();
@@ -13946,8 +13758,6 @@ fn exercise_smtp_receiving_owner(
         )
     };
     let slots = ReadSlots::new(1).unwrap();
-    let settlement = ReadSlots::new(1).unwrap();
-    let pending = owner::Pending::default();
     let worker = owner::Receiving {
         loaded: &loaded,
         executable,
@@ -13955,13 +13765,9 @@ fn exercise_smtp_receiving_owner(
         additional: &[],
         slots: &slots,
         clock: &clock,
-        pending: &pending,
     };
     worker.ready(until(10_000)).unwrap();
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "0"
-    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
     let inbox = sql(
         fixture,
         "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
@@ -14026,147 +13832,45 @@ fn exercise_smtp_receiving_owner(
         Err(owner::Error::Admission(Error::Capacity))
     );
     assert!(exhausted.stopped().is_some());
-    assert_eq!(pending.operation().unwrap(), None);
     let first = worker
         .create(&message, until(10_000), &mut meter())
         .unwrap();
     assert!(first.length > message.bytes.len() as u64);
-    assert_eq!(pending.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "1"
-    );
-    sql(fixture, "CREATE FUNCTION public.reject_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject receiving'; END $$; CREATE TRIGGER reject_owned_receiving BEFORE INSERT ON td_mta.receiving_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+    sql(fixture, "CREATE FUNCTION public.reject_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject receiving'; END $$; CREATE TRIGGER reject_owned_receiving BEFORE INSERT ON td_mta.emails FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Database))
     );
-    assert_eq!(pending.operation().unwrap(), None);
-    // The COMMIT outlives the 3 s client deadline and then commits. Writes
-    // meeting it wait out the 1 s lock timeout inside inline settlement, so
-    // the 10 s sleep keeps both refusals well before it ends.
-    sql(fixture, "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts; CREATE FUNCTION public.delay_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
+    sql(fixture, "DROP TRIGGER reject_owned_receiving ON td_mta.emails; CREATE FUNCTION public.delay_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
     assert_eq!(
         worker.create(&message, until(3000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
-    let operation = pending.operation().unwrap().unwrap();
-    assert_eq!(
-        worker.ready(until(10_000)),
-        Err(owner::Error::Admission(Error::Busy))
-    );
-    assert_eq!(
-        worker.create(&message, until(10_000), &mut meter()),
-        Err(owner::Error::Admission(Error::Busy))
-    );
-    assert_eq!(pending.operation().unwrap(), Some(operation));
     thread::sleep(Duration::from_secs(8));
     sql(
         fixture,
-        "DROP TRIGGER delay_owned_receiving ON td_mta.receiving_receipts",
+        "DROP TRIGGER delay_owned_receiving ON td_mta.emails",
     );
-    let settled = pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
-        .unwrap()
-        .unwrap();
-    assert_eq!(settled.operation, operation);
-    assert_eq!(
-        settled.outcome.accounts.first().unwrap().1.length,
-        first.length
-    );
-    assert_eq!(pending.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "2"
-    );
-    // A refused COMMIT leaves no receipt: absence settles and clears.
-    sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
+    sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
-    assert!(pending.operation().unwrap().is_some());
-    assert!(pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
-        .unwrap()
-        .is_none());
-    assert_eq!(pending.operation().unwrap(), None);
-    // Readiness settles a retained absence inline.
-    assert_eq!(
-        worker.create(&message, until(10_000), &mut meter()),
-        Err(owner::Error::Publication(changes::Error::Indeterminate))
-    );
-    assert!(pending.operation().unwrap().is_some());
     worker.ready(until(10_000)).unwrap();
-    assert_eq!(pending.operation().unwrap(), None);
     sql(
         fixture,
-        "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts",
+        "DROP TRIGGER reject_owned_receiving ON td_mta.emails",
     );
     worker
         .create(&message, until(10_000), &mut meter())
         .unwrap();
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "3"
-    );
-    // A COMMIT that sleeps past the 2 s client deadline and then rolls back:
-    // a write while it runs is busy and retains it; the next one after it
-    // ends settles the absence inline and publishes.
-    sql(fixture, "CREATE FUNCTION public.rollback_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_owned_receiving()");
-    assert_eq!(
-        worker.create(&message, until(2000), &mut meter()),
-        Err(owner::Error::Publication(changes::Error::Indeterminate))
-    );
-    let rolled = pending.operation().unwrap().unwrap();
-    assert_eq!(
-        worker.create(&message, until(10_000), &mut meter()),
-        Err(owner::Error::Admission(Error::Busy))
-    );
-    assert_eq!(pending.operation().unwrap(), Some(rolled));
-    thread::sleep(Duration::from_secs(4));
-    sql(
-        fixture,
-        "DROP TRIGGER rollback_owned_receiving ON td_mta.receiving_receipts",
-    );
-    worker
-        .create(&message, until(10_000), &mut meter())
-        .unwrap();
-    assert_eq!(pending.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "4"
-    );
-    // A delayed COMMIT that commits: the next write finds its receipt inline
-    // and publishes.
-    sql(fixture, "CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
-    assert_eq!(
-        worker.create(&message, until(3000), &mut meter()),
-        Err(owner::Error::Publication(changes::Error::Indeterminate))
-    );
-    assert!(pending.operation().unwrap().is_some());
-    thread::sleep(Duration::from_secs(9));
-    sql(
-        fixture,
-        "DROP TRIGGER delay_owned_receiving ON td_mta.receiving_receipts",
-    );
-    worker
-        .create(&message, until(10_000), &mut meter())
-        .unwrap();
-    assert_eq!(pending.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "6"
-    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
     sql(
         fixture,
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
-    let fresh = owner::Pending::default();
-    let worker = owner::Receiving {
-        pending: &fresh,
-        ..worker
-    };
     assert_eq!(
         worker.ready(until(10_000)),
         Err(owner::Error::Publication(changes::Error::Policy))
@@ -14175,11 +13879,7 @@ fn exercise_smtp_receiving_owner(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Policy))
     );
-    assert_eq!(fresh.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
-        "6"
-    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
     sql(
         fixture,
         &format!(

@@ -2898,12 +2898,12 @@ td-mta/src/postgres_read_values.rs	direct-reservation	4
 td-mta/src/postgres_read_values.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_receiving.rs	direct-reservation	2
 td-mta/src/postgres_receiving.rs	heap-owner	4
-td-mta/src/postgres_receiving.rs	unchecked-growth-or-clone	7
-td-mta/src/postgres_receiving/fanout.rs	direct-reservation	7
+td-mta/src/postgres_receiving.rs	unchecked-growth-or-clone	6
+td-mta/src/postgres_receiving/fanout.rs	direct-reservation	6
 td-mta/src/postgres_receiving/fanout.rs	heap-owner	1
-td-mta/src/postgres_receiving/fanout.rs	unchecked-growth-or-clone	15
-td-mta/src/postgres_receiving/input.rs	direct-reservation	3
-td-mta/src/postgres_receiving/input.rs	unchecked-growth-or-clone	5
+td-mta/src/postgres_receiving/fanout.rs	unchecked-growth-or-clone	13
+td-mta/src/postgres_receiving/input.rs	direct-reservation	2
+td-mta/src/postgres_receiving/input.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_recovery.rs	allocation-macro	1
 td-mta/src/postgres_recovery.rs	heap-owner	1
 td-mta/src/postgres_recovery.rs	unchecked-growth-or-clone	1
@@ -2963,7 +2963,7 @@ td-mta/src/postgres_search_prepare.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_selection.rs	heap-owner	1
 td-mta/src/postgres_selection.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_smtp_receiving.rs	direct-reservation	2
-td-mta/src/postgres_smtp_receiving.rs	unchecked-growth-or-clone	4
+td-mta/src/postgres_smtp_receiving.rs	unchecked-growth-or-clone	3
 td-mta/src/postgres_smtp_storage.rs	direct-reservation	7
 td-mta/src/postgres_smtp_storage.rs	unchecked-growth-or-clone	9
 td-mta/src/postgres_submission_cancel.rs	heap-owner	1

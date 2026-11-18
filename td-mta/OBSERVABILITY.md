@@ -81,7 +81,6 @@ and `severity`.
 | `relay_connection_failed` | fixed `stage` and `error` class | warning | inspect_relay |
 | `relay_step_failed` | fixed `stage` | warning | inspect_relay |
 | `service_stopped` | boolean `failed` | error if failed, otherwise info | inspect_service if failed |
-| `receiving_unsettled` | boolean `stopping` | error if stopping, otherwise warning | inspect_recovery |
 | `log_write_failed` | signed `os_code` or null | error | inspect_logging |
 
 Protocol values are `smtp`, `jmap`, `relay`; listener-ready records accept only
@@ -99,13 +98,6 @@ Unknown means a potentially accepted relay outcome requiring inspection, not
 proof of failure or an instruction to resend. The queue state machine owns
 retry policy. `mail_accepted` means locally durable acceptance; it never implies
 relay acceptance. Neither an event nor its absence proves durable storage.
-`receiving_unsettled` means a retained SMTP delivery whose COMMIT result was
-lost failed inline settlement, and the delivery that met it was refused.
-`stopping` is true when the delivery was held past the 30-second backstop
-and the receiving run stops so a restart releases it (POSTGRES.md section
-104); the run's `service_stopped` follows. Each value has its own
-one-per-minute bucket.
-
 Refusal reasons/actions are: `capacity` and `deadline` -> `retry_later`,
 `quota` -> `inspect_quota`, `storage` -> `inspect_storage`, `configuration` ->
 `check_config`, and `recovery` -> `inspect_recovery`. Actions are advice, not
@@ -561,7 +553,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `structure_reuse` | Qualified persisted MIME tables reused after manifest qualification and verified entity-header rechecks; zero-duration count. Included work remains inside `jmap_structure`. |
 | `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
-| `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |
+| `smtp_publish` | Inbound SMTP database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure and receives SMTP 451 |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 | `smtp_rate_refused` | Zero-duration accepted-mail rate decisions: busy counts a MAIL refused with 421 4.7.0, unavailable counts a full rate table forgetting another key's debt |
 
@@ -603,7 +595,7 @@ rechecks the selection. It exports no message bodies, envelopes or
 credentials. Durable usage counters are observed without an integrity audit.
 Account tables are counted only through their ceiling plus one; reserved
 final-result claims are included in each affected receipt table's occupancy.
-Receiving, route-owner, HTTP write and submission expiry receipts count only
+Route-owner, HTTP write and submission expiry receipts count only
 those inside their retention, and device records only unrevoked ones or
 revocations inside 30 days; expired rows await the account's next
 publication of their kind and refuse nothing (POSTGRES.md sections 21, 46,

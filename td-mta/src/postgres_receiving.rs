@@ -1,8 +1,8 @@
-//! Retained owner-side SMTP publication; no listener or gateway admission.
+//! Atomic SMTP publication; no listener or gateway admission.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
-    ids::{BlobId, EmailId, MailboxId, ReceivingOperationId, ThreadId},
+    ids::{BlobId, EmailId, MailboxId, ThreadId},
     ports::{self, Clock, Deadline},
     postgres_probe::{self, Request},
     postgres_publication as publication,
@@ -20,21 +20,8 @@ use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 pub(crate) mod fanout;
 mod input;
-pub use fanout::{
-    inspect_fanout, prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Target,
-};
+pub use fanout::{prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Target};
 pub use input::Message;
-pub const MAX_RECEIPTS: i64 = 16_384;
-/// Every inspection or retry of an operation ends within this, then it expires.
-/// Six publication phase deadlines: operations are random per delivery, so a
-/// receipt never dedupes a sender's retry, and a short window keeps a flood
-/// from refusing an account's mail beyond MAX_RECEIPTS per minute.
-pub const RECEIPT_RETENTION_MS: i64 = 60_000;
-const _: () = assert!(
-    RECEIPT_RETENTION_MS > 0
-        && RECEIPT_RETENTION_MS as u128 >= 6 * crate::postgres_probe::MAX_DURATION.as_millis()
-);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -66,22 +53,17 @@ pub struct Outcome {
 #[derive(Clone)]
 pub struct Delivery {
     binding: Binding,
-    operation: ReceivingOperationId,
     email: EmailId,
     blob: BlobId,
     new_thread: ThreadId,
     bytes: Arc<Vec<u8>>,
     body_digest: [u8; 32],
     interpretation: Option<Arc<crate::postgres_mime_evidence::Prepared>>,
-    request_digest: [u8; 32],
     message_id: String,
     anchors: Arc<Vec<String>>,
     provenance: input::Provenance,
 }
 impl Delivery {
-    pub fn operation(&self) -> ReceivingOperationId {
-        self.operation
-    }
     pub fn email(&self) -> EmailId {
         self.email
     }
@@ -182,12 +164,12 @@ pub fn prepare_with_meter(
     preparation_time(binding, deadline)?;
     let clock = PreparationClock { clock, deadline };
     charge(&clock, meter, 0, 0)?;
-    let mut ids = [[0; 16]; 4];
+    let mut ids = [[0; 16]; 3];
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     for id in &mut ids {
         entropy.fill(id).map_err(|_| Error::Crypto)?;
     }
-    let [operation, email, blob, new_thread] = ids;
+    let [email, blob, new_thread] = ids;
     let (email, blob, new_thread) = (
         EmailId::from_bytes(email),
         BlobId::from_bytes(blob),
@@ -201,26 +183,6 @@ pub fn prepare_with_meter(
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     let body_digest = hash.finish().map_err(|_| Error::Crypto)?;
-    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
-    for part in [
-        b"td-mta PostgreSQL receiving v1\0".as_slice(),
-        binding.epoch().as_bytes().as_slice(),
-        binding.account().as_bytes().as_slice(),
-        &binding.selection().generation.to_be_bytes(),
-        binding.selection().version.as_bytes().as_slice(),
-        email.as_bytes().as_slice(),
-        blob.as_bytes().as_slice(),
-        new_thread.as_bytes().as_slice(),
-        &(bytes.len() as u64).to_be_bytes(),
-        &body_digest,
-        &(provenance.encoded.len() as u64).to_be_bytes(),
-        provenance.encoded.as_slice(),
-        binding.profile().as_bytes(),
-    ] {
-        charge(&clock, meter, part.len(), 0)?;
-        hash.update(part).map_err(|_| Error::Crypto)?;
-    }
-    let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
     charge(&clock, meter, 0, 0)?;
     let interpretation = crate::postgres_mime_evidence::prepare_metered(
         &bytes,
@@ -235,14 +197,12 @@ pub fn prepare_with_meter(
     }
     Ok(Delivery {
         binding: binding.clone(),
-        operation: ReceivingOperationId::from_bytes(operation),
         email,
         blob,
         new_thread,
         bytes: Arc::new(bytes),
         body_digest,
         interpretation,
-        request_digest,
         message_id,
         anchors: Arc::new(anchors),
         provenance,
@@ -263,45 +223,6 @@ async fn begin(client: &Client, binding: &Binding) -> Result<(), Error> {
     }
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
 }
-async fn receipt(client: &Client, delivery: &Delivery) -> Result<Option<Outcome>, Error> {
-    let rows=client.query("SELECT request_digest,email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM td_mta.receiving_receipts WHERE account=$1 AND operation=$2 LIMIT 2", &[&delivery.binding.account().as_bytes().as_slice(),&delivery.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() != 1 {
-        return Err(Error::Integrity);
-    }
-    let row = rows.first().ok_or(Error::Integrity)?;
-    let digest: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-    if digest != delivery.request_digest {
-        return Err(Error::Conflict);
-    }
-    let email: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-    let blob: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-    let thread: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
-    let mailbox: &[u8] = row.try_get(4).map_err(|_| Error::Integrity)?;
-    let length: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
-    let old = sequence(row.try_get(7).map_err(|_| Error::Integrity)?)?;
-    let next = sequence(row.try_get(8).map_err(|_| Error::Integrity)?)?;
-    if email != delivery.email.as_bytes()
-        || blob != delivery.blob.as_bytes()
-        || usize::try_from(length).ok() != Some(delivery.bytes.len())
-        || old.checked_add(1) != Some(next)
-    {
-        return Err(Error::Integrity);
-    }
-    Ok(Some(Outcome {
-        email: delivery.email,
-        blob: delivery.blob,
-        thread: ThreadId::from_bytes(thread.try_into().map_err(|_| Error::Integrity)?),
-        mailbox: MailboxId::from_bytes(mailbox.try_into().map_err(|_| Error::Integrity)?),
-        length: length as u64,
-        created_at: row.try_get(6).map_err(|_| Error::Integrity)?,
-        old_sequence: old,
-        new_sequence: next,
-    }))
-}
-
 async fn inbox(
     client: &Client,
     account: crate::ids::AccountId,
@@ -360,43 +281,12 @@ pub fn ready(
     result
 }
 
-pub fn inspect(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    delivery: &Delivery,
-) -> Result<Option<Outcome>, Error> {
-    let delivery = delivery.clone();
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &delivery.binding).await?;
-            client
-                .query_one(
-                    "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-                    &[&delivery.binding.account().as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            receipt(client, &delivery).await
-        })
-    })
-    .map_err(Error::Connection)?;
-    if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
-    }
-    result
-}
-
-/// A historical receipt is known success, not authority for a fresh write.
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
     delivery: &Delivery,
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, delivery)? {
-        return Ok(outcome);
-    }
     let delivery = delivery.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
@@ -415,9 +305,6 @@ pub fn publish(
                 )
                 .await
                 .map_err(|_| Error::Database)?;
-            if let Some(outcome) = receipt(client, &delivery).await? {
-                return Ok(outcome);
-            }
             if generation != delivery.binding.selection().generation
                 || version != Some(delivery.binding.selection().version.as_bytes().as_slice())
                 || !delivery.binding.roles().receive()
@@ -471,7 +358,6 @@ async fn write_delivery(
             crate::postgres_sequence::Error::Integrity => Error::Integrity,
             crate::postgres_sequence::Error::Database => Error::Database,
         })?;
-    // One sample stamps this receipt and sets the expiry cutoff.
     let created_at: i64 = client
         .query_one(
             "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
@@ -481,21 +367,6 @@ async fn write_delivery(
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;
-    let cutoff = created_at
-        .checked_sub(RECEIPT_RETENTION_MS)
-        .ok_or(Error::Integrity)?;
-    // Under the account write lock, so no owner inspects a row while it expires.
-    client
-        .execute(
-            "DELETE FROM td_mta.receiving_receipts WHERE account=$1 AND created_at<$2",
-            &[&account, &cutoff],
-        )
-        .await
-        .map_err(|_| Error::Database)?;
-    let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.receiving_receipts WHERE account=$1 LIMIT $2) bounded", &[&account,&MAX_RECEIPTS]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-    if count >= MAX_RECEIPTS {
-        return Err(Error::Capacity);
-    }
     let mailbox_id = inbox(client, account_id, old).await?;
     let mailbox = mailbox_id.as_bytes().as_slice();
     let email = delivery.email.as_bytes().as_slice();
@@ -647,29 +518,6 @@ async fn write_delivery(
         return Err(Error::Integrity);
     }
     let length = i64::try_from(delivery.bytes.len()).map_err(|_| Error::Capacity)?;
-    if client
-        .execute(
-            "INSERT INTO td_mta.receiving_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-            &[
-                &account,
-                &delivery.operation.as_bytes().as_slice(),
-                &delivery.request_digest.as_slice(),
-                &email,
-                &delivery.blob.as_bytes().as_slice(),
-                &thread,
-                &mailbox,
-                &length,
-                &created_at,
-                &old.to_be_bytes().as_slice(),
-                &changed,
-            ],
-        )
-        .await
-        .map_err(|_| Error::Database)?
-        != 1
-    {
-        return Err(Error::Integrity);
-    }
     Ok(Outcome {
         email: delivery.email,
         blob: delivery.blob,

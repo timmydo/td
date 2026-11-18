@@ -56,8 +56,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_search_index.sql"),
     include_str!("postgres_receipt_stamps.sql"),
     include_str!("postgres_retry_floor.sql"),
+    "DROP TABLE td_mta.receiving_receipts;",
 ];
-const VERSION: u32 = 42;
+const VERSION: u32 = 43;
 #[path = "postgres_schema_acl.rs"]
 mod acl;
 // Shared by every future serving connection and explicit schema operation.

@@ -2,15 +2,11 @@
 use super::{
     connect_authenticated_until,
     retained::{Bounds, LIFETIME},
-    Endpoint, Error, Input, Mode, Request, Worker, MAX_DURATION,
+    Error, Input, Mode, Request, Worker, MAX_DURATION,
 };
 use crate::{
     ids::StoreEpoch,
-    postgres_receiving::{
-        self as receiving,
-        fanout::{self, Publication},
-        Fanout, FanoutOutcome,
-    },
+    postgres_receiving::{self as receiving, fanout, Fanout, FanoutOutcome},
     postgres_route_owners as owners,
     postgres_runtime_profile::Binding,
     postgres_schema,
@@ -31,8 +27,6 @@ pub(crate) struct MutationSession {
     worker: Worker,
     bounds: Bounds,
     epoch: StoreEpoch,
-    // Where an uncertain COMMIT on this session went, for settlement there.
-    endpoint: Endpoint,
     // None selects the fixed renewal budget, never SMTP publication credit.
     accounts: Option<usize>,
     retired: bool,
@@ -93,14 +87,10 @@ impl MutationSession {
             worker,
             bounds,
             epoch: schema.store_epoch,
-            endpoint: request.address,
             accounts,
             retired: false,
             clean_idle: true,
         })
-    }
-    pub(crate) fn endpoint(&self) -> Endpoint {
-        self.endpoint
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         !self.retired
@@ -228,11 +218,10 @@ impl MutationSession {
         match result {
             Ok(publication) => {
                 // Durable evidence survives later deadline or retirement failure.
-                let rollback = matches!(publication, Publication::Existing(_));
-                if self.finish(rollback).is_err() {
+                if self.finish(false).is_err() {
                     self.retired = true;
                 }
-                Ok(publication.outcome())
+                Ok(publication)
             }
             Err(error) => {
                 self.retired = true;

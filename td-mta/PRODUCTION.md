@@ -704,3 +704,12 @@ grants unchanged. An account whose upload quota filled under an older binary
 recovers as it uploads again (each attempt, even one refused for quota,
 reclaims one batch) and, from relay retention turns, on its own while a relay
 route serves it (POSTGRES.md section 216). Do not delete leases by hand.
+
+## Inbound SMTP commit replies (schema 43)
+
+The fenced schema upgrade removes `td_mta.receiving_receipts`, the old
+commit-recovery ledger. Existing messages and their SMTP envelope metadata
+stay in the mail tables. The receiving worker returns 250 after PostgreSQL
+confirms COMMIT and 451 on an uncertain result. A sender retry may produce
+a duplicate if the first delivery committed. Use the consistent pre-upgrade
+backup for rollback across this schema change.

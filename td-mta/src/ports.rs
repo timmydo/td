@@ -310,10 +310,9 @@ pub struct Commit {
     pub epoch: StoreEpoch,
     pub sequence: Sequence,
 }
-/// Rejected guarantees this attempt committed no transaction. Indeterminate means a
-/// transaction may have committed: never report success or replay it, and keep it
-/// fenced until recovered. SMTP receiving retains and settles it in process
-/// (POSTGRES.md section 104) rather than stopping the writer.
+/// Rejected guarantees this attempt committed no transaction. An indeterminate
+/// commit may already be durable. SMTP receiving returns 451, discards the
+/// database connection and leaves any new delivery attempt to the sender.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitFailure {
     Rejected(Error),

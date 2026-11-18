@@ -180,7 +180,6 @@ fn run_once(
         .ok_or_else(|| config_failure("tls", "invariant"))?;
     let slots = td_mta::postgres_read::ReadSlots::new(limits.storage_views)
         .map_err(|_| config_failure("postgres", "read-capacity"))?;
-    let smtp_pending = td_mta::postgres_smtp_receiving::Pending::default();
     // The process's only HTTP write owner: receipt sweeps rely on one owner
     // fencing each family's publications (POSTGRES.md section 217).
     let http_pending = td_mta::postgres_http_updates::Pending::default();
@@ -438,7 +437,6 @@ fn run_once(
                             additional: &receiving_bindings,
                             slots: &slots,
                             clock: clock.as_ref(),
-                            pending: &smtp_pending,
                         },
                         clock.clone(),
                         policies.id().get(),
