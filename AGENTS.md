@@ -220,15 +220,15 @@ boundaries are:
 
 # Code review
 
-- Each commit receives two independent reviews at high effort, using
-  `opus-latest` and `gpt-sol-latest` or the approved subscription
-  alternatives, by the routes, standing approval, panel cycle and
-  escalation triggers `DEVELOPMENT.md` defines. Stop and ask when the
-  passes stop converging.
+- Use two independent high-effort subscription subagents for each commit's
+  review. Use a subscription subagent for follow-up confirmation as well.
+  `DEVELOPMENT.md` defines model selection, standing substitutions, the
+  panel cycle and escalation triggers. Stop and ask when passes stop
+  converging.
 - The acting agent reconciles every finding and records its own summary,
   concrete reviewer identities, and checks in the commit message.
-- Retained td-agent review traces are user-owned audit records: preserve
-  them during cleanup and delete them only at the human's explicit request.
+- Preserve retained review traces during cleanup. These user-owned audit
+  records may be deleted only at the human's explicit request.
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
 verifies that every touched path ends in `.md`. Other unavailable-reviewer

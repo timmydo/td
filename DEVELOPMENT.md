@@ -1326,126 +1326,79 @@ and records results.
 
 # Code review: two frontier models per commit
 
-Every increment receives two independent reviews of one exact commit:
-`opus-latest` and `gpt-sol-latest`, both at **high** effort. Select the
-newest available frontier release in each family and record the concrete
-versions actually used. An unresolved `latest` alias is not a receipt.
-The subscription alternatives below may replace one of these models.
+Use fresh subagents provided by the current harness subscription for all
+commit reviews, including confirmation after fixes. Each increment receives
+two independent high-effort reviews of the exact same commit. Use the
+newest available Opus and GPT Sol releases or the standing model
+substitutions below. Record concrete model versions.
 
-Use a fresh review subagent in the current harness when it can select the
-required model and high effort. Give it the repository and full commit id,
-ask it to inspect the complete commit, relevant instructions and surrounding
-code, and return prioritized findings with file locations. It must not edit
-or inherit the acting agent's conclusions.
+Give each review subagent the repository and full commit ID. Ask it to
+inspect the complete commit, relevant instructions and surrounding code,
+and return prioritized findings with file locations. Give it a fresh
+context without the acting agent's conclusions. Reviewers inspect the
+tree read-only. The acting agent reconciles the two independent reports.
 
-## Subscription alternatives
+## Subscription model selection
 
-To preserve API credits when subscription credits are available, prefer these
-user-approved alternatives to a paid td-agent review:
+Codex keeps the GPT Sol subagent and may use a fresh Astra subagent for
+the Opus slot. Claude keeps the Opus subagent and may use a fresh Fable
+subagent for the GPT Sol slot. Both subagents review at high effort.
+These substitutions have standing user approval until revoked. If a
+subscription cannot provide the required reviewers, use the human waiver
+procedure below.
 
-- Codex keeps the independent GPT Sol review and may use a fresh Astra
-  subagent instead of the td-agent Opus review.
-- Claude keeps the independent Opus review and may use a fresh Fable
-  subagent instead of the td-agent GPT Sol review.
-
-Both reviews still inspect the exact commit independently at high effort;
-the acting agent's own assessment does not count as either review. Select
-the newest available release in the chosen family and record the concrete
-model actually used. Use a fresh context without the acting agent's
-conclusions. The same reconciliation and confirmation rules apply.
-
-This is standing approval from the repository user until revoked; do not
-ask again for each commit. It permits the substitution, not omission of
-the second review. If the alternative is unavailable, follow the ordinary
-review route unless the user has prohibited paid API calls; in that case
-ask before spending API credits.
-
-The current verifier recognizes Opus and GPT Sol receipts. Record Astra or
-Fable's concrete identity, high effort, reviewed commit, findings and
-dispositions in the commit body, and use the existing waiver for the
-replaced slot. Do not mislabel an alternative as Opus or GPT Sol, or put
-its unsupported model in a Reviewed-by trailer. Keep the other review's
-normal Reviewed-by trailer. For Codex:
+The verifier recognizes Opus and GPT Sol receipts. For a substitution,
+record Astra or Fable's concrete identity, effort, reviewed commit,
+findings and dispositions in the commit body. Use the waiver for its
+slot and the normal reviewer trailer for the other slot. For example,
+a Codex panel using Astra records:
 
 ```text
-Reviewed-by: subagent/gpt-6.1-sol
-Review-waiver: opus — Astra substitution to preserve API credits; approved by repository user
+Reviewed-by: subagent/gpt-6.2-sol
+Review-waiver: opus — Astra subscription subagent substitution; approved by repository user
 Checks: <checks actually run>
 ```
 
-For Claude, retain the concrete Opus Reviewed-by trailer and use:
+A Claude panel using Fable records its concrete Opus reviewer and:
 
 ```text
-Review-waiver: gpt-sol — Fable substitution to preserve API credits; approved by repository user
+Review-waiver: gpt-sol — Fable subscription subagent substitution; approved by repository user
 ```
-
-These trailers record this standing human approval; they do not claim the
-verifier independently checks the replacement review.
-
-## API review route
-
-When the harness cannot invoke the required model and the subscription
-alternative is not used, run the following from the change's worktree:
-
-```text
-td-agent review --commit COMMIT_ID --model opus-latest
-td-agent review --commit COMMIT_ID --model gpt-sol-latest
-```
-
-Run only the command for the model unavailable in the harness. td-agent
-reads unpublished commits from the local Git object database, generates the
-full diff and built-in review instruction, and prepares an internal checkout
-pinned to that commit. Source and Git metadata are read-only; test output
-uses private writable scratch. td-agent removes its checkout and scratch on
-completion or error. No remote, caller-written prompt or prepared diff is
-needed. The command defaults to high effort and resolves the model alias to
-its concrete API identity. See `td-agent/DESIGN.md` §2 for confinement, cost
-limits and retained traces. A nonzero exit or incomplete report is not a
-review. Both transports fill the same reviewer slots; the subscription
-alternatives above use an explicit waiver for the replaced slot. There is
-no separate CLI review step.
 
 ## Review records and follow-up
 
 Store reports under `.td-build-cache/agent-scratch/` in the owned worktree.
 Summarize their findings and dispositions in the commit, then delete owned
 stdout/stderr report captures and private review copies before finishing.
-The full JSONL traces are separate user-owned audit records, stored centrally
-in `$XDG_STATE_HOME/td-agent/reviews/` (otherwise
-`~/.local/state/td-agent/reviews/`), shared across worktrees and sessions.
-The command labels their paths `retained trace` and asks callers to keep them.
-Never follow those paths to delete traces as part of report, session or
-worktree cleanup. An explicit `--log-dir` must likewise name retained storage
-outside disposable session trees. td-agent itself removes its private run
-directories under the canonical home's `.local/state/td-agent/review-runs/` on td, or the key directory's
-`reviews/` on a development host; those are workspaces, not the state
-directory's retained traces. See `td-agent/DESIGN.md` §2.
+Historical review traces are user-owned audit records. Preserve their
+files under `$XDG_STATE_HOME/td-agent/reviews/` (by default
+`~/.local/state/td-agent/reviews/`) and in any explicit retained log
+directory. Delete retained traces only at the human's explicit request.
 
 Do not alter a reviewer's report to make it agree with the change. The acting
 agent reconciles each finding, fixes valid issues and explains rejected ones
 with evidence.
 
-Schedule one panel cycle per commit. After fixes, the review subagent alone
-confirms the resulting diff. Re-run the panel only for a named escalation:
+Schedule one panel cycle per commit. After fixes, one subscription review
+subagent confirms the resulting diff. Re-run the panel only for a named escalation:
 a new source file, unsafe surface or dependency, a material design change,
 or a disagreement that needs the other model's judgment. Record the trigger.
 Stop and ask the user if passes stop converging. Review the exact final
 source tree; a message-only amendment does not invalidate a source review,
 nor does a rebase that needs no new `ready` ("Rebasing after ready").
 
-Close the commit message with a review/check trailer block. Both reviewers
-may use the same transport. For example:
+Close the commit message with a review/check trailer block. A panel with
+both model families available uses their concrete subagent identities:
 
 ```text
-Reviewed-by: subagent/gpt-6.1-sol
-Reviewed-by: td-agent/anthropic/claude-opus-5.5
+Reviewed-by: subagent/gpt-6.2-sol
+Reviewed-by: subagent/opus-5.5
 Checks: <checks actually run>
 ```
 
 The body records the reviewed commit, concrete models, high effort, findings,
 dispositions and confirmation passes. `ready` and `td-review` share the same
-record verifier. Historical CLI receipts remain readable, but the current
-workflow invokes only harness subagents or `td-agent review`.
+record verifier. Historical review receipts remain valid.
 
 Outside the standing subscription approval above, an unavailable model may
 be waived only with a reason and a named human's explicit approval. At most
