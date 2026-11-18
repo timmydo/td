@@ -1025,19 +1025,11 @@ and retain partial-search behavior. Operational failures, uncertainty or no
 completed cycle within a day make status fail. The supervisor records JSON
 output and exit status; mailbox alert routing remains a separate configuration.
 
-If a worker reports `search-commit-unknown`, inspect its journal and the database
-first. Preserve the progress file. To authorize safe replay of derived writes
-from its last confirmed cursor, run:
-
-```text
-/home/alice/.local/bin/td-mta postgres search-prepare-resume \
-  --state-dir /home/alice/.local/state/td-mta-search \
-  --epoch STORE_EPOCH_HEX \
-  --connection-file /home/alice/.config/td-mta/owner-connection
-```
-
-The command verifies the epoch and does not claim the interrupted transaction
-rolled back. The next scheduled page clears failure status only after success.
+After a worker interruption or a `commit-unknown` result, keep the progress
+file. The next scheduled worker retries from the last confirmed cursor,
+verifies the database epoch and skips rows already indexed. Status reports
+the interruption until a page succeeds. Repeated failures appear in the
+worker journal with their database, connection or preparation error.
 An epoch or search-version mismatch requires preserving the old evidence and
 provisioning a fresh dedicated progress directory. No certificates or packages
 are needed beyond the existing PostgreSQL installation and schema-40 extension.

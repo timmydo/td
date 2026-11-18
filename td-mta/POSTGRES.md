@@ -8408,15 +8408,20 @@ invocations wait five minutes before starting another cycle. Unsupported
 interpretations remain explicit skips and can be retried in later cycles.
 They neither block preparation of other messages nor certify completeness.
 
-Before database work the job persists an in-flight marker. Only a known result
-clears it: a successful page advances progress; a known pre-COMMIT failure
-retains the cursor and records operational failure. Unknown COMMIT, process
-termination or failure to save a result leaves an uncertainty marker. The job
-then refuses automatic replay. `postgres search-prepare-resume` with the same
-state, epoch and connection arguments verifies the database epoch and explicitly
-authorizes replay from the last confirmed cursor. Repeating derived writes is
-safe; this command does not claim the previous transaction rolled back. Status
-remains unhealthy until a successful preparation page clears operational failure.
+Before database work the job persists an in-flight marker with the last
+confirmed cursor and upper bound. After an interrupted or unacknowledged
+page, the next scheduled invocation uses that checkpoint. Each page verifies
+the database epoch under the schema lock and selects only missing or
+incompatible search evidence. Rows already prepared by a committed page
+are skipped. Before the first confirmed page, the upper bound is selected
+again. Only confirmed page results contribute to the cycle counters.
+
+A failed attempt leaves the cursor in place and reports its error. If an
+earlier page was in flight, its marker survives a failed retry. A confirmed
+page clears both the marker and the operational failure. The optional
+`postgres search-prepare-resume` command can still verify the epoch and
+clear an in-flight marker without running a page. It leaves failure status
+set until a page succeeds.
 
 `postgres search-prepare-status --state-dir PATH --epoch HEX` needs no database
 credentials. It reports counts, timestamps, continuation and in-flight/failure

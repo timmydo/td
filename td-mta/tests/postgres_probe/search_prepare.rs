@@ -358,10 +358,10 @@ fn scheduled(fixture: &Fixture, epoch: td_mta::ids::StoreEpoch, good: &[u8]) {
         invoke("search-prepare", 1)
             .get("error")
             .and_then(td_json::Json::as_str),
-        Some("search-commit-unknown")
+        Some("commit-unknown")
     );
     sql(fixture,"DROP TRIGGER end_search_job_commit ON td_mta.blob_search; DROP FUNCTION public.end_search_job_commit()");
-    invoke("search-prepare-resume", 0);
+    let checkpoint = fs::read(state.join("state.json")).unwrap();
     invoke("search-prepare-status", 1);
     let resumed = invoke("search-prepare", 0);
     assert_eq!(
@@ -372,6 +372,35 @@ fn scheduled(fixture: &Fixture, epoch: td_mta::ids::StoreEpoch, good: &[u8]) {
         Some(1)
     );
     invoke("search-prepare-status", 0);
+    // A crash after PostgreSQL committed can leave this same checkpoint.
+    fs::write(state.join("state.json"), &checkpoint).unwrap();
+    let replay = invoke("search-prepare", 0);
+    assert_eq!(
+        replay.get("phase").and_then(td_json::Json::as_str),
+        Some("complete")
+    );
+    assert_eq!(
+        replay
+            .get("progress")
+            .and_then(|p| p.get("written"))
+            .and_then(td_json::Json::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT count(*) FROM td_mta.blob_search WHERE {}",
+                predicate(key(4, 30))
+            )
+        ),
+        "1"
+    );
+    invoke("search-prepare-status", 0);
+    fs::write(state.join("state.json"), checkpoint).unwrap();
+    invoke("search-prepare-resume", 0);
+    invoke("search-prepare-status", 1);
+    invoke("search-prepare", 0);
     fs::set_permissions(state.join("state.json"), fs::Permissions::from_mode(0o644)).unwrap();
     invoke("search-prepare-status", 1);
 }

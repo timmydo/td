@@ -116,10 +116,9 @@ search evidence is prepared. A healthy search cycle does not establish that
 synchronization is current or that the replica is source-complete.
 
 See [automatic search preparation](DEPLOYMENT.md#automatic-search-preparation)
-for schedule generation, limits, failure status and explicit uncertainty
-recovery. Do not delete the progress file or automatically run
-`search-prepare-resume` to clear a failure. Status checks record failures;
-mailbox alert delivery requires separate operator configuration.
+for schedule generation, limits and status. Preserve the progress file after
+an interruption. The worker resumes on its next scheduled run. Status checks
+record failures; mailbox alert delivery requires separate operator configuration.
 
 ## Update and rollback
 

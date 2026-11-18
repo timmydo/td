@@ -806,9 +806,9 @@ outcome without timing assertions. Runtime mode and a nonowner login are refused
 
 Scheduled preparation is exercised through the real command binary: initial
 unhealthy status, successful preparation, the waiting phase, and a deferred
-trigger causing unknown COMMIT. A subsequent invocation refuses replay until
-the explicit resume command succeeds; status remains unhealthy until a page
-completes. A world-readable state file is refused. Unit cases cover epoch and
+trigger causing unknown COMMIT. Scheduled retries report a persistent failure
+and recover once the fault clears. Replaying a saved checkpoint after a
+committed page skips its indexed rows. A world-readable state file is refused. Unit cases cover epoch and
 search-version binding, clock rollback and generated systemd/Shepherd schedules.
 
 

@@ -1,4 +1,4 @@
-//! Finite scheduled preparation with an explicit uncertainty latch.
+//! Finite scheduled preparation from the last confirmed search cursor.
 use super::{
     report_error, scrub_state::FileState, search_job_state::State, with_addresses, AttemptError,
 };
@@ -83,9 +83,6 @@ pub(super) fn run(
             let healthy = state.healthy(time);
             return Ok((state, healthy, "status"));
         }
-        if state.in_flight && operation != Operation::Resume {
-            return Err("search-commit-unknown");
-        }
         let loaded = match Loaded::open(
             options.connection.as_deref().ok_or("search-connection")?,
             "search-prepare",
@@ -125,6 +122,7 @@ pub(super) fn run(
         if !state.active {
             state.begin(time)?;
         }
+        let was_in_flight = state.in_flight;
         state.in_flight = true;
         save(&file, &state)?;
         let result = with_addresses(&loaded, |request, deadline| {
@@ -148,7 +146,7 @@ pub(super) fn run(
                 Ok((state, true, if page.done { "complete" } else { "progress" }))
             }
             Err((_, code)) => {
-                state.in_flight = code == "commit-unknown";
+                state.in_flight = was_in_flight || code == "commit-unknown";
                 state.operation_failed = true;
                 state.observe(now()?)?;
                 save(&file, &state)?;
