@@ -761,3 +761,72 @@ stay in the mail tables. The receiving worker returns 250 after PostgreSQL
 confirms COMMIT and 451 on an uncertain result. A sender retry may produce
 a duplicate if the first delivery committed. Use the consistent pre-upgrade
 backup for rollback across this schema change.
+
+## Deploy from the development machine
+
+Run `./td-mta/deploy` in the reviewed development checkout. The command
+fetches shared main, selects the newest first-parent descendant of the
+installed release with a passing main-integration verdict on this machine,
+and sends that exact Git object to claw1 using the production SSH identity.
+It checks the deployed tree and refuses divergent history. When no newer
+revision qualifies it checks the running release and leaves mail online.
+The main-integration runner owns the verdicts (see DEVELOPMENT.md).
+A detached systemd job owns each activation through SSH disconnects.
+Its root-only receipt path is printed before activation. The development
+machine checks authenticated public JMAP before and after the job using
+td-mail account xyz882015 (override with `--jmap-account NAME`). The
+second check records both observations in public-jmap.json beside the receipt.
+
+A fresh unprivileged checkout builds the candidate with install-td-mta.
+The operator stages the release, validates the epoch, selected configuration
+and runtime login, and checks scheduled backup and aggregate health.
+Older candidates without schema-plan must pass strict schema-inspect.
+A recognized pending migration or a change to required runtime grants
+also needs the private PostgreSQL profiles and comparison SQL described
+in the online recovery procedure. The deployment takes a fresh verified
+base, rehearses the candidate on an independent writable copy inside a
+private network namespace, and proves archive replay on another copy.
+
+The default forward activation budget is 60 seconds. On expiry the job
+restores service and records the observed outage. Recovery and clean
+PostgreSQL shutdown can extend the interruption beyond the budget. Use
+`./td-mta/deploy --window-seconds N` to set it for an invocation.
+The job records the active timers and conditions the mail and scheduled
+writer services on a durable deployment fence. During schema cutover a
+temporary nftables output rule reserves the loopback database connection
+for the root operator. It verifies the named restore point and selected
+mail evidence before attempting DDL. A preseeded, primary-device copy
+is synchronized by content after clean PostgreSQL shutdown. Budget
+space for this additional data directory and time to read both copies.
+The actual upgrade and runtime checks use the candidate data directory
+on private loopback. The original shut-down primary remains in the private
+job directory. Before writer admission a failed migration can reopen that
+original cluster and binary. Once admission begins the job preserves the
+selected database, including accepted mail, for operator recovery.
+
+Watch the job and its receipt with `systemctl status td-mta-deploy-XXXXXXXX`
+and `sudo cat /var/lib/td-mta-operator/deploy-XXXXXXXX/receipt.json`,
+substituting the printed identifier. After an interrupted host boot,
+`/var/lib/td-mta-operator/deployment-fence` names the owning job. Check
+its event record, unit states, selected executable, both PGDATA directories
+and the recovery receipt before reopening writers. Never restore a retained
+cluster after writers may have reopened without reconciling subsequent mail.
+ACME may need its separate four-minute lease budget after SMTP and JMAP
+return. Keep recovery inputs and the original data through the rollback
+window.
+
+
+On claw1 the root-only libpq service file is
+`/var/lib/td-mta-operator/physical-backup/service.conf`. Its
+`cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
+The ordinary `cutover_marker` profile uses `td_mta_cutover_marker`,
+`marker.pass` and the `postgres` database. Both use verified loopback TLS.
+The same operator directory supplies `compare-selected.sql`, a bounded
+read-only transaction producing deterministic rows for schema, epoch,
+selected configuration, sampled emails, recipients and body chunks.
+The backup volume directory is `/data/td-mta-physical-recovery`, root:root
+0700 on the separate data disk. The owner login uses the scheduled backup
+libpq profile in `/var/lib/td-mta/backup-control/service.conf`.
+The host uses its installed Python 3.11+, PostgreSQL 17 tools, systemd,
+nftables, rsync with --fsync, tar, util-linux and the native build
+toolchain. Database passwords stay in protected files on claw1.
