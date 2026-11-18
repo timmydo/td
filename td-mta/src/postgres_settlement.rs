@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 const INLINE: Duration = Duration::from_secs(3);
 
 /// Prepay `connections` settlement connections, each at the mutation frame
-/// ceiling that bounds receipt inspection and Email receipt retirement,
+/// ceiling that bounds receipt inspection,
 /// before a write settles its owner's retained operation.
 pub(crate) fn charge(
     meter: &mut Meter,

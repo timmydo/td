@@ -2793,7 +2793,7 @@ td-mta/src/postgres_drafts.rs	heap-owner	3
 td-mta/src/postgres_drafts.rs	unchecked-growth-or-clone	9
 td-mta/src/postgres_email_set.rs	direct-reservation	12
 td-mta/src/postgres_email_set.rs	heap-owner	1
-td-mta/src/postgres_email_set.rs	unchecked-growth-or-clone	21
+td-mta/src/postgres_email_set.rs	unchecked-growth-or-clone	19
 td-mta/src/postgres_email_set/deletion.rs	allocating-conversion	1
 td-mta/src/postgres_email_set/deletion.rs	direct-reservation	6
 td-mta/src/postgres_email_set/deletion.rs	unchecked-growth-or-clone	9
@@ -2817,7 +2817,7 @@ td-mta/src/postgres_http_drafts.rs	unchecked-growth-or-clone	3
 td-mta/src/postgres_http_mailboxes.rs	direct-reservation	2
 td-mta/src/postgres_http_mailboxes.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_http_updates.rs	direct-reservation	4
-td-mta/src/postgres_http_updates.rs	unchecked-growth-or-clone	7
+td-mta/src/postgres_http_updates.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_http_upload_receive.rs	direct-reservation	1
 td-mta/src/postgres_http_upload_receive.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_imports.rs	allocating-constructor	1

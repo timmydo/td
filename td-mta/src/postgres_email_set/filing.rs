@@ -48,9 +48,6 @@ pub fn prepare(
 }
 
 impl Filing {
-    pub(crate) fn into_change(self) -> Change {
-        self.0
-    }
     pub fn operation(&self) -> EmailOperationId {
         self.0.operation()
     }

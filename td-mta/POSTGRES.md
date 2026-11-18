@@ -1550,15 +1550,8 @@ A missing receipt authorizes a new operation identity only once section 165
 proves the uncertain transaction rolled back.
 Fresh operations refuse while 1024 receipts younger than a minute remain;
 publication first deletes older ones (section 217).
-The HTTP owner retires its exact receipt only after confirmed publication or
-historical settlement. Retirement checks epoch, account, operation, digest and
-complete outcome under the account writer lock. Once confirmed, the owner
-transitions irreversibly to retirement-only custody: it cannot publish that
-operation again. Missing receipts settle a lost retirement acknowledgement.
-Retirement failures preserve the known successful response and keep this
-owner fenced until retirement succeeds; the next mutation retries cleanup
-before admitting a new operation. Unknown publication outcomes retain the
-original operation and its publication endpoint until inspection there finds
+The HTTP owner releases a confirmed result immediately. An uncertain write
+retains its original operation and publication endpoint until inspection finds
 the receipt or proves its absence; the next mutation settles inline before
 admitting a new operation. Receipts a crash orphans expire with the rest.
 All calls retain finite worker/deadline limits.
@@ -2948,10 +2941,8 @@ by its own recovery workflow.
 Every HTTP write owner (sections 82, 84, 89, 101 and 130 name the others)
 runs the same settlement inline when a write meets its retained operation.
 It first prepays each connection settlement may open from the write's
-meter, 1088 records apiece: one inspection, plus the receipt retirement an
-Email operation needs once its receipt is found (a pending retirement
-prepays that one alone; a cancellation charges its section 130 ceilings
-instead). A refused charge returns that refusal, Capacity or Deadline,
+meter, 1088 records for one inspection (cancellation charges its section
+130 ceilings instead). A refused charge returns that refusal, Capacity or Deadline,
 rather than busy. Settlement then runs under the write's deadline capped
 at three seconds, so an unreachable endpoint cannot hold the owner,
 worker and a foreground slot for the whole request, and that slot is
@@ -5269,7 +5260,7 @@ surface as errors, which retain custody; all of them use the single pinned
 primary, and an HTTP or SMTP receiving owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
 still be pending, beyond the bounded sweeps of sections 52, 120, 123, 216
-and 218, an Email owner's retirement of its own confirmed receipt, and, by
+and 218 and, by
 another instance serving the same account, section 46's receiving sweep
 (section 104) and the HTTP families' sweeps (section 217).
 Any further sweep of attempt, phase, recovery, expiry, HTTP-family or
@@ -7254,8 +7245,7 @@ account's receipts of its own family older than one minute before the
 sample, then refuses with Capacity only while 1,024 younger ones remain. A
 full ledger is a per-minute flood bound, never a lifetime one; td-mail's
 sends, attachments and folder writes are not limited over an account's
-life. The owner's retirement of a confirmed flag receipt (section 32)
-continues. Capacity inspection counts only receipts inside the minute; an
+life. Capacity inspection counts only receipts inside the minute; an
 idle account keeps expired ones until its next publication of that family.
 
 A receipt is no JMAP idempotency record: operation IDs are random per
@@ -7269,9 +7259,8 @@ remove the held receipt first, however long settlement waits and whatever
 the database clock does. Another instance selecting a profile with the same
 account (section 1) can sweep it after a minute; the owner then releases a
 committed operation as rolled back. That loses only the passive outcome:
-the owner never republishes, the reply already sent stands, and retiring an
-absent flag receipt is already a no-op. A restart releases every owner. No
-other reader exists: the upload lease, not its receipt, governs downloads
+the owner never republishes and the reply already sent stands. A restart
+releases every owner. No other reader exists: the upload lease, not its receipt, governs downloads
 and upload expiry; the relay and section 216 address submissions by ID; a
 cancellation receipt ages from its publication, not the group's completion.
 After expiry an operation is not replayable, and no owner republishes one.

@@ -5255,7 +5255,6 @@ fn exercise_flags(
         Err(flags::Error::Capacity)
     );
     assert_eq!(publish(&first).unwrap(), first_result);
-    // Publication sweeps, beside the owner's retirement of its own receipts.
     // Hold receipts this fixture replays later past every sweep that
     // follows; flag outcomes carry no stamp, so the hold never lifts.
     receipt_expiry::hold(fixture, "flag_receipts", &account.to_string());

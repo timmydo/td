@@ -29,9 +29,6 @@ pub fn prepare(
     prepare_batch_kind(binding, device, &updates, expected, true).map(Deletion)
 }
 impl Deletion {
-    pub(crate) fn into_change(self) -> Change {
-        self.0
-    }
     pub fn operation(&self) -> EmailOperationId {
         self.0.operation()
     }

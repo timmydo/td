@@ -28,7 +28,6 @@ enum Operation {
     Update(Change),
     Destroy(deletion::Deletion),
     Filing(filing::Filing),
-    Retiring(changes::Retirement),
 }
 impl Operation {
     fn operation(&self) -> EmailOperationId {
@@ -36,27 +35,6 @@ impl Operation {
             Self::Update(value) => value.operation(),
             Self::Destroy(value) => value.operation(),
             Self::Filing(value) => value.operation(),
-            Self::Retiring(value) => value.operation(),
-        }
-    }
-    fn confirmed(self, outcome: changes::BatchOutcome) -> Self {
-        let change = match self {
-            Self::Update(value) => value,
-            Self::Destroy(value) => value.into_change(),
-            Self::Filing(value) => value.into_change(),
-            Self::Retiring(value) => return Self::Retiring(value),
-        };
-        Self::Retiring(changes::Retirement::new(change, outcome))
-    }
-    fn retire(
-        &self,
-        connection: &postgres_probe::Request<'_>,
-        trust: &td_crypto::TrustStore,
-        deadline: Instant,
-    ) -> Result<(), changes::Error> {
-        match self {
-            Self::Retiring(value) => value.retire(connection, trust, deadline),
-            _ => Err(changes::Error::Invalid),
         }
     }
     fn inspect(
@@ -69,7 +47,6 @@ impl Operation {
             Self::Update(value) => changes::inspect_batch(connection, trust, deadline, value),
             Self::Destroy(value) => deletion::inspect(connection, trust, deadline, value),
             Self::Filing(value) => filing::inspect(connection, trust, deadline, value),
-            Self::Retiring(value) => Ok(Some(value.outcome.clone())),
         }
     }
     fn publish(
@@ -80,7 +57,6 @@ impl Operation {
         password: &[u8],
     ) -> Result<changes::BatchOutcome, changes::Error> {
         match self {
-            Self::Retiring(_) => Err(changes::Error::Invalid),
             Self::Update(value) => {
                 changes::publish_batch(connection, trust, deadline, value, password)
             }
@@ -196,7 +172,7 @@ pub struct Settled {
 }
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
-    /// A found receipt becomes retirement custody and absence proves rollback
+    /// A found receipt confirms the write and absence proves rollback
     /// unless another process swept the expired receipt; either releases the
     /// uncertain fence. Any error retains the operation.
     pub fn settle(
@@ -225,7 +201,7 @@ impl Pending {
         settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
 }
-/// Inspect and retire only at the retained endpoint (section 165).
+/// Inspect only at the retained endpoint (section 165).
 fn settle_held(
     pending: &mut Option<(Operation, Endpoint)>,
     loaded: &Loaded,
@@ -246,14 +222,7 @@ fn settle_held(
         return Ok(None);
     };
     let operation = change.operation();
-    let (change, _) = pending.take().ok_or(Error::Invalid)?;
-    let retiring = change.confirmed(outcome.clone());
-    if retiring
-        .retire(&connection, &loaded.trust, deadline)
-        .is_err()
-    {
-        *pending = Some((retiring, endpoint));
-    }
+    *pending = None;
     Ok(Some(Settled { operation, outcome }))
 }
 
@@ -434,17 +403,8 @@ impl Updates<'_> {
             return Err(Error::Deadline);
         }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
-        if let Some((change, _)) = pending.as_ref() {
-            // Settle within this request's capped deadline with a foreground
-            // slot it releases before taking its own. A found receipt costs a
-            // retirement connection after the inspection; a retirement retries
-            // with that one alone.
-            let connections = if matches!(change, Operation::Retiring(_)) {
-                1
-            } else {
-                2
-            };
-            settlement::charge(meter, self.clock, connections)?;
+        if pending.is_some() {
+            settlement::charge(meter, self.clock, 1)?;
             let inline = settlement::inline_deadline(deadline)?;
             if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
                 || pending.is_some()
@@ -487,9 +447,6 @@ impl Updates<'_> {
         }
         match outcome {
             Ok(outcome) => {
-                let endpoint = endpoint.ok_or(Error::Invalid)?;
-                *pending = Some((change, endpoint));
-                // Allocate before effects; preserve a known commit after deadline.
                 if outcome.results.len() != request.input.len() {
                     return Err(Error::Corrupt);
                 }
@@ -499,15 +456,6 @@ impl Updates<'_> {
                     .any(|result| !request.input.valid_result(*result))
                 {
                     return Err(Error::Corrupt);
-                }
-                let (change, _) = pending.take().ok_or(Error::Invalid)?;
-                let confirmed = change.confirmed(outcome.clone());
-                let connection = settlement::request(self.loaded, endpoint);
-                if confirmed
-                    .retire(&connection, &self.loaded.trust, deadline)
-                    .is_err()
-                {
-                    *pending = Some((confirmed, endpoint));
                 }
                 Ok(Completion {
                     before_sequence: Sequence::from_u64(outcome.state.old_sequence),

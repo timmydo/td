@@ -533,14 +533,6 @@ pub(super) fn exercise(
     };
     let email_hex = sql(fixture, "SELECT encode(id,'hex') FROM td_mta.emails");
     let email = td_mta::ids::EmailId::parse(&email_hex).unwrap();
-    // A nearly full legacy ledger must allow unlimited confirmed HTTP writes.
-    let baseline: usize = sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts")
-        .parse()
-        .unwrap();
-    let account = binding.account();
-    // Stamped a day ahead, so no publication below sweeps them however long
-    // this section runs; flag outcomes carry no stamp.
-    sql(fixture, &format!("UPDATE td_mta.flag_receipts SET created_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000; INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex'),decode('01','hex'),(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 FROM generate_series(1,{}) n", 1023 - baseline));
     let set_flag = |flagged| {
         let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
         let mut meter = td_mta::admission::work::Meter::new(
@@ -567,74 +559,17 @@ pub(super) fn exercise(
             &mut meter,
         )
     };
-    for flagged in [true, false, true] {
+    // A confirmed edit releases the owner without a second transaction.
+    // Use fresh receipts so the age-based sweep has no work.
+    sql(fixture, "UPDATE td_mta.flag_receipts SET created_at=(extract(epoch FROM clock_timestamp())*1000)::bigint; CREATE SEQUENCE public.retirement_attempts; CREATE FUNCTION public.refuse_receipt_retirement() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$ BEGIN PERFORM nextval('public.retirement_attempts'); RAISE EXCEPTION 'fixture retirement failure'; END $$; CREATE TRIGGER refuse_receipt_retirement BEFORE DELETE ON td_mta.flag_receipts FOR EACH ROW WHEN (OLD.created_at >= (extract(epoch FROM clock_timestamp())*1000)::bigint - 60000) EXECUTE FUNCTION public.refuse_receipt_retirement()");
+    for flagged in [true, false] {
         assert!(set_flag(flagged).unwrap().outcome.is_ok());
         assert_eq!(confirmed.operation().unwrap(), None);
-        assert_eq!(
-            sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
-            "1023"
-        );
     }
-    sql(fixture, "CREATE FUNCTION public.refuse_receipt_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture retirement failure'; END $$; CREATE TRIGGER refuse_receipt_retirement BEFORE DELETE ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.refuse_receipt_retirement()");
-    assert!(
-        set_flag(false).unwrap().outcome.is_ok(),
-        "cleanup cannot erase known publication"
-    );
-    let retained = confirmed.operation().unwrap().unwrap();
     assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
-        "1024"
+        sql(fixture, "SELECT is_called FROM public.retirement_attempts"),
+        "f"
     );
-    assert!(
-        set_flag(true).is_err(),
-        "failed retirement fences another publication"
-    );
-    assert_eq!(confirmed.operation().unwrap(), Some(retained));
-    assert_eq!(
-        sql(
-            fixture,
-            "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"
-        ),
-        "0"
-    );
-    let cleanup_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
-    let settled = confirmed
-        .settle(
-            &loaded,
-            executable,
-            &cleanup_slots,
-            &clock,
-            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(settled.operation, retained);
-    assert_eq!(
-        confirmed.operation().unwrap(),
-        Some(retained),
-        "failed cleanup preserves the fence and known outcome"
-    );
-    // Simulate a retirement COMMIT whose acknowledgement was lost.
-    sql(fixture, "DROP TRIGGER refuse_receipt_retirement ON td_mta.flag_receipts; DROP FUNCTION public.refuse_receipt_retirement()");
-    sql(
-        fixture,
-        &format!("DELETE FROM td_mta.flag_receipts WHERE operation=decode('{retained}','hex')"),
-    );
-    assert!(set_flag(true).unwrap().outcome.is_ok());
-    assert_eq!(confirmed.operation().unwrap(), None);
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
-        "1023"
-    );
-    sql(
-        fixture,
-        "DELETE FROM td_mta.flag_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
-    );
-    assert_eq!(
-        sql(fixture, "SELECT count(*) FROM td_mta.flag_receipts"),
-        baseline.to_string()
-    );
-    assert!(set_flag(false).unwrap().outcome.is_ok());
     sql(fixture, "CREATE FUNCTION public.delay_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_client_commit()");
     let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
     let mut meter = td_mta::admission::work::Meter::new(
@@ -704,6 +639,11 @@ pub(super) fn exercise(
     );
     assert!(settled.outcome.state.new_sequence > settled.outcome.state.old_sequence);
     assert_eq!(confirmed.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT is_called FROM public.retirement_attempts"),
+        "f"
+    );
+    sql(fixture, "DROP TRIGGER refuse_receipt_retirement ON td_mta.flag_receipts; DROP FUNCTION public.refuse_receipt_retirement(); DROP SEQUENCE public.retirement_attempts");
     drop((first, second));
     sql(fixture, "CREATE FUNCTION public.delay_destroy_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_destroy_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_destroy_commit()");
     let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
