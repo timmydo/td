@@ -2157,8 +2157,8 @@ deletes, under the account write lock, the account's receipts whose recorded
 first lease ended more than one hour before its locked database time; a
 later refusal rolls that back. Renewal does not extend a receipt, and none is
 needed then: a claim replays its receipt only to settle its own acquisition
-while it holds no grant, and the relay retries a slot without a grant every
-round. A claim retried more than an hour after its lease ended may find its
+while it holds no grant. The relay retries ungranted slots each round,
+subject to the five-second wait after a capacity refusal. A claim retried more than an hour after its lease ended may find its
 receipt swept by another acquisition and then acquires afresh under a higher
 generation; the unused earlier generation was never live authority, since
 every fence compares the owner row's generation, boot and operation.
@@ -2170,8 +2170,9 @@ custody, and the retried acquisition takes a fresh generation as above.
 The cap therefore bounds acquisitions in any hour plus one lease, not per
 account lifetime. The relay releases on every exit and acquires once per
 start, so a supervisor restarting it more than about 1024 times in an hour
-for one account still meets Capacity, which fails the relay until receipts
-age out; that heals by itself.
+for one account can exhaust claim capacity. That account waits until
+receipts age out. A route at the maximum fencing generation also waits on
+capacity and cannot acquire another generation.
 
 Route rows are retired, not kept for life. A selected configuration may
 have several relay profiles, each serving its own route for every account,
@@ -7557,6 +7558,8 @@ but each round retains its bounded account work and protocol input limits.
 The process retains one claim operation, boot identity and owner generation per
 account instead of acquiring and releasing on each turn. Historical acquisition
 receipts require fresh owner observation and successful renewal before dispatch.
+Capacity on one route-owner acquisition leaves other accounts eligible
+for acquisition, renewal and dispatch.
 Newly acquired accounts enter a bounded registry and wait for renewal acknowledgement.
 The renewal worker snapshots that registry without holding its mutex over SQL,
 then renews all registered leases in one transaction every five seconds or when

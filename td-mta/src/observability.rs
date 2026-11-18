@@ -137,6 +137,7 @@ impl Delivery {
 pub enum RelayStep {
     IdlePoll,
     LeaseRenewal,
+    OwnerCapacity,
     Mail,
     Rcpt,
     Data,
@@ -150,6 +151,7 @@ impl RelayStep {
         match self {
             Self::IdlePoll => "idle_poll",
             Self::LeaseRenewal => "lease_renewal",
+            Self::OwnerCapacity => "owner_capacity",
             Self::Mail => "mail",
             Self::Rcpt => "rcpt",
             Self::Data => "data",

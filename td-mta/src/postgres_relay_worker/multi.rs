@@ -69,10 +69,13 @@ pub(super) fn idle_poll_result(
         Err(error) => Err(error),
     }
 }
+const OWNER_CAPACITY_RETRY: Duration = Duration::from_secs(5);
+
 struct Slot {
     claim: owners::Claim,
     grant: Option<owners::Grant>,
     renewed: bool,
+    acquire_at: Instant,
 }
 // Four simultaneous claim copies cover the registry, renewal snapshot/SQL
 // values and foreground custody. Two bounded names live outside each value.
@@ -121,11 +124,16 @@ impl Registry {
             .filter(|_| slot.renewed)
             .map(|grant| (slot.claim.clone(), grant)))
     }
-    fn acquire(&self, worker: &Worker<'_, '_>, index: usize) -> Result<(), Error> {
+    fn acquire(
+        &self,
+        worker: &Worker<'_, '_>,
+        control: &Control,
+        index: usize,
+    ) -> Result<(), Error> {
         let claim = {
             let slots = self.slots.lock().map_err(|_| Error::Worker)?;
             let slot = slots.get(index).ok_or(Error::Worker)?;
-            if slot.grant.is_some() {
+            if slot.grant.is_some() || Instant::now() < slot.acquire_at {
                 return Ok(());
             }
             slot.claim.clone()
@@ -137,6 +145,21 @@ impl Registry {
             &claim,
         ) {
             Ok(grant) => grant,
+            Err(owners::Error::Capacity) => {
+                {
+                    let mut slots = self.slots.lock().map_err(|_| Error::Worker)?;
+                    slots.get_mut(index).ok_or(Error::Worker)?.acquire_at =
+                        Instant::now() + OWNER_CAPACITY_RETRY;
+                }
+                control.log(
+                    crate::observability::Kind::RelayStepFailed {
+                        stage: crate::observability::RelayStep::OwnerCapacity,
+                    },
+                    None,
+                    None,
+                );
+                return Ok(());
+            }
             Err(
                 owners::Error::Busy | owners::Error::Connection(_) | owners::Error::Indeterminate,
             ) => return Ok(()),
@@ -263,6 +286,7 @@ pub(super) fn run(
             claim: database(owners::prepare(binding, boot))?.with_retry_floor(worker.retry_floor),
             grant: None,
             renewed: false,
+            acquire_at: Instant::now(),
         });
         states.push(AccountState {
             retry: false,
@@ -286,7 +310,7 @@ pub(super) fn run(
         if control.stop_requested() {
             return Ok(());
         }
-        registry.acquire(worker, cursor)?;
+        registry.acquire(worker, control, cursor)?;
         if !registry.snapshot()?.is_empty() {
             break registry.renew(worker, None)?;
         }
@@ -345,7 +369,7 @@ pub(super) fn run(
                     }
                     repairing = request;
                 }
-                registry.acquire(worker, cursor)?;
+                registry.acquire(worker, control, cursor)?;
                 if let Some((claim, grant)) = registry.active(cursor)? {
                     let state = states.get_mut(cursor).ok_or(Error::Worker)?;
                     buffers = worker.schedule_turn(

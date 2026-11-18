@@ -231,32 +231,36 @@ pub(super) fn exercise(
     drop(socket);
     drop(smtp_socket);
     let output = local.join("output");
-    let mut child = ProbeChild(
-        Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(["serve", "--connection-file"])
-            .arg(&connection)
-            .args(["--profile", "multi", "--runtime"])
-            .arg(&runtime)
-            .arg("--scratch")
-            .arg(&scratch)
-            .stdout(fs::File::create(&output).unwrap())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let stop = Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = fs::read_to_string(&output).unwrap();
-        if status.contains("\"status\":\"ready\"") {
-            break;
-        }
-        assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "service exited: {status}"
+    let start_worker = || {
+        let mut child = ProbeChild(
+            Command::new(env!("CARGO_BIN_EXE_td-mta"))
+                .args(["serve", "--connection-file"])
+                .arg(&connection)
+                .args(["--profile", "multi", "--runtime"])
+                .arg(&runtime)
+                .arg("--scratch")
+                .arg(&scratch)
+                .stdout(fs::File::create(&output).unwrap())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
         );
-        assert!(Instant::now() < stop, "service startup timed out: {status}");
-        thread::sleep(Duration::from_millis(20));
-    }
+        let stop = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = fs::read_to_string(&output).unwrap();
+            if status.contains("\"status\":\"ready\"") {
+                break;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "service exited: {status}"
+            );
+            assert!(Instant::now() < stop, "service startup timed out: {status}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        child
+    };
+    let mut child = start_worker();
     super::multi_receiving::smtp(fixture, smtp_address, false);
     let basic = |name: &str, password: &[u8]| {
         let input = [name.as_bytes(), b":", password].concat();
@@ -368,55 +372,58 @@ pub(super) fn exercise(
         String::from_utf8(result.stdout).unwrap()
     };
     assert!(queue_command("queue-route-repair").contains("requested"));
-    // A competing owner holds A while B must still make forward progress.
-    for (index, name, account, identity, email) in [
-        (
-            0,
-            "user",
-            a,
-            IdentityId::from_bytes([0xbb; 16]),
-            "main@example.test",
-        ),
-        (
-            1,
-            "user-b",
-            b,
-            IdentityId::from_bytes([0xdd; 16]),
-            "second@example.test",
-        ),
-    ] {
-        let authorization = basic(name, devices[index].password());
-        let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-        let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
-        let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-        let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
-        let mailboxes = query(&authorization, "POST", "/jmap/api", "application/json",
+    let submit_both = || {
+        for (index, name, account, identity, email) in [
+            (
+                0,
+                "user",
+                a,
+                IdentityId::from_bytes([0xbb; 16]),
+                "main@example.test",
+            ),
+            (
+                1,
+                "user-b",
+                b,
+                IdentityId::from_bytes([0xdd; 16]),
+                "second@example.test",
+            ),
+        ] {
+            let authorization = basic(name, devices[index].password());
+            let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+            let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
+            let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+            let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
+            let mailboxes = query(&authorization, "POST", "/jmap/api", "application/json",
             &td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":account},"m"]]}).to_string());
-        let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
-        let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
-            .as_str()
-            .unwrap();
-        let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
+            let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
+                .as_str()
+                .unwrap();
+            let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
             ["Email/set",{"accountId":account,"create":{"draft":{
                 "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":email}],"to":[{"email":"recipient@example.test"}],"subject":"Account relay","messageId":["multi-relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Private sender.","isEncodingProblem":false,"isTruncated":false}}
             }}},"0"],
             ["EmailSubmission/set",{"accountId":account,"create":{"submission":{"emailId":"#draft","identityId":identity}}},"1"]
         ]}).to_string();
-        let reply = query(
-            &authorization,
-            "POST",
-            "/jmap/api",
-            "application/json",
-            &body,
-        );
-        let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert!(
-            value["methodResponses"][1][1]["created"]["submission"]["id"]
-                .as_str()
-                .is_some(),
-            "{reply}"
-        );
-    }
+            let reply = query(
+                &authorization,
+                "POST",
+                "/jmap/api",
+                "application/json",
+                &body,
+            );
+            let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(
+                value["methodResponses"][1][1]["created"]["submission"]["id"]
+                    .as_str()
+                    .is_some(),
+                "{reply}"
+            );
+        }
+    };
+    // A competing owner holds A while B must still make forward progress.
+    submit_both();
     let stop = Instant::now() + Duration::from_secs(30);
     while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('cc',16),'hex') AND state=4") != "1" {
         assert!(Instant::now() < stop);
@@ -449,13 +456,52 @@ pub(super) fn exercise(
         sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts"),
         receipts
     );
-    let stopped = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-        .args(["stop", "--runtime"])
-        .arg(&runtime)
-        .output()
-        .unwrap();
-    assert!(stopped.status.success());
-    super::wait_command(&mut child);
+    let stop_worker = |child: &mut ProbeChild| {
+        let stopped = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["stop", "--runtime"])
+            .arg(&runtime)
+            .output()
+            .unwrap();
+        assert!(stopped.status.success());
+        super::wait_command(child);
+    };
+    stop_worker(&mut child);
+
+    // A full ledger must leave B queued while A delivers. The idle owner
+    // cleanup rolls back on capacity, so its row marks every retry up to
+    // the successful claim. A sequence preserves timing across rollbacks.
+    sql(fixture, "INSERT INTO td_mta.route_owner_receipts SELECT decode(repeat('cc',16),'hex'),decode(md5(i::text),'hex'),decode(repeat('00',32),'hex'),int8send(1),0,9000000000000000000 FROM generate_series(1,1024-(SELECT count(*)::int FROM td_mta.route_owner_receipts WHERE account=decode(repeat('cc',16),'hex'))) i");
+    sql(fixture, "INSERT INTO td_mta.route_owners SELECT account,'capacity-probe',destination,generation,NULL,NULL,0,NULL FROM td_mta.route_owners WHERE account=decode(repeat('cc',16),'hex');
+        CREATE SEQUENCE public.claim_time MINVALUE 0 START WITH 0;
+        CREATE FUNCTION public.time_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE previous bigint; observed bigint;
+        BEGIN
+            SELECT last_value INTO previous FROM public.claim_time;
+            observed := floor(extract(epoch FROM clock_timestamp())*1000);
+            IF previous>0 AND observed-previous<4900 THEN RAISE EXCEPTION 'early owner-capacity retry'; END IF;
+            PERFORM setval('public.claim_time',observed); RETURN OLD;
+        END $$;
+        CREATE TRIGGER time_claim BEFORE DELETE ON td_mta.route_owners FOR EACH ROW WHEN (OLD.route_name='capacity-probe') EXECUTE FUNCTION public.time_claim();
+        GRANT SELECT,UPDATE ON SEQUENCE public.claim_time TO mail_runtime");
+    child = start_worker();
+    submit_both();
+    let stop = Instant::now() + Duration::from_secs(30);
+    while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('aa',16),'hex') AND state=4") != "2"
+        || sql(fixture, "SELECT is_called FROM public.claim_time") != "t" {
+        assert!(Instant::now() < stop, "A did not deliver while B was full");
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 3);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_attempts a JOIN td_mta.recipients r ON a.account=r.account AND a.submission_id=r.submission_id WHERE a.account=decode(repeat('cc',16),'hex') AND r.state<>4"), "0");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.route_owners WHERE account=decode(repeat('cc',16),'hex') AND owner_boot IS NOT NULL"), "0");
+    sql(fixture, "DELETE FROM td_mta.route_owner_receipts WHERE account=decode(repeat('cc',16),'hex') AND operation=decode(md5('1'),'hex')");
+    let stop = Instant::now() + Duration::from_secs(30);
+    while sql(fixture, "SELECT count(*) FROM td_mta.recipients WHERE account=decode(repeat('cc',16),'hex') AND state=4") != "2" {
+        assert!(Instant::now() < stop, "B did not resume after one slot opened");
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 4);
+    stop_worker(&mut child);
     assert_eq!(
         sql(
             fixture,
