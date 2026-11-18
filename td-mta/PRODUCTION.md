@@ -337,14 +337,36 @@ and staging locations. This runbook does not depend on them to build or update.
 
 ## Shorten a schema maintenance window
 
-While mail is serving, stage the reviewed executable and rollback binary.
-Prepare the private restore cluster and its bootstrap roles, check extension
-availability and free space, and stage the queries that compare the restored
-database with the fenced source. Rehearse the migration and database checks
-on an isolated restore of a recent backup with mail services disabled.
-Prepare the cutover commands to advance on each successful check and stop
-on failure. Keep the fresh backup at the writer fence for rollback so it
-includes mail accepted during preparation.
+For schema cutovers, prepare an online physical backup and an isolated
+recovery copy while mail is serving. Keep streaming PostgreSQL WAL until
+the copy reaches the exact pre-migration restore point. The [online cutover
+procedure](DEPLOYMENT.md#online-recovery-point-for-a-schema-cutover) covers
+host prerequisites, commands and evidence. Qualify it on the installed host
+before booking the short window. If it cannot be qualified, allow time for
+the fenced logical backup and restore drill. Scheduled backups continue on
+their existing policy.
+
+Use the PostgreSQL 17 client binaries alongside the installed server.
+Place the private base, WAL spool and isolated trial on the recovery
+volume under `/data`. The live cluster uses an external configuration
+file and TLS material; retain those separately and give the trial its
+own configuration. Budget space for two cluster copies and the WAL spool
+before each window.
+
+For physical backup access, provision a dedicated `LOGIN REPLICATION
+NOSUPERUSER` PostgreSQL role with a private SCRAM credential. Restrict
+its HBA entry to `hostssl replication`, that role and the loopback client
+address. Reload HBA and verify a replication connection using
+`sslmode=verify-full`, the configured CA, the server certificate name as
+`host`, and `hostaddr=127.0.0.1`. The mode-0600 passfile entry names that
+host, the PostgreSQL port, `replication` and the backup role. Keep the credential with
+the backup operator. The streaming procedure uses no permanent replication
+slot and requires no change to `archive_mode`.
+
+Stage both binaries, the migration commands and the comparison queries.
+Rehearse the migration on a separate isolated copy with mail services
+disabled. Prepare the cutover commands to advance on each successful check
+and stop on failure.
 
 Start a timestamped SMTP and JMAP probe before stopping services. Use a probe
 location that can reach each listener while it is healthy. Record the SMTP
@@ -353,9 +375,9 @@ challenge for JMAP. For each protocol, retain the last success before the
 interruption and the first success after restart, with the probe interval
 and location. These bound the interruption observed by clients on that path.
 
-During the fence, verify the fresh backup, run the migration and qualify the
-candidate against the upgraded database. Start the mail services as soon as
-these checks pass.
+During the fence, confirm recovery through the last accepted write, run the
+migration and qualify the candidate against the upgraded database. Start the
+mail services as soon as these checks pass.
 Record elapsed times for backup, restore, comparison, migration and restart
 in the activation receipt. Verify ACME, timers and aggregate health as usual
 and record their completion separately from listener recovery.
@@ -364,8 +386,9 @@ and record their completion separately from listener recovery.
 
 This procedure is for a **binary-only** update with a compatible database and
 configuration. If the change requires a schema upgrade, stop here and follow
-the migration contract in [POSTGRES.md](POSTGRES.md): fence all database users,
-take a verified backup and apply the documented migration. Do not run
+the migration contract in [POSTGRES.md](POSTGRES.md): fence application
+and maintenance sessions, verify the pre-migration recovery point and
+apply the documented migration. Do not run
 `schema-upgrade` as a speculative fix. Binary rollback does not undo a schema
 or configuration change.
 

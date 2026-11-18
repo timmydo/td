@@ -493,6 +493,145 @@ reimported configuration before service activation.
 Neither a historical audit report nor copying a local runtime/scratch
 directory is a database backup or recovery authorization.
 
+## Online recovery point for a schema cutover
+
+The recovery point for a schema migration is the old database after its
+last accepted write. Prepare and verify the large part of the backup while
+mail is online. At cutover only the remaining write-ahead log (WAL) needs
+to reach the recovery copy. A logical dump taken earlier cannot replay that
+interval. The daily logical backup and its freshness checks serve a separate
+purpose.
+
+**Qualify the host while it serves.** Use PostgreSQL 17 tools matching the
+server. A physical restore rewinds every database and role in the cluster.
+Use a dedicated mail cluster; a shared cluster needs a separately approved
+whole-cluster recovery and writer fence. Keep the base
+and WAL on protected recovery storage with private directories (0700),
+independent of the production data disk. Keep bootstrap configuration,
+extensions and any external keys separately. Reserve space for the base,
+an independent working copy and a bounded WAL spool. Use a storage quota
+or monitor the spool against a byte budget and free-space reserve for the
+other backups. Set a preparation deadline and a separate maximum fence wait.
+On failure, interruption or timeout, stop and wait for the receiver started
+by this attempt, then stop its isolated trial if running. Account for the
+incomplete attempt or remove only its disposable files; preserve any earlier
+verified recovery set. Qualify this procedure on a single primary and
+timeline, with ordinary logged mail tables and no
+external tablespaces. A failover invalidates this cutover attempt.
+
+Provide a dedicated physical-replication connection through local peer
+authentication or verified TLS and a private libpq service/passfile. Keep
+replication authority out of the mail runtime. Check `wal_level` is
+`replica` or higher, full-page writes are enabled and three WAL senders
+are free during preparation.
+The receiver's application name must be excluded from synchronous standby
+selection so a backup cannot delay mail commits. Have a separately
+authorized SQL operator for the restore point and WAL switches. Rehearse
+on a private copy using the installed binaries and extension libraries.
+
+**Prepare while mail is online.** Use a new private directory per attempt
+and a unique restore point name, such as `td_cut_` followed by a fresh UUID.
+In the commands below, `work` is the absolute private recovery directory and
+`PGSERVICEFILE` names the private file defining `cutover_repl`. Start the
+receiver first; verify its PID is alive and its entry in
+`pg_stat_replication` is streaming from the intended primary.
+
+```sh
+umask 077
+set -eu
+mkdir -m 700 "$work/wal"
+pg_receivewal -w -n --synchronous -D "$work/wal" \
+  -d 'service=cutover_repl application_name=td_cutover_wal' \
+  >"$work/receiver.log" 2>&1 &
+receiver_pid=$!
+# After confirming the receiver is streaming:
+pg_basebackup -w -d 'service=cutover_repl' -D "$work/base" \
+  --wal-method=stream --no-slot
+pg_verifybackup "$work/base"
+```
+
+Run the stages under the same supervisor with the cleanup above armed
+throughout. Use default durable writes. Both streams are slotless; monitor
+receiver health and lag. A recycled or missing segment invalidates the
+attempt. Keep the verified base immutable. Make a fresh
+independent copy for trial replay (a regular copy or copy-on-write reflink,
+never hard links). On the copy use a private local socket and HBA, disable
+TCP listeners and outbound connections, and run no mail services. Use a
+reviewed recovery configuration, including compatible server limits and an
+empty copy-local `postgresql.auto.conf`. Remove inherited recovery signals
+on the copy. Keep the live data directory, external configuration paths,
+archive commands, replication connections and tablespaces out of the
+trial instance.
+
+Create `standby.signal` on the copy. Start its PostgreSQL with hot standby
+enabled, `archive_mode=off`, empty `primary_conninfo` and
+`primary_slot_name`, `recovery_target_timeline='current'`,
+`recovery_target_action='pause'`, and `recovery_target_name` set to the
+chosen name. Set its `restore_command` to copy completed segments from the
+private WAL directory, e.g. `cp /private/cutover/wal/%f %p` with a
+shell-safe absolute path. The command must fail for unavailable segments.
+Use only completed WAL segment names. Keep the receiver running. After
+the base finishes, create a rehearsal restore point on the source with
+`pg_create_restore_point` using a name distinct from the fence target.
+Switch WAL, require the completed segment containing the returned LSN, and
+verify the copy replays through that LSN while it is still in recovery.
+This exercises the archive even when no mail arrived during preparation.
+Verify source and copy system identifiers and
+timeline against the base and record the base manifest checksum. A readable
+copy alone does not prove it caught up.
+
+**Seal at the writer fence.** Stop mail services and fence all application
+and maintenance sessions as for an ordinary schema upgrade. Keep timers,
+automatic restarts and other writers fenced through candidate qualification.
+Verify zero
+in-flight writers and zero prepared transactions. Keep only the authorized
+operator and WAL capture connections. On the same primary create the
+previously chosen restore point exactly once and save its returned LSN in
+the private receipt. Use `psql -X -v ON_ERROR_STOP=1` with an explicit
+source connection and the variable `point` set to the name. If the result
+is lost, abandon this attempt and target name before retrying.
+
+```sql
+SELECT pg_create_restore_point(:'point') AS fence_lsn \gset
+SELECT :'fence_lsn' AS fence_lsn, pg_walfile_name(:'fence_lsn') AS fence_segment;
+SELECT pg_switch_wal();
+```
+
+Require the completed fence segment in the retained WAL archive. On the
+isolated copy verify the following with `fence_lsn` set to the source result:
+
+```sql
+SELECT pg_is_in_recovery() AND pg_get_wal_replay_pause_state() = 'paused'
+       AND pg_last_wal_replay_lsn() = :'fence_lsn'::pg_lsn AS at_fence;
+```
+
+Require true and compare the pre-upgrade schema, epoch and selected mail
+invariants against the fenced source. Retain the base, contiguous completed
+WAL through that point, external bootstrap material and private receipt
+(source identity, timeline, base checksum, target name, LSN, segment and
+comparison results). Preserve these inputs independently of the trial copy
+through the rollback window. Send SIGINT to the recorded receiver PID,
+wait for a successful exit and check its log. Persist the retained archive,
+manifest and receipt, including directory entries, before migration (on
+Linux, `sync -f "$work"` for that filesystem and separately for any other
+recovery volume). Stop the trial copy while it is paused. Never resume it
+as a mail server.
+Only then run the migration on the original primary. A missing segment,
+target mismatch or timed-out check leaves the migration unstarted. Resume
+the old service on its unchanged database if the window cannot be met.
+If WAL capture is unavailable, use a fresh logical dump in a window long
+enough for its full restore and comparisons. For that cutover keep all mail
+writers and maintenance jobs fenced continuously from before the dump
+through the restore check, migration and candidate checks. Only a standalone
+restore drill may reopen the source immediately after capturing its inventory.
+For actual recovery, rebuild from the retained base and WAL on an isolated
+copy, target the recorded timeline and restore point, and verify the LSN
+and comparisons before any promotion. Fence the old primary and SMTP egress
+and follow POSTGRES.md section 6 for a fresh epoch, credentials and delivery
+reconciliation before serving. After reopening writes, restoring only to
+the cutover point would discard subsequent accepted mail. Preserve and
+reconcile that later history before considering such a restore.
+
 ## Local logical backup and an isolated restore drill
 
 PostgreSQL's `pg_dump --format=custom` takes a consistent logical database
