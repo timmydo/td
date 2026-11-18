@@ -4748,7 +4748,7 @@ and builds/clones the bounded Policy snapshot (home, at most 32 shares,
 runtime); `broker.rs` and `config.rs` copy the name into template setup and
 JSON fields; `conversation.rs` formats the grant-edit refusal; `ui.rs`
 copies template metadata and formats the picker labels. These sites are
-listed by category in `td-alloc/allocation-debt.tsv`. The new stdin
+listed by category in `builder/allocation-debt.tsv`. The new stdin
 bootstrap and relay buffer growth use td-alloc; this is not whole-operation
 allocation safety for the existing policy, config, JSON or UI APIs.
 

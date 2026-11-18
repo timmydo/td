@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 type Inventory = BTreeMap<(String, String), usize>;
-pub(crate) const INVENTORY: &str = "td-alloc/allocation-debt.tsv";
+pub(crate) const INVENTORY: &str = "builder/allocation-debt.tsv";
 
 fn operations(source: &str) -> BTreeMap<String, usize> {
     let code =
@@ -707,6 +707,7 @@ mod tests {
         )
         .unwrap();
         assert!(check(root).is_err());
+        fs::create_dir_all(root.join("builder")).unwrap();
         fs::write(root.join(INVENTORY), render(root).unwrap()).unwrap();
         assert!(check(root).is_ok());
         let html = root.join("td-html/src/html5/tokenizer.rs");

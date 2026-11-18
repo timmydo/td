@@ -762,10 +762,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // Only the allocation guard reads the debt inventory, and the cargo-test
-    // preflight runs the guard before any cargo command. Staging copies it
-    // with td-alloc's tree, but no build step, build script or test opens
-    // it, so it selects no crate legs (`changed_roster_crates`) and no
-    // recipe check (`check_scope`).
+    // preflight runs the guard before any cargo command. It lives outside
+    // every staged crate tree, so no recipe key holds it, and no build step,
+    // build script or test opens it: it selects no crate legs
+    // (`changed_roster_crates`) and no recipe check (`check_scope`).
     if p == crate::allocation_guard::INVENTORY {
         sel.add_preflight("cargo-test");
         sel.add_note(
@@ -6225,10 +6225,9 @@ fn close_over_changed_readers(
             full.push(donor.clone());
         }
         let prefix = format!("{donor}/");
-        // The debt inventory beside a td-alloc source edit is no read.
         let paths: Vec<String> = changed
             .iter()
-            .filter(|p| p.starts_with(&prefix) && *p != crate::allocation_guard::INVENTORY)
+            .filter(|p| p.starts_with(&prefix))
             .cloned()
             .collect();
         let precise = precise
@@ -6299,6 +6298,13 @@ fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String
 /// list would outgrow `SCOPE_PATHS_MAX`: a crate covers every path under
 /// it, and `recipes` alone is a miss.
 fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
+    // No recipe step reads the debt inventory; as a builder path it would
+    // otherwise leave the run unscoped.
+    let changed: Vec<String> = changed
+        .iter()
+        .filter(|p| *p != crate::allocation_guard::INVENTORY)
+        .cloned()
+        .collect();
     if !runs_recipe_checks(targets)
         || changed.is_empty()
         || changed.iter().any(|p| p.contains(".."))
@@ -6322,14 +6328,7 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
     if !sources.is_empty() {
         crates.push(RECIPE_SOURCES.trim_end_matches('/').to_string());
     }
-    let mut paths: Vec<String> = changed.to_vec();
-    // No recipe step reads the debt inventory, though td-alloc's tree, which
-    // every recipe compiles in, holds it: as a scope path it would reach
-    // every check.
-    paths.retain(|p| p != crate::allocation_guard::INVENTORY);
-    if paths.is_empty() {
-        return None;
-    }
+    let mut paths = changed;
     paths.sort();
     paths.dedup();
     let size = paths
@@ -10331,6 +10330,18 @@ mod tests {
             return;
         }
         let inventory = crate::allocation_guard::INVENTORY.to_string();
+        // Outside every staged local-source tree, so no recipe key holds it.
+        let roster = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
+        for line in roster.lines().filter(|l| !l.starts_with('#')) {
+            let mut fields = line.split_whitespace().skip(1);
+            let main = fields.next().into_iter();
+            let trees = fields.next().into_iter().flat_map(|t| t.split(','));
+            for tree in main.chain(trees) {
+                assert!(!inventory.starts_with(&format!("{tree}/")), "{tree}");
+            }
+        }
+        // Nor in the engine fingerprint, which every memo key holds.
+        assert!(!inventory.starts_with("builder/src/"));
         let selection = compute_selection(&root, std::slice::from_ref(&inventory));
         assert_eq!(selection.preflights, ["cargo-test"]);
         assert!(selection.targets.is_empty(), "{:?}", selection.targets);
