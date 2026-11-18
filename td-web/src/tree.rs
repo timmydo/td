@@ -39,6 +39,10 @@ pub struct Tree {
     /// `style` elements whose type is CSS's and `<link rel=stylesheet>`s
     /// with an `href`, in tree order.
     sheets: BudgetVec<NodeId>,
+    /// `img` elements with a `src` not blank, in tree order: the first
+    /// `MAX_PICTURES` of them, and how many more there are.
+    pictures: BudgetVec<NodeId>,
+    past: usize,
     base: Option<NodeId>,
     title: BudgetString,
 }
@@ -105,6 +109,15 @@ fn linked(element: &td_html::document::Element) -> bool {
         && element
             .attribute("href")
             .is_some_and(|href| !href.trim().is_empty())
+}
+
+/// Whether an `img` names a picture to fetch: a `src` that is not blank
+/// (DESIGN.md §10, "Subresources"); `srcset` is not read.
+fn picture(element: &td_html::document::Element) -> bool {
+    element.attribute("src").is_some_and(|src| {
+        !src.trim_matches(|c: char| c.is_ascii_whitespace())
+            .is_empty()
+    })
 }
 
 /// Whether a sheet is in the preferred style sheet set: untitled, or
@@ -175,6 +188,8 @@ impl Tree {
         let mut rank = BudgetVec::filled(page, count, NONE)?;
         let mut link = BudgetVec::filled(page, count, None)?;
         let mut sheets = BudgetVec::new(page)?;
+        let mut pictures = BudgetVec::new(page)?;
+        let mut past = 0usize;
         let mut base = None;
         let mut title = None;
         // The preferred style sheet set's name: the first titled sheet's
@@ -206,6 +221,13 @@ impl Tree {
                     "link" if linked(element) && in_set(element, &mut preferred) => {
                         sheets.try_push(id)?
                     }
+                    "img" if picture(element) => {
+                        if pictures.len() < crate::pictures::MAX_PICTURES {
+                            pictures.try_push(id)?;
+                        } else {
+                            past = past.saturating_add(1);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -224,6 +246,8 @@ impl Tree {
             rank,
             link,
             sheets,
+            pictures,
+            past,
             base,
             title: text,
         })
@@ -276,6 +300,23 @@ impl Tree {
     /// `link`s, in tree order.
     pub fn sheets(&self) -> &[NodeId] {
         self.sheets.as_slice()
+    }
+
+    /// The `img` elements with a `src` fetched, in tree order, at most
+    /// `MAX_PICTURES`.
+    pub fn pictures(&self) -> &[NodeId] {
+        self.pictures.as_slice()
+    }
+
+    /// The `img` elements with a `src` past `MAX_PICTURES`.
+    pub fn past(&self) -> usize {
+        self.past
+    }
+
+    /// An `img`'s `src`, as written, its ASCII white space trimmed.
+    pub fn src(&self, id: NodeId) -> Option<&str> {
+        let src = html_element(&self.document, id)?.attribute("src")?;
+        Some(src.trim_matches(|c: char| c.is_ascii_whitespace()))
     }
 
     /// A `style` element's text, or a `link`'s `href`, with its `media`.

@@ -727,7 +727,8 @@ fn a_flat_grey_block_decodes_to_its_level_at_every_scale() {
             width: 8,
             height: 8,
             components: 1,
-            sampling: (1, 1)
+            sampling: (1, 1),
+            progressive: false
         }
     );
 }
@@ -817,7 +818,8 @@ fn the_z8_thumbnail_decodes_to_the_oracles_hashes() {
             width: 160,
             height: 120,
             components: 3,
-            sampling: (2, 1)
+            sampling: (2, 1),
+            progressive: false
         }
     );
     // Every dequantised coefficient, integer-exact.

@@ -13,6 +13,7 @@ mod memory;
 mod page;
 mod paint;
 mod picture;
+mod pictures;
 mod pipeline;
 mod save;
 mod search;

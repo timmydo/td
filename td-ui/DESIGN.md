@@ -3809,7 +3809,23 @@ larger than its picture nor than the columns by `MAX_PICTURE_ROWS` rows,
 so the fits a list keeps are bounded by its pictures' budget; a fit's
 pixels are reserved fallibly, with all overlap weights and sums computed
 on the stack; a picture whose fit cannot be had is not drawn. A fit walks every source pixel, so it costs the picture's size
-whatever it is shrunk to, paid on the first paint at a size. A theme
+whatever it is shrunk to, paid on the first paint at a size.
+`Picture::into_fitted` makes a picture its own fit at its own size, in
+its buffer, with no allocation; `Fitted::fit_exact` area-averages a fit
+to exactly the size asked, enlarging an axis where that is larger, each
+output pixel weighted by its exact overlap with the premultiplied
+pixels under it, so one within a single pixel is that pixel, none past
+`MAX_PICTURE_AXIS` or `MAX_PICTURE_PIXELS`, nor of a fit whose pixels
+are not its size. It averages an axis at a time, in whichever order
+costs fewer overlap steps, through one pass between them:
+`fit_exact_cost` says those steps and that pass's bytes before it is
+made, so a caller bounds its work and its memory, and `fit_exact_until`
+reads a stop at each row, giving none once it is set. `Raster::image_scaled`
+draws a fit at a whole multiple of its size, exactly what `image` draws
+of its exact fit at that size, with no copy made, each source pixel a
+run: an opaque one filled, a clear one skipped, any other blended.
+td-web's inline pictures fill the boxes a page lays them in
+(td-web/DESIGN.md §10). A theme
 leaves a picture's colours its own. An id names its list too: the owner
 of two lists tags each (`set_picture_tag`), and `picture` answers only
 its own tag's ids, so a composition asks each list in turn.

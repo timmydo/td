@@ -1,11 +1,10 @@
 # td-web
 
-**Status: normative; every increment of §9 has landed, and §10's
-through its stylesheets (increment 8); increment 7's validation still
+**Status: normative; every increment of §9 and §10 has landed,
+through inline pictures (increment 9); increment 7's validation still
 owes what it lists as not yet done.** §10, styled documents, is how
-td-web makes, lays out and paints a page; its increment 9 is planned,
-normative for the work it names. The roadmap (§11) is not normative;
-each item there is its own amendment.
+td-web makes, lays out and paints a page. The roadmap (§11) is not
+normative; each item there is its own amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -173,8 +172,10 @@ both count while both live; cancellation returns credit only when the
 worker actually drops its work or result. Shared page references use
 fallible BudgetShared ownership. The blank page needs no allocation.
 
-The renderer's typed handoff has four reusable request/result slots,
-matching `MAX_WORKERS`, in one BudgetShared mailbox admitted at startup.
+The renderer's typed handoff has eight reusable request/result slots,
+one for each fetch thread that hands it work, `MAX_WORKERS`
+navigations' and `MAX_SUBRESOURCES` inline pictures' (§10, "Slots"),
+in one BudgetShared mailbox admitted at startup.
 Those slots include active, queued and completed-but-unclaimed requests;
 further submitters wait for a free slot. A ticket retains that mailbox's
 budget ownership until it is consumed or dropped. Short content types
@@ -185,8 +186,9 @@ Admission/refcount refusal returns the static resource notice, and an
 already cancelled reply allocates no handoff. The worker drops cancelled
 rendered output before taking another request. Beside the slots, a
 lane of `LANE` (4) items holds what the window posts without waiting, a
-relayout (§10, "Relayout") or a page or layout let go to be dropped on
-the render thread (§10, "Handover"); the worker takes the lane's items
+relayout (§10, "Relayout"), a page, a layout or a page's pictures let
+go to be dropped on the render thread (§10, "Handover"), or a `data:`
+picture to decode (§10, "Subresources"); the worker takes the lane's items
 before the slots', and a post to a full lane is refused, never waited
 for.
 
@@ -203,7 +205,11 @@ heap owners, recognized unchecked allocation operations and std channels.
 
 A navigated picture admits `PICTURE_WORK` (200 MiB) before decoding
 and, decoded, keeps its actual RGBA capacity, Charge::shrink_to
-releasing the excess without a gap. A held save body owns its capacity
+releasing the excess without a gap. An inline picture (§10,
+"Subresources") admits instead its own decoding's peak, reckoned from
+its header by each decoder's layout (`picture::work`, at most
+`PICTURE_WORK`), to its page's pictures term, and keeps its capacity,
+made its own fit in place. A held save body owns its capacity
 charge through the save worker, even after its Document is dropped. A
 wrapper frees its value before releasing its charge.
 
@@ -578,7 +584,8 @@ at the bottom. The status row says, first that applies: what the last
 input made happen (a link not followed, a refusal, a copy), until the
 next key, click, wheel turn or paste, and what a save did, once it
 ends, until the same; what is loading, `loading styles of` a URL while
-its page waits for its sheets (§10, "Subresources"); that a save runs;
+its page waits for its sheets and `loading pictures, K of M shown`
+while its pictures come (§10, "Subresources"); that a save runs;
 where the link
 under the pointer, else the focused link, goes; the response's status, the place in the page, the
 encoding its text was decoded from when not UTF-8 (§5), and any cut.
@@ -602,7 +609,7 @@ its URL, then ` - td-web`.
 | `Shift+Left`, `Shift+Right` (page) | move the selection's end a character; with `Ctrl`, to the word before's start or the word after's end |
 | `Shift+Up`, `Shift+Down` (page) | move it to its paragraph's start or end, from there the paragraph before's start or the one after's end |
 | `Ctrl+A` (page) | select the page |
-| `Escape` (page) | stop loading, else a save still fetching (§5), else clear the focused link, find's marks and the selection |
+| `Escape` (page) | stop loading, else the page's pictures still to come (§10, "Subresources"), else a save still fetching (§5), else clear the focused link, find's marks and the selection |
 | `Ctrl+C` | copy the address or find row's selection while it has focus, else the page's selection, else the focused link's URL, else the page's |
 | `Ctrl+S` | save the document into Downloads (§5, "Saving") |
 | `F8` | body text in Noto Sans or Noto Serif, for this run |
@@ -738,15 +745,14 @@ relayout that keeps the page's tree, as the place at the top is.
    monospace one, a missing one said once and the page drawn on the
    cell. Landed.
 
-Increments 6 onward are §10's; 6 and 7 have landed.
+Increments 6 onward are §10's; 6 to 9 have landed.
 
 ## 10. Styled documents
 
 A page is a document tree, styled by td-css, laid out by td-layout and
-painted by td-web. Increment 8 (below), stylesheets fetched as
-subresources, has landed; what increment 9 adds, pictures fetched the
-same way, is planned, normative for the work it names; the rest of this
-section is the contract.
+painted by td-web. Increments 8 and 9 (below), stylesheets and inline
+pictures fetched as subresources, have landed; this section is the
+contract.
 
 ### Pipeline and threads
 
@@ -990,7 +996,7 @@ through td-alloc as well. Any refusal follows "Cuts" below.
 | layout | owned geometry, lines, fragments and td-web's indexes over them | the page's |
 | page | tree, styled and layout together | 224 MiB, td-layout's `MAX_PAGE_BYTES` |
 | sheets | their text, linked and imported sheets' kept for the page's life, compiled rules and scratch; referenced strings/tokens remain charged until their final owner drops | 48 MiB |
-| pictures | inline pictures' pixels and fitted copies (increment 9) | 48 MiB (estimate) |
+| pictures | inline pictures' pixels, their fitted copies, the peak of the one decoding and their bookkeeping | 48 MiB |
 
 The ceilings of page, sheets and pictures sum to `PAGES`, so a page
 alone is refused only by its own terms and what the root holds beside
@@ -1015,6 +1021,58 @@ that compiles them found by halving), a page's sheets need at most
 compile to a set of 13.7 MiB; The Guardian's inline sheets 11.7 MiB;
 every other page 0.2 to 5.5 MiB. The term stays 48 MiB, its room
 over the corpus for hostile sheets, which it refuses.
+
+A page's pictures (below, "Subresources") are held in a child of its
+budget, the pictures term: each decoded picture's pixels at its
+decoded size, the copies fitted to boxes that are not a whole multiple
+of that, the working peak of the one being decoded, charged before it
+begins and returned once it is kept, and their bookkeeping (each
+picture's entry, its inbox, at most `MAX_PICTURES` places, and a
+fetch's URL). A copy being made holds its pixels and the one pass
+between its two in the term too. A layout's list of its fits is the
+page's, charged to its budget with the rest of the layout. The
+reckoned peak is the largest of the decoder's phases, each holding
+what it holds once the last let go, not their sum: a PNG's gathered
+stream (three times its body while it is grown), that stream beside
+its inflated rows, then those rows beside RGBA; a JPEG's sample
+planes, padded to whole MCUs, beside RGB, then RGB beside td-web's
+RGBA, a progressive frame's whole-size coefficients beside its planes
+before them (td-jpeg's `Header::progressive`; a baseline frame holds
+none); WebP's two 32-bit images or its macroblock planes beside RGBA;
+AVIF's coded copy beside the codec's frames, in 64-pixel superblocks,
+so a picture one pixel tall is reckoned at 64, then its planes beside
+RGBA. The decoding's scratch is the pictures term's, not the window's
+working allowance: the term's ceiling, inside `PAGES`, bounds both. Over
+a corpus generated on the host (`cjpeg`, `cwebp`, `avifenc`, `ffmpeg`;
+baseline, progressive and progressive 4:4:4 JPEG to 4000x3000, PNG,
+GIF, lossy and lossless WebP and AVIF to 2048x1536, and each 8192x1 and
+1x8192, AVIF's thin one as 8192x64, the same superblock row), the
+resident peak's growth decoding each was 0.08 to 0.99 of its reckoning,
+a 4000x3000 baseline JPEG and its progressive 4:4:4 transcode the
+closest, as their RGB beside RGBA is all they hold; each format's
+reckoning is pinned by
+`picture::tests::each_estimate_is_its_decoders_largest_phase`. Measured
+(`app::tests::measure_window` over the corpus below, with every
+picture each page names, and `pictures::tests::measure_decoding`, a
+process a picture), and before block-level and floated pictures were
+laid, which the corpus's pages hold few of, a page's inline pictures
+hold at most 25.3 MiB at 1920x1200, Debian's eight, seven of
+them copies its sheets size to its 420 px banner, and the Guardian's
+108 21.3 MiB at both outputs, drawn at their size or twice it with no
+copy; at 3840x2160, where copies are four times the pixels, Debian's
+take 41.1 MiB and the United States article's 47.8 MiB, which the term
+refuses five of its 64 pictures for room, Debian one of its eight,
+each keeping its placeholder and counted in the status row. The term
+stays 48 MiB: a larger one would come out of the sheets' term, which
+the corpus needs 27.2 MiB of, or of the jail's margin under
+`memory-high`, and a page past it loses pictures, not its styles. The
+corpus's 271 pictures (173 WebP, 67 JPEG, 29 PNG, 4 GIF, to 1282x777)
+each decoded within 48 ms; the 4000x3000 JPEGs above take 0.4 to 0.7
+s. Within the 48 MiB term a baseline JPEG to about 7 MP is decoded,
+a progressive one to about 5.5 MP, a page's first. A
+page of 24 large PNGs, twelve 1600x1200 and twelve 800x600, shows 12
+and refuses 12 for room, the term holding 44.0 MiB, the process
+peaking at 77.6 MiB resident at 1920x1200 and 100.4 MiB at 3840x2160.
 
 A picture reached by navigation is a page of its own, charged the shared
 decoder's conservative 200 MiB peak before decoding, including the bounded
@@ -1070,8 +1128,8 @@ relayout does not fit beside it and lets the old layout go first.
   place (§3);
 - the subresources' bodies, 16 MiB (`MAX_SUBRESOURCES` of
   `MAX_SUBRESOURCE`, below, "Subresources"), a sheet's at most 1 MiB
-  and a picture's (increment 9) 4 MiB, held for pictures before they
-  exist;
+  and a picture's 4 MiB (`MAX_PICTURE_BODY`), each held by its fetch
+  thread, and so by its slot, until the render thread has decoded it;
 - `WORKING`, td-layout's `WORKING_BYTES` (64 MiB): a cascade's
   candidate, wrapping scratch and the allocator's overhead, for the one
   step the render thread runs at a time, measured for layout and, for
@@ -1209,8 +1267,9 @@ apply it. Every sheet is fetched whatever its
 media, so what is fetched says nothing of the viewport. A `<link>`'s
 URL is joined against the page's `<base href>`, else the page's URL;
 an import's against the URL its sheet answered from, after redirects.
-Inline pictures (increment 9) are each `img` with a `src`, in tree
-order, at most `MAX_PICTURES` (64, estimate) a page.
+Inline pictures (increment 9) are each `img` whose `src`, ASCII white
+space trimmed, is not blank, in tree order, at most `MAX_PICTURES`
+(128) a page, those past it keeping their placeholders.
 
 **Requests.** Each is a GET sent `public`, following redirects as a
 navigation does (§4). A subresource from another site is taken, as
@@ -1263,8 +1322,12 @@ applied`. A page naming no sheet to gather, no `<link>` and no
 the corpus of increment 8 (below), a
 page links and imports at most 23 sheets, GitHub's, holding 3.6 MiB of
 text, the nearest the corpus comes to either bound; the others 0 to
-17 sheets and at most 0.24 MiB. A picture's body at most
-`MAX_SUBRESOURCE` (4 MiB).
+17 sheets and at most 0.24 MiB. A picture asks `accept:
+image/png,image/jpeg,image/gif,image/webp,*/*;q=0.1`, AVIF decoded
+but not named while td-avif covers only part of it (§5), its body at
+most `MAX_PICTURE_BODY` (4 MiB, `MAX_SUBRESOURCE`), a `data:` one's
+decoded bytes the same, and each hop the `deadline` of what is left of
+its `PICTURE_WAIT` (30 s from its ask).
 
 **Slots.** Subresources have a count of their own, `MAX_SUBRESOURCES`
 (4) fetches out across the window, stopped ones included until the
@@ -1316,6 +1379,33 @@ service's: four more of its threads at most, outside td-web's jail
 (§3), each counted request's memory bounded as the service bounds it
 and a sheet's decoded body by td-web's 1 MiB limit.
 
+Pictures take at most `PICTURE_SLOTS` (2) of the four slots at once,
+counting sheets' among them: a picture is asked only while fewer than
+two slots are out, so a page's pictures leave the next page's sheets
+two however long they take, and its navigation, served by its own
+workers, none to wait for. While no slot is free nothing is joined or
+copied for the next picture.
+A picture's fetch holds its slot until the render thread has decoded
+its body, or it was refused, and it ends: its thread hands the body to
+the render thread in one of the handoff's slots (§3), which has one for
+each fetch thread, navigations' and pictures', so a handoff never waits
+behind another's. Its worst case: a page whose pictures' origin never
+answers holds two slots, and two of the service's workers, for
+`PICTURE_WAIT` (30 s) after each ask, plus a name lookup, and asks
+no other once it is left: shown, a page of `MAX_PICTURES` such
+pictures holds them two at a time for up to 32 minutes. The next
+page's sheets are fetched two at a time meanwhile
+(`a_page_of_tarpit_pictures_holds_back_no_navigation_or_sheet`, its
+pictures waiting 20 s, the next page styled within 10 s and no picture
+past the two asked). `PICTURE_WAIT` gives a 4 MiB picture a little more than
+1 Mbit/s. Measured by replaying the corpus's captured answers at their
+captured times (below), the Guardian's 108 pictures are all laid 9.1 s
+after its page is shown at two slots, 6.3 s at three, 4.9 s at four and
+17.7 s at one, Wikipedia's World War II and United States articles' 62
+and 64 in 4.4 s at two and 3.1 s at three; two keep half the slots for
+sheets, the bound the paragraphs above give them, at the cost of a
+picture-heavy page's last pictures, which come last in tree order.
+
 **Waiting.** A page waits for its sheets, as browsers hold rendering
 for them, rather than being shown and restyled. The render thread
 decodes and parses the page, finds its sheets and decodes its `data:`
@@ -1352,15 +1442,119 @@ within 1.3 s of its reply (Debian's, a chain of imports, and the WHATWG
 specification's, whose styling alone takes 0.8 s), so none came late at
 3 s; `STYLE_WAIT` stays 3 s, a slower network's margin.
 
-**Pictures** are fetched once the page is shown, decoded on the render
-thread one at a time through the shared picture dispatch (§5), each
-decoding's peak charged to the pictures term first. A decoded
-picture's size is its intrinsic size for td-layout; arrivals coalesce
-into one relayout at most every `PICTURE_SETTLE` (250 ms, estimate),
-keeping the top's place, and a fitted copy at its laid size is made
-with that layout and charged there. A picture refused (type, decoding,
-budget) keeps its placeholder. `srcset`, `<picture>`'s sources, CSS
-background images and SVG are not fetched.
+**Pictures** are fetched once their page is shown, a markup page on
+rung 1 or 2 (rung 3's text lays none), and asked for only while no
+navigation is out, so the next page's sheets come first; those already
+out are taken. Each `src` is joined against the page's `<base href>`,
+else its URL, as a link is; one whose path ends `.svg` or `.svgz`
+(ASCII case-insensitively, before its query) is not fetched, td-web
+drawing no SVG, nor one of a scheme other than `http`, `https` and
+`data`. A `data:` one is known as such before it is joined, whatever
+its length, td-url's `MAX_URL` notwithstanding: its bound is td-html's
+1 MiB attribute (`MAX_ATTRIBUTE_BYTES`), base64 to about 768 KiB
+decoded, a longer `src` dropping the page to its text (rung 3), so
+`MAX_PICTURE_BODY` does not bind it. td-web keeps no cache: each `img`
+is its own fetch, the same `src` twice fetched twice (in the corpus at
+most five of a page's 81), and one its layout lays no box for,
+`display: none`, is fetched all the same, the layout not consulted.
+Each picture is fetched on a thread of its own, which hands a `2xx`
+reply's body to the render thread; a `data:` picture is decoded by the
+render thread from the page's tree, with no request and no slot, one on
+its lane at a time. Each picture asked owes its page an answer: one
+ended any other way, a panic or a lost render thread among them, is
+answered failed as its fetch or decoding drops, so none stays out. There
+it is sniffed as MIME Sniffing sniffs an image, by its signature
+whatever its type, except that one whose type's essence is XML's
+(`text/xml`, `application/xml` or `…+xml`, SVG's among them) is
+refused; decoded one at a time through the shared picture dispatch
+(§5), its decoding's peak charged to the pictures term first ("Memory")
+and its body dropped there once decoded; and kept as its own fit,
+premultiplied in the raster's order, in place (td-ui's
+`Picture::into_fitted`). It is put in its page's inbox, a place a
+picture, so no answer waits for another to be taken or is lost however
+fast they come, and the window takes the inbox each time it polls. A
+picture whose fetch fails or is refused (an answer other than `2xx`,
+mixed content, past its bound or its wait), whose body is not a picture
+td-web decodes or fails to decode, or which the term has not the room
+for, keeps its placeholder, its frame and its `alt` text. A JPEG
+decoded at a reduced scale keeps its frame's size as its intrinsic
+size.
+
+A picture taken lays the page again, not at once: those come since the
+last settle are laid together by one relayout, a settle waiting until
+`PICTURE_SETTLE` (250 ms) has passed since the page's last relayout
+came, and while one runs, the first at once. A settle's relayout is a
+layout alone ("Relayout" above), each picture's size its intrinsic
+size for td-layout, a pixel a CSS px, and it keeps the reader's place
+as any relayout does; a relayout for another cause lays the pictures
+settled by then and no others, so what a layout shows is what its
+settle counted. Each layout fits each picture it lays to its box in
+device pixels, each edge rounded as a paint places it: a box that is a
+whole multiple of the picture's size, as one laid at its own size is
+at any scale, draws the picture itself, each pixel a square that
+multiple on a side (td-ui's `Raster::image_scaled`), with no copy; any
+other takes a copy fitted to it exactly (`Fitted::fit_exact`), made on
+the render thread with the layout, charged to the pictures term and
+shared by a later layout that lays it at the same size; a copy refused
+keeps the box's placeholder. Inline, block-level and floated pictures,
+in a link or not, are laid and drawn alike. A copy is made an axis at
+a time, in the cheaper order, so its cost is about its source's pixels
+plus its own (`Fitted::fit_exact_cost`): a 1x8192 picture laid
+8192x1 takes 16 Ki steps, not 64 Mi. A layout's copies take at most
+`FIT_WORK` (32 Mi) steps, 0.13 to 0.25 s at the host's measured 131 to
+246 M steps a second, a cancel read at each row; a copy past it keeps
+its placeholder, is counted not shown and noted, so a layout's fitting
+is bounded whatever its pictures and boxes. A relayout that keeps the
+old layout shown beside it while it is made holds that layout's
+copies too; one whose copies were refused beside them is laid once
+more, once a want, with the layout it made kept shown beside and its
+copies reused: the old one was let go to the render thread's lane
+ahead of it, so the room it held is had. Painting
+charges a picture its pixels within the clip as a fill is, `BLEND` (5)
+times them unless every pixel is opaque: td-ui copies an opaque one
+and fills an opaque scaled pixel's run at about its fill rate (1.1 to
+2.3 Gpx/s on the host, sixteen overlapping 1x1 pictures scaled to
+2160x2160 in 32 ms), and blends a translucent
+one at about a fifth of it (0.4 Gpx/s). An opaque picture scaled by two
+or three draws at 1.1 to 1.6 Gpx/s and is charged its pixels alone, so
+a paint at its bound of them takes up to about 50 ms (22 pictures of
+720x720 pixels drawn at 1440x1440, 49.7 ms), the slowest paint the
+bound admits. Measured by replaying the corpus, a
+settle's relayout takes 3 ms on average for the Guardian's front page
+and 17 ms for the World War II article, the slowest, so the settles
+take a few per cent of the render thread while pictures come, and 250
+ms keeps a page's pictures appearing in a few batches a second.
+
+While a navigation is out, pictures that come are taken but neither
+asked for nor laid: its page is made first, and a settle waits for it
+to end. A navigation started cancels a relayout of the page shown
+that is still running beside the layout shown, so its page's job never
+waits behind it on the render thread, and the page shown is laid again
+once no navigation is out, if the navigation ends without a page; it
+is laid for no other cause meanwhile. One that let the layout go first
+runs on, so the page is never left unlaid while the navigation is out.
+A relayout asked during a navigation when none was running at its
+start runs ahead of the navigation's page on the render thread, as
+before. A page of `MAX_PICTURES` 1x8192 pictures laid 8192x1
+is laid in a few ms, and a navigation from it is shown in 26 ms
+(`a_navigation_cancels_the_relayout_of_the_page_shown`, release
+build).
+
+`Escape` stops a navigation out first, then the page's pictures still
+to come (§8): those not come are let go, their fetches asking no
+further hop and what they answer dropped where it is put; those come
+stay. The status row says `pictures stopped`, then `N of the page's M
+pictures are not shown; Ctrl+R asks again`, and a reload, a navigation
+like any, asks for them anew. While pictures come it says `loading
+pictures, K of M shown`, and once all are settled `N of the page's M
+pictures are not shown` for those past `MAX_PICTURES`, refused or
+failed, or whose copy the layout shown refused (`the page's picture is
+not shown` when it names one); one with no box counts as shown. A page
+let go, overtaken, reloaded or stepped down to rung 3 lets its pictures
+go on the render thread, their fetches told first, as its layouts go
+(above, "Handover"). An unlinked picture opens its `src` on a click as
+its placeholder did (below, "Links"). `srcset`, `<picture>`'s sources,
+CSS background images and SVG are not fetched.
 
 ### Places, find, selection and links
 
@@ -1634,9 +1828,12 @@ order, then every glyph.
    `SELECTED`; the underlines, overlines and line-throughs it takes
    from itself and its ancestors, as CSS propagates them, as fills
    across the fragment, a pixel thick at scale one; and a replaced
-   element's picture fitted to its box, else a frame in `BORDER`
-   (`SELECTED` when its link is marked) holding its `alt` text,
-   clipped to it.
+   element's picture once its layout has fitted it, an `Image` held
+   back in the fills' order and charged its pixels as a fill is (it is
+   not opaque, so it covers no fill, and a later fill covering it
+   leaves it undrawn), framed in `SELECTED` when its link is marked;
+   else a frame in `BORDER` (`SELECTED` when its link is marked)
+   holding its `alt` text, clipped to it.
 4. The glyphs: each fragment's in its colour, face and size, marked
    ones in the theme's pairs, `PAPER` on `SELECTED` and `INK` on
    `INACTIVE_SELECTION`, which no page colour moves, so a mark is as
@@ -2007,25 +2204,72 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    a load average of about 7; a page holds 0.4 to 31.1 MiB of td-alloc's
    owned storage and declares 0.9 to 56.0 MiB, and a process peaks at
    42 to 87 MiB resident at 1920x1200 and 65 to 110 MiB at 3840x2160.
-9. **Inline pictures**, as "Subresources" says. Validation: placeholders
-   becoming pictures, one relayout per settle with the top kept, a
-   refused picture keeping its placeholder, an unlinked picture opened
-   by a click, mixed content at a redirect, `MAX_PICTURES` and the
-   pictures term; the resident peak with a page of large pictures,
-   `MAX_PICTURES`, `PICTURE_SETTLE` and the pictures term measured.
+9. **Inline pictures**, as "Subresources" says. Landed. Validation
+   through the injected fetcher, in-process: placeholders shown first
+   and becoming pictures, drawn by pixel at their own size, at twice it
+   at scale two with no copy, and as a copy where the page sizes them;
+   pictures come together laid by one relayout at `PICTURE_SETTLE`,
+   none before it, the top kept, a fitted copy kept by the next layout
+   at its size, and a relayout for another cause laying only those
+   settled; a refused picture keeping its placeholder and its `alt`
+   text, noted (no route, a `404`, an XML type, a body that does not
+   decode, SVG and another scheme never asked, a picture sniffed
+   whatever its type); an unlinked picture opened by a click, a linked
+   one following its link; mixed content at a redirect, never asked, and
+   an `http` page's `http` picture shown; `MAX_PICTURES` and two past
+   it, the first in tree order each asked once; the pictures term
+   refusing a decoding and a copy, each kept as a placeholder; a
+   decoding charged its whole reckoned peak first, refused a byte short,
+   then exactly its pixels, and a copy exactly its own; a `data:`
+   picture, asked of no one; each request's `Ask` (public, its accept,
+   4 MiB, within its wait); `Escape` stopping a navigation before the
+   pictures and the pictures after, those not come never shown, then a
+   reload asking again; a picture not asked while a navigation is out;
+   a page overtaken while a picture is out letting its pictures, decoded
+   pictures and fitted copies go on the render thread and returning
+   every charge; each answer put once and none after its page has
+   gone, an untaken one going with its pictures, an owed one answered
+   failed as it drops; a page of pictures whose origin never answers
+   holding two slots, the next page's sheet fetched and styled at once;
+   a layout's copies within its work, the rest placeholders noted; a
+   navigation cancelling the page shown's relayout, the page laid again
+   once it is stopped; block-level, floated and linked pictures laid
+   and drawn, a refused one framed with its `alt`; copies refused beside
+   the old layout's made again with it let go, at every resize; a
+   `data:` picture past `MAX_URL` decoded; a slot held until its
+   picture is decoded; a picture in the marked link framed; no settle
+   while a relayout is out; a step down or a refusal letting the
+   pictures go, their fetches told at once; a relayout stepped down to
+   rung 2 laying its pictures, rung 3 none; a picture charged its
+   pixels, `BLEND` times them when translucent, and knowing it; a
+   navigation leaving a relayout that let the layout go running; a
+   copy no room holds laid again once a want; `data:` pictures on the
+   lane one at a time; a JPEG decoded at half scale laid at its frame's
+   size; and `alt` text drawn inside its box. Measured on
+   the host (`app::tests::measure_window` and
+   `pictures::tests::measure_decoding` over a `fetch::tests::Corpus`, a
+   process a page, output or picture, release build, the pinned faces):
+   increment 8's pages but the specifications and SANE's list, every
+   picture each names, 342 answers captured to scratch 2026-11-17 and
+   never committed, replayed at their captured times, and a page of
+   large pictures; the pictures term, `MAX_PICTURES`, `PICTURE_SETTLE`,
+   `PICTURE_SLOTS` and the decoding's reckoned peak as "Memory",
+   "Subresources" and "Slots" say. With their pictures, a process
+   peaks at 44 to 97 MiB resident at 1920x1200, the Guardian's the
+   most, and 67 to 141 MiB at 3840x2160, the United States article's.
+   `MAX_PICTURES` is 128, the Guardian's front page naming 108, where
+   64 left 44 of them placeholders.
 
 No request carries a cookie until a jar is designed (§11).
 
 ### Open questions
 
-The estimates above (the pictures term, `MAX_PICTURES`,
-`PICTURE_SETTLE`) stand until increment 9 measures them. So does the
-value of td-layout's cascade work ceiling, in match steps and
-substitution charges together: no figure is set here, only that it hold
-a page to a few seconds of the render thread on the development host,
-which the cell measurement above ("Time") holds for the `:not()` sheet
-and increments 7's and 8's runs for the corpus, the slowest page made
-in 0.8 s.
+td-layout's cascade work ceiling, in match steps and substitution
+charges together, has no figure set here, only that it hold a page to
+a few seconds of the render thread on the development host, which the
+cell measurement above ("Time") holds for the `:not()` sheet and
+increments 7's and 8's runs for the corpus, the slowest page made in
+0.8 s.
 
 ## 11. Roadmap (not normative)
 

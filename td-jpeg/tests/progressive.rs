@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
-use td_jpeg::{decode, decode_with, header, Error, Scale};
+use td_jpeg::{decode, decode_with, header, Error, Header, Scale};
 
 const PAIRS: &[(&[u8], &[u8], &[u8])] = &[
     (
@@ -39,7 +39,15 @@ const PAIRS: &[(&[u8], &[u8], &[u8])] = &[
 fn libjpeg_progression_matches_baseline_at_every_scale_and_sampling() {
     for &(base, progressive, restart) in PAIRS {
         for stream in [progressive, restart] {
-            assert_eq!(header(stream).unwrap(), header(base).unwrap());
+            let (stream_head, base_head) = (header(stream).unwrap(), header(base).unwrap());
+            assert!(stream_head.progressive && !base_head.progressive);
+            assert_eq!(
+                Header {
+                    progressive: false,
+                    ..stream_head
+                },
+                base_head
+            );
             for scale in [Scale::Full, Scale::Half, Scale::Quarter, Scale::Eighth] {
                 assert_eq!(decode(stream, scale).unwrap(), decode(base, scale).unwrap());
             }

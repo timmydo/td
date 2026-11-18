@@ -518,6 +518,7 @@ impl Gathered {
                     &mut measure,
                     stopped,
                     &budget,
+                    None,
                 )
             }
         };
@@ -586,6 +587,8 @@ pub enum Made {
 #[allow(clippy::large_enum_variant)]
 enum Job {
     Reply(Reply),
+    /// An inline picture fetched, to be decoded into its page's inbox.
+    Picture(crate::pictures::Decode),
     Styles {
         styling: Styling,
         arrived: Arrivals,
@@ -608,6 +611,10 @@ enum Ran {
 fn render(job: Job, memory: &Budget) -> Rendered {
     match job {
         Job::Reply(reply) => render_reply(reply, memory),
+        Job::Picture(decode) => {
+            crate::pictures::decode(decode);
+            None
+        }
         Job::Styles {
             styling,
             arrived,
@@ -718,6 +725,8 @@ pub enum Lane {
         cancel: Cancel,
         answer: Answer,
     },
+    /// A `data:` picture of a page, decoded with no request.
+    Picture(crate::pictures::Data),
 }
 
 /// Whatever the window lets go, held by value as `Lane` is.
@@ -729,6 +738,8 @@ pub enum Dropped {
     Arrival(Receiver<Option<(Document, Option<String>)>>),
     /// A page stopped while its sheets were fetched.
     Styling(Styling),
+    /// The pictures of a page let go, decoded ones among them.
+    Pictures(crate::pictures::Pictures),
 }
 
 /// Answers a relayout that ends without answering, as one whose job
@@ -750,6 +761,8 @@ fn lane(item: Lane, _: &Budget) {
         Lane::Drop(Dropped::Page(page)) => drop(page),
         Lane::Drop(Dropped::Arrival(answer)) => drop(answer),
         Lane::Drop(Dropped::Styling(styling)) => drop(styling),
+        Lane::Drop(Dropped::Pictures(pictures)) => drop(pictures),
+        Lane::Picture(data) => crate::pictures::decode_data(data),
         Lane::Again {
             again,
             faces,
@@ -798,9 +811,12 @@ struct RenderState {
 }
 
 // `run` holds the thread's lock across `submit`, which waits for a free
-// slot: with no more fetch threads than slots, one is always free, so the
+// slot: with no more fetch threads than slots, navigations' and
+// pictures' (each holding a subresource slot), one is always free, so the
 // window's `post` never waits behind it.
-const _: () = assert!(crate::app::MAX_WORKERS <= crate::worker::QUEUED);
+const _: () = assert!(
+    crate::app::MAX_WORKERS + crate::subresource::MAX_SUBRESOURCES <= crate::worker::QUEUED
+);
 
 /// How many let-goes are held while the lane is full.
 const PENDING: usize = 8;
@@ -1061,6 +1077,16 @@ impl Renderer {
         });
         let shown = shown.and_then(|text| Url::parse(text.as_str()).ok());
         self.answered(Ok(ran), shown, status, want)
+    }
+
+    /// An inline picture decoded on the render thread into its page's
+    /// inbox, waiting for it there; one the render thread did not take is
+    /// let go here, a body and handles, no pixels.
+    pub fn picture(&self, decode: crate::pictures::Decode) {
+        match self.run(Job::Picture(decode)) {
+            Ran::Done(_) => {}
+            Ran::Memory(job) | Ran::Lost(job) => drop(job),
+        }
     }
 
     /// A picture handed back made again, the page shown let go; this
@@ -2090,7 +2116,10 @@ pub(crate) mod tests {
         }
         let text = format!("{}é", "x".repeat(127));
         assert_eq!(ContentType::copy(&root, &text).unwrap().as_str(), text);
-        assert_eq!(crate::worker::QUEUED, crate::app::MAX_WORKERS);
+        assert_eq!(
+            crate::worker::QUEUED,
+            crate::app::MAX_WORKERS + crate::subresource::MAX_SUBRESOURCES
+        );
     }
 
     #[test]
@@ -2161,6 +2190,7 @@ pub(crate) mod tests {
             old: page.laid.as_ref().map(|laid| laid.try_clone().unwrap()),
             keep: true,
             want,
+            pictures: None,
         }
     }
 

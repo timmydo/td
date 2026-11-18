@@ -277,6 +277,10 @@ pub mod tests {
             self.reply(url, 302, &[("location", location)], b"")
         }
 
+        pub fn picture(self, url: &str, body: &[u8]) -> Self {
+            self.reply(url, 200, &[("content-type", "image/png")], body)
+        }
+
         pub fn sheet(self, url: &str, body: &str) -> Self {
             self.page(url, "text/css", body)
         }

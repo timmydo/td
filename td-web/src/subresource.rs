@@ -55,10 +55,17 @@ impl Slots {
 
     /// A slot, when fewer than `MAX_SUBRESOURCES` are out.
     fn take(&self) -> Option<Slot> {
+        self.take_within(MAX_SUBRESOURCES)
+    }
+
+    /// A slot, when fewer than `most` are out: pictures leave room for
+    /// sheets (DESIGN.md §10, "Slots").
+    pub(crate) fn take_within(&self, most: usize) -> Option<Slot> {
+        let most = most.min(MAX_SUBRESOURCES);
         let out = self.0.try_clone().ok()?;
         let mut held = self.0.load(Ordering::SeqCst);
         loop {
-            if held >= MAX_SUBRESOURCES {
+            if held >= most {
                 return None;
             }
             match self
@@ -71,8 +78,7 @@ impl Slots {
         }
     }
 
-    /// How many fetches are out.
-    #[cfg(test)]
+    /// How many fetches are out, sheets' and pictures' together.
     pub fn out(&self) -> usize {
         self.0.load(Ordering::SeqCst)
     }

@@ -210,6 +210,9 @@ pub struct Header {
     pub components: u8,
     /// Sampling factors (horizontal, vertical) of the first component.
     pub sampling: (u8, u8),
+    /// A progressive frame (SOF2), which holds its coefficients whole
+    /// until its last scan, rather than baseline.
+    pub progressive: bool,
 }
 
 /// Reads the frame header of a baseline or progressive stream.
@@ -222,6 +225,7 @@ pub fn header(data: &[u8]) -> Result<Header, Error> {
         height: frame.height,
         components: frame.components.len() as u8,
         sampling: (first.h, first.v),
+        progressive: frame.progressive,
     })
 }
 

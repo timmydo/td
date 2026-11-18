@@ -11,7 +11,9 @@ environment or a clock, or starts a thread.
 ## Public surface
 
 - `header(bytes) -> Result<Header, Error>`: the frame's width, height,
-  components and luma sampling, read without decoding.
+  components, luma sampling and whether it is progressive, read without
+  decoding, so a consumer reckons its peak (only a progressive frame
+  holds its coefficients whole).
 - `decode(bytes, Scale) -> Result<Rgb8, Error>`, and `decode_with`, which
   also hands each block's coefficients to a sink for the oracle tests:
   the frame at `Scale::Full`, `Half`, `Quarter` or `Eighth`;

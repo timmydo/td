@@ -101,7 +101,7 @@ including sends that outlive their source page. Construction refuses above
 1 MiB and preserves the old clipboard on allocation failure; its dedicated
 payload module has a strict source guard. URL formatting, Wayland request
 metadata and incoming pastes remain outside this adoption. Its render-worker mailbox and typed request/result slots use
-one fallible shared owner on the page root, with four reusable request/result
+one fallible shared owner on the page root, with eight (`QUEUED`) reusable request/result
 slots admitted at startup and a content-type copy held inline or in a
 BudgetString. Tickets keep the mailbox's charge through their lifetimes. Thread startup still uses std/OS machinery.
 General UI, fetch/window IPC, URL metadata and other existing subsystem

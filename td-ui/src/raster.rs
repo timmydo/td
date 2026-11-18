@@ -726,12 +726,65 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                 .iter_mut()
                 .zip(top.as_chunks::<4>().0)
             {
-                let keep = 255 - u16::from(top[3]);
-                for (out, &top) in out.iter_mut().zip(top).take(3) {
-                    let under = u16::from(*out) * keep;
-                    *out = top.saturating_add(((under + 127) / 255) as u8);
+                over(out, top);
+            }
+        }
+    }
+
+    /// Blends `fitted` drawn `factor` times its size, each of its pixels
+    /// a square `factor` on a side, with its top left at `rect`'s, inside
+    /// `clip`: what `image` draws of `fitted.fit_exact` at that size,
+    /// with no copy made.
+    pub fn image_scaled(&mut self, clip: Rect, rect: Rect, fitted: &Fitted, factor: usize) {
+        if factor <= 1 {
+            return self.image(clip, rect, fitted);
+        }
+        let most = |n: usize| u32::try_from(n.saturating_mul(factor)).unwrap_or(u32::MAX);
+        let rect = Rect {
+            width: rect.width.min(most(fitted.width)),
+            height: rect.height.min(most(fitted.height)),
+            ..rect
+        };
+        let Some(area) = clip
+            .intersection(self.surface.bounds())
+            .and_then(|clip| clip.intersection(rect))
+        else {
+            return;
+        };
+        // As `image`: the area lies inside the surface and the picture
+        // drawn, so its offsets are non-negative. A source row is taken
+        // once a destination row, each of its pixels a run `factor` long
+        // (the first cut by the clip): an opaque one filled, a clear one
+        // skipped, any other blended.
+        let left = (area.x - rect.x) as usize;
+        let (first, phase) = (left / factor, left % factor);
+        for y in area.y..area.y + i64::from(area.height) {
+            let from = (y - rect.y) as usize / factor * fitted.width * 4;
+            let to = y as usize * self.stride + area.x as usize * 4;
+            let (Some(top), Some(under)) = (
+                fitted.bgra.get(from..from + fitted.width * 4),
+                self.pixels.get_mut(to..to + area.width as usize * 4),
+            ) else {
+                continue;
+            };
+            let mut rest = under.as_chunks_mut::<4>().0;
+            let mut run = factor - phase;
+            for top in top.as_chunks::<4>().0.iter().skip(first) {
+                if rest.is_empty() {
+                    break;
                 }
-                out[3] = 255;
+                let (span, after) = rest.split_at_mut(run.min(rest.len()));
+                match top[3] {
+                    255 => span.fill(*top),
+                    0 => {}
+                    _ => {
+                        for out in span.iter_mut() {
+                            over(out, top);
+                        }
+                    }
+                }
+                rest = after;
+                run = factor;
             }
         }
     }
@@ -950,6 +1003,28 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                     pixel.copy_from_slice(paint);
                 }
             }
+        }
+    }
+}
+
+/// A premultiplied pixel over an opaque one: copied when it is opaque,
+/// nothing when it is clear, else each colour channel `top + out * (255 -
+/// alpha) / 255`, rounded.
+#[inline(always)]
+fn over(out: &mut [u8; 4], top: &[u8; 4]) {
+    match top[3] {
+        255 => *out = *top,
+        0 => {}
+        alpha => {
+            let keep = 255 - u16::from(alpha);
+            let mix =
+                |out: u8, top: u8| top.saturating_add(((u16::from(out) * keep + 127) / 255) as u8);
+            *out = [
+                mix(out[0], top[0]),
+                mix(out[1], top[1]),
+                mix(out[2], top[2]),
+                255,
+            ];
         }
     }
 }

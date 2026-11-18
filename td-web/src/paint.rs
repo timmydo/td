@@ -18,7 +18,8 @@ use td_css::values::{ComputedValue, Property};
 use td_css::ComputedStyle;
 use td_html::document::{Namespace, NodeId};
 use td_layout::block::BoxGeometry;
-use td_layout::inline::{DisplayText, Line, TextFragment};
+use td_layout::inline::{DisplayText, FontMetrics, Line, TextFragment, UNIT};
+use td_layout::StyleId;
 use td_ui::prose;
 use td_ui::raster::{
     Draw, GlyphStyle, Primitive, Rect, Scale, TextFamily, BORDER, INACTIVE_SELECTION, INK, PAPER,
@@ -58,6 +59,10 @@ pub const MAX_STACKED: usize = 8;
 /// the corpus charges at most 2.9 panes, so 8 leaves it room while
 /// td-ui's fill rate (about 2 Gpx/s) holds a paint to tens of ms.
 pub const PANES: u64 = 8;
+/// A picture not opaque throughout is charged this many times its
+/// pixels: td-ui blends one at about a fifth of its fill rate (0.4
+/// Gpx/s against 2), and copies an opaque one at about that rate.
+pub const BLEND: u64 = 5;
 /// Fills held back from the sink so a later fill that covers one leaves
 /// it undrawn; past this many the oldest is drawn.
 const HELD: usize = 16;
@@ -348,6 +353,50 @@ impl<'s, 'k> Painter<'s, 'k> {
             c
         }
     }
+    /// A fitted picture, `id` its layout's, at `rect` within `clip`,
+    /// charged its pixels as a fill is, `BLEND` times them unless it is
+    /// `opaque`, and held back in the fills' order;
+    /// not opaque, it covers no fill held before it, and a later fill
+    /// that covers it leaves it undrawn.
+    fn image(&mut self, rect: Rect, clip: Rect, id: u64, opaque: bool) {
+        let Some(clip) = clip
+            .intersection(self.damage)
+            .and_then(|c| c.intersection(rect))
+        else {
+            return;
+        };
+        if !self.room() {
+            return;
+        }
+        let pixels = area(clip);
+        let charged = if opaque {
+            pixels
+        } else {
+            pixels.saturating_mul(BLEND)
+        };
+        if !self.charge(charged, 0) {
+            return;
+        }
+        let draw = Draw {
+            clip,
+            primitive: Primitive::Image { id, rect },
+        };
+        self.hold(draw, charged);
+    }
+    /// `draw` held back after those held, the oldest drawn past `HELD`.
+    fn hold(&mut self, draw: Draw, pixels: u64) {
+        if self.holding >= HELD {
+            if let Some(&(oldest, _)) = self.held.first() {
+                self.emit(oldest);
+            }
+            self.held.copy_within(1.., 0);
+            self.holding = HELD - 1;
+        }
+        if let Some(slot) = self.held.get_mut(self.holding) {
+            *slot = (draw, pixels);
+            self.holding += 1;
+        }
+    }
     /// An opaque fill. The fills held back that it covers are not drawn:
     /// it would cover them.
     fn fill(&mut self, rect: Rect, color: u32, clip: Rect) {
@@ -383,21 +432,11 @@ impl<'s, 'k> Painter<'s, 'k> {
             kept += 1;
         }
         self.holding = kept;
-        if self.holding >= HELD {
-            if let Some(&(oldest, _)) = self.held.first() {
-                self.emit(oldest);
-            }
-            self.held.copy_within(1.., 0);
-            self.holding = HELD - 1;
-        }
         let draw = Draw {
             clip,
             primitive: Primitive::Fill { rect, color },
         };
-        if let Some(slot) = self.held.get_mut(self.holding) {
-            *slot = (draw, pixels);
-            self.holding += 1;
-        }
+        self.hold(draw, pixels);
     }
     fn glyph(&mut self, x: i64, y: i64, scalar: char, style: GlyphStyle, clip: Rect) {
         let Some(clip) = clip.intersection(self.damage) else {
@@ -706,10 +745,12 @@ fn paint_box(
     p: &mut Painter,
     grounds: &mut Chain<u32>,
     laid: &Laid,
+    measure: &mut Measure,
     frame: &Frame,
     at: u32,
     g: &BoxGeometry,
     canvas: u32,
+    marks: &Marks,
 ) {
     let Some(style) = laid.styled().style(g.style) else {
         return;
@@ -765,6 +806,25 @@ fn paint_box(
             let color = p.colour(c);
             p.fill(rect, color, clip);
         }
+    }
+    // A block-level replaced box: its picture, else its placeholder, its
+    // `alt` text on the first line's baseline in its own font.
+    if g.replaced {
+        let c = g.content;
+        let line = FontMetrics::line(measure, style);
+        let place = Placed {
+            node: g.node,
+            style: g.style,
+            x: c.x,
+            y: c.y,
+            width: c.width,
+            height: c.height,
+            baseline: c.y + f64::from(line.baseline) / f64::from(UNIT),
+        };
+        let Some(ground) = ground_of(p, grounds, laid, Some(at), canvas) else {
+            return;
+        };
+        paint_picture(p, laid, measure, frame, &place, clip, ground, marks);
     }
 }
 
@@ -1074,7 +1134,7 @@ fn paint_run(
     }
 }
 
-/// A line's replaced boxes: each a frame, its `alt` text in it.
+/// A line's replaced boxes, each as `paint_picture` draws it.
 #[allow(clippy::too_many_arguments)]
 fn paint_replaced(
     p: &mut Painter,
@@ -1086,60 +1146,107 @@ fn paint_replaced(
     ground: u32,
     marks: &Marks,
 ) {
-    let styled = laid.styled();
     for r in line.replaced.iter() {
         if !p.work(1) {
             return;
         }
-        let Some(style) = styled.style(r.style) else {
-            continue;
+        let place = Placed {
+            node: r.node,
+            style: r.style,
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            baseline: line.y + line.baseline,
         };
-        if hidden(style) {
-            continue;
+        paint_picture(p, laid, measure, frame, &place, clip, ground, marks);
+    }
+}
+
+/// A replaced box where a layout placed it, inline or block-level, and
+/// the baseline its `alt` text is drawn on.
+struct Placed {
+    node: NodeId,
+    style: StyleId,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    baseline: f64,
+}
+
+/// A replaced box: its picture fitted to it, once it has come and been
+/// fitted; else a frame, its `alt` text in it. A picture in the link
+/// marked is framed as a placeholder in it is.
+#[allow(clippy::too_many_arguments)]
+fn paint_picture(
+    p: &mut Painter,
+    laid: &Laid,
+    measure: &mut Measure,
+    frame: &Frame,
+    r: &Placed,
+    clip: Rect,
+    ground: u32,
+    marks: &Marks,
+) {
+    let Some(style) = laid.styled().style(r.style) else {
+        return;
+    };
+    if hidden(style) {
+        return;
+    }
+    let Some(rect) = frame.rect(r.x, r.y, r.width, r.height) else {
+        return;
+    };
+    let Some(inner) = rect.intersection(clip) else {
+        return;
+    };
+    let one = u32::try_from(frame.scale.max(1)).unwrap_or(1);
+    let selected = laid
+        .tree()
+        .link(r.node)
+        .is_some_and(|l| Some(l) == marks.link);
+    let fitted = laid.fitted(r.node);
+    if let Some(id) = fitted {
+        p.image(rect, inner, id, laid.opaque(id));
+        if !selected {
+            return;
         }
-        let Some(rect) = frame.rect(r.x, r.y, r.width, r.height) else {
-            continue;
-        };
-        let Some(inner) = rect.intersection(clip) else {
-            continue;
-        };
-        let one = u32::try_from(frame.scale.max(1)).unwrap_or(1);
-        let selected = laid
-            .tree()
-            .link(r.node)
-            .is_some_and(|l| Some(l) == marks.link);
-        let frame_colour = if selected { SELECTED } else { BORDER };
-        for side in [
-            Rect {
-                height: one.min(rect.height),
-                ..rect
-            },
-            Rect {
-                y: rect.y + i64::from(rect.height.saturating_sub(one)),
-                height: one.min(rect.height),
-                ..rect
-            },
-            Rect {
-                width: one.min(rect.width),
-                ..rect
-            },
-            Rect {
-                x: rect.x + i64::from(rect.width.saturating_sub(one)),
-                width: one.min(rect.width),
-                ..rect
-            },
-        ] {
-            p.fill(side, frame_colour, clip);
-        }
-        if let Some(alt) = laid.tree().alt(r.node).filter(|alt| !alt.is_empty()) {
-            let font = measure.font(style);
-            let ink = blend(style.color(), ground).map_or(ground, |c| p.colour(c));
-            let baseline = frame.y(line.y + line.baseline);
-            let ground = p.colour(ground);
-            paint_run(
-                p, measure, frame, font, alt, r.x, baseline, ink, ground, inner,
-            );
-        }
+    }
+    let frame_colour = if selected { SELECTED } else { BORDER };
+    for side in [
+        Rect {
+            height: one.min(rect.height),
+            ..rect
+        },
+        Rect {
+            y: rect.y + i64::from(rect.height.saturating_sub(one)),
+            height: one.min(rect.height),
+            ..rect
+        },
+        Rect {
+            width: one.min(rect.width),
+            ..rect
+        },
+        Rect {
+            x: rect.x + i64::from(rect.width.saturating_sub(one)),
+            width: one.min(rect.width),
+            ..rect
+        },
+    ] {
+        p.fill(side, frame_colour, clip);
+    }
+    if fitted.is_some() {
+        return;
+    }
+    if let Some(alt) = laid.tree().alt(r.node).filter(|alt| !alt.is_empty()) {
+        let font = measure.font(style);
+        let ink = blend(style.color(), ground).map_or(ground, |c| p.colour(c));
+        let baseline = frame.y(r.baseline);
+        let ground = p.colour(ground);
+        paint_run(
+            p, measure, frame, font, alt, r.x, baseline, ink, ground, inner,
+        );
     }
 }
 
@@ -1193,7 +1300,17 @@ pub fn paint(
                 break 'boxes;
             }
             if let Some(g) = g.filter(|_| meets) {
-                paint_box(&mut p, &mut grounds, laid, frame, at, g, canvas);
+                paint_box(
+                    &mut p,
+                    &mut grounds,
+                    laid,
+                    measure,
+                    frame,
+                    at,
+                    g,
+                    canvas,
+                    marks,
+                );
             }
         }
     }
@@ -1743,6 +1860,22 @@ mod tests {
         assert_eq!(p.pixels, em * em);
         p.glyph(-2, 10, 'a', style, frame().pane);
         assert_eq!(p.pixels, em * em + (em - 2) * em);
+        // A picture charges its pixels within its clip, `BLEND` times
+        // them unless it is opaque; a fill covering it gives them back.
+        let mut sink = |_| {};
+        let mut p = painter(&mut sink);
+        let rect = Rect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 10,
+        };
+        p.image(rect, frame().pane, 0, true);
+        assert_eq!(p.pixels, 200);
+        p.image(rect, frame().pane, 1, false);
+        assert_eq!(p.pixels, 200 + 200 * BLEND);
+        p.fill(rect, 0x123456, frame().pane);
+        assert_eq!(p.pixels, 200);
     }
 
     #[test]

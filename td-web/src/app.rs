@@ -25,7 +25,9 @@ use td_ui::entry_model::{Action, EntryModel};
 use td_ui::keys::Section;
 use td_ui::picture::Fitted;
 use td_ui::prose::{Faces, Metrics};
-use td_ui::raster::{fill, Raster, Rect, Scale, Surface, TextFamily, CHROME, PAPER};
+use td_ui::raster::{
+    fill, Draw, Primitive, Raster, Rect, Scale, Surface, TextFamily, CHROME, PAPER,
+};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use td_ui::CELL_WIDTH;
 use td_url::{Reference, Url};
@@ -35,6 +37,7 @@ use crate::fetch;
 use crate::fonts::Measure;
 use crate::page::{Laid, Want};
 use crate::paint::{self, Marks, Scratch};
+use crate::pictures::{self, Pictures};
 use crate::pipeline::{self, Again, Refusal, Rung};
 use crate::save;
 use crate::subresource::{self, Slots};
@@ -230,6 +233,18 @@ struct Current {
     /// Paper left where a page was let go for a picture's room: the
     /// entry of the page it was, for history, a reload and a stop.
     held: Option<Entry>,
+    /// The page's inline pictures (DESIGN.md §10, "Subresources").
+    pictures: Option<Pictures>,
+    /// A navigation cancelled the relayout that ran beside the layout
+    /// shown: laid again once no navigation is out.
+    relay_after: bool,
+    /// The want last laid again for copies refused beside the old
+    /// layout's: once a want, so a shortage never loops.
+    refit: Option<Want>,
+    /// The next relayout is asked though it wants what the layout shown
+    /// was laid for: the old layout's copies, let go ahead of it on the
+    /// lane, leave room for those refused.
+    refitting: bool,
 }
 
 impl Current {
@@ -247,6 +262,10 @@ impl Current {
             cut: false,
             fitted: PictureFit::Empty,
             held: None,
+            pictures: None,
+            relay_after: false,
+            refit: None,
+            refitting: false,
         }
     }
 
@@ -380,6 +399,14 @@ pub struct App {
     slots: Slots,
     /// How long a page waits for its sheets.
     style_wait: Duration,
+    /// The bytes of a page's pictures term.
+    pictures_term: usize,
+    /// The overlap steps one layout's fitted copies take (`FIT_WORK`).
+    fit_work: u64,
+    /// How long a picture's fetch is given.
+    picture_wait: Duration,
+    /// The most subresource slots its pictures take at once.
+    picture_slots: usize,
     surface: Surface,
     focus: Focus,
     address: EntryModel,
@@ -416,6 +443,9 @@ impl Drop for App {
         self.end_loading();
         if let Some(relayout) = &self.current.relayout {
             relayout.cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(pictures) = &self.current.pictures {
+            pictures.leave();
         }
     }
 }
@@ -592,6 +622,10 @@ impl App {
             workers: Arc::new(AtomicUsize::new(0)),
             slots,
             style_wait: subresource::STYLE_WAIT,
+            picture_wait: pictures::PICTURE_WAIT,
+            picture_slots: pictures::PICTURE_SLOTS,
+            pictures_term: crate::memory::PICTURES,
+            fit_work: pictures::FIT_WORK,
             surface,
             focus: Focus::Address,
             address: entry(MAX_ADDRESS)?,
@@ -702,6 +736,7 @@ impl App {
             scale: u8::try_from(self.surface.scale.value()).unwrap_or(1),
             body: self.body(),
             styles: self.current.styles,
+            pictures: self.current.pictures.as_ref().map_or(0, Pictures::settled),
         }
     }
 
@@ -812,9 +847,11 @@ impl App {
         let (target, named) = (url.clone(), fragment.clone());
         let stopped = Arc::new(AtomicBool::new(false));
         let told = Arc::clone(&stopped);
-        // A navigation is laid out with the page's own styles.
+        // A navigation is laid out with the page's own styles, before
+        // any of its pictures has come.
         let want = Want {
             styles: true,
+            pictures: 0,
             ..self.want()
         };
         self.workers.fetch_add(1, Ordering::SeqCst);
@@ -850,6 +887,16 @@ impl App {
             styles,
             styling: false,
         });
+        // The navigation's page is made before the page shown is laid
+        // again: a running relayout is cancelled, so the render thread
+        // takes the reply next, and runs again once no navigation is out.
+        // One that let the layout go runs on: the page is never left
+        // unlaid while the navigation is out.
+        let shown = self.current.laid().is_some();
+        if let Some(relayout) = self.current.relayout.as_ref().filter(|_| shown) {
+            relayout.cancel.store(true, Ordering::SeqCst);
+            self.current.relay_after = true;
+        }
         self.focus = Focus::Page;
         self.show_address();
     }
@@ -881,7 +928,11 @@ impl App {
                 self.renderer.error(
                     Some(loading.url.clone()),
                     "the fetch ended without an answer",
-                    self.want(),
+                    // A page of its own, before any picture of it.
+                    Want {
+                        pictures: 0,
+                        ..self.want()
+                    },
                 ),
                 loading.fragment.clone(),
             ),
@@ -998,10 +1049,85 @@ impl App {
                 self.show_fragment();
             }
         }
+        self.start_pictures();
         self.relayout();
         self.show_address();
         // A pointer left still over where the page arrived.
         self.refresh_hover();
+    }
+
+    /// The pictures of the page just shown, to be fetched as slots free:
+    /// a markup page's, laid with its own sheets or the user agent's.
+    fn start_pictures(&mut self) {
+        let Some(url) = self.current.doc.url.as_ref() else {
+            return;
+        };
+        let Some(page) = self.current.doc.page() else {
+            return;
+        };
+        if page.tree.source() != Source::Markup || page.rung == Rung::Text {
+            return;
+        }
+        // Refused for memory, the pictures keep their placeholders.
+        if let Ok(pictures) = Pictures::new(
+            &page.tree,
+            url,
+            &page.budget,
+            self.pictures_term,
+            self.fit_work,
+        ) {
+            self.current.pictures = pictures;
+        }
+    }
+
+    /// The page's pictures: those come taken, those wanted asked for while
+    /// no navigation is out (a page's sheets come first), and those come
+    /// laid at most once every `PICTURE_SETTLE`, never while a relayout
+    /// runs, so a long relayout is not cancelled by each settle.
+    fn pictures(&mut self) {
+        let now = self.clock.now();
+        let Some(pictures) = self.current.pictures.as_mut() else {
+            return;
+        };
+        if pictures.take() {
+            self.redraw = true;
+        }
+        // While a navigation is out none is asked for and none laid: its
+        // page is made first, and so its sheets fetched first.
+        if self.loading.is_some() {
+            return;
+        }
+        let base = if pictures.wanted() { self.base() } else { None };
+        let Some(pictures) = self.current.pictures.as_mut() else {
+            return;
+        };
+        if let (Some(base), Some(page)) = (&base, self.current.doc.page()) {
+            let asker = pictures::Asker {
+                fetcher: &self.fetcher,
+                renderer: &self.renderer,
+                slots: &self.slots,
+                tree: &page.tree,
+                base,
+                wait: self.picture_wait,
+                most: self.picture_slots,
+            };
+            pictures.ask(&asker);
+        }
+        let due = pictures.due(now) && self.current.relayout.is_none() && !self.current.again;
+        if due {
+            pictures.settle();
+            self.relayout();
+            self.redraw = true;
+        }
+    }
+
+    /// The page's pictures let go on the render thread, their fetches
+    /// told first.
+    fn let_go_pictures(&mut self) {
+        if let Some(pictures) = self.current.pictures.take() {
+            pictures.leave();
+            self.renderer.let_go(Dropped::Pictures(pictures));
+        }
     }
 
     fn entry(&self) -> Option<Entry> {
@@ -1071,7 +1197,16 @@ impl App {
     /// The page shown and a relayout of it let go on the render thread,
     /// an answer the relayout already made among them.
     fn let_go_current(&self, old: Current) {
-        let Current { doc, relayout, .. } = old;
+        let Current {
+            doc,
+            relayout,
+            pictures,
+            ..
+        } = old;
+        if let Some(pictures) = pictures {
+            pictures.leave();
+            self.renderer.let_go(Dropped::Pictures(pictures));
+        }
         if let Some(relayout) = relayout {
             // Cancelled and taken under the slot's lock, which the render
             // thread writes under: what it makes after is dropped there.
@@ -1101,6 +1236,11 @@ impl App {
             }
             self.message = Some("stopped".into());
             self.show_address();
+            return true;
+        }
+        // Then the page's pictures still to come; those come stay.
+        if self.current.pictures.as_mut().is_some_and(Pictures::stop) {
+            self.message = Some("pictures stopped".into());
             return true;
         }
         // A save that has answered says what became of it, a failure
@@ -1267,6 +1407,15 @@ impl App {
     /// `relayout` keeping `top` at the top: the top's place shown, or the
     /// one a relayout that let the layout go took with it.
     fn relayout_from(&mut self, top: Option<Anchor>) {
+        if self.current.relay_after {
+            // Set only by a navigation that cancelled a relayout kept
+            // beside the layout shown, which stays shown meanwhile.
+            if self.loading.is_some() {
+                self.current.again = true;
+                return;
+            }
+            self.current.relay_after = false;
+        }
         if self.metrics.scale() != self.surface.scale {
             self.metrics = Metrics::new(self.renderer.faces(), self.surface.scale);
         }
@@ -1276,6 +1425,12 @@ impl App {
             self.current.again = false;
             return;
         };
+        let pictures = self
+            .current
+            .pictures
+            .as_ref()
+            .map(|pictures| pictures.set(&page.budget))
+            .transpose();
         if let Some(running) = &self.current.relayout {
             // The one running is for this unless it was cancelled; else it
             // is cancelled and another asked once it ends.
@@ -1287,7 +1442,10 @@ impl App {
             return;
         }
         let laid = page.laid.as_ref();
-        if laid.is_some_and(|laid| pipeline::redo(laid.want, want) == pipeline::Redo::Nothing) {
+        let refitting = self.current.refitting;
+        if !refitting
+            && laid.is_some_and(|laid| pipeline::redo(laid.want, want) == pipeline::Redo::Nothing)
+        {
             // Back to what is shown: nothing was refused it.
             self.current.again = false;
             self.current.kept = false;
@@ -1302,9 +1460,12 @@ impl App {
         let Some(page) = self.current.doc.page_mut() else {
             return;
         };
-        let (Ok(tree), Ok(budget), Ok((faces, cancel, answer))) =
-            (page.tree.try_clone(), page.budget.try_clone(), parts)
-        else {
+        let (Ok(tree), Ok(budget), Ok((faces, cancel, answer)), Ok(pictures)) = (
+            page.tree.try_clone(),
+            page.budget.try_clone(),
+            parts,
+            pictures,
+        ) else {
             // Asked again at the next poll.
             self.message = Some(Cow::Borrowed(
                 "the page could not be laid out again: memory",
@@ -1331,6 +1492,7 @@ impl App {
             old,
             keep,
             want,
+            pictures,
         };
         let (Ok(theirs), Ok(answered)) = (cancel.try_clone(), answer.try_clone()) else {
             if let Some(page) = self.current.doc.page_mut() {
@@ -1349,6 +1511,7 @@ impl App {
         };
         match self.renderer.post(item) {
             Ok(()) => {
+                self.current.refitting = false;
                 self.current.relayout = Some(Relayout {
                     answer,
                     cancel,
@@ -1397,6 +1560,10 @@ impl App {
             return;
         };
         self.redraw = true;
+        let now = self.clock.now();
+        if let Some(pictures) = self.current.pictures.as_mut() {
+            pictures.laid(now);
+        }
         match made {
             Ok(page) => {
                 let focused = self.focused().or(running.focused);
@@ -1411,7 +1578,19 @@ impl App {
                 // old one's.
                 let same = BudgetShared::ptr_eq(&shown.tree, &page.tree);
                 let old = std::mem::replace(shown, page);
+                // Copies refused while the old layout held its own are
+                // made again, once a want, the layout shown kept beside:
+                // the old goes to the lane before the relayout does, so
+                // its copies' room is had.
+                let short = shown.laid.as_ref().map_or(0, |laid| laid.short());
+                let copies = old.laid.as_ref().map_or(0, |laid| laid.copies());
+                let want = shown.laid.as_ref().map(|laid| laid.want);
                 self.renderer.let_go(Dropped::Page(old));
+                if short > 0 && copies > 0 && want.is_some() && self.current.refit != want {
+                    self.current.refit = want;
+                    self.current.refitting = true;
+                    self.current.again = true;
+                }
                 self.current.kept = false;
                 self.current.measure = None;
                 let pane = self.pane();
@@ -1431,13 +1610,18 @@ impl App {
                         view.clamp(&laid, &pane);
                     }
                 }
+                // Stepped down to another tree, rung 3's: no picture of
+                // the old one is in it.
+                if !same {
+                    self.let_go_pictures();
+                }
                 if same && self.current.view.hits.is_some() && !self.current.find_refused {
                     self.remark();
                 }
                 self.refresh_hover();
             }
             Err(Refusal::Cancelled) => {
-                if running.let_go {
+                if running.let_go || self.current.relay_after {
                     // Nothing to show until the one after it comes.
                     self.current.again = true;
                 }
@@ -1448,6 +1632,7 @@ impl App {
                 if let Body::Page(page) = old {
                     self.renderer.let_go(Dropped::Page(page));
                 }
+                self.let_go_pictures();
             }
         }
         if self.current.again || running.let_go && self.current.laid().is_none() {
@@ -2279,6 +2464,37 @@ impl App {
                     ),
                 );
             }
+            let laid = self.current.laid();
+            let drawn = |node| !laid.is_some_and(|laid| laid.refused(node));
+            if let Some(count) = self.current.pictures.as_ref().map(|p| p.count(drawn)) {
+                if count.out {
+                    add_part(
+                        &mut out,
+                        format_args!("loading pictures, {} of {} shown", count.shown, count.of),
+                    );
+                } else if count.not > 0 {
+                    let are = if count.not == 1 { "is" } else { "are" };
+                    let again = if count.stopped {
+                        "; Ctrl+R asks again"
+                    } else {
+                        ""
+                    };
+                    if count.of == 1 {
+                        add_part(
+                            &mut out,
+                            format_args!("the page's picture is not shown{again}"),
+                        );
+                    } else {
+                        add_part(
+                            &mut out,
+                            format_args!(
+                                "{} of the page's {} pictures {are} not shown{again}",
+                                count.not, count.of
+                            ),
+                        );
+                    }
+                }
+            }
             if let Some(limit) = notes.styles {
                 add_part(
                     &mut out,
@@ -2455,6 +2671,7 @@ impl Handler for App {
             self.settle();
             self.redraw = true;
         }
+        self.pictures();
         if self.saving.is_some() {
             self.settle_save();
             self.redraw = true;
@@ -2473,6 +2690,7 @@ impl Handler for App {
             || self.saving.is_some()
             || self.current.relayout.is_some()
             || self.current.again
+            || self.current.pictures.as_ref().is_some_and(Pictures::busy)
         {
             LOADING_WAIT_MS
         } else {
@@ -2546,6 +2764,15 @@ impl Handler for App {
                                 link,
                             };
                             let frame = view.frame(&pane);
+                            // An inline picture is its layout's fitted copy.
+                            let mut sink = |draw: Draw| match draw.primitive {
+                                Primitive::Image { id, rect } => {
+                                    if let Some((fitted, factor)) = laid.fitted_by(id) {
+                                        raster.image_scaled(draw.clip, rect, fitted, factor);
+                                    }
+                                }
+                                _ => raster.draw(draw),
+                            };
                             paint::paint(
                                 &laid,
                                 measure,
@@ -5718,6 +5945,12 @@ mod tests {
                 if let Some(style_wait) = style_wait {
                     app.style_wait = style_wait;
                 }
+                if let Ok(slots) = std::env::var("TD_WEB_PICTURE_SLOTS") {
+                    app.picture_slots = slots.parse().unwrap();
+                }
+                if let Ok(term) = std::env::var("TD_WEB_PICTURES_TERM") {
+                    app.pictures_term = term.parse::<usize>().unwrap() << 20;
+                }
                 let alone = app.renderer.budget().used();
                 type_address(&mut app, &addresses[n]);
                 let started = Instant::now();
@@ -5730,6 +5963,46 @@ mod tests {
                 });
                 let made = started.elapsed();
                 let waited = styles.map(|styles| styles.elapsed());
+                // Its pictures, as they come: how many settles laid them
+                // and when the last was laid.
+                let shown = Instant::now();
+                let (mut settles, mut settled) = (0, 0);
+                let (mut relaying, mut relaid) = (None, std::time::Duration::ZERO);
+                wait(&mut app, |app| {
+                    let pictures = app.current.pictures.as_ref();
+                    let now = pictures.map_or(0, Pictures::settled);
+                    if now != settled {
+                        settled = now;
+                        settles += 1;
+                    }
+                    match (relaying, app.current.relayout.is_some()) {
+                        (None, true) => relaying = Some(Instant::now()),
+                        (Some(since), false) => {
+                            relaid += since.elapsed();
+                            relaying = None;
+                        }
+                        _ => {}
+                    }
+                    !pictures.is_some_and(Pictures::busy)
+                        && app.current.relayout.is_none()
+                        && !app.current.again
+                });
+                if let Some(pictures) = app.current.pictures.as_ref() {
+                    let why: Vec<_> = (0..pictures::MAX_PICTURES)
+                        .filter_map(|at| pictures.refused(at))
+                        .collect();
+                    println!(
+                        "{name} at {scale}: pictures {:?}, refused {why:?}, laid by {settles} \
+                         settles taking {relaid:.1?}, the last {:.1?} after the page, the term \
+                         holding {:.2} MiB",
+                        pictures.count(|node| !app
+                            .current
+                            .laid()
+                            .is_some_and(|laid| laid.refused(node))),
+                        shown.elapsed(),
+                        pictures.term().used() as f64 / 1048576.0,
+                    );
+                }
                 let held = app.renderer.budget().used() - alone;
                 if let Some(sheets) = app.current.doc.page().and_then(|p| p.sheets.as_ref()) {
                     println!(
@@ -5929,12 +6202,16 @@ mod tests {
         held: Vec<String>,
         started: Mutex<Vec<String>>,
         release: Mutex<mpsc::Receiver<()>>,
+        /// URLs held apart, each released by its own sender.
+        apart: Vec<(String, Mutex<mpsc::Receiver<()>>)>,
     }
 
     impl Fetcher for Gate {
         fn get(&self, url: &str, ask: Ask) -> Result<Reply, String> {
             self.started.lock().unwrap().push(url.into());
-            if self.held.iter().any(|held| held == url) {
+            if let Some((_, release)) = self.apart.iter().find(|(apart, _)| apart == url) {
+                let _ = release.lock().unwrap().recv();
+            } else if self.held.iter().any(|held| held == url) {
                 let _ = self.release.lock().unwrap().recv();
             }
             self.table.get(url, ask)
@@ -5942,14 +6219,33 @@ mod tests {
     }
 
     fn gate(table: Table, held: &[&str]) -> (Arc<Gate>, mpsc::Sender<()>) {
+        let (gate, release, _) = gate_apart(table, held, &[]);
+        (gate, release)
+    }
+
+    /// `gate`, with each of `apart` held until its own sender releases
+    /// it.
+    fn gate_apart(
+        table: Table,
+        held: &[&str],
+        apart: &[&str],
+    ) -> (Arc<Gate>, mpsc::Sender<()>, Vec<mpsc::Sender<()>>) {
         let (release, released) = mpsc::channel();
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for url in apart {
+            let (send, receive) = mpsc::channel();
+            senders.push(send);
+            receivers.push((url.to_string(), Mutex::new(receive)));
+        }
         let gate = Arc::new(Gate {
             table,
             held: held.iter().map(|url| url.to_string()).collect(),
             started: Mutex::new(Vec::new()),
             release: Mutex::new(released),
+            apart: receivers,
         });
-        (gate, release)
+        (gate, release, senders)
     }
 
     fn started(gate: &Gate) -> Vec<String> {
@@ -6545,5 +6841,1401 @@ mod tests {
                 "page {n}"
             );
         }
+    }
+
+    /// A PNG of `width` by `height` pixels, each `rgb`.
+    fn png(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
+        td_png::encode_rgb8(width, height, &rgb.repeat(width * height)).unwrap()
+    }
+
+    /// Polls until `done`, within a long wait: none of these is about
+    /// lateness.
+    fn until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done(app) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits for the page's pictures to come and be laid.
+    fn pictured(app: &mut App) {
+        until(app, "the pictures did not come", |app| {
+            !app.current.pictures.as_ref().is_some_and(Pictures::busy)
+                && app.current.relayout.is_none()
+                && !app.current.again
+        });
+    }
+
+    /// The pictures the layout shown lays: each node's index and size.
+    fn fits(app: &App) -> Vec<(usize, usize, usize)> {
+        crate::page::tests::fits(laid(app))
+    }
+
+    /// The node index of each picture the page names, in tree order.
+    fn picture_nodes(app: &App) -> Vec<usize> {
+        laid(app)
+            .tree()
+            .pictures()
+            .iter()
+            .map(|node| node.index())
+            .collect()
+    }
+
+    fn refused(app: &App, at: usize) -> Option<pictures::Why> {
+        app.current.pictures.as_ref().unwrap().refused(at)
+    }
+
+    /// The glyphs a paint of the page draws, in order.
+    fn glyph_text(app: &mut App) -> String {
+        painted(app).iter().map(|&(_, c, _)| c).collect()
+    }
+
+    /// The pictures a paint of the page draws: each one's id and box.
+    fn images(app: &mut App) -> Vec<(u64, Rect)> {
+        let pane = app.pane();
+        let frame = app.current.view.frame(&pane);
+        let marks = Marks {
+            hits: &[],
+            selection: None,
+            link: None,
+        };
+        let mut scratch = Scratch::new(app.renderer.budget());
+        let (laid, measure) =
+            measure_of(&app.current.doc, &mut app.current.measure, &app.renderer).unwrap();
+        let mut out = Vec::new();
+        paint::paint(
+            &laid,
+            measure,
+            &frame,
+            app.surface.bounds(),
+            &marks,
+            &mut scratch,
+            &mut |draw| {
+                if let Primitive::Image { id, rect } = draw.primitive {
+                    out.push((id, rect));
+                }
+            },
+        );
+        out
+    }
+
+    /// The middle of the box the node of index `node` is laid in, in the
+    /// window.
+    fn picture_point(app: &App, node: usize) -> (i64, i64) {
+        let pane = app.pane();
+        let frame = app.current.view.frame(&pane);
+        let scale = frame.scale as f64;
+        let laid = laid(app);
+        let inline = laid
+            .lines()
+            .iter()
+            .flat_map(|line| line.replaced.iter())
+            .find(|r| r.node.index() == node)
+            .map(|r| (r.x, r.y, r.width, r.height));
+        // Else a block-level one, its content box.
+        let (x, y, width, height) = inline.unwrap_or_else(|| {
+            let id = laid
+                .tree()
+                .pictures()
+                .iter()
+                .find(|id| id.index() == node)
+                .copied()
+                .unwrap();
+            let g = laid.geometry(laid.geometry_of(id).unwrap()).unwrap();
+            assert!(g.replaced);
+            (g.content.x, g.content.y, g.content.width, g.content.height)
+        });
+        (
+            frame.x + ((x + width / 2.0) * scale) as i64,
+            frame.y + ((y + height / 2.0) * scale) as i64,
+        )
+    }
+
+    /// The window painted: its pixels, BGRA.
+    fn window_pixels(app: &mut App) -> Vec<u8> {
+        let font = td_ui::font::pinned().unwrap();
+        let surface = app.surface;
+        let mut pixels = vec![0u8; surface.width * surface.height * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+        app.paint(&mut raster, surface).unwrap();
+        drop(raster);
+        pixels
+    }
+
+    fn pixel(app: &App, pixels: &[u8], (x, y): (i64, i64)) -> [u8; 4] {
+        let at = (y as usize * app.surface.width + x as usize) * 4;
+        pixels[at..at + 4].try_into().unwrap()
+    }
+
+    /// The URLs asked for that end in `tail`, and what each asked.
+    fn asks(table: &Table, tail: &str) -> Vec<(String, Ask)> {
+        let asked = table.asked.lock().unwrap();
+        asked
+            .iter()
+            .filter(|(url, _)| url.ends_with(tail))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_pages_pictures_come_in_place_of_their_placeholders() {
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/p",
+                    "text/html",
+                    "<body style=margin:0><p>top<p><img src=/a.png alt=qqq> \
+                     <img src=' b.png ' alt=zzz> <img src=a.png width=15 alt=w>",
+                )
+                .picture("https://example.org/a.png", &png(30, 20, [255, 0, 0]))
+                .picture("https://example.org/b.png", &png(10, 40, [0, 0, 255])),
+        );
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/p");
+        // Shown first, before any has come, with its placeholders.
+        assert!(fits(&app).is_empty());
+        let glyphs = glyph_text(&mut app);
+        assert!(
+            glyphs.contains("qqq") && glyphs.contains("zzz") && glyphs.ends_with("w"),
+            "{glyphs}"
+        );
+        assert!(images(&mut app).is_empty());
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(
+            fits(&app),
+            vec![(nodes[0], 30, 20), (nodes[1], 10, 40), (nodes[2], 15, 10)]
+        );
+        // At their own size drawn with no copy; one the page sizes, a
+        // copy fitted to its box.
+        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[0]), Some(1));
+        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[2]), None);
+        // Each drawn in its box in place of its alt text.
+        assert_eq!(glyph_text(&mut app), "top");
+        assert_eq!(images(&mut app).len(), 3);
+        let pixels = window_pixels(&mut app);
+        assert_eq!(
+            pixel(&app, &pixels, picture_point(&app, nodes[0])),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(
+            pixel(&app, &pixels, picture_point(&app, nodes[1])),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            pixel(&app, &pixels, picture_point(&app, nodes[2])),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(notes(&mut app), "");
+        // Each asked public, as a picture asks, within its wait.
+        let asked = asks(&table, ".png");
+        let mut urls: Vec<_> = asked.iter().map(|(url, _)| url.as_str()).collect();
+        urls.sort_unstable();
+        // Each `img` its own fetch: td-web keeps no cache.
+        assert_eq!(
+            urls,
+            [
+                "https://example.org/a.png",
+                "https://example.org/a.png",
+                "https://example.org/b.png"
+            ]
+        );
+        for (_, ask) in &asked {
+            assert!(ask.public);
+            assert_eq!(ask.accept, pictures::ACCEPT);
+            assert_eq!(ask.limit, pictures::MAX_PICTURE_BODY);
+            let left = ask.deadline.unwrap() - std::time::Instant::now();
+            assert!(left <= pictures::PICTURE_WAIT, "{left:?}");
+        }
+        slots_free(&app);
+    }
+
+    /// At scale two a picture laid at its size fills a box twice its
+    /// pixels each way, drawn scaled with no copy made.
+    #[test]
+    fn a_picture_at_scale_two_fills_its_box_with_no_copy() {
+        let table = Table::default()
+            .page(
+                "https://example.org/two",
+                "text/html",
+                "<body style=margin:0><img src=/a.png>",
+            )
+            .picture("https://example.org/a.png", &png(3, 2, [255, 0, 0]));
+        let surface = Surface::new(800, 600, Scale::new(2).unwrap()).unwrap();
+        let mut app = App::new(Arc::new(table), surface, None).unwrap();
+        app.style_wait = std::time::Duration::from_secs(60);
+        typed(&mut app, "example.org/two");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 6, 4)]);
+        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[0]), Some(2));
+        let pixels = window_pixels(&mut app);
+        // The box's top left, from its middle.
+        let (x, y) = picture_point(&app, nodes[0]);
+        let (left, top) = (x - 3, y - 2);
+        for (x, y) in [(0, 0), (5, 3), (2, 1)] {
+            assert_eq!(
+                pixel(&app, &pixels, (left + x, top + y)),
+                [0, 0, 255, 255],
+                "at {x}, {y}"
+            );
+        }
+        assert_ne!(pixel(&app, &pixels, (left + 6, top)), [0, 0, 255, 255]);
+        assert_ne!(pixel(&app, &pixels, (left, top + 4)), [0, 0, 255, 255]);
+        slots_free(&app);
+    }
+
+    #[test]
+    fn a_refused_picture_keeps_its_placeholder_and_is_noted() {
+        let good = png(4, 4, [0, 255, 0]);
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/r",
+                    "text/html",
+                    "<img src=/gone.png alt=a0><img src=/e404.png alt=a1>\
+                     <img src=/x.png alt=a2><img src=/bad.png alt=a3>\
+                     <img src=/s.svg alt=a4><img src=http://example.org/m.png alt=a5>\
+                     <img src=/ok.gif alt=a6><img src=mailto:x@example.org alt=a7>\
+                     <img src='  ' alt=a8>",
+                )
+                .reply(
+                    "https://example.org/e404.png",
+                    404,
+                    &[("content-type", "image/png")],
+                    &good,
+                )
+                .reply(
+                    "https://example.org/x.png",
+                    200,
+                    &[("content-type", "image/svg+xml")],
+                    &good,
+                )
+                .reply(
+                    "https://example.org/bad.png",
+                    200,
+                    &[("content-type", "image/png")],
+                    b"not a picture",
+                )
+                // Sniffed: what it is, whatever its type says.
+                .reply(
+                    "https://example.org/ok.gif",
+                    200,
+                    &[("content-type", "image/gif")],
+                    &good,
+                )
+                .picture("https://example.org/s.svg", &good)
+                .picture("http://example.org/m.png", &good),
+        );
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/r");
+        pictured(&mut app);
+        // The blank `src` names no picture.
+        let nodes = picture_nodes(&app);
+        assert_eq!(nodes.len(), 8);
+        assert_eq!(fits(&app), vec![(nodes[6], 4, 4)]);
+        use pictures::Why::{Failed, Skipped};
+        let why: Vec<_> = (0..8).map(|at| refused(&app, at)).collect();
+        assert_eq!(
+            why,
+            [
+                Some(Failed),
+                Some(Failed),
+                Some(Failed),
+                Some(Failed),
+                Some(Skipped),
+                Some(Failed),
+                None,
+                Some(Skipped)
+            ]
+        );
+        assert_eq!(notes(&mut app), "7 of the page's 8 pictures are not shown");
+        // SVG and mixed content are never asked.
+        let urls = table.urls();
+        assert!(!urls.iter().any(|url| url.ends_with(".svg")), "{urls:?}");
+        assert!(!urls.iter().any(|url| url.starts_with("http:")), "{urls:?}");
+        // Each refused keeps its placeholder and alt text.
+        let glyphs = glyph_text(&mut app);
+        assert_eq!(glyphs, "a0a1a2a3a4a5a7a8");
+        slots_free(&app);
+    }
+
+    #[test]
+    fn a_picture_redirected_to_http_is_refused_at_that_hop() {
+        let picture = png(3, 3, [9, 9, 9]);
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/m",
+                    "text/html",
+                    "<img src=/r.png alt=r>",
+                )
+                .redirect("https://example.org/r.png", "http://example.org/r.png")
+                .picture("http://example.org/r.png", &picture)
+                .page(
+                    "http://plain.example/",
+                    "text/html",
+                    "<img src=/p.png alt=p>",
+                )
+                .picture("http://plain.example/p.png", &picture),
+        );
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/m");
+        pictured(&mut app);
+        assert!(fits(&app).is_empty());
+        assert_eq!(refused(&app, 0), Some(pictures::Why::Failed));
+        assert_eq!(notes(&mut app), "the page's picture is not shown");
+        let urls = table.urls();
+        assert!(urls.contains(&"https://example.org/r.png".to_string()));
+        assert!(!urls.contains(&"http://example.org/r.png".to_string()));
+        // An `http` page's `http` picture is no mixed content.
+        typed(&mut app, "http://plain.example/");
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 1);
+        slots_free(&app);
+    }
+
+    #[test]
+    fn pictures_past_max_pictures_keep_their_placeholders() {
+        let count = pictures::MAX_PICTURES + 2;
+        let picture = png(1, 1, [1, 1, 1]);
+        let mut table = Table::default().page(
+            "https://example.org/many",
+            "text/html",
+            &(0..count)
+                .map(|n| format!("<img src=/p{n}.png alt=p>"))
+                .collect::<String>(),
+        );
+        for n in 0..count {
+            table = table.picture(&format!("https://example.org/p{n}.png"), &picture);
+        }
+        let table = Arc::new(table);
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/many");
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        // The first in tree order, each once.
+        let mut asked = table.urls();
+        asked.retain(|url| url.ends_with(".png"));
+        asked.sort_unstable();
+        let mut first: Vec<_> = (0..pictures::MAX_PICTURES)
+            .map(|n| format!("https://example.org/p{n}.png"))
+            .collect();
+        first.sort_unstable();
+        assert_eq!(asked, first);
+        assert_eq!(
+            notes(&mut app),
+            format!("2 of the page's {count} pictures are not shown")
+        );
+        slots_free(&app);
+    }
+
+    /// The pictures term refuses a decoding past it, and a fitted copy;
+    /// each keeps its placeholder.
+    #[test]
+    fn the_pictures_term_bounds_what_a_page_decodes_and_fits() {
+        let table = Table::default()
+            .page(
+                "https://example.org/t",
+                "text/html",
+                "<img src=/small.png alt=s><img src=/big.png alt=b>\
+                 <img src=/small.png width=1100 height=1000 alt=w>",
+            )
+            .picture("https://example.org/small.png", &png(4, 4, [5, 5, 5]))
+            .picture("https://example.org/big.png", &png(1100, 1000, [5, 5, 5]));
+        let mut app = app(table);
+        // Room for the small one and its bookkeeping; 1100 by 1000 pixels
+        // are 4.2 MiB.
+        app.pictures_term = 4 << 20;
+        typed(&mut app, "example.org/t");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 4, 4)]);
+        assert_eq!(refused(&app, 1), Some(pictures::Why::Room));
+        // Decoded, but its box takes more than the term has.
+        assert_eq!(refused(&app, 2), None);
+        assert_eq!(glyph_text(&mut app), "bw");
+        assert_eq!(
+            app.current.pictures.as_ref().unwrap().term().limit(),
+            (4 << 20) + td_alloc::Budget::metadata_bytes()
+        );
+        slots_free(&app);
+    }
+
+    /// Pictures that come within `PICTURE_SETTLE` of a settle wait for the
+    /// next: those come are laid together by one relayout, the reader's
+    /// place kept, and a fitted copy at the same size kept.
+    #[test]
+    fn pictures_come_together_are_laid_by_one_relayout_keeping_the_top() {
+        let markup = format!(
+            "<img src=/a.png width=10 alt=a><img src=/b.png alt=b><img src=/c.png alt=c>{}",
+            numbered(200)
+        );
+        let table = Table::default()
+            .page("https://example.org/s", "text/html", &markup)
+            .picture("https://example.org/a.png", &png(20, 100, [1, 2, 3]))
+            .picture("https://example.org/b.png", &png(20, 300, [1, 2, 3]))
+            .picture("https://example.org/c.png", &png(20, 200, [1, 2, 3]));
+        let (gate, release) = gate(
+            table,
+            &["https://example.org/b.png", "https://example.org/c.png"],
+        );
+        let mut app = app_over(gate.clone());
+        app.clock.fixed = Some(1_000);
+        typed(&mut app, "example.org/s");
+        // The first comes and is laid at once: no settle before it.
+        until(&mut app, "a was not laid", |app| {
+            fits(app).len() == 1 && app.current.relayout.is_none()
+        });
+        let nodes = picture_nodes(&app);
+        for _ in 0..5 {
+            key(&mut app, "PageDown");
+        }
+        let before = top(&app);
+        let text = line_text(&app, top_line(&app));
+        let kept = crate::page::tests::fit_copy(laid(&app), nodes[0])
+            .try_clone()
+            .unwrap();
+        // b and c come within PICTURE_SETTLE of it: taken, not laid.
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        until(&mut app, "b and c did not come", |app| {
+            pictures::tests::came(app.current.pictures.as_ref().unwrap()) == 3
+        });
+        for _ in 0..10 {
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(app.current.relayout.is_none());
+        assert_eq!(fits(&app).len(), 1);
+        assert!(notes(&mut app).ends_with(" · loading pictures, 1 of 3 shown"));
+        // A relayout for another cause lays those settled only.
+        key(&mut app, "F8");
+        relaid(&mut app);
+        assert_eq!(fits(&app).len(), 1);
+        // At PICTURE_SETTLE, one relayout lays both.
+        app.clock.fixed = Some(1_000 + pictures::PICTURE_SETTLE);
+        app.poll(0);
+        assert!(app.current.relayout.is_some());
+        relaid(&mut app);
+        assert_eq!(fits(&app).len(), 3);
+        assert!(!app.current.pictures.as_ref().unwrap().busy());
+        assert_eq!(top(&app).place, before.place);
+        assert_eq!(line_text(&app, top_line(&app)), text);
+        assert!(BudgetShared::ptr_eq(
+            &kept,
+            crate::page::tests::fit_copy(laid(&app), nodes[0])
+        ));
+        drop(kept);
+        app.poll(0);
+        assert!(app.current.relayout.is_none() && !app.current.again);
+        assert!(!notes(&mut app).contains("picture"));
+        slots_free(&app);
+    }
+
+    #[test]
+    fn a_click_on_an_unlinked_picture_opens_it() {
+        let picture = png(40, 30, [7, 7, 7]);
+        let table = site()
+            .page(
+                "https://example.org/u",
+                "text/html",
+                "<img src=/u.png alt=u> <a href=/b><img src=/l.png alt=l></a>",
+            )
+            .picture("https://example.org/u.png", &picture)
+            .picture("https://example.org/l.png", &picture);
+        let mut app = app(table);
+        typed(&mut app, "example.org/u");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app).len(), 2);
+        let unlinked = picture_point(&app, nodes[0]);
+        app.mouse(PointerPhase::Press, unlinked, false);
+        app.mouse(PointerPhase::Release, unlinked, false);
+        settle(&mut app);
+        assert_eq!(app.title(), "https://example.org/u.png - td-web");
+        key(&mut app, "M-Left");
+        settle(&mut app);
+        pictured(&mut app);
+        let linked = picture_point(&app, nodes[1]);
+        app.mouse(PointerPhase::Press, linked, false);
+        app.mouse(PointerPhase::Release, linked, false);
+        settle(&mut app);
+        assert_eq!(app.title(), "B - td-web");
+    }
+
+    #[test]
+    fn escape_stops_the_pictures_still_to_come_and_a_reload_asks_again() {
+        let h = "https://example.org/h.png";
+        let table = Table::default()
+            .page(
+                "https://example.org/e",
+                "text/html",
+                "<img src=/ok.png alt=k><img src=/h.png alt=h>",
+            )
+            .picture("https://example.org/ok.png", &png(5, 5, [3, 3, 3]))
+            .picture(h, &png(6, 6, [3, 3, 3]));
+        let (gate, release) = gate(table, &[h]);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org/e");
+        asked(&mut app, &gate, h);
+        until(&mut app, "ok was not laid", |app| {
+            fits(app).len() == 1 && app.current.relayout.is_none()
+        });
+        assert_eq!(notes(&mut app), "loading pictures, 1 of 2 shown");
+        key(&mut app, "Escape");
+        assert_eq!(app.status_text(), "pictures stopped");
+        assert_eq!(
+            notes(&mut app),
+            "1 of the page's 2 pictures is not shown; Ctrl+R asks again"
+        );
+        assert_eq!(refused(&app, 1), Some(pictures::Why::Stopped));
+        // Answered after, it is let go, never shown.
+        release.send(()).unwrap();
+        slots_free(&app);
+        for _ in 0..10 {
+            app.poll(0);
+        }
+        assert_eq!(fits(&app).len(), 1);
+        assert_eq!(refused(&app, 1), Some(pictures::Why::Stopped));
+        // Nothing more to stop.
+        key(&mut app, "Escape");
+        assert_ne!(app.status_text(), "pictures stopped");
+        // A reload asks again.
+        key(&mut app, "C-r");
+        settle(&mut app);
+        until(&mut app, "h was not asked again", |_| {
+            started(&gate).iter().filter(|url| *url == h).count() == 2
+        });
+        release.send(()).unwrap();
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 2);
+        assert_eq!(notes(&mut app), "");
+        slots_free(&app);
+    }
+
+    /// Escape stops a navigation out before the pictures of the page
+    /// shown, which wait for it to end before asking for more.
+    #[test]
+    fn escape_stops_a_navigation_before_the_pictures() {
+        let h = "https://example.org/h.png";
+        let next = "https://example.org/next";
+        let table = Table::default()
+            .page(
+                "https://example.org/e",
+                "text/html",
+                "<img src=/h.png><img src=/i.png><img src=/j.png>",
+            )
+            .page(next, "text/html", "<p>next")
+            .picture(h, &png(2, 2, [3, 3, 3]))
+            .picture("https://example.org/i.png", &png(2, 2, [3, 3, 3]))
+            .picture("https://example.org/j.png", &png(2, 2, [3, 3, 3]));
+        let i = "https://example.org/i.png";
+        let (gate, release, apart) = gate_apart(table, &[h, next], &[i]);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org/e");
+        asked(&mut app, &gate, h);
+        asked(&mut app, &gate, i);
+        type_address(&mut app, "example.org/next");
+        asked(&mut app, &gate, next);
+        // While the navigation is out, i's answer is taken but j, whose
+        // slot it frees, is not asked.
+        apart[0].send(()).unwrap();
+        until(&mut app, "i did not come", |app| {
+            pictures::tests::came(app.current.pictures.as_ref().unwrap()) == 1
+        });
+        for _ in 0..10 {
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!started(&gate).iter().any(|url| url.ends_with("/j.png")));
+        key(&mut app, "Escape");
+        assert_eq!(app.status_text(), "stopped");
+        assert!(app.current.pictures.as_ref().unwrap().busy());
+        key(&mut app, "Escape");
+        assert_eq!(app.status_text(), "pictures stopped");
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        slots_free(&app);
+        idle(&app);
+    }
+
+    /// A page overtaken while its pictures come lets them go on the render
+    /// thread, its decoded pictures and fitted copies with them, and
+    /// returns every charge.
+    #[test]
+    fn an_overtaken_pages_pictures_go_on_the_render_thread() {
+        let page = "https://drops.example/";
+        let h = "https://drops.example/h.png";
+        let table = Table::default()
+            .page("https://drops.example/home", "text/html", "<p>home")
+            .page(
+                page,
+                "text/html",
+                "<img src=/a.png width=5><img src=/h.png>",
+            )
+            .picture("https://drops.example/a.png", &png(8, 8, [1, 2, 3]))
+            .picture(h, &png(8, 8, [1, 2, 3]));
+        let (gate, release) = gate(table, &[h]);
+        let told = pictures::tests::watch(page);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "drops.example/home");
+        app.renderer.idle();
+        app.renderer.release();
+        app.renderer.idle();
+        let used = app.renderer.budget().used();
+        typed(&mut app, "drops.example/");
+        asked(&mut app, &gate, h);
+        until(&mut app, "a was not laid", |app| {
+            fits(app).len() == 1 && app.current.relayout.is_none()
+        });
+        typed(&mut app, "drops.example/home");
+        // h answers after: decoded by no one.
+        release.send(()).unwrap();
+        slots_free(&app);
+        idle(&app);
+        app.renderer.idle();
+        app.renderer.release();
+        app.renderer.idle();
+        let mut drops: Vec<_> = told.try_iter().collect();
+        drops.sort_unstable();
+        assert_eq!(drops, [("fit", true), ("inline", true), ("pictures", true)]);
+        assert_eq!(app.renderer.budget().used(), used);
+    }
+
+    /// Pictures take at most `PICTURE_SLOTS` of the subresource slots:
+    /// a page of pictures whose origin never answers holds back neither a
+    /// navigation nor the next page's sheets.
+    #[test]
+    fn a_page_of_tarpit_pictures_holds_back_no_navigation_or_sheet() {
+        let mut markup = String::new();
+        let mut tarpit = Vec::new();
+        for n in 0..6 {
+            markup.push_str(&format!("<img src=/t{n}.png>"));
+            tarpit.push(format!("https://example.org/t{n}.png"));
+        }
+        let table = Table::default()
+            .page("https://example.org/t", "text/html", &markup)
+            .page(
+                "https://example.org/s",
+                "text/html",
+                "<link rel=stylesheet href=/s.css><i class=s>styled</i>",
+            )
+            .sheet("https://example.org/s.css", ".s{display:none}");
+        let service = Arc::new(Service {
+            table,
+            tarpit,
+            workers: Mutex::new(0),
+            free: std::sync::Condvar::new(),
+            served: Mutex::new(Vec::new()),
+        });
+        let mut app = app_over(service.clone());
+        // Long past the bound below, so a loaded host's slow navigation
+        // is not taken for one held back.
+        app.picture_wait = std::time::Duration::from_secs(20);
+        typed(&mut app, "example.org/t");
+        let tarpits = |service: &Service| {
+            let served = service.served.lock().unwrap();
+            served
+                .iter()
+                .filter(|(url, _)| url.ends_with(".png"))
+                .count()
+        };
+        until(&mut app, "the pictures were not asked", |_| {
+            tarpits(&service) == pictures::PICTURE_SLOTS
+        });
+        for _ in 0..20 {
+            app.poll(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(tarpits(&service), pictures::PICTURE_SLOTS);
+        assert_eq!(app.slots.out(), pictures::PICTURE_SLOTS);
+        // The next page's sheet takes a slot the pictures left.
+        let started = std::time::Instant::now();
+        typed(&mut app, "example.org/s");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(page_text(&app), "");
+        assert_eq!(notes(&mut app), "");
+        // The tarpit's fetches end at their wait; none past them asked.
+        until(&mut app, "the tarpit's fetches did not end", |app| {
+            app.slots.out() == 0
+        });
+        assert_eq!(tarpits(&service), pictures::PICTURE_SLOTS);
+    }
+
+    #[test]
+    fn a_data_picture_is_decoded_with_no_request() {
+        let picture = png(6, 2, [0, 255, 0]);
+        let markup = format!(
+            "<img src=\"data:image/png;base64,{}\" alt=d><img src=\"data:,nope\" alt=n>",
+            base64(&picture)
+        );
+        let table = Arc::new(Table::default().page("https://example.org/d", "text/html", &markup));
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/d");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 6, 2)]);
+        assert_eq!(refused(&app, 1), Some(pictures::Why::Failed));
+        assert_eq!(table.urls(), ["https://example.org/d"]);
+    }
+
+    /// The render thread held on a relayout of its own until the guard
+    /// goes: what is posted after it waits in the lane.
+    fn hold_render(app: &App) -> impl Drop {
+        use crate::document::tests::{again_of, hold, WAITS};
+        let held = hold();
+        let page = app.current.doc.page().unwrap();
+        let want = Want {
+            width: WAITS,
+            ..app.want()
+        };
+        let again = again_of(page, want);
+        let (faces, cancel, answer) = app.renderer.relayout_parts().unwrap();
+        assert!(app
+            .renderer
+            .post(Lane::Again {
+                again,
+                faces,
+                cancel,
+                answer,
+            })
+            .is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        held
+    }
+
+    /// A page of `count` `data:` pictures one pixel wide and 8192 tall,
+    /// each laid 8192 wide and one tall.
+    fn thin_pictures(count: usize) -> String {
+        let picture = png(1, 8192, [9, 99, 199]);
+        let src = format!("data:image/png;base64,{}", base64(&picture));
+        let mut markup = String::from("<body style=margin:0><p>thin");
+        for _ in 0..count {
+            markup.push_str(&format!("<img src=\"{src}\" width=8192 height=1>"));
+        }
+        markup.push_str("<p>end");
+        markup
+    }
+
+    /// The fitted copies one layout makes take at most its work: one
+    /// past it keeps its placeholder, is not counted shown, and is noted.
+    /// Both come before the window takes either, so one settle lays both.
+    #[test]
+    fn a_layouts_copies_take_at_most_its_work() {
+        let (a, b) = ("https://example.org/a.png", "https://example.org/b.png");
+        let table = Table::default()
+            .page(
+                "https://example.org/w",
+                "text/html",
+                "<body style=margin:0><img src=/a.png width=15 height=15 alt=aa>\
+                 <img src=/b.png width=15 height=15 alt=bb>",
+            )
+            .picture(a, &png(10, 10, [0, 0, 255]))
+            .picture(b, &png(10, 10, [0, 0, 255]));
+        let (gate, release) = gate(table, &[a, b]);
+        let mut app = app_over(gate.clone());
+        let one = td_ui::picture::Picture::new(10, 10, vec![0; 400])
+            .unwrap()
+            .into_fitted()
+            .fit_exact_cost(15, 15)
+            .unwrap()
+            .steps;
+        app.fit_work = one + one / 2;
+        typed(&mut app, "example.org/w");
+        asked(&mut app, &gate, a);
+        asked(&mut app, &gate, b);
+        relaid(&mut app);
+        let held = hold_render(&app);
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pictures::tests::ready(app.current.pictures.as_ref().unwrap()) < 2 {
+            assert!(std::time::Instant::now() < deadline, "not decoded");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 15, 15)]);
+        assert_eq!(laid(&app).short(), 1);
+        assert_eq!(glyph_text(&mut app), "bb");
+        assert_eq!(notes(&mut app), "1 of the page's 2 pictures is not shown");
+        slots_free(&app);
+    }
+
+    /// A page of thin pictures laid very wide (DESIGN.md §10's bound on
+    /// fitting): each copy costs its axes in turn, so all are laid in a
+    /// relayout of bounded work, and a navigation from it cancels the
+    /// relayout it starts beside, so its own page is made first; the page
+    /// is laid again once the navigation ends without a page.
+    #[test]
+    fn a_navigation_cancels_the_relayout_of_the_page_shown() {
+        let next = "https://example.org/next";
+        let table = Table::default()
+            .page(
+                "https://example.org/thin",
+                "text/html",
+                &thin_pictures(pictures::MAX_PICTURES),
+            )
+            .page(next, "text/html", "<p>next");
+        let (gate, release) = gate(table, &[next]);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org/thin");
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        assert_eq!(laid(&app).short(), 0);
+        let fitted = std::time::Instant::now();
+        resize(&mut app, 700);
+        let laid_again = fitted.elapsed();
+        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        // A relayout asked, then a navigation before it is taken.
+        app.input(Input::Resize(surface(760)), &mut Board::default());
+        let running = app
+            .current
+            .relayout
+            .as_ref()
+            .unwrap()
+            .cancel
+            .try_clone()
+            .unwrap();
+        let started = std::time::Instant::now();
+        type_address(&mut app, "example.org/next");
+        assert!(running.load(Ordering::SeqCst));
+        assert!(app.current.relay_after);
+        asked(&mut app, &gate, next);
+        // Cancelled, it is not asked again while the navigation is out.
+        until(&mut app, "the relayout was not taken", |app| {
+            app.current.relayout.is_none()
+        });
+        assert!(app.current.again);
+        // Stopped: the page shown is laid again for the window.
+        key(&mut app, "Escape");
+        relaid(&mut app);
+        assert!(!app.current.relay_after);
+        assert_eq!(laid(&app).want.width, app.want().width);
+        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        // Asked again, its page made behind no relayout.
+        app.input(Input::Resize(surface(700)), &mut Board::default());
+        type_address(&mut app, "example.org/next");
+        // The stopped fetch, then this one.
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        settle(&mut app);
+        let shown = started.elapsed();
+        assert_eq!(page_text(&app), "next");
+        eprintln!(
+            "thin pictures: laid again in {laid_again:.1?}, the navigation shown in {shown:.1?}"
+        );
+        slots_free(&app);
+    }
+
+    /// Block-level and floated pictures, and one in a link, are laid and
+    /// drawn as inline ones are; a refused one draws its frame and alt.
+    #[test]
+    fn block_level_pictures_are_laid_and_drawn() {
+        let table = site()
+            .page(
+                "https://example.org/blocks",
+                "text/html",
+                "<body style=margin:0><img src=/a.png style=display:block alt=a>\
+                 <img src=/b.png style=float:left width=20 alt=b>\
+                 <a href=/x><img src=/c.png style=display:block alt=c></a>\
+                 <img src=/gone.png style=display:block width=60 height=30 alt=zz>",
+            )
+            .picture("https://example.org/a.png", &png(30, 20, [255, 0, 0]))
+            .picture("https://example.org/b.png", &png(10, 10, [0, 255, 0]))
+            .picture("https://example.org/c.png", &png(12, 8, [0, 0, 255]));
+        let mut app = app(table);
+        typed(&mut app, "example.org/blocks");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(
+            fits(&app),
+            vec![(nodes[0], 30, 20), (nodes[1], 20, 20), (nodes[2], 12, 8)]
+        );
+        assert_eq!(images(&mut app).len(), 3);
+        assert_eq!(glyph_text(&mut app), "zz");
+        let pixels = window_pixels(&mut app);
+        for (at, bgra) in [
+            (0, [0, 0, 255, 255]),
+            (1, [0, 255, 0, 255]),
+            (2, [255, 0, 0, 255]),
+        ] {
+            assert_eq!(
+                pixel(&app, &pixels, picture_point(&app, nodes[at])),
+                bgra,
+                "picture {at}"
+            );
+        }
+        assert_eq!(notes(&mut app), "1 of the page's 4 pictures is not shown");
+        slots_free(&app);
+    }
+
+    /// Pictures fitted to the window's width, whose copies at a new width
+    /// have no room beside the old ones', are laid again once with the
+    /// old let go: every resize shows them all.
+    #[test]
+    fn copies_refused_beside_the_old_layouts_are_made_with_it_let_go() {
+        let table = Table::default()
+            .page(
+                "https://example.org/wide",
+                "text/html",
+                "<body style=margin:0><img src=/a.png style=width:100%>\
+                 <img src=/b.png style=width:100%>",
+            )
+            .picture("https://example.org/a.png", &png(100, 100, [1, 2, 3]))
+            .picture("https://example.org/b.png", &png(100, 100, [4, 5, 6]));
+        let mut app = app(table);
+        // Room for both copies at 800 pixels square and their scratch,
+        // not for those and the next ones beside.
+        app.pictures_term = 7 << 20;
+        typed(&mut app, "example.org/wide");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        let width = |app: &App| fits(app).first().map(|&(_, width, _)| width);
+        let first = width(&app).unwrap();
+        assert_eq!(fits(&app).len(), 2);
+        for (n, wide) in [700, 790, 700, 790].into_iter().enumerate() {
+            resize(&mut app, wide);
+            pictured(&mut app);
+            assert_eq!(fits(&app).len(), 2, "resize {n}");
+            assert_eq!(laid(&app).short(), 0, "resize {n}");
+            assert_ne!(width(&app), Some(first), "resize {n}");
+            // Each copy made at the size it is drawn at.
+            for &node in &nodes {
+                let copy = crate::page::tests::fit_copy(laid(&app), node);
+                let fit = fits(&app).into_iter().find(|f| f.0 == node).unwrap();
+                assert_eq!((copy.fitted().width, copy.fitted().height), (fit.1, fit.2));
+            }
+            assert!(!notes(&mut app).contains("picture"), "resize {n}");
+        }
+        slots_free(&app);
+    }
+
+    /// A `data:` picture longer than td-url's longest URL is known before
+    /// it is joined and decoded, with no request.
+    #[test]
+    fn a_long_data_picture_is_decoded() {
+        let mut noise = Vec::new();
+        let mut n = 7u32;
+        for _ in 0..40 * 40 * 3 {
+            n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            noise.push((n >> 16) as u8);
+        }
+        let picture = td_png::encode_rgb8(40, 40, &noise).unwrap();
+        let src = base64(&picture);
+        assert!(src.len() > 4096, "{}", src.len());
+        let markup = format!("<img src=\"  DATA:image/png;base64,{src}\" alt=d>");
+        let table = Arc::new(Table::default().page("https://example.org/d", "text/html", &markup));
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/d");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 40, 40)]);
+        assert_eq!(table.urls(), ["https://example.org/d"]);
+    }
+
+    /// A fetched picture holds its slot until the render thread has
+    /// decoded it.
+    #[test]
+    fn a_picture_holds_its_slot_until_it_is_decoded() {
+        let a = "https://example.org/a.png";
+        let table = Table::default()
+            .page("https://example.org/k", "text/html", "<img src=/a.png>")
+            .picture(a, &png(3, 3, [1, 1, 1]));
+        let (gate, release) = gate(table, &[a]);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org/k");
+        asked(&mut app, &gate, a);
+        let held = hold_render(&app);
+        // Fetched; its decoding waits behind the held job.
+        release.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for _ in 0..10 {
+            app.poll(0);
+        }
+        assert_eq!(app.slots.out(), 1);
+        assert!(fits(&app).is_empty());
+        drop(held);
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 1);
+        slots_free(&app);
+    }
+
+    /// A picture in the link marked is framed in the selection's colour
+    /// over its picture.
+    #[test]
+    fn a_picture_in_the_marked_link_is_framed() {
+        let table = site()
+            .page(
+                "https://example.org/f",
+                "text/html",
+                "<body style=margin:0><a href=/b><img src=/a.png></a>",
+            )
+            .picture("https://example.org/a.png", &png(20, 20, [255, 0, 0]));
+        let mut app = app(table);
+        typed(&mut app, "example.org/f");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        let (x, y) = picture_point(&app, nodes[0]);
+        let corner = (x - 10, y - 10);
+        let pixels = window_pixels(&mut app);
+        assert_eq!(pixel(&app, &pixels, corner), [0, 0, 255, 255]);
+        key(&mut app, "Tab");
+        let pixels = window_pixels(&mut app);
+        assert_ne!(pixel(&app, &pixels, corner), [0, 0, 255, 255]);
+        assert_eq!(pixel(&app, &pixels, (x, y)), [0, 0, 255, 255]);
+    }
+
+    /// Pictures that come while a relayout runs are not settled until it
+    /// has been taken: a settle would cancel it for their sake and ask
+    /// another.
+    #[test]
+    fn no_settle_cancels_a_running_relayout() {
+        let h = "https://example.org/h.png";
+        let table = Table::default()
+            .page(
+                "https://example.org/n",
+                "text/html",
+                "<img src=/h.png alt=h><p>text",
+            )
+            .picture(h, &png(4, 4, [1, 1, 1]));
+        let (gate, release) = gate(table, &[h]);
+        let mut app = app_over(gate.clone());
+        app.clock.fixed = Some(1_000);
+        typed(&mut app, "example.org/n");
+        asked(&mut app, &gate, h);
+        relaid(&mut app);
+        let held = hold_render(&app);
+        // h is fetched and its decoding waits; a relayout is asked.
+        release.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.input(Input::Resize(surface(700)), &mut Board::default());
+        drop(held);
+        // Both done on the render thread, neither taken by the window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let answered = app
+                .current
+                .relayout
+                .as_ref()
+                .unwrap()
+                .answer
+                .lock()
+                .unwrap()
+                .is_some();
+            if answered && pictures::tests::ready(app.current.pictures.as_ref().unwrap()) > 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "not done");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // One poll takes h while the relayout is out, then the relayout:
+        // h waits for the next, none asked for it now.
+        app.poll(0);
+        assert_eq!(
+            pictures::tests::came(app.current.pictures.as_ref().unwrap()),
+            1
+        );
+        assert!(app.current.relayout.is_none() && !app.current.again);
+        assert!(fits(&app).is_empty());
+        app.clock.fixed = Some(1_000 + pictures::PICTURE_SETTLE);
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 1);
+        slots_free(&app);
+    }
+
+    /// A relayout that steps down to another tree, or is refused into the
+    /// static notice, lets the page's pictures go, their fetches told at
+    /// once, before the render thread drops them.
+    #[test]
+    fn a_step_down_or_refusal_lets_the_pictures_go() {
+        for refused in [false, true] {
+            let h = "https://example.org/h.png";
+            let table = Table::default()
+                .page(
+                    "https://example.org/s",
+                    "text/html",
+                    "<p>alpha <img src=/h.png> beta",
+                )
+                .picture(h, &png(4, 4, [1, 1, 1]));
+            let (gate, release) = gate(table, &[h]);
+            let mut app = app_over(gate.clone());
+            typed(&mut app, "example.org/s");
+            asked(&mut app, &gate, h);
+            let inbox = pictures::tests::inbox(app.current.pictures.as_ref().unwrap());
+            let answer_with = if refused {
+                Err(Refusal::Limit("memory"))
+            } else {
+                let going = Arc::new(AtomicBool::new(false));
+                let other = app
+                    .renderer
+                    .document(
+                        Url::parse("https://example.org/s").unwrap(),
+                        200,
+                        Some("text/html"),
+                        b"<p>alpha beta".to_vec(),
+                        app.want(),
+                        &going,
+                    )
+                    .unwrap();
+                let Body::Page(page) = std::mem::replace(&mut { other }.body, Body::Blank) else {
+                    panic!("a page");
+                };
+                Ok(page)
+            };
+            let held = hold_render(&app);
+            let (_, cancel, answer) = app.renderer.relayout_parts().unwrap();
+            *answer.lock().unwrap() = Some(answer_with);
+            app.current.relayout = Some(Relayout {
+                answer,
+                cancel,
+                top: app.anchor(),
+                focused: None,
+                want: app.want(),
+                let_go: refused,
+            });
+            app.poll(0);
+            assert!(app.current.pictures.is_none(), "refused {refused}");
+            assert!(pictures::tests::gone(&inbox), "refused {refused}");
+            assert_eq!(matches!(app.current.doc.body, Body::Resources), refused);
+            drop(held);
+            release.send(()).unwrap();
+            drop(inbox);
+            slots_free(&app);
+        }
+    }
+    /// A page shown on rung 3, its text, starts no pictures: it lays
+    /// none; on rung 2 it does.
+    #[test]
+    fn a_text_rung_page_starts_no_pictures() {
+        let table = Table::default().page(
+            "https://example.org/r3",
+            "text/html",
+            "<img src=/a.png><p>text",
+        );
+        let mut app = app(table);
+        typed(&mut app, "example.org/r3");
+        for (rung, starts) in [(Rung::Text, false), (Rung::UserAgent, true)] {
+            app.let_go_pictures();
+            app.current.doc.page_mut().unwrap().rung = rung;
+            app.start_pictures();
+            assert_eq!(app.current.pictures.is_some(), starts, "{rung:?}");
+        }
+        app.let_go_pictures();
+    }
+    /// A navigation started while a relayout that let the layout go
+    /// runs leaves it running: the page is laid again, never left paper,
+    /// while the navigation is out.
+    #[test]
+    fn a_navigation_leaves_a_let_go_relayout_running() {
+        let next = "https://example.org/next";
+        let table = Table::default()
+            .page(
+                "https://example.org/p",
+                "text/html",
+                &format!("<p>words shown{}", numbered(400)),
+            )
+            .page(next, "text/html", "<p>next");
+        let (gate, release) = gate(table, &[next]);
+        let mut app = app_over(gate.clone());
+        typed(&mut app, "example.org/p");
+        relaid(&mut app);
+        let held = hold_render(&app);
+        // Too little room beside the layout shown: the relayout lets it
+        // go first.
+        let root = app.renderer.budget().try_clone().unwrap();
+        let hog = root
+            .charge(root.limit() - root.used() - (64 << 10))
+            .unwrap();
+        app.input(Input::Resize(surface(700)), &mut Board::default());
+        drop(hog);
+        assert!(app.current.laid().is_none());
+        let running = app
+            .current
+            .relayout
+            .as_ref()
+            .unwrap()
+            .cancel
+            .try_clone()
+            .unwrap();
+        type_address(&mut app, "example.org/next");
+        asked(&mut app, &gate, next);
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(!app.current.relay_after);
+        drop(held);
+        until(&mut app, "the page was not laid again", |app| {
+            app.current.laid().is_some()
+        });
+        assert!(app.loading.is_some());
+        assert_eq!(laid(&app).want.width, app.want().width);
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(page_text(&app), "next");
+    }
+
+    /// A picture whose copy no room ever holds is laid again once a want
+    /// after a resize, not again and again.
+    #[test]
+    fn a_refit_is_asked_once_a_want() {
+        let table = Table::default()
+            .page(
+                "https://example.org/once",
+                "text/html",
+                "<body style=margin:0><img src=/a.png style=width:25%>\
+                 <img src=/b.png style=width:100%>",
+            )
+            .picture("https://example.org/a.png", &png(100, 100, [1, 2, 3]))
+            .picture("https://example.org/b.png", &png(100, 100, [4, 5, 6]));
+        let mut app = app(table);
+        // Room for a's copy, never for b's.
+        app.pictures_term = 2 << 20;
+        typed(&mut app, "example.org/once");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app).len(), 1);
+        for wide in [700, 760] {
+            resize(&mut app, wide);
+            pictured(&mut app);
+            assert_eq!(fits(&app).len(), 1, "at {wide}");
+            assert_eq!(fits(&app)[0].0, nodes[0]);
+            assert_eq!(laid(&app).short(), 1);
+            assert_eq!(app.current.refit, Some(laid(&app).want));
+            assert!(notes(&mut app).ends_with("1 of the page's 2 pictures is not shown"));
+        }
+        slots_free(&app);
+    }
+
+    /// `data:` pictures go to the render thread one at a time.
+    #[test]
+    fn data_pictures_take_the_lane_one_at_a_time() {
+        let picture = png(3, 3, [0, 255, 0]);
+        let src = format!("data:image/png;base64,{}", base64(&picture));
+        let markup = format!("<img src=\"{src}\"><img src=\"{src}\"><img src=\"{src}\">");
+        let table = Table::default().page("https://example.org/d3", "text/html", &markup);
+        let mut app = app(table);
+        typed(&mut app, "example.org/d3");
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 3);
+        // Asked anew with the render thread held: one on the lane.
+        app.let_go_pictures();
+        let held = hold_render(&app);
+        app.start_pictures();
+        for _ in 0..5 {
+            app.poll(0);
+        }
+        assert_eq!(
+            pictures::tests::asked(app.current.pictures.as_ref().unwrap()),
+            1
+        );
+        drop(held);
+        pictured(&mut app);
+        assert_eq!(fits(&app).len(), 3);
+    }
+
+    /// A JPEG decoded at a reduced scale is laid at its frame's size.
+    #[test]
+    fn a_reduced_jpeg_is_laid_at_its_frames_size() {
+        let table = Table::default()
+            .page(
+                "https://example.org/wide",
+                "text/html",
+                "<body style=margin:0><img src=/w.jpg alt=w>",
+            )
+            .reply(
+                "https://example.org/w.jpg",
+                200,
+                &[("content-type", "image/jpeg")],
+                &crate::picture::tests::wide_jpeg(),
+            );
+        let mut app = app(table);
+        typed(&mut app, "example.org/wide");
+        pictured(&mut app);
+        let node = picture_nodes(&app)[0];
+        let r = laid(&app)
+            .lines()
+            .iter()
+            .flat_map(|line| line.replaced.iter())
+            .find(|r| r.node.index() == node)
+            .map(|r| (r.width, r.height))
+            .unwrap();
+        assert_eq!(r, (16384.0, 16.0));
+        slots_free(&app);
+    }
+
+    /// A refused picture's `alt` text is drawn inside its box, inline and
+    /// block-level.
+    #[test]
+    fn alt_text_is_drawn_within_its_box() {
+        let table = Table::default().page(
+            "https://example.org/alt",
+            "text/html",
+            "<body style=margin:0><p>top<p><img src=/gone.png width=120 height=40 alt=qq>\
+             <img src=/gone.png style=display:block width=200 height=50 alt=zz>",
+        );
+        let mut app = app(table);
+        typed(&mut app, "example.org/alt");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        let pane = app.pane();
+        let frame = app.current.view.frame(&pane);
+        let marks = Marks {
+            hits: &[],
+            selection: None,
+            link: None,
+        };
+        let mut scratch = Scratch::new(app.renderer.budget());
+        let (laid_now, measure) =
+            measure_of(&app.current.doc, &mut app.current.measure, &app.renderer).unwrap();
+        let mut glyphs = Vec::new();
+        paint::paint(
+            &laid_now,
+            measure,
+            &frame,
+            app.surface.bounds(),
+            &marks,
+            &mut scratch,
+            &mut |draw| {
+                if let Primitive::Glyph { x, y, scalar, .. } = draw.primitive {
+                    glyphs.push((x, y, scalar));
+                }
+            },
+        );
+        drop(laid_now);
+        for (node, letter, (width, height)) in
+            [(nodes[0], 'q', (120, 40)), (nodes[1], 'z', (200, 50))]
+        {
+            let (cx, cy) = picture_point(&app, node);
+            let (left, top) = (cx - width / 2, cy - height / 2);
+            let drawn: Vec<_> = glyphs.iter().filter(|g| g.2 == letter).collect();
+            assert_eq!(drawn.len(), 2, "{letter}");
+            for &&(x, y, _) in &drawn {
+                assert!(x >= left && x < left + width, "{letter} at {x}, box {left}");
+                assert!(y >= top && y < top + height, "{letter} at {y}, box {top}");
+            }
+        }
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(DIGITS[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 }

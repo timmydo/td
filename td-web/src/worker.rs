@@ -1,4 +1,5 @@
-//! Bounded render handoff. Four reusable request/result slots are admitted
+//! Bounded render handoff. Eight reusable request/result slots, one for
+//! each navigation's and each subresource's fetch thread, are admitted
 //! once at startup. Payloads own nested storage separately. Thread creation
 //! remains std/OS machinery; ordinary handoffs allocate no backing storage.
 //! Beside the slots, a lane of `LANE` items the window thread posts without
@@ -9,7 +10,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use td_alloc::{Budget, BudgetShared};
 
-pub(crate) const QUEUED: usize = 4;
+pub(crate) const QUEUED: usize = 8;
 /// Items the lane holds; a post past them is refused, never waited for.
 pub(crate) const LANE: usize = 4;
 
@@ -261,7 +262,7 @@ pub(crate) enum SubmitError<I> {
 }
 
 /// One worker; drop closes its queue and joins its bounded active operation.
-/// Four slots include queued, running and completed-but-unclaimed results.
+/// `QUEUED` slots include queued, running and completed-but-unclaimed results.
 pub(crate) struct Worker<I, O, L> {
     mailbox: BudgetShared<Mailbox<I, O, L>>,
     thread: Option<JoinHandle<()>>,

@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fonts::Measure;
+use crate::pictures::{FitCopy, Inline, Set};
 use crate::sheets::Omitted;
 use crate::tree::{Tree, NONE};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetVec};
@@ -16,6 +17,7 @@ use td_html::document::NodeId;
 use td_layout::block::{layout_with_budget, BoxGeometry, IntrinsicSize, Layout, Request};
 use td_layout::inline::{FontMetrics, Line, UNIT};
 use td_layout::{BoxKind, BoxNode, Error, Limits, StyleId, StyledDocument, TableRole};
+use td_ui::picture::Fitted;
 use td_ui::raster::TextFamily;
 
 /// Lines, boxes and markers an index by height spans together.
@@ -38,6 +40,9 @@ pub struct Want {
     pub body: TextFamily,
     /// With the page's own sheets and `style` attributes; `F9` clears it.
     pub styles: bool,
+    /// The page's inline pictures come by its last settle, which it lays
+    /// at their size (DESIGN.md §10, "Subresources").
+    pub pictures: u32,
 }
 
 /// A tree styled: td-layout's styled document, its environment, and
@@ -305,13 +310,136 @@ pub struct Laid {
     /// Links that laid a fragment or replaced box, in tree order, each
     /// with the line its first lies on.
     links: BudgetVec<(NodeId, u32)>,
+    /// Each inline picture laid, fitted to its box, by node index.
+    fits: BudgetVec<Fit>,
+    /// The node indices of pictures whose copy was refused, for room or
+    /// for `FIT_WORK`, in order: each keeps its placeholder.
+    short: BudgetVec<usize>,
 }
 
-/// Each image's intrinsic size: its `alt` text's line in its own font,
-/// none without one (DESIGN.md §10, increment 6). Sorted by node index.
+/// An inline picture fitted to the box a layout lays it in: its node's
+/// index, its size in device pixels, and what is drawn there.
+pub struct Fit {
+    node: usize,
+    width: usize,
+    height: usize,
+    copy: Drawn,
+}
+
+/// What a picture's box draws: the picture itself at a whole multiple of
+/// its size, each pixel a square that many device pixels on a side; else
+/// a copy fitted to the box, shared with a later layout that lays it at
+/// the same size.
+enum Drawn {
+    Scaled(BudgetShared<Inline>, usize),
+    Copy(BudgetShared<FitCopy>),
+}
+
+/// A box's device pixels across, as a paint at `scale` places its edges:
+/// each edge rounded on its own.
+fn device(at: f64, size: f64, scale: f64) -> usize {
+    let from = (at * scale).round();
+    let to = ((at + size) * scale).round();
+    if to > from && to - from < usize::MAX as f64 {
+        (to - from) as usize
+    } else {
+        0
+    }
+}
+
+/// Each picture of `pictures` that `layout` lays fitted to its box, in
+/// device pixels at `scale`, its inline boxes and then its block-level
+/// ones: drawn scaled when the box is a whole multiple of its size, else
+/// a copy `reuse` made at that size shared, else one made and charged to
+/// the pictures term within `FIT_WORK` steps a layout; one refused, for
+/// room or work, left out and counted, its placeholder drawn. By node
+/// index.
+fn fit(
+    layout: &Layout,
+    pictures: &Set,
+    reuse: Option<&Laid>,
+    scale: f64,
+    cancel: &AtomicBool,
+    memory: &Budget,
+) -> Result<(BudgetVec<Fit>, BudgetVec<usize>), Error> {
+    let mut fits = BudgetVec::new(memory)?;
+    let mut short = BudgetVec::new(memory)?;
+    let mut work = pictures.work();
+    let inline = layout
+        .lines
+        .iter()
+        .flat_map(|line| line.replaced.iter())
+        .map(|r| (r.node, r.x, r.y, r.width, r.height));
+    let blocks = layout.boxes.iter().filter(|g| g.replaced).map(|g| {
+        (
+            g.node,
+            g.content.x,
+            g.content.y,
+            g.content.width,
+            g.content.height,
+        )
+    });
+    for (node, x, y, w, h) in inline.chain(blocks) {
+        let Some(picture) = pictures.get(node) else {
+            continue;
+        };
+        if cancel.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        let index = node.index();
+        if fits.iter().any(|fit: &Fit| fit.node == index) || short.contains(&index) {
+            continue;
+        }
+        let (width, height) = (device(x, w, scale), device(y, h, scale));
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let copy = match picture.factor(width, height) {
+            Some(factor) => Drawn::Scaled(picture.try_clone()?, factor),
+            None => {
+                let kept = reuse
+                    .and_then(|old| old.fit_of(node))
+                    .filter(|old| old.width == width && old.height == height)
+                    .and_then(|old| match &old.copy {
+                        Drawn::Copy(copy) => Some(copy.try_clone()),
+                        Drawn::Scaled(..) => None,
+                    })
+                    .transpose()?;
+                let made = match kept {
+                    Some(copy) => Some(copy),
+                    None => picture
+                        .fit(width, height, pictures.term(), &mut work, cancel)
+                        .and_then(|copy| BudgetShared::new(pictures.term(), copy).ok()),
+                };
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(Error::Cancelled);
+                }
+                let Some(copy) = made else {
+                    short.try_push(index)?;
+                    continue;
+                };
+                Drawn::Copy(copy)
+            }
+        };
+        fits.try_push(Fit {
+            node: index,
+            width,
+            height,
+            copy,
+        })?;
+    }
+    fits.sort_unstable_by_key(|fit| fit.node);
+    short.sort_unstable();
+    Ok((fits, short))
+}
+
+/// Each image's intrinsic size: its picture's, in CSS px a pixel, once it
+/// has come; else its `alt` text's line in its own font, none without
+/// one (DESIGN.md §10, "Subresources"). Sorted by node index.
 fn alt_sizes(
     styled: &Styled,
     measure: &mut Measure,
+    pictures: Option<&Set>,
     memory: &Budget,
 ) -> Result<BudgetVec<(usize, IntrinsicSize)>, BudgetError> {
     let mut out = BudgetVec::new(memory)?;
@@ -322,6 +450,13 @@ fn alt_sizes(
         let Some(style) = styled.style(b.style) else {
             continue;
         };
+        if let Some(inline) = pictures.and_then(|set| set.get(b.node)) {
+            let (width, height) = inline.natural();
+            let width = u32::try_from(width).unwrap_or(u32::MAX);
+            let height = u32::try_from(height).unwrap_or(u32::MAX);
+            out.try_push((b.node.index(), IntrinsicSize::picture_px(width, height)))?;
+            continue;
+        }
         let alt = styled.tree().alt(b.node).unwrap_or("");
         let size = if alt.is_empty() {
             IntrinsicSize {
@@ -451,7 +586,10 @@ fn ancestry(
 
 impl Laid {
     /// `styled` laid out for `want` with `measure`, its output charged to
-    /// `memory` beside `retained` bytes of output kept.
+    /// `memory` beside `retained` bytes of output kept; `pictures` laid at
+    /// their size and fitted to their boxes, the copies `reuse` made at
+    /// the same size shared.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         styled: BudgetShared<Styled>,
         measure: &mut Measure,
@@ -459,9 +597,11 @@ impl Laid {
         retained: usize,
         cancel: &AtomicBool,
         memory: &Budget,
+        pictures: Option<&Set>,
+        reuse: Option<&Laid>,
     ) -> Result<Self, Error> {
         measure.forget();
-        let sizes = alt_sizes(&styled, measure, memory)?;
+        let sizes = alt_sizes(&styled, measure, pictures, memory)?;
         let intrinsic = |node: NodeId, _: StyleId| {
             sizes
                 .binary_search_by_key(&node.index(), |(at, _)| *at)
@@ -478,6 +618,10 @@ impl Laid {
         let layout = layout_with_budget(styled.styled(), measure, &request, memory)?;
         drop(sizes);
         let scale = f64::from(want.scale.max(1));
+        let (fits, short) = match pictures {
+            Some(pictures) => fit(&layout, pictures, reuse, scale, cancel, memory)?,
+            None => (BudgetVec::new(memory)?, BudgetVec::new(memory)?),
+        };
         let line_spans = chunks(&layout.lines, memory, |line: &Line| {
             // The line's box, where its fills fall, and its glyphs' ink.
             let (mut top, mut bottom) = (line.y, line.y + line.height);
@@ -583,6 +727,64 @@ impl Laid {
             parents,
             node_geometry,
             links,
+            fits,
+            short,
+        })
+    }
+
+    /// The fitted copy of `node`'s picture, if it was laid with one.
+    fn fit_of(&self, node: NodeId) -> Option<&Fit> {
+        let at = self
+            .fits
+            .binary_search_by_key(&node.index(), |fit| fit.node)
+            .ok()?;
+        self.fits.get(at)
+    }
+
+    /// How many pictures' copies were refused.
+    pub fn short(&self) -> usize {
+        self.short.len()
+    }
+
+    /// Whether `node`'s picture was settled but its copy refused: its
+    /// placeholder is drawn.
+    pub fn refused(&self, node: NodeId) -> bool {
+        self.short.binary_search(&node.index()).is_ok()
+    }
+
+    /// How many pictures it draws from copies of their own.
+    pub fn copies(&self) -> usize {
+        self.fits
+            .iter()
+            .filter(|fit| matches!(fit.copy, Drawn::Copy(_)))
+            .count()
+    }
+
+    /// The id a paint names `node`'s picture by, if it was laid with one.
+    pub fn fitted(&self, node: NodeId) -> Option<u64> {
+        self.fits
+            .binary_search_by_key(&node.index(), |fit| fit.node)
+            .ok()
+            .map(|at| at as u64)
+    }
+
+    /// Whether the picture a paint names by `id` is opaque throughout.
+    pub fn opaque(&self, id: u64) -> bool {
+        let fit = usize::try_from(id).ok().and_then(|at| self.fits.get(at));
+        match fit.map(|fit| &fit.copy) {
+            Some(Drawn::Scaled(inline, _)) => inline.opaque(),
+            Some(Drawn::Copy(copy)) => copy.opaque(),
+            None => false,
+        }
+    }
+
+    /// The picture a paint names by `id` and the whole multiple of its
+    /// size it is drawn at.
+    pub fn fitted_by(&self, id: u64) -> Option<(&Fitted, usize)> {
+        let fit = self.fits.get(usize::try_from(id).ok()?)?;
+        Some(match &fit.copy {
+            Drawn::Scaled(inline, factor) => (inline.picture(), *factor),
+            Drawn::Copy(copy) => (copy.fitted(), 1),
         })
     }
 
@@ -665,7 +867,9 @@ impl Laid {
                 (self.painted.capacity() + self.parents.capacity() + self.node_geometry.capacity())
                     * 4
                     + self.clips.capacity() * std::mem::size_of::<Clip>()
-                    + self.links.capacity() * std::mem::size_of::<(NodeId, u32)>(),
+                    + self.links.capacity() * std::mem::size_of::<(NodeId, u32)>()
+                    + self.fits.capacity() * std::mem::size_of::<Fit>()
+                    + self.short.capacity() * std::mem::size_of::<usize>(),
             )
     }
 }
@@ -704,6 +908,7 @@ pub(crate) mod tests {
         scale: 1,
         body: TextFamily::Sans,
         styles: true,
+        pictures: 0,
     };
 
     /// `markup` parsed, styled and laid for `want` on the cell.
@@ -731,8 +936,35 @@ pub(crate) mod tests {
             0,
             &AtomicBool::new(false),
             &page,
+            None,
+            None,
         )
         .unwrap()
+    }
+
+    /// Each picture `laid` lays fitted: its node's index and its size.
+    pub(crate) fn fits(laid: &Laid) -> Vec<(usize, usize, usize)> {
+        laid.fits
+            .iter()
+            .map(|fit| (fit.node, fit.width, fit.height))
+            .collect()
+    }
+
+    /// The fitted copy `laid` lays for the node of index `node`.
+    pub(crate) fn fit_copy(laid: &Laid, node: usize) -> &BudgetShared<FitCopy> {
+        match &laid.fits.iter().find(|fit| fit.node == node).unwrap().copy {
+            Drawn::Copy(copy) => copy,
+            Drawn::Scaled(..) => panic!("drawn scaled"),
+        }
+    }
+
+    /// The whole multiple of its size `laid` draws the picture of the
+    /// node of index `node` at, with no copy.
+    pub(crate) fn scaled(laid: &Laid, node: usize) -> Option<usize> {
+        match &laid.fits.iter().find(|fit| fit.node == node)?.copy {
+            Drawn::Scaled(_, factor) => Some(*factor),
+            Drawn::Copy(_) => None,
+        }
     }
 
     pub(crate) fn laid(markup: &str) -> Laid {
@@ -851,6 +1083,8 @@ pub(crate) mod tests {
             0,
             &cancel,
             &page,
+            None,
+            None,
         );
         assert!(matches!(laid, Err(Error::Cancelled)));
         assert!(!SET_BEFORE_WALK.with(Cell::get));

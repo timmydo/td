@@ -10940,8 +10940,10 @@ webpki-roots, plus td-inflate for content decoding. So:
    portal, each other or `web`'s `[web-fetch]` (td-web/DESIGN.md §3),
    which serves eight counted requests at once (`--workers 8`, item 3):
    td-web's four navigations and four subresource fetches, stopped ones
-   included, so a navigation never waits behind a page's sheets
-   (td-web/DESIGN.md §10, "Slots").
+   included, so a navigation never waits behind a page's sheets or
+   pictures; a page's pictures take at most two of the four subresource
+   fetches, sheets' included in the count, so the next page's sheets
+   keep two (td-web/DESIGN.md §10, "Slots").
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds the `td-fetch` directory into the jail's runtime
    directory when it is granted, read-only like the bus and as a
@@ -11007,8 +11009,11 @@ webpki-roots, plus td-inflate for content decoding. So:
    N in place of the five minutes, by the same whole-exchange deadline;
    a streamed request refuses the line, its bounds being the service's.
    The name lookup stays outside it, the recorded gap below. td-web asks
-   it of each subresource hop, what is left of its page's wait for its
-   sheets, so a sheet no one will apply holds no worker past it. An older
+   it of each subresource hop: for a sheet, what is left of its page's
+   wait for its sheets, so a sheet no one will apply holds no worker past
+   it; for an inline picture, what is left of its own 30 s
+   (`PICTURE_WAIT`) from when it was asked, so a picture whose origin
+   never answers holds its worker and slot at most that long. An older
    service refuses the unknown line.
 
    A counted, non-public request may carry `tls-ca N`, where N is 1 to

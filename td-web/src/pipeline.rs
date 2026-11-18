@@ -9,6 +9,7 @@ use crate::fonts::Measure;
 use crate::gather::Sheets;
 use crate::memory;
 use crate::page::{Laid, Styled, Want};
+use crate::pictures::Set;
 use crate::sheets::{self, Omitted};
 use crate::tree::{self, Source, Tree, TEXT_PREFIX};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString};
@@ -209,6 +210,7 @@ fn style(
     Ok(BudgetShared::new(page, styled)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lay(
     styled: BudgetShared<Styled>,
     measure: &mut Measure,
@@ -216,8 +218,12 @@ fn lay(
     retained: usize,
     cancel: &AtomicBool,
     page: &Budget,
+    pictures: Option<&Set>,
+    reuse: Option<&Laid>,
 ) -> Result<BudgetShared<Laid>, Refusal> {
-    let laid = Laid::new(styled, measure, want, retained, cancel, page)?;
+    let laid = Laid::new(
+        styled, measure, want, retained, cancel, page, pictures, reuse,
+    )?;
     stopped(cancel, Step::Layout)?;
     Ok(BudgetShared::new(page, laid)?)
 }
@@ -297,7 +303,7 @@ pub fn styled_page(
     };
     if want.styles {
         let own = style(&tree, sheets.as_deref(), true, want, input, 0, cancel, page)
-            .and_then(|styled| lay(styled, measure, want, 0, cancel, page));
+            .and_then(|styled| lay(styled, measure, want, 0, cancel, page, None, None));
         match own {
             Ok(laid) => {
                 notes.omitted = omitted(&laid, sheets.as_ref());
@@ -321,7 +327,7 @@ pub fn styled_page(
         }
     }
     drop(sheets);
-    user_agent(tree, markup, notes, want, measure, cancel, page)
+    user_agent(tree, markup, notes, want, measure, cancel, page, None)
 }
 
 /// The child a cascade's set is compiled in: the sheets term, less what
@@ -336,6 +342,7 @@ fn terms(page: &Budget, sheets: Option<&Sheets>) -> Result<Budget, td_alloc::Bud
 }
 
 /// Rung 2, then rung 3.
+#[allow(clippy::too_many_arguments)]
 pub fn user_agent(
     tree: BudgetShared<Tree>,
     markup: Option<BudgetShared<BudgetString>>,
@@ -344,10 +351,11 @@ pub fn user_agent(
     measure: &mut Measure,
     cancel: &AtomicBool,
     page: &Budget,
+    pictures: Option<&Set>,
 ) -> Result<Page, Refusal> {
     let input = markup.as_ref().map_or(0, |markup| markup.len());
     let laid = style(&tree, None, false, want, input, 0, cancel, page)
-        .and_then(|styled| lay(styled, measure, want, 0, cancel, page));
+        .and_then(|styled| lay(styled, measure, want, 0, cancel, page, pictures, None));
     match laid {
         Ok(laid) => Ok(Page {
             tree,
@@ -414,6 +422,11 @@ fn extracted(
     cancel: &AtomicBool,
     page: &Budget,
 ) -> Result<Page, Refusal> {
+    // Rung 3's text lays no picture.
+    let want = Want {
+        pictures: 0,
+        ..want
+    };
     let text = extract(&markup, MAX_TEXT.saturating_sub(TEXT_PREFIX.len()), page)?;
     stopped(cancel, Step::Extract)?;
     let mut made = text_page(&text, want, measure, cancel, page)?;
@@ -452,7 +465,7 @@ pub fn text_page(
     let (tree, shown) = fitted(tree, None, want, measure, cancel, page)?;
     let input = node_text(&tree).len() + TEXT_PREFIX.len();
     let styled = style(&tree, None, false, want, input, 0, cancel, page)?;
-    let laid = lay(styled, measure, want, 0, cancel, page)?;
+    let laid = lay(styled, measure, want, 0, cancel, page, None, None)?;
     Ok(Page {
         tree,
         markup: None,
@@ -538,7 +551,7 @@ pub fn own_page(
     let tree = BudgetShared::new(page, Tree::parse(&markup, Source::Own, page)?)?;
     let styled = style(&tree, None, false, want, markup.len(), 0, cancel, page)?;
     drop(markup);
-    let laid = lay(styled, measure, want, 0, cancel, page)?;
+    let laid = lay(styled, measure, want, 0, cancel, page, None, None)?;
     Ok(Page {
         tree,
         markup: None,
@@ -566,6 +579,9 @@ pub struct Again {
     pub old: Option<BudgetShared<Laid>>,
     pub keep: bool,
     pub want: Want,
+    /// The page's inline pictures come by its last settle, laid at their
+    /// size.
+    pub pictures: Option<Set>,
 }
 
 /// What `again` must redo for `want` over a layout made for `was`.
@@ -579,7 +595,7 @@ pub enum Redo {
 pub fn redo(was: Want, want: Want) -> Redo {
     if was.width != want.width || was.scale != want.scale || was.styles != want.styles {
         Redo::Cascade
-    } else if was.height != want.height || was.body != want.body {
+    } else if was.height != want.height || was.body != want.body || was.pictures != want.pictures {
         Redo::Layout
     } else {
         Redo::Nothing
@@ -637,6 +653,7 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
         old,
         keep,
         want,
+        pictures,
     } = again;
     let page = &budget;
     let (old, kept, retained) = match old {
@@ -670,7 +687,7 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
         };
         let reuse = old
             .as_ref()
-            .filter(|old| redo(old.want, want) == Redo::Layout && shown == notes.shown)
+            .filter(|old| redo(old.want, want) != Redo::Cascade && shown == notes.shown)
             .map(|old| old.styled_ref().try_clone())
             .transpose()?;
         let styled = match reuse {
@@ -690,7 +707,16 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
             }
         };
         let own = styled.own;
-        let laid = lay(styled, measure, want, retained, cancel, page)?;
+        let laid = lay(
+            styled,
+            measure,
+            want,
+            retained,
+            cancel,
+            page,
+            pictures.as_ref(),
+            old.as_deref(),
+        )?;
         Ok::<_, Refusal>((tree, laid, shown, own))
     })();
     drop(old);
@@ -725,7 +751,16 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
                         notes.styles = Some(name);
                     }
                     drop(sheets);
-                    user_agent(tree, markup, notes, want, measure, cancel, page)
+                    user_agent(
+                        tree,
+                        markup,
+                        notes,
+                        want,
+                        measure,
+                        cancel,
+                        page,
+                        pictures.as_ref(),
+                    )
                 }
                 (Rung::UserAgent, Some(markup)) => {
                     drop(sheets);
@@ -1017,6 +1052,7 @@ pub(crate) mod tests {
                 old: Some(old.try_clone().unwrap()),
                 keep: true,
                 want: taller,
+                pictures: None,
             },
             &mut measure(taller),
             &cancel,
@@ -1297,7 +1333,16 @@ pub(crate) mod tests {
         let cancel = AtomicBool::new(false);
         let styled = style(&tree, None, true, WANT, 4, 0, &cancel, &page).unwrap();
         cancel.store(true, Ordering::SeqCst);
-        let laid = lay(styled, &mut measure(WANT), WANT, 0, &cancel, &page);
+        let laid = lay(
+            styled,
+            &mut measure(WANT),
+            WANT,
+            0,
+            &cancel,
+            &page,
+            None,
+            None,
+        );
         assert_eq!(laid.err(), Some(Refusal::Cancelled));
         assert_eq!(page.used(), used);
     }
@@ -1322,6 +1367,7 @@ pub(crate) mod tests {
             old,
             keep,
             want,
+            pictures: None,
         }
     }
 
@@ -1563,6 +1609,7 @@ pub(crate) mod tests {
                     old: Some(old),
                     keep: true,
                     want: wider,
+                    pictures: None,
                 },
                 &mut measure(wider),
                 &cancel,
@@ -1723,5 +1770,42 @@ pub(crate) mod tests {
                 (high + sheets.bytes()) as f64 / 1048576.0,
             );
         }
+    }
+
+    /// A relayout stepped down to the user-agent sheets lays the
+    /// pictures it was given, and says so; rung 3's text says it lays
+    /// none.
+    #[test]
+    fn a_relayout_stepped_down_lays_its_pictures() {
+        let root = Budget::new(512 << 20).unwrap();
+        let text = format!("{}<img src=/a.png width=9 height=6>", ladder());
+        let made = made(&text, WANT, &root).unwrap();
+        assert_eq!(made.rung, Rung::Own);
+        let node = made.tree.pictures()[0];
+        let body = td_png::encode_rgb8(3, 2, &[1, 2, 3].repeat(6)).unwrap();
+        let term = Budget::new(16 << 20).unwrap();
+        let want = Want {
+            pictures: 1,
+            ..WIDER
+        };
+        let relaid_within = |limit: usize| {
+            let child = root.child(limit).unwrap();
+            relaid(Again {
+                pictures: Some(crate::pictures::tests::set_of(node, &body, &term)),
+                ..again_of(&made, Rung::Own, None, false, want, &child)
+            })
+        };
+        let lo = 2 * Budget::metadata_bytes();
+        let limit = least(lo, 64 << 20, |limit| rank(&relaid_within(limit)) >= 2);
+        let down = relaid_within(limit).unwrap();
+        assert_eq!(down.rung, Rung::UserAgent);
+        let laid = down.laid.as_ref().unwrap();
+        assert_eq!(laid.want.pictures, 1);
+        assert!(laid.fitted(node).is_some());
+        drop(down);
+        let limit = least(lo, limit, |limit| rank(&relaid_within(limit)) >= 1);
+        let text = relaid_within(limit).unwrap();
+        assert_eq!(text.rung, Rung::Text);
+        assert_eq!(text.laid.as_ref().unwrap().want.pictures, 0);
     }
 }

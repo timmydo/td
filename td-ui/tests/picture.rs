@@ -167,3 +167,76 @@ fn the_raster_blends_a_fitted_picture_over_its_buffer_inside_the_clip() {
         .count();
     assert_eq!(lit, 8);
 }
+
+/// A picture drawn at a whole multiple of its size is what its exact fit
+/// at that size draws, pixel for pixel, clipped the same, the rectangle
+/// past it drawing nothing more.
+#[test]
+fn a_picture_drawn_scaled_is_its_exact_fit_drawn() {
+    let font = td_ui::font::pinned().unwrap();
+    let surface = Surface::new(16, 16, Scale::new(1).unwrap()).unwrap();
+    let rgba = [
+        255, 0, 0, 255, 0, 0, 255, 255, 9, 9, 9, 9, //
+        10, 200, 30, 100, 255, 255, 255, 128, 0, 0, 0, 0,
+    ];
+    let own = Picture::new(3, 2, rgba.to_vec()).unwrap().into_fitted();
+    let rect = Rect {
+        x: 1,
+        y: 2,
+        width: 12,
+        height: 12,
+    };
+    let clip = Rect {
+        x: 2,
+        y: 0,
+        width: 8,
+        height: 7,
+    };
+    for factor in 1..=3 {
+        let ground = || {
+            let mut buffer = vec![0u8; 16 * 16 * 4];
+            for pixel in buffer.as_chunks_mut::<4>().0 {
+                pixel.copy_from_slice(&[100, 50, 25, 255]);
+            }
+            buffer
+        };
+        let (mut scaled, mut fitted) = (ground(), ground());
+        Raster::new(&mut scaled, &font, surface, 16 * 4)
+            .unwrap()
+            .image_scaled(clip, rect, &own, factor);
+        let fit = own.fit_exact(3 * factor, 2 * factor).unwrap();
+        Raster::new(&mut fitted, &font, surface, 16 * 4)
+            .unwrap()
+            .image(clip, rect, &fit);
+        assert_eq!(scaled, fitted, "at {factor}");
+        assert_ne!(scaled, ground(), "at {factor}");
+    }
+}
+
+/// An exact fit costs each axis in turn, the cheaper order first: a tall
+/// line of pixels laid as a wide one costs the two lines, not their
+/// product; an empty or unsized fit is none, and one stopped is none.
+#[test]
+fn an_exact_fit_costs_its_axes_in_turn() {
+    let tall = Picture::new(1, 8192, [10, 20, 30, 255].repeat(8192))
+        .unwrap()
+        .into_fitted();
+    let cost = tall.fit_exact_cost(8192, 1).unwrap();
+    assert!(cost.steps <= 4 * 8192, "{cost:?}");
+    assert_eq!(cost.scratch, 4);
+    let wide = tall.fit_exact(8192, 1).unwrap();
+    assert!(wide
+        .bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|p| *p == [30, 20, 10, 255]));
+    assert!(tall.fit_exact_cost(0, 1).is_none());
+    let empty = Fitted {
+        width: 0,
+        height: 0,
+        bgra: Vec::new(),
+    };
+    assert!(empty.fit_exact(2, 2).is_none());
+    assert!(tall.fit_exact_until(8192, 1, &|| true).is_none());
+}

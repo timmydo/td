@@ -999,6 +999,16 @@ fn data_url(href: &str, memory: &Budget) -> Option<Result<Option<Data>, BudgetEr
     Some(decoded.map(|bytes| bytes.map(|bytes| Data { css, label, bytes })))
 }
 
+/// `href`'s payload as a `data:` URL, whatever its type: `None` when it
+/// is no `data:` URL; within, none when it does not decode, an error when
+/// it cannot be held. A `data:` picture's (DESIGN.md §10, "Requests").
+pub(crate) fn data(
+    href: &str,
+    memory: &Budget,
+) -> Option<Result<Option<BudgetVec<u8>>, BudgetError>> {
+    data_url(href, memory).map(|data| data.map(|data| data.map(|data| data.bytes)))
+}
+
 fn hex(byte: u8) -> Option<u8> {
     char::from(byte)
         .to_digit(16)
