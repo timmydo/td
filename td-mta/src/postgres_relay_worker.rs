@@ -62,6 +62,54 @@ fn meter(until: Deadline) -> Meter {
 }
 /// Between empty retention passes for one account.
 const RETENTION_PAUSE: Duration = Duration::from_secs(600);
+/// A second retention step left less than this of the turn's deadline is
+/// skipped rather than run to a certain timeout.
+const RETENTION_STEP_MINIMUM: Duration = Duration::from_secs(1);
+/// The two capacity-freeing steps of a retention turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetentionStep {
+    Retire,
+    Uploads,
+}
+impl RetentionStep {
+    fn other(self) -> Self {
+        match self {
+            Self::Retire => Self::Uploads,
+            Self::Uploads => Self::Retire,
+        }
+    }
+}
+/// What a retention turn did: the leading step's committed count (None when
+/// it failed), then the second step's, None when it was skipped for want of
+/// time. The whole is None when no connection slot let either run.
+type RetentionTurn = Option<(Option<u64>, Option<Option<u64>>)>;
+/// The order alternates every turn, so a step that keeps exhausting the
+/// shared deadline cannot starve the other for more than one turn. A skipped
+/// second step leads a make-up turn on the next round, but a make-up is never
+/// followed by another, so failing steps still wait `RETENTION_PAUSE`. A turn
+/// in which nothing ran keeps the order and any make-up for the next one.
+/// Returns the next turn's first step, whether it is a make-up, and its wait.
+fn next_retention(
+    first: RetentionStep,
+    makeup: bool,
+    turn: RetentionTurn,
+) -> (RetentionStep, bool, Duration) {
+    let Some((led, followed)) = turn else {
+        return (first, makeup, RETENTION_PAUSE);
+    };
+    let next = first.other();
+    // Skipped, not failed: a fast failure of the second step earns no make-up.
+    if followed.is_none() && !makeup {
+        return (next, true, Duration::ZERO);
+    }
+    let progress = led.is_some_and(|n| n > 0) || followed.flatten().is_some_and(|n| n > 0);
+    let wait = if progress {
+        Duration::ZERO
+    } else {
+        RETENTION_PAUSE
+    };
+    (next, false, wait)
+}
 /// The observation's database UTC when retention is due and the queue clock
 /// is stable; decided once, so the idle reader closes exactly when it runs.
 fn retention_due(
@@ -400,7 +448,8 @@ impl Worker<'_, '_> {
     /// expired upload leases (section 35), as separate transactions sharing
     /// one deadline, when `retention_due` returned the stable observation.
     /// Either failure is logged and retried later, as both only free
-    /// capacity; the caller has closed its idle reader.
+    /// capacity; `next_retention` keeps either from starving the other. The
+    /// caller has closed its idle reader.
     fn retain(
         &self,
         worker: &Dispatches<'_, '_>,
@@ -414,35 +463,37 @@ impl Worker<'_, '_> {
             return Ok(());
         };
         // One budget for both steps keeps the turn within a single deadline
-        // of the owner lease; a fast failure of either still leaves the
-        // other its run.
+        // of the owner lease.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let (retired, reclaimed) = match worker.connection.slots.acquire() {
-            Ok(_slot) => {
-                use crate::postgres_submission_retention as retention;
-                let retired = retention::retire(
-                    self.request,
-                    self.trust,
-                    deadline,
-                    claim,
-                    generation,
-                    observed_at,
-                )
-                .ok();
-                let reclaimed = retention::reclaim_uploads(
-                    self.request,
-                    self.trust,
-                    deadline,
-                    claim,
-                    generation,
-                    observed_at,
-                )
-                .ok();
-                (retired, reclaimed)
-            }
-            Err(_) => (None, None),
+        let first = state.retention_first;
+        let step = |step| {
+            use crate::postgres_submission_retention as retention;
+            let run = match step {
+                RetentionStep::Retire => retention::retire,
+                RetentionStep::Uploads => retention::reclaim_uploads,
+            };
+            run(
+                self.request,
+                self.trust,
+                deadline,
+                claim,
+                generation,
+                observed_at,
+            )
+            .ok()
         };
-        if retired.is_none() || reclaimed.is_none() {
+        let turn: RetentionTurn = match worker.connection.slots.acquire() {
+            Ok(_slot) => {
+                let led = step(first);
+                let left = deadline.saturating_duration_since(Instant::now());
+                Some((
+                    led,
+                    (left >= RETENTION_STEP_MINIMUM).then(|| step(first.other())),
+                ))
+            }
+            Err(_) => None,
+        };
+        if !matches!(turn, Some((Some(_), Some(Some(_))))) {
             control.log(
                 crate::observability::Kind::RelayStepFailed {
                     stage: crate::observability::RelayStep::Retention,
@@ -461,12 +512,9 @@ impl Worker<'_, '_> {
         }
         // Committed progress may leave more for the next turn; otherwise,
         // including after a failure, wait.
-        let progress = retired.is_some_and(|n| n > 0) || reclaimed.is_some_and(|n| n > 0);
-        let wait = if progress {
-            Duration::ZERO
-        } else {
-            RETENTION_PAUSE
-        };
+        let (next, makeup, wait) = next_retention(first, state.retention_makeup, turn);
+        state.retention_first = next;
+        state.retention_makeup = makeup;
         state.retention_at = Instant::now() + wait;
         Ok(())
     }
@@ -829,6 +877,57 @@ fn health(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn retention_steps_alternate_and_a_skipped_step_leads_the_next_round() {
+        use RetentionStep::{Retire, Uploads};
+        // Retirement used the whole deadline and upload reclamation was
+        // skipped: reclamation leads the next round.
+        assert_eq!(
+            next_retention(Retire, false, Some((None, None))),
+            (Uploads, true, Duration::ZERO)
+        );
+        // If that make-up turn skips retirement in turn, it waits.
+        assert_eq!(
+            next_retention(Uploads, true, Some((None, None))),
+            (Retire, false, RETENTION_PAUSE)
+        );
+        // A second step that ran and failed fast is not skipped: no make-up.
+        assert_eq!(
+            next_retention(Retire, false, Some((Some(0), Some(None)))),
+            (Uploads, false, RETENTION_PAUSE)
+        );
+        // Ordinary turns alternate, waiting only without progress, whichever
+        // step made it.
+        assert_eq!(
+            next_retention(Uploads, false, Some((Some(0), Some(Some(3))))),
+            (Retire, false, Duration::ZERO)
+        );
+        assert_eq!(
+            next_retention(Retire, true, Some((Some(2), None))),
+            (Uploads, false, Duration::ZERO)
+        );
+        // No slot let either step run: the order and pending make-up hold.
+        assert_eq!(
+            next_retention(Uploads, true, None),
+            (Uploads, true, RETENTION_PAUSE)
+        );
+        // No spin: a zero wait without progress is only ever a make-up, and
+        // never follows one.
+        let counts = [None, Some(0), Some(1)];
+        for first in [Retire, Uploads] {
+            for makeup in [false, true] {
+                for led in counts {
+                    for followed in [None, Some(None), Some(Some(0)), Some(Some(1))] {
+                        let (_, again, wait) = next_retention(first, makeup, Some((led, followed)));
+                        let progress = led == Some(1) || followed == Some(Some(1));
+                        if wait.is_zero() && !progress {
+                            assert!(again && !makeup, "{first:?} {makeup} {led:?} {followed:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn health_republishes_after_proven_absence() {
         use crate::postgres_route_health::{Error as E, Outcome, State};

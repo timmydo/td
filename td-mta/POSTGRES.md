@@ -1705,9 +1705,10 @@ answers its own replay inside its minute. Relay retention (section 216) also
 runs the same batch, in a transaction of its own, on each retention turn, so an
 account a relay route serves recovers expired leases, and the body bytes and
 blob count they hold, without another upload: typically within ten minutes of
-expiry while the relay runs with a stable queue clock, and a backlog drains a
-batch per round. An account no relay worker serves keeps them until its next
-upload.
+expiry while the relay runs with a stable queue clock, and within about
+twenty minutes even while submission retirement keeps failing (section
+216), and a backlog drains a batch per round. An account no relay worker
+serves keeps them until its next upload.
 Their bytes never exceed the upload quota, though zero-length uploads can hold
 blob count.
 The candidate scan reads the account's leases (no expiry index), which the
@@ -7196,17 +7197,22 @@ more detectable here than for dispatch.
 
 The relay calls both on idle and active account turns, sharing one
 10-second deadline so the turn stays well inside the 30-second owner
-lease (a slow retirement leaves reclamation no time; a fast failure of
-either leaves the other its run): again on the next round after either
-made progress, otherwise ten minutes later. A failure of either records
+lease: again on the next round after either made progress, otherwise ten
+minutes later. Their order alternates every turn, so neither leads twice
+running, and a second step left under a second of the deadline is not
+run but leads a make-up turn on the account's next round instead of ten
+minutes later. A make-up turn is never followed by another, so a step
+that keeps timing out delays the other by at most one turn and steps
+that both keep failing still wait ten minutes. A turn in which no
+connection slot let either run keeps the order and any make-up. A
+skipped step counts as failed below. A failure of either records
 `relay_step_failed` at `retention` and renews the lease to serialize
 behind any interrupted transaction; only a failed renewal stops the
-relay, as everywhere. Retirement and
-lease reclamation are idempotent, so an uncertain COMMIT needs no Pending
-custody. A first pass over a long
-history drains it at 64 submissions per round. The candidate scan reads all
-of the account's submissions (no completed_at index), bounded by the
-`queue_submissions` quota, once per pass.
+relay, as everywhere. Retirement and lease reclamation are idempotent,
+so an uncertain COMMIT needs no Pending custody. A first pass over a
+long history drains it at 64 submissions per round. The candidate scan
+reads all of the account's submissions (no completed_at index), bounded
+by the `queue_submissions` quota, once per pass.
 
 Deleting attempt-family receipts is one of the bounded sweeps section 165
 admits. Relay operations on these kinds are settled before the worker does

@@ -8,6 +8,8 @@ pub(super) struct AccountState {
     pub empty: bool,
     pub notice_at: Instant,
     pub retention_at: Instant,
+    pub retention_first: RetentionStep,
+    pub retention_makeup: bool,
     pub repaired: bool,
 }
 // Only a complete empty pass increases the wait; no lease or custody lives here.
@@ -268,6 +270,8 @@ pub(super) fn run(
             empty: false,
             notice_at: Instant::now(),
             retention_at: Instant::now(),
+            retention_first: RetentionStep::Retire,
+            retention_makeup: false,
             repaired: false,
         });
     }
