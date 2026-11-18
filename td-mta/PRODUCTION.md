@@ -771,6 +771,10 @@ and sends that exact Git object to claw1 using the production SSH identity.
 It checks the deployed tree and refuses divergent history. When no newer
 revision qualifies it checks the running release and leaves mail online.
 The main-integration runner owns the verdicts (see DEVELOPMENT.md).
+To deploy the fetched main tip even when its integration verdict is missing
+or failed, run `./td-mta/deploy --skip-tests`. The deployment receipt records
+the override. Ancestry, production preflight, schema recovery, and service
+verification still run as applicable.
 A detached systemd job owns each activation through SSH disconnects.
 Its root-only receipt path is printed before activation. The development
 machine checks authenticated public JMAP before and after the job using

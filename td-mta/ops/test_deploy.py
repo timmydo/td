@@ -1,8 +1,63 @@
-"""Failure boundaries that must hold without access to a production host."""
+"""Release selection and failure boundaries without access to a production host."""
+from contextlib import redirect_stderr
+import io
+from pathlib import Path
+import runpy
+import subprocess
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
 import activate
+
+
+class Selection(unittest.TestCase):
+    def setUp(self):
+        launcher = runpy.run_path(str(Path(__file__).resolve().parents[1]/'deploy'))
+        self.select = launcher['select']
+        self.main = launcher['main']
+        self.live = '1'*40
+        self.tip = '2'*40
+
+    def test_skip_selects_main_after_checking_ancestry(self):
+        check = Mock()
+        with patch.dict(self.select.__globals__, run=check, Path=Mock(side_effect=AssertionError)):
+            self.assertEqual(self.select(self.tip, self.live, skip_tests=True), (self.tip, None))
+        check.assert_called_once_with(['git', 'merge-base', '--is-ancestor', self.live, self.tip])
+
+    def test_skip_rejects_divergent_history(self):
+        check = Mock(side_effect=subprocess.CalledProcessError(1, 'git merge-base'))
+        with patch.dict(self.select.__globals__, run=check), self.assertRaises(subprocess.CalledProcessError):
+            self.select(self.tip, self.live, skip_tests=True)
+
+    def test_cli_requires_full_override_spelling(self):
+        for abbreviated in ('--s', '--skip'):
+            with self.subTest(abbreviated=abbreviated), patch.object(sys, 'argv', ['deploy', abbreviated]):
+                with patch.dict(self.main.__globals__, output=Mock(side_effect=AssertionError)):
+                    with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+                        self.main()
+                self.assertEqual(stopped.exception.code, 2)
+
+    def test_cli_pins_advertised_main_for_both_modes(self):
+        class Selected(Exception):
+            pass
+
+        for args in ([], ['--skip-tests']):
+            with self.subTest(args=args):
+                read = Mock(side_effect=[self.tip+'\trefs/heads/main', '3'*40, '',
+                                         '/opt/td-mta/lib/td-mta/releases/git-'+self.live+'/td-mta'])
+                run = Mock()
+                select = Mock(side_effect=Selected)
+                with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as ancestry:
+                    with patch.object(sys, 'argv', ['deploy', *args]), self.assertRaises(Selected):
+                        with patch.dict(self.main.__globals__, output=read, run=run, select=select):
+                            self.main()
+                ancestry.assert_called_once_with(['git', 'merge-base', '--is-ancestor', '3'*40, self.tip],
+                                                 cwd=self.main.__globals__['ROOT'])
+                self.assertEqual(read.call_args_list[0].args[0],
+                                 ['git','ls-remote','--exit-code','--refs','origin','refs/heads/main'])
+                run.assert_any_call(['git', 'fetch', '--no-write-fetch-head', '--no-tags', 'origin', self.tip])
+                select.assert_called_once_with(self.tip, self.live, skip_tests=bool(args))
 
 
 class Admission(unittest.TestCase):

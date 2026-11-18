@@ -39,8 +39,11 @@ def revision(value):
     return value
 
 
-def select(tip, live):
+def select(tip, live, *, skip_tests):
     run(['git', 'merge-base', '--is-ancestor', live, tip])
+    if skip_tests:
+        print('Skipping the main-integration verdict check for fetched origin/main.', flush=True)
+        return tip, None
     state = Path(os.environ.get('TD_MAIN_INTEGRATION_DIR',
                  Path.home()/'.local/state/td/main-integration'))/'verdicts'
     revisions = output(['git', 'rev-list', '--first-parent', tip, '^'+live]).splitlines()
@@ -79,26 +82,34 @@ def public_jmap(account):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument('--skip-tests', action='store_true',
+                        help='select the fetched origin/main tip without requiring a passing '
+                             'main-integration verdict; production checks still run')
     parser.add_argument('--window-seconds', type=int, default=60)
     parser.add_argument('--jmap-account', default='xyz882015', help='production td-mail account on this machine')
     opts = parser.parse_args()
     if not 1 <= opts.window_seconds <= 3600:
         parser.error('window must be 1..3600 seconds')
-    run(['git', 'fetch', '--no-tags', 'origin', 'refs/heads/main'])
+    # FETCH_HEAD is shared with concurrent fetches in this checkout.
+    advertised = output(['git','ls-remote','--exit-code','--refs','origin','refs/heads/main']).split()
+    if len(advertised) != 2 or advertised[1] != 'refs/heads/main':
+        raise ValueError('unexpected main advertisement')
+    tip = revision(advertised[0])
+    run(['git', 'fetch', '--no-write-fetch-head', '--no-tags', 'origin', tip])
     controller = revision(output(['git','rev-parse','HEAD^{commit}']))
     run(['git','diff','--quiet',controller,'--','td-mta/deploy','td-mta/ops'])
     refs = output(['git','for-each-ref','--contains',controller,'--format=%(refname)',
                    'refs/remotes/origin/'])
-    if not refs:
+    if not refs and subprocess.run(['git', 'merge-base', '--is-ancestor', controller, tip],
+                                   cwd=ROOT).returncode != 0:
         raise ValueError('deployment tool revision has not been submitted to origin')
-    tip = revision(output(['git', 'rev-parse', 'FETCH_HEAD^{commit}']))
     live_path = output(ssh('readlink', '-f', '/opt/td-mta/bin/td-mta'))
     match = re.fullmatch('/opt/td-mta/lib/td-mta/releases/git-([0-9a-f]{40})/td-mta', live_path)
     if not match:
         raise ValueError('unrecognized production release')
     live = match[1]
-    selected, verdict = select(tip, live)
+    selected, verdict = select(tip, live, skip_tests=opts.skip_tests)
     tree = revision(output(['git', 'rev-parse', selected+'^{tree}']))
     print(f'claw1 current {live}, selected {selected}', flush=True)
     jmap_before = public_jmap(opts.jmap_account)
@@ -113,7 +124,8 @@ def main():
             blob=run(['git','show',controller+':td-mta/ops/'+src],stdout=subprocess.PIPE).stdout
             z.writestr(dest,blob)
         z.writestr('job.json', json.dumps(dict(previous=live, revision=selected,
-                   tree=tree, controller=controller, verdict=verdict, main=tip, budget=opts.window_seconds)))
+                   tree=tree, controller=controller, verdict=verdict, main=tip,
+                   skip_tests=opts.skip_tests, budget=opts.window_seconds)))
     job = output(ssh('sudo','-n','mktemp','-d',OPERATOR+'/deploy-XXXXXXXX'))
     if not re.fullmatch(OPERATOR+r'/deploy-[a-zA-Z0-9]{8}', job):
         raise ValueError('unexpected deployment directory')
