@@ -97,6 +97,20 @@ enum Access {
     Mail,
 }
 
+/// The application role on a serving primary. Replica-specific roles have
+/// separate contracts and are never selected by the production deployer.
+pub fn primary_grants() -> impl Iterator<Item = (&'static str, &'static str)> {
+    TABLES.iter().map(|(table, access)| {
+        let privileges = match access {
+            Access::Read | Access::Replica => "SELECT",
+            Access::Lease => "SELECT, INSERT, DELETE",
+            Access::Selection => "SELECT, UPDATE (singleton)",
+            Access::Mail => "SELECT, INSERT, UPDATE, DELETE",
+        };
+        (*table, privileges)
+    })
+}
+
 const PRIVILEGES: &str = "SELECT c.relname::text,
     c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity
         AND NOT c.relforcerowsecurity,

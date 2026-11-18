@@ -8553,3 +8553,16 @@ The td-mail client opts in only for text queries on an advertising account,
 rejects unsolicited partial inventory, and shows known matches with a persistent
 incomplete-results warning. Its filtered list responses do not replace the
 unfiltered folder cache. CLI results and warning logs expose the skipped count.
+
+
+## Planning a production deployment
+
+`postgres schema-plan --connection-file PATH` takes a shared migration
+lock and validates the ledger through its last installed migration. It
+reports the current and target versions, the store epoch, the ordered
+pending versions, the required schema USAGE, and target table and column
+grants for the existing dedicated primary runtime login. Role membership,
+ownership, maintenance state and effective privileges are qualified by
+`runtime-check` after migration. An empty pending list means the ledger is current. A
+corrupt, missing or newer ledger fails. Planning changes no SQL objects.
+Serving and runtime qualification continue to require the complete ledger.

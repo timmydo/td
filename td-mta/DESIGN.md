@@ -1601,7 +1601,7 @@ Current commands use stable JSON output and exit codes:
 | `status --json --runtime PATH` | Selected service lifecycle; `--require-ready` makes its exit code a readiness probe |
 | `stop --runtime PATH` | Request orderly shutdown through the private control socket |
 | `postgres device-create`, `postgres device-revoke`, `postgres device-list` | Database credential administration |
-| `postgres schema-init`, `postgres schema-inspect`, `postgres schema-upgrade` | Explicit database schema administration |
+| `postgres schema-init`, `postgres schema-inspect`, `postgres schema-plan`, `postgres schema-upgrade` | Explicit database schema administration |
 | `postgres account-init`, `postgres account-inspect` | Account initialization and inspection |
 
 The owner-side `postgres account-create`, `account-update`, `account-alias-add`

@@ -601,10 +601,10 @@ fn command_output_with_timeout(
         assert!(Instant::now() < stop, "probe command timed out");
         thread::sleep(Duration::from_millis(10));
     }
-    let output_limit = if arguments.get(1) == Some(&"config-snapshot") {
-        13 * 1024 * 1024
-    } else {
-        1024
+    let output_limit = match arguments.get(1) {
+        Some(&"config-snapshot") => 13 * 1024 * 1024,
+        Some(&"schema-plan") => 8 * 1024,
+        _ => 1024,
     };
     assert!(fs::metadata(&output_path).unwrap().len() < output_limit);
     let text = fs::read_to_string(output_path).unwrap();
@@ -689,6 +689,10 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
+    let plan = invoke("schema-plan", 0);
+    assert!(plan.contains("\"current\":43,\"target\":43"));
+    assert!(plan.contains("\"pending\":[]"));
+    assert!(plan.contains("\"leases\":\"SELECT, INSERT, DELETE\""));
     let inspected = invoke("schema-inspect", 0);
     assert_eq!(
         initialized.replace("postgres-schema-init", "postgres-schema-inspect"),
@@ -706,6 +710,10 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
         &fixture,
         "UPDATE td_mta.schema_migrations SET version = 99 WHERE version = 2",
     );
+    assert!(invoke("schema-plan", 1).contains("unsupported-version-or-checksum"));
+    assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version=2 WHERE version=99; DELETE FROM td_mta.schema_migrations WHERE version=43");
+    assert!(invoke("schema-plan", 0).contains("\"pending\":[43]"));
     assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(invoke("schema-init", 1).contains("input-private-mode"));
@@ -717,6 +725,7 @@ fn schema_commands_refuse_profiles_and_secret_arguments_without_echoing_them() {
     for operation in [
         "schema-init",
         "schema-inspect",
+        "schema-plan",
         "schema-upgrade",
         "runtime-check",
     ] {

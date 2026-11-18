@@ -38,6 +38,7 @@ mod usage;
 enum Operation {
     Probe,
     Initialize,
+    Plan,
     Upgrade,
     Inspect,
     RuntimeCheck,
@@ -46,6 +47,7 @@ impl Operation {
     fn parse(value: &OsStr) -> Option<Self> {
         match value.to_str()? {
             "probe" => Some(Self::Probe),
+            "schema-plan" => Some(Self::Plan),
             "schema-init" => Some(Self::Initialize),
             "schema-upgrade" => Some(Self::Upgrade),
             "schema-inspect" => Some(Self::Inspect),
@@ -56,6 +58,7 @@ impl Operation {
     fn name(self) -> &'static str {
         match self {
             Self::Probe => "postgres-probe",
+            Self::Plan => "postgres-schema-plan",
             Self::Initialize => "postgres-schema-init",
             Self::Upgrade => "postgres-schema-upgrade",
             Self::Inspect => "postgres-schema-inspect",
@@ -215,6 +218,27 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
+        Ok(Outcome::Plan(receipt)) => {
+            let mut out = io::stdout().lock();
+            write!(out, "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"current\":{},\"target\":{},\"store_epoch\":\"{}\",\"pending\":[", receipt.version, postgres_schema::VERSION, receipt.store_epoch)?;
+            for (index, version) in (receipt.version + 1..=postgres_schema::VERSION).enumerate() {
+                if index > 0 {
+                    write!(out, ",")?;
+                }
+                write!(out, "{version}")?;
+            }
+            write!(out, "],\"schema_usage\":\"td_mta\",\"primary_grants\":{{")?;
+            for (index, (table, grants)) in
+                td_mta::postgres_runtime_access::primary_grants().enumerate()
+            {
+                if index > 0 {
+                    write!(out, ",")?;
+                }
+                write!(out, "\"{table}\":\"{grants}\"")?;
+            }
+            writeln!(out, "}}}}")?;
+            Ok(ExitCode::SUCCESS)
+        }
         Ok(Outcome::Runtime(receipt)) => {
             writeln!(
                 io::stdout().lock(),
@@ -241,6 +265,7 @@ fn report_error(command: &str, stage: &str, code: &str) -> io::Result<()> {
 enum Outcome {
     Probe(postgres_probe::Status),
     Schema(postgres_schema::Receipt),
+    Plan(postgres_schema::Receipt),
     Runtime(postgres_schema::Receipt),
 }
 
@@ -279,6 +304,9 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
             }
             Operation::Upgrade => {
                 postgres_schema::upgrade(request, &loaded.trust, deadline).map(Outcome::Schema)
+            }
+            Operation::Plan => {
+                postgres_schema::plan(request, &loaded.trust, deadline).map(Outcome::Plan)
             }
             Operation::Inspect => {
                 postgres_schema::inspect(request, &loaded.trust, deadline).map(Outcome::Schema)
@@ -406,6 +434,7 @@ mod tests {
         for operation in [
             "schema-init",
             "schema-inspect",
+            "schema-plan",
             "schema-upgrade",
             "runtime-check",
         ] {

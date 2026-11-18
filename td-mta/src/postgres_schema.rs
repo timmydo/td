@@ -58,7 +58,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_retry_floor.sql"),
     "DROP TABLE td_mta.receiving_receipts;",
 ];
-const VERSION: u32 = 43;
+pub const VERSION: u32 = 43;
 #[path = "postgres_schema_acl.rs"]
 mod acl;
 // Shared by every future serving connection and explicit schema operation.
@@ -220,8 +220,28 @@ pub fn inspect(
     result
 }
 
+/// Accept a recognized ledger prefix to plan an explicit owner migration.
+pub fn plan(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+) -> Result<Receipt, Error> {
+    let result = postgres_probe::with_client(request, trust, deadline, |client| {
+        Box::pin(inspect_prefix(client, false))
+    })
+    .map_err(Error::Connection)?;
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
+    result
+}
+
 /// The caller must retain this same session through all application SQL.
 pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    inspect_prefix(client, true).await
+}
+
+async fn inspect_prefix(client: &Client, require_current: bool) -> Result<Receipt, Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
     version(client).await?;
     let locked: bool = client
@@ -236,7 +256,7 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
     if !locked {
         return Err(Error::Busy);
     }
-    let result = ledger(client, true).await;
+    let result = ledger(client, require_current).await;
     if result.is_ok() {
         timing.succeeded();
     }
