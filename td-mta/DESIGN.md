@@ -1622,12 +1622,15 @@ None of these commands starts or restarts a service or provisions a device
 password. POSTGRES.md owns their retention and partial-completion contract.
 
 POSTGRES.md specifies arguments and the remaining database commands. The
-private Unix control socket carries status and stop only; database changes
-use authenticated PostgreSQL connections. Its directory permissions establish
+private Unix control socket carries status, stop, and the queue-clock, route,
+logging-status and performance-status requests; database changes use
+authenticated PostgreSQL connections. Its directory permissions establish
 local control authority. It stays bound across an internal reload, so
 `not-running` means no process holds it. A request in that gap stays queued for
 the next generation: `stop` waits 30 seconds for its reply and other requests 2,
-and may report `io` across a longer gap. A client that gives up has an unknown
+and may report `io` across a longer gap. Each deadline starts before the client
+dials, and connecting gets at most 2 seconds of it, so a full accept queue also
+ends in `io` rather than an unbounded wait. A client that gives up has an unknown
 outcome, since the next generation still serves what it sent. An operator's or
 a reload's stop before readiness is an orderly end that announces nothing; any
 other is a failed start. There is no public administration HTTP API.

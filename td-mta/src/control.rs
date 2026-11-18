@@ -264,15 +264,16 @@ pub(super) fn request(
     runtime: &str,
     stop: bool,
 ) -> Result<(&'static str, &'static str), ConfigFailure> {
-    let (_root, mut stream) = connect(runtime)?;
-    request_over(&mut stream, stop)
+    let start = Instant::now();
+    let (_root, mut stream) = connect(runtime, start)?;
+    request_over(&mut stream, start, stop)
 }
 
 fn request_over(
     stream: &mut UnixStream,
+    start: Instant,
     stop: bool,
 ) -> Result<(&'static str, &'static str), ConfigFailure> {
-    let start = Instant::now();
     send(stream, start, if stop { b"STOP\n" } else { b"STATUS\n" }).map_err(io_failure)?;
     stream
         .shutdown(std::net::Shutdown::Write)
@@ -297,8 +298,8 @@ fn request_over(
 }
 
 pub(super) fn clock_request(runtime: &str, command: &str) -> Result<&'static str, ConfigFailure> {
-    let (_root, mut stream) = connect(runtime)?;
     let start = Instant::now();
+    let (_root, mut stream) = connect(runtime, start)?;
     send(
         &mut stream,
         start,
@@ -326,7 +327,8 @@ pub(super) fn clock_request(runtime: &str, command: &str) -> Result<&'static str
     }
 }
 
-fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
+/// Dials the control socket within the exchange deadline from `start`.
+fn connect(runtime: &str, start: Instant) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
     check_runtime_path(runtime)?;
     let root =
         PrivateRoot::open(runtime).map_err(|_| config_failure("control", "root-policy-or-io"))?;
@@ -339,12 +341,17 @@ fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
     {
         return Err(config_failure("control", "socket-policy"));
     }
-    let stream = UnixStream::connect(&path).map_err(io_failure)?;
+    // A full accept queue, as while no generation accepts, blocks a plain
+    // connect without limit; td-fs bounds it on a helper it abandons.
+    let deadline = start
+        .checked_add(EXCHANGE)
+        .ok_or_else(|| io_failure(io::ErrorKind::InvalidInput.into()))?;
+    let stream = td_fs::unix_connect_until(&path, deadline).map_err(io_failure)?;
     Ok((root, stream))
 }
 pub(super) fn logging_request(runtime: &str) -> Result<String, ConfigFailure> {
-    let (_root, mut stream) = connect(runtime)?;
     let start = Instant::now();
+    let (_root, mut stream) = connect(runtime, start)?;
     send(&mut stream, start, b"LOG-STATUS\n").map_err(io_failure)?;
     stream
         .shutdown(std::net::Shutdown::Write)
@@ -359,8 +366,8 @@ pub(super) fn logging_request(runtime: &str) -> Result<String, ConfigFailure> {
 }
 
 pub(super) fn performance_request(runtime: &str) -> Result<String, ConfigFailure> {
-    let (_root, mut stream) = connect(runtime)?;
     let start = Instant::now();
+    let (_root, mut stream) = connect(runtime, start)?;
     send(&mut stream, start, b"PERFORMANCE-STATUS\n").map_err(io_failure)?;
     stream
         .shutdown(std::net::Shutdown::Write)
@@ -492,7 +499,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let control = Control::default();
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(move || request_over(&mut client, true).ok());
+            let waiting = scope.spawn(move || request_over(&mut client, Instant::now(), true).ok());
             // Longer than any other exchange waits, with nothing serving it.
             std::thread::sleep(EXCHANGE + Duration::from_millis(500));
             assert!(!waiting.is_finished());
