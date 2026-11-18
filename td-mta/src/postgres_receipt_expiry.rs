@@ -3,8 +3,7 @@
 use tokio_postgres::Client;
 
 /// Six publication deadlines. A receipt only settles its own uncertain
-/// operation, and that operation's owner fences every publication of its
-/// family in its process until it has settled.
+/// operation, and its publisher never replays an uncertain COMMIT.
 pub(crate) const RETENTION_MS: i64 = 60_000;
 const _: () = assert!(
     RETENTION_MS > 0 && RETENTION_MS as u128 >= 6 * crate::postgres_probe::MAX_DURATION.as_millis()

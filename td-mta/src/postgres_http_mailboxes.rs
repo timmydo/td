@@ -9,10 +9,10 @@ use crate::{
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_input::Loaded,
     postgres_mailbox_set::{self as changes, Change},
-    postgres_probe::{self, Endpoint},
+    postgres_probe,
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
-    postgres_settlement as settlement,
+    postgres_settlement::{self as settlement, Retained},
     store_fs::{
         MailboxCreateCompletion, MailboxCreateRequest, MailboxCreateResult,
         MailboxDeleteCompletion, MailboxDeleteRequest, MailboxDeleteResult, UploadError,
@@ -28,7 +28,7 @@ use std::{
 /// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<(Change, Endpoint)>>,
+    change: Mutex<Option<Retained<Change>>>,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<MailboxOperationId>, Error> {
@@ -37,7 +37,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(|(change, _)| change.operation()))
+            .map(|held| held.change.operation()))
     }
 }
 
@@ -50,7 +50,7 @@ pub struct Settled {
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
     /// A found receipt or proven absence releases the operation; any error
-    /// retains it and keeps writes fenced.
+    /// retains it for historical inspection.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -80,20 +80,20 @@ impl Pending {
 /// Inspect only at the retained endpoint. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
-    pending: &mut Option<(Change, Endpoint)>,
+    pending: &mut Option<Retained<Change>>,
     loaded: &Loaded,
     slots: &ReadSlots,
     deadline: Instant,
 ) -> Result<Option<Settled>, Error> {
-    let Some((change, endpoint)) = pending.as_ref() else {
+    let Some(held) = pending.as_ref() else {
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, *endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+    let connection = settlement::request(loaded, held.endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
         .map_err(map_error)?
         .map(|outcome| Settled {
-            operation: change.operation(),
+            operation: held.change.operation(),
             outcome,
         });
     *pending = None;
@@ -247,7 +247,7 @@ impl Mailboxes<'_> {
             return Err(Error::Deadline);
         }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
-        if pending.is_some() {
+        if Retained::inspect_before_write(&mut pending, self.binding.account(), Instant::now()) {
             // Settle within this request's capped deadline, with a foreground
             // slot it releases before taking its own.
             settlement::charge(meter, self.clock, 1)?;
@@ -320,7 +320,11 @@ impl Mailboxes<'_> {
         match outcome {
             Ok(outcome) => {
                 if outcome.results.len() != count {
-                    *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
+                    *pending = Some(Retained::new(
+                        change,
+                        endpoint.ok_or(Error::Invalid)?,
+                        self.binding.account(),
+                    ));
                     return Err(Error::Corrupt);
                 }
                 results.extend(outcome.results);
@@ -333,7 +337,11 @@ impl Mailboxes<'_> {
                 })
             }
             Err(changes::Error::Indeterminate) => {
-                *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
+                *pending = Some(Retained::new(
+                    change,
+                    endpoint.ok_or(Error::Invalid)?,
+                    self.binding.account(),
+                ));
                 Ok(Completion {
                     before_epoch: self.binding.epoch(),
                     before_sequence: Sequence::from_u64(0),

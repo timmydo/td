@@ -4518,8 +4518,8 @@ ceil(remaining/4096) records. This conservative charge covers verification,
 replay and framing even on fallback. Composition and source/body digests
 charge the same meter separately. Refusal discards provisional bytes; the
 existing pending owner retains only the prepared message/manifests after an
-unknown COMMIT, until settlement finds its receipt or proves its absence
-(POSTGRES.md section 165). Filename, media type and description limits are
+unknown COMMIT, within the account and time limits for subsequent writes
+(POSTGRES.md sections 79 and 165). Filename, media type and description limits are
 255, 127 and 1024 bytes per part; composition uses fixed encoder/header
 scratch. This is a finite memory/work bound, not maximum-size throughput
 qualification.

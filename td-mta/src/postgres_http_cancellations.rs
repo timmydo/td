@@ -6,11 +6,11 @@ use crate::{
     ids::{AccountId, DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
     ports::{self, Clock, Deadline},
     postgres_input::Loaded,
-    postgres_probe::{self, Endpoint},
+    postgres_probe,
     postgres_read::ReadSlots,
     postgres_route_owners::Claim,
     postgres_runtime_profile::Binding,
-    postgres_settlement as settlement,
+    postgres_settlement::{self as settlement, Retained},
     postgres_submission_cancel::{self as changes, Cancellation},
 };
 use std::{
@@ -31,11 +31,10 @@ impl From<ports::Error> for Error {
 }
 
 /// Retain across requests with the endpoint the operation was published to.
-/// Unknown COMMIT blocks another cancellation until historical settlement;
-/// no password or transport callback is retained.
+/// Only the uncertain operation is needed for historical inspection.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<(Cancellation, Endpoint)>>,
+    change: Mutex<Option<Retained<Cancellation>>>,
 }
 #[derive(Debug)]
 pub struct Settled {
@@ -49,7 +48,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(|(change, _)| change.operation()))
+            .map(|held| held.change.operation()))
     }
     /// Internal historical settlement using independent connection capacity.
     /// A found receipt or proven absence releases the operation; errors
@@ -78,20 +77,20 @@ impl Pending {
 /// rollback unless another process swept the expired receipt (POSTGRES.md
 /// section 165).
 fn settle_held(
-    pending: &mut Option<(Cancellation, Endpoint)>,
+    pending: &mut Option<Retained<Cancellation>>,
     loaded: &Loaded,
     slots: &ReadSlots,
     deadline: Instant,
 ) -> Result<Option<Settled>, Error> {
-    let Some((change, endpoint)) = pending.as_ref() else {
+    let Some(held) = pending.as_ref() else {
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-    let connection = settlement::request(loaded, *endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+    let connection = settlement::request(loaded, held.endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
         .map_err(Error::Publication)?
         .map(|outcome| Settled {
-            operation: change.operation(),
+            operation: held.change.operation(),
             outcome,
         });
     *pending = None;
@@ -163,7 +162,7 @@ impl Cancellations<'_> {
             .change
             .try_lock()
             .map_err(|_| ports::Error::Busy)?;
-        if pending.is_some() {
+        if Retained::inspect_before_write(&mut pending, self.binding.account(), Instant::now()) {
             // Settle within this request's capped limits, with a foreground
             // slot it releases before taking its own. A frontend request
             // reports a settlement failure; a route owner's is refused as busy.
@@ -218,7 +217,7 @@ impl Cancellations<'_> {
             }
         }
         if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
-            *pending = Some((change, endpoint));
+            *pending = Some(Retained::new(change, endpoint, self.binding.account()));
         }
         outcome.map_err(Error::Publication)
     }

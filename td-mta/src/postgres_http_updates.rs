@@ -9,10 +9,10 @@ use crate::{
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_email_set::{self as changes, deletion, filing, Change},
     postgres_input::Loaded,
-    postgres_probe::{self, Endpoint},
+    postgres_probe,
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
-    postgres_settlement as settlement,
+    postgres_settlement::{self as settlement, Retained},
     store_fs::{
         EmailDestroyCompletion, EmailDestroyRequest, EmailDestroyResult, EmailUpdate,
         EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult, UploadError,
@@ -139,14 +139,10 @@ struct Completion {
     admission_stopped: bool,
 }
 
-/// One active or uncertain mutation and the endpoint it was published to.
-/// Retain this owner across HTTP requests, exactly one per process: each
-/// family's receipt sweep relies on its owner fencing every publication of
-/// that family in the process (POSTGRES.md section 217).
-/// Production startup/recovery wiring remains part of the backend cutover.
+/// One bounded owner per write family, shared by accounts in the HTTP process.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<(Operation, Endpoint)>>,
+    change: Mutex<Option<Retained<Operation>>>,
     pub mailboxes: crate::postgres_http_mailboxes::Pending,
     pub drafts: crate::postgres_http_drafts::Pending,
     pub submissions: crate::postgres_http_submissions::Pending,
@@ -160,7 +156,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(|(change, _)| change.operation()))
+            .map(|held| held.change.operation()))
     }
 }
 
@@ -203,25 +199,25 @@ impl Pending {
 }
 /// Inspect only at the retained endpoint (section 165).
 fn settle_held(
-    pending: &mut Option<(Operation, Endpoint)>,
+    pending: &mut Option<Retained<Operation>>,
     loaded: &Loaded,
     slots: &ReadSlots,
     deadline: Instant,
 ) -> Result<Option<Settled>, Error> {
-    let Some((change, endpoint)) = pending.as_ref() else {
+    let Some(held) = pending.as_ref() else {
         return Ok(None);
     };
-    let endpoint = *endpoint;
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, endpoint);
-    let Some(outcome) = change
+    let connection = settlement::request(loaded, held.endpoint);
+    let Some(outcome) = held
+        .change
         .inspect(&connection, &loaded.trust, deadline)
         .map_err(map_error)?
     else {
         *pending = None;
         return Ok(None);
     };
-    let operation = change.operation();
+    let operation = held.change.operation();
     *pending = None;
     Ok(Some(Settled { operation, outcome }))
 }
@@ -403,7 +399,7 @@ impl Updates<'_> {
             return Err(Error::Deadline);
         }
         let mut pending = self.pending.change.try_lock().map_err(|_| Error::Busy)?;
-        if pending.is_some() {
+        if Retained::inspect_before_write(&mut pending, self.binding.account(), Instant::now()) {
             settlement::charge(meter, self.clock, 1)?;
             let inline = settlement::inline_deadline(deadline)?;
             if settle_held(&mut pending, self.loaded, self.slots, inline).is_err()
@@ -465,7 +461,11 @@ impl Updates<'_> {
                 })
             }
             Err(changes::Error::Indeterminate) => {
-                *pending = Some((change, endpoint.ok_or(Error::Invalid)?));
+                *pending = Some(Retained::new(
+                    change,
+                    endpoint.ok_or(Error::Invalid)?,
+                    self.binding.account(),
+                ));
                 Ok(Completion {
                     before_sequence: Sequence::from_u64(0),
                     outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),

@@ -2,6 +2,7 @@
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
+    ids::AccountId,
     ports::{Clock, Error},
     postgres_input::Loaded,
     postgres_probe::{Endpoint, Mode, Request},
@@ -11,6 +12,45 @@ use std::time::{Duration, Instant};
 /// An unreachable pinned endpoint must not hold a write's owner, foreground
 /// slot and worker for its whole deadline before the busy refusal.
 const INLINE: Duration = Duration::from_secs(3);
+
+/// Historical evidence can be inspected on a later request, but only during
+/// a bounded monotonic interval and only on behalf of its own account.
+const HTTP_INSPECTION_WINDOW: Duration =
+    Duration::from_millis(crate::postgres_receipt_expiry::RETENTION_MS as u64);
+
+pub(crate) struct Retained<T> {
+    pub(crate) change: T,
+    pub(crate) endpoint: Endpoint,
+    account: AccountId,
+    since: Instant,
+}
+
+impl<T> Retained<T> {
+    pub(crate) fn new(change: T, endpoint: Endpoint, account: AccountId) -> Self {
+        Self {
+            change,
+            endpoint,
+            account,
+            since: Instant::now(),
+        }
+    }
+
+    /// Discarding local inspection data neither determines the old outcome
+    /// nor authorizes replay. The new request must run its own transaction.
+    pub(crate) fn inspect_before_write(
+        slot: &mut Option<Self>,
+        account: AccountId,
+        now: Instant,
+    ) -> bool {
+        if slot.as_ref().is_some_and(|held| {
+            held.account != account
+                || now.saturating_duration_since(held.since) >= HTTP_INSPECTION_WINDOW
+        }) {
+            *slot = None;
+        }
+        slot.is_some()
+    }
+}
 
 /// Prepay `connections` settlement connections, each at the mutation frame
 /// ceiling that bounds receipt inspection,
@@ -51,4 +91,34 @@ pub(crate) fn request(loaded: &Loaded, endpoint: Endpoint) -> Request<'_> {
     let mut connection = loaded.bootstrap.request(endpoint);
     connection.mode = Mode::Runtime;
     connection
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_requests_can_release_unresolved_history() {
+        let account = AccountId::from_bytes([1; 16]);
+        let other = AccountId::from_bytes([2; 16]);
+        let endpoint = Endpoint::Tcp(([127, 0, 0, 1], 5432).into());
+        let new = || Retained::new((), endpoint, account);
+        let held = new();
+        let since = held.since;
+        let mut slot = Some(held);
+        assert!(Retained::inspect_before_write(&mut slot, account, since));
+        assert!(!Retained::inspect_before_write(&mut slot, other, since));
+        assert!(slot.is_none());
+
+        let held = new();
+        let end = held.since + HTTP_INSPECTION_WINDOW;
+        let mut slot = Some(held);
+        assert!(Retained::inspect_before_write(
+            &mut slot,
+            account,
+            end - Duration::from_millis(1)
+        ));
+        assert!(!Retained::inspect_before_write(&mut slot, account, end));
+        assert!(slot.is_none());
+    }
 }

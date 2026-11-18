@@ -6,10 +6,10 @@ use crate::{
     ids::{AccountId, DeviceId, UploadOperationId},
     ports::{self, Clock, Deadline},
     postgres_input::Loaded,
-    postgres_probe::{self, Endpoint},
+    postgres_probe,
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
-    postgres_settlement as settlement,
+    postgres_settlement::{self as settlement, Retained},
     postgres_uploads::{self as changes, Upload},
 };
 use std::{
@@ -34,7 +34,7 @@ impl From<ports::Error> for Error {
 /// startup/recovery wiring belongs to cutover.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<(Upload, Endpoint)>>,
+    change: Mutex<Option<Retained<Upload>>>,
     ingress: Mutex<()>,
 }
 
@@ -72,11 +72,11 @@ impl Pending {
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(|(change, _)| change.operation()))
+            .map(|held| held.change.operation()))
     }
     /// Historical inspection only, using independent settlement capacity.
     /// A found receipt or proven absence releases the operation; errors
-    /// leave it fenced and retained.
+    /// leave it available for further inspection.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -99,20 +99,20 @@ impl Pending {
 /// Inspect only at the retained endpoint. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
-    pending: &mut Option<(Upload, Endpoint)>,
+    pending: &mut Option<Retained<Upload>>,
     loaded: &Loaded,
     slots: &ReadSlots,
     deadline: Instant,
 ) -> Result<Option<Settled>, Error> {
-    let Some((change, endpoint)) = pending.as_ref() else {
+    let Some(held) = pending.as_ref() else {
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-    let connection = settlement::request(loaded, *endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+    let connection = settlement::request(loaded, held.endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
         .map_err(Error::Publication)?
         .map(|outcome| Settled {
-            operation: change.operation(),
+            operation: held.change.operation(),
             outcome,
         });
     *pending = None;
@@ -156,7 +156,8 @@ impl Uploads<'_> {
                 .change
                 .try_lock()
                 .map_err(|_| ports::Error::Busy)?;
-            if pending.is_some() {
+            if Retained::inspect_before_write(&mut pending, self.binding.account(), Instant::now())
+            {
                 settlement::charge(meter, self.clock, 1)?;
                 let deadline = settlement::inline_deadline(phase(self.clock, until)?)?;
                 if settle_held(&mut pending, self.loaded, self.slots, deadline).is_err() {
@@ -247,7 +248,7 @@ impl Uploads<'_> {
             }
         }
         if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
-            *pending = Some((change, endpoint));
+            *pending = Some(Retained::new(change, endpoint, self.binding.account()));
         }
         outcome.map_err(Error::Publication)
     }

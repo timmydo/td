@@ -191,9 +191,6 @@ pub(super) fn exercise(
     use td_mta::postgres_route_owners as owners;
     super::create_runtime_login(fixture);
     super::grant_runtime_mail(fixture);
-    let (held, grant) = super::multi_relay::leases(fixture, request, trust, &published);
-    let held_live = std::cell::Cell::new(true);
-    let relay = super::serving_relay::Relay::multi(fixture, relay_socket, relay_dns);
     let devices: Vec<_> = [a, b]
         .into_iter()
         .map(|account| {
@@ -205,6 +202,10 @@ pub(super) fn exercise(
             device
         })
         .collect();
+    uncertain_upload(fixture, &published, [(a, &devices[0]), (b, &devices[1])]);
+    let (held, grant) = super::multi_relay::leases(fixture, request, trust, &published);
+    let held_live = std::cell::Cell::new(true);
+    let relay = super::serving_relay::Relay::multi(fixture, relay_socket, relay_dns);
     let local = td_fs::TempDir::new("ma").unwrap();
     fs::set_permissions(local.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let ca = local.join("ca.pem");
@@ -461,6 +462,93 @@ pub(super) fn exercise(
             "SELECT count(*) FROM td_mta.devices WHERE revoked_at IS NULL"
         ),
         "2"
+    );
+}
+
+// Account A's deferred COMMIT keeps its row locked after the HTTP worker has
+// returned uncertainty. Account B uses the very same process-wide upload slot.
+fn uncertain_upload(
+    fixture: &Fixture,
+    profile: &runtime::PublishedProfile,
+    accounts: [(AccountId, &td_mta::postgres_devices::Creation); 2],
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline},
+        postgres_bootstrap::Bootstrap,
+        postgres_http_uploads as uploads,
+        postgres_input::Loaded,
+        postgres_read::ReadSlots,
+        postgres_uploads,
+    };
+    let loaded = Loaded {
+        bootstrap: Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            "multi",
+        )
+        .unwrap(),
+        trust: td_crypto::TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let clock = RuntimeClock::new();
+    let slots = ReadSlots::new(1).unwrap();
+    let pending = uploads::Pending::default();
+    let publish = |(account, device): (AccountId, &td_mta::postgres_devices::Creation), ms| {
+        let cap = Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+        let mut meter = Meter::new(
+            cap,
+            Charge {
+                io_bytes: 1024 * 1024,
+                records: 4096,
+                output_bytes: 1024,
+                ..Default::default()
+            },
+        );
+        uploads::Uploads {
+            loaded: &loaded,
+            executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
+            binding: profile.binding_for(account).unwrap(),
+            slots: &slots,
+            clock: &clock,
+            pending: &pending,
+            password: device.password(),
+        }
+        .create(
+            uploads::Input {
+                account,
+                device: device.device_id(),
+                bytes: b"account upload",
+                deadline: cap,
+            },
+            &mut meter,
+        )
+    };
+    sql(fixture, "CREATE FUNCTION public.delay_first_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(9); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_first_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.account=decode(repeat('aa',16),'hex')) EXECUTE FUNCTION public.delay_first_upload()");
+    let [first, second] = accounts;
+    assert_eq!(
+        publish(first, 3_000),
+        Err(uploads::Error::Publication(
+            postgres_uploads::Error::Indeterminate
+        ))
+    );
+    assert!(pending.operation().unwrap().is_some());
+    publish(second, 10_000).unwrap();
+    assert!(pending.operation().unwrap().is_none());
+    // Wait for the already-issued COMMIT without reissuing either upload.
+    sql(
+        fixture,
+        "DROP TRIGGER delay_first_upload ON td_mta.upload_receipts; DROP FUNCTION public.delay_first_upload()",
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(DISTINCT account), count(*) FROM td_mta.upload_receipts"
+        ),
+        "2|2"
     );
 }
 

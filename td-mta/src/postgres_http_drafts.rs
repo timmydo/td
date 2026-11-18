@@ -10,10 +10,10 @@ use crate::{
     ports::{Clock, CommitFailure, Deadline, Error},
     postgres_drafts::{self as changes, Draft},
     postgres_input::Loaded,
-    postgres_probe::{self, Endpoint, Mode},
+    postgres_probe::{self, Mode},
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
-    postgres_settlement as settlement,
+    postgres_settlement::{self as settlement, Retained},
     store_fs::DraftCompletion,
 };
 use std::{
@@ -25,7 +25,7 @@ use std::{
 /// Retain this owner across HTTP requests.
 #[derive(Default)]
 pub struct Pending {
-    change: Mutex<Option<(Draft, Endpoint)>>,
+    change: Mutex<Option<Retained<Draft>>>,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<DraftOperationId>, Error> {
@@ -34,7 +34,7 @@ impl Pending {
             .try_lock()
             .map_err(|_| Error::Busy)?
             .as_ref()
-            .map(|(change, _)| change.operation()))
+            .map(|held| held.change.operation()))
     }
 }
 
@@ -47,7 +47,7 @@ pub struct Settled {
 impl Pending {
     /// Use a separate settlement connection allowance, never foreground slots.
     /// A found receipt or proven absence releases the operation; any error
-    /// retains it and keeps writes fenced.
+    /// retains it for historical inspection.
     pub fn settle(
         &self,
         loaded: &Loaded,
@@ -77,20 +77,20 @@ impl Pending {
 /// Inspect only at the retained endpoint. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
-    pending: &mut Option<(Draft, Endpoint)>,
+    pending: &mut Option<Retained<Draft>>,
     loaded: &Loaded,
     slots: &ReadSlots,
     deadline: Instant,
 ) -> Result<Option<Settled>, Error> {
-    let Some((change, endpoint)) = pending.as_ref() else {
+    let Some(held) = pending.as_ref() else {
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, *endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, change)
+    let connection = settlement::request(loaded, held.endpoint);
+    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
         .map_err(map_error)?
         .map(|outcome| Settled {
-            operation: change.operation(),
+            operation: held.change.operation(),
             outcome,
         });
     *pending = None;
@@ -152,7 +152,7 @@ impl Drafts<'_> {
             .change
             .try_lock()
             .map_err(|_| store(Error::Busy))?;
-        if pending.is_some() {
+        if Retained::inspect_before_write(&mut pending, self.binding.account(), Instant::now()) {
             // Settle within this request's capped deadline, with a foreground
             // slot it releases before taking its own.
             settlement::charge(meter, self.clock, 1).map_err(store)?;
@@ -364,7 +364,11 @@ impl Drafts<'_> {
                 cleanup_error: None,
             }),
             Err(changes::Error::Indeterminate) => {
-                *pending = Some((draft, endpoint.ok_or_else(|| store(Error::Invalid))?));
+                *pending = Some(Retained::new(
+                    draft,
+                    endpoint.ok_or_else(|| store(Error::Invalid))?,
+                    self.binding.account(),
+                ));
                 Ok(DraftCompletion {
                     before_epoch,
                     before_sequence: Sequence::from_u64(0),
