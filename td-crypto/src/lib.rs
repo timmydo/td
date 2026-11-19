@@ -28,6 +28,8 @@ mod pkcs8;
 pub use pem::{PemCertificates, CERTIFICATE_DER_CAPACITY};
 mod provider;
 pub use provider::{P256Key, Provider, P256_PKCS8_CAPACITY};
+mod dkim;
+pub use dkim::{verify_dkim_sha256, DkimAlgorithm, DkimVerification};
 mod certificate;
 mod certificate_algorithms;
 mod der;

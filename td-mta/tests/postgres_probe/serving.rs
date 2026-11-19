@@ -139,15 +139,16 @@ pub(super) fn exercise(
     exchange(b"RCPT TO:<main@example.test>\r\n", "250");
     exchange(b"RCPT TO:<@example.test:outside@remote.test>\r\n", "550");
     exchange(b"DATA\r\n", "354");
-    exchange(
-        b"Subject: Executable PostgreSQL\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nBcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\n\r\nDelivered by the real process.\r\n.\r\n",
-        "250",
-    );
+    let mut signed = Vec::from(&b"Bcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\nX-TD-DKIM-Results: fail (sender supplied)\r\n"[..]);
+    signed.extend_from_slice(super::dkim_vectors::MESSAGE);
+    signed.extend_from_slice(b".\r\n");
+    exchange(&signed, "250");
     exchange(b"QUIT\r\n", "221");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
-    let received = sql(
+    let received = super::sql_bounded(
         fixture,
         "SELECT convert_from(bytes,'UTF8') FROM td_mta.blob_chunks WHERE ordinal=0",
+        16384,
     );
     assert!(
         received.starts_with(
@@ -156,6 +157,29 @@ pub(super) fn exercise(
         "{received}"
     );
     assert!(received.contains("\r\nReceived-SPF: pass (sender supplied)\r\n"));
+    let (local_trace, incoming) = received.split_once("\r\nReceived: ").unwrap();
+    assert!(
+        local_trace.contains("\r\nX-TD-DKIM-Results: complete; receiver="),
+        "{local_trace}"
+    );
+    for signature in [
+        "result=pass; a=rsa-sha256; bits=1024; d=football.example.com; s=test",
+        "result=pass; a=ed25519-sha256; bits=256; d=football.example.com; s=brisbane",
+    ] {
+        assert!(local_trace.contains(signature), "{local_trace}");
+    }
+    assert!(incoming.contains("\r\nX-TD-DKIM-Results: fail (sender supplied)\r\n"));
+    let query = include_str!("../../POSTGRES.md")
+        .split_once("### Inspecting direct-MX DKIM observations")
+        .unwrap()
+        .1
+        .split_once("```sql\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    assert_eq!(sql(fixture, query), "pass|1024|football.example.com|1");
     assert!(smtp_address.is_ipv6() && https_address.is_ipv6());
     assert_eq!(
         sql(
@@ -352,7 +376,7 @@ pub(super) fn exercise(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        assert_eq!(hex, sql(fixture, "SELECT encode(string_agg(bytes,''::bytea ORDER BY ordinal),'hex') FROM td_mta.blob_chunks GROUP BY account,blob_id"));
+        assert_eq!(hex, super::sql_bounded(fixture, "SELECT encode(string_agg(bytes,''::bytea ORDER BY ordinal),'hex') FROM td_mta.blob_chunks GROUP BY account,blob_id", 32768));
         let (head, body) = persistent_reply(&mut tls);
         assert!(head.starts_with("HTTP/1.1 200 ") && head.contains("Connection: close"));
         assert_eq!(td_json::parse_slice(&body).unwrap(), session);
@@ -1047,9 +1071,7 @@ fn replica_source_reads(
     assert_eq!(body.blob(), email.blob);
     assert_eq!(body.digest(), email.digest);
     assert_eq!(body.bytes().len() as u64, email.size);
-    assert!(body
-        .bytes()
-        .ends_with(b"Delivered by the real process.\r\n"));
+    assert!(body.bytes().ends_with(super::dkim_vectors::MESSAGE));
     assert_eq!(
         sql(fixture, "SELECT length FROM td_mta.blobs"),
         body.bytes().len().to_string()

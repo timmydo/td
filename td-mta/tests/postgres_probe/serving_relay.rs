@@ -82,12 +82,25 @@ impl Relay {
                 };
                 let mut answer = packet[..n].to_vec();
                 answer[2] |= 0x80;
-                if packet.get(12..n.saturating_sub(4)) == Some(b"\x07example\x04test\x00")
-                    && packet.get(n.saturating_sub(4)..n.saturating_sub(2)) == Some(&[0, 16])
-                {
-                    answer[7] = 1;
-                    answer.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60, 0, 12, 11]);
-                    answer.extend_from_slice(b"v=spf1 -all");
+                if packet.get(n.saturating_sub(4)..n.saturating_sub(2)) == Some(&[0, 16]) {
+                    let record = match packet.get(12..n.saturating_sub(4)) {
+                        Some(b"\x07example\x04test\x00") => Some("v=spf1 -all"),
+                        Some(b"\x04test\x0a_domainkey\x08football\x07example\x03com\x00") => {
+                            Some(super::dkim_vectors::RSA_TXT)
+                        }
+                        Some(b"\x08brisbane\x0a_domainkey\x08football\x07example\x03com\x00") => {
+                            Some(super::dkim_vectors::ED_TXT)
+                        }
+                        _ => None,
+                    };
+                    if let Some(record) = record {
+                        let size = u8::try_from(record.len()).unwrap();
+                        answer[7] = 1;
+                        answer.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60]);
+                        answer.extend_from_slice(&(u16::from(size) + 1).to_be_bytes());
+                        answer.push(size);
+                        answer.extend_from_slice(record.as_bytes());
+                    }
                 } else if packet[n - 3] == 1 {
                     answer[7] = 1;
                     answer.extend_from_slice(&[

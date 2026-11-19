@@ -2016,8 +2016,8 @@ Passive receipt facts confer no authority. The receiving service supplies this t
 Preparation validates bounded SMTP metadata, non-NUL DATA with complete CRLF
 lines of arbitrary length within the selected message ceiling, and a root-header
 ceiling of at most 1 MiB. It uses the shared receiving header and trace formatter: prepend the
-server Return-Path, local Received-SPF when observed, and Received fields in
-that order, strip supplied Return-Path fields, retain
+server Return-Path, the local SPF and DKIM observations when present, and
+the Received field in that order, strip supplied Return-Path fields, retain
 root identifiers and keep body bytes unchanged. The header scanner borrows the already admitted immutable DATA, so tentative
 field-name bytes that become body consume work but no extra header backing
 or recognized-header allowance. Original work/deadline limits
@@ -2045,7 +2045,7 @@ envelope provenance, recipient rows, Inbox membership, history and quota usage.
 The receiver stores its verdict in the immutable message body alongside its
 own Received field. All fanout copies retain the same trace. A raw download
 begins with Return-Path, then Received-SPF for an observed direct delivery,
-then Received. The folded Received-SPF properties identify the receiver,
+then X-TD-DKIM-Results when observed, then Received. The folded Received-SPF properties identify the receiver,
 socket peer, HELO/EHLO and effective envelope sender. The result `none`
 means an evaluation found no applicable SPF policy or usable sender domain.
 Older direct deliveries have Received immediately after Return-Path and
@@ -2086,6 +2086,43 @@ For example, an old message containing a peer-supplied pass counts as
 `unobserved`. An observed failure followed by the same peer claim counts
 as `fail`. A `temperror` includes DNS and local evaluation timeouts and
 does not establish that the peer failed the sender's policy.
+
+### Inspecting direct-MX DKIM observations
+
+Open the raw message and read the local `X-TD-DKIM-Results` field between
+the receiver's Received-SPF and Received fields. Historical direct deliveries
+without this field have no local DKIM observation. Lower fields, including
+fields with the same name, came with the message. Each local field begins
+with `none` (unsigned), `complete`, or `incomplete`. The last status means
+the verifier could not finish all signatures within its work and time limits.
+A signature row identifies the outcome and the available algorithm, exact key
+size in bits, signing domain and selector. In particular, a valid 1,024-bit
+RSA signature records `pass` and `bits=1024`. The private trace is padded to
+a fixed byte length so a verdict cannot change quota or header admission.
+
+On the primary, this query counts RSA signatures by outcome, key size and
+signing domain in the most recent 1,000 retained direct deliveries. The
+initial Received field delimits the local trace even on older mail.
+Multi-account deliveries contribute one observation per account copy.
+
+```sql
+WITH recent AS (
+    SELECT account, blob_id FROM td_mta.emails
+    WHERE origin = 1 AND gateway IS NULL
+    ORDER BY received_at DESC, account, id
+    LIMIT 1000
+), traces AS (
+    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 8192), 'escape'),
+                      E'\r\nReceived: ', 1) AS prefix
+    FROM recent r JOIN td_mta.blob_chunks c
+      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
+)
+SELECT parts[1] AS outcome, parts[2]::integer AS rsa_bits,
+       parts[3] AS signing_domain, count(*)
+FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
+    E'\r\n\tresult=([a-z]+); a=rsa-sha256; bits=([0-9]+); d=([A-Za-z0-9.-]+);', 'g') AS m(parts)
+GROUP BY 1, 2, 3 ORDER BY 4 DESC, 3, 2, 1;
+```
 
 ## 47. Verified submission input preparation
 

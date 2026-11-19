@@ -46,6 +46,18 @@ pub trait Job: Send {
     ) -> Result<(), Failure> {
         self.prepare(deadline)
     }
+    /// Original decoded DATA while this job retains its ingress permit.
+    fn dkim_input(&self) -> Option<&[u8]> {
+        None
+    }
+    fn prepare_with_auth(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<crate::spf::Outcome>,
+        _dkim: Option<crate::dkim::Report>,
+    ) -> Result<(), Failure> {
+        self.prepare_with_spf(deadline, spf)
+    }
     fn commit(&mut self) -> Result<Completion, Failure>;
 }
 /// Construction admits fixed capacity; no method may wait for peer input.

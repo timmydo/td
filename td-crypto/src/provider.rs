@@ -48,7 +48,9 @@ impl std::fmt::Debug for Provider {
 
 // Hold key state inside the unwind boundary and never return partial
 // operations. Hooks still run; abort, blocking and OOM are not contained.
-fn provider<T>(operation: impl FnOnce() -> Result<T, Error> + UnwindSafe) -> Result<T, Error> {
+pub(super) fn provider<T>(
+    operation: impl FnOnce() -> Result<T, Error> + UnwindSafe,
+) -> Result<T, Error> {
     catch_unwind(operation).map_err(|_| Error::Crypto)?
 }
 

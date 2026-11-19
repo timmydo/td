@@ -227,6 +227,11 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
         if many { "24" } else { "8" }
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE (account=decode(repeat('aa',16),'hex') AND address NOT IN ('main@example.test','alias@example.test')) OR (account=decode(repeat('cc',16),'hex') AND address<>'second@example.test')"), "0");
+    // All recipients retain the same trusted observation in their immutable copy.
+    assert_eq!(sql(fixture, "SELECT bool_and(accounts >= 2 AND variants = 1 AND observed)
+        FROM (SELECT blob_id, count(DISTINCT account) AS accounts, count(DISTINCT bytes) AS variants,
+            bool_and(position(convert_to(E'\\r\\nX-TD-DKIM-Results: none; receiver=localhost\\r\\n', 'UTF8') in bytes) > 0) AS observed
+        FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('Subject: SMTP fanout', 'UTF8') in bytes)>0 GROUP BY blob_id) AS copies"), "t");
     if many {
         // Sequence increments are visible even while A's deferred trigger holds COMMIT.
         sql(fixture, "CREATE SEQUENCE public.release_smtp_commit; GRANT SELECT ON SEQUENCE public.release_smtp_commit TO mail_runtime;

@@ -26,6 +26,7 @@ pub mod bounded;
 pub mod clock;
 pub mod compose_text;
 pub mod config;
+pub mod dkim;
 pub mod dns_lookup;
 pub mod dns_owner;
 pub mod dns_reply;

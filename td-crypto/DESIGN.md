@@ -286,6 +286,23 @@ padding and chunk boundaries with the independently qualified owned digest
 and inject update errors/unwinds; no test asserts a wall-clock performance
 threshold.
 
+### Inbound DKIM signature verification
+
+The mail receiver passes the SHA-256 digest of the canonical signed headers,
+the selected algorithm and the decoded DNS public key and signature to
+`verify_dkim_sha256`. A parsed key yields its exact bit length and a signature
+match or mismatch. Invalid keys and provider unwinds have separate errors.
+
+The RSA path accepts a minimal PKCS#1 RSAPublicKey or a complete
+rsaEncryption SubjectPublicKeyInfo with NULL parameters and zero unused
+bits. The DKIM operation accepts 1,024 through 4,096 modulus bits,
+including intermediate sizes. It applies the primitive's odd-exponent
+bound of 3 through 2^33 − 1 and verifies PKCS#1 v1.5 SHA-256 over the
+supplied digest. Only this operation uses the DKIM key range.
+The Ed25519 path verifies the 32-byte digest as an Ed25519 message with a
+32-byte raw public key. It rejects malformed and small-order public keys.
+RFC 8463 Appendix A supplies independent signatures for both algorithms.
+
 ### Crypto factory and P-256 signing keys
 
 `Provider` is a stateless td-owned implementation of `Crypto`; creating it does

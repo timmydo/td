@@ -653,6 +653,12 @@ resolve to the local account and do not forward externally. td-mail rules
 currently change flags or mailbox membership and have no sending action.
 This coverage does not authorize a future forwarding feature.
 
+Direct-MX DKIM fixtures include the RSA-SHA256 and Ed25519-SHA256 signed
+message and public keys in RFC 8463 Appendix A. The native IPv6 SMTP and
+PostgreSQL fixture serves the selector TXT records on loopback, delivers
+the original message and verifies the local 1,024-bit RSA and 256-bit
+Ed25519 observations alongside a sender-supplied lookalike field.
+
 ## Local delivery-failure notices
 
 The foreground PostgreSQL fixture covers terminal expiry and permanent MAIL

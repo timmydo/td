@@ -1092,9 +1092,18 @@ a null reverse path uses `postmaster@` and the HELO/EHLO identity. The
 receiver records the result on accepted mail, including mail claiming a
 locally hosted domain. Every SPF outcome uses the ordinary recipient,
 quota and publication policy. A failing SPF check can therefore appear in
-Inbox. SPF covers the envelope sender. The visible From header currently
-has no DKIM signature verification or DMARC alignment check. Section 46
-of POSTGRES.md describes how to inspect the local result.
+Inbox. SPF covers the envelope sender.
+
+At the end of DATA the receiver verifies DKIM signatures over the original
+headers and body, before adding its own trace. A passing signature identifies
+the signing domain and covers the selected header fields. When a signature
+includes an `l=` tag, it covers only that many canonicalized body bytes. Signatures
+using RSA-SHA256 with 1,024 through 4,096-bit keys and Ed25519-SHA256 are
+eligible. The local result records the algorithm and actual key size.
+A signing domain can differ from the visible From domain. DMARC alignment
+is a separate check planned in IMPLEMENTATION.md F02. Section 46 of
+POSTGRES.md describes how to inspect local observations. All DKIM outcomes
+use the same recipient, quota and delivery policy.
 
 Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
 ACME HTTP-01 challenges and
@@ -1550,10 +1559,11 @@ The caller output prefix changes only after the final clock check; errors
 preserve it. Configuration borrows, resolver order and generation stay fixed
 for the owner's lifetime, consistent with restart-only resolver changes.
 
-Direct receiving has a separate DNS worker for SPF names derived from
-the inbound SMTP envelope and published policies. It sends questions to the
-configured numeric resolvers. It has no outbound application-dial capability
-and shares no cache entries with the configured relay/ACME resolver.
+Direct receiving uses separate SPF and DKIM workers. SPF queries derive from
+the SMTP envelope and published policy. DKIM queries TXT at the selector's
+`_domainkey` name. Both workers send DNS questions only to configured numeric
+resolvers, have no application-dial capability, and keep their per-message
+work separate from the configured relay/ACME cache.
 
 The prepared `outbound_dial` helper runs only on the admitted outbound
 handshake worker while its caller retains the sole outbound slot and configured
@@ -1749,8 +1759,8 @@ input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result gets the temporary 451 of a
 refused one; the sender's retry may duplicate a delivery that committed.
 A supplied result alone is not durability proof. PostgreSQL receiving
-stages bounded ingress, replaces Return-Path, adds the direct-MX Received-SPF
-observation and generates Received from trusted connection facts. It resolves
+stages bounded ingress, replaces Return-Path, adds the direct-MX SPF and DKIM
+observations and generates Received from trusted connection facts. It resolves
 immutable threads and publishes one Inbox email with its body, envelope and history in one
 transaction. A delivery job owns its connection authorization adapter,
 so a worker can construct it and transfer the job without borrowing that

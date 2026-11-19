@@ -161,7 +161,7 @@ pub fn prepare_with_meter(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Delivery, Error> {
-    prepare_observed(binding, message, deadline, meter, clock, None)
+    prepare_observed(binding, message, deadline, meter, clock, Default::default())
 }
 
 fn prepare_observed(
@@ -170,7 +170,7 @@ fn prepare_observed(
     deadline: Instant,
     meter: &mut Meter,
     clock: &RuntimeClock,
-    spf: Option<crate::spf::Outcome>,
+    observed: crate::receiving_headers::Observations<'_>,
 ) -> Result<Delivery, Error> {
     preparation_time(binding, deadline)?;
     let clock = PreparationClock { clock, deadline };
@@ -192,7 +192,7 @@ fn prepare_observed(
         (email, blob, new_thread),
         &clock,
         meter,
-        spf,
+        observed,
     )?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in bytes.chunks(publication::CHUNK) {

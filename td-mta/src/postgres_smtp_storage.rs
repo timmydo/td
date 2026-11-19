@@ -245,7 +245,11 @@ impl Drop for Permit<'_> {
 }
 enum Stage {
     Writing,
-    Prepared(Deadline, Option<crate::spf::Outcome>),
+    Prepared(
+        Deadline,
+        Option<crate::spf::Outcome>,
+        Option<crate::dkim::Report>,
+    ),
     Done,
 }
 pub struct Delivery<'a, 'b> {
@@ -466,13 +470,25 @@ impl Job for Delivery<'_, '_> {
         self.failure = result.err();
         result
     }
+    fn dkim_input(&self) -> Option<&[u8]> {
+        (self.failure.is_none() && matches!(self.stage, Stage::Writing))
+            .then_some(self.bytes.as_slice())
+    }
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure> {
-        self.prepare_with_spf(deadline, None)
+        self.prepare_with_auth(deadline, None, None)
     }
     fn prepare_with_spf(
         &mut self,
         deadline: Deadline,
         spf: Option<crate::spf::Outcome>,
+    ) -> Result<(), Failure> {
+        self.prepare_with_auth(deadline, spf, None)
+    }
+    fn prepare_with_auth(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<crate::spf::Outcome>,
+        dkim: Option<crate::dkim::Report>,
     ) -> Result<(), Failure> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -486,16 +502,17 @@ impl Job for Delivery<'_, '_> {
             return Err(Failure::Refused(Error::Deadline));
         }
         charge(&self.backend.clock, &mut self.meter, Charge::default())?;
-        self.stage = Stage::Prepared(deadline, spf);
+        self.stage = Stage::Prepared(deadline, spf, dkim);
         Ok(())
     }
     fn commit(&mut self) -> Result<Completion, Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let Stage::Prepared(deadline, spf) = self.stage else {
+        let Stage::Prepared(deadline, spf, dkim) = &mut self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
+        let (deadline, spf, dkim) = (*deadline, *spf, dkim.take());
         self.stage = Stage::Done;
         charge(
             &self.backend.clock,
@@ -549,7 +566,10 @@ impl Job for Delivery<'_, '_> {
                     cap,
                     meter,
                     session,
-                    spf,
+                    crate::receiving_headers::Observations {
+                        spf,
+                        dkim: dkim.as_ref(),
+                    },
                 )
             },
         );

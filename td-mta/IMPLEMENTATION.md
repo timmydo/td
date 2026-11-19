@@ -2926,15 +2926,16 @@ disposition are independent of the result. Gateway-origin evaluation still
 requires a trusted original-peer contract. CONFORMANCE.md describes the
 local DNS and stored-message evidence.
 
-**F02 — DKIM and DMARC.** Extend the crypto port with RSA-SHA256 and Ed25519-SHA256
-verification; use streaming body/header canonicalization, bounded signature/DNS
-processing and exact standards fixtures.
-Define alignment and organizational-domain rules using a reviewed data strategy
-and applicable standard versions; do not casually add a dependency or hostname
-heuristic. Start with observed results before policy enforcement. Forwarded
-mail and malformed signatures must not become implicit success. Outbound
-signing remains the smart host's configured responsibility unless separately
-requested. Report support does not imply DMARC report generation.
+**F02 — DKIM and DMARC.** Direct MX verifies RSA-SHA256 and Ed25519-SHA256
+signatures under RFCs 6376, 8301 and 8463 and stores an observation per
+evaluated signature with its signing domain, selector and available key size.
+Section 46 of POSTGRES.md covers local inspection. Outbound signing belongs
+to the smart host.
+
+DMARC remains planned. Define alignment and organizational-domain discovery
+using the applicable standards and a reviewed data strategy. Record DMARC
+results locally before considering enforcement. Aggregate or failure report
+generation requires separate design.
 
 **F03 — Catch-all.** Add an explicit per-domain fallback only after exact aliases,
 with predictable quota/admission behavior and tests for rejected domains. No

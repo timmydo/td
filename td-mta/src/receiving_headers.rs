@@ -481,6 +481,101 @@ pub(crate) fn spf_trace_allowance(hostname: &str) -> Result<usize, ports::Error>
     Ok(trace_allowance(hostname)? + frame + hostname.len() + 39 + helo + sender)
 }
 
+const DKIM_NAME_BYTES: usize = 253;
+const DKIM_ROW_BYTES: usize =
+    b"\r\n\tresult=permerror; a=ed25519-sha256; bits=65535; d=; s=".len() + 2 * DKIM_NAME_BYTES;
+const DKIM_FIXED_BYTES: usize = b"X-TD-DKIM-Results: incomplete; receiver=".len()
+    + crate::dkim::MAX_SIGNATURES * DKIM_ROW_BYTES
+    + 7;
+
+pub(crate) fn auth_trace_allowance(hostname: &str) -> Result<usize, Error> {
+    Ok(spf_trace_allowance(hostname)? + DKIM_FIXED_BYTES + hostname.len())
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Observations<'a> {
+    pub spf: Option<crate::spf::Outcome>,
+    pub dkim: Option<&'a crate::dkim::Report>,
+}
+
+impl Observations<'_> {
+    pub fn allowance(self, hostname: &str) -> Result<usize, Error> {
+        match (self.spf, self.dkim) {
+            (None, None) => trace_allowance(hostname),
+            (Some(_), None) => spf_trace_allowance(hostname),
+            (Some(_), Some(_)) => auth_trace_allowance(hostname),
+            (None, Some(_)) => Err(Error::Invalid),
+        }
+    }
+}
+
+fn valid_trace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= DKIM_NAME_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn dkim_trace(
+    output: &mut String,
+    hostname: &str,
+    report: &crate::dkim::Report,
+) -> Result<(), Error> {
+    let start = output.len();
+    let rows = || report.signatures.iter().take(crate::dkim::MAX_SIGNATURES);
+    let invalid = rows().any(|row| {
+        [row.domain.as_deref(), row.selector.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|name| !valid_trace_name(name))
+    });
+    let status =
+        if invalid || report.incomplete || report.signatures.len() > crate::dkim::MAX_SIGNATURES {
+            "incomplete"
+        } else if report.signatures.is_empty() {
+            "none"
+        } else {
+            "complete"
+        };
+    write!(output, "X-TD-DKIM-Results: {status}; receiver={hostname}")
+        .map_err(|_| Error::Capacity)?;
+    if !invalid {
+        for row in rows() {
+            write!(output, "\r\n\tresult={}", row.outcome.as_str()).map_err(|_| Error::Capacity)?;
+            if let Some(algorithm) = row.algorithm {
+                write!(output, "; a={}", algorithm.as_str()).map_err(|_| Error::Capacity)?;
+            }
+            if let Some(bits) = row.key_bits {
+                write!(output, "; bits={bits}").map_err(|_| Error::Capacity)?;
+            }
+            if let Some(domain) = &row.domain {
+                write!(output, "; d={domain}").map_err(|_| Error::Capacity)?;
+            }
+            if let Some(selector) = &row.selector {
+                write!(output, "; s={selector}").map_err(|_| Error::Capacity)?;
+            }
+        }
+    }
+    // Fill with folded comments to give every verdict and timeout the same
+    // stored length. Each physical line contains text and stays below 998 bytes.
+    let used = output.len() - start;
+    let mut remaining = (DKIM_FIXED_BYTES + hostname.len() - 2)
+        .checked_sub(used)
+        .ok_or(Error::Capacity)?;
+    while remaining > 0 {
+        let fold = if remaining > 996 {
+            (remaining - 5).min(996)
+        } else {
+            remaining
+        };
+        let spaces = fold.checked_sub(5).ok_or(Error::Invalid)?;
+        write!(output, "\r\n\t({empty:spaces$})", empty = "").map_err(|_| Error::Capacity)?;
+        remaining -= fold;
+    }
+    output.write_str("\r\n").map_err(|_| Error::Capacity)
+}
+
 struct QuotedContent<'a>(&'a str);
 impl std::fmt::Display for QuotedContent<'_> {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -503,7 +598,7 @@ pub(crate) fn trace(
     email: EmailId,
     utc_ms: i64,
     maximum: usize,
-    spf: Option<crate::spf::Outcome>,
+    observed: Observations<'_>,
 ) -> Result<String, ports::Error> {
     let date = td_civil::unix_to_civil_utc_checked(utc_ms.div_euclid(1000))
         .ok_or(ports::Error::Invalid)?;
@@ -536,7 +631,10 @@ pub(crate) fn trace(
         .map_err(|_| ports::Error::Capacity)?;
     write!(output, "Return-Path: <{}>\r\n", receipt.reverse_path)
         .map_err(|_| ports::Error::Capacity)?;
-    if let Some(result) = spf {
+    if observed.dkim.is_some() && observed.spf.is_none() {
+        return Err(Error::Invalid);
+    }
+    if let Some(result) = observed.spf {
         if receipt.gateway.is_some() {
             return Err(ports::Error::Invalid);
         }
@@ -554,6 +652,9 @@ pub(crate) fn trace(
             result.as_str(), receipt.peer, QuotedContent(receipt.ehlo), QuotedContent(mailbox), pad = ""
         )
         .map_err(|_| ports::Error::Invalid)?;
+    }
+    if let Some(report) = observed.dkim {
+        dkim_trace(&mut output, hostname, report)?;
     }
     write!(output, "Received: from {} (", receipt.ehlo).map_err(|_| ports::Error::Capacity)?;
     match receipt.peer {
@@ -608,6 +709,24 @@ mod spf_tests {
         gateway: Option<&str>,
         observed: Option<Outcome>,
     ) -> Result<String, Error> {
+        render_auth(
+            host,
+            ehlo,
+            reverse_path,
+            gateway,
+            Observations {
+                spf: observed,
+                dkim: None,
+            },
+        )
+    }
+    fn render_auth(
+        host: &str,
+        ehlo: &str,
+        reverse_path: &str,
+        gateway: Option<&str>,
+        observed: Observations<'_>,
+    ) -> Result<String, Error> {
         let mut encoded = [0; 64];
         let receipt = SmtpReceipt {
             peer: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
@@ -623,13 +742,129 @@ mod spf_tests {
             true,
             EmailId::from_bytes([1; 16]),
             0,
-            if observed.is_some() {
-                spf_trace_allowance(host)?
-            } else {
-                trace_allowance(host)?
-            },
+            observed.allowance(host)?,
             observed,
         )
+    }
+
+    #[test]
+    fn dkim_report_uses_a_fixed_charge_and_a_trusted_position() {
+        use crate::dkim::{Outcome as DkimOutcome, Report, SignatureResult, MAX_SIGNATURES};
+        let host = "mx.example.test";
+        let unavailable = Report::unavailable();
+        let render = |report: &Report| {
+            render_auth(
+                host,
+                "sender.test",
+                "",
+                None,
+                Observations {
+                    spf: Some(Outcome::Pass),
+                    dkim: Some(report),
+                },
+            )
+        };
+        let field = |trace: &str| {
+            trace
+                .split_once("\r\nX-TD-DKIM-Results: ")
+                .unwrap()
+                .1
+                .split_once("\r\nReceived: ")
+                .unwrap()
+                .0
+                .to_owned()
+        };
+        let none = Report {
+            signatures: Vec::new(),
+            incomplete: false,
+        };
+        let unsigned = render(&none).unwrap();
+        assert!(field(&unsigned).starts_with("none; receiver=mx.example.test\r\n"));
+        assert!(field(&render(&unavailable).unwrap()).starts_with("incomplete; receiver="));
+        assert_eq!(render(&unavailable).unwrap().len(), unsigned.len());
+        assert_eq!(
+            auth_trace_allowance(host).unwrap() - spf_trace_allowance(host).unwrap(),
+            2299 + host.len()
+        );
+        assert!(
+            unsigned.find("Received-SPF:").unwrap() < unsigned.find("X-TD-DKIM-Results:").unwrap()
+        );
+
+        let longest = [
+            "x".repeat(63),
+            "y".repeat(63),
+            "z".repeat(63),
+            "a".repeat(61),
+        ]
+        .join(".");
+        for outcome in [
+            DkimOutcome::Pass,
+            DkimOutcome::Fail,
+            DkimOutcome::Temperror,
+            DkimOutcome::Permerror,
+        ] {
+            let details = || SignatureResult {
+                outcome,
+                algorithm: Some(td_crypto::DkimAlgorithm::Ed25519),
+                key_bits: Some(256),
+                domain: Some(longest.clone()),
+                selector: Some(longest.clone()),
+            };
+            let full = Report {
+                signatures: (0..MAX_SIGNATURES).map(|_| details()).collect(),
+                incomplete: true,
+            };
+            let raw = render(&full).unwrap();
+            assert_eq!(raw.len(), unsigned.len());
+            assert!(raw.split("\r\n").all(|line| line.len() <= 998));
+            assert_eq!(
+                field(&raw)
+                    .matches(&format!(
+                        "result={}; a=ed25519-sha256; bits=256; d={longest}; s={longest}",
+                        outcome.as_str()
+                    ))
+                    .count(),
+                MAX_SIGNATURES
+            );
+        }
+
+        let invalid = Report {
+            signatures: vec![SignatureResult {
+                outcome: DkimOutcome::Pass,
+                algorithm: Some(td_crypto::DkimAlgorithm::Rsa),
+                key_bits: Some(1024),
+                domain: Some("x\r\nForged: pass".into()),
+                selector: None,
+            }],
+            incomplete: false,
+        };
+        assert_eq!(render(&invalid).unwrap(), render(&unavailable).unwrap());
+        assert_eq!(
+            render_auth(
+                host,
+                "sender.test",
+                "",
+                Some("gateway"),
+                Observations {
+                    spf: Some(Outcome::Pass),
+                    dkim: Some(&none)
+                }
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            render_auth(
+                host,
+                "sender.test",
+                "",
+                None,
+                Observations {
+                    spf: None,
+                    dkim: Some(&none)
+                }
+            ),
+            Err(Error::Invalid)
+        );
     }
 
     const OUTCOMES: &[Outcome] = &[

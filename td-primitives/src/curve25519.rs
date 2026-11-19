@@ -574,13 +574,38 @@ pub mod ed25519 {
         message: &[u8],
         signature: &[u8; SIGNATURE_LEN],
     ) -> Result<(), Refused> {
+        let key = Point::decode(public)?;
+        verify_point(key, public, message, signature)
+    }
+
+    /// Verify a signature whose public key came from an untrusted source.
+    /// Reject malformed and small-order keys; a mismatched signature is false.
+    pub fn verify_untrusted(
+        public: &[u8; PUBLIC_LEN],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Refused> {
+        if is_small_order(public) {
+            return Err(Refused);
+        }
+        let key = Point::decode(public)?;
+        Ok(signature
+            .try_into()
+            .is_ok_and(|signature| verify_point(key, public, message, signature).is_ok()))
+    }
+
+    fn verify_point(
+        key: Point,
+        public: &[u8; PUBLIC_LEN],
+        message: &[u8],
+        signature: &[u8; SIGNATURE_LEN],
+    ) -> Result<(), Refused> {
         let (r, s) = signature.split_at(32);
         let r: &[u8; 32] = r.try_into().map_err(|_| Refused)?;
         let s: &[u8; 32] = s.try_into().map_err(|_| Refused)?;
         if !is_canonical_scalar(s) {
             return Err(Refused);
         }
-        let key = Point::decode(public)?;
         let k = challenge(r, public, message);
         let recomputed = Point::decode(&BASE)?
             .multiply(s)

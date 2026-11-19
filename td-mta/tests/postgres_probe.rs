@@ -13,6 +13,9 @@ use td_crypto::{Crypto, Provider, TrustStore, P256_PKCS8_CAPACITY};
 use td_fs::TempDir;
 use td_mta::postgres_probe::{probe, Endpoint, Error, Request};
 
+#[path = "support/dkim_vectors.rs"]
+mod dkim_vectors;
+
 #[path = "support/tls_certificate_fixture.rs"]
 mod certificate;
 

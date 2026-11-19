@@ -39,7 +39,7 @@ pub fn prepare_fanout(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Fanout, Error> {
-    prepare_observed(targets, message, deadline, meter, clock, None)
+    prepare_observed(targets, message, deadline, meter, clock, Default::default())
 }
 
 pub(crate) fn prepare_observed(
@@ -48,7 +48,7 @@ pub(crate) fn prepare_observed(
     deadline: Instant,
     meter: &mut Meter,
     clock: &RuntimeClock,
-    spf: Option<crate::spf::Outcome>,
+    observed: crate::receiving_headers::Observations<'_>,
 ) -> Result<Fanout, Error> {
     if targets.is_empty() || targets.len() > crate::config::identities::MAX_ACCOUNTS {
         return Err(Error::Capacity);
@@ -106,7 +106,8 @@ pub(crate) fn prepare_observed(
     if original != partition {
         return Err(Error::Policy);
     }
-    let prepared = super::prepare_observed(first.binding, message, deadline, meter, clock, spf)?;
+    let prepared =
+        super::prepare_observed(first.binding, message, deadline, meter, clock, observed)?;
     let mut deliveries = Vec::new();
     deliveries
         .try_reserve_exact(targets.len())

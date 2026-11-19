@@ -41,6 +41,9 @@ impl<B: smtp_storage::Storage> Drop for StorageClose<'_, B> {
     }
 }
 
+mod dkim_worker;
+pub(crate) use dkim_worker::STACK_BYTES as DKIM_STACK_BYTES;
+
 const SCAN: Duration = Duration::from_millis(5);
 const NETWORK_TURNS: usize = 16;
 
@@ -58,6 +61,7 @@ struct Finish<'a> {
     finished: &'a AtomicBool,
     storage: &'a std::thread::Thread,
     tls: &'a std::thread::Thread,
+    dkim: Option<&'a std::thread::Thread>,
     control: &'a Control,
 }
 impl Drop for Finish<'_> {
@@ -68,6 +72,9 @@ impl Drop for Finish<'_> {
         self.finished.store(true, Ordering::Release);
         self.storage.unpark();
         self.tls.unpark();
+        if let Some(dkim) = self.dkim {
+            dkim.unpark();
+        }
     }
 }
 
@@ -204,7 +211,7 @@ impl<'a> BoundListener<'a> {
             return Err(Error::Forbidden);
         }
         let hostname = row.server_name.ok_or(Error::Invalid)?;
-        let trace_bytes = crate::receiving_headers::spf_trace_allowance(hostname)?;
+        let trace_bytes = crate::receiving_headers::auth_trace_allowance(hostname)?;
         socket.set_nonblocking(true).map_err(Error::from)?;
         Ok(Self {
             socket,
@@ -267,7 +274,7 @@ enum Work {
 enum Phase {
     Empty,
     Network,
-    AwaitSpf {
+    AwaitAuthentication {
         until: Tick,
     },
     Queued {
@@ -291,6 +298,7 @@ struct Slot<'s, 'cfg, 'spf, B: Storage + 's> {
     final_reply: bool,
     spf_ticket: Option<crate::smtp_spf::Ticket<'spf>>,
     spf_result: Option<crate::spf::Outcome>,
+    dkim_report: Option<crate::dkim::Report>,
     data_timing: Option<crate::performance::Timer>,
     commit_wait: Option<crate::performance::Timer>,
 }
@@ -317,6 +325,7 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
         self.final_reply = false;
         self.spf_ticket = None;
         self.spf_result = None;
+        self.dkim_report = None;
     }
 }
 
@@ -395,7 +404,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             .map_err(|_| Error::Conflict)?;
         let result =
             crate::smtp_spf::with_worker(self.resources.limits().smtp_sessions, resolvers, |spf| {
-                self.run_inner(control, ready, spf)
+                self.run_inner(control, ready, spf, resolvers)
             });
         if result.is_err() {
             control.fail();
@@ -414,6 +423,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
         ready: impl FnOnce() -> Result<(), Error>,
         spf: Option<&crate::smtp_spf::Service<'_>>,
+        resolvers: &[std::net::SocketAddr],
     ) -> Result<(), Error> {
         let limits = self.resources.limits();
         if self.listeners.is_empty()
@@ -495,6 +505,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 final_reply: false,
                 spf_ticket: None,
                 spf_result: None,
+                dkim_report: None,
                 data_timing: None,
                 commit_wait: None,
             }));
@@ -525,10 +536,21 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     return Err(Error::from(error));
                 }
             };
+            let dkim = td_alloc::string("smtp-dkim").ok().and_then(|name| {
+                std::thread::Builder::new()
+                    .name(name)
+                    .stack_size(dkim_worker::STACK_BYTES)
+                    .spawn_scoped(scope, || {
+                        self.verify_dkim(&slots, &finished, &main, control, resolvers)
+                    })
+                    .ok()
+            });
+            let dkim_thread = dkim.as_ref().map(|worker| worker.thread());
             let _finish = Finish {
                 finished: &finished,
                 storage: storage.thread(),
                 tls: tls.thread(),
+                dkim: dkim_thread,
                 control,
             };
             while started.load(Ordering::Acquire) != 2 {
@@ -589,6 +611,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     let mut progress = false;
                     let mut wake_storage = false;
                     let mut wake_tls = false;
+                    let mut wake_dkim = false;
                     for offset in 0..total {
                         let index = (cursor + offset) % total;
                         let Some(cell) = slots.get(index) else {
@@ -623,12 +646,22 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         if let Phase::Done = slot.phase {
                             slot.phase = Phase::Network;
                         }
-                        if let Phase::AwaitSpf { until } = slot.phase {
-                            let result = spf
-                                .and_then(|service| service.poll(index, slot.spf_ticket.as_ref()));
-                            if result.is_none() && now < until && stopping.is_none() {
-                                continue;
+                        if let Phase::AwaitAuthentication { until } = slot.phase {
+                            let result = match spf {
+                                Some(service) => service.poll(index, slot.spf_ticket.as_ref()),
+                                None => Some(crate::spf::Outcome::Temperror),
+                            };
+                            if now < until && stopping.is_none() {
+                                if slot.dkim_report.is_none() && dkim_thread.is_some() {
+                                    wake_dkim = true;
+                                    continue;
+                                }
+                                if result.is_none() {
+                                    continue;
+                                }
                             }
+                            slot.dkim_report
+                                .get_or_insert_with(crate::dkim::Report::unavailable);
                             slot.freeze_spf(result);
                             slot.phase = Phase::Network;
                         }
@@ -664,6 +697,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                             )
                                         });
                                         slot.spf_result = None;
+                                        slot.dkim_report = None;
                                     }
                                     let connection = slot.connection()?;
                                     let network = connection.network_mut()?;
@@ -706,8 +740,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                         progress = true;
                                     }
                                     Ok(Progress::Work) => {
-                                        let dispatched =
-                                            self.dispatch(&mut slot, now, control, spf, index);
+                                        let dispatched = self.dispatch(
+                                            &mut slot,
+                                            now,
+                                            control,
+                                            spf,
+                                            index,
+                                            dkim_thread.is_some(),
+                                        );
                                         if dispatched.is_err() {
                                             slot.queue_retirement();
                                         }
@@ -721,10 +761,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 work: Work::Tls, ..
                             } => wake_tls = true,
                             Phase::Queued { .. } | Phase::Retire => wake_storage = true,
+                            Phase::AwaitAuthentication { .. } => wake_dkim = true,
                             _ => (),
                         }
                     }
                     cursor = (cursor + 1) % total;
+                    // Each worker can acquire the queued slot when it wakes.
+                    if let Some(thread) = dkim_thread.filter(|_| wake_dkim) {
+                        thread.unpark();
+                    }
                     if wake_storage {
                         storage.thread().unpark();
                     }
@@ -892,6 +937,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
         spf: Option<&crate::smtp_spf::Service<'_>>,
         index: usize,
+        dkim_available: bool,
     ) -> Result<(), Error> {
         let network = slot.connection()?.network()?;
         let (work, seconds) = match network.session().pending() {
@@ -912,10 +958,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             };
             // Keep the full original commit budget, including on nearly expired DATA.
             let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds);
-            if result.is_none() && until > now && !control.stop_requested() {
-                slot.phase = Phase::AwaitSpf { until };
+            if until > now && !control.stop_requested() && (dkim_available || result.is_none()) {
+                slot.phase = Phase::AwaitAuthentication { until };
                 return Ok(());
             }
+            slot.dkim_report = Some(crate::dkim::Report::unavailable());
             slot.freeze_spf(result);
         }
         let deadline = after(now, seconds)?.min(transport_deadline);
@@ -1096,7 +1143,9 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
                 let job = slot.delivery.as_mut().ok_or(Error::Conflict)?;
                 if !prepared {
-                    if let Err(error) = job.prepare_with_spf(cap, slot.spf_result) {
+                    if let Err(error) =
+                        job.prepare_with_auth(cap, slot.spf_result, slot.dkim_report.take())
+                    {
                         return self.delivery_refused(slot, work, error, control);
                     }
                 }

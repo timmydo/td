@@ -42,10 +42,10 @@ check found.
 | `bcrypt_pbkdf` | OpenBSD's `bcrypt_pbkdf` over Blowfish, up to 1024 bytes of output | td-ssh's passphrases on key files. It has no cap on rounds, as a key file asks for those: the caller reading the file sets one |
 | `mlkem768` | ML-KEM-768 (FIPS 203): key generation, encapsulation, decapsulation, each deterministic in the random bytes the caller passes | td-ssh's `mlkem768x25519-sha256` exchange |
 | `aes_gcm` | AES-128-GCM and AES-256-GCM (SP 800-38D), 96-bit nonce, 128-bit tag | TLS records, where a server may offer nothing else |
-| `curve25519` | X25519 (RFC 7748); Ed25519 (RFC 8032), with `ed25519::is_small_order` | TLS key exchange; TLS and certificate signatures; td-subst's signing keys; td-ssh's exchange, host and user keys. The check is for td-ssh, which reads keys it does not yet trust |
+| `curve25519` | X25519 (RFC 7748); Ed25519 (RFC 8032), with `ed25519::is_small_order` | TLS key exchange; TLS and certificate signatures; td-subst's signing keys; td-ssh's exchange, host and user keys; DKIM verification with DNS-supplied keys |
 | `ec` | P-256: ECDH, ECDSA signing (RFC 6979 nonces), verification. P-384: ECDH and verification | TLS key exchange and signatures; td-test-https's identities. A TLS 1.2 server holding a P-384 certificate refuses a client that does not list that group, whichever it then negotiates |
 | `ec` | P-521: ECDSA verification. On all three curves, `uncompressed`: a SEC 1 point in either form, validated and uncompressed | td-crypto's certificate and handshake policy, which admits P-521 signatures and compressed certificate keys and which td-mta/IMPLEMENTATION.md F04 moves onto this crate |
-| `rsa` | RSASSA-PKCS1-v1_5 and RSASSA-PSS verification, 2048 to 8192 bits. PSS salt the length of the hash | TLS and certificate signatures; OpenPGP v4 signatures on Flathub commits |
+| `rsa` | RSASSA-PKCS1-v1_5 and RSASSA-PSS verification, 2048 to 8192 bits. PSS salt the length of the hash. DKIM PKCS#1 SHA-256, 1024 to 4096 bits | TLS and certificate signatures; OpenPGP v4 signatures on Flathub commits; DKIM verification |
 | `random` | The system's random bytes, from `/dev/random` | Keys, nonces and TLS randoms |
 | `ct` | Equality reading every byte; best-effort erasure | Tag and secret comparison |
 
@@ -307,7 +307,9 @@ a change to any of these reds:
   verifies forgeries anyone can make. A caller admitting key material asks
   `ed25519::is_small_order`, true of all fourteen small-order encodings: the
   eight torsion points and the six spellings of them `verify` refuses anyway.
-  td-crypto does, for trust anchors and local issuers; td-tls-provider's
+  DKIM calls `verify_untrusted`, which applies that check and decodes the
+  public point before verifying the signature. td-crypto checks small order
+  for trust anchors and local issuers; td-tls-provider's
   Ed25519 verifier does, for every certificate and handshake signature it
   checks; td-ssh does wherever it takes key material. It says nothing of
   mixed-order keys, and need not: without the discrete log of the prime-order
@@ -326,7 +328,11 @@ a change to any of these reds:
 - PKCS#1 builds the one encoding the hash allows and compares it, which is what
   defeats the 2006 forgery; so it refuses a DigestInfo missing its NULL.
 - PSS takes only a salt the length of the hash, as TLS requires.
-- RSA takes odd exponents from 3 to 33 bits and moduli from 2048 to 8192 bits.
+- RSA takes odd exponents from 3 to 2^33 - 1. The general public key
+  constructors require 2048 to 8192 modulus bits. The DKIM-specific
+  verification function accepts modulus sizes of 1024 through 4096 bits
+  for PKCS#1 v1.5 with a supplied SHA-256 digest. It returns the exact
+  modulus size with the result and keeps the parsed key private.
 - ML-KEM encapsulation applies FIPS 203 7.2's modulus check to the peer's key and
   decapsulation 7.3's hash check to its own. A bad ciphertext is not refused: it gets
   the implicit rejection value, which is the specification's point.

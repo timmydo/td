@@ -57,12 +57,19 @@ impl PublicKey {
     /// Big-endian modulus and exponent with no leading zero byte: 2048 to 8192
     /// bits, and an odd exponent of at least 3 and at most 33 bits.
     pub fn from_parts(n: &[u8], e: &[u8]) -> Result<Self, Refused> {
+        Self::from_parts_bounded(n, e, MIN_MODULUS_BITS, MAX_MODULUS_BITS)
+    }
+
+    fn from_parts_bounded(n: &[u8], e: &[u8], min: usize, max: usize) -> Result<Self, Refused> {
+        if n.len() > max.div_ceil(8) {
+            return Err(Refused);
+        }
         let &first = n.first().ok_or(Refused)?;
         if first == 0 || e.first().is_none_or(|high| *high == 0) || e.len() > 8 {
             return Err(Refused);
         }
         let modulus_bits = 8 * n.len() - first.leading_zeros() as usize;
-        if !(MIN_MODULUS_BITS..=MAX_MODULUS_BITS).contains(&modulus_bits) {
+        if !(min..=max).contains(&modulus_bits) {
             return Err(Refused);
         }
         let exponent = e
@@ -134,11 +141,15 @@ impl PublicKey {
         signature: &[u8],
     ) -> Result<(), Refused> {
         let recovered = self.public_operation(signature)?;
-        let digest = D::digest(message);
+        self.check_pkcs1::<D>(&recovered, &D::digest(message))
+    }
+
+    fn check_pkcs1<D: RsaHash>(&self, recovered: &[u8], digest: &D::Output) -> Result<(), Refused> {
         let tail = D::DIGEST_INFO.len() + D::OUTPUT_LEN;
-        // RFC 8017 asks for at least 8 bytes of padding, which the 2048-bit floor
-        // leaves with room to spare under every hash here.
         let padding = self.len().checked_sub(tail + 3).ok_or(Refused)?;
+        if padding < 8 {
+            return Err(Refused);
+        }
         let mut expected = Vec::with_capacity(self.len());
         expected.extend_from_slice(&[0, 1]);
         expected.resize(2 + padding, 0xff);
@@ -205,6 +216,23 @@ impl PublicKey {
             Err(Refused)
         }
     }
+}
+
+/// PKCS#1 v1.5 SHA-256 over a precomputed header digest. The DKIM key
+/// range does not create a general-purpose PublicKey with a smaller floor.
+pub fn verify_dkim_sha256(
+    der_key: &[u8],
+    digest: &[u8; 32],
+    signature: &[u8],
+) -> Result<(u16, bool), Refused> {
+    let (n, e) = der::two_integers(der_key)?;
+    let key = PublicKey::from_parts_bounded(n, e, 1024, 4096)?;
+    let bits = u16::try_from(key.modulus_bits).map_err(|_| Refused)?;
+    let verified = key
+        .public_operation(signature)
+        .and_then(|recovered| key.check_pkcs1::<Sha256>(&recovered, digest))
+        .is_ok();
+    Ok((bits, verified))
 }
 
 fn mgf1_xor<D: Digest>(seed: &[u8], out: &mut [u8]) {

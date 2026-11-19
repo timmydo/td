@@ -117,6 +117,9 @@ impl<J: Job> Job for ObservedJob<J> {
         }
         Ok(())
     }
+    fn dkim_input(&self) -> Option<&[u8]> {
+        self.inner.dkim_input()
+    }
     fn prepare(&mut self, deadline: Deadline) -> Result<(), smtp_storage::Failure> {
         self.inner.prepare(deadline)
     }
@@ -126,6 +129,14 @@ impl<J: Job> Job for ObservedJob<J> {
         spf: Option<td_mta::spf::Outcome>,
     ) -> Result<(), smtp_storage::Failure> {
         self.inner.prepare_with_spf(deadline, spf)
+    }
+    fn prepare_with_auth(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<td_mta::spf::Outcome>,
+        dkim: Option<td_mta::dkim::Report>,
+    ) -> Result<(), smtp_storage::Failure> {
+        self.inner.prepare_with_auth(deadline, spf, dkim)
     }
     fn commit(&mut self) -> Result<smtp_storage::Completion, smtp_storage::Failure> {
         if self.gated {
@@ -549,7 +560,8 @@ pub(super) fn exercise(
                 // The second acceptance spends a two-message burst, so a MAIL
                 // pipelined behind its final dot is refused and the session closes.
                 envelope(&mut client);
-                client.get_mut().write_all(b"Subject: second\r\n\r\nbody\r\n.\r\nMAIL FROM:<sender@example.test>\r\n").unwrap();
+                client.get_mut().write_all(super::dkim_vectors::MESSAGE).unwrap();
+                client.get_mut().write_all(b".\r\nMAIL FROM:<sender@example.test>\r\n").unwrap();
                 client.get_mut().flush().unwrap();
                 reply(&mut client, "250");
                 reply(&mut client, "421 4.7.0");
@@ -558,6 +570,11 @@ pub(super) fn exercise(
                 // Closing ends the server's drain, so the slot frees promptly.
                 drop(client);
                 assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
+                // The silent resolver spent the observation window. The signed
+                // message still reached durable custody without a false pass.
+                let trace = sql(fixture, "SELECT split_part(split_part(encode(substring(bytes FROM 1 FOR 8192),'escape'), E'\\r\\nReceived: ', 1), 'X-TD-DKIM-Results: ', 2) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('football.example.com','UTF8') in bytes)>0");
+                assert!(trace.starts_with("incomplete;"), "{trace}");
+                assert!(!trace.contains("result=pass"));
                 // A new session from the address is greeted, then refused at MAIL.
                 let greeted = Instant::now() + Duration::from_secs(20);
                 let mut again = loop {

@@ -43,6 +43,7 @@ changing that validator requires an explicit atomic implementation update.
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
 | Direct SPF worker stack and evaluation scratch | 1 | 2097152 | 2097152 |
+| Direct DKIM worker stack and verification scratch | 1 | 4194304 | 4194304 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 11 | 262144 | 2883584 |
 | Unix connector stacks | 8 | 262144 | 2097152 |
@@ -58,10 +59,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **437961984** |
+| **Total** | | | **442156288** |
 
-The total is approximately 417.67 MiB against a 512 MiB configured budget;
-the remaining 98908928 bytes are unassigned headroom, not another cache.
+The total is approximately 421.67 MiB against a 512 MiB configured budget;
+the remaining 94714624 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -410,7 +411,7 @@ M21 must measure this separate process and its bounded page/body lifecycle.
 
 ## Direct receiving runtime
 
-Direct SMTP uses fixed storage, TLS and SPF workers. One SPF worker serves
+Direct SMTP uses fixed storage, TLS, SPF and DKIM workers. One SPF worker serves
 all SMTP slots. Each slot has room for one queued envelope and one result;
 a new MAIL replaces the previous generation. When the envelope is cleared
 by RSET, a new greeting, a disconnect or slot retirement, or the receiver
@@ -428,9 +429,22 @@ observation produces `temperror`. The direct SMTP SIZE and header limits
 reserve space for the longest generated Received-SPF trace and escaped
 envelope values.
 
+The DKIM worker verifies the original dot-unstuffed DATA before the receiver
+rewrites trace headers. It borrows the admitted bytes under the individual
+session lock. Other sessions can continue network and storage work. The
+worker handles one message at a time with a 1 MiB stack and 3 MiB of scratch,
+including the DNS packet and header descriptors. Verification examines up
+to four signatures, 1,024 fields in the first 256 KiB of headers, 128 signed
+field names per signature and 16 KiB per signature or key tag list.
+Repeated body canonicalization modes and lengths reuse a digest within
+the message. SPF and DKIM share the
+same final wait of up to 200 ms. Queued observations expire within that
+window, including when the full commit budget needs the time. An incomplete
+observation is recorded on delivery.
+
 A startup-reserved vector holds at most the configured SMTP connection
 count (compiled maximum 32). Each mutex-protected slot owns its protocol,
-transport, optional ingress job and one phase: empty, network, awaiting SPF, queued,
+transport, optional ingress job and one phase: empty, network, awaiting authentication, queued,
 completed, retry or retiring. Worker scans replace separate work queues:
 each worker performs at most one operation per eligible slot per pass.
 Only the matching worker executes a queued operation. DATA chunk copies do
@@ -442,8 +456,10 @@ There are no queued references that can outlive this phase, so these slots
 need neither scalar reuse tokens nor a separate completion-credit ledger.
 The retained slot is the completion reservation before every effect.
 
-Main uses nonblocking slot locks and a round-robin socket scan. Threads
-use park/unpark with a maximum five-millisecond wait. Pending TLS turns
+Main uses nonblocking slot locks and a round-robin socket scan. It wakes
+workers after releasing slot locks. The network, TLS and storage loops park
+for at most five milliseconds. The DKIM worker retries a contended scan
+within five milliseconds and sleeps until signaled after an idle scan. Pending TLS turns
 are rescheduled no sooner than ten milliseconds after completion and keep
 the original handshake deadline. Storage coordination retries retain the
 captured operation deadline and wait at least five milliseconds after a
