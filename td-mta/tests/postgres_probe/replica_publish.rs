@@ -125,7 +125,7 @@ pub(super) fn exercise(
     let mut publisher = open();
     sql(
         &fixture,
-        "UPDATE td_mta.replica_accounts SET receipt_limit=2",
+        "UPDATE td_mta.replica_accounts SET receipt_limit=1",
     );
     assert_eq!(
         publisher.publish(effect.clone(), deadline()),
@@ -219,6 +219,59 @@ pub(super) fn exercise(
         ),
         "1"
     );
+    drop(publisher);
+    // An upgraded replica with both a copied Email and legacy absences keeps
+    // its pending page and can resume at the original live capacity.
+    super::rewind_replica_retention(&fixture);
+    sql(&fixture, "INSERT INTO td_mta.replica_email_receipts SELECT account,decode(repeat('ef',16),'hex'),generation,int8send(0),digest,false FROM td_mta.replica_email_receipts;
+        INSERT INTO td_mta.replica_email_receipts SELECT account,decode(repeat('ee',16),'hex'),generation,observed,digest,false FROM td_mta.replica_email_receipts WHERE present;
+        INSERT INTO td_mta.replica_mailbox_receipts SELECT account,decode(repeat('ef',16),'hex'),observed,false FROM td_mta.replica_mailbox_receipts WHERE present;
+        UPDATE td_mta.replica_progress SET receipt_count=6");
+    sql(
+        &fixture,
+        "CREATE TABLE td_mta.replica_absent_by_observation(obstruction bigint)",
+    );
+    assert_eq!(
+        postgres_schema::upgrade(&owner, &trust, deadline()),
+        Err(postgres_schema::Error::Database)
+    );
+    assert_eq!(sql(&fixture, "SELECT max(version), (SELECT count(*) FROM td_mta.replica_email_receipts WHERE NOT present AND digest IS NOT NULL) FROM td_mta.schema_migrations"), "43|2");
+    sql(&fixture, "DROP TABLE td_mta.replica_absent_by_observation;
+        CREATE FUNCTION public.check_upgrade_time() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF (SELECT min(setting::bigint) FROM pg_settings WHERE name IN ('statement_timeout','transaction_timeout')) NOT BETWEEN 10001 AND 120000
+            THEN RAISE EXCEPTION 'schema upgrade deadline'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER migration_time BEFORE UPDATE ON td_mta.replica_progress FOR EACH ROW EXECUTE FUNCTION public.check_upgrade_time()");
+    assert_eq!(
+        postgres_schema::upgrade(
+            &owner,
+            &trust,
+            std::time::Instant::now() + std::time::Duration::from_secs(120)
+        )
+        .unwrap()
+        .version,
+        44
+    );
+    sql(
+        &fixture,
+        "DROP TRIGGER migration_time ON td_mta.replica_progress",
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT receipt_count FROM td_mta.replica_progress"
+        ),
+        "2"
+    );
+    assert_eq!(sql(&fixture, "SELECT identity=e.blob_id || e.thread_id || int8send(e.received_at) FROM td_mta.replica_email_receipts r JOIN td_mta.emails e USING(account,id)"), "t");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.replica_email_receipts WHERE NOT present AND identity IS NULL AND digest IS NULL"), "1");
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.replica_mailbox_receipts WHERE NOT present"
+        ),
+        "0"
+    );
+    let mut publisher = open();
     sql(
         &fixture,
         "UPDATE td_mta.replica_blob_identities SET digest=decode(repeat('00',32),'hex')",
@@ -277,6 +330,31 @@ pub(super) fn exercise(
         ),
         "1"
     );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT receipt_count FROM td_mta.replica_progress"
+        ),
+        "0"
+    );
+    let rebound = observation_details(
+        &source,
+        page,
+        id,
+        3,
+        Some(&[]),
+        None,
+        Some(td_mta::ids::ThreadId::from_bytes([0x39; 16])),
+    );
+    let rebound = Arc::new(
+        Effect::prepare_existing(&source, account, ticket, &rebound, id, deadline()).unwrap(),
+    );
+    assert_eq!(
+        publisher.publish(rebound, deadline()),
+        Err(Error::Integrity)
+    );
+    drop(publisher);
+    let mut publisher = open();
     let restored = observation(&source, page, id, 3, Some(&[]));
     let reuse_absent = Arc::new(
         Effect::prepare_existing(&source, account, ticket, &restored, id, deadline()).unwrap(),
@@ -402,6 +480,9 @@ pub(super) fn exercise(
         )
         .unwrap(),
     );
+    // Preserve absence conflicts at or ahead of the cursor. A receipt for previously
+    // copied mail also retires when its absence is behind the checkpoint.
+    sql(&fixture, &format!("INSERT INTO td_mta.replica_email_receipts(account,id,generation,observed,present,identity) SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),generation,int8send({}::bigint+n-1),false,CASE WHEN n=0 THEN decode(repeat('01',40),'hex') END FROM td_mta.replica_progress CROSS JOIN generate_series(0,2) n", change_state.sequence.number()));
     sql(&fixture,"CREATE TRIGGER reject_replica_completion BEFORE UPDATE ON td_mta.replica_pending FOR EACH ROW EXECUTE FUNCTION public.reject_replica_completion()");
     assert_eq!(
         publisher.advance(empty.clone(), deadline()),
@@ -413,6 +494,13 @@ pub(super) fn exercise(
             .unwrap();
     assert_eq!(progress.email_cursor, base);
     let pending = progress.pending.unwrap();
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.replica_email_receipts WHERE NOT present"
+        ),
+        "4"
+    );
     assert_eq!(pending.ticket(), second);
     assert!(pending.complete());
     sql(
@@ -437,6 +525,13 @@ pub(super) fn exercise(
     let progress =
         td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
             .unwrap();
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.replica_email_receipts WHERE NOT present"
+        ),
+        "2"
+    );
     assert_eq!(progress.email_cursor, change_state);
     assert!(progress.pending.unwrap().complete());
     assert_eq!(publisher.advance(next_page, deadline()), Err(Error::Stale));
@@ -462,7 +557,10 @@ pub(super) fn exercise(
     let observed_text = next_state.encode(&mut state_bytes).unwrap();
     let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let account_text = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
-    let response = td_json::json!({"accountId":account_text,"sourceId":source.epoch().to_string(),"baseState":base_text,"state":observed_text,"ids":[],"nextCursor":null});
+    let absent_id = cursor.upper;
+    let mut id_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let absent_text = td_mta::wire::encode_id(absent_id, &mut id_bytes).unwrap();
+    let response = td_json::json!({"accountId":account_text,"sourceId":source.epoch().to_string(),"baseState":base_text,"state":observed_text,"ids":[absent_text],"nextCursor":null});
     let continuation = td_mta::replica_source::inventory(
         &response,
         Binding {
@@ -500,6 +598,47 @@ pub(super) fn exercise(
             page: 2
         }
     );
+    let ticket = Ticket {
+        generation: 2,
+        page: 2,
+    };
+    let not_found = observation(&source, page, absent_id, 6, None);
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_accounts SET receipt_limit=2",
+    );
+    let absent = Arc::new(
+        Effect::prepare(
+            &source,
+            account,
+            ticket,
+            &not_found,
+            absent_id,
+            None,
+            deadline(),
+        )
+        .unwrap(),
+    );
+    let observed = publisher.publish(absent, deadline()).unwrap();
+    assert!(!observed.changed && !observed.present);
+    let contradiction = observation(&source, page, absent_id, 6, Some(&[]));
+    let present = Arc::new(
+        Effect::prepare_existing(
+            &source,
+            account,
+            ticket,
+            &contradiction,
+            absent_id,
+            deadline(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        publisher.publish(present, deadline()),
+        Err(Error::Integrity)
+    );
+    drop(publisher);
+    let mut publisher = open();
     let progress =
         td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
             .unwrap();
@@ -525,7 +664,7 @@ pub(super) fn exercise(
     drop(publisher);
     sql(
         &fixture,
-        "UPDATE td_mta.replica_pending SET done=decode(repeat('00',128),'hex')",
+        "UPDATE td_mta.replica_pending SET done=decode('01'||repeat('00',127),'hex')",
     );
     let mut publisher = open();
     assert!(publisher
@@ -566,6 +705,17 @@ pub(super) fn observation_with_mailboxes(
     keywords: Option<&[&str]>,
     folders: Option<&[td_mta::ids::MailboxId]>,
 ) -> MetadataPage {
+    observation_details(source, page, id, advance, keywords, folders, None)
+}
+fn observation_details(
+    source: &Source,
+    page: &MetadataPage,
+    id: EmailId,
+    advance: u64,
+    keywords: Option<&[&str]>,
+    folders: Option<&[td_mta::ids::MailboxId]>,
+    thread: Option<td_mta::ids::ThreadId>,
+) -> MetadataPage {
     use td_json::{json, Json};
     use td_mta::{bounded::TextBuffer, format::Sequence, sync::DataState, wire};
     let metadata = page.view().unwrap();
@@ -582,7 +732,7 @@ pub(super) fn observation_with_mailboxes(
     let blob = wire::encode_id(original.blob, &mut id_bytes)
         .unwrap()
         .to_owned();
-    let thread = wire::encode_id(original.thread, &mut id_bytes)
+    let thread = wire::encode_id(thread.unwrap_or(original.thread), &mut id_bytes)
         .unwrap()
         .to_owned();
     let mailboxes = Json::Obj(

@@ -19,6 +19,8 @@ use std::{
 };
 use td_crypto::TrustStore;
 
+pub(crate) const MAX_STEP_EMAILS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Invalid,
@@ -203,14 +205,22 @@ impl<'a> Worker<'a> {
             .source_limits()
             .map_err(Error::Source)?
             .metadata_ids
-            .min(16);
+            .min(MAX_STEP_EMAILS);
         if maximum == 0 {
             return Err(Error::Invalid);
         }
         let mut ids = Vec::new();
         ids.try_reserve_exact(maximum)
             .map_err(|_| Error::Capacity)?;
-        ids.extend(pending.unfinished().take(maximum));
+        // Finish already-local objects first: a removal later in the pending
+        // page can release capacity for an earlier arrival.
+        let local = progress.local_work.iter().flatten().copied();
+        let others = if progress.local_work.first() == Some(&None) {
+            maximum
+        } else {
+            0
+        };
+        ids.extend(local.chain(pending.unfinished().take(others)).take(maximum));
         let page = reader.metadata(&ids).map_err(Error::Source)?;
         let inventory = matches!(pending.advance(), Advance::Inventory(_));
         for id in ids {

@@ -113,22 +113,8 @@ pub(super) fn exercise(
             },
         ],
     );
-    let mut publisher = open();
-    let before = publisher.inspect(deadline()).unwrap();
-    sql(
-        fixture,
-        &format!(
-            "UPDATE td_mta.replica_accounts SET receipt_limit={}",
-            before.receipt_count
-        ),
-    );
-    assert_eq!(
-        publisher.mailboxes(initial.clone(), deadline()),
-        Err(Error::Quota)
-    );
-    drop(publisher);
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes"), "1");
-    sql(fixture,"UPDATE td_mta.replica_accounts SET receipt_limit=100; CREATE TRIGGER reject_replica_graph BEFORE UPDATE ON td_mta.replica_progress FOR EACH ROW EXECUTE FUNCTION public.reject_replica_completion()");
+    let before = open().inspect(deadline()).unwrap();
+    sql(fixture, "UPDATE td_mta.replica_accounts SET receipt_limit=2; CREATE TRIGGER reject_replica_graph BEFORE UPDATE ON td_mta.replica_progress FOR EACH ROW EXECUTE FUNCTION public.reject_replica_completion()");
     let mut publisher = open();
     assert_eq!(
         publisher.mailboxes(initial.clone(), deadline()),
@@ -262,7 +248,7 @@ pub(super) fn exercise(
             fixture,
             "SELECT count(*) FROM td_mta.replica_mailbox_receipts"
         ),
-        "4"
+        "2"
     );
     assert_eq!(
         publisher.inspect(deadline()).unwrap().mailbox_checkpoint,
@@ -290,4 +276,38 @@ pub(super) fn exercise(
     drop(publisher);
     let mut publisher = open();
     assert_eq!(publisher.mailboxes(initial, deadline()), Err(Error::Stale));
+    drop(publisher);
+    // Folder replacement stays bounded even with the Email/Blob budget full.
+    sql(
+        fixture,
+        "UPDATE td_mta.replica_accounts SET receipt_limit=2",
+    );
+    for n in 0..8 {
+        let mut publisher = open();
+        let graph = graph(
+            source,
+            account,
+            state(23 + n),
+            &[
+                root(),
+                Folder {
+                    id: replacement,
+                    name: "New archive".into(),
+                    parent: None,
+                    role: Some("archive"),
+                },
+                Folder {
+                    id: MailboxId::from_bytes([n as u8 + 1; 16]),
+                    name: format!("Transient {n}"),
+                    parent: None,
+                    role: None,
+                },
+            ],
+        );
+        assert!(publisher.mailboxes(graph, deadline()).unwrap().changed);
+        assert_eq!(
+            sql(fixture, "SELECT receipt_count FROM td_mta.replica_progress"),
+            "2"
+        );
+    }
 }

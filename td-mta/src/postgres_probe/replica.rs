@@ -224,7 +224,8 @@ impl ReplicaSession {
                 match job {
                     Job::Mailboxes(graph)=>crate::postgres_replica_mailboxes::publish(client,&graph,deadline,&marker).await.map(Completed::Mailboxes),
                     Job::Inspect {source,account}=>{
-                        let progress=crate::postgres_replica_progress::read_snapshot(client,source,account).await.map_err(|_|apply::Error::Integrity)?;
+                        let mut progress=crate::postgres_replica_progress::read_snapshot(client,source,account).await.map_err(|_|apply::Error::Integrity)?;
+                        progress.select_local_work(client).await.map_err(|_|apply::Error::Database)?;
                         client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
                         Ok(Completed::Inspected(Box::new(progress)))
                     },

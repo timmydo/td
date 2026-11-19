@@ -247,16 +247,6 @@ pub(crate) async fn publish(
     }
     hierarchy.sort_unstable_by_key(|m| m.0);
     crate::postgres_mailboxes::hierarchy_ids(&hierarchy).map_err(|_| Error::Integrity)?;
-    let existing=client.query_typed_one("SELECT count(*) FROM td_mta.replica_mailbox_receipts WHERE account=$1 AND id=ANY($2::bytea[])",&[(&account,Type::BYTEA),(&ids,Type::BYTEA_ARRAY)]).await.map_err(|_|Error::Database)?.try_get::<_,i64>(0).map_err(|_|Error::Integrity)?;
-    let extra = ids
-        .len()
-        .checked_sub(usize::try_from(existing).map_err(|_| Error::Integrity)?)
-        .ok_or(Error::Integrity)?;
-    let receipts = progress
-        .receipt_count
-        .checked_add(extra as u64)
-        .filter(|count| *count <= progress.limits.receipts)
-        .ok_or(Error::Quota)?;
     let next = if changes.is_empty() {
         old
     } else {
@@ -265,12 +255,29 @@ pub(crate) async fn publish(
     write_changes(client, account, &changes, next).await?;
     client.execute_typed("UPDATE td_mta.replica_mailbox_receipts SET observed=$3,present=false WHERE account=$1 AND present AND NOT(id=ANY($2::bytea[]))",&[(&account,Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&observed.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
     if client.execute_typed("INSERT INTO td_mta.replica_mailbox_receipts(account,id,observed,present) SELECT $1,id,$3,true FROM unnest($2::bytea[]) q(id) ON CONFLICT(account,id) DO UPDATE SET observed=EXCLUDED.observed,present=true",&[(&account,Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&observed.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=ids.len() as u64 {return Err(Error::Integrity);}
+    client.execute_typed(
+        "DELETE FROM td_mta.replica_mailbox_receipts r WHERE account=$1 AND NOT present AND NOT EXISTS (SELECT FROM td_mta.mailboxes m WHERE (m.account,m.id)=(r.account,r.id))",
+        &[(&account, Type::BYTEA)],
+    ).await.map_err(|_| Error::Database)?;
     let checkpoint = if retained.is_empty() {
         observed
     } else {
         progress.mailbox_checkpoint.sequence.number()
     };
-    if client.execute_typed("UPDATE td_mta.replica_progress SET receipt_count=$2,mailbox_checkpoint=$3 WHERE account=$1",&[(&account,Type::BYTEA),(&(receipts as i64),Type::INT8),(&checkpoint.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+    if client
+        .execute_typed(
+            "UPDATE td_mta.replica_progress SET mailbox_checkpoint=$2 WHERE account=$1",
+            &[
+                (&account, Type::BYTEA),
+                (&checkpoint.to_be_bytes().as_slice(), Type::BYTEA),
+            ],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        != 1
+    {
+        return Err(Error::Integrity);
+    }
     if next != old
         && client
             .execute_typed(

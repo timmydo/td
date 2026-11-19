@@ -358,9 +358,9 @@ padding bits. Each effect's completion bit must commit with its local publicatio
 only all completed effects permit advancement to the page's original continuation.
 A newer per-object observation never becomes the global change checkpoint.
 
-The account initializer persists only the first page. Bounded receipt retention and restart orchestration
-remain subsequent work. Limits reserve no bodies and cannot authorize an
-unbounded writer. Exhaustion pauses publication without skipping mail.
+The account initializer persists only the first page. Live quotas reserve no bodies. When live contents exceed those limits,
+publication pauses without skipping mail. Historical identity storage is
+accounted for separately below.
 This increment does not make a replica usable or certify copy completeness.
 
 ### Reloading persisted work
@@ -402,20 +402,42 @@ Publication locks the local account and commits the body, Email, source IDs,
 thread membership, mailbox memberships, keywords, usage, local change history,
 source receipt and pending completion bit together. It never advances the
 page continuation or global source cursor. Missing mailbox dependencies pause
-publication. An existing Email cannot change its immutable body, thread or
-received timestamp. Local sequence numbers advance only when visible content
+publication. While a receipt exists, a previously observed Email keeps its
+original Blob, thread and received timestamp across updates and restoration.
+Local sequence numbers advance only when visible content
 changes. Repeating the same observation is idempotent; older observations and
 conflicting data at the same source state refuse. A newer observation with
 unchanged content updates the receipt without inventing a local change.
 
-Schema 38 adds bounded Email receipts and immutable Blob identity receipts.
-Bodies no longer referenced by Emails, leases or submissions may be collected;
-the identity receipt and core Blob-ID reservation survive. Reappearance may
-restore only the exact original length and digest under that Blob ID. Ordinary
-publication still refuses previously reserved Blob IDs. Body-byte, blob,
-Email and receipt limits are checked transactionally. Receipts currently remain
-until an explicit future retention implementation; reaching their configured
-limit pauses copying and does not discard safety evidence or mail.
+The receipt quota counts each live Email and each distinct live Blob. Folder
+receipts have their own limit of 256 readable mailboxes. The transaction
+that changes the data also updates the count. A restore must fit the same
+live limits as a new copy.
+
+Once no Email, lease or submission references a Blob, the body can be
+collected. Its ID reservation, length and digest survive so that a later
+download under the same Blob ID must match the original. These fixed-size
+records consume disk space per distinct copied Blob outside the live receipt
+quota. Size and verify the physical storage budget as described in
+[replica operations](REPLICA-OPERATIONS.md#size-and-verify-the-replica-volume).
+Ordinary publication still refuses previously reserved Blob IDs.
+
+An Email deletion releases its live charge immediately. Its receipt retains
+the last observed absence and, when known, the original Blob ID, thread ID
+and received timestamp. A fetch can observe source state newer than the
+pending page. Retiring that receipt when the page completes could let a
+contradictory observation at the same state restore the deleted mail.
+Each page transition deletes up to one maximum changes page of absent
+Email receipts strictly behind the durable Email changes cursor. Initial
+inventory pins the cursor. Until catch-up passes these observations,
+absences consume temporary disk space outside the live quota.
+
+A future page must carry an observation at or above its source state, so
+retiring older absences preserves replay checks. A newer source observation
+that presents the same Email ID after retirement must pass the usual
+new-copy checks, including the permanent Blob identity check. Schema 44
+recomputes live usage and backfills immutable tuples for existing Emails.
+An older absent receipt that lacks a tuple retains its source-state check.
 
 A purpose-specific runtime role requires write access to replica progress,
 pending work, mailbox receipts, Email receipts and Blob identities while source
@@ -433,7 +455,7 @@ remains success even if subsequent connection retirement fails.
 
 This is a library primitive, not an operator copy command or a read service.
 No resident worker, new default memory allowance, local credentials or source
-configuration is enabled. Copy scheduling, retention
+configuration is enabled. Copy scheduling
 and completeness validation remain required before a usable full-copy claim.
 
 ### Reusing verified local bodies
@@ -491,7 +513,7 @@ cursor represents fully completed previous work, and the next page retains its
 own original newState until a subsequent transition. Status must distinguish
 these values and must not promote an object observation into a checkpoint.
 This primitive adds no polling worker, mailbox reconciliation, expired-history
-reset, receipt pruning, read service or copy-completeness claim.
+reset, read service or copy-completeness claim.
 
 ### Full mailbox graph reconciliation
 
@@ -514,17 +536,18 @@ The visible union, including retained retired folders, must fit the existing
 256-mailbox bound. A source graph that fits by itself may temporarily exceed
 that limit when combined with local removal dependencies. Capacity refusal
 pauses reconciliation and leaves the previous view intact; this limitation is
-explicit, not truncation or copy completion. Receipt accumulation shares the
-configured receipt quota. Historical tombstones remain bounded by that quota.
+explicit, not truncation or copy completion. A complete graph removes receipts
+for folders it can delete. Its surviving Inbox receipt
+records the latest graph observation even while other removals are deferred.
 Schema 39 adds latest-observation and present-folder receipt indexes so graph
 checks do not scan all historical mailbox identities.
 
-Changes, local history/sequence, source receipts, receipt usage and the Mailbox
+Changes, local history/sequence, source receipts and the Mailbox
 checkpoint commit together. The checkpoint advances only once no retired
 removal dependencies remain. Repeating the same source graph can remove folders
 whose references have since cleared and then finish the checkpoint; repeating
 an already applied graph emits no local change. Metadata-only observation
-changes do not advance the Email cursor. The copy scheduler, retention, history
+changes do not advance the Email cursor. The copy scheduler, history
 reset and completeness qualification remain subsequent work.
 
 ### Bounded copy steps
@@ -537,7 +560,9 @@ reloads durable progress through the restricted runtime publisher, authenticates
 fresh source discovery, and reconciles the complete mailbox graph before Email
 work. It either applies at most 16 unfinished IDs (also bounded by negotiated
 metadata limits), or advances a completed page. It never advances unfinished
-work. Initial inventory downloads and verifies each complete body; change
+work. The worker checks unfinished IDs already present locally first, so
+authoritative removals in the page release capacity before new arrivals.
+Initial inventory downloads and verifies each complete body; change
 catch-up reuses a matching local Blob and downloads only MissingBody results.
 The source HTTP connection is reused within the step. No source or local SQL
 transaction spans a network body download.
@@ -603,7 +628,8 @@ Prepare a fresh schema and bind it with `postgres replica-source-init` first.
 `postgres replica-account-init` takes the owner connection, local epoch,
 source origin/epoch, preserved account ID, username, protected password file,
 optional CA file and explicit positive `--body-bytes`, `--blobs`, `--emails`
-and `--receipts` quotas. A td source's account may hold up to its
+and `--receipts` quotas. Each live Email and each distinct live Blob uses
+one receipt. A td source's account may hold up to its
 `queue_submissions` × 16 KiB of body and that many blobs past its own caps
 in compact failure notices (POSTGRES.md section 213); replica quotas equal
 to the source caps stall on such an account. It authenticates discovery and obtains the initial
@@ -767,7 +793,8 @@ It reports no full-copy or disaster-recovery qualification.
 ## Fresh local provisioning
 
 `./install-td-mta --setup-replica --help` describes preparation of a fresh,
-private local PostgreSQL installation. It uses the installed td-mta executable,
+private local PostgreSQL installation. Provision the dedicated replica volume
+and verify its size before setup (REPLICA-OPERATIONS.md). It uses the installed td-mta executable,
 and PostgreSQL 17, requires no OpenSSL, and never adopts existing data.
 An explicit source origin, protected source password, local account address,
 resolver and positive body/blob/Email/receipt quotas are required. Source login

@@ -467,7 +467,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 43);
+    assert_eq!(receipt.version, 44);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -544,7 +544,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        43
+        44
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -685,12 +685,12 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":43"));
+    assert!(initialized.contains("\"schema_version\":44"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
     let plan = invoke("schema-plan", 0);
-    assert!(plan.contains("\"current\":43,\"target\":43"));
+    assert!(plan.contains("\"current\":44,\"target\":44"));
     assert!(plan.contains("\"pending\":[]"));
     assert!(plan.contains("\"leases\":\"SELECT, INSERT, DELETE\""));
     let inspected = invoke("schema-inspect", 0);
@@ -712,8 +712,8 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     );
     assert!(invoke("schema-plan", 1).contains("unsupported-version-or-checksum"));
     assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
-    sql(&fixture, "UPDATE td_mta.schema_migrations SET version=2 WHERE version=99; DELETE FROM td_mta.schema_migrations WHERE version=43");
-    assert!(invoke("schema-plan", 0).contains("\"pending\":[43]"));
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version=2 WHERE version=99; DELETE FROM td_mta.schema_migrations WHERE version=44");
+    assert!(invoke("schema-plan", 0).contains("\"pending\":[44]"));
     assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(invoke("schema-init", 1).contains("input-private-mode"));
@@ -944,7 +944,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=43",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=44",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -952,7 +952,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=43 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=44 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1135,7 +1135,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 43);
+    assert_eq!(receipt.version, 44);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -2020,7 +2020,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 43);
+        assert_eq!(receipt.version, 44);
         assert_eq!(
             sql(
                 &fixture,
@@ -2096,6 +2096,12 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     }
 }
 
+// The historical test schemas predate the identity column and absence index.
+// Dropping the column also removes its dependent constraint. Callers rewind before inserting historical absences.
+fn rewind_replica_retention(fixture: &Fixture) {
+    sql(fixture, "DROP INDEX td_mta.replica_absent_by_observation; ALTER TABLE td_mta.replica_email_receipts DROP COLUMN identity, ALTER COLUMN digest SET NOT NULL; DELETE FROM td_mta.schema_migrations WHERE version=44");
+}
+
 #[test]
 #[ignore = "real PostgreSQL 17 with pg_trgm 1.6 required"]
 fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
@@ -2109,7 +2115,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
     };
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 43);
+    assert_eq!(receipt.version, 44);
     assert_eq!(sql(&fixture,
         "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
         "1.6:search_owner:td_mta_trgm");
@@ -2124,6 +2130,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         td_mta::postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
         Err(td_mta::postgres_schema::Error::Owner)
     );
+    rewind_replica_retention(&fixture);
     sql(&fixture, "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40; ALTER DATABASE postgres OWNER TO td_probe; REVOKE TEMP ON DATABASE postgres FROM PUBLIC; GRANT CREATE ON DATABASE postgres TO search_owner");
     sql(&fixture, include_str!("../src/postgres_receiving.sql"));
     sql(
@@ -2154,6 +2161,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536);
     // Exercise the deployed table with its runtime grants and a retained
     // operation. Upgrade must leave the account state and other grants intact.
+    rewind_replica_retention(&fixture);
     sql(
         &fixture,
         "DELETE FROM td_mta.schema_migrations WHERE version=43",
@@ -2166,6 +2174,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     );
     assert_eq!(sql(&fixture, "SELECT to_regclass('td_mta.receiving_receipts') IS NULL, encode(sequence,'hex') FROM td_mta.accounts"), "t|0000000000000001");
     let rewind = "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version>=40";
+    rewind_replica_retention(&fixture);
     sql(&fixture, rewind);
     sql(&fixture, include_str!("../src/postgres_receiving.sql"));
     sql(&fixture, "GRANT USAGE ON SCHEMA td_mta TO PUBLIC");

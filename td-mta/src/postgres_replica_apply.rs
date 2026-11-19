@@ -64,14 +64,22 @@ pub(crate) async fn apply(
     pending
         .applied(effect.ticket, effect.id, effect.observed)
         .map_err(|_| Error::Stale)?;
-    let receipt=client.query_typed_opt("SELECT generation,observed,digest,present FROM td_mta.replica_email_receipts WHERE account=$1 AND id=$2",&[(&account,Type::BYTEA),(&id,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+    let identity = effect.mail.as_ref().map(|mail| {
+        let mut value = [0u8; 40];
+        let (blob, rest) = value.split_at_mut(16);
+        let (thread, received) = rest.split_at_mut(16);
+        blob.copy_from_slice(mail.blob.as_bytes());
+        thread.copy_from_slice(mail.thread.as_bytes());
+        received.copy_from_slice(&mail.received_at.to_be_bytes());
+        value
+    });
+    let receipt=client.query_typed_opt("SELECT generation,observed,digest,present,identity FROM td_mta.replica_email_receipts WHERE account=$1 AND id=$2",&[(&account,Type::BYTEA),(&id,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
     let existing=client.query_typed_opt("SELECT blob_id,thread_id,received_at,changed FROM td_mta.emails WHERE account=$1 AND id=$2",&[(&account,Type::BYTEA),(&id,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
     let mut equal = false;
     match &receipt {
         Some(row) => {
             let generation = sequence(row, 0)?;
             let observed = sequence(row, 1)?;
-            let digest: [u8; 32] = bytes(row, 2)?;
             let present: bool = row.try_get(3).map_err(|_| Error::Integrity)?;
             if generation > progress.generation || generation == 0 || present != existing.is_some()
             {
@@ -80,7 +88,17 @@ pub(crate) async fn apply(
             if observed > effect.observed.sequence.number() {
                 return Err(Error::Stale);
             }
-            equal = digest == effect.digest;
+            let saved: Option<&[u8]> = row.try_get(4).map_err(|_| Error::Integrity)?;
+            if let (Some(saved), Some(identity)) = (saved, identity) {
+                if saved != identity {
+                    return Err(Error::Integrity);
+                }
+            }
+            equal = if present {
+                bytes::<32>(row, 2)? == effect.digest
+            } else {
+                effect.mail.is_none()
+            };
             if observed == effect.observed.sequence.number() && !equal {
                 return Err(Error::Integrity);
             }
@@ -92,7 +110,6 @@ pub(crate) async fn apply(
             if existing.is_some() {
                 return Err(Error::Integrity);
             }
-            progress.receipt_count = charge(progress.receipt_count, 1, progress.limits.receipts)?;
         }
     }
     let mut next = old;
@@ -113,6 +130,10 @@ pub(crate) async fn apply(
             {
                 return Err(Error::Integrity);
             }
+        }
+        if existing.is_none() {
+            progress.email_count = charge(progress.email_count, 1, progress.limits.emails)?;
+            progress.receipt_count = charge(progress.receipt_count, 1, progress.limits.receipts)?;
         }
         check_mailboxes(client, effect.account, mail, old).await?;
         blob(
@@ -180,7 +201,6 @@ pub(crate) async fn apply(
                 .await?;
             }
             (None, Some(mail)) => {
-                progress.email_count = charge(progress.email_count, 1, progress.limits.emails)?;
                 let created = thread(client, effect.account, mail.thread, next, old, true).await?;
                 if client.execute_typed("INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,3,$6)",&[(&account,Type::BYTEA),(&id,Type::BYTEA),(&mail.blob.as_bytes().as_slice(),Type::BYTEA),(&mail.thread.as_bytes().as_slice(),Type::BYTEA),(&mail.received_at,Type::INT8),(&next.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
                 relations(client, effect, mail, next).await?;
@@ -256,7 +276,11 @@ pub(crate) async fn apply(
                     thread_id.as_bytes(),
                 )
                 .await?;
-                collect_blob(client, effect.account, blob).await?;
+                let collected = collect_blob(client, effect.account, blob).await?;
+                progress.receipt_count = progress
+                    .receipt_count
+                    .checked_sub(1 + u64::from(collected))
+                    .ok_or(Error::Integrity)?;
             }
             (None, None) => return Err(Error::Integrity),
         }
@@ -298,7 +322,9 @@ pub(crate) async fn apply(
         }
     }
     let present = effect.mail.is_some();
-    if client.execute_typed("INSERT INTO td_mta.replica_email_receipts(account,id,generation,observed,digest,present) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(account,id) DO UPDATE SET generation=EXCLUDED.generation,observed=EXCLUDED.observed,digest=EXCLUDED.digest,present=EXCLUDED.present",&[(&account,Type::BYTEA),(&id,Type::BYTEA),(&effect.ticket.generation.to_be_bytes().as_slice(),Type::BYTEA),(&effect.observed.sequence.number().to_be_bytes().as_slice(),Type::BYTEA),(&effect.digest.as_slice(),Type::BYTEA),(&present,Type::BOOL)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+    let digest = effect.mail.as_ref().map(|_| effect.digest.as_slice());
+    let identity = identity.as_ref().map(|value| value.as_slice());
+    if client.execute_typed("INSERT INTO td_mta.replica_email_receipts AS r(account,id,generation,observed,digest,present,identity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account,id) DO UPDATE SET generation=EXCLUDED.generation,observed=EXCLUDED.observed,digest=EXCLUDED.digest,present=EXCLUDED.present,identity=COALESCE(r.identity,EXCLUDED.identity)",&[(&account,Type::BYTEA),(&id,Type::BYTEA),(&effect.ticket.generation.to_be_bytes().as_slice(),Type::BYTEA),(&effect.observed.sequence.number().to_be_bytes().as_slice(),Type::BYTEA),(&digest,Type::BYTEA),(&present,Type::BOOL),(&identity,Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
     if client
         .execute_typed(
             "UPDATE td_mta.replica_progress SET email_count=$2,receipt_count=$3 WHERE account=$1",
@@ -568,12 +594,12 @@ async fn blob(
         created_at,
         changed: next,
     };
+    *receipts = charge(*receipts, 1, limits.receipts)?;
     if identity.is_some() {
         publication::write_reserved_blob(client, value, deadline)
             .await
             .map_err(publication_error)?;
     } else {
-        *receipts = charge(*receipts, 1, limits.receipts)?;
         publication::write_blob(client, value, deadline)
             .await
             .map_err(publication_error)?;
@@ -584,18 +610,18 @@ async fn blob(
         .await
         .map_err(publication_error)
 }
-async fn collect_blob(client: &Client, account_id: AccountId, blob: BlobId) -> Result<(), Error> {
+async fn collect_blob(client: &Client, account_id: AccountId, blob: BlobId) -> Result<bool, Error> {
     let account = account_id.as_bytes().as_slice();
     let id = blob.as_bytes().as_slice();
     let deleted=client.query_typed_opt("DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=$2 AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length",&[(&account,Type::BYTEA),(&id,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
-    if let Some(row) = deleted {
+    if let Some(row) = &deleted {
         let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
         if length < 0 {
             return Err(Error::Integrity);
         }
         if client.execute_typed("UPDATE td_mta.account_usage SET body_bytes=body_bytes-$2,blob_count=blob_count-1 WHERE account=$1 AND body_bytes>=$2 AND blob_count>=1",&[(&account,Type::BYTEA),(&length,Type::INT8)]).await.map_err(|_|Error::Database)?!=1{return Err(Error::Integrity);}
     }
-    Ok(())
+    Ok(deleted.is_some())
 }
 
 /// A finite, thread-owned copy connection with closed replica operations.

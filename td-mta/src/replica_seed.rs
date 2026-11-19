@@ -77,9 +77,6 @@ impl Seed {
         {
             return Err(Error::Source);
         }
-        if graph.list.len() as u64 > limits.receipts {
-            return Err(Error::Capacity);
-        }
         let inbox = graph
             .list
             .iter()

@@ -44,6 +44,29 @@ pub struct Progress {
     pub email_count: u64,
     pub receipt_count: u64,
     pub pending: Option<Pending>,
+    pub(crate) local_work: [Option<EmailId>; crate::replica_copy::MAX_STEP_EMAILS],
+}
+
+impl Progress {
+    pub(crate) async fn select_local_work(&mut self, client: &Client) -> Result<(), Error> {
+        if self.pending.as_ref().is_none_or(Pending::complete) {
+            return Ok(());
+        }
+        let rows = client.query_typed(
+            "SELECT e.id FROM td_mta.replica_pending p
+                CROSS JOIN LATERAL generate_series(0,octet_length(p.ids)/16-1) AS n
+                JOIN td_mta.emails e ON e.account=p.account AND e.id=substring(p.ids FROM 16*n+1 FOR 16)
+             WHERE p.account=$1 AND get_bit(p.done,n)=0 ORDER BY e.id LIMIT $2",
+            &[(&self.account.as_bytes().as_slice(),Type::BYTEA),(&(crate::replica_copy::MAX_STEP_EMAILS as i64),Type::INT8)],
+        ).await.map_err(|_| Error::Database)?;
+        for (slot, row) in self.local_work.iter_mut().zip(rows) {
+            let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+            *slot = Some(EmailId::from_bytes(
+                id.try_into().map_err(|_| Error::Integrity)?,
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn inspect(
@@ -148,6 +171,7 @@ pub(crate) async fn read_snapshot(
         email_count,
         receipt_count,
         pending,
+        local_work: [None; crate::replica_copy::MAX_STEP_EMAILS],
     })
 }
 

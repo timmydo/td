@@ -752,12 +752,13 @@ selection and flag receipt relations with an initially empty passive configurati
 pointer, but no runtime role or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 9, or reports an
+PATH [--timeout-seconds N]` applies every missing migration or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
 These commands use the same protected bootstrap, verified TLS/SCRAM, fresh
-bounded DNS lookup and shared ten-second network deadline as the probe. They
+bounded DNS lookup and ten-second default deadline as the probe. Schema
+upgrade accepts a longer maintenance deadline, up to 3600 seconds. They
 try another resolved address only on a definite transport refusal before
 COMMIT; the schema worker converts every connection loss after COMMIT may
 have been sent to Indeterminate. No schema error, migration conflict or
@@ -8414,7 +8415,15 @@ transaction publishes the full effect, local change history and its pending
 completion bit. No global checkpoint is advanced. Body garbage collection keeps
 an immutable identity receipt and core ID reservation; replica-only restoration
 requires matching length and digest. Normal publication retains fresh-ID refusal.
-Receipt exhaustion pauses publication; no pruning or completeness claim is added.
+Schema 44 charges receipts for live Emails and Blobs and
+backfills the Email identity tuple for visible messages. Deletions release
+capacity under the account lock. Permanent Blob identity evidence and
+cursor-based Email receipt reclamation are specified in REPLICATION.md. For a
+large existing replica, the schema owner can give the fenced
+`postgres schema-upgrade` operation `--timeout-seconds N` (1 through 3600,
+default 10). The single deadline covers connection and all migration work.
+PostgreSQL uses the remaining time for the migration transaction and its
+statements. New connections and lock acquisition keep their existing bounds.
 A schema-37 binary cannot serve schema 38. Use the fenced upgrade procedure and
 a consistent backup; this increment does not deploy or activate a local replica.
 

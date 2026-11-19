@@ -166,6 +166,40 @@ pub(super) fn exercise(
     assert!(progress.pending.unwrap().complete());
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.emails"), "1");
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.blobs"), "1");
+    // Stand in for a previous copy of a now-destroyed source Email. The new
+    // source Email sorts before that removal in the pending changes. Their
+    // replacement fits exactly at one Email and one Blob.
+    sql(&fixture, &format!("BEGIN;
+        UPDATE td_mta.emails SET id=decode(repeat('ff',16),'hex');
+        UPDATE td_mta.replica_email_receipts SET id=decode(repeat('ff',16),'hex'),observed=int8send(0);
+        UPDATE td_mta.memberships SET email_id=decode(repeat('ff',16),'hex');
+        UPDATE td_mta.keywords SET email_id=decode(repeat('ff',16),'hex');
+        UPDATE td_mta.replica_accounts SET receipt_limit=2;
+        UPDATE td_mta.replica_progress SET inventory_base=int8send(0),email_cursor=int8send(0);
+        UPDATE td_mta.replica_pending SET ids=decode('{}'||repeat('ff',16),'hex'),done=decode(repeat('00',128),'hex');
+        COMMIT", mail.id));
+    let mut worker = Worker::new(source(), binding.account, epoch, local()).unwrap();
+    assert_eq!(worker.step(remote(limits)).unwrap().applied, 1);
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT receipt_count FROM td_mta.replica_progress"
+        ),
+        "0"
+    );
+    assert_eq!(worker.step(remote(limits)).unwrap().applied, 1);
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT receipt_count FROM td_mta.replica_progress"
+        ),
+        "2"
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT encode(id,'hex') FROM td_mta.emails"),
+        mail.id.to_string()
+    );
+    worker.retire();
     super::replica_serving::exercise(
         &fixture,
         epoch,

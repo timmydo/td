@@ -28,7 +28,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     );
     sql(&fixture, include_str!("../../src/postgres_receiving.sql"));
     let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(upgraded.version, 43);
+    assert_eq!(upgraded.version, 44);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);

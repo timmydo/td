@@ -1,4 +1,5 @@
 //! Explicit operator schema-ledger preparation; no serving path selects it.
+use crate::postgres_probe::with_migration_client;
 use crate::{
     ids::StoreEpoch,
     postgres_probe::{self, Request},
@@ -57,8 +58,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_receipt_stamps.sql"),
     include_str!("postgres_retry_floor.sql"),
     "DROP TABLE td_mta.receiving_receipts;",
+    include_str!("postgres_replica_retention.sql"),
 ];
-pub const VERSION: u32 = 43;
+pub const VERSION: u32 = 44;
 #[path = "postgres_schema_acl.rs"]
 mod acl;
 // Shared by every future serving connection and explicit schema operation.
@@ -103,6 +105,8 @@ pub fn initialize(
     )
 }
 
+pub const MAX_UPGRADE_DURATION: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Explicit owner migration. Validate every prior checksum before any DDL.
 /// A current compatible ledger returns its receipt without another write.
 pub fn upgrade(
@@ -124,7 +128,12 @@ fn write_schema(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
+    let maximum = if fresh_epoch.is_some() {
+        postgres_probe::MAX_DURATION
+    } else {
+        MAX_UPGRADE_DURATION
+    };
+    let result = with_migration_client(request, trust, deadline, maximum, move |client| {
         Box::pin(async move {
             version(client).await?;
             client
@@ -166,6 +175,20 @@ fn write_schema(
                     acl::read(client).await?,
                 )
             };
+            if fresh_epoch.is_none() {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
+                let milliseconds =
+                    i64::try_from(remaining.as_millis().max(1)).map_err(|_| Error::Invalid)?;
+                client
+                    .query_one(
+                        "SELECT set_config('statement_timeout', ($1::bigint)::text, true), set_config('transaction_timeout', ($1::bigint)::text, true)",
+                        &[&milliseconds],
+                    )
+                    .await
+                    .map_err(|_| Error::Database)?;
+            }
             for (index, ddl) in MIGRATIONS.iter().enumerate().skip(start) {
                 let version = i32::try_from(index + 1).map_err(|_| Error::Version)?;
                 let checksum = checksum(ddl)?;

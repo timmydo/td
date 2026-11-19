@@ -68,6 +68,7 @@ impl Operation {
 }
 
 struct Options {
+    timeout: Duration,
     connection: String,
     profile: String,
 }
@@ -75,10 +76,19 @@ struct Options {
 fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let mut connection = None;
     let mut profile = None;
+    let mut timeout = None;
     while let Some(flag) = args.next() {
         match flag.to_str()? {
             "--connection-file" if connection.is_none() => {
                 connection = Some(args.next()?.into_string().ok()?);
+            }
+            "--timeout-seconds" if operation == Operation::Upgrade && timeout.is_none() => {
+                let seconds: u64 = args.next()?.to_str()?.parse().ok()?;
+                let duration = Duration::from_secs(seconds);
+                if duration.is_zero() || duration > postgres_schema::MAX_UPGRADE_DURATION {
+                    return None;
+                }
+                timeout = Some(duration);
             }
             "--profile" if operation == Operation::Probe && profile.is_none() => {
                 profile = Some(args.next()?.into_string().ok()?)
@@ -87,6 +97,7 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
         }
     }
     Some(Options {
+        timeout: timeout.unwrap_or(Duration::from_secs(10)),
         connection: connection?,
         profile: match operation {
             Operation::Probe => profile?,
@@ -200,7 +211,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
-    match check(&loaded, operation) {
+    match check(&loaded, operation, options.timeout) {
         Ok(Outcome::Probe(status)) => {
             writeln!(
                 io::stdout().lock(),
@@ -269,8 +280,12 @@ enum Outcome {
     Runtime(postgres_schema::Receipt),
 }
 
-fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str, &'static str)> {
-    with_addresses(loaded, |request, deadline| {
+fn check(
+    loaded: &Loaded,
+    operation: Operation,
+    timeout: Duration,
+) -> Result<Outcome, (&'static str, &'static str)> {
+    with_addresses_timeout(loaded, timeout, |request, deadline| {
         if operation == Operation::RuntimeCheck {
             return td_mta::postgres_runtime_access::inspect(request, &loaded.trust, deadline)
                 .map(Outcome::Runtime)
@@ -452,6 +467,25 @@ mod tests {
             classify(postgres_schema::Error::Indeterminate),
             ("schema", "indeterminate-do-not-retry")
         );
+    }
+    #[test]
+    fn only_upgrade_accepts_a_bounded_maintenance_timeout() {
+        let args = |op, seconds| {
+            parse(&[
+                op,
+                "--connection-file",
+                "/private/db",
+                "--timeout-seconds",
+                seconds,
+            ])
+        };
+        assert_eq!(
+            args("schema-upgrade", "3600").map(|options| options.timeout),
+            Some(Duration::from_secs(3600))
+        );
+        assert!(args("schema-upgrade", "0").is_none());
+        assert!(args("schema-upgrade", "3601").is_none());
+        assert!(args("schema-init", "60").is_none());
     }
     #[test]
     fn last_address_exhaustion_distinguishes_deadline_from_transport() {

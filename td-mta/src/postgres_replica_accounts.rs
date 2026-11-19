@@ -101,9 +101,8 @@ pub fn initialize(
             let blobs = i64::try_from(seed.limits.blobs).map_err(|_| Error::Capacity)?;
             let emails = i64::try_from(seed.limits.emails).map_err(|_| Error::Capacity)?;
             let receipts = i64::try_from(seed.limits.receipts).map_err(|_| Error::Capacity)?;
-            let count = i64::try_from(graph.list.len()).map_err(|_| Error::Capacity)?;
             if client.execute_typed("INSERT INTO td_mta.replica_accounts(account,source,seed_digest,body_limit,blob_limit,email_limit,receipt_limit) VALUES($1,true,$2,$3,$4,$5,$6)", &[(&account,Type::BYTEA),(&seed.digest.as_slice(),Type::BYTEA),(&body,Type::INT8),(&blobs,Type::INT8),(&emails,Type::INT8),(&receipts,Type::INT8)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
-            if client.execute_typed("INSERT INTO td_mta.replica_progress(account,generation,email_cursor,mailbox_checkpoint,inventory_base,inventory_cursor,inventory_complete,email_count,receipt_count) VALUES($1,$2,$3,$4,$3,NULL,false,0,$5)", &[(&account,Type::BYTEA),(&one.as_slice(),Type::BYTEA),(&base.as_slice(),Type::BYTEA),(&mailbox_state.as_slice(),Type::BYTEA),(&count,Type::INT8)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+            if client.execute_typed("INSERT INTO td_mta.replica_progress(account,generation,email_cursor,mailbox_checkpoint,inventory_base,inventory_cursor,inventory_complete,email_count,receipt_count) VALUES($1,$2,$3,$4,$3,NULL,false,0,0)", &[(&account,Type::BYTEA),(&one.as_slice(),Type::BYTEA),(&base.as_slice(),Type::BYTEA),(&mailbox_state.as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
             if client
                 .execute_typed(
                     "INSERT INTO td_mta.account_usage VALUES($1,0,0,0,0,0)",

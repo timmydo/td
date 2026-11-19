@@ -1100,7 +1100,11 @@ epoch, retain old evidence and provision a fresh scrub directory.
 After installing the current td-mta binary, use `./install-td-mta
 --setup-replica --help` for fresh local provisioning. Supply the source HTTPS
 origin, a protected password file, your local mailbox address, resolver and
-explicit body/blob/Email/receipt quotas. Source credentials stay separate from
+explicit body/blob/Email/receipt quotas. Place the database on a dedicated
+size-limited volume and verify the mount before enabling the generated copy
+worker. The [desktop replica runbook](REPLICA-OPERATIONS.md#size-and-verify-the-replica-volume)
+covers new and installed volumes and the fenced schema-44 upgrade.
+Source credentials stay separate from
 the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.
 

@@ -415,15 +415,26 @@ pub(crate) fn with_schema_client<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
-    with_output_limit(
+    with_migration_client(request, trust, deadline, MAX_DURATION, operation)
+}
+
+pub(crate) fn with_migration_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    maximum: Duration,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    // Prepared names grow with the driver's process-wide statement counter.
+    let mut worker = connect_worker_bounded(
         request,
         trust,
         deadline,
-        // Prepared names grow with the driver's process-wide statement counter.
         128 * 1024,
         Input::schema(),
-        operation,
-    )
+        maximum,
+    )?;
+    worker.run(operation)
 }
 
 // One complete source candidate, bounded independently of material/probe work.

@@ -43,6 +43,96 @@ an isolated restore proves that particular archive can be restored. Keep
 those receipts separate from synchronization status. Synchronization propagates
 source deletions, so a replica is not a versioned backup.
 
+## Size and verify the replica volume
+
+Schema 44 charges the receipt quota for live Emails and Blobs. PostgreSQL
+also retains a length and digest for every distinct copied Blob, including
+those whose bytes have been collected. Size the replica for body data, live
+metadata, indexes, these lifetime identity records, WAL, temporary space
+and schema upgrades. The source body total alone cannot predict the space
+required. On an existing install, measure both the mounted filesystem
+(`df -B1`) and the private cluster (`du -sx -B1 "$replica_root/postgres"`).
+Allow for the expected net growth until the next capacity review and free
+space for a maintenance copy or index rebuild. Keep backups on another disk.
+
+Give the replica its own **fixed-size filesystem**. Record the chosen maximum
+in bytes, the device UUID and the free-space threshold that leaves time to
+stop copying or expand. One Linux configuration is an ext4 filesystem on a
+dedicated partition or thick logical volume. For example, an administrator
+can allocate a new 64 GiB thick LV with `lvcreate -L 64G -n tdreplica VG`
+and initialize that **new, empty** device with `mkfs.ext4 /dev/VG/tdreplica`.
+64 GiB is an example budget of 68719476736 bytes. Choose a size from the
+actual mailbox and available storage. Configure the mount by UUID in the
+host's boot configuration. Give the replica user ownership of a private
+directory on it. Keep the *underlying*, unmounted mountpoint empty, owned
+by root and mode 000 so services cannot fall back to writing the host disk.
+
+For a fresh replica, choose a short path such as `/srv/tdreplica/mail` for
+`--root`. Mount the volume and prepare its parent first. Setup creates the
+final, previously absent directory. For an installed replica, preserve its
+absolute paths, which the services and clients retain. While every service
+is stopped and after the cold backup below, copy the complete root with
+ownership and modes intact into a private directory on the new volume.
+Extracting the cold archive into that empty directory and comparing it with
+`tar -df` before switching preserves the full root and its permissions.
+Keep the original offline. Bind-mount that directory at the old absolute
+path over an empty, inaccessible underlying mountpoint. Persist both mounts
+in the host configuration before re-enabling the user services.
+
+Verify the budget on the database host, before the first copy, after a move
+or resize and before restarting an upgraded copier. For an ext4 volume use
+the following checks with the recorded UUID and byte limit. For a fresh
+setup, check the mount containing the parent before setup and repeat these
+checks on the completed installation before enabling either supervisor.
+
+```sh
+# Supply replica_root, replica_uuid and replica_budget_bytes from this install.
+(
+  set -eu
+  device=$(readlink -e "/dev/disk/by-uuid/$replica_uuid")
+  devno=$(lsblk -dnro MAJ:MIN "$device")
+  test -n "$devno"
+  test "$(lsblk -bdnro SIZE "$device")" -le "$replica_budget_bytes"
+  for path in "$replica_root" "$replica_root/postgres" "$replica_root/postgres/pg_wal"; do
+    test "$(findmnt -nro MAJ:MIN --target "$path")" = "$devno"
+    test "$(findmnt -nro FSTYPE --target "$path")" = ext4
+  done
+  # The generated cluster has no relocated tablespaces or WAL.
+  test "$(postgres -D "$replica_root/postgres" -c "config_file=$replica_root/postgresql.conf" -C data_directory)" = "$replica_root/postgres"
+  test -d "$replica_root/postgres/pg_wal"
+  test ! -L "$replica_root/postgres/pg_wal"
+  entries=$(find "$replica_root/postgres/pg_tblspc" -mindepth 1 -print -quit)
+  test -z "$entries"
+  findmnt --submounts --target "$replica_root/postgres" -o TARGET,SOURCE,MAJ:MIN
+  df -B1 --output=size,used,avail,target "$replica_root"
+)
+```
+
+Inspect the mount list for nested mounts under the cluster, including its
+temporary and index directories. Require all of PGDATA to reside on that
+one device, and keep PostgreSQL archive commands, temporary tablespaces
+and external logging destinations disabled in this profile. Inspect the
+selected PostgreSQL service and its configuration if customized. With the
+generated definitions, the cluster is `ROOT/postgres` and uses the built-in
+tablespaces. Shepherd writes service logs under `ROOT`. With systemd,
+stdout and stderr go to the host journal, which has its own disk budget.
+The block device
+enforces the capacity even when the copy process restarts. Mail quotas,
+`df` free bytes on a shared home filesystem and copy-worker status do not
+establish a physical cap. A client on another host cannot establish it.
+
+Monitor free blocks and inodes (`df -B1`, `df -i`) independently of copy
+status. At the recorded low-water mark stop synchronization and scheduled
+search work. On exhaustion, keep the copier stopped and enlarge the volume
+before allowing PostgreSQL recovery or a retry. For the example LV an
+administrator can run `lvextend -L +16G /dev/VG/tdreplica` followed by
+`resize2fs /dev/VG/tdreplica`. Record and verify the new budget. A fixed
+partition can be replaced with a larger dedicated volume using the stopped
+copy procedure. Preserve WAL, Blob identities and pending-page records.
+Start PostgreSQL, check its log and `replica-progress`, then verify reader
+readiness and a fresh successful copy round. An interrupted transaction can
+be retried against the durable page.
+
 ## Services and local access
 
 There are three services: `td-mta-replica-postgres`, `td-mta-replica` (the JMAP
@@ -157,6 +247,97 @@ maintenance jobs, before upgrading; binary rollback alone
 does not undo a schema upgrade. PostgreSQL package updates are a separate
 operation. Public-server deployment and ACME renewal are independent of local
 replica updates.
+
+### Fenced desktop upgrade from schema 43 to 44
+
+This procedure is for a private Unix-socket replica with the three generated
+services. Keep the public deployment tooling on the primary. Schedule a
+desktop read outage. Run the mail commands as the installation user.
+
+1. Record the current `replica-progress` output, local epoch, source origin
+   and epoch, account ID, generation, cursor, pending-page counts and current
+   executable (`readlink -e "$replica_bin"`). Stop synchronization, the reader, optional search timers **and their active
+   jobs**, and any manual copy command. With writers now fenced, recapture
+   the progress values so the comparison uses the last committed page. Prevent supervisor respawn and interactive access for the
+   duration of the cutover. With Shepherd use `herd stop td-mta-replica-sync`,
+   `herd stop td-mta-replica`, then `herd stop td-mta-replica-postgres`.
+   The corresponding systemd commands are `systemctl --user stop NAME`.
+   Confirm the three services have stopped. Require PostgreSQL 17
+   `pg_controldata "$replica_root/postgres"` to report a clean shut down.
+2. Save the entire stopped root to a new mode-0700 recovery directory on a
+   **different volume**. Include PGDATA with WAL, local passwords and
+   connection files, configuration, copy-state and supervisor definitions.
+   First confirm the old PGDATA has a local pg_wal directory, an empty
+   pg_tblspc and no relocated cluster files. An installation that relocated
+   any of these needs a cold backup covering those locations as well and a
+   verified relocation into the capped volume before this procedure.
+   With the single-volume layout above, `tar -cpf "$backup/root.tar" -C
+   "$replica_root" .` and `tar -df "$backup/root.tar" -C "$replica_root"`
+   create and compare the archive. Run under `umask 077` and require success.
+   Protect the backup, record the previous executable beside it and retain
+   its release, runtime libraries and PostgreSQL 17 installation. If moving
+   from an unbounded filesystem, complete the volume move above now. Verify
+   the budget, identity of the volume, unused space and absence of relocated
+   WAL or tablespaces.
+3. Install the reviewed candidate with `./install-td-mta --prefix PREFIX`,
+   using the existing prefix. Leave supervisor services stopped. In the
+   private recovery directory create `owner.hba` containing exactly
+   `local td_mta td_mta_owner scram-sha-256` on one line and
+   `local all all reject` on the next. As the installation user, start
+   PostgreSQL in a separate foreground terminal. Its private owner-only
+   socket remains at the address in the existing connection file.
+
+   ```sh
+   postgres -D "$replica_root/postgres" -c "config_file=$replica_root/postgresql.conf" \
+     -c "hba_file=$backup/owner.hba" -c "listen_addresses=" \
+     -c "unix_socket_directories=$replica_root/socket"
+   ```
+
+4. Read the plan with the candidate. Require current 43, target 44, exactly
+   one pending migration (44), and the recorded local store epoch. Allow a
+   bounded maintenance window for the identity backfill. For example:
+
+   ```sh
+   owner_file="$replica_root/owner-connection"
+   "$replica_bin" postgres schema-plan --connection-file "$owner_file"
+   ```
+
+   Read the plan output and verify all four values above. On a match,
+   run the upgrade in the same fenced maintenance window.
+
+   ```sh
+   "$replica_bin" postgres schema-upgrade --connection-file "$owner_file" --timeout-seconds 900
+   "$replica_bin" postgres schema-inspect --connection-file "$owner_file"
+   "$replica_bin" postgres replica-progress --connection-file "$owner_file" \
+     --epoch "$replica_epoch" --account "$replica_account"
+   ```
+
+   Require version 44 and the same epoch, source binding, account, generation,
+   cursor, pending ID count and unfinished ID count as before. The live
+   receipt count can decrease.
+   Schema 44 requires no additional grants. Keep the replica reader and
+   publisher privilege sets. After a lost upgrade response, keep writers
+   fenced, wait for the migration lock to release and inspect the ledger.
+   A confirmed 43 may be retried after diagnosis. A confirmed 44 goes through
+   the same verification before serving.
+5. Stop the private foreground server with `pg_ctl -D "$replica_root/postgres"
+   -m fast -w stop`. Confirm clean shutdown. Start the normal PostgreSQL
+   service with its original HBA, then start the reader. Check
+   `status --json --require-ready` and read one saved message. Start the
+   copier, require a successful round recorded *after* startup, then resume
+   the search schedules. Keep the rollback copy until verification finishes.
+
+If the cutover fails, stop the copier, reader, scheduled jobs and **both**
+possible PostgreSQL launches. Preserve the failed cluster separately.
+Restore the verified schema-43 cold archive with `tar -xpf "$backup/root.tar"
+-C "$replica_root"` into an **empty, mode-0700 root** at the original absolute
+path on the capped volume. Select the saved old executable by atomically
+replacing the installation's `bin/td-mta` symlink. Start PostgreSQL, verify
+schema 43, the saved local epoch, source binding and checkpoints with the old
+binary, then restart and verify the reader and copier. Recheck freshness.
+Copy progress made after the archive must be fetched again. If the required source history has expired,
+keep this copy for reading and provision a separate fresh replica from the
+source before switching clients. Never start the old binary on ledger 44.
 
 ## Integrity and recovery evidence
 

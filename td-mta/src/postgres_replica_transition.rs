@@ -77,6 +77,10 @@ pub(crate) async fn advance(
             .transpose()
             .map_err(|_| Error::Integrity)?;
         if client.execute_typed("UPDATE td_mta.replica_progress SET inventory_cursor=$2,inventory_complete=$3,email_cursor=$4 WHERE account=$1",&[(&account,Type::BYTEA),(&cursor,Type::TEXT),(&complete,Type::BOOL),(&email_cursor.sequence.number().to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+        client.execute_typed(
+            "DELETE FROM td_mta.replica_email_receipts WHERE account=$1 AND id IN (SELECT id FROM td_mta.replica_email_receipts WHERE account=$1 AND NOT present AND observed<$2 ORDER BY observed,id LIMIT $3)",
+            &[(&account,Type::BYTEA),(&email_cursor.sequence.number().to_be_bytes().as_slice(),Type::BYTEA),(&(crate::replica_pending::MAX_IDS as i64),Type::INT8)],
+        ).await.map_err(|_|Error::Database)?;
         let mut ids = Vec::new();
         ids.try_reserve_exact(pending.ids().len().checked_mul(16).ok_or(Error::Capacity)?)
             .map_err(|_| Error::Capacity)?;

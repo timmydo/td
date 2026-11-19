@@ -277,7 +277,7 @@ pub(super) fn exercise() {
         ),
         "09".repeat(16)
     );
-    assert_eq!(sql(&fixture,"SELECT encode(email_cursor,'hex'),encode(mailbox_checkpoint,'hex'),inventory_complete,email_count,receipt_count FROM td_mta.replica_progress"),"0000000000000005|0000000000000006|f|0|2");
+    assert_eq!(sql(&fixture,"SELECT encode(email_cursor,'hex'),encode(mailbox_checkpoint,'hex'),inventory_complete,email_count,receipt_count FROM td_mta.replica_progress"),"0000000000000005|0000000000000006|f|0|0");
     assert_eq!(sql(&fixture,"SELECT encode(ids,'hex'),octet_length(done),encode(done,'hex')=repeat('00',128),next_cursor IS NOT NULL FROM td_mta.replica_pending"),format!("{}{}|128|t|t","00".repeat(16),"01".repeat(16)));
     assert_eq!(sql(&fixture,"SELECT count(*) FROM td_mta.changes WHERE kind=1 AND action=1 AND sequence=decode('0000000000000001','hex')"),"2");
     assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"0|0|0|0|0");
