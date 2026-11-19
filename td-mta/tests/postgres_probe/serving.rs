@@ -97,10 +97,8 @@ pub(super) fn exercise(
         assert_eq!(status["write_failures"].as_u64(), Some(0));
         (child, runtime)
     };
-    assert_eq!(
-        https_ipv4.local_addr().unwrap().port(),
-        https_address.port()
-    );
+    let https_v4_address = https_ipv4.local_addr().unwrap();
+    assert_eq!(https_v4_address.port(), https_address.port());
     drop((smtp, https, https_ipv4));
     let (mut cloud, cloud_runtime) = start("cloud");
     let clock_command = |operation: &str| {
@@ -186,20 +184,34 @@ pub(super) fn exercise(
         .lines()
         .filter(|line| !line.starts_with("---"))
         .collect::<String>();
-    let query = |authorization: &str| {
+    let query = |address: std::net::SocketAddr| {
         let (mut tls, _) = super::smtp_transport::upgrade_protocol(
-            TcpStream::connect(https_address).unwrap(),
+            TcpStream::connect(address).unwrap(),
             Arc::new(td_mta::clock::RuntimeClock::new()),
             &fixture.ca,
             td_crypto::TlsProtocol::Http1,
         );
-        write!(tls,"GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nConnection: close\r\n\r\n",https_address.port()).unwrap();
+        write!(tls,"GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n",address.port()).unwrap();
         tls.flush().unwrap();
         let mut reply = String::new();
         tls.read_to_string(&mut reply).unwrap();
         reply
     };
-    let reply = query(&encoded);
+    // Establish the TCP sessions together, before doing any TLS or API work.
+    let pending: Vec<_> = (0..7)
+        .map(|_| TcpStream::connect(https_address).unwrap())
+        .collect();
+    let mut extra = TcpStream::connect(https_address).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    match extra.read(&mut [0]) {
+        Ok(0) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+        result => panic!("expected the per-address refusal, got {result:?}"),
+    }
+    let reply = query(https_v4_address);
+    drop(pending);
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     assert!(reply.contains("urn:ietf:params:jmap:mail"), "{reply}");
     assert!(reply.contains("urn:ietf:params:jmap:submission"), "{reply}");
@@ -860,13 +872,13 @@ pub(super) fn exercise(
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(query(&encoded).starts_with("HTTP/1.1 200"));
+    assert!(query(https_address).starts_with("HTTP/1.1 200"));
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();
     td_mta::postgres_devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke)
         .unwrap();
-    assert!(query(&encoded).starts_with("HTTP/1.1 401"));
+    assert!(query(https_address).starts_with("HTTP/1.1 401"));
     for (child, runtime) in [(&mut cloud, cloud_runtime), (&mut desktop, desktop_runtime)] {
         let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
             .args(["stop", "--runtime"])

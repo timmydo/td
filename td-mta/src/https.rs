@@ -31,9 +31,16 @@ use std::{
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
-const PER_PEER: usize = 16;
+const MAX_PER_PEER: usize = 16;
 const DRAIN_BYTES: usize = 64 * 1024;
 const DRAIN_SECONDS: u64 = 5;
+
+fn peer_limit(peer: PeerAddress, slots: usize) -> usize {
+    match peer {
+        PeerAddress::Network(_) => slots.saturating_sub(1).clamp(1, MAX_PER_PEER),
+        PeerAddress::Local => slots.min(MAX_PER_PEER),
+    }
+}
 
 pub struct BoundListener {
     socket: ListenerSocket,
@@ -1009,7 +1016,7 @@ impl Https<'_> {
                     .iter()
                     .filter(|existing| **existing == Some(peer))
                     .count()
-                    >= PER_PEER
+                    >= peer_limit(peer, slots.len())
                 {
                     control.log(
                         crate::observability::Kind::AdmissionRefused {
@@ -1999,6 +2006,22 @@ pub(crate) use crate::http_date::http_date;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn connection_limits_leave_room_for_another_network_peer() {
+        let network = PeerAddress::Network(std::net::Ipv4Addr::LOCALHOST.into());
+        for (slots, network_limit, local_limit) in [
+            (8, 7, 8),
+            (1, 1, 1),
+            (2, 1, 2),
+            (16, 15, 16),
+            (17, 16, 16),
+            (32, 16, 16),
+        ] {
+            assert_eq!(peer_limit(network, slots), network_limit);
+            assert_eq!(peer_limit(PeerAddress::Local, slots), local_limit);
+        }
+    }
+
     #[test]
     fn timing_labels_are_closed_and_never_retain_target_ids() {
         use crate::performance::Phase as Metric;

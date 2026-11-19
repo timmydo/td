@@ -1367,7 +1367,7 @@ Initial default ceilings (validated together at startup):
 | --- | --- |
 | Simultaneous inbound SMTP sessions | 8, at most 2 per peer address |
 | Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
-| Active HTTPS connections | 8, with a separate cap of 2 TLS handshakes |
+| Active HTTPS connections | 8, at most 7 per network address, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 3 |
@@ -2244,8 +2244,12 @@ revocation state.
 Upload publication acquires a fresh commit-time authorization guard; future
 mutations must do the same.
 
-At most sixteen active HTTPS connections per IP and the configured global count
-are admitted. Per-IP connection refusals emit the bounded, rate-limited
+A profile's HTTPS listeners share its configured connection pool. When it has at
+least two slots, each network address can occupy at most the smaller of
+sixteen and the pool size minus one. A one-slot pool admits one connection.
+Clients sharing a public address share its allowance. In a private Unix-socket
+profile, all clients share up to sixteen slots, subject to the configured
+pool size. Per-IP connection refusals emit the bounded, rate-limited
 admission-refused event before closing the unauthenticated socket. No peer
 address or credential is retained in that event. Authentication uses fixed
 one-second monotonic windows: 64

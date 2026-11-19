@@ -3295,7 +3295,9 @@ origin/rate checks and hands credential lookup to the fixed authentication
 worker. The current local backend tries its registry mutex there and performs
 no credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
 a retired slot can retain its old peer charge until the next scan. The
-listener has a fixed sixteen-connection per-IP cap.
+per-address limit leaves at least one slot for another peer in a pool of
+two or more. At the default size, one network
+address can use seven of the eight slots.
 Transient accept resource failures back off for five seconds. Session slots
 are the completion storage; no unbounded work queue or per-client thread exists.
 An HTTP connection admits at most 32 requests under its original absolute
