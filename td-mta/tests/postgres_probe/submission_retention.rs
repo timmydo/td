@@ -356,9 +356,10 @@ pub(super) fn exercise(
 
     let claim = owners::prepare(binding, BootId::from_bytes([93; 16])).unwrap();
     let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
-    let retire = || retention::retire(request, trust, deadline(), &claim, grant.generation, now());
+    let retire =
+        || retention::Step::Retire.run(request, trust, deadline(), &claim, grant.generation, now());
     assert_eq!(
-        retention::retire(
+        retention::Step::Retire.run(
             request,
             trust,
             deadline(),
@@ -369,7 +370,7 @@ pub(super) fn exercise(
         Err(retention::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
-        retention::retire(
+        retention::Step::Retire.run(
             request,
             trust,
             deadline(),
@@ -518,10 +519,18 @@ pub(super) fn exercise(
 
     // Lease reclamation is its own transaction under the same claim, fence
     // and clock guard.
-    let reclaim =
-        || retention::reclaim_uploads(request, trust, deadline(), &claim, grant.generation, now());
+    let reclaim = || {
+        retention::Step::UploadLeases.run(
+            request,
+            trust,
+            deadline(),
+            &claim,
+            grant.generation,
+            now(),
+        )
+    };
     assert_eq!(
-        retention::reclaim_uploads(
+        retention::Step::UploadLeases.run(
             request,
             trust,
             deadline(),
@@ -532,7 +541,7 @@ pub(super) fn exercise(
         Err(retention::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
-        retention::reclaim_uploads(
+        retention::Step::UploadLeases.run(
             request,
             trust,
             deadline(),
@@ -587,6 +596,49 @@ pub(super) fn exercise(
         &format!("UPDATE td_mta.leases SET expires_at=0 WHERE blob_id={b5}"),
     );
     let upload = usage().upload_bytes;
+    // A corrupt upload counter rolls back only the lease batch. Keep that
+    // failure in place while both unrelated transactions commit.
+    let source = id(0xe4);
+    let stale = id(0xfb);
+    sql(fixture, &format!("UPDATE td_mta.account_usage SET upload_bytes=0 WHERE account={account};
+        INSERT INTO td_mta.route_owners SELECT account,'idle-upkeep',destination,generation,owner_boot,operation,0,1
+          FROM td_mta.route_owners WHERE account={account} AND owner_boot IS NOT NULL LIMIT 1;
+        INSERT INTO td_mta.submission_attempts SELECT account,{stale},request_digest,submission_id,'idle-upkeep',destination,owner_boot,owner_operation,generation,0,ordinals,old_sequence,new_sequence,false
+          FROM td_mta.submission_attempts WHERE account={account} AND attempt_id={source}"));
+    assert_eq!(reclaim(), Err(retention::Error::Integrity));
+    for step in [
+        retention::Step::AbandonedOwners,
+        retention::Step::IdleAttempts,
+    ] {
+        assert!(
+            step.run(request, trust, deadline(), &claim, grant.generation, now())
+                .unwrap()
+                > 0
+        );
+    }
+    assert_eq!(
+        count(
+            fixture,
+            "td_mta.route_owners WHERE route_name='idle-upkeep' AND owner_boot IS NULL"
+        ),
+        "1"
+    );
+    assert_eq!(
+        count(
+            fixture,
+            &format!("td_mta.submission_attempts WHERE attempt_id={stale}")
+        ),
+        "0"
+    );
+    assert_eq!(
+        count(fixture, &format!("td_mta.leases WHERE blob_id={b5}")),
+        "1"
+    );
+    sql(
+        fixture,
+        "DELETE FROM td_mta.route_owners WHERE route_name='idle-upkeep'",
+    );
+    resync(fixture, &account);
     assert_eq!(reclaim(), Ok(1));
     assert_eq!(
         count(fixture, &format!("td_mta.leases WHERE blob_id={b5}")),

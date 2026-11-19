@@ -173,15 +173,9 @@ pub(super) fn exercise(
     )
     .parse()
     .unwrap();
-    let reclaimed = td_mta::postgres_submission_retention::reclaim_account(
-        request,
-        trust,
-        deadline(),
-        &claim,
-        grant.generation,
-        now,
-    )
-    .unwrap();
+    let reclaimed = td_mta::postgres_submission_retention::Step::IdleAttempts
+        .run(request, trust, deadline(), &claim, grant.generation, now)
+        .unwrap();
     assert!(
         reclaimed > 0,
         "attempt cleanup schedules another retention round"

@@ -620,15 +620,16 @@ pub(super) fn exercise(
     )
     .unwrap();
     let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
-    td_mta::postgres_submission_retention::reclaim_uploads(
-        request,
-        trust,
-        deadline(),
-        &claim,
-        grant.generation,
-        grant.claimed_at,
-    )
-    .unwrap();
+    td_mta::postgres_submission_retention::Step::AbandonedOwners
+        .run(
+            request,
+            trust,
+            deadline(),
+            &claim,
+            grant.generation,
+            grant.claimed_at,
+        )
+        .unwrap();
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submission_attempts WHERE route_name='removed' AND NOT active"), "1");
     assert_eq!(
         sql(

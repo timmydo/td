@@ -8,8 +8,7 @@ pub(super) struct AccountState {
     pub empty: bool,
     pub notice_at: Instant,
     pub retention_at: Instant,
-    pub retention_first: RetentionStep,
-    pub retention_makeup: bool,
+    pub retention: RetentionCycle,
     pub repaired: bool,
     pub dispatch_at: Instant,
 }
@@ -304,8 +303,7 @@ pub(super) fn run(
             empty: false,
             notice_at: Instant::now(),
             retention_at: Instant::now(),
-            retention_first: RetentionStep::Retire,
-            retention_makeup: false,
+            retention: RetentionCycle::new(),
             repaired: false,
             dispatch_at: Instant::now(),
         });

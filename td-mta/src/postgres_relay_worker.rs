@@ -14,6 +14,7 @@ use crate::{
     postgres_relay_data::Retained,
     postgres_route_owners as owners,
     postgres_runtime_profile::PublishedProfile,
+    postgres_submission_retention::Step as RetentionStep,
     queue_clock::{evidence::Journal, ClockControl, RetentionTime},
     smtp_receiving::Control,
     tls_admission::HandshakePool,
@@ -71,53 +72,53 @@ fn log_capacity(control: &Control, stage: crate::observability::RelayStep) {
 }
 /// Between empty retention passes for one account.
 const RETENTION_PAUSE: Duration = Duration::from_secs(600);
-/// A second retention step left less than this of the turn's deadline is
-/// skipped rather than run to a certain timeout.
+/// Leave a step for the next turn when little of the owner deadline remains.
 const RETENTION_STEP_MINIMUM: Duration = Duration::from_secs(1);
-/// The two capacity-freeing steps of a retention turn.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetentionStep {
-    Retire,
-    Uploads,
+
+struct RetentionCycle {
+    next: RetentionStep,
+    progress: bool,
 }
-impl RetentionStep {
-    fn other(self) -> Self {
-        match self {
-            Self::Retire => Self::Uploads,
-            Self::Uploads => Self::Retire,
+
+impl RetentionCycle {
+    fn new() -> Self {
+        Self {
+            next: RetentionStep::Retire,
+            progress: false,
         }
     }
-}
-/// What a retention turn did: the leading step's committed count (None when
-/// it failed), then the second step's, None when it was skipped for want of
-/// time. The whole is None when no connection slot let either run.
-type RetentionTurn = Option<(Option<u64>, Option<Option<u64>>)>;
-/// The order alternates every turn, so a step that keeps exhausting the
-/// shared deadline cannot starve the other for more than one turn. A skipped
-/// second step leads a make-up turn on the next round, but a make-up is never
-/// followed by another, so failing steps still wait `RETENTION_PAUSE`. A turn
-/// in which nothing ran keeps the order and any make-up for the next one.
-/// Returns the next turn's first step, whether it is a make-up, and its wait.
-fn next_retention(
-    first: RetentionStep,
-    makeup: bool,
-    turn: RetentionTurn,
-) -> (RetentionStep, bool, Duration) {
-    let Some((led, followed)) = turn else {
-        return (first, makeup, RETENTION_PAUSE);
-    };
-    let next = first.other();
-    // Skipped, not failed: a fast failure of the second step earns no make-up.
-    if followed.is_none() && !makeup {
-        return (next, true, Duration::ZERO);
+
+    /// Try each independent transaction once per cycle, across as many
+    /// turns as the shared deadlines require. Failed steps also advance.
+    fn run(
+        &mut self,
+        mut step: impl FnMut(RetentionStep) -> Option<u64>,
+        mut has_time: impl FnMut() -> bool,
+    ) -> (Duration, bool) {
+        let mut failed = false;
+        loop {
+            let count = step(self.next);
+            failed |= count.is_none();
+            self.progress |= count.is_some_and(|count| count > 0);
+            self.next = match self.next {
+                RetentionStep::Retire => RetentionStep::UploadLeases,
+                RetentionStep::UploadLeases => RetentionStep::AbandonedOwners,
+                RetentionStep::AbandonedOwners => RetentionStep::IdleAttempts,
+                RetentionStep::IdleAttempts => RetentionStep::Retire,
+            };
+            if self.next == RetentionStep::Retire {
+                let wait = if std::mem::take(&mut self.progress) {
+                    Duration::ZERO
+                } else {
+                    RETENTION_PAUSE
+                };
+                return (wait, failed);
+            }
+            if !has_time() {
+                return (Duration::ZERO, true);
+            }
+        }
     }
-    let progress = led.is_some_and(|n| n > 0) || followed.flatten().is_some_and(|n| n > 0);
-    let wait = if progress {
-        Duration::ZERO
-    } else {
-        RETENTION_PAUSE
-    };
-    (next, false, wait)
 }
 /// The observation's database UTC when retention is due and the queue clock
 /// is stable; decided once, so the idle reader closes exactly when it runs.
@@ -470,12 +471,7 @@ impl Worker<'_, '_> {
         state.retry = !state.retry;
         Ok(buffers)
     }
-    /// Retire settled submissions (POSTGRES.md section 216) and reclaim
-    /// expired upload leases (section 35), as separate transactions sharing
-    /// one deadline, when `retention_due` returned the stable observation.
-    /// Either failure is logged and retried later, as both only free
-    /// capacity; `next_retention` keeps either from starving the other. The
-    /// caller has closed its idle reader.
+    /// Run account upkeep after the idle reader releases its connection.
     fn retain(
         &self,
         worker: &Dispatches<'_, '_>,
@@ -488,38 +484,25 @@ impl Worker<'_, '_> {
         let Some(observed_at) = stable_at else {
             return Ok(());
         };
-        // One budget for both steps keeps the turn within a single deadline
-        // of the owner lease.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let first = state.retention_first;
-        let step = |step| {
-            use crate::postgres_submission_retention as retention;
-            let run = match step {
-                RetentionStep::Retire => retention::retire,
-                RetentionStep::Uploads => retention::reclaim_account,
-            };
-            run(
-                self.request,
-                self.trust,
-                deadline,
-                claim,
-                generation,
-                observed_at,
-            )
-            .ok()
+        let (wait, failed) = match worker.connection.slots.acquire() {
+            Ok(_slot) => state.retention.run(
+                |step| {
+                    step.run(
+                        self.request,
+                        self.trust,
+                        deadline,
+                        claim,
+                        generation,
+                        observed_at,
+                    )
+                    .ok()
+                },
+                || deadline.saturating_duration_since(Instant::now()) >= RETENTION_STEP_MINIMUM,
+            ),
+            Err(_) => (RETENTION_PAUSE, true),
         };
-        let turn: RetentionTurn = match worker.connection.slots.acquire() {
-            Ok(_slot) => {
-                let led = step(first);
-                let left = deadline.saturating_duration_since(Instant::now());
-                Some((
-                    led,
-                    (left >= RETENTION_STEP_MINIMUM).then(|| step(first.other())),
-                ))
-            }
-            Err(_) => None,
-        };
-        if !matches!(turn, Some((Some(_), Some(Some(_))))) {
+        if failed {
             control.log(
                 crate::observability::Kind::RelayStepFailed {
                     stage: crate::observability::RelayStep::Retention,
@@ -536,11 +519,6 @@ impl Worker<'_, '_> {
                 generation,
             ))?;
         }
-        // Committed progress may leave more for the next turn; otherwise,
-        // including after a failure, wait.
-        let (next, makeup, wait) = next_retention(first, state.retention_makeup, turn);
-        state.retention_first = next;
-        state.retention_makeup = makeup;
         state.retention_at = Instant::now() + wait;
         Ok(())
     }
@@ -939,55 +917,45 @@ mod tests {
         assert_eq!(queue.clock_status(), "confirmed");
     }
     #[test]
-    fn retention_steps_alternate_and_a_skipped_step_leads_the_next_round() {
-        use RetentionStep::{Retire, Uploads};
-        // Retirement used the whole deadline and upload reclamation was
-        // skipped: reclamation leads the next round.
-        assert_eq!(
-            next_retention(Retire, false, Some((None, None))),
-            (Uploads, true, Duration::ZERO)
-        );
-        // If that make-up turn skips retirement in turn, it waits.
-        assert_eq!(
-            next_retention(Uploads, true, Some((None, None))),
-            (Retire, false, RETENTION_PAUSE)
-        );
-        // A second step that ran and failed fast is not skipped: no make-up.
-        assert_eq!(
-            next_retention(Retire, false, Some((Some(0), Some(None)))),
-            (Uploads, false, RETENTION_PAUSE)
-        );
-        // Ordinary turns alternate, waiting only without progress, whichever
-        // step made it.
-        assert_eq!(
-            next_retention(Uploads, false, Some((Some(0), Some(Some(3))))),
-            (Retire, false, Duration::ZERO)
-        );
-        assert_eq!(
-            next_retention(Retire, true, Some((Some(2), None))),
-            (Uploads, false, Duration::ZERO)
-        );
-        // No slot let either step run: the order and pending make-up hold.
-        assert_eq!(
-            next_retention(Uploads, true, None),
-            (Uploads, true, RETENTION_PAUSE)
-        );
-        // No spin: a zero wait without progress is only ever a make-up, and
-        // never follows one.
-        let counts = [None, Some(0), Some(1)];
-        for first in [Retire, Uploads] {
-            for makeup in [false, true] {
-                for led in counts {
-                    for followed in [None, Some(None), Some(Some(0)), Some(Some(1))] {
-                        let (_, again, wait) = next_retention(first, makeup, Some((led, followed)));
-                        let progress = led == Some(1) || followed == Some(Some(1));
-                        if wait.is_zero() && !progress {
-                            assert!(again && !makeup, "{first:?} {makeup} {led:?} {followed:?}");
-                        }
+    fn a_failed_or_slow_step_never_starves_the_rest_of_the_cycle() {
+        use RetentionStep::{AbandonedOwners, IdleAttempts, Retire, UploadLeases};
+        let mut cycle = RetentionCycle::new();
+        let all = [Retire, UploadLeases, AbandonedOwners, IdleAttempts];
+        for slow in all {
+            for outcome in [None, Some(0), Some(1)] {
+                let mut seen = Vec::new();
+                let mut next_wait = Duration::ZERO;
+                let mut turns = 0;
+                while seen.len() < all.len() {
+                    let last = std::cell::Cell::new(None);
+                    let (wait, failed) = cycle.run(
+                        |step| {
+                            seen.push(step);
+                            last.set(Some(step));
+                            if step == slow {
+                                outcome
+                            } else {
+                                Some(0)
+                            }
+                        },
+                        || last.get() != Some(slow),
+                    );
+                    if seen.len() < all.len() {
+                        assert!(failed);
+                        assert!(wait.is_zero());
                     }
+                    next_wait = wait;
+                    turns += 1;
                 }
+                assert!(turns <= 2);
+                assert_eq!(seen, all);
+                assert_eq!(next_wait.is_zero(), outcome == Some(1));
             }
         }
+        assert_eq!(
+            cycle.run(|step| (step != UploadLeases).then_some(0), || true),
+            (RETENTION_PAUSE, true)
+        );
     }
     #[test]
     fn health_republishes_after_proven_absence() {

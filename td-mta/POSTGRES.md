@@ -7052,7 +7052,7 @@ Submission and cancellation receipts expire a minute after publication on
 their own (section 217) and expiry receipts an hour after (section 120), so
 the deletes below usually find none of them; the rest wait for this
 retention.
-`postgres_submission_retention::retire` deletes, in one transaction, the
+The submission retirement step deletes, in one transaction, the
 oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
 than 30 days ago (`RETENTION_MS`, against the database clock), whatever
 their recipients' outcomes (Accepted, Failed, Canceled or OutcomeUnknown,
@@ -7089,15 +7089,12 @@ Integrity rather than underflow, writes a Destroyed EmailSubmission change
 per submission and advances the account sequence, so state strings change
 and the submission ID collision check still finds the ID.
 
-On the same turn `reclaim_uploads` takes the same claim, fence and clock
-guard in a transaction of its own and reclaims one batch of expired upload
-leases exactly as upload publication does (section 35), so an account that
-stopped uploading still recovers that quota. A batch that reclaims nothing
-rolls back; a non-empty one commits with no change row or sequence step,
-since leases carry no JMAP state. Keeping the two transactions apart means
-neither failure holds back the other's progress (an account whose usage
-counters disagree with its leases still retires submissions), and neither
-holds the account lock longer than its own bounded batch.
+The relay also reclaims expired upload leases as upload publication does
+(section 35), releases abandoned route owners and canceled custody
+(section 123), and reclaims idle attempts and their receipts (section 218).
+Each step uses its own transaction with the same claim, fence and clock
+check. An empty batch rolls back. A corrupt upload counter can refuse a
+lease batch while the other three transactions still commit.
 
 The relay waits for the minimum retry interval of stable samples after
 startup and each observed clock discontinuity before running cleanup.
@@ -7114,22 +7111,18 @@ when the database binding still matches. A first activation or a
 checkpoint without a matching cutoff requires one clock confirmation
 before time-based cleanup.
 
-The relay calls both on idle and active account turns, sharing one
-10-second deadline so the turn stays well inside the 30-second owner
-lease: again on the next round after either made progress, otherwise ten
-minutes later. Their order alternates every turn, so neither leads twice
-running, and a second step left under a second of the deadline is not
-run but leads a make-up turn on the account's next round instead of ten
-minutes later. A make-up turn is never followed by another, so a step
-that keeps timing out delays the other by at most one turn and steps
-that both keep failing still wait ten minutes. A turn in which no
-connection slot let either run keeps the order and any make-up. A
-skipped step counts as failed below. A failure of either records
-`relay_step_failed` at `retention` and renews the lease to serialize
-behind any interrupted transaction; only a failed renewal stops the
-relay, as everywhere. Retirement and lease reclamation are idempotent,
-so an uncertain COMMIT needs no Pending custody. A first pass over a
-long history drains it at 64 submissions per round. The candidate scan
+On idle and active account turns the four transactions share one ten-second
+deadline within the 30-second owner lease. Each cycle runs the steps in the
+order above. A step with less than one second left starts on the next
+account turn with a fresh deadline. Success and failure both advance the
+cycle. After all four ran, any committed progress schedules another cycle
+on the next round; otherwise the account waits ten minutes. Without a
+connection slot the cursor stays put for ten minutes. A failure or a step
+deferred at the deadline records `relay_step_failed` at `retention`; the
+relay renews its lease to serialize behind any interrupted transaction.
+Only a failed renewal stops the relay. The steps are idempotent so an
+uncertain COMMIT needs no Pending custody. A first pass over a long
+history drains up to 64 submissions per cycle. The candidate scan
 reads all of the account's submissions (no completed_at index), bounded
 by the `queue_submissions` quota, once per pass.
 

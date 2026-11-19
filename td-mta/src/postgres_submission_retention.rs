@@ -31,113 +31,70 @@ pub enum Error {
     Clock,
 }
 
-/// Delete one bounded batch of submissions completed more than
-/// `RETENTION_MS` ago, whatever their recipients' outcomes, with no pending
-/// failure notice, active attempt or final reservation, their recipients,
-/// attempts and every receipt keyed by them, and release their transmitted
-/// blobs as Email deletion does. Anything not yet completed stays.
-/// Idempotent: a lost COMMIT is redone or found finished by the next call.
-/// Returns how many submissions it retired.
-/// `stable_at` is database UTC the queue clock guard found stable; a database
-/// clock that has since moved away from it refuses with Clock.
-pub fn retire(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    claim: &Claim,
-    generation: u64,
-    stable_at: impl Into<RetentionTime>,
-) -> Result<u64, Error> {
-    run(
-        Step::Retire,
-        request,
-        trust,
-        deadline,
-        claim,
-        generation,
-        stable_at.into(),
-    )
-}
-
-/// Reclaim one bounded batch of the account's expired upload leases
-/// (POSTGRES.md section 35) under the relay's route claim, in a transaction
-/// of its own, so an account that never uploads again still recovers that
-/// quota and a failure here never holds back submission retirement, nor the
-/// reverse. Idempotent like `retire`; returns how many leases it reclaimed.
-pub fn reclaim_uploads(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    claim: &Claim,
-    generation: u64,
-    stable_at: impl Into<RetentionTime>,
-) -> Result<u64, Error> {
-    run(
-        Step::UploadLeases,
-        request,
-        trust,
-        deadline,
-        claim,
-        generation,
-        stable_at.into(),
-    )
-}
-
-/// Return the number of reclaimed leases, abandoned owners or attempts, and
-/// retired attempts, so the relay runs another round after any progress.
-pub fn reclaim_account(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    claim: &Claim,
-    generation: u64,
-    stable_at: impl Into<RetentionTime>,
-) -> Result<u64, Error> {
-    run(
-        Step::AccountResources,
-        request,
-        trust,
-        deadline,
-        claim,
-        generation,
-        stable_at.into(),
-    )
-}
-
-#[derive(Clone, Copy)]
-enum Step {
+/// Independent upkeep operations under one account's current relay claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Step {
     Retire,
     UploadLeases,
-    AccountResources,
+    AbandonedOwners,
+    IdleAttempts,
 }
 
-fn run(
-    step: Step,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    claim: &Claim,
-    generation: u64,
-    stable_at: RetentionTime,
-) -> Result<u64, Error> {
-    let claim = claim.clone();
-    postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            match step {
-                Step::Retire => retire_locked(client, &claim, generation, stable_at).await,
-                Step::UploadLeases | Step::AccountResources => {
-                    let (leases, other) =
-                        reclaim_locked(client, &claim, generation, stable_at).await?;
-                    Ok(if matches!(step, Step::UploadLeases) {
-                        leases
-                    } else {
-                        leases + other
-                    })
+impl Step {
+    /// Reclaim one bounded batch and return its committed count. The next
+    /// pass can retry after a lost COMMIT. A stale owner or clock refuses
+    /// every step before it changes any rows.
+    pub fn run(
+        self,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        claim: &Claim,
+        generation: u64,
+        stable_at: impl Into<RetentionTime>,
+    ) -> Result<u64, Error> {
+        let stable_at = stable_at.into();
+        let claim = claim.clone();
+        postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+            Box::pin(async move {
+                let now = lock(client, &claim, generation, stable_at).await?;
+                let account = claim.binding().account();
+                let account = account.as_bytes().as_slice();
+                let count = match self {
+                    Self::Retire => retire_locked(client, account, now).await?,
+                    Self::UploadLeases => crate::postgres_uploads::reclaim(client, account, now)
+                        .await
+                        .map_err(|error| match error {
+                            crate::postgres_uploads::Error::Database => Error::Database,
+                            crate::postgres_uploads::Error::Capacity => Error::Capacity,
+                            _ => Error::Integrity,
+                        })?,
+                    Self::AbandonedOwners => owners::reclaim_abandoned(client, &claim, now)
+                        .await
+                        .map_err(Error::Owner)?,
+                    Self::IdleAttempts => {
+                        crate::postgres_attempt_reclamation::reclaim(client, account, None, now)
+                            .await
+                            .map_err(|error| match error {
+                                crate::postgres_attempts::Error::Database => Error::Database,
+                                _ => Error::Integrity,
+                            })?
+                    }
+                };
+                if count > 0 {
+                    owners::check_locked(client, &claim, generation)
+                        .await
+                        .map_err(Error::Owner)?;
+                    client
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(|_| Error::Database)?;
                 }
-            }
+                Ok(count)
+            })
         })
-    })
-    .map_err(Error::Connection)?
+        .map_err(Error::Connection)?
+    }
 }
 
 /// Begin the relay's account transaction: the account row FOR UPDATE under
@@ -163,49 +120,6 @@ async fn lock(
     Ok(now.min(stable_at.cutoff))
 }
 
-async fn reclaim_locked(
-    client: &Client,
-    claim: &Claim,
-    generation: u64,
-    stable_at: RetentionTime,
-) -> Result<(u64, u64), Error> {
-    let now = lock(client, claim, generation, stable_at).await?;
-    let account = claim.binding().account();
-    let leases = crate::postgres_uploads::reclaim(client, account.as_bytes().as_slice(), now)
-        .await
-        .map_err(|error| match error {
-            crate::postgres_uploads::Error::Database => Error::Database,
-            crate::postgres_uploads::Error::Capacity => Error::Capacity,
-            _ => Error::Integrity,
-        })?;
-    // Nothing reclaimed leaves the transaction to roll back.
-    let abandoned = owners::reclaim_abandoned(client, claim, now)
-        .await
-        .map_err(Error::Owner)?;
-    let retired = crate::postgres_attempt_reclamation::reclaim(
-        client,
-        account.as_bytes().as_slice(),
-        None,
-        now,
-    )
-    .await
-    .map_err(|error| match error {
-        crate::postgres_attempts::Error::Database => Error::Database,
-        _ => Error::Integrity,
-    })?;
-    if leases == 0 && abandoned == 0 && retired == 0 {
-        return Ok((0, 0));
-    }
-    owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Database)?;
-    Ok((leases, abandoned + retired))
-}
-
 /// Whether a candidate fits after earlier ones, with `recipients` and
 /// `bytes` totals including it. The first always fits: one submission holds
 /// at most 1000 recipients and one 32 MiB blob.
@@ -213,17 +127,8 @@ fn fits(taken: usize, recipients: i64, bytes: i64) -> bool {
     taken == 0 || (recipients <= MAX_RECIPIENTS && bytes <= MAX_BYTES)
 }
 
-async fn retire_locked(
-    client: &Client,
-    claim: &Claim,
-    generation: u64,
-    stable_at: RetentionTime,
-) -> Result<u64, Error> {
-    let now = lock(client, claim, generation, stable_at).await?;
+async fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
     let cutoff = now.checked_sub(RETENTION_MS).ok_or(Error::Integrity)?;
-    let binding = claim.binding();
-    let account_id = binding.account();
-    let account = account_id.as_bytes().as_slice();
     let candidates = client.query(concat!("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR ",include_str!("postgres_pending_route_reset.sql")," OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s"), &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
     if candidates.is_empty() {
         return Ok(0);
@@ -312,13 +217,6 @@ async fn retire_locked(
     {
         return Err(Error::Integrity);
     }
-    owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Database)?;
     u64::try_from(retired).map_err(|_| Error::Integrity)
 }
 
