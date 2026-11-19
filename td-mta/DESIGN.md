@@ -1086,6 +1086,16 @@ plaintext-toggle setting. Once STARTTLS begins, a failed handshake closes
 the connection; it never continues that session in plaintext. Reset SMTP
 state after successful TLS.
 
+Direct MX observes SPF for the envelope sender on each accepted MAIL FROM.
+It evaluates the connecting socket address against the MAIL FROM domain;
+a null reverse path uses `postmaster@` and the HELO/EHLO identity. The
+receiver records the result on accepted mail, including mail claiming a
+locally hosted domain. Every SPF outcome uses the ordinary recipient,
+quota and publication policy. A failing SPF check can therefore appear in
+Inbox. SPF covers the envelope sender. The visible From header currently
+has no DKIM signature verification or DMARC alignment check. Section 46
+of POSTGRES.md describes how to inspect the local result.
+
 Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
 ACME HTTP-01 challenges and
 may redirect ordinary GET requests to a fixed configured HTTPS origin; it
@@ -1124,8 +1134,8 @@ and define revocation/rotation fixtures before enabling the listener.
 
 The authenticated identity is the gateway, not the original sender. Record
 both the socket peer and configured gateway ID. V1 does not implement PROXY
-protocol, XCLIENT, or trust arbitrary original-IP headers. Future SPF checks
-must not mistake the gateway's address for the originating sender's address.
+protocol, XCLIENT, or trust arbitrary original-IP headers. Gateway receipts
+carry no local SPF observation because the socket peer is the gateway.
 Gateway-provided authentication results require a separately specified trust
 contract before they influence policy.
 
@@ -1540,6 +1550,11 @@ The caller output prefix changes only after the final clock check; errors
 preserve it. Configuration borrows, resolver order and generation stay fixed
 for the owner's lifetime, consistent with restart-only resolver changes.
 
+Direct receiving has a separate DNS worker for SPF names derived from
+the inbound SMTP envelope and published policies. It sends questions to the
+configured numeric resolvers. It has no outbound application-dial capability
+and shares no cache entries with the configured relay/ACME resolver.
+
 The prepared `outbound_dial` helper runs only on the admitted outbound
 handshake worker while its caller retains the sole outbound slot and configured
 endpoint/TLS policy. It tries at most 16 numeric addresses in order, with no
@@ -1734,9 +1749,9 @@ input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result gets the temporary 451 of a
 refused one; the sender's retry may duplicate a delivery that committed.
 A supplied result alone is not durability proof. PostgreSQL receiving
-stages bounded ingress, replaces Return-Path, generates
-Received from trusted connection facts, resolves immutable threads and
-publishes one Inbox email with its body, envelope and history in one
+stages bounded ingress, replaces Return-Path, adds the direct-MX Received-SPF
+observation and generates Received from trusted connection facts. It resolves
+immutable threads and publishes one Inbox email with its body, envelope and history in one
 transaction. A delivery job owns its connection authorization adapter,
 so a worker can construct it and transfer the job without borrowing that
 worker's stack. Borrowed adapters remain supported through the same

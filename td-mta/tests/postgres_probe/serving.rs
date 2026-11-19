@@ -140,11 +140,22 @@ pub(super) fn exercise(
     exchange(b"RCPT TO:<@example.test:outside@remote.test>\r\n", "550");
     exchange(b"DATA\r\n", "354");
     exchange(
-        b"Subject: Executable PostgreSQL\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nBcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\n\r\nDelivered by the real process.\r\n.\r\n",
+        b"Subject: Executable PostgreSQL\r\nFrom: main@example.test\r\nTo: outside@remote.test\r\nBcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\n\r\nDelivered by the real process.\r\n.\r\n",
         "250",
     );
     exchange(b"QUIT\r\n", "221");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+    let received = sql(
+        fixture,
+        "SELECT convert_from(bytes,'UTF8') FROM td_mta.blob_chunks WHERE ordinal=0",
+    );
+    assert!(
+        received.starts_with(
+            "Return-Path: <sender@example.test>\r\nReceived-SPF: fail identity=mailfrom;"
+        ),
+        "{received}"
+    );
+    assert!(received.contains("\r\nReceived-SPF: pass (sender supplied)\r\n"));
     assert!(smtp_address.is_ipv6() && https_address.is_ipv6());
     assert_eq!(
         sql(

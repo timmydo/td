@@ -87,7 +87,10 @@ fn sequence_routes_aliases_and_reset() {
         command(&mut s, "RSET\r\n", "250 ");
         command(&mut s, "EHLO sender.test\r\n", "250-");
         command(&mut s, "MAIL FROM:<>\r\n", "250 ");
+        assert!(s.take_spf_envelope().unwrap().reverse_path.is_empty());
+        assert!(s.take_spf_envelope().is_none());
         command(&mut s, "MAIL FROM:<other@example.test>\r\n", "503 ");
+        assert!(s.take_spf_envelope().is_none());
         for (address, code) in [
             ("alice@example.test", "550 "),
             ("alias@other.test", "550 "),

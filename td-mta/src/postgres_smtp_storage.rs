@@ -245,7 +245,7 @@ impl Drop for Permit<'_> {
 }
 enum Stage {
     Writing,
-    Prepared(Deadline),
+    Prepared(Deadline, Option<crate::spf::Outcome>),
     Done,
 }
 pub struct Delivery<'a, 'b> {
@@ -467,6 +467,13 @@ impl Job for Delivery<'_, '_> {
         result
     }
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure> {
+        self.prepare_with_spf(deadline, None)
+    }
+    fn prepare_with_spf(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<crate::spf::Outcome>,
+    ) -> Result<(), Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -479,14 +486,14 @@ impl Job for Delivery<'_, '_> {
             return Err(Failure::Refused(Error::Deadline));
         }
         charge(&self.backend.clock, &mut self.meter, Charge::default())?;
-        self.stage = Stage::Prepared(deadline);
+        self.stage = Stage::Prepared(deadline, spf);
         Ok(())
     }
     fn commit(&mut self) -> Result<Completion, Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let Stage::Prepared(deadline) = self.stage else {
+        let Stage::Prepared(deadline, spf) = self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
         self.stage = Stage::Done;
@@ -542,6 +549,7 @@ impl Job for Delivery<'_, '_> {
                     cap,
                     meter,
                     session,
+                    spf,
                 )
             },
         );

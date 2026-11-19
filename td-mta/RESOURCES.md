@@ -42,6 +42,7 @@ changing that validator requires an explicit atomic implementation update.
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
+| Direct SPF worker stack and evaluation scratch | 1 | 2097152 | 2097152 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 11 | 262144 | 2883584 |
 | Unix connector stacks | 8 | 262144 | 2097152 |
@@ -57,10 +58,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **435864832** |
+| **Total** | | | **437961984** |
 
-The total is approximately 415.67 MiB against a 512 MiB configured budget;
-the remaining 101006080 bytes are unassigned headroom, not another cache.
+The total is approximately 417.67 MiB against a 512 MiB configured budget;
+the remaining 98908928 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -409,15 +410,27 @@ M21 must measure this separate process and its bounded page/body lifecycle.
 
 ## Direct receiving runtime
 
-The initial `smtp_receiving` runtime implements direct IPv4 SMTP with two
-fixed workers: storage and TLS. It does not instantiate the other roles in
-the proposed whole-service table above. Standard worker stacks and bounded
-per-connection allocations are permitted under DESIGN section 5; this
-increment makes no new whole-service memory claim.
+Direct SMTP uses fixed storage, TLS and SPF workers. One SPF worker serves
+all SMTP slots. Each slot has room for one queued envelope and one result;
+a new MAIL replaces the previous generation. When the envelope is cleared
+by RSET, a new greeting, a disconnect or slot retirement, or the receiver
+freezes the result for commit, it atomically cancels that generation. The
+worker skips canceled envelopes before starting DNS and checks the active
+generation between resolver exchanges and socket operations. An in-flight
+socket call has at most one second of idle wait within the original
+deadline. The network loop never waits for cancellation or a worker lock.
+The SPF worker’s 2 MiB reservation includes a 1 MiB stack and reusable DNS
+packet and evaluation scratch. One observation has a two-second deadline
+from MAIL, including queueing. At the end of DATA, the receiver waits at
+most another 200 ms within that deadline while preserving the original
+commit budget. Missing worker capacity, local work exhaustion or an expired
+observation produces `temperror`. The direct SMTP SIZE and header limits
+reserve space for the longest generated Received-SPF trace and escaped
+envelope values.
 
 A startup-reserved vector holds at most the configured SMTP connection
 count (compiled maximum 32). Each mutex-protected slot owns its protocol,
-transport, optional ingress job and one phase: empty, network, queued,
+transport, optional ingress job and one phase: empty, network, awaiting SPF, queued,
 completed, retry or retiring. Worker scans replace separate work queues:
 each worker performs at most one operation per eligible slot per pass.
 Only the matching worker executes a queued operation. DATA chunk copies do
@@ -448,7 +461,7 @@ spool cleanup cannot hold the TLS worker behind a storage commit. Main
 never drops a native TLS owner during its network loop. A refused DATA
 copy may release its resident delivery memory and permit there, without
 native storage I/O; other delivery disposal remains worker-owned.
-After worker failure, the loop stops and joins both workers before
+On storage or TLS worker failure, the loop stops and joins those workers before
 terminal cleanup, including disposal of poisoned
 slots without resuming their operations. Blocking kernel I/O remains a
 host failure that no timeout can forcibly cancel.
@@ -494,7 +507,11 @@ only the final address set and minimum chain/address TTL. A job returns at
 most 16 addresses. Do not
 allocate one packet/name buffer per waiting lookup. Expired entries are
 replaced in place. Configuration fixes names/resolvers; this is not a recursive
-resolver or a DNS cache for incoming arbitrary domains.
+resolver or a DNS cache for incoming arbitrary domains. The separate SPF
+worker performs TXT, A, AAAA, MX and PTR lookups without a cross-message
+cache. Its per-observation limits include ten DNS-causing SPF terms, two
+void lookups and eight CNAME hops per lookup. A single DNS work meter spans
+alias continuations, resolver retries and TCP fallback.
 
 Control has six 64 KiB regions: HTTP transfer, JWS/CSR, JSON input/tokens,
 configuration stream scratch, administrative output, and main-owned control

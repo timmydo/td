@@ -139,7 +139,7 @@ impl Receiving<'_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<changes::FanoutOutcome, Error> {
-        self.create_fanout_inner(targets, message, until, meter, None)
+        self.create_fanout_inner(targets, message, until, meter, None, None)
     }
     pub(crate) fn create_fanout_cached(
         &self,
@@ -148,8 +148,9 @@ impl Receiving<'_> {
         until: Deadline,
         meter: &mut Meter,
         session: &mut postgres_probe::MutationSession,
+        spf: Option<crate::spf::Outcome>,
     ) -> Result<changes::FanoutOutcome, Error> {
-        self.create_fanout_inner(targets, message, until, meter, Some(session))
+        self.create_fanout_inner(targets, message, until, meter, Some(session), spf)
     }
     fn create_fanout_inner(
         &self,
@@ -158,6 +159,7 @@ impl Receiving<'_> {
         until: Deadline,
         meter: &mut Meter,
         session: Option<&mut postgres_probe::MutationSession>,
+        spf: Option<crate::spf::Outcome>,
     ) -> Result<changes::FanoutOutcome, Error> {
         if !self.valid()
             || targets
@@ -192,8 +194,10 @@ impl Receiving<'_> {
         let change = {
             let mut timing =
                 crate::performance::Timer::start(crate::performance::Phase::SmtpPrepare);
-            let change = changes::prepare_fanout(targets, message, deadline, meter, self.clock)
-                .map_err(Error::Publication)?;
+            let change = changes::fanout::prepare_observed(
+                targets, message, deadline, meter, self.clock, spf,
+            )
+            .map_err(Error::Publication)?;
             timing.succeeded();
             change
         };

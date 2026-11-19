@@ -34,7 +34,7 @@ pub fn lookup(
             let mut id = [0; 2];
             entropy.fill(&mut id).map_err(|_| Error::Entropy)?;
             check(budget)?;
-            let question = Question::from_name(name.clone(), kind, u16::from_be_bytes(id));
+            let question = Question::from_name(*name, kind, u16::from_be_bytes(id));
             match dns_transport::exchange(*server, &question, budget, packet) {
                 Ok(Reply::ResponseCode(3)) => {
                     return Ok((Reply::NoData, check(budget)?));
@@ -108,7 +108,7 @@ fn collect(
         until: Tick(u64::MAX),
     };
     for kind in [AddressType::A, AddressType::Aaaa] {
-        let mut name = original.clone();
+        let mut name = *original;
         let mut remaining = allowance;
         let mut until = Tick(u64::MAX);
         let mut seen: [Option<Name>; MAX_ALIASES + 1] = std::array::from_fn(|_| None);
@@ -127,7 +127,7 @@ fn collect(
                     if seen.iter().flatten().any(|old| old == visited) {
                         return Err(Error::Dns);
                     }
-                    *seen.get_mut(seen_count).ok_or(Error::Dns)? = Some(visited.clone());
+                    *seen.get_mut(seen_count).ok_or(Error::Dns)? = Some(*visited);
                     seen_count += 1;
                 }
             }
@@ -220,7 +220,7 @@ mod tests {
         bytes
     }
     fn addresses(name: &Name, kind: AddressType, ttl: u32, count: u8) -> Reply {
-        let query = Question::from_name(name.clone(), kind, 123);
+        let query = Question::from_name(*name, kind, 123);
         let mut cell = [0; 271];
         let bytes = answer(query.write(&mut cell).unwrap(), ttl, count);
         dns_reply::read(&bytes, &query, MAX_ALIASES).unwrap()
@@ -340,7 +340,7 @@ mod tests {
                         &[if count == 1 {
                             name("alias.test")
                         } else {
-                            original.clone()
+                            original
                         }],
                         false,
                         1,
@@ -495,7 +495,7 @@ mod tests {
         terminal: bool,
         ttl: u32,
     ) -> Reply {
-        let q = Question::from_name(current.clone(), kind, 123);
+        let q = Question::from_name(*current, kind, 123);
         let mut cell = [0; 271];
         let mut bytes = q.write(&mut cell).unwrap().to_vec();
         bytes[2] |= 0x80;
@@ -537,7 +537,7 @@ mod tests {
                 } else if hidden {
                     vec![name("hidden.test"), name("end.test")]
                 } else {
-                    vec![original.clone()]
+                    vec![original]
                 };
                 Ok((chain(current, kind, &targets, calls == 2, 60), Tick(0)))
             });

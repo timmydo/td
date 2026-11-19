@@ -2016,7 +2016,8 @@ Passive receipt facts confer no authority. The receiving service supplies this t
 Preparation validates bounded SMTP metadata, non-NUL DATA with complete CRLF
 lines of arbitrary length within the selected message ceiling, and a root-header
 ceiling of at most 1 MiB. It uses the shared receiving header and trace formatter: prepend the
-server Return-Path/Received fields, strip supplied Return-Path fields, retain
+server Return-Path, local Received-SPF when observed, and Received fields in
+that order, strip supplied Return-Path fields, retain
 root identifiers and keep body bytes unchanged. The header scanner borrows the already admitted immutable DATA, so tentative
 field-name bytes that become body consume work but no extra header backing
 or recognized-header allowance. Original work/deadline limits
@@ -2038,6 +2039,53 @@ delivery and can duplicate a committed message. New requests can proceed
 as soon as database locks and ordinary worker capacity permit. Schema 43
 drops the schema-13 recovery ledger. This migration preserves message bodies,
 envelope provenance, recipient rows, Inbox membership, history and quota usage.
+
+### Inspecting direct-MX SPF observations
+
+The receiver stores its verdict in the immutable message body alongside its
+own Received field. All fanout copies retain the same trace. A raw download
+begins with Return-Path, then Received-SPF for an observed direct delivery,
+then Received. The folded Received-SPF properties identify the receiver,
+socket peer, HELO/EHLO and effective envelope sender. The result `none`
+means an evaluation found no applicable SPF policy or usable sender domain.
+Older direct deliveries have Received immediately after Return-Path and
+have no local observation. A peer can supply additional Received-SPF or
+Authentication-Results fields below the local trace.
+
+Run this read-only query on the primary to count the most recent 1,000
+retained direct delivery rows. Each row represents one delivered account
+copy. It reads the start of chunk zero and matches only the receiver's
+second physical line. Encoding the prefix as PostgreSQL bytea escape text
+also works with non-UTF-8 message content. The provenance predicate excludes
+gateway, imported and JMAP messages even if their headers claim a result.
+
+```sql
+WITH recent AS (
+    SELECT account, blob_id
+    FROM td_mta.emails
+    WHERE origin = 1 AND gateway IS NULL
+    ORDER BY received_at DESC, account, id
+    LIMIT 1000
+), lines AS (
+    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 512), 'escape'),
+                      E'\r\n', 2) AS second_line
+    FROM recent r
+    JOIN td_mta.blob_chunks c
+      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
+)
+SELECT coalesce(substring(second_line FROM
+           '^Received-SPF: (pass|fail|softfail|neutral|none|temperror|permerror) identity=mailfrom;$'),
+           'unobserved') AS result,
+       count(*) AS account_deliveries
+FROM lines
+GROUP BY 1
+ORDER BY 1;
+```
+
+For example, an old message containing a peer-supplied pass counts as
+`unobserved`. An observed failure followed by the same peer claim counts
+as `fail`. A `temperror` includes DNS and local evaluation timeouts and
+does not establish that the peer failed the sender's policy.
 
 ## 47. Verified submission input preparation
 

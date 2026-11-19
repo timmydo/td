@@ -161,6 +161,17 @@ pub fn prepare_with_meter(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Delivery, Error> {
+    prepare_observed(binding, message, deadline, meter, clock, None)
+}
+
+fn prepare_observed(
+    binding: &Binding,
+    message: &Message<'_>,
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+    spf: Option<crate::spf::Outcome>,
+) -> Result<Delivery, Error> {
     preparation_time(binding, deadline)?;
     let clock = PreparationClock { clock, deadline };
     charge(&clock, meter, 0, 0)?;
@@ -175,8 +186,14 @@ pub fn prepare_with_meter(
         BlobId::from_bytes(blob),
         ThreadId::from_bytes(new_thread),
     );
-    let (bytes, anchors, message_id, provenance) =
-        input::prepare(binding, message, email, blob, new_thread, &clock, meter)?;
+    let (bytes, anchors, message_id, provenance) = input::prepare(
+        binding,
+        message,
+        (email, blob, new_thread),
+        &clock,
+        meter,
+        spf,
+    )?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in bytes.chunks(publication::CHUNK) {
         charge(&clock, meter, part.len(), 0)?;

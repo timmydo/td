@@ -427,6 +427,20 @@ fn run_once(
                 .try_reserve_exact(accounts.account_count())
                 .map_err(|_| config_failure("receiving", "capacity"))?;
             receiving_bindings.extend(published.bindings().skip(1));
+            let mut spf_resolvers = Vec::new();
+            if binding.roles().receive() {
+                let outbound = candidate
+                    .outbound()
+                    .map_err(|_| config_failure("receiving", "resolvers"))?;
+                for index in 0..outbound.resolver_count() {
+                    let resolver = outbound
+                        .resolver(index)
+                        .map_err(|_| config_failure("receiving", "resolvers"))?
+                        .ok_or_else(|| config_failure("receiving", "resolvers"))?;
+                    td_alloc::push(&mut spf_resolvers, resolver.endpoint)
+                        .map_err(|_| config_failure("receiving", "capacity"))?;
+                }
+            }
             let storage = if binding.roles().receive() {
                 Some(
                     td_mta::postgres_smtp_storage::Backend::new(
@@ -685,7 +699,9 @@ fn run_once(
                     announce(listeners.len(), mailbox_access, relay)
                 };
                 let result = match receiving.as_ref() {
-                    Some(receiving) => receiving.run_with_ready(&control, ready),
+                    Some(receiving) => {
+                        receiving.run_with_resolvers(&control, ready, &spf_resolvers)
+                    }
                     None => control.wait_with_ready(ready),
                 }
                 .map_err(|error| ConfigFailure::from(adapter("serving", error)));

@@ -619,7 +619,14 @@ submission or route.
 The separate foreground-process fixture also mixes an accepted local RCPT
 with rejected external RCPT commands. Its delivered message carries forged
 From, To, Bcc, Resent-To, X-Original-To, X-Forwarded-To, Received and
-Authentication-Results headers. After local acceptance, outbound submission,
+Authentication-Results and Received-SPF headers. Its private resolver
+publishes `v=spf1 -all` for the envelope domain. The executable returns 250,
+and its PostgreSQL body begins with the local Return-Path and Received-SPF
+fail fields while preserving the sender's claimed pass farther down. Header
+tests cover all seven results, the effective null sender, quoted values and
+maximum trace size. DNS and policy fixtures exercise aliases, TCP fallback,
+lookup exhaustion and nested policies without public DNS. After local
+acceptance, outbound submission,
 recipient and route tables remain empty, queue usage remains zero, and the
 fixture smart host has accepted no delivery. Authenticated JMAP submission
 then exercises the legitimate outbound path in the same fixture. The

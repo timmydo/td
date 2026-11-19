@@ -13,7 +13,7 @@ pub enum Error {
 
 /// Canonical label-length wire form, including the root octet. Only ASCII
 /// letters fold; arbitrary label octets and label boundaries remain distinct.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Name {
     bytes: [u8; MAX_NAME_BYTES],
     used: u16,
@@ -23,8 +23,20 @@ impl Name {
     /// Configured endpoint syntax, not a presentation-format DNS name parser.
     pub fn from_host(host: &str) -> Result<Self, Error> {
         crate::config::values::dns_name(host).map_err(|_| Error::Invalid)?;
+        Self::from_labels(host)
+    }
+
+    /// SPF target-names can contain non-host labels after macro expansion.
+    pub(crate) fn from_labels(host: &str) -> Result<Self, Error> {
+        let host = host.strip_suffix('.').unwrap_or(host);
         let mut name = Self::empty();
         for label in host.split('.') {
+            if label.is_empty()
+                || label.len() > 63
+                || !label.bytes().all(|b| (0x20..=0x7e).contains(&b))
+            {
+                return Err(Error::Invalid);
+            }
             name.push(u8::try_from(label.len()).map_err(|_| Error::Invalid)?)?;
             for byte in label.bytes() {
                 name.push(byte.to_ascii_lowercase())?;
@@ -152,6 +164,26 @@ impl Question {
         self.id
     }
 
+    pub(crate) fn wire(&self) -> WireQuestion<'_> {
+        WireQuestion {
+            name: &self.name,
+            id: self.id,
+            kind: self.kind.code(),
+        }
+    }
+
+    pub fn write<'a>(&self, output: &'a mut [u8]) -> Result<&'a [u8], Error> {
+        self.wire().write(output)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WireQuestion<'a> {
+    pub(crate) name: &'a Name,
+    pub(crate) kind: u16,
+    pub(crate) id: u16,
+}
+impl WireQuestion<'_> {
     /// Only the returned prefix is a query; bytes beyond it are unchanged.
     /// Insufficient capacity writes nothing. No TCP length prefix or EDNS.
     pub fn write<'a>(&self, output: &'a mut [u8]) -> Result<&'a [u8], Error> {
@@ -172,7 +204,7 @@ impl Question {
         output
             .get_mut(end..end + 2)
             .ok_or(Error::Capacity)?
-            .copy_from_slice(&self.kind.code().to_be_bytes());
+            .copy_from_slice(&self.kind.to_be_bytes());
         *output.get_mut(end + 3).ok_or(Error::Capacity)? = 1; // IN
         Ok(output)
     }
@@ -227,7 +259,7 @@ mod tests {
     fn compressed_suffixes_count_only_original_bytes() {
         let packet = b"\x07EXAMPLE\x04test\x00\x02MX\xc0\x00\xc0\x0e";
         let expected = Name::from_host("mx.example.test").unwrap();
-        assert_eq!(Name::read(packet, 14).unwrap(), (expected.clone(), 5));
+        assert_eq!(Name::read(packet, 14).unwrap(), (expected, 5));
         assert_eq!(Name::read(packet, 19).unwrap(), (expected, 2));
         for end in 0..14 {
             assert!(Name::read(&packet[..end], 0).is_err());

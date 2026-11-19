@@ -205,7 +205,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 25],
+    reservations: [Reservation; 26],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -383,6 +383,11 @@ impl Limits {
                 bytes_each: 512 * KIB,
             },
             Reservation {
+                name: "direct SPF worker and scratch",
+                count: 1,
+                bytes_each: crate::smtp_spf::STACK_BYTES + MIB,
+            },
+            Reservation {
                 name: "slot queues and queue window",
                 count: 1,
                 bytes_each: 128 * KIB,
@@ -487,7 +492,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 435_864_832);
+        assert_eq!(plan.total_bytes(), 437_961_984);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,

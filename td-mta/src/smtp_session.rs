@@ -297,6 +297,7 @@ pub struct Session<'a> {
     rejected_envelope: Option<Envelope>,
     recipient_bytes: usize,
     transactions: u64,
+    spf_requested: bool,
     rate_limited: bool,
     accepted: Option<Charge>,
 }
@@ -331,6 +332,7 @@ impl<'a> Session<'a> {
             rejected_envelope: None,
             recipient_bytes: 0,
             transactions: 0,
+            spf_requested: false,
             rate_limited: false,
             accepted: None,
         })
@@ -406,6 +408,14 @@ impl<'a> Session<'a> {
     /// Maximum decoded incoming bytes. The reservation additionally covers trace.
     pub fn incoming_limit(&self) -> usize {
         self.settings.message_bytes - self.settings.trace_bytes
+    }
+    /// Consume the successful MAIL event once, before another command is read.
+    pub(crate) fn take_spf_envelope(&mut self) -> Option<&Envelope> {
+        if std::mem::take(&mut self.spf_requested) {
+            self.envelope.as_ref()
+        } else {
+            None
+        }
     }
     pub fn envelope(&self) -> Option<&Envelope> {
         self.envelope.as_ref()
@@ -601,6 +611,7 @@ impl<'a> Session<'a> {
         self.data_continuation = false;
     }
     fn reset(&mut self) {
+        self.spf_requested = false;
         self.envelope = None;
         self.recipient_bytes = 0;
         self.data_bytes = 0;
@@ -792,6 +803,7 @@ impl<'a> Session<'a> {
             declared_bytes: size,
         });
         self.transactions += 1;
+        self.spf_requested = true;
         self.respond("250 2.1.0 Sender accepted\r\n", Next::Command);
         Ok(())
     }

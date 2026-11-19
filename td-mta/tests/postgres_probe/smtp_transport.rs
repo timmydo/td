@@ -120,6 +120,13 @@ impl<J: Job> Job for ObservedJob<J> {
     fn prepare(&mut self, deadline: Deadline) -> Result<(), smtp_storage::Failure> {
         self.inner.prepare(deadline)
     }
+    fn prepare_with_spf(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<td_mta::spf::Outcome>,
+    ) -> Result<(), smtp_storage::Failure> {
+        self.inner.prepare_with_spf(deadline, spf)
+    }
     fn commit(&mut self) -> Result<smtp_storage::Completion, smtp_storage::Failure> {
         if self.gated {
             self.probe.state.lock().unwrap().entered = true;
@@ -457,14 +464,18 @@ pub(super) fn exercise(
             },
         };
         let control = Control::default();
+        // This resolver accepts a datagram but never answers. The rate fixture
+        // must still commit the message and publish a local transient result.
+        let silent = rate.then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let endpoint = silent.as_ref().map(|socket| socket.local_addr().unwrap());
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(1);
             let server = scope.spawn({
                 let receiving = &receiving;
                 let control = &control;
-                move || receiving.run_with_ready(control, || {
+                move || receiving.run_with_resolvers(control, || {
                     tx.send(()).map_err(|_| td_mta::ports::Error::Invalid)
-                })
+                }, endpoint.as_slice())
             });
             let stop = Stop(&control);
             rx.recv_timeout(Duration::from_secs(20)).unwrap();
@@ -523,6 +534,11 @@ pub(super) fn exercise(
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
             command(&mut client, b".\r\n", "250");
             assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+            if let Some(silent) = &silent {
+                silent.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                assert!(silent.recv(&mut [0; 512]).unwrap() > 12);
+            }
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to(E'Return-Path: <sender@example.test>\\r\\nReceived-SPF: temperror ', 'UTF8') in bytes)=1"), "1");
             let preserved = format!("{long_header}{}\r\n.dot\r\n", "b".repeat(8192));
             let hex: String = preserved.bytes().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.blob_chunks WHERE position(decode('{hex}','hex') in bytes)>0")), "1");

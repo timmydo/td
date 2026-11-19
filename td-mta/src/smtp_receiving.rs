@@ -204,7 +204,7 @@ impl<'a> BoundListener<'a> {
             return Err(Error::Forbidden);
         }
         let hostname = row.server_name.ok_or(Error::Invalid)?;
-        let trace_bytes = crate::receiving_headers::trace_allowance(hostname)?;
+        let trace_bytes = crate::receiving_headers::spf_trace_allowance(hostname)?;
         socket.set_nonblocking(true).map_err(Error::from)?;
         Ok(Self {
             socket,
@@ -267,6 +267,9 @@ enum Work {
 enum Phase {
     Empty,
     Network,
+    AwaitSpf {
+        until: Tick,
+    },
     Queued {
         work: Work,
         deadline: Deadline,
@@ -279,20 +282,32 @@ enum Phase {
     },
     Retire,
 }
-struct Slot<'s, 'cfg, B: Storage + 's> {
+struct Slot<'s, 'cfg, 'spf, B: Storage + 's> {
     phase: Phase,
     connection: Option<Connection<'cfg>>,
     delivery: Option<B::Job<'s>>,
     listener: usize,
     peer: IpAddr,
     final_reply: bool,
+    spf_ticket: Option<crate::smtp_spf::Ticket<'spf>>,
+    spf_result: Option<crate::spf::Outcome>,
     data_timing: Option<crate::performance::Timer>,
     commit_wait: Option<crate::performance::Timer>,
 }
-impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
+impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
     fn connection(&mut self) -> Result<&mut Connection<'cfg>, Error> {
         self.connection.as_mut().ok_or(Error::Conflict)
     }
+    fn freeze_spf(&mut self, result: Option<crate::spf::Outcome>) {
+        self.spf_result = Some(result.unwrap_or(crate::spf::Outcome::Temperror));
+        self.spf_ticket = None;
+    }
+
+    fn queue_retirement(&mut self) {
+        self.spf_ticket = None;
+        self.phase = Phase::Retire;
+    }
+
     fn retire(&mut self) {
         self.data_timing.take();
         self.commit_wait.take();
@@ -300,6 +315,8 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
         self.connection.take();
         self.phase = Phase::Empty;
         self.final_reply = false;
+        self.spf_ticket = None;
+        self.spf_result = None;
     }
 }
 
@@ -361,11 +378,25 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
         ready: impl FnOnce() -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.run_with_resolvers(control, ready, &[])
+    }
+
+    /// Direct-MX DNS observations use only the configured recursive endpoints.
+    /// With no resolver, accepted mail carries a local temporary error.
+    pub fn run_with_resolvers(
+        &self,
+        control: &Control,
+        ready: impl FnOnce() -> Result<(), Error>,
+        resolvers: &[std::net::SocketAddr],
+    ) -> Result<(), Error> {
         control
             .state
             .compare_exchange(0, 5, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Conflict)?;
-        let result = self.run_inner(control, ready);
+        let result =
+            crate::smtp_spf::with_worker(self.resources.limits().smtp_sessions, resolvers, |spf| {
+                self.run_inner(control, ready, spf)
+            });
         if result.is_err() {
             control.fail();
             return result;
@@ -382,6 +413,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         &self,
         control: &Control,
         ready: impl FnOnce() -> Result<(), Error>,
+        spf: Option<&crate::smtp_spf::Service<'_>>,
     ) -> Result<(), Error> {
         let limits = self.resources.limits();
         if self.listeners.is_empty()
@@ -461,6 +493,8 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 listener: 0,
                 peer: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 final_reply: false,
+                spf_ticket: None,
+                spf_result: None,
                 data_timing: None,
                 commit_wait: None,
             }));
@@ -584,9 +618,18 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 });
                         slot.final_reply = final_reply;
                         if stopping.is_some_and(|deadline| deadline.expired(now)) && !final_reply {
-                            slot.phase = Phase::Retire;
+                            slot.queue_retirement();
                         }
                         if let Phase::Done = slot.phase {
+                            slot.phase = Phase::Network;
+                        }
+                        if let Phase::AwaitSpf { until } = slot.phase {
+                            let result = spf
+                                .and_then(|service| service.poll(index, slot.spf_ticket.as_ref()));
+                            if result.is_none() && now < until && stopping.is_none() {
+                                continue;
+                            }
+                            slot.freeze_spf(result);
                             slot.phase = Phase::Network;
                         }
                         if let Phase::Retry { work, deadline, at } = slot.phase {
@@ -605,10 +648,23 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             if stopping.is_some_and(|deadline| deadline.expired(now))
                                 && !final_reply
                             {
-                                slot.phase = Phase::Retire;
+                                slot.queue_retirement();
                             } else {
                                 let turn = (|| {
                                     let peer = slot.peer;
+                                    if let Some(envelope) =
+                                        slot.connection()?.network_mut()?.take_spf_envelope()
+                                    {
+                                        slot.spf_ticket = spf.and_then(|service| {
+                                            service.start(
+                                                index,
+                                                peer,
+                                                &envelope.ehlo,
+                                                &envelope.reverse_path,
+                                            )
+                                        });
+                                        slot.spf_result = None;
+                                    }
                                     let connection = slot.connection()?;
                                     let network = connection.network_mut()?;
                                     rate_turn(&mut rates, peer, network, now);
@@ -626,7 +682,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                             .network_mut()?
                                             .service_unavailable(self.clock.as_ref());
                                     }
-                                    connection.advance(self.clock.as_ref())
+                                    let progress = connection.advance(self.clock.as_ref())?;
+                                    if connection.network()?.session().envelope().is_none() {
+                                        slot.spf_ticket = None;
+                                    }
+                                    Ok(progress)
                                 })();
                                 match turn {
                                     Ok(Progress::Pending) => break,
@@ -642,13 +702,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                                 None,
                                             );
                                         }
-                                        slot.phase = Phase::Retire;
+                                        slot.queue_retirement();
                                         progress = true;
                                     }
                                     Ok(Progress::Work) => {
-                                        let dispatched = self.dispatch(&mut slot, now, control);
+                                        let dispatched =
+                                            self.dispatch(&mut slot, now, control, spf, index);
                                         if dispatched.is_err() {
-                                            slot.phase = Phase::Retire;
+                                            slot.queue_retirement();
                                         }
                                         progress = true;
                                     }
@@ -826,9 +887,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn dispatch(
         &self,
-        slot: &mut Slot<'s, 'cfg, B>,
+        slot: &mut Slot<'s, 'cfg, '_, B>,
         now: Tick,
         control: &Control,
+        spf: Option<&crate::smtp_spf::Service<'_>>,
+        index: usize,
     ) -> Result<(), Error> {
         let network = slot.connection()?.network()?;
         let (work, seconds) = match network.session().pending() {
@@ -841,7 +904,21 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             Pending::StartTls { .. } => (Work::Tls, self.timeouts.limits().handshake_seconds),
             _ => return Err(Error::Conflict),
         };
-        let deadline = after(now, seconds)?.min(network.deadline());
+        let transport_deadline = network.deadline();
+        if matches!(work, Work::Commit { .. }) && slot.spf_result.is_none() {
+            let result = match spf {
+                Some(service) => service.poll(index, slot.spf_ticket.as_ref()),
+                None => Some(crate::spf::Outcome::Temperror),
+            };
+            // Keep the full original commit budget, including on nearly expired DATA.
+            let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds);
+            if result.is_none() && until > now && !control.stop_requested() {
+                slot.phase = Phase::AwaitSpf { until };
+                return Ok(());
+            }
+            slot.freeze_spf(result);
+        }
+        let deadline = after(now, seconds)?.min(transport_deadline);
         if matches!(work, Work::Write) {
             return self.write_data(slot, deadline, control);
         }
@@ -859,7 +936,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn worker(
         &self,
-        slots: &[Mutex<Slot<'s, 'cfg, B>>],
+        slots: &[Mutex<Slot<'s, 'cfg, '_, B>>],
         tls: bool,
         finished: &AtomicBool,
         started: &AtomicU8,
@@ -907,7 +984,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     }
                     Phase::Queued { work, deadline } if matches!(work, Work::Tls) == tls => {
                         if control.state() == State::Failed {
-                            slot.phase = Phase::Retire;
+                            slot.queue_retirement();
                             progress = true;
                             continue;
                         }
@@ -952,7 +1029,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn storage(
         &self,
-        slot: &mut Slot<'s, 'cfg, B>,
+        slot: &mut Slot<'s, 'cfg, '_, B>,
         work: Work,
         cap: Deadline,
         random: &mut td_crypto::SystemEntropy,
@@ -1019,7 +1096,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
                 let job = slot.delivery.as_mut().ok_or(Error::Conflict)?;
                 if !prepared {
-                    if let Err(error) = job.prepare(cap) {
+                    if let Err(error) = job.prepare_with_spf(cap, slot.spf_result) {
                         return self.delivery_refused(slot, work, error, control);
                     }
                 }
@@ -1052,7 +1129,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             // closes without one.
                             if matches!(result, Err(CommitFailure::Indeterminate(_))) {
                                 slot.delivery.take();
-                                slot.phase = Phase::Retire;
+                                slot.queue_retirement();
                                 return Ok(());
                             }
                         }
@@ -1082,12 +1159,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn write_data(
         &self,
-        slot: &mut Slot<'s, 'cfg, B>,
+        slot: &mut Slot<'s, 'cfg, '_, B>,
         cap: Deadline,
         control: &Control,
     ) -> Result<(), Error> {
         if control.state() == State::Failed {
-            slot.phase = Phase::Retire;
+            slot.queue_retirement();
             return Ok(());
         }
         let work = Work::Write;
@@ -1125,7 +1202,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn delivery_refused(
         &self,
-        slot: &mut Slot<'s, 'cfg, B>,
+        slot: &mut Slot<'s, 'cfg, '_, B>,
         work: Work,
         error: smtp_storage::Failure,
         control: &Control,
@@ -1133,6 +1210,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         slot.data_timing.take();
         slot.commit_wait.take();
         if matches!(error, smtp_storage::Failure::HeaderLimit) {
+            slot.spf_ticket = None;
             slot.delivery.take();
             slot.connection()?
                 .network_mut()?
@@ -1152,13 +1230,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn storage_refused(
         &self,
-        slot: &mut Slot<'s, 'cfg, B>,
+        slot: &mut Slot<'s, 'cfg, '_, B>,
         work: Work,
         error: Error,
         control: &Control,
     ) -> Result<(), Error> {
         slot.data_timing.take();
         slot.commit_wait.take();
+        slot.spf_ticket = None;
         slot.delivery.take();
         let network = slot.connection()?.network_mut()?;
         match work {
@@ -1177,7 +1256,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         Ok(())
     }
 
-    fn tls(&self, slot: &mut Slot<'s, 'cfg, B>, cap: Deadline) -> Result<(), Error> {
+    fn tls(&self, slot: &mut Slot<'s, 'cfg, '_, B>, cap: Deadline) -> Result<(), Error> {
         let now = self.clock.monotonic()?;
         if cap.expired(now) {
             return Err(Error::Deadline);

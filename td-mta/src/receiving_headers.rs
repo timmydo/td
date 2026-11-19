@@ -472,6 +472,30 @@ pub(crate) fn trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
         .and_then(|n| n.checked_add(52 + 32 + 128 + 2))
         .ok_or(ports::Error::Capacity)
 }
+/// Upper bound including RFC 7208 §9.1. A quoted byte can double; a null
+/// reverse path supplies postmaster@ followed by the greeting a second time.
+pub(crate) fn spf_trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
+    let frame = b"Received-SPF: permerror identity=mailfrom;\r\n\treceiver=; client-ip=\"\";\r\n\thelo=\"\";\r\n\tenvelope-from=\"\"\r\n".len();
+    let helo = 2 * crate::format::row::MAX_EHLO;
+    let sender = (2 * crate::format::row::MAX_ADDRESS).max("postmaster@".len() + helo);
+    Ok(trace_allowance(hostname)? + frame + hostname.len() + 39 + helo + sender)
+}
+
+struct QuotedContent<'a>(&'a str);
+impl std::fmt::Display for QuotedContent<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0.bytes() {
+            if !byte.is_ascii_graphic() && byte != b' ' {
+                return Err(std::fmt::Error);
+            }
+            if matches!(byte, b'\\' | b'"') {
+                output.write_char('\\')?;
+            }
+            output.write_char(char::from(byte))?;
+        }
+        Ok(())
+    }
+}
 pub(crate) fn trace(
     receipt: &SmtpReceipt<'_>,
     hostname: &str,
@@ -479,6 +503,7 @@ pub(crate) fn trace(
     email: EmailId,
     utc_ms: i64,
     maximum: usize,
+    spf: Option<crate::spf::Outcome>,
 ) -> Result<String, ports::Error> {
     let date = td_civil::unix_to_civil_utc_checked(utc_ms.div_euclid(1000))
         .ok_or(ports::Error::Invalid)?;
@@ -509,12 +534,28 @@ pub(crate) fn trace(
     output
         .try_reserve_exact(maximum)
         .map_err(|_| ports::Error::Capacity)?;
-    write!(
-        output,
-        "Return-Path: <{}>\r\nReceived: from {} (",
-        receipt.reverse_path, receipt.ehlo
-    )
-    .map_err(|_| ports::Error::Capacity)?;
+    write!(output, "Return-Path: <{}>\r\n", receipt.reverse_path)
+        .map_err(|_| ports::Error::Capacity)?;
+    if let Some(result) = spf {
+        if receipt.gateway.is_some() {
+            return Err(ports::Error::Invalid);
+        }
+        let (prefix, mailbox) = if receipt.reverse_path.is_empty() {
+            ("postmaster@", receipt.ehlo)
+        } else {
+            ("", receipt.reverse_path)
+        };
+        // Folding whitespace keeps the committed byte charge and header ceiling
+        // independent of the authentication result.
+        let width = "permerror".len().saturating_sub(result.as_str().len());
+        write!(
+            output,
+            "Received-SPF: {} identity=mailfrom;\r\n\t{pad:width$}receiver={hostname}; client-ip=\"{}\";\r\n\thelo=\"{}\";\r\n\tenvelope-from=\"{prefix}{}\"\r\n",
+            result.as_str(), receipt.peer, QuotedContent(receipt.ehlo), QuotedContent(mailbox), pad = ""
+        )
+        .map_err(|_| ports::Error::Invalid)?;
+    }
+    write!(output, "Received: from {} (", receipt.ehlo).map_err(|_| ports::Error::Capacity)?;
     match receipt.peer {
         IpAddr::V4(ip) => write!(output, "[{ip}]"),
         IpAddr::V6(ip) => write!(output, "[IPv6:{ip}]"),
@@ -552,4 +593,174 @@ fn copy_identifier(id: &str, work: &mut Work<'_>) -> Result<String, Error> {
         .map_err(|_| Error::Capacity)?;
     copy.push_str(id);
     Ok(copy)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spf_tests {
+    use super::*;
+    use crate::{format::row::ReceiptRecipients, spf::Outcome};
+
+    fn render(
+        host: &str,
+        ehlo: &str,
+        reverse_path: &str,
+        gateway: Option<&str>,
+        observed: Option<Outcome>,
+    ) -> Result<String, Error> {
+        let mut encoded = [0; 64];
+        let receipt = SmtpReceipt {
+            peer: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+            gateway,
+            tls: ReceiptTls::Tls13,
+            ehlo,
+            reverse_path,
+            recipients: ReceiptRecipients::encode(&["owner@example.test"], &mut encoded).unwrap(),
+        };
+        trace(
+            &receipt,
+            host,
+            true,
+            EmailId::from_bytes([1; 16]),
+            0,
+            if observed.is_some() {
+                spf_trace_allowance(host)?
+            } else {
+                trace_allowance(host)?
+            },
+            observed,
+        )
+    }
+
+    const OUTCOMES: &[Outcome] = &[
+        Outcome::None,
+        Outcome::Neutral,
+        Outcome::Pass,
+        Outcome::Fail,
+        Outcome::Softfail,
+        Outcome::Temperror,
+        Outcome::Permerror,
+    ];
+
+    #[test]
+    fn received_spf_precedes_the_receivers_own_received_field() {
+        const HOST: &str = "mx.example.test";
+        const HELO: &str = "[IPv6:::1]";
+        let size = render(HOST, HELO, "", None, Some(Outcome::Permerror))
+            .unwrap()
+            .len();
+        for &outcome in OUTCOMES {
+            let header = render(HOST, HELO, "", None, Some(outcome)).unwrap();
+            assert_eq!(header.len(), size);
+            assert!(header.starts_with(&format!(
+                "Return-Path: <>\r\nReceived-SPF: {} identity=mailfrom;\r\n\t{}receiver=mx.example.test; client-ip=\"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff\";\r\n\thelo=\"[IPv6:::1]\";\r\n\tenvelope-from=\"postmaster@[IPv6:::1]\"\r\nReceived: ",
+                outcome.as_str(), " ".repeat("permerror".len() - outcome.as_str().len())
+            )));
+        }
+        for gateway in [None, Some("gateway")] {
+            let header = render(HOST, HELO, "", gateway, None).unwrap();
+            assert!(header.starts_with("Return-Path: <>\r\nReceived: "));
+        }
+        assert_eq!(
+            render(HOST, HELO, "", Some("gateway"), Some(Outcome::Pass)),
+            Err(Error::Invalid)
+        );
+        let quoted = render(
+            HOST,
+            HELO,
+            r#""a\"b"@example.test"#,
+            None,
+            Some(Outcome::None),
+        )
+        .unwrap();
+        assert!(quoted.contains(r#"envelope-from="\"a\\\"b\"@example.test""#));
+        assert_eq!(
+            render(HOST, "a\r\nForged: pass", "", None, Some(Outcome::None)),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn local_verdict_and_sender_trace_fit_the_exact_filtered_header_budget() {
+        let clock = crate::clock::RuntimeClock::new();
+        let mut last = clock.monotonic().unwrap();
+        let deadline = Deadline::after(last, 10_000).unwrap();
+        let mut meter = Meter::new(
+            deadline,
+            td_mime::work::Charge {
+                records: 1_000_000,
+                io_bytes: 1_000_000,
+                output_bytes: 1_000_000,
+                unlinks: 0,
+            },
+        );
+        let mut work = Work {
+            clock: &clock,
+            deadline,
+            meter: &mut meter,
+            last: &mut last,
+        };
+        let original = b"Received-SPF: pass (prior hop)\r\n";
+        let tail = b"\r\nbody\r\n";
+        let source = [
+            b"Return-Path: <injected@example.test>\r\n".as_slice(),
+            original,
+            tail,
+        ]
+        .concat();
+        let trace = |outcome| {
+            render(
+                "mx.example.test",
+                "mail.example.test",
+                "user@example.test",
+                None,
+                Some(outcome),
+            )
+            .unwrap()
+        };
+        let limit = trace(Outcome::Fail).len() + original.len();
+        let filtered = |trace: &str, limit, work: &mut Work<'_>| -> Result<Vec<u8>, HeaderError> {
+            let mut headers = Headers::resident(&source, limit);
+            assert!(headers.push(&source, true, work)?);
+            let mut raw = Vec::new();
+            headers.write_filtered(
+                trace.as_bytes(),
+                |bytes| {
+                    raw.extend_from_slice(bytes);
+                    Ok(())
+                },
+                work,
+            )?;
+            Ok(raw)
+        };
+        for &outcome in OUTCOMES {
+            let trace = trace(outcome);
+            assert_eq!(
+                filtered(&trace, limit - 1, &mut work),
+                Err(HeaderError::HeaderLimit)
+            );
+            let raw = filtered(&trace, limit, &mut work).unwrap();
+            assert_eq!(raw, [trace.as_bytes(), original, tail].concat());
+            // PostgreSQL charges this exact byte length to the account.
+            assert_eq!(raw.len(), limit + tail.len());
+        }
+    }
+
+    #[test]
+    fn maximum_quoted_properties_fit_the_advertised_trace_allowance() {
+        let host = [
+            "x".repeat(63),
+            "y".repeat(63),
+            "z".repeat(63),
+            "t".repeat(61),
+        ]
+        .join(".");
+        let helo = "\\".repeat(crate::format::row::MAX_EHLO);
+        let sender = "\"".repeat(crate::format::row::MAX_ADDRESS);
+        for reverse in ["", sender.as_str()] {
+            let header = render(&host, &helo, reverse, None, Some(Outcome::Temperror)).unwrap();
+            assert!(header.len() + 2 <= spf_trace_allowance(&host).unwrap());
+            assert!(header.split("\r\n").all(|line| line.len() <= 998));
+        }
+    }
 }

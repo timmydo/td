@@ -2,7 +2,7 @@
 use crate::{
     clock::RuntimeClock,
     dns_reply::{self, Reply, MAX_ALIASES, MAX_RECORDS},
-    dns_wire::{Question, MAX_PACKET_BYTES, MAX_QUERY_BYTES},
+    dns_wire::{Question, WireQuestion, MAX_PACKET_BYTES, MAX_QUERY_BYTES},
     ports::{Clock, Deadline, Error, Tick},
 };
 use std::{
@@ -27,7 +27,7 @@ pub struct Budget<'a> {
     pub remaining_aliases: usize,
 }
 impl Budget<'_> {
-    fn check(&mut self) -> Result<Duration, Error> {
+    pub(crate) fn check(&mut self) -> Result<Duration, Error> {
         let now = self.clock.sample()?.monotonic;
         if self.deadline.expired(now) {
             return Err(Error::Deadline);
@@ -45,6 +45,13 @@ impl Budget<'_> {
         }
         Ok(remaining.min(IDLE))
     }
+    fn while_current(&mut self, current: &dyn Fn() -> bool) -> Result<Duration, Error> {
+        if !current() {
+            return Err(Error::Conflict);
+        }
+        self.check()
+    }
+
     fn charge(&mut self, charge: Charge) -> Result<(), Error> {
         self.check()?;
         self.meter
@@ -58,19 +65,19 @@ impl Budget<'_> {
             ..Charge::default()
         })
     }
-    fn parse(
+    fn parse<T>(
         &mut self,
         packet: &[u8],
-        question: &Question,
-    ) -> Result<Result<Reply, crate::dns_wire::Error>, Error> {
+        parse: &impl Fn(&[u8]) -> Result<Packet<T>, Error>,
+    ) -> Result<Packet<T>, Error> {
         self.charge(Charge {
             // One framing pass plus at most nine answer scans.
             records: ((MAX_ALIASES + 2) * MAX_RECORDS) as u64,
             ..Charge::default()
         })?;
-        let result = dns_reply::read(packet, question, self.remaining_aliases);
+        let result = parse(packet);
         self.check()?;
-        Ok(result)
+        result
     }
 }
 fn work(error: Stop) -> Error {
@@ -96,7 +103,39 @@ pub fn exchange(
     budget: &mut Budget<'_>,
     packet: &mut [u8],
 ) -> Result<Reply, Error> {
-    budget.check()?;
+    let aliases = budget.remaining_aliases;
+    exchange_with(
+        endpoint,
+        question.wire(),
+        budget,
+        packet,
+        &|| true,
+        |packet| {
+            Ok(match dns_reply::read(packet, question, aliases) {
+                Ok(Reply::Truncated) => Packet::Truncated,
+                Ok(reply) => Packet::Complete(reply),
+                Err(_) => Packet::Invalid,
+            })
+        },
+    )
+}
+
+pub(crate) enum Packet<T> {
+    Invalid,
+    Truncated,
+    Complete(T),
+}
+
+/// Only a matching TC reply requests TCP fallback to the same numeric endpoint.
+pub(crate) fn exchange_with<T>(
+    endpoint: SocketAddr,
+    question: WireQuestion<'_>,
+    budget: &mut Budget<'_>,
+    packet: &mut [u8],
+    current: &dyn Fn() -> bool,
+    parse: impl Fn(&[u8]) -> Result<Packet<T>, Error>,
+) -> Result<T, Error> {
+    budget.while_current(current)?;
     if budget.remaining_aliases > MAX_ALIASES {
         return Err(Error::Capacity);
     }
@@ -112,14 +151,14 @@ pub fn exchange(
     );
     budget.io(0)?;
     let result = UdpSocket::bind(local);
-    budget.check()?;
+    budget.while_current(current)?;
     let socket = result.map_err(io)?;
     budget.io(0)?;
     let result = socket.connect(endpoint);
-    budget.check()?;
+    budget.while_current(current)?;
     result.map_err(io)?;
     socket
-        .set_write_timeout(Some(budget.check()?))
+        .set_write_timeout(Some(budget.while_current(current)?))
         .map_err(io)?;
     budget.charge(Charge {
         output_bytes: query.len() as u64,
@@ -127,42 +166,45 @@ pub fn exchange(
     })?;
     budget.io(query.len())?;
     let result = socket.send(query);
-    budget.check()?;
+    budget.while_current(current)?;
     if result.map_err(io)? != query.len() {
         return Err(Error::Dns);
     }
     for _ in 0..MAX_DATAGRAMS {
-        socket.set_read_timeout(Some(budget.check()?)).map_err(io)?;
+        socket
+            .set_read_timeout(Some(budget.while_current(current)?))
+            .map_err(io)?;
         budget.io(UDP_BYTES + 1)?;
         let result = socket.recv(packet.get_mut(..UDP_BYTES + 1).ok_or(Error::Capacity)?);
-        budget.check()?;
+        budget.while_current(current)?;
         let size = result.map_err(io)?;
         if size > UDP_BYTES {
             return Err(Error::Dns);
         }
         let data = packet.get(..size).ok_or(Error::Invalid)?;
-        match budget.parse(data, question)? {
-            Ok(Reply::Truncated) => {
+        match budget.parse(data, &parse)? {
+            Packet::Truncated => {
                 drop(socket);
-                return tcp(endpoint, question, query, budget, packet);
+                return tcp(endpoint, query, budget, packet, current, &parse);
             }
-            Ok(reply) => return Ok(reply),
-            Err(_) => continue,
+            Packet::Complete(reply) => return Ok(reply),
+            Packet::Invalid => continue,
         }
     }
     Err(Error::Dns)
 }
-fn tcp(
+fn tcp<T>(
     endpoint: SocketAddr,
-    question: &Question,
     query: &[u8],
     budget: &mut Budget<'_>,
     packet: &mut [u8],
-) -> Result<Reply, Error> {
-    let timeout = budget.check()?;
+    current: &dyn Fn() -> bool,
+    parse: &impl Fn(&[u8]) -> Result<Packet<T>, Error>,
+) -> Result<T, Error> {
+    let timeout = budget.while_current(current)?;
     budget.io(0)?;
     let result = TcpStream::connect_timeout(&endpoint, timeout);
-    budget.check()?;
+    budget.while_current(current)?;
     let mut socket = result.map_err(io)?;
     let mut frame = [0; MAX_QUERY_BYTES + 2];
     frame.get_mut(..2).ok_or(Error::Capacity)?.copy_from_slice(
@@ -182,12 +224,12 @@ fn tcp(
     let mut offset = 0usize;
     while offset < end {
         socket
-            .set_write_timeout(Some(budget.check()?))
+            .set_write_timeout(Some(budget.while_current(current)?))
             .map_err(io)?;
         let bytes = frame.get(offset..end).ok_or(Error::Invalid)?;
         budget.io(bytes.len())?;
         let result = socket.write(bytes);
-        budget.check()?;
+        budget.while_current(current)?;
         let size = result.map_err(io)?;
         if size == 0 || size > bytes.len() {
             return Err(Error::Dns);
@@ -195,31 +237,34 @@ fn tcp(
         offset += size;
     }
     let mut prefix = [0; 2];
-    receive(&mut socket, &mut prefix, budget)?;
+    receive(&mut socket, &mut prefix, budget, current)?;
     let size = usize::from(u16::from_be_bytes(prefix));
     if size < 12 {
         return Err(Error::Dns);
     }
     let packet = packet.get_mut(..size).ok_or(Error::Capacity)?;
-    receive(&mut socket, packet, budget)?;
-    match budget.parse(packet, question)? {
-        Ok(Reply::Truncated) | Err(_) => Err(Error::Dns),
-        Ok(reply) => Ok(reply),
+    receive(&mut socket, packet, budget, current)?;
+    match budget.parse(packet, parse)? {
+        Packet::Truncated | Packet::Invalid => Err(Error::Dns),
+        Packet::Complete(reply) => Ok(reply),
     }
 }
 fn receive(
     socket: &mut TcpStream,
     output: &mut [u8],
     budget: &mut Budget<'_>,
+    current: &dyn Fn() -> bool,
 ) -> Result<(), Error> {
     let mut offset = 0usize;
     while offset < output.len() {
-        socket.set_read_timeout(Some(budget.check()?)).map_err(io)?;
+        socket
+            .set_read_timeout(Some(budget.while_current(current)?))
+            .map_err(io)?;
         let end = output.len().min(offset + IO_BYTES);
         let bytes = output.get_mut(offset..end).ok_or(Error::Invalid)?;
         budget.io(bytes.len())?;
         let result = socket.read(bytes);
-        budget.check()?;
+        budget.while_current(current)?;
         let size = result.map_err(io)?;
         if size == 0 || size > bytes.len() {
             return Err(Error::Dns);

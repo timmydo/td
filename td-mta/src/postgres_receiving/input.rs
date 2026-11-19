@@ -33,14 +33,19 @@ pub(super) struct Provenance {
 pub(super) fn prepare(
     binding: &Binding,
     message: &Message<'_>,
-    email: EmailId,
-    blob: BlobId,
-    thread: ThreadId,
+    ids: (EmailId, BlobId, ThreadId),
     clock: &impl Clock,
     meter: &mut Meter,
+    spf: Option<crate::spf::Outcome>,
 ) -> Result<(Vec<u8>, Vec<String>, String, Provenance), Error> {
+    let (email, blob, thread) = ids;
     let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
-    let allowance = headers::trace_allowance(message.hostname).map_err(Error::Input)?;
+    let allowance = if spf.is_some() {
+        headers::spf_trace_allowance(message.hostname)
+    } else {
+        headers::trace_allowance(message.hostname)
+    }
+    .map_err(Error::Input)?;
     if message.header_bytes == 0
         || message.header_bytes > 1024 * 1024
         || message.header_bytes > maximum
@@ -63,6 +68,7 @@ pub(super) fn prepare(
         email,
         message.received_at,
         allowance,
+        spf,
     )
     .map_err(Error::Input)?;
     let mut last = clock.sample().map_err(Error::Input)?.monotonic;

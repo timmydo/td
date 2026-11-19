@@ -1,5 +1,5 @@
 //! Bounded DNS answer extraction after network peer admission.
-use crate::dns_wire::{AddressType, Error, Name, Question, MAX_PACKET_BYTES};
+use crate::dns_wire::{Error, Name, Question, WireQuestion, MAX_PACKET_BYTES};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const MAX_RECORDS: usize = 256;
@@ -57,17 +57,9 @@ impl Addresses {
     pub const fn ttl(&self) -> u32 {
         self.ttl
     }
-    fn add(&mut self, address: IpAddr, ttl: u32) -> Result<(), Error> {
-        self.ttl = self.ttl.min(ttl);
-        if !self.values().contains(&address) {
-            *self.values.get_mut(self.count).ok_or(Error::Capacity)? = address;
-            self.count += 1;
-        }
-        Ok(())
-    }
 }
 #[derive(Clone, Copy, Default)]
-struct Record {
+pub(crate) struct Record {
     owner: u16,
     kind: u16,
     class: u16,
@@ -85,15 +77,22 @@ fn word(packet: &[u8], at: usize) -> Result<u16, Error> {
             .map_err(|_| Error::Invalid)?,
     ))
 }
-fn value(packet: &[u8], record: Record) -> Result<&[u8], Error> {
+pub(crate) fn value(packet: &[u8], record: Record) -> Result<&[u8], Error> {
     let start = usize::from(record.data);
     packet
         .get(start..start + usize::from(record.length))
         .ok_or(Error::Invalid)
 }
 fn alias(packet: &[u8], record: Record) -> Result<Name, Error> {
-    let (name, consumed) = Name::read(packet, usize::from(record.data))?;
-    if consumed != usize::from(record.length) {
+    target(packet, record, 0)
+}
+
+pub(crate) fn target(packet: &[u8], record: Record, skip: usize) -> Result<Name, Error> {
+    let expected = usize::from(record.length)
+        .checked_sub(skip)
+        .ok_or(Error::Invalid)?;
+    let (name, consumed) = Name::read(packet, usize::from(record.data) + skip)?;
+    if consumed != expected {
         return Err(Error::Invalid);
     }
     Ok(name)
@@ -149,10 +148,33 @@ fn record(packet: &[u8], at: usize) -> Result<(Record, usize), Error> {
 /// Subtract Alias::hops before a continuation; successful addresses also obey
 /// this allowance, even when the terminal packet contains further aliases.
 pub fn read(packet: &[u8], question: &Question, remaining_aliases: usize) -> Result<Reply, Error> {
-    if packet.len() > MAX_PACKET_BYTES || remaining_aliases > MAX_ALIASES {
+    if remaining_aliases > MAX_ALIASES {
         return Err(Error::Capacity);
     }
-    if packet.len() < 12 || word(packet, 0)? != question.id() {
+    match parse(packet, question.wire(), |answers| {
+        extract(packet, question, answers, remaining_aliases)
+    })? {
+        Message::Truncated => Ok(Reply::Truncated),
+        Message::ResponseCode(code) => Ok(Reply::ResponseCode(code)),
+        Message::Answer(reply) => Ok(reply),
+    }
+}
+
+pub(crate) enum Message<T> {
+    Truncated,
+    ResponseCode(u8),
+    Answer(T),
+}
+
+pub(crate) fn parse<T>(
+    packet: &[u8],
+    question: WireQuestion<'_>,
+    extract: impl FnOnce(&[Record]) -> Result<T, Error>,
+) -> Result<Message<T>, Error> {
+    if packet.len() > MAX_PACKET_BYTES {
+        return Err(Error::Capacity);
+    }
+    if packet.len() < 12 || word(packet, 0)? != question.id {
         return Err(Error::Invalid);
     }
     let flags = word(packet, 2)?;
@@ -161,15 +183,15 @@ pub fn read(packet: &[u8], question: &Question, remaining_aliases: usize) -> Res
     }
     let (name, used) = Name::read(packet, 12)?;
     let mut position = 12 + used;
-    if &name != question.name()
-        || word(packet, position)? != question.kind().code()
+    if &name != question.name
+        || word(packet, position)? != question.kind
         || word(packet, position + 2)? != 1
     {
         return Err(Error::Invalid);
     }
     position += 4;
     if flags & 0x0200 != 0 {
-        return Ok(Reply::Truncated);
+        return Ok(Message::Truncated);
     }
     let answers = usize::from(word(packet, 6)?);
     let total = answers + usize::from(word(packet, 8)?) + usize::from(word(packet, 10)?);
@@ -188,14 +210,9 @@ pub fn read(packet: &[u8], question: &Question, remaining_aliases: usize) -> Res
         return Err(Error::Invalid);
     }
     if flags & 0x000f != 0 {
-        return Ok(Reply::ResponseCode((flags & 0x000f) as u8));
+        return Ok(Message::ResponseCode((flags & 0x000f) as u8));
     }
-    extract(
-        packet,
-        question,
-        records.get(..answers).ok_or(Error::Capacity)?,
-        remaining_aliases,
-    )
+    extract(records.get(..answers).ok_or(Error::Capacity)?).map(Message::Answer)
 }
 fn extract(
     packet: &[u8],
@@ -203,76 +220,91 @@ fn extract(
     records: &[Record],
     remaining_aliases: usize,
 ) -> Result<Reply, Error> {
-    let mut current = question.name().clone();
-    let mut hops = 0usize;
+    let mut values = [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MAX_ADDRESSES];
+    let mut count = 0;
+    let (path, hops, ttl) = walk(packet, question.wire(), records, remaining_aliases, |rr| {
+        let addr = address(packet, rr)?;
+        if !values.get(..count).ok_or(Error::Capacity)?.contains(&addr) {
+            *values.get_mut(count).ok_or(Error::Capacity)? = addr;
+            count += 1;
+        }
+        Ok(())
+    })?;
+    if count != 0 {
+        Ok(Reply::Addresses(Addresses {
+            values,
+            count,
+            ttl,
+            path,
+        }))
+    } else if hops != 0 {
+        Ok(Reply::Alias {
+            name: *path.names().last().ok_or(Error::Invalid)?,
+            hops,
+            ttl,
+            path,
+        })
+    } else {
+        Ok(Reply::NoData)
+    }
+}
+
+pub(crate) fn address(packet: &[u8], rr: Record) -> Result<IpAddr, Error> {
+    let bytes = value(packet, rr)?;
+    match rr.kind {
+        1 => Ok(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(bytes).map_err(|_| Error::Invalid)?,
+        ))),
+        28 => Ok(IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(bytes).map_err(|_| Error::Invalid)?,
+        ))),
+        _ => Err(Error::Invalid),
+    }
+}
+
+pub(crate) fn walk(
+    packet: &[u8],
+    question: WireQuestion<'_>,
+    records: &[Record],
+    remaining_aliases: usize,
+    mut visit: impl FnMut(Record) -> Result<(), Error>,
+) -> Result<(Path, usize, u32), Error> {
+    let mut path = Path::empty();
+    let mut current = *question.name;
     let mut ttl = u32::MAX;
-    let mut result = Addresses {
-        values: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MAX_ADDRESSES],
-        count: 0,
-        ttl,
-        path: Path::empty(),
-    };
-    loop {
-        if result.path.names().any(|name| name == &current) {
+    for hops in 0..=remaining_aliases {
+        if path.names().any(|name| name == &current) {
             return Err(Error::Invalid);
         }
-        *result.path.names.get_mut(hops).ok_or(Error::Capacity)? = Some(current.clone());
-        let mut next: Option<Name> = None;
-        let mut any_address = false;
-        result.ttl = ttl;
+        *path.names.get_mut(hops).ok_or(Error::Capacity)? = Some(current);
+        let mut next = None;
+        let mut has_data = false;
         for rr in records.iter().copied().filter(|rr| rr.class == 1) {
             if Name::read(packet, usize::from(rr.owner))?.0 != current {
                 continue;
             }
-            match rr.kind {
-                5 => {
-                    let name = alias(packet, rr)?;
-                    if next.as_ref().is_some_and(|prior| prior != &name) {
-                        return Err(Error::Invalid);
-                    }
-                    next = Some(name);
-                    ttl = ttl.min(rr.ttl);
+            if rr.kind == 5 {
+                let target = alias(packet, rr)?;
+                if next.as_ref().is_some_and(|prior| prior != &target) {
+                    return Err(Error::Invalid);
                 }
-                1 | 28 => {
-                    any_address = true;
-                    if rr.kind == question.kind().code() {
-                        let bytes = value(packet, rr)?;
-                        let address = match question.kind() {
-                            AddressType::A => IpAddr::V4(Ipv4Addr::from(
-                                <[u8; 4]>::try_from(bytes).map_err(|_| Error::Invalid)?,
-                            )),
-                            AddressType::Aaaa => IpAddr::V6(Ipv6Addr::from(
-                                <[u8; 16]>::try_from(bytes).map_err(|_| Error::Invalid)?,
-                            )),
-                        };
-                        result.add(address, rr.ttl)?;
-                    }
-                }
-                _ => {}
+                next = Some(target);
+                ttl = ttl.min(rr.ttl);
+            } else if rr.kind == question.kind {
+                has_data = true;
+                ttl = ttl.min(rr.ttl);
+                visit(rr)?;
+            } else if matches!(rr.kind, 1 | 28) {
+                has_data = true;
             }
         }
-        if let Some(name) = next {
-            if any_address {
-                return Err(Error::Invalid);
-            }
-            hops += 1;
-            if hops > remaining_aliases {
-                return Err(Error::Capacity);
-            }
-            current = name;
-        } else if result.count != 0 {
-            return Ok(Reply::Addresses(result));
-        } else if hops != 0 {
-            return Ok(Reply::Alias {
-                name: current,
-                hops,
-                ttl,
-                path: result.path,
-            });
-        } else {
-            return Ok(Reply::NoData);
+        match next {
+            Some(_) if has_data => return Err(Error::Invalid),
+            Some(target) => current = target,
+            None => return Ok((path, hops, ttl)),
         }
     }
+    Err(Error::Capacity)
 }
 
 const _: () = assert!(std::mem::size_of::<Record>() <= 16);
@@ -282,7 +314,7 @@ const _: () = assert!(std::mem::size_of::<Reply>() <= 3 * 1024);
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::dns_wire::MAX_QUERY_BYTES;
+    use crate::dns_wire::{AddressType, MAX_QUERY_BYTES};
     fn read(packet: &[u8], question: &Question) -> Result<Reply, Error> {
         super::read(packet, question, MAX_ALIASES)
     }

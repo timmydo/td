@@ -2368,7 +2368,8 @@ redirect policy, fixed trust settings, and total deadlines.
 **Acceptance:** local DNS/HTTPS fixtures cover compressed-name loops, malformed
 lengths, unrelated replies, TCP fallback, chain limits, expiration, slow peers,
 HTTP ambiguity and connection cleanup. Provider/domain failures are typed and
-bounded. No MX resolution or SPF/TXT evaluator in v1. Resolver endpoints are
+bounded. M09 resolves configured outbound hosts. Direct inbound SPF uses
+the separate F01 worker. Resolver endpoints are
 explicit runtime data, never permission to use public DNS during automated tests.
 
 ## M10 — SMTP core with durable local delivery
@@ -2916,11 +2917,14 @@ separate work. It does not mark M24 or the full M25 release complete.
 
 These do not block v1 and must not be advertised before their own acceptance.
 
-**F01 — SPF.** Add bounded DNS TXT/MX evaluation with RFC lookup/recursion/work
-limits, cache and timeout policy, and a complete pass/fail/softfail/neutral/
-none/temperror/permerror result model. Direct mode evaluates the real peer;
-gateway mode needs the explicit trusted-origin contract first. Authentication
-results must distinguish checks from disposition. Local DNS fixtures only.
+**F01 — SPF.** Direct receiving evaluates the MAIL FROM identity against the
+socket peer using the configured resolvers and RFC 7208 terms. The worker
+has per-message work and time bounds and no cross-message cache.
+Accepted mail records pass, fail, softfail, neutral, none, temperror or
+permerror in the local Received-SPF trace. Recipient policy and final SMTP
+disposition are independent of the result. Gateway-origin evaluation still
+requires a trusted original-peer contract. CONFORMANCE.md describes the
+local DNS and stored-message evidence.
 
 **F02 — DKIM and DMARC.** Extend the crypto port with RSA-SHA256 and Ed25519-SHA256
 verification; use streaming body/header canonicalization, bounded signature/DNS

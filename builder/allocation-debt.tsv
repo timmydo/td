@@ -2453,9 +2453,7 @@ td-mta/src/config/policy.rs	unchecked-growth-or-clone	1
 td-mta/src/config/storage.rs	unchecked-growth-or-clone	2
 td-mta/src/control.rs	allocating-conversion	5
 td-mta/src/control.rs	allocation-macro	1
-td-mta/src/dns_lookup.rs	unchecked-growth-or-clone	3
 td-mta/src/dns_owner.rs	unchecked-growth-or-clone	1
-td-mta/src/dns_reply.rs	unchecked-growth-or-clone	2
 td-mta/src/dns_wire.rs	unchecked-growth-or-clone	5
 td-mta/src/draft_input.rs	direct-reservation	3
 td-mta/src/draft_input.rs	unchecked-growth-or-clone	3

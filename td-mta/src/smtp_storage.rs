@@ -37,6 +37,15 @@ pub trait Job: Send {
     /// Called on the network loop: no database, filesystem, peer I/O or waits.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Failure>;
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure>;
+    /// The verdict belongs to this SMTP transaction. Backends that retain
+    /// received messages record it beside the local trace.
+    fn prepare_with_spf(
+        &mut self,
+        deadline: Deadline,
+        _spf: Option<crate::spf::Outcome>,
+    ) -> Result<(), Failure> {
+        self.prepare(deadline)
+    }
     fn commit(&mut self) -> Result<Completion, Failure>;
 }
 /// Construction admits fixed capacity; no method may wait for peer input.
