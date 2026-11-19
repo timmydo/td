@@ -1,174 +1,166 @@
 # Shared review policy fixtures for td-builder and td-review.
 # case NAME ready|not-ready [paths=comma,separated]
 
-case mixed ready paths=src/a.rs
+case codex-astra ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: green
 
-case both-subagent ready paths=src/a.rs
+case openai-astra ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/openai/gpt-6-astra
+Review-effort: high
+Checks: green
+
+case claude-fable ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/claude-fable-5-2
+Review-effort: high
+Checks: green
+
+case api-fable ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/anthropic/claude-fable-5.2
+Review-effort: high
+Checks: green
+
+case astra-via-api not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.2-astra
+Review-effort: high
+Checks: green
+
+case astra-via-cli not-ready paths=src/a.rs
+subject
+
+Reviewed-by: codex/gpt-6.2-astra
+Review-effort: high
+Checks: green
+
+case fable-via-cli not-ready paths=src/a.rs
+subject
+
+Reviewed-by: claude/claude-fable-5-2
+Review-effort: high
+Checks: green
+
+case wrong-provider not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/gpt-6.2-astra
+Review-effort: high
+Checks: green
+
+case fable-variant not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/anthropic/claude-fable-5.2:floor
+Review-effort: high
+Checks: green
+
+case fable-alias not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/fable-latest
+Review-effort: high
+Checks: green
+
+case astra-alias not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/gpt-astra-latest
+Review-effort: high
+Checks: green
+
+case effort-missing not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/gpt-6.2-astra
+Checks: green
+
+case effort-low not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/claude-fable-5-2
+Review-effort: low
+Checks: green
+
+case checks-missing not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/anthropic/claude-fable-5.2
+Review-effort: high
+
+case legacy-panel not-ready paths=src/a.rs
 subject
 
 Reviewed-by: subagent/opus-5.5
 Reviewed-by: subagent/gpt-6.1-sol
 Checks: green
 
-case both-harness ready paths=src/a.rs
+case legacy-waiver not-ready paths=src/a.rs
 subject
 
-Reviewed-by: harness/opus-5.5
-Reviewed-by: harness/gpt-6.1-sol
+Reviewed-by: subagent/opus-5.5
+Review-waiver: gpt-sol — unavailable; approved by tester
 Checks: green
 
-case both-td-agent ready paths=src/a.rs
+case legacy-cli-panel not-ready paths=src/a.rs
 subject
 
-Reviewed-by: td-agent/opus-5.5
-Reviewed-by: td-agent/gpt-6.1-sol
+Reviewed-by: claude/opus-5.5
+Reviewed-by: codex/gpt-6-astra
 Checks: green
 
-case both-td-agent-subagent ready paths=src/a.rs
+case api-short not-ready paths=src/a.rs
 subject
 
-Reviewed-by: td-agent-subagent/opus-5.5
-Reviewed-by: td-agent-subagent/gpt-6.1-sol
+Reviewed-by: td-agent/fable-5.2
+Review-effort: high
 Checks: green
 
-case opus-alone not-ready paths=src/a.rs
+case api-wrong-slug not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/anthropic/fable-5.2
+Review-effort: high
 Checks: green
 
-case gpt-alone not-ready paths=src/a.rs
+case missing-review not-ready paths=src/a.rs
 subject
 
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Checks: green
-
-case no-reviews not-ready paths=src/a.rs
-subject
-
-Checks: green
-
-case no-checks not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-
-case empty-checks not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Checks:
-
-case same-family not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/opus-4.8
-Checks: green
-
-case duplicates not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Checks: green
-
-case pair-duplicates ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Checks: green
-
-case alias-opus not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/opus-latest
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Checks: green
-
-case alias-gpt not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/gpt-sol-latest
-Checks: green
-
-case non-sol not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: subagent/gpt-6.1
-Checks: green
-
-case gemini not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/google/gemini-3.8-flash
-Checks: green
-
-case ambiguous not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: subagent/opus-gpt-6-sol
-Checks: green
-
-case unknown-tool not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: unknown/opus-5.5
+Review-effort: high
 Checks: green
 
 case malformed not-ready paths=src/a.rs
 subject
 
 Reviewed-by: subagent
-Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-effort: high
 Checks: green
 
-case legacy-pair ready paths=src/a.rs
+case unknown-transport not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.8-flash
+Reviewed-by: unknown/gpt-6.2-astra
+Review-effort: high
 Checks: green
 
-case legacy-wrong-family not-ready paths=src/a.rs
+case unknown-waiver not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: codex/opus-5.5
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: green
+Review-waiver: other
 
-case fallback-no-effect not-ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Review-fallback: codex — quota
-Checks: green
-
-case fallback-not-required ready paths=src/a.rs
-subject
-
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Checks: green
-
-case docs ready paths=AGENTS.md,README.md
+case docs ready paths=AGENTS.md,NOTES.MD
 subject
 
 Review-waiver: docs-only
@@ -186,69 +178,30 @@ subject
 Review-waiver: docs-only
 Checks: green
 
-case approved-opus ready paths=src/a.rs
+case docs-no-checks not-ready paths=README.md
 subject
 
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Review-waiver: opus — service unavailable; approved by tester
-Checks: green
+Review-waiver: docs-only
 
-case approved-gpt ready paths=src/a.rs
+case empty-checks not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Review-waiver: gpt-sol: unavailable, approved by tester
-Checks: green
-
-case waiver-no-reason not-ready paths=src/a.rs
-subject
-
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Review-waiver: opus approved by tester
-Checks: green
-
-case waiver-no-human not-ready paths=src/a.rs
-subject
-
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Review-waiver: opus — unavailable
-Checks: green
-
-case waiver-placeholder not-ready paths=src/a.rs
-subject
-
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Review-waiver: opus — unavailable; approved by <who>
-Checks: green
-
-case waive-both not-ready paths=src/a.rs
-subject
-
-Review-waiver: opus — unavailable; approved by tester
-Review-waiver: gpt-sol — unavailable; approved by tester
-Checks: green
-
-case waive-transport not-ready paths=src/a.rs
-subject
-
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Review-waiver: subagent — unavailable; approved by tester
-Checks: green
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
+Checks:
 
 case quoted not-ready paths=src/a.rs
 subject
 
-    Reviewed-by: subagent/anthropic/claude-opus-5.5
-    Reviewed-by: td-agent/openai/gpt-6.1-sol
+    Reviewed-by: subagent/gpt-6.2-astra
+    Review-effort: high
     Checks: green
-
-Quoted shape only.
 
 case trailing-prose not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: green
 
 Next: more work
@@ -257,75 +210,33 @@ then done
 case final-block ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/unknown
+Reviewed-by: unknown
 
-Body after old block
+New paragraph.
 
-Reviewed-by: subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: green
 
 case case-insensitive-keys ready paths=src/a.rs
 subject
 
-REVIEWED-BY: subagent/anthropic/claude-opus-5.5
-Reviewed-By: td-agent/openai/gpt-6.1-sol
+REVIEWED-BY: subagent/gpt-6.2-astra
+review-EFFORT: high
 checks: green
 
-case docs-upper-extension ready paths=NOTES.MD
+case separated-checks not-ready paths=src/a.rs
 subject
 
-Review-waiver: docs-only
-Checks: green
-
-case separated-checks not-ready paths=a.rs
-subject
-
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: td-agent/gpt-6.1-sol
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 
 Checks: green
 
-case legacy-astra ready paths=a.rs
+case conflicting-effort not-ready paths=src/a.rs
 subject
 
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: codex/gpt-6-astra
-Reviewed-by: agy/gemini-3.8-flash-high
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: green
-
-case new-astra not-ready paths=a.rs
-subject
-
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: td-agent/gpt-6-astra
-Checks: green
-
-case non-frontier-mini not-ready paths=a.rs
-subject
-
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: td-agent/openai/gpt-6.1-sol-mini
-Checks: green
-
-case preview-id not-ready paths=a.rs
-subject
-
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: td-agent/openai/gpt-sol-preview-123
-Checks: green
-
-case historical-hyphenated-opus ready paths=a.rs
-subject
-
-Reviewed-by: subagent/gpt-6-sol
-Reviewed-by: claude/claude-opus-5-5
-Reviewed-by: agy/gemini-3.8-flash-high
-Checks: green
-
-case new-hyphenated-opus not-ready paths=a.rs
-subject
-
-Reviewed-by: subagent/gpt-6-sol
-Reviewed-by: td-agent/claude-opus-5-5
-Checks: green
+Review-effort: low

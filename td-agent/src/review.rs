@@ -37,7 +37,7 @@ const MAX_MAX_TOKENS: u64 = 200_000;
 /// base85 runs can approach.
 const ASCII_BYTES_PER_TOKEN: u64 = 3;
 
-pub const USAGE: &str = r"usage: td-agent review --commit REV [--model opus-latest|gpt-sol-latest]
+pub const USAGE: &str = r"usage: td-agent review --commit REV [--model MODEL]
                        [--max-cost USD] [--log-dir DIRECTORY]
                        [--repo DIRECTORY] [--sparse DIRECTORY]...
                        [--max-tokens N] [--effort high]
@@ -56,9 +56,8 @@ private test outputs are writable. Network, edits, publication and peer
 tools are unavailable to the reviewer. Abruptly abandoned scratch is collected on slot reuse on td,
 or by the next review on a development host.
 
-The model defaults to opus-latest. opus-latest and gpt-sol-latest resolve to
-the newest concrete frontier release in the API model list, recorded in
-the trace. A concrete model id is also accepted. All reviews use high effort.
+The model defaults to fable-latest, which selects the newest stable Claude
+Fable release in the API model list and records its identity in the trace. A concrete model id is also accepted. All reviews use high effort.
 Changed top-level directories are included automatically; --sparse adds
 directories, and the reviewer may widen the checkout. Tools default to 8192
 UTF-8 bytes per result and 512 KiB total; full results remain in the trace.
@@ -91,7 +90,7 @@ Legacy diagnostic form: td-agent review [--model MODEL] [--effort high]
 --repo, FILE or noninteractive stdin is reviewed in one request without tools.
 
 Example:
-  td-agent review --commit HEAD --model gpt-sol-latest
+  td-agent review --commit HEAD --model fable-latest
 ";
 
 /// The instruction the model is given. The commit follows it in the
@@ -298,7 +297,7 @@ impl Options {
             );
         }
         if options.repository.is_some() && options.model.is_none() {
-            options.model = Some("opus-latest".into());
+            options.model = Some(crate::models::DEFAULT_REVIEW_MODEL.into());
         }
         if options.repository.is_some() && named {
             return Err("--repo reviews --commit (HEAD by default), not FILE or stdin".into());
@@ -710,10 +709,7 @@ fn run_diff(
     let options = &mut resolved;
     // Without a per-turn limit, a list that cannot be had only leaves
     // the model unlisted.
-    let alias = matches!(
-        options.model.as_deref().unwrap_or(&client.model),
-        "opus-latest" | "gpt-sol-latest"
-    );
+    let alias = crate::models::review_alias(options.model.as_deref().unwrap_or(&client.model));
     let listed = match crate::review_routing::prepare(options, client, journal) {
         Ok(listed) => listed,
         Err(_)
@@ -1058,7 +1054,7 @@ mod tests {
         assert_eq!(repository.repository, Some(PathBuf::from(".")));
         let local = Options::parse(&args("--commit HEAD")).unwrap();
         assert_eq!(local.repository, Some(std::env::current_dir().unwrap()));
-        assert_eq!(local.model.as_deref(), Some("opus-latest"));
+        assert_eq!(local.model.as_deref(), Some("fable-latest"));
         assert_eq!(local.effort.as_deref(), Some("high"));
 
         assert_eq!(repository.revision.as_deref(), Some("HEAD"));

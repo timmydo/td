@@ -17,7 +17,7 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20                [--remote HOST [--remote-program PATH]]\n\
 \x20      td-agent serve [--stop]\n\
 \x20      td-agent attach\n\
-\x20      td-agent review --commit REV [--model opus-latest|gpt-sol-latest]\n\
+\x20      td-agent review --commit REV [--model MODEL]\n\
 \x20                      [--max-cost USD] [--repo DIRECTORY]\n\
 \x20      td-agent review-log FILE\n\
 \x20      td-agent review-logs [DIRECTORY] [--day YYYY-MM-DD]\n\

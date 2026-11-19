@@ -258,6 +258,7 @@ fn run(fixture: &Fixture, mock: &MockFetch, cap: &str) -> std::process::Output {
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn local_commit_review_resolves_frontier_aliases_at_high_effort() {
     for (alias, concrete) in [
+        ("fable-latest", "anthropic/claude-fable-5.2"),
         ("opus-latest", "anthropic/claude-opus-5.5"),
         ("gpt-sol-latest", "openai/gpt-6.1-sol"),
     ] {
@@ -354,13 +355,7 @@ fn missing_frontier_model_refuses_before_completion_and_cleans_up() {
     let mut command = Command::new(PROGRAM);
     command
         .current_dir(&fixture.source)
-        .args([
-            "review",
-            "--commit",
-            &fixture.commit,
-            "--model",
-            "opus-latest",
-        ])
+        .args(["review", "--commit", &fixture.commit])
         .stdin(Stdio::null());
     for (name, value) in template.get_envs() {
         if let Some(value) = value {
@@ -369,7 +364,7 @@ fn missing_frontier_model_refuses_before_completion_and_cleans_up() {
     }
     let result = command.output().unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete opus-latest"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete fable-latest"));
     assert_eq!(mock.requests().len(), 1);
     fixture.no_workspaces();
 }
@@ -380,7 +375,7 @@ fn configured_frontier_alias_cannot_bypass_resolution_without_a_turn_limit() {
     let fixture = Fixture::new();
     fs::write(
         fixture.config.join("td-agent/config"),
-        "model = \"opus-latest\"\nmax_cost_per_turn = \"none\"\n",
+        "model = \"fable-latest\"\nmax_cost_per_turn = \"none\"\n",
     )
     .unwrap();
     let input = fixture.root.join("commit.txt");
@@ -396,7 +391,7 @@ fn configured_frontier_alias_cannot_bypass_resolution_without_a_turn_limit() {
     }
     let result = command.output().unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete opus-latest"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete fable-latest"));
     assert_eq!(mock.requests().len(), 1);
 }
 

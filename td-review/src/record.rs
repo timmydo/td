@@ -4,10 +4,8 @@
 //! replays commits individually and a commit nobody reviewed must not be one of
 //! them.
 //!
-//! The rule has two implementations: td-review is outside the builder
-//! workspace and cannot depend on it. They share transport normalization;
-//! `tests/review-record.cases` pins their remaining rules together. Both
-//! crates fail if a case disagrees with them.
+//! The builder includes the same verifier. Both entry points exercise
+//! `tests/review-record.cases`.
 
 #[path = "reviewer.rs"]
 mod reviewer;
@@ -147,8 +145,7 @@ mod tests {
 
     #[test]
     fn complete_record_is_ready() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: green\n";
+        let m = "s\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: green\n";
         assert!(problems(m, &code(&["a.rs"])).is_empty());
     }
 
@@ -163,7 +160,7 @@ mod tests {
     fn readiness_counts_the_commits_missing_one() {
         let good = Commit {
             oid: "a".into(),
-            message: "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\n\
+            message: "s\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\n\
                       Checks: green\n"
                 .into(),
             paths: code(&["a.rs"]),
@@ -201,18 +198,6 @@ mod tests {
         assert_eq!(second.paths, code(&["AGENTS.md"]));
     }
 
-    /// The acting model reviewing its own work through a second front end is
-    /// not a second opinion — the mirror of builder's own assertion.
-    #[test]
-    fn the_acting_model_cannot_be_its_own_cross_model_review() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: claude/opus-4.8\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        assert_eq!(problems(m, &code(&["a.rs"])).len(), 1);
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        assert!(problems(m, &code(&["a.rs"])).is_empty());
-    }
-
     /// A body carrying the FIELD separator ends the message early: the record
     /// in the prefix could look complete while the prose that disqualifies it
     /// is parsed as a path list. Fail the batch closed instead.
@@ -229,9 +214,9 @@ mod tests {
     fn a_merge_commit_is_not_ready_however_good_its_record() {
         let merge = Commit {
             oid: A.to_string(),
-            message: "m\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                      Reviewed-by: agy/gemini-3.1-pro\nChecks: green\n"
-                .to_string(),
+            message:
+                "m\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: green\n"
+                    .to_string(),
             paths: Vec::new(),
             parents: 2,
         };
@@ -278,8 +263,7 @@ mod tests {
             .to_path_buf()
     }
 
-    /// The fixture `td-builder ready` also reads. Two implementations of one
-    /// rule; nothing but this makes them agree.
+    /// The fixture `td-builder ready` also reads.
     #[test]
     fn shared_fixture_cases() {
         let path = repo_root().join("tests/review-record.cases");

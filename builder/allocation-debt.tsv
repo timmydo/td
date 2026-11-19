@@ -3496,9 +3496,9 @@ td-review/src/main.rs	unchecked-growth-or-clone	6
 td-review/src/record.rs	allocating-conversion	7
 td-review/src/record.rs	allocation-macro	1
 td-review/src/record.rs	unchecked-growth-or-clone	2
-td-review/src/reviewer.rs	allocating-conversion	6
-td-review/src/reviewer.rs	allocation-macro	7
-td-review/src/reviewer.rs	unchecked-growth-or-clone	15
+td-review/src/reviewer.rs	allocating-conversion	1
+td-review/src/reviewer.rs	allocation-macro	4
+td-review/src/reviewer.rs	unchecked-growth-or-clone	11
 td-review/src/saved.rs	allocating-conversion	5
 td-review/src/saved.rs	allocation-macro	3
 td-review/src/saved.rs	heap-owner	1

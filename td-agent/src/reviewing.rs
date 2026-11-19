@@ -99,7 +99,7 @@ impl Session {
         let model = client
             .review_model
             .clone()
-            .unwrap_or_else(|| "opus-latest".into());
+            .unwrap_or_else(|| crate::models::DEFAULT_REVIEW_MODEL.into());
         let effort = Some("high".to_string());
         let cap = client.review_max_cost;
         if let Err(why) = cost::within(
@@ -165,8 +165,7 @@ impl Session {
             }
         };
         let ((charged, basis), resolved) = receipt(&ran.head, cap);
-        let identified =
-            resolved.is_some() || !matches!(model.as_str(), "opus-latest" | "gpt-sol-latest");
+        let identified = resolved.is_some() || !crate::models::review_alias(&model);
         let model = resolved.unwrap_or(model);
         let log = retained_trace(&ran.head)
             .map(|path| format!("; its retained trace is {}", path.display()))

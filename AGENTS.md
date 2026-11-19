@@ -220,19 +220,16 @@ boundaries are:
 
 # Code review
 
-- Use two independent high-effort subscription subagents for each commit's
-  review. Use a subscription subagent for follow-up confirmation as well.
-  `DEVELOPMENT.md` defines model selection, standing substitutions, the
-  panel cycle and escalation triggers. Stop and ask when passes stop
-  converging.
+- Each commit gets one independent frontier-model subagent review at high
+  effort. Follow `DEVELOPMENT.md` for model selection, the review record
+  and confirmation after fixes. Ask the user if passes stop converging.
 - The acting agent reconciles every finding and records its own summary,
-  concrete reviewer identities, and checks in the commit message.
+  the concrete reviewer identity, and checks in the commit message.
 - Preserve retained review traces during cleanup. These user-owned audit
   records may be deleted only at the human's explicit request.
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
-verifies that every touched path ends in `.md`. Other unavailable-reviewer
-waivers require a reason and the human approver named in the trailer.
+verifies that every touched path ends in `.md`.
 
 Commit messages are the durable review record. Put rationale, design
 decisions, findings and dispositions, and verified-red evidence there. Hard

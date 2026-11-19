@@ -128,7 +128,7 @@ fn git_out(root: &Path, args: &[&str]) -> String {
 /// detected rename, and this list is the one place the gate checks reality
 /// rather than believing the message: `git mv builder/src/nar.rs notes.md`
 /// reports `notes.md` alone, so every path ends in `.md` and a commit that
-/// DELETED a Rust source waives both frontier reviews. Off, a rename is a delete
+/// DELETED a Rust source waives the frontier review. Off, a rename is a delete
 /// plus an add and both sides are seen.
 fn commit_paths(root: &Path, oid: &str) -> Vec<String> {
     git_try(
@@ -597,9 +597,8 @@ td-sh: something
 
 A body.
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: affected-checks --committed-only (green)
 ";
 
@@ -617,32 +616,7 @@ Checks: affected-checks --committed-only (green)
     }
 
     #[test]
-    fn each_frontier_family_is_required() {
-        assert_eq!(
-            probs("s\n\nReviewed-by: subagent/opus-5.5\nChecks: green\n"),
-            ["no gpt-sol review"]
-        );
-        assert_eq!(
-            probs("s\n\nReviewed-by: td-agent/openai/gpt-6.1-sol\nChecks: green\n"),
-            ["no opus review"]
-        );
-    }
-
-    #[test]
-    fn either_transport_can_supply_both_models() {
-        for transport in ["subagent", "td-agent"] {
-            let message = format!("s\n\nReviewed-by: {transport}/anthropic/claude-opus-5.5\nReviewed-by: {transport}/openai/gpt-6.1-sol\nChecks: green\n");
-            assert!(probs(&message).is_empty());
-        }
-    }
-
-    #[test]
-    fn two_versions_of_one_family_are_one_opinion() {
-        assert_eq!(probs("s\n\nReviewed-by: subagent/opus-5.5\nReviewed-by: td-agent/opus-4.8\nChecks: green\n"), ["no gpt-sol review"]);
-    }
-
-    #[test]
-    fn docs_only_waives_the_reviews_but_is_checked() {
+    fn docs_only_waives_the_review_but_is_checked() {
         let message = "s\n\nReview-waiver: docs-only\nChecks: none needed\n";
         assert!(problems(message, &code(&["AGENTS.md", "README.md"])).is_empty());
         assert_eq!(
@@ -737,33 +711,37 @@ Checks: affected-checks --committed-only (green)
 
     #[test]
     fn unknown_reviewers_are_named() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: gemini/x\nChecks: g\n";
-        assert!(probs(m).iter().any(|s| s == "unknown reviewer 'gemini'"));
+        let m = "s\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nReviewed-by: gemini/x\nChecks: g\n";
+        assert!(probs(m)
+            .iter()
+            .any(|s| s == "invalid frontier reviewer 'gemini/x'"));
     }
 
     #[test]
     fn a_malformed_identity_is_reported_not_ignored() {
-        let m = "s\n\nReviewed-by: subagent\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
+        let m = "s\n\nReviewed-by: subagent\nReview-effort: high\nChecks: g\n";
         let p = probs(m);
         assert!(p.iter().any(|s| s.contains("malformed Reviewed-by")));
-        assert!(p.iter().any(|s| s == "no opus review"));
+        assert!(p
+            .iter()
+            .any(|s| s == "no frontier subagent review (GPT Astra or Claude Fable)"));
     }
 
     /// git matches its own trailer tokens case-insensitively, and an agent that
     /// wrote `Reviewed-By:` must not be told the review is missing.
     #[test]
     fn trailer_keys_are_case_insensitive() {
-        let m = "s\n\nReviewed-By: subagent/opus-4.8\nREVIEWED-BY: codex/gpt-5.6-sol\nreviewed-by: agy/gemini-3.1-pro\nchecks: g\n";
+        let m = "s\n\nREVIEWED-BY: subagent/claude-fable-5-2\nReview-Effort: high\nchecks: g\n";
         assert!(probs(m).is_empty());
     }
 
     /// The message this file's own workflow tells agents to write: a `Next:`
     /// paragraph below the record hides it from the block scan, and "no
-    /// subagent review" with three of them on screen is the worst diagnostic
+    /// subagent review" with the record on screen is the worst diagnostic
     /// an unattended agent could act on.
     #[test]
     fn a_record_that_does_not_close_the_message_says_so() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\n\
+        let m = "s\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\n\
                  Checks: green\n\nNext: finish the parser\nthen wire the CLI\n";
         let p = probs(m);
         assert!(
@@ -777,7 +755,7 @@ Checks: affected-checks --committed-only (green)
     #[test]
     fn a_complete_record_plus_a_quoted_one_is_still_ready() {
         let m = "docs: explain the record\n\nIt reads:\n\n    Reviewed-by: subagent/opus-4.8\n\n\
-                 Reviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
+                 Reviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: g\n";
         assert!(probs(m).is_empty());
     }
 
@@ -792,10 +770,9 @@ Checks: affected-checks --committed-only (green)
     #[test]
     fn only_the_trailing_block_is_the_record() {
         let m = "s\n\nReviewed-by: subagent/opus-4.7\n\nprose after it\n\n\
-                 Reviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
+                 Reviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: g\n";
         let rec = parse_record(m);
-        let tools: Vec<&str> = rec.reviewers.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(tools, vec!["subagent", "legacy-cli"]);
+        assert!(rec.frontier);
         assert!(probs(m).is_empty());
     }
 

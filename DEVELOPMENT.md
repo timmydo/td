@@ -1324,89 +1324,51 @@ measured path shows |t| above 4.5. Rerun a failure before believing it, and
 report it with its numbers. td-primitives/DESIGN.md says what is measured
 and records results.
 
-# Code review: two frontier models per commit
+# Code review
 
-Use fresh subagents provided by the current harness subscription for all
-commit reviews, including confirmation after fixes. Each increment receives
-two independent high-effort reviews of the exact same commit. Use the
-newest available Opus and GPT Sol releases or the standing model
-substitutions below. Record concrete model versions.
+Each commit gets one independent review at high effort. Choose the newest
+available release of the model for the harness performing the work.
 
-Give each review subagent the repository and full commit ID. Ask it to
-inspect the complete commit, relevant instructions and surrounding code,
-and return prioritized findings with file locations. Give it a fresh
-context without the acting agent's conclusions. Reviewers inspect the
-tree read-only. The acting agent reconciles the two independent reports.
+| Harness | Reviewer |
+| --- | --- |
+| Codex | Fresh GPT Astra subagent |
+| Claude Code | Fresh Claude Fable subagent |
+| td-agent | Fable via `td-agent review --commit COMMIT_ID --model fable-latest --effort high` |
 
-## Subscription model selection
+Give the reviewer the repository and full commit ID in a fresh context.
+Ask it to inspect the complete commit, relevant instructions and surrounding
+code read-only, and return prioritized findings with file locations.
+Keep the acting agent's conclusions out of the prompt. If the required
+model is unavailable, report that to the user.
 
-Codex keeps the GPT Sol subagent and may use a fresh Astra subagent for
-the Opus slot. Claude keeps the Opus subagent and may use a fresh Fable
-subagent for the GPT Sol slot. Both subagents review at high effort.
-These substitutions have standing user approval until revoked. If a
-subscription cannot provide the required reviewers, use the human waiver
-procedure below.
+The acting agent reconciles each finding, fixes valid issues and explains
+rejected findings with evidence. After a source change, have the reviewer
+confirm the amended commit. Ask the user if passes stop converging.
+A message-only amendment preserves the review, as does a rebase covered
+by “Rebasing after ready”.
 
-The verifier recognizes Opus and GPT Sol receipts. For a substitution,
-record Astra or Fable's concrete identity, effort, reviewed commit,
-findings and dispositions in the commit body. Use the waiver for its
-slot and the normal reviewer trailer for the other slot. For example,
-a Codex panel using Astra records:
+Record the reviewed commit, findings, dispositions and any confirmation
+in the commit body. Close with the concrete model ID, effort and checks.
+For example, a Codex review records:
 
 ```text
-Reviewed-by: subagent/gpt-6.2-sol
-Review-waiver: opus — Astra subscription subagent substitution; approved by repository user
+Reviewed-by: subagent/gpt-6.2-astra
+Review-effort: high
 Checks: <checks actually run>
 ```
 
-A Claude panel using Fable records its concrete Opus reviewer and:
+Claude Code records its concrete Fable ID, such as
+`subagent/claude-fable-5-2`. td-agent records the resolved provider ID,
+such as `td-agent/anthropic/claude-fable-5.2`. Both `ready` and
+`td-review` apply this rule to every commit awaiting landing, including
+commits on branches opened under the previous policy.
 
-```text
-Review-waiver: gpt-sol — Fable subscription subagent substitution; approved by repository user
-```
-
-## Review records and follow-up
-
-Store reports under `.td-build-cache/agent-scratch/` in the owned worktree.
-Summarize their findings and dispositions in the commit, then delete owned
-stdout/stderr report captures and private review copies before finishing.
-Historical review traces are user-owned audit records. Preserve their
-files under `$XDG_STATE_HOME/td-agent/reviews/` (by default
-`~/.local/state/td-agent/reviews/`) and in any explicit retained log
-directory. Delete retained traces only at the human's explicit request.
-
-Do not alter a reviewer's report to make it agree with the change. The acting
-agent reconciles each finding, fixes valid issues and explains rejected ones
-with evidence.
-
-Schedule one panel cycle per commit. After fixes, one subscription review
-subagent confirms the resulting diff. Re-run the panel only for a named escalation:
-a new source file, unsafe surface or dependency, a material design change,
-or a disagreement that needs the other model's judgment. Record the trigger.
-Stop and ask the user if passes stop converging. Review the exact final
-source tree; a message-only amendment does not invalidate a source review,
-nor does a rebase that needs no new `ready` ("Rebasing after ready").
-
-Close the commit message with a review/check trailer block. A panel with
-both model families available uses their concrete subagent identities:
-
-```text
-Reviewed-by: subagent/gpt-6.2-sol
-Reviewed-by: subagent/opus-5.5
-Checks: <checks actually run>
-```
-
-The body records the reviewed commit, concrete models, high effort, findings,
-dispositions and confirmation passes. `ready` and `td-review` share the same
-record verifier. Historical review receipts remain valid.
-
-Outside the standing subscription approval above, an unavailable model may
-be waived only with a reason and a named human's explicit approval. At most
-one frontier reviewer may be waived:
-
-```text
-Review-waiver: opus — <reason>; approved by <human name>
-```
+Keep disposable reports in the owning worktree's
+`.td-build-cache/agent-scratch/` and remove them after recording the
+findings. Preserve user-owned td-agent traces under
+`$XDG_STATE_HOME/td-agent/reviews/` (default
+`~/.local/state/td-agent/reviews/`) and in explicitly selected log
+directories. Delete retained traces only at the human's explicit request.
 
 A documentation-only increment may instead use:
 

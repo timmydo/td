@@ -66,9 +66,7 @@ pub(crate) fn prepare(
 ) -> Result<models::Models, String> {
     let selected = options.model.as_deref().unwrap_or(&client.model);
     let mut listed = None;
-    if matches!(selected, "opus-latest" | "gpt-sol-latest")
-        || (selected.starts_with('~') && explicit(options))
-    {
+    if models::review_alias(selected) || (selected.starts_with('~') && explicit(options)) {
         let models = review::models(&client.base_url, &[])?;
         let resolved = if selected.starts_with('~') {
             models

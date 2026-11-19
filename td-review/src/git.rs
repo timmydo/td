@@ -518,7 +518,7 @@ impl Git {
             // of a detected rename, and `record::problems` judges the
             // `docs-only` waiver on these paths: `git mv src/x.rs notes.md`
             // reports `notes.md` alone, so every path ends in `.md` and a
-            // commit that DELETED a source waives all three reviews.
+            // commit that DELETED a source waives code review.
             "--no-renames",
             range,
             "--",
@@ -1807,7 +1807,7 @@ mod tests {
     /// decision made from its output silently stops seeing the source half of
     /// a `git mv`. That produced two separate defects — a check selection that
     /// missed the deletion a rename left behind, and a `docs-only` waiver that
-    /// let a commit deleting Rust source waive all three reviews — and FIVE
+    /// let a commit deleting Rust source waive code review — and FIVE
     /// call sites had to be found by reading, because nothing said the rule.
     ///
     /// This is the rule. Every `--name-only` in shipped code carries

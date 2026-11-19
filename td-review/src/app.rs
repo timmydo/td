@@ -2175,8 +2175,7 @@ mod tests {
     /// A complete review record, for the tests that need a commit whose READY
     /// cell reads `ok` — the rest leave it owing reviews, which most of them do
     /// not care about.
-    const RECORD: &str = "Reviewed-by: subagent/opus-5\nReviewed-by: codex/gpt-5.6-sol\n\
-                          Reviewed-by: agy/gemini-3.1-pro\nChecks: green";
+    const RECORD: &str = "Reviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: green";
 
     /// A work tree on `main` with one branch published to `origin`, present
     /// locally only as a remote-tracking ref.

@@ -454,15 +454,13 @@ impl Models {
     /// Resolve a review tier once to a concrete base model. Numeric release
     /// versions sort naturally; routed and reduced variants do not qualify.
     pub fn review_model(&self, selector: &str) -> Result<String, String> {
-        let family = match selector {
-            "opus-latest" => "opus",
-            "gpt-sol-latest" => "gpt-sol",
-            _ => return Ok(selector.to_string()),
-        };
+        if !review_alias(selector) {
+            return Ok(selector.to_string());
+        }
         self.models
             .iter()
             .filter_map(|m| {
-                let version = review_version(&m.id, family)?;
+                let version = review_version(&m.id, selector)?;
                 Some((version, &m.id))
             })
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
@@ -496,10 +494,20 @@ impl Models {
     }
 }
 
-fn review_version(id: &str, family: &str) -> Option<Vec<u64>> {
-    let text = match family {
-        "opus" => id.strip_prefix("anthropic/claude-opus-")?,
-        "gpt-sol" => id.strip_prefix("openai/gpt-")?.strip_suffix("-sol")?,
+pub(crate) const DEFAULT_REVIEW_MODEL: &str = "fable-latest";
+
+pub(crate) fn review_alias(selector: &str) -> bool {
+    matches!(
+        selector,
+        DEFAULT_REVIEW_MODEL | "opus-latest" | "gpt-sol-latest"
+    )
+}
+
+fn review_version(id: &str, selector: &str) -> Option<Vec<u64>> {
+    let text = match selector {
+        DEFAULT_REVIEW_MODEL => id.strip_prefix("anthropic/claude-fable-")?,
+        "opus-latest" => id.strip_prefix("anthropic/claude-opus-")?,
+        "gpt-sol-latest" => id.strip_prefix("openai/gpt-")?.strip_suffix("-sol")?,
         _ => return None,
     };
     if !text.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
@@ -640,6 +648,11 @@ mod tests {
             "anthropic/claude-opus-5.5",
             "anthropic/claude-opus-9.0:floor",
             "anthropic/claude-sonnet-10.0",
+            "anthropic/claude-fable-5.9",
+            "anthropic/claude-fable-5.10",
+            "other/claude-fable-8",
+            "anthropic/claude-fable-8-mini",
+            "anthropic/claude-fable-8:floor",
         ];
         let entries: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}","pricing":{{"prompt":"0","completion":"0"}},"context_length":100000,"supported_parameters":["reasoning","tools"]}}"#)).collect();
         let body = format!(r#"{{"data":[{}]}}"#, entries.join(","));
@@ -651,6 +664,10 @@ mod tests {
         assert_eq!(
             models.review_model("opus-latest").unwrap(),
             "anthropic/claude-opus-5.5"
+        );
+        assert_eq!(
+            models.review_model("fable-latest").unwrap(),
+            "anthropic/claude-fable-5.10"
         );
         assert_eq!(models.review_model("fixed/model").unwrap(), "fixed/model");
         assert!(super::Models::default()

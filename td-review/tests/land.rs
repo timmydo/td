@@ -96,8 +96,7 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
 
 /// A complete review record, for a commit whose READY cell has to read `ok` —
 /// the only cell `!merge` replaces.
-const RECORD: &str = "Reviewed-by: subagent/opus-5\nReviewed-by: codex/gpt-5.6-sol\n\
-                      Reviewed-by: agy/gemini-3.1-pro\nChecks: green";
+const RECORD: &str = "Reviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: green";
 
 fn commit(dir: &Path, file: &str, body: &str, message: &str, when: &str) -> Res<()> {
     fs::write(dir.join(file), body)?;
@@ -3185,8 +3184,7 @@ fn delete_landed_spares_a_same_named_branch_on_another_remote() -> Res<()> {
 #[test]
 fn list_shows_the_review_record_per_branch() -> Res<()> {
     let s = scenario("record")?;
-    let record = "\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                  Reviewed-by: agy/gemini-3.1-pro\nChecks: affected-checks (green)";
+    let record = "\n\nReviewed-by: subagent/gpt-6.2-astra\nReview-effort: high\nChecks: affected-checks (green)";
 
     git(&s.work, &["checkout", "-b", "reviewed-rolling"])?;
     commit(

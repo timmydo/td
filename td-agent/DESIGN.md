@@ -178,7 +178,7 @@ worker offers publication bound to an approved commit, but shared networking
 does not promise that it is the only possible publication channel.
 
 **The review command** is `td-agent review --commit REV
-[--model opus-latest|gpt-sol-latest]`, invoked from the change's local
+[--model MODEL]`, invoked from the change's local
 repository. It needs neither a published branch nor a remote: REV is
 resolved once from the local Git object database. `--repo DIRECTORY` may
 select another local repository, with HEAD its default revision. td-agent
@@ -190,10 +190,10 @@ confined checkout and tool loop described below applies. It removes the
 checkout and scratch on completion or error; abandoned scratch is collected
 on slot reuse on td, or by the next review on a development host.
 
-The default model is `opus-latest`. That alias and `gpt-sol-latest` resolve
-from the API model list to the highest numeric stable frontier release of
-Claude Opus or GPT Sol respectively, excluding routed variants and smaller
-model variants. A missing family fails before any completion. The requested
+The default model is `fable-latest`, which resolves from the API model
+list to the highest numeric stable Claude Fable release. Explicit
+`opus-latest` and `gpt-sol-latest` selectors resolve their respective
+families by the same rule. All three exclude routed and smaller variants. A missing family fails before any completion. The requested
 alias and concrete resolved identity are logged; every request uses the
 concrete identity. Both review forms seed that selected provider model ID
 and the requested effort in the reviewer system prompt, using the same
@@ -7730,7 +7730,7 @@ default; `jev_threshold`'s is calibrated (§11):
   defaults the conversation's model and routing (§12,
 "`task`")
 - `review_model` and `review_max_cost`, a number of credits above zero;
-  defaults `opus-latest` and 1 ("`/review`", below)
+  defaults `fable-latest` and 1 ("`/review`", below)
 - `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every
   resumption as cold, and `cold_resume_tokens`, from 1,000 to
   10,000,000, or `none`; defaults 300 and 32,000 (§14)
@@ -7877,7 +7877,7 @@ limit and logs a `request` of purpose `review` for the whole review, its
 head naming the revision, the commit staged, the model and the cap,
 before it starts this program's `review` with `--repo` the staged
 repository, `--commit` the full commit id, `--model` `review_model` or
-else `opus-latest`, `--max-cost` the cap exactly, `--effort high`, and
+else `fable-latest`, `--max-cost` the cap exactly, `--effort high`, and
 the conversation's routing when it has one. The
 review runs beside the process, which goes on hearing the window: an
 interrupt, or the window closing, kills it, as does a failure to wait on

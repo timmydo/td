@@ -1,11 +1,12 @@
-//! The shared review record: one independent Opus and GPT Sol opinion.
+//! The shared review record: one independent frontier review at high effort.
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Record {
-    pub reviewers: Vec<(String, String)>,
-    pub waivers: Vec<(String, String)>,
-    pub checks: Option<String>,
-    pub malformed: Vec<String>,
+    pub frontier: bool,
+    docs_only: bool,
+    high_effort: bool,
+    checks: bool,
+    malformed: Vec<String>,
 }
 
 fn trailer(line: &str) -> bool {
@@ -31,68 +32,44 @@ fn block(message: &str) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+fn version_part(part: &str) -> bool {
+    part.bytes().all(|b| b.is_ascii_digit()) && part.parse::<u64>().is_ok()
+}
+
 fn version(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    text.split('.').all(version_part)
 }
 
-fn family(model: &str) -> Option<&'static str> {
-    let lower = model.to_ascii_lowercase();
-    let base = lower
-        .strip_prefix("anthropic/")
-        .or_else(|| lower.strip_prefix("openai/"))
-        .unwrap_or(&lower);
-    if base
-        .strip_prefix("claude-opus-")
-        .or_else(|| base.strip_prefix("opus-"))
-        .is_some_and(version)
-    {
-        return Some("opus");
+fn frontier_reviewer(tool: &str, model: &str) -> bool {
+    if tool == "td-agent" {
+        return model
+            .strip_prefix("anthropic/claude-fable-")
+            .is_some_and(version);
     }
-    if base
+    if tool != "subagent" {
+        return false;
+    }
+    if model
+        .strip_prefix("openai/")
+        .unwrap_or(model)
         .strip_prefix("gpt-")
-        .and_then(|m| m.strip_suffix("-sol"))
+        .and_then(|m| m.strip_suffix("-astra"))
         .is_some_and(version)
     {
-        return Some("gpt-sol");
+        return true;
     }
-    None
-}
-
-fn receipt_family(transport: &str, model: &str) -> Option<&'static str> {
-    family(model).or_else(|| {
-        // Prior CLI rosters admitted Astra as the GPT family's opinion.
-        // New harness and td-agent receipts must name GPT Sol.
-        let lower = model.to_ascii_lowercase();
-        let base = lower.strip_prefix("openai/").unwrap_or(&lower);
-        if transport != "legacy-cli" {
-            return None;
-        }
-        if base
-            .strip_prefix("claude-opus-")
-            .or_else(|| base.strip_prefix("opus-"))
-            .is_some_and(|v| v.split('-').all(version))
-        {
-            return Some("opus");
-        }
-        base.strip_prefix("gpt-")
-            .and_then(|m| m.strip_suffix("-astra"))
-            .is_some_and(version)
-            .then_some("gpt-sol")
-    })
-}
-
-fn transport(tool: &str) -> Option<&'static str> {
-    match tool {
-        "subagent" | "harness" | "td-agent-subagent" => Some("subagent"),
-        "td-agent" | "td-agent-codex" | "td-agent-claude" => Some("td-agent"),
-        // Existing receipts stay readable; these are no longer invocation paths.
-        "claude" | "codex" => Some("legacy-cli"),
-        "agy" | "td-agent-agy" => Some("retired"),
-        _ => None,
-    }
+    let base = model.strip_prefix("anthropic/").unwrap_or(model);
+    let Some(release) = base
+        .strip_prefix("claude-fable-")
+        .or_else(|| base.strip_prefix("fable-"))
+    else {
+        return false;
+    };
+    // Claude Code spells a release like 5.2 as 5-2.
+    version(release)
+        || release
+            .split_once('-')
+            .is_some_and(|(major, minor)| version_part(major) && version_part(minor))
 }
 
 pub fn parse(message: &str) -> Record {
@@ -110,76 +87,30 @@ pub fn parse(message: &str) -> Record {
                         .push(format!("malformed Reviewed-by: {value}"));
                     continue;
                 };
-                let tool = tool.trim();
-                let model = model.trim();
-                let Some(normalized) = transport(tool) else {
-                    record.malformed.push(format!("unknown reviewer '{tool}'"));
-                    continue;
-                };
-                if normalized == "retired" {
-                    continue;
-                }
-                let found = receipt_family(normalized, model);
-                let bound = match tool {
-                    "codex" | "td-agent-codex" => Some("gpt-sol"),
-                    "claude" | "td-agent-claude" => Some("opus"),
-                    _ => None,
-                };
-                if found.is_none() || bound.is_some_and(|expected| found != Some(expected)) {
-                    record.malformed.push(format!("'{tool}/{model}' is not a concrete reviewer of the required frontier model"));
-                    continue;
-                }
-                let reviewer = (normalized.to_string(), model.to_string());
-                if !record.reviewers.contains(&reviewer) {
-                    record.reviewers.push(reviewer);
+                if frontier_reviewer(tool.trim(), model.trim()) {
+                    record.frontier = true;
+                } else {
+                    record
+                        .malformed
+                        .push(format!("invalid frontier reviewer '{value}'"));
                 }
             }
-            "review-waiver" => {
-                let (who, why) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
-                let who = who.trim_end_matches([':', '-', ',']);
-                let who = match who {
-                    "claude" => "opus",
-                    "codex" => "gpt-sol",
-                    "agy" => continue,
-                    other => other,
-                };
-                record.waivers.push((
-                    who.to_string(),
-                    why.trim_start_matches(|c: char| {
-                        c == '—' || c == '-' || c == ':' || c.is_whitespace()
-                    })
-                    .to_string(),
-                ));
-            }
-            "checks" if !value.is_empty() => record.checks = Some(value.to_string()),
+            "review-waiver" if value == "docs-only" => record.docs_only = true,
+            "review-waiver" => record.malformed.push(format!("unknown waiver '{value}'")),
+            "review-effort" if value == "high" => record.high_effort = true,
+            "review-effort" => record.malformed.push("review effort must be high".into()),
+            "checks" if !value.is_empty() => record.checks = true,
             "checks" => record.malformed.push("empty Checks trailer".into()),
-            // Historical quota provenance has no eligibility effect.
-            "review-fallback" => {}
             _ => {}
         }
     }
     record
 }
 
-fn approved(why: &str) -> bool {
-    let lower = why.to_ascii_lowercase();
-    let Some((reason, name)) = lower.split_once("approved by ") else {
-        return false;
-    };
-    let name = name.trim();
-    !reason
-        .trim_matches(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .is_empty()
-        && !name.is_empty()
-        && !name.contains(['<', '>'])
-        && !matches!(name, "human" | "name" | "who" | "approver")
-}
-
 pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
     let record = parse(message);
-    let mut out = record.malformed.clone();
-    let docs_only = record.waivers.iter().any(|(who, _)| who == "docs-only");
-    if docs_only {
+    let mut out = record.malformed;
+    if record.docs_only {
         if paths.is_empty() {
             out.push("waived as docs-only, but no paths could be read".into());
         }
@@ -189,45 +120,12 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         {
             out.push(format!("docs-only waiver touches {path}"));
         }
+    } else if !record.frontier {
+        out.push("no frontier subagent review (GPT Astra or Claude Fable)".into());
+    } else if !record.high_effort {
+        out.push("missing Review-effort: high".into());
     }
-    if record
-        .waivers
-        .iter()
-        .filter(|(who, _)| who != "docs-only")
-        .count()
-        > 1
-    {
-        out.push("at most one frontier reviewer may be waived at once".into());
-    }
-    for (who, why) in &record.waivers {
-        if who == "docs-only" {
-            continue;
-        }
-        if !["opus", "gpt-sol"].contains(&who.as_str()) {
-            out.push(format!("unknown waiver '{who}'"));
-        }
-        if !approved(why) {
-            out.push(format!(
-                "waiver '{who}' needs a reason and its human approver"
-            ));
-        }
-    }
-    if !docs_only {
-        for wanted in ["opus", "gpt-sol"] {
-            if !record
-                .reviewers
-                .iter()
-                .any(|(transport, model)| receipt_family(transport, model) == Some(wanted))
-                && !record
-                    .waivers
-                    .iter()
-                    .any(|(who, why)| who == wanted && approved(why))
-            {
-                out.push(format!("no {wanted} review"));
-            }
-        }
-    }
-    if record.checks.is_none() {
+    if !record.checks {
         out.push("no Checks trailer".into());
     }
     if !out.is_empty() {
@@ -240,7 +138,7 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         if message.lines().take(final_start).any(|line| {
             trailer(line)
                 && line.split_once(':').is_some_and(|(key, _)| {
-                    ["reviewed-by", "review-waiver", "checks"]
+                    ["reviewed-by", "review-waiver", "review-effort", "checks"]
                         .contains(&key.to_ascii_lowercase().as_str())
                 })
         }) {
