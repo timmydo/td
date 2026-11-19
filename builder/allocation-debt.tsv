@@ -3728,10 +3728,10 @@ td-sh/src/pattern.rs	allocating-constructor	2
 td-sh/src/pattern.rs	allocating-conversion	8
 td-sh/src/pattern.rs	unchecked-growth-or-clone	20
 td-sh/src/process.rs	allocating-constructor	4
-td-sh/src/process.rs	allocating-conversion	21
+td-sh/src/process.rs	allocating-conversion	20
 td-sh/src/process.rs	allocation-macro	15
-td-sh/src/process.rs	heap-owner	12
-td-sh/src/process.rs	unchecked-growth-or-clone	44
+td-sh/src/process.rs	heap-owner	11
+td-sh/src/process.rs	unchecked-growth-or-clone	40
 td-sh/src/regex.rs	allocating-constructor	4
 td-sh/src/regex.rs	allocating-conversion	18
 td-sh/src/regex.rs	allocation-macro	9

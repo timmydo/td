@@ -14,7 +14,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      map it, so it can run before the dynamic loader/closure is present,
 //   3. it has NO dynamic NEEDED entry (a fully static link has no dynamic
 //      section at all) — an EMPTY runtime closure, no libc.so to resolve.
-// It then RUNS the binary (`td-sh -c 'exit 0'`) so a mis-built ELF with correct
+// It then runs the binary with a numbered redirection and a nested td-sh so a mis-built ELF with correct
 // headers but a broken entry point / static link fails here, not just a shape
 // mismatch.
 //
@@ -78,18 +78,27 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", PATH),
     );
-    // Beyond the shape: actually RUN the static binary so a mis-built ELF with
-    // correct headers but a broken entry point / bad static link fails here (the
-    // shape checks alone would pass it). `-c 'exit 0'` parses and runs a real (if
-    // trivial) program through the interpreter and must exit 0.
-    steps.push(Step::run("{root}", &[bin, "-c", "exit 0"]).env("PATH", PATH));
+    // Exercise inheritance with the very same static shell as the child.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                bin,
+                "-ec",
+                r#"exec 9>/dev/null; "$1" -c 'echo inherited >&9'"#,
+                "sh",
+                bin,
+            ],
+        )
+        .env("PATH", PATH),
+    );
 
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-sh is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry, and runs (`-c 'exit 0'` returns 0) — a self-contained /bin/sh with an empty runtime closure, runnable in stage-1 init before the dynamic loader/closure is present\n".into(),
+        content: "PASS: td-sh is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry, and passes an open fd 9 to a second copy of itself — a self-contained /bin/sh with an empty runtime closure, runnable in stage-1 init before the dynamic loader/closure is present\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -103,7 +112,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-sh-test: build-plan --auto builds td-sh (the target /bin/sh, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs it (-c 'exit 0')"
+echo ">> recipe-check td-sh-test: build-plan --auto builds td-sh (the target /bin/sh, statically linked by the /td/store target Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs a nested shell with fd 9 inherited"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-sh-test 1
 "#,

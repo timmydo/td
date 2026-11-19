@@ -9,15 +9,10 @@
 //! crate's `lib.rs` and is host-side test tooling — it is NOT part of this
 //! binary and runs the built shell as a subprocess.
 //!
-//! The interpreter is safe `std` but for FOUR confined syscalls: a virtual
-//! file-descriptor table replaces `dup2`, `Stdio::piped`/`CommandExt::exec`
-//! cover the process primitives, and subshells clone shell state in-process. The
-//! crate `#![deny(unsafe_code)]`s and `sys.rs` carries the single scoped
-//! `#[allow]` — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`, an
-//! `ioctl(2)` restricted to three value-pinned requests, and `poll(2)` asking
-//! about ONE descriptor, none of which `std` exposes an API for at all. That
-//! is the EIGHTH target-side unsafe exception UNSAFE.md records; the
-//! confinement tests below assert its roster against this crate's own source.
+//! The interpreter keeps a per-environment descriptor table. External commands
+//! inherit its explicit file descriptors through the handoff in `fd_exec`.
+//! The confined kernel interface for that handoff, signals, terminal state,
+//! readiness and umask is documented in UNSAFE.md §8 and pinned below.
 //!
 //! Still deferred, and each a further reviewed amendment: the half of job
 //! control that needs a job to be a PROCESS (see below), and
@@ -34,12 +29,16 @@
 //! the process group a signal would be aimed at.
 #![deny(unsafe_code)]
 
+#[allow(dead_code, reason = "shared fallible allocation helpers")]
+#[path = "../../td-alloc/src/lib.rs"]
+mod allocation;
 mod arith;
 mod ast;
 mod builtin;
 mod complete;
 mod exec;
 mod expand;
+mod fd_exec;
 mod funcs;
 mod jobs;
 mod lexer;
@@ -80,7 +79,13 @@ fn main() -> ExitCode {
     // ending the shell: that is what every version before this ran on, and a
     // guard that may sit above the end of a small stack beats a `/bin/sh` that
     // exits before reading the script.
-    let started = process::on_shell_stack(|| run(&args)).unwrap_or_else(|_| run(&args));
+    let mut fds = process::Fds::new();
+    if let Err(e) = fds.import_inherited() {
+        let _ = writeln!(std::io::stderr(), "td-sh: inherited descriptors: {e}");
+        return ExitCode::from(2);
+    }
+    let started =
+        process::on_shell_stack(|| run(&args, &mut fds)).unwrap_or_else(|_| run(&args, &mut fds));
     let code = match started {
         Ok(code) => code,
         Err(msg) => {
@@ -99,8 +104,9 @@ fn main() -> ExitCode {
 }
 
 /// Parse the command line and dispatch to the right execution mode.
-fn run(args: &[String]) -> Result<i32, String> {
+fn run(args: &[String], fds: &mut process::Fds) -> Result<i32, String> {
     let mut sh = Shell::new();
+    std::mem::swap(&mut sh.fds, fds);
     // Settle "was this signal ignored when we started?" while this is still the
     // only thread — a stage asking for the first time during a SIBLING's guard,
     // or during the window a sibling's spawn opens, would read that ignore as
@@ -607,10 +613,7 @@ fn read_complete(editor: &mut line::Editor, sh: &mut Shell, buffer: &mut String)
 }
 
 /// Assertions about this crate's own SOURCE, which the compiler cannot make:
-/// the unsafe surface is four syscalls, in one module, with one call site each,
-/// writing two handler words and no others, issuing three ioctl requests and no
-/// others, asking about one descriptor and one event, and named by three
-/// modules and no others.
+/// the syscall roster, arguments, allowed callers and assembly boundary.
 /// Needles that can reach this module's own text are built with `concat!` so
 /// the module does not count itself, with two exceptions: the ioctl-request
 /// needle asserts ABSENCE, where a self-match could only red, and the
@@ -622,12 +625,14 @@ mod confinement {
     /// Every file the recipe compiles. `covers_every_module` keeps it honest.
     const SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
+        ("allocation.rs", include_str!("../../td-alloc/src/lib.rs")),
         ("arith.rs", include_str!("arith.rs")),
         ("ast.rs", include_str!("ast.rs")),
         ("builtin.rs", include_str!("builtin.rs")),
         ("complete.rs", include_str!("complete.rs")),
         ("exec.rs", include_str!("exec.rs")),
         ("expand.rs", include_str!("expand.rs")),
+        ("fd_exec.rs", include_str!("fd_exec.rs")),
         ("funcs.rs", include_str!("funcs.rs")),
         ("jobs.rs", include_str!("jobs.rs")),
         ("lexer.rs", include_str!("lexer.rs")),
@@ -929,13 +934,13 @@ mod confinement {
         );
     }
 
-    /// Exactly one scoped allow and exactly one unsafe block, both in `sys.rs`.
+    /// Pin the instruction and the startup descriptor adoption in `sys.rs`.
     ///
     /// Counted on WHITESPACE-STRIPPED code, because `unsafe` and its brace are
     /// two tokens: `unsafe\n{` is the same construct to the compiler and a
     /// different string to a scan, and nothing here enforces rustfmt.
     #[test]
-    fn the_unsafe_surface_is_one_allow_and_one_block() {
+    fn the_unsafe_surface_is_the_instruction_and_startup_adoption() {
         let allow = concat!("#[allow(", "unsafe", "_code)]");
         let block = concat!("unsafe", "{");
         let all: String = SOURCES
@@ -943,11 +948,43 @@ mod confinement {
             .map(|(_, t)| squeeze(&code_only(t)))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(all.matches(allow).count(), 1, "expected one scoped allow");
-        assert_eq!(all.matches(block).count(), 1, "expected one unsafe block");
+        assert_eq!(all.matches(allow).count(), 2);
+        assert_eq!(all.matches(block).count(), 2);
         let sys = squeeze(&code_only(source("sys.rs")));
-        assert_eq!(sys.matches(allow).count(), 1);
-        assert_eq!(sys.matches(block).count(), 1);
+        assert_eq!(sys.matches(allow).count(), 2);
+        assert_eq!(sys.matches(block).count(), 2);
+        assert!(sys.contains(concat!(
+            "iffd<3||syscall",
+            "4(SYS_FCNTL,fdasusize,F_GETFD,0,0)!=0{returnOk(None);}",
+            "fd_result(syscall",
+            "4(SYS_FCNTL,fdasusize,F_SETFD,FD_CLOEXEC,0))?;",
+            "Ok(Some(own_file(fd)))"
+        )));
+        assert!(sys.contains(concat!(
+            "fd_result(syscall",
+            "4(SYS_FCNTL,source.as_raw_fd()asusize,",
+            "F_DUPFD_CLOEXEC,floor.max(3)asusize,0,)).map(|fd|Self(own_file(fd)))"
+        )));
+        assert!(sys.contains(concat!(
+            "letfd=fd_result(syscall",
+            "4(SYS_MEMFD_CREATE,c\"td-sh-here\".as_ptr()asusize,",
+            "MFD_FLAGS,0,0,))?;letmutfile=own_file(fd);"
+        )));
+        let launcher = squeeze(&code_only(source("fd_exec.rs")));
+        assert!(launcher.contains(concat!(
+            "crate::process::on_shell_stack(||{lettable=sys",
+            "::Private",
+            "Table::split()?;formapin&self.mappings{"
+        )));
+        assert_eq!(count_code(concat!("Private", "Table::split(")), 1);
+        assert_eq!(sys.matches(concat!("own_", "file(")).count(), 4);
+        assert!(sys.contains(concat!("unsafe", "{std::fs::File::from_raw_fd(fd)}")));
+        let main = source("main.rs").split("fn run(").next().unwrap();
+        let import = main.find(concat!("fds.import_", "inherited()")).unwrap();
+        let evaluate = main.find(concat!("process::on_", "shell_stack(")).unwrap();
+        assert!(import < evaluate);
+        assert_eq!(count_code(concat!("::take_", "inherited(")), 1);
+        assert_eq!(count_code(concat!(".import_", "inherited()")), 1);
     }
 
     /// `sys.rs` carries no block comment at all. That used to be what made a
@@ -972,11 +1009,14 @@ mod confinement {
         );
     }
 
-    /// The lint is named twice in the whole crate: denied at the root, allowed
-    /// once in `sys.rs`. A third mention is a second surface.
     #[test]
-    fn the_unsafe_lint_is_named_exactly_twice() {
-        assert_eq!(count_code(concat!("unsafe", "_code")), 2);
+    fn the_unsafe_lint_is_only_denied_forbidden_or_scoped_in_sys() {
+        assert_eq!(count_code(concat!("unsafe", "_code")), 4);
+        assert!(code_only(source("allocation.rs")).contains(concat!(
+            "#![forbid(",
+            "unsafe",
+            "_code)]"
+        )));
         assert_eq!(
             code_only(source("main.rs"))
                 .matches(concat!("#![deny(", "unsafe", "_code)]"))
@@ -986,8 +1026,7 @@ mod confinement {
         );
     }
 
-    /// The `ioctl` roster is THREE REQUESTS — not syscalls, of which the crate
-    /// has four — pinned by VALUE, since a name alone would let the number
+    /// The three ioctl requests are pinned by VALUE, since a name alone would let the number
     /// change under it.
     #[test]
     fn the_ioctl_requests_are_exactly_three_and_value_pinned() {
@@ -1053,7 +1092,7 @@ mod confinement {
     }
 
     #[test]
-    fn the_syscall_roster_is_exactly_four_and_value_pinned() {
+    fn the_syscall_roster_is_exact_and_value_pinned() {
         let decl = concat!("const", "SYS", "_");
         let sys = squeeze(source("sys.rs"));
         let mut seen: Vec<String> = Vec::new();
@@ -1070,10 +1109,15 @@ mod confinement {
         assert_eq!(
             seen,
             vec![
+                concat!("SYS", "_WAIT4:usize=61").to_string(),
+                concat!("SYS", "_MEMFD_CREATE:usize=319").to_string(),
                 concat!("SYS", "_POLL:usize=7").to_string(),
                 concat!("SYS", "_RT_SIGACTION:usize=13").to_string(),
                 concat!("SYS", "_IOCTL:usize=16").to_string(),
+                concat!("SYS", "_FCNTL:usize=72").to_string(),
                 concat!("SYS", "_UMASK:usize=95").to_string(),
+                concat!("SYS", "_DUP3:usize=292").to_string(),
+                concat!("SYS", "_CLOSE_RANGE:usize=436").to_string(),
             ]
         );
     }
@@ -1260,7 +1304,7 @@ mod confinement {
         for (name, text) in SOURCES {
             let uses = code_only(text).matches(call).count();
             match *name {
-                "builtin.rs" | "process.rs" | "term.rs" => {
+                "builtin.rs" | "process.rs" | "term.rs" | "fd_exec.rs" => {
                     assert!(uses > 0, "{name} stopped calling")
                 }
                 _ => assert_eq!(uses, 0, "{name} reaches the syscall module"),
@@ -1305,18 +1349,14 @@ mod confinement {
         }
     }
 
-    /// The raw entry point has ONE call site PER SYSCALL. Module privacy stops
-    /// another MODULE reaching `syscall4`, but not another wrapper inside
-    /// `sys.rs`, and a second wrapper is a second syscall however safe its
-    /// signature looks.
     #[test]
-    fn the_raw_syscall_has_one_call_site_per_syscall() {
+    fn the_raw_syscalls_and_descriptor_arguments_are_pinned() {
         let code = code_only(source("sys.rs"));
         let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            5,
-            "`{name}` should appear five times in code: its definition and its four calls"
+            15,
+            "unexpected raw syscall site"
         );
         assert_eq!(
             code.matches(concat!("fn ", "syscall", "4(")).count(),
@@ -1328,10 +1368,20 @@ mod confinement {
         // names no constant and would satisfy the roster test above.
         let squeezed = squeeze(&code);
         for number in [
-            concat!("SYS", "_UMASK,"),
-            concat!("SYS", "_RT_SIGACTION,"),
-            concat!("SYS", "_IOCTL,"),
-            concat!("SYS", "_POLL,"),
+            "SYS_UMASK,",
+            "SYS_RT_SIGACTION,",
+            "SYS_IOCTL,",
+            "SYS_POLL,",
+            "SYS_MEMFD_CREATE,c\"td-sh-here\".as_ptr()asusize,MFD_FLAGS,0,0,",
+            "SYS_FCNTL,file.as_raw_fd()asusize,F_ADD_SEALS,HERE_SEALS,0,",
+            "SYS_FCNTL,destasusize,F_SETFD,0,0)",
+            "SYS_FCNTL,source.as_raw_fd()asusize,F_DUPFD_CLOEXEC,floor.max(3)asusize,0,",
+            "SYS_FCNTL,fdasusize,F_GETFD,0,0)",
+            "SYS_FCNTL,fdasusize,F_SETFD,FD_CLOEXEC,0)",
+            "SYS_DUP3,src.as_raw_fd()asusize,destasusize,0,0,",
+            "SYS_WAIT4,pidasusize,(&mutstatusas*muti32)asusize,0,0,",
+            "SYS_CLOSE_RANGE,end,end,CLOSE_RANGE_UNSHARE,0)",
+            "SYS_FCNTL,destasusize,F_SETFD,FD_CLOEXEC,0)",
         ] {
             assert_eq!(
                 squeezed
@@ -1340,6 +1390,20 @@ mod confinement {
                 1,
                 "each call must pass the named syscall number"
             );
+        }
+        for pin in [
+            "constF_DUPFD_CLOEXEC:usize=1030;",
+            "constF_GETFD:usize=1;",
+            "constF_SETFD:usize=2;",
+            "constFD_CLOEXEC:usize=1;",
+            "constMFD_FLAGS:usize=0x0001|0x0002|0x0008;",
+            "constF_ADD_SEALS:usize=1033;",
+            "constHERE_SEALS:usize=0x0001|0x0002|0x0004|0x0008;",
+            "constCLOSE_RANGE_UNSHARE:usize=2;",
+            "letend=u32::MAXasusize;",
+            "letmutstatus=0i32;",
+        ] {
+            assert_eq!(squeezed.matches(pin).count(), 1, "{pin}");
         }
     }
 }

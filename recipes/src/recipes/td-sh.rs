@@ -13,9 +13,7 @@ use crate::types::{Recipe, Step};
 // the dash/ash goldens; see td-sh/tests/conformance.rs) — a lexer/parser, word
 // expansion (parameter/command/arithmetic substitution, field splitting,
 // pathname expansion), control flow, functions and the core builtins. The crate
-// root `#![deny(unsafe_code)]`s and `sys.rs` holds the one scoped exception --
-// `umask(2)`, a disposition-only `rt_sigaction(2)`, and an `ioctl(2)` restricted
-// to three value-pinned terminal requests: the calls `std` exposes no API for.
+// root confines its kernel interface to sys.rs (UNSAFE.md §8).
 // td-sh IS the shipped `/bin/sh` and `/bin/ash`: system-x86-64 packs this output
 // into the real root and into BOTH initramfs images, where it replaced the
 // busybox multicall outright rather than beside it. Every generated script --
@@ -48,6 +46,8 @@ const MAIN_RS: &str = include_str!("../../../td-sh/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("allocation", include_str!("../../../td-alloc/src/lib.rs")),
+    ("fd_exec", include_str!("../../../td-sh/src/fd_exec.rs")),
     ("arith", include_str!("../../../td-sh/src/arith.rs")),
     ("ast", include_str!("../../../td-sh/src/ast.rs")),
     ("builtin", include_str!("../../../td-sh/src/builtin.rs")),
@@ -108,7 +108,7 @@ pub fn recipe() -> Recipe {
         path: "{out}/bin".into(),
     });
     steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
+        path: "{src}/td-sh/src/main.rs".into(),
         content: MAIN_RS.into(),
         exec: false,
     });
@@ -116,7 +116,11 @@ pub fn recipe() -> Recipe {
     // can resolve `mod NAME;` from the filesystem.
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: if *name == "allocation" {
+                "{src}/td-alloc/src/lib.rs".into()
+            } else {
+                format!("{{src}}/td-sh/src/{name}.rs")
+            },
             content: (*source).into(),
             exec: false,
         });
@@ -143,7 +147,7 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "-o",
                 "{out}/bin/td-sh",
-                "{src}/main.rs",
+                "{src}/td-sh/src/main.rs",
             ],
         )
         .env("SOURCE_DATE_EPOCH", "1"),

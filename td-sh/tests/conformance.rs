@@ -56,8 +56,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use td_sh::{
-    graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize, CaseWorkdir,
-    Disposition, Expectations, ASH_DASH_CHAIN,
+    graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize, Disposition,
+    Expectations, ASH_DASH_CHAIN,
 };
 
 fn spec_dir() -> PathBuf {
@@ -1074,7 +1074,7 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved(
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     // Exclusively created and dropped with the test, so a planted symlink at a
     // predictable name cannot redirect the link written just below.
-    let work = CaseWorkdir::new()?;
+    let work = td_fs::TempDir::new("td-sh-argv0")?;
     let bin = work.path().join("bin");
     std::fs::create_dir(&bin)?;
     let link = bin.join("mysh");
@@ -1173,10 +1173,8 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved(
 
     // It renames WITHOUT redirecting the search, unlike ash (ash.c:8354). The
     // two names must be DIFFERENT PROGRAMS or the assertion is vacuous.
-    use std::os::unix::fs::PermissionsExt;
     let decoy = bin.join("decoy");
-    std::fs::write(&decoy, format!("#!{}\necho I-AM-DECOY\n", shell.display()))?;
-    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))?;
+    write_executable(&decoy, &format!("#!{}\necho I-AM-DECOY\n", shell.display()))?;
     // A decoy that cannot EXECUTE would leave the rows below passing whatever
     // the shell did, which is the vacuity they exist to escape.
     let out = std::process::Command::new(&decoy).output()?;
@@ -5104,5 +5102,179 @@ fn a_script_without_a_shebang_keeps_its_descriptors() -> Result<(), Box<dyn std:
     let case = cases.first().ok_or("no case parsed")?;
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "{:?}", outcome.detail);
+    Ok(())
+}
+
+#[test]
+fn external_commands_share_explicit_file_descriptors() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = td_fs::TempDir::new("td-sh-inherited-fd")?;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+        .current_dir(dir.path())
+        .env("TD_SH", env!("CARGO_BIN_EXE_td-sh"))
+        .args([
+            "-ec",
+            r#"
+            exec 9>lock
+            flock -n 9
+            if flock -n lock true; then exit 91; fi
+            exec 9>&-
+            flock -n lock true
+            exec 9>file
+            "$TD_SH" -c 'printf A >&9'
+            "$TD_SH" -c 'exec 9>/dev/null; "$TD_SH" -c "printf hidden >&9"'
+            x=$("$TD_SH" -c 'printf capture >&9' 9>&1)
+            test "$x" = capture
+            "$TD_SH" -c 'read a <&7; test "$a" = hello' 7<<EOF
+hello
+EOF
+            (exec 9>other; /bin/sh -c 'printf B >&9')
+            /bin/sh -c 'printf C >&9' 8>&9
+            /bin/sh -c 'test ! -e /proc/self/fd/9 && printf D >&8' 8>&9 9>&-
+            exec -a td-sh:fd-exec "$TD_SH" -c 'test "$$" = "$1" && printf E >&9' child "$$"
+        "#,
+        ])
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dir.path().join("file"))?, b"ACDE");
+    assert_eq!(std::fs::read(dir.path().join("other"))?, b"B");
+    // Closing a standard stream installs /dev/null in that slot. Each
+    // launch must still give its alias the original open description.
+    let alias = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+        .args(["-c", r#"exec 3>&1 1>&-; /bin/sh -c 'printf alias >&3'"#])
+        .output()?;
+    assert!(alias.status.success());
+    assert_eq!(alias.stdout, b"alias");
+    Ok(())
+}
+
+// A concurrent fork in the test harness must never inherit the write
+// handle to an executable fixture (ETXTBSY on its subsequent exec).
+fn write_executable(
+    path: &std::path::Path,
+    contents: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s' "$2" > "$1""#, "fixture"])
+        .arg(path)
+        .arg(contents)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[test]
+fn numbered_descriptors_preserve_exec_failure_and_script_fallback(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = td_fs::TempDir::new("td-sh-fd-exec-failure")?;
+    let shell = env!("CARGO_BIN_EXE_td-sh");
+    for (file, contents) in [
+        ("script", r#"printf '%s' "${BASH_VERSION-td-sh}" >&9"#),
+        ("missing", "#!/no-such-td-sh-interpreter\n"),
+    ] {
+        let path = dir.path().join(file);
+        write_executable(&path, contents)?;
+    }
+    let out = std::process::Command::new(shell)
+        .current_dir(dir.path())
+        .args(["-c", r#"unset BASH_VERSION; exec 9>out; ./script || exit 1; trap 'echo "trap $?"' EXIT; exec ./missing"#])
+        .output()?;
+    assert_eq!(out.status.code(), Some(127));
+    assert_eq!(out.stdout, b"trap 127\n");
+    assert_eq!(std::fs::read(dir.path().join("out"))?, b"td-sh");
+    Ok(())
+}
+
+#[test]
+fn exec_reads_large_here_documents_to_the_end() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = td_fs::TempDir::new("td-sh-exec-here")?;
+    let line = "a".repeat(512 * 1024);
+    for (command, after) in [
+        (
+            r#"exec /bin/sh -c 'test "$$" = "$1" && wc -c' check "$$" <<'END'"#,
+            "",
+        ),
+        (
+            "exec 9<<'END'",
+            r#"exec /bin/sh -c 'test "$$" = "$1" && wc -c <&9' check "$$""#,
+        ),
+    ] {
+        let script = dir.path().join("body");
+        std::fs::write(&script, format!("{command}\n{line}\nEND\n{after}\n"))?;
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+            .arg(&script)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            (line.len() + 1).to_string()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn numbered_redirections_respect_the_descriptor_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let sh = env!("CARGO_BIN_EXE_td-sh");
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"ulimit -n 12 && exec "$1" -ec "$2""#,
+            "limit",
+            sh,
+            r#"exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 10>&- 11>&-; /bin/sh -c 'echo ok'"#,
+        ])
+        .output()?;
+    assert_eq!(out.stdout, b"ok\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for (setup, command) in [
+        ("ulimit -n 6", r#"exec 3>&1 4>&1; /bin/sh -c 'echo ok >&4'"#),
+        (
+            "exec 3>/dev/null 4>&3 5>&3 6>&3 7>&3; ulimit -n 10",
+            r#"exec 9>&3; /bin/sh -c 'echo ok >&9'"#,
+        ),
+        (
+            "exec 9>/dev/null; ulimit -n 8",
+            r#"/bin/sh -c 'echo ok >&9'"#,
+        ),
+    ] {
+        let inherited = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(r#"{setup}; exec "$1" -c "$2""#),
+                "limit",
+                sh,
+                command,
+            ])
+            .output()?;
+        assert!(
+            inherited.status.success(),
+            "{setup}: {}",
+            String::from_utf8_lossy(&inherited.stderr)
+        );
+    }
+    let out = std::process::Command::new(sh)
+        .args(["-c", "exec 2147483647>/dev/null; echo unexpected"])
+        .output()?;
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bad file descriptor"));
     Ok(())
 }

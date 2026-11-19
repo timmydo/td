@@ -21,8 +21,8 @@ its CPU instructions, or the twenty-eighth's checked storage (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
-for `td-compositor`, whose received descriptors enter exact File ownership through a second
-scoped allow. The tenth, `td-busd`,
+for `td-compositor` and `td-sh`, which also adopt received (§6) or inherited
+and freshly created (§8) descriptors into File ownership. The tenth, `td-busd`,
 carries the same different shape for general descriptor forwarding. Sections
 6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
 pointer accesses into the perf ring mapping whose lifetime and bounds that
@@ -196,7 +196,7 @@ one.
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
-| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
+| 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, `ioctl(2)` (three requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
@@ -1299,20 +1299,51 @@ decoupling construct of their own.
 
 ## 8. `td-sh` — the shell
 
-The `td-sh` shell, whose one `syscall4` body in `td-sh/src/sys.rs` carries
-EXACTLY FOUR syscalls — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`,
-`ioctl(2)` with three value-pinned requests, and `poll(2)` — reached from
-exactly three modules: `builtin.rs` for the `umask` and `trap` builtins,
-`process.rs` for the guards that hand a subshell back the process state a
-fork would have kept for it, for the one that stops the shell listening
-to the terminal while a foreground child runs, and for the one question
-`read -t` asks, and `term.rs` for the terminal mode and width the line
-editor needs. `std` exposes an API for
-none of them, and in the umask case that is not a gap that can be worked
-around: it is why the shipped `/init` spelled one line `busybox sh -c
-'umask 077; …'` until this surface existed, and why the shell that is
-supposed to replace busybox could not serve it. That line is `/bin/sh -c`
-now, and it was the last call the image made into the multiplexer.
+The shell confines nine Linux syscalls to one instruction in
+`td-sh/src/sys.rs`. The `umask` and `trap` builtins and process
+guards use `umask(2)` and disposition-only `rt_sigaction(2)`. The
+line editor uses three value-pinned `ioctl(2)` requests, and
+`read -t` uses `poll(2)` on one descriptor.
+
+At startup, before starting an evaluator thread, the shell adopts
+inherited descriptors above stderr into its numbered table. It checks
+`F_GETFD` (1) for zero flags, sets `FD_CLOEXEC` (1) with `F_SETFD`
+(2), and takes ownership once with `File::from_raw_fd`. Descriptors
+opened by Rust already have close-on-exec set. The table retains the open
+file description and its offset and locks across clones. The interpreter's
+own procfs file descriptor numbers can differ from the shell numbers.
+
+For a command with extra descriptors, the launcher borrows file sources
+whose numbered slot keeps its open description. It duplicates other sources
+with `F_DUPFD_CLOEXEC` (1030), starting at 3 and skipping live destinations.
+The same operation probes a requested redirection number against the
+current descriptor limit before committing it. Each transfer owns the
+successful duplicate and closes it once. A fresh
+thread uses `close_range(u32::MAX, u32::MAX, CLOSE_RANGE_UNSHARE)`
+(flag 2) to obtain a private copy of the fd table. The range contains no
+valid Linux descriptor. It installs the numbered duplicates with
+`dup3(source, destination, 0)` and sets close-on-exec on explicitly
+closed high destinations. A source already at its destination has its
+close-on-exec flag cleared with `F_SETFD` (argument zero) in the
+private table, including inherited fds above a lowered soft limit.
+The worker only spawns or execs a command with
+inherited standard streams. All prepared file owners remain with the
+caller. A successful process replacement keeps the shell's PID. After a
+spawn, the worker drops its child handle in the private table and returns
+only the PID. It exits before the shell waits, releasing its snapshot
+of other pipeline ends. The shell reaps that exact positive PID with
+`wait4(pid, &status, 0, NULL)`, retrying interruption. No new executable
+or mounted procfs is needed for the launch. Startup discovery of ambient
+descriptors uses procfs when mounted, or the POSIX range 3–9 before
+procfs is available. A here-document up to Linux PIPE_BUF (4096 bytes)
+fits in a pipe before launch. Larger documents require Linux 6.3 or
+later for the no-exec seal, including in standalone builds. They use an anonymous file
+created with `memfd_create("td-sh-here", MFD_CLOEXEC | MFD_ALLOW_SEALING
+| MFD_NOEXEC_SEAL)`. The shell adopts the new descriptor, writes and
+rewinds the contents, then sets `F_ADD_SEALS` (1033) with
+`F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`. The bytes
+and cursor survive exec independently of any shell thread. The scoped
+File adoption also owns each successful close-on-exec transfer duplicate.
 
 `umask(2)` cannot fail, so there is no `check()` on that path; what it
 does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.
@@ -1464,8 +1495,8 @@ signals, blocks none, and runs on no alternate stack; a handler-bearing
 `rt_sigaction`, which is the `SA_RESTORER` question above and lands as its
 own amendment when `trap INT` is served for real.
 
-A FIFTH syscall, or a fourth `ioctl` request, is an amendment here;
-`td-sh/src/main.rs`'s confinement tests assert the roster and its four
+An additional syscall or a fourth `ioctl` request is an amendment here;
+`td-sh/src/main.rs`'s confinement tests assert the roster and its
 value-pinned numbers, that the three ioctl REQUESTS are value-pinned too
 and named three times each — the declaration, the roster the gate checks
 against, and the one wrapper that issues them — with the five refused
@@ -1476,9 +1507,10 @@ handler words are pinned by value and named in `sys.rs` alone, that the
 installed action is `handler` followed by three zeros, the whole `asm!`
 block including which register each argument lands in and that
 `options(nomem)` stays absent, that the crate names the unsafe lint
-exactly twice outside comments, that those three modules are the
+only at the root denial, two scoped allows and shared allocation module
+forbid, that those four modules are the
 wrappers' only callers, that no module aliases OR IMPORTS OUT OF the
-syscall module, that `syscall4` has exactly one call site per syscall
+syscall module, that `syscall4` has exactly the admitted call sites
 and that each passes the NAMED number rather than a bare literal (the
 number reaches the kernel as an argument, so pinning the declarations
 alone does not pin what is issued), that `sys.rs` carries no block
@@ -1488,8 +1520,8 @@ compiler sees — and that the scan COVERS every module `main.rs`
 declares, whatever its visibility, since a module
 missing from that list is one no other assertion can see, and that the
 pollfd length is pinned in the SHIPPED build for the reason the termios
-and winsize lengths are. `sys.rs`'s own tests then issue three of the
-four: two are checked against `/proc/self/status` — `Umask:` for one, the
+and winsize lengths are. `sys.rs`'s own tests then exercise the original interfaces. Two are
+checked against `/proc/self/status` — `Umask:` for one, the
 `SigIgn:` mask for the other — and `poll` is asked about a real pipe,
 whose readiness the test controls from both ends. `term.rs`'s test
 issues the fourth against a
@@ -1803,21 +1835,11 @@ a deadline built from `alarm(2)` or `setitimer(2)`, which arrives as
 SIGALRM and so needs the handler this surface deliberately cannot
 install.
 
-Every other primitive td-sh needs — pipes, process spawn, `exec`, the
-virtual fd table that stands in for `dup2`, and process substitution —
-is reachable through safe `std`, which is what keeps that surface at
-four.
-
-Process substitution is the one of those that had to be argued rather
-than observed, so the argument is written down here. `<(cmd)` expands to
-a PATH an arbitrary program opens for itself, and in ash that path is
-`/dev/fd/64`: a descriptor the shell duplicated with `F_DUPFD` and the
-exec'd command INHERITED. Every descriptor safe `std` opens is
-close-on-exec — `io::pipe`, `File::open`, and `try_clone_to_owned`,
-which is `F_DUPFD_CLOEXEC` — and nothing in safe `std` clears that flag,
-so the inheriting spelling needs `fcntl(2)` as a FIFTH syscall. It was
-built that way, with `F_SETFD` pinned by value and its argument pinned
-to zero, and then removed — not for taste. The flag belongs to the
+Process substitution keeps its existing PID-addressed pipe independent
+of the external descriptor handoff. `<(cmd)` expands to a path an arbitrary
+program opens. In ash that path can be `/dev/fd/64`, a descriptor the
+child inherits. Clearing close-on-exec on a shared pipe for its entire
+lifetime would expose it to other stages. The flag belongs to the
 DESCRIPTOR and the descriptor table belongs to the PROCESS, while this
 shell's subshells are threads, so clearing it hands the end to every
 `execve` the shell makes next, the body's own included, where a forking

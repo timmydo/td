@@ -1,17 +1,15 @@
 //! The confined raw-syscall layer — the whole `unsafe` surface of this crate.
 //!
-//! The crate root `#![deny(unsafe_code)]`s and exactly one item here carries a
-//! scoped `#[allow]`: `syscall4`, the `syscall`-instruction body copied from
-//! `td-util/src/sys.rs`. Everything else in the crate — and every other function
-//! in this module — is ordinary safe Rust. This is the EIGHTH target-side unsafe
-//! exception UNSAFE.md records.
+//! The crate denies unsafe code except for the syscall instruction and
+//! adoption of inherited and freshly created descriptors (UNSAFE.md §8).
 //!
-//! The surface is FOUR syscalls, reached from THREE modules and no others:
+//! Nine syscalls are reached from four modules:
 //! `builtin.rs`, for the `umask` and `trap` builtins; `process.rs`, for the
 //! guards that hand a subshell back the process state a real fork would have
 //! kept for it, for the one that stops the shell listening to the terminal
 //! while a foreground child runs, AND for the descriptor question `read -t`
-//! asks; and `term.rs`, for the terminal mode and width the line editor needs.
+//! asks; `term.rs`, for terminal mode and width; and `fd_exec.rs`, for
+//! transferring explicit numbered descriptors to an external command.
 //! None is reachable through safe `std`, which exposes no umask API, no
 //! signal-disposition API, no terminal-mode API and no readiness API at all —
 //! `IsTerminal` answers whether a descriptor is a terminal, never how wide, in
@@ -53,7 +51,7 @@
 //! the three it may issue are pinned by value and `ioctl` refuses anything else
 //! before the syscall — the roster is code, not just a test.
 //!
-//! `poll(2)` is the narrowest of the four: it exists for ONE builtin, `read -t`,
+//! `poll(2)` exists for ONE builtin, `read -t`,
 //! whose whole question is the one poll answers — would a read return without
 //! waiting. Nothing in `std` asks it. Its absence is the one the shell had to
 //! ANNOUNCE: readiness was answered from the descriptor table's own shape, which
@@ -67,10 +65,15 @@ compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
 use std::sync::Mutex;
 
+const SYS_WAIT4: usize = 61;
+const SYS_MEMFD_CREATE: usize = 319;
 const SYS_POLL: usize = 7;
 const SYS_RT_SIGACTION: usize = 13;
 const SYS_IOCTL: usize = 16;
+const SYS_FCNTL: usize = 72;
 const SYS_UMASK: usize = 95;
+const SYS_DUP3: usize = 292;
+const SYS_CLOSE_RANGE: usize = 436;
 
 /// Every bit `umask(2)` can hold: the nine rwx permission bits and NOT ONE MORE.
 /// Linux's `sys_umask` ands the argument with `S_IRWXUGO`, so setuid, setgid and
@@ -119,7 +122,7 @@ pub const SIG_MAX: u8 = 64;
 const UNCHANGEABLE: [u8; 2] = [9, 19];
 
 /// The single raw-syscall entry point (x86_64 SysV syscall ABI), copied from
-/// `td-util/src/sys.rs`. Its body is the ONLY `unsafe` in the crate. The scoped
+/// `td-util/src/sys.rs`. Its body owns the only assembly instruction. The scoped
 /// `#[allow]` covers where `unsafe` may appear, not what may be passed here — this
 /// fn is safe to CALL, so its confinement is module privacy plus the two typed
 /// wrappers below being its only callers.
@@ -151,6 +154,148 @@ fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
         );
     }
     ret
+}
+
+fn fd_result(ret: isize) -> std::io::Result<i32> {
+    if ret < 0 {
+        Err(std::io::Error::from_raw_os_error((-ret) as i32))
+    } else {
+        Ok(ret as i32)
+    }
+}
+
+const F_DUPFD_CLOEXEC: usize = 1030;
+const F_GETFD: usize = 1;
+const F_SETFD: usize = 2;
+const FD_CLOEXEC: usize = 1;
+const CLOSE_RANGE_UNSHARE: usize = 2;
+
+/// Only a successful dup of a borrowed fd enters this owner.
+pub(super) struct Transfer(std::fs::File);
+
+impl Transfer {
+    pub(super) fn new(source: std::os::fd::BorrowedFd<'_>, floor: i32) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        fd_result(syscall4(
+            SYS_FCNTL,
+            source.as_raw_fd() as usize,
+            F_DUPFD_CLOEXEC,
+            floor.max(3) as usize,
+            0,
+        ))
+        .map(|fd| Self(own_file(fd)))
+    }
+    pub(super) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.0.as_fd()
+    }
+}
+
+/// A fresh worker splits its fd table from the interpreter without closing
+/// any valid descriptor. All remapping below is local to that worker.
+pub(super) struct PrivateTable(std::marker::PhantomData<std::rc::Rc<()>>);
+impl PrivateTable {
+    pub(super) fn split() -> std::io::Result<Self> {
+        let end = u32::MAX as usize;
+        fd_result(syscall4(SYS_CLOSE_RANGE, end, end, CLOSE_RANGE_UNSHARE, 0))
+            .map(|_| Self(std::marker::PhantomData))
+    }
+    pub(super) fn install(
+        &self,
+        dest: i32,
+        source: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        match source {
+            Some(src) if src.as_raw_fd() == dest => {
+                fd_result(syscall4(SYS_FCNTL, dest as usize, F_SETFD, 0, 0)).map(drop)
+            }
+            Some(src) => fd_result(syscall4(
+                SYS_DUP3,
+                src.as_raw_fd() as usize,
+                dest as usize,
+                0,
+                0,
+            ))
+            .map(drop),
+            None if dest >= 3 => {
+                match fd_result(syscall4(SYS_FCNTL, dest as usize, F_SETFD, FD_CLOEXEC, 0)) {
+                    Err(e) if e.raw_os_error() == Some(9) => Ok(()),
+                    result => result.map(drop),
+                }
+            }
+            None => Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+    }
+}
+
+/// At shell startup only, transfer ownership of an inherited descriptor
+/// into the virtual table. Never adopt a Rust-owned close-on-exec handle.
+pub(super) fn take_inherited(fd: i32) -> std::io::Result<Option<std::fs::File>> {
+    if fd < 3 || syscall4(SYS_FCNTL, fd as usize, F_GETFD, 0, 0) != 0 {
+        return Ok(None);
+    }
+    fd_result(syscall4(SYS_FCNTL, fd as usize, F_SETFD, FD_CLOEXEC, 0))?;
+    Ok(Some(own_file(fd)))
+}
+
+// Only a fresh duplicate, a newly created memfd, or the startup check
+// above can establish sole ownership of a raw descriptor.
+#[allow(unsafe_code)]
+fn own_file(fd: i32) -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    // SAFETY: each caller transfers the sole owner exactly once.
+    unsafe { std::fs::File::from_raw_fd(fd) }
+}
+
+const MFD_FLAGS: usize = 0x0001 | 0x0002 | 0x0008;
+const F_ADD_SEALS: usize = 1033;
+const HERE_SEALS: usize = 0x0001 | 0x0002 | 0x0004 | 0x0008;
+
+/// Large here-documents must survive a real exec without a writer thread.
+pub(super) fn here_file(bytes: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::fd::AsRawFd;
+    let fd = fd_result(syscall4(
+        SYS_MEMFD_CREATE,
+        c"td-sh-here".as_ptr() as usize,
+        MFD_FLAGS,
+        0,
+        0,
+    ))?;
+    let mut file = own_file(fd);
+    file.write_all(bytes)?;
+    file.rewind()?;
+    fd_result(syscall4(
+        SYS_FCNTL,
+        file.as_raw_fd() as usize,
+        F_ADD_SEALS,
+        HERE_SEALS,
+        0,
+    ))?;
+    Ok(file)
+}
+
+/// Reap exactly the child spawned by the short-lived worker.
+pub(super) fn wait_child(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let mut status = 0i32;
+    loop {
+        let ret = syscall4(
+            SYS_WAIT4,
+            pid as usize,
+            (&mut status as *mut i32) as usize,
+            0,
+            0,
+        );
+        if ret != -4 {
+            return fd_result(ret).map(|_| std::process::ExitStatus::from_raw(status));
+        }
+    }
 }
 
 /// A kernel refusal, as the negative errno the raw ABI returns in place of

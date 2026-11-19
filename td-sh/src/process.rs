@@ -1,37 +1,26 @@
 //! I/O plumbing: a per-shell descriptor table, redirection application,
 //! pipelines, subshells and external-command spawning.
 //!
-//! The shell keeps its OWN file-descriptor table (`Fds`) rather than dup2'ing
-//! real kernel descriptors, because `std` exposes no `dup2`/`fork` and the
-//! crate's one `unsafe` surface is `sys.rs`'s four syscalls -- `umask(2)`, a
-//! disposition-only `rt_sigaction(2)`, `ioctl(2)` and `poll(2)` -- and nothing
-//! else.
-//! Builtins and shell functions read and write through
-//! this table; only when an *external* program runs is the table translated into
-//! `std::process::Command` stdio. A pipeline's stages run CONCURRENTLY, on
+//! Each shell environment owns its numbered descriptors. Builtins and functions
+//! use that table directly. External programs get standard streams through
+//! `Command` and explicit file descriptors through `fd_exec`. Pipeline stages run on
 //! threads joined by real `std::io::pipe` descriptors, so a consumer runs while
 //! its producer does and an infinite producer is bounded by the pipe rather than
 //! by memory. That is also what makes every piece of PROCESS-global state below
 //! -- the umask, signal dispositions, the interrupt guard -- something stages
 //! share rather than own.
 //!
-//! The virtual table is why `exec cmd` hands the child only descriptors 0/1/2:
-//! passing a higher one across an `execve` needs a `pre_exec` `dup2` (unsafe) or a
-//! real `fork`, so `exec 3>f; cmd >&3` works (3 is remapped onto a standard
-//! descriptor for the child) while `exec 3>f; cmd` cannot let `cmd` see fd 3.
-//! A `Fd::Closed` likewise reaches the child as `/dev/null` rather than closed.
-//! Process substitution is the one thing that needs a child to reach a higher
-//! descriptor, and it goes around that rule rather than through it: the word it
-//! expands to names the descriptor by PID (`dev_fd_path`), so the command opens
-//! it rather than inheriting it.
+//! Shell numbers are local to the environment, including in threaded subshells.
+//! The backing fd in the interpreter's /proc entry can have a different number.
+//! Process substitution names its pipe by PID (see `dev_fd_path`).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -56,7 +45,6 @@ pub enum Fd {
     /// The process's real stdin/stdout/stderr (0/1/2).
     Inherit(u8),
     File(Arc<File>),
-    ReadBuf(Arc<Mutex<Cursor<Vec<u8>>>>),
     WriteBuf(Arc<Mutex<Vec<u8>>>),
     Null,
     Closed,
@@ -75,8 +63,44 @@ impl Fds {
         Fds { map }
     }
 
-    fn get(&self, fd: u32) -> Option<&Fd> {
+    pub(super) fn slots(&self) -> impl Iterator<Item = (&u32, &Fd)> {
+        self.map.iter()
+    }
+    pub(super) fn get(&self, fd: u32) -> Option<&Fd> {
         self.map.get(&fd)
+    }
+
+    pub(super) fn import_inherited(&mut self) -> std::io::Result<()> {
+        let mut import = |fd: i32| -> std::io::Result<()> {
+            if let Some(file) = crate::sys::take_inherited(fd)? {
+                crate::allocation::insert(&mut self.map, fd as u32, file_entry(file))
+                    .map_err(|_| std::io::ErrorKind::OutOfMemory)?;
+            }
+            Ok(())
+        };
+        match std::fs::read_dir("/proc/self/fd") {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Some(fd) = entry?.file_name().to_str().and_then(|n| n.parse().ok()) {
+                        import(fd)?;
+                    }
+                }
+            }
+            Err(e)
+                if matches!(e.raw_os_error(), Some(23 | 24))
+                    || matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                // Stage-1 may start before procfs. POSIX scripts can use 0–9.
+                for fd in 3..=9 {
+                    import(fd)?;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
     }
 
     /// Whether descriptor `fd` is a terminal. Only an INHERITED descriptor can
@@ -162,7 +186,6 @@ pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
                 Err(std::io::Error::other("poisoned buffer"))
             }
         }
-        Some(Fd::ReadBuf(_)) => Err(std::io::Error::other("descriptor not open for writing")),
         Some(Fd::Null) => Ok(()),
     }
 }
@@ -226,12 +249,6 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
             let mut src: &File = f;
             src.read(&mut one)?
         }
-        Some(Fd::ReadBuf(b)) => {
-            let mut cur = b
-                .lock()
-                .map_err(|_| std::io::Error::other("poisoned buffer"))?;
-            cur.read(&mut one)?
-        }
         Some(Fd::Null) => 0,
         _ => return Err(std::io::Error::other("descriptor not open for reading")),
     };
@@ -248,7 +265,7 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
 /// exists for a single builtin.
 ///
 /// Only the entries backed by a REAL descriptor are asked. The rest are the
-/// shell's own memory -- a cursor over a here-document, a capture buffer, the
+/// shell's in-memory capture buffer and the
 /// two sinks -- where a read cannot block whatever the kernel would say about
 /// anything, so they answer at once and never spend a syscall.
 pub fn read_ready(sh: &Shell, fd: u32, timeout_ms: i32) -> Result<bool, String> {
@@ -272,7 +289,7 @@ pub fn read_ready(sh: &Shell, fd: u32, timeout_ms: i32) -> Result<bool, String> 
         Some(Fd::File(f)) => std::os::fd::AsRawFd::as_raw_fd(&**f),
         // The shell's own memory, and the absent entry that reads as EOF: a
         // read cannot block on any of them whatever the kernel would say.
-        Some(Fd::Null | Fd::ReadBuf(_) | Fd::WriteBuf(_) | Fd::Closed) | None => {
+        Some(Fd::Null | Fd::WriteBuf(_) | Fd::Closed) | None => {
             return Ok(true);
         }
     };
@@ -456,7 +473,7 @@ pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
     for (fd, plan) in &plans {
         let fd = *fd;
         let prev = sh.fds.map.get(&fd).cloned();
-        match open_planned(sh, plan) {
+        match open_planned(sh, fd, plan) {
             Ok(Ok(Opened::To(target))) => {
                 sh.fds.set(fd, target);
                 saved.entries.push((fd, prev));
@@ -616,13 +633,27 @@ fn plan_redirs<'a>(sh: &mut Shell, redirs: &'a [Redir]) -> R<Vec<(u32, Plan<'a>)
 /// Phase 2. Opens what phase 1 decided. A failure here is recoverable: the
 /// message is printed and `Ok(Err(()))` is returned so `apply_redirs` can turn it
 /// into a skipped command.
-fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
+fn open_planned(sh: &mut Shell, dest: u32, plan: &Plan) -> R<Result<Opened, ()>> {
+    if dest > 2 && !matches!(plan, Plan::Same | Plan::Close) {
+        // F_DUPFD_CLOEXEC checks the floor against RLIMIT_NOFILE. EMFILE
+        // means the floor is valid but every slot above it is occupied.
+        let valid = i32::try_from(dest).is_ok_and(|floor| {
+            match crate::sys::Transfer::new(std::io::stdin().as_fd(), floor) {
+                Ok(_) => true,
+                Err(e) => e.raw_os_error() == Some(24),
+            }
+        });
+        if !valid {
+            return Ok(bad_descriptor(sh, dest));
+        }
+    }
     match plan {
         Plan::Here(body) => {
             let text = exec::here_body(sh, body)?;
-            Ok(Ok(Opened::To(Fd::ReadBuf(Arc::new(Mutex::new(
-                Cursor::new(text.into_bytes()),
-            ))))))
+            match here_input(text.as_bytes()) {
+                Ok(entry) => Ok(Ok(Opened::To(entry))),
+                Err(e) => Ok(open_failed(sh, "here-document", OpenKind::Read, &e)),
+            }
         }
         Plan::Read(name) => Ok(open_file(
             sh,
@@ -651,14 +682,16 @@ fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
         // bad. Recoverable, not fatal: ash's is `dup2_or_raise` at `redirect`
         // time, inside the `redirectsafe` that catches it.
         Plan::From(n) => match sh.fds.get(*n) {
-            Some(Fd::Closed) | None => {
-                let _ = exec::diag(sh, &format!("{n}: bad file descriptor"));
-                Ok(Err(()))
-            }
+            Some(Fd::Closed) | None => Ok(bad_descriptor(sh, *n)),
             Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
         },
         Plan::BothFile(name) => Ok(truncating_open(sh, name, sh.opts.noclobber).map(to_both)),
     }
+}
+
+fn bad_descriptor(sh: &mut Shell, fd: u32) -> Result<Opened, ()> {
+    let _ = exec::diag(sh, &format!("{fd}: bad file descriptor"));
+    Err(())
 }
 
 /// The one open that TRUNCATES, which three plans want and only `>|` wants
@@ -780,10 +813,24 @@ fn open_error(name: &str, kind: OpenKind, e: &std::io::Error) -> String {
     format!("{} {name}: {}", kind.verb(), kind.errmsg(e))
 }
 
+fn file_entry(file: File) -> Fd {
+    Fd::File(Arc::new(file))
+}
+
+fn here_input(bytes: &[u8]) -> std::io::Result<Fd> {
+    // A Linux pipe can accept PIPE_BUF bytes before a reader starts.
+    // Larger documents need independent backing across process replacement.
+    let file = if bytes.len() <= 4096 {
+        let (reader, mut writer) = std::io::pipe()?;
+        writer.write_all(bytes)?;
+        File::from(OwnedFd::from(reader))
+    } else {
+        crate::sys::here_file(bytes)?
+    };
+    Ok(file_entry(file))
+}
+
 fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions, kind: OpenKind) -> Result<Opened, ()> {
-    if name == "/dev/null" {
-        return Ok(Opened::To(Fd::Null));
-    }
     // `>"$empty"` is ENOENT to the kernel, but `resolve` joins a relative target
     // onto the cwd and joining "" yields the cwd ITSELF -- so this opened the
     // current directory and succeeded, and `<"$empty"` then handed a directory's
@@ -794,7 +841,7 @@ fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions, kind: OpenKind) -> 
     }
     let path = sh.resolve(name);
     match opts.open(&path) {
-        Ok(f) => Ok(Opened::To(Fd::File(Arc::new(f)))),
+        Ok(f) => Ok(Opened::To(file_entry(f))),
         Err(e) => open_failed(sh, name, kind, &e),
     }
 }
@@ -1301,7 +1348,7 @@ pub(crate) struct InterruptibleChild {
 ///
 /// The shell is briefly exposed while this window is open, which is the same
 /// exposure the guard already documents between commands rather than a new one.
-fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<std::process::Child> {
+fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<crate::fd_exec::Child> {
     // What THIS shell wants its child to have, which is POSIX's rule: a signal
     // it ignores is inherited ignored, and everything else is default -- a
     // trapped signal included, since the handler is the shell's and the child
@@ -1330,7 +1377,7 @@ fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<std::
     // Under the guard's lock, so two stages cannot interleave here and neither
     // can race a guard being taken or given back.
     let Ok(_guard) = GUARD.lock() else {
-        return cmd.spawn();
+        return crate::fd_exec::spawn(&sh.fds, cmd);
     };
     let mut saved = Vec::with_capacity(want.len());
     for (sig, want) in &want {
@@ -1341,7 +1388,7 @@ fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<std::
             _ => {}
         }
     }
-    let spawned = cmd.spawn();
+    let spawned = crate::fd_exec::spawn(&sh.fds, cmd);
     for (sig, was) in saved {
         let _ = crate::sys::signal_set(sig, was);
     }
@@ -2037,8 +2084,6 @@ pub fn close_procsubs(sh: &mut Shell, mark: u64) {
 /// `arg0` is `exec -a NAME`'s override. It names the replacement without
 /// changing which program is FOUND, deliberately unlike ash (ash.c:8354).
 pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()> {
-    use std::os::unix::process::CommandExt;
-
     let Some(program) = argv.first() else {
         return Ok(());
     };
@@ -2050,18 +2095,10 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
             return failed_exec(sh, code);
         }
     };
-    // Replacing the process is only safe from the real shell with real stdio. An
-    // in-process clone (subshell, `&`, command substitution) would take the whole
-    // script with it, and an in-process buffer has no kernel fd to hand over; both
-    // run the command and exit instead, which is what the caller would have seen.
-    let buffered =
-        (0..=2).any(|fd| matches!(sh.fds.get(fd), Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_))));
-    if sh.cloned || buffered {
-        // A real `execve` replaces the image, taking the trap table with it, so the
-        // emulation has to drop it too -- otherwise this shell runs an EXIT trap
-        // the exec'd program could never have run.
-        sh.traps.clear();
-        exec_external(sh, argv, None, arg0)?;
+    // A clone shares this process, and a capture needs its drain through the wait.
+    let needs_pump = sh.fds.slots().any(|(_, fd)| matches!(fd, Fd::WriteBuf(_)));
+    if sh.cloned || needs_pump {
+        run_external(sh, argv, None, arg0, true)?;
         return Err(Sig::Exit(sh.status));
     }
 
@@ -2075,24 +2112,14 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()
         sh.jobs.wait_all();
     }
 
-    let mut cmd = Command::new(&resolved);
-    cmd.arg0(arg0.unwrap_or(program));
-    cmd.args(argv.iter().skip(1));
-    cmd.env_clear();
-    for (k, v) in sh.exported_env() {
-        cmd.env(k, v);
-    }
-    // Names the shell cannot spell still belong to the environment it was handed.
-    for (k, v) in &sh.opaque_env {
-        cmd.env(k, v);
-    }
-    cmd.current_dir(&sh.cwd);
-    cmd.stdin(stdio_for(sh, 0)?);
-    cmd.stdout(stdio_for(sh, 1)?);
-    cmd.stderr(stdio_for(sh, 2)?);
-
+    let mut cmd = external_command(
+        sh,
+        resolved.as_os_str(),
+        arg0.unwrap_or(program),
+        argv.iter().skip(1).map(OsStr::new),
+    );
     // Safe: `CommandExt::exec` returns the error rather than trapping it.
-    let e = cmd.exec();
+    let e = crate::fd_exec::replace(&sh.fds, &mut cmd);
     let (why, code) = exec_failure(&e);
     let _ = exec::diag(sh, &format!("{program}: {why}"));
     failed_exec(sh, code)
@@ -2108,7 +2135,7 @@ fn failed_exec(sh: &mut Shell, code: i32) -> R<()> {
 }
 
 /// Where Linux names the running binary, for a script without `#!`. That
-/// path, and only it, needs `/proc` mounted; without it the retry fails as
+/// path needs `/proc` mounted; without it the retry fails as
 /// ash's does (busybox's default `CONFIG_BUSYBOX_EXEC_PATH` is the same
 /// file), reporting the script `not found`.
 const SELF_EXE: &str = "/proc/self/exe";
@@ -2116,18 +2143,15 @@ const SELF_EXE: &str = "/proc/self/exe";
 /// A `Command` for `program`, with the exported environment, the cwd and
 /// stdio wired to the descriptor table -- a pipe where `piped` says the
 /// shell bridges that descriptor itself.
-fn external_command(
+fn external_command<'a>(
     sh: &Shell,
     program: &OsStr,
     arg0: &str,
-    args: &[&OsStr],
-    piped: [bool; 3],
-) -> R<Command> {
+    args: impl Iterator<Item = &'a OsStr>,
+) -> Command {
     use std::os::unix::process::CommandExt;
-
     let mut cmd = Command::new(program);
-    cmd.arg0(arg0);
-    cmd.args(args);
+    cmd.arg0(arg0).args(args);
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
         cmd.env(k, v);
@@ -2137,23 +2161,7 @@ fn external_command(
         cmd.env(k, v);
     }
     cmd.current_dir(&sh.cwd);
-    let [stdin, stdout, stderr] = piped;
-    cmd.stdin(if stdin {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 0)?
-    });
-    cmd.stdout(if stdout {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 1)?
-    });
-    cmd.stderr(if stderr {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 2)?
-    });
-    Ok(cmd)
+    cmd
 }
 
 /// Whether a file the kernel refused is one to run as a script. Not when
@@ -2217,18 +2225,23 @@ fn script_name(
 /// Spawn an external program, wiring its stdio to the current descriptor table.
 /// The seed corpus never reaches here (it is builtin-only), but real scripts do.
 ///
-/// A buffered shell descriptor (a `ReadBuf` feeding stdin, or a `WriteBuf`
-/// capturing stdout/stderr — as set up by command substitution and pipelines)
-/// cannot be handed to a foreign process directly, so it is bridged through a real
-/// OS pipe: the in-process bytes are pumped to/from the child on helper threads.
-/// Without this an external consumer would read the shell's real inherited stdin
-/// (blocking the shell forever on a live terminal) and `x=$(external)` would lose
-/// the command's output.
+/// Captures share one output pipe per buffer. File-backed entries retain
+/// their open file descriptions across the launch.
 pub fn exec_external(
     sh: &mut Shell,
     argv: &[String],
     path: Option<&str>,
     arg0: Option<&str>,
+) -> R<()> {
+    run_external(sh, argv, path, arg0, false)
+}
+
+fn run_external(
+    sh: &mut Shell,
+    argv: &[String],
+    path: Option<&str>,
+    arg0: Option<&str>,
+    replacing: bool,
 ) -> R<()> {
     let Some(program) = argv.first() else {
         sh.set_status(0);
@@ -2244,35 +2257,11 @@ pub fn exec_external(
         }
     };
 
-    // A `ReadBuf` on stdin becomes piped input; a `WriteBuf` on stdout/stderr
-    // becomes a captured pipe. Everything else maps to a `Stdio` directly.
-    let stdin_bytes: Option<Vec<u8>> = match sh.fds.get(0) {
-        Some(Fd::ReadBuf(b)) => b.lock().ok().map(|mut cur| {
-            let mut v = Vec::new();
-            let _ = cur.read_to_end(&mut v);
-            v
-        }),
-        _ => None,
-    };
-    let stdout_buf = match sh.fds.get(1) {
-        Some(Fd::WriteBuf(b)) => Some(b.clone()),
-        _ => None,
-    };
-    let stderr_buf = match sh.fds.get(2) {
-        Some(Fd::WriteBuf(b)) => Some(b.clone()),
-        _ => None,
-    };
-
-    let piped = [
-        stdin_bytes.is_some(),
-        stdout_buf.is_some(),
-        stderr_buf.is_some(),
-    ];
     // argv[0] is the WORD, not the path the search resolved to (ash.c:8354);
     // `Command`'s default is the program path. `exec -a` overrides the word.
     let word = arg0.unwrap_or(program);
     let args: Vec<&OsStr> = argv.iter().skip(1).map(OsStr::new).collect();
-    let mut cmd = external_command(sh, resolved.as_os_str(), word, &args, piped)?;
+    let mut cmd = external_command(sh, resolved.as_os_str(), word, args.iter().copied());
     let mut spawned = spawn_uninherited(sh, &mut cmd);
     // A file the kernel will not execute -- no `#!`, not an ELF -- is a
     // script for THIS shell, as POSIX asks and ash does: `tryexec`
@@ -2292,7 +2281,7 @@ pub fn exec_external(
         let name = script_name(sh, program, path, &resolved);
         let mut script: Vec<&OsStr> = vec![OsStr::new("--"), OsStr::new(&name)];
         script.extend(args.iter().copied());
-        cmd = external_command(sh, OsStr::new(SELF_EXE), "sh", &script, piped)?;
+        cmd = external_command(sh, OsStr::new(SELF_EXE), "sh", script.iter().copied());
         spawned = spawn_uninherited(sh, &mut cmd);
     }
 
@@ -2306,65 +2295,21 @@ pub fn exec_external(
         }
     };
 
+    if replacing {
+        // A failed launch still runs the shell's EXIT trap.
+        sh.traps.clear();
+    }
+
     // The shell stops listening to Ctrl-C for exactly as long as the child is
     // alive. Both are in the terminal's foreground process group, so the driver's
     // SIGINT reaches BOTH -- and a shell whose SIGINT is `SIG_DFL` dies beside the
     // command the operator meant to interrupt. As the image's login shell that
     // costs the session, and getty respawning a fresh login is not an answer.
     //
-    // Taken HERE rather than beside the wait, because the wait is not the only
-    // place this blocks on the child: the stderr drain below reads to EOF on this
-    // thread, so for `x=$(cmd 2>&1)` the child has already run and exited by the
-    // time the wait is reached. Held until the stdout joiner is done too, since a
-    // grandchild holding that pipe keeps the shell here just as long.
+    // Keep the guard until capture pipes inherited by descendants close.
     let interrupt_guard = InterruptibleChild::hold(sh);
 
-    // Feed stdin and drain stdout concurrently so a child that writes while reading
-    // cannot deadlock a single-threaded pump. `Builder::spawn` is used (not
-    // `thread::spawn`) so an OS thread-creation failure drops the pump closure —
-    // closing that pipe end (child sees EOF on stdin / EPIPE on stdout) rather than
-    // panicking; there is no inline fallback, only this safe degradation. The stdin
-    // writer is DETACHED (never joined): if the consumer exits early it gets EPIPE
-    // and ends, and if the child hands its stdin
-    // to a lingering grandchild the writer blocks harmlessly in the background
-    // instead of hanging the shell. stdout is captured on a joined thread; stderr is
-    // drained on this thread.
-    if let (Some(bytes), Some(mut si)) = (stdin_bytes, child.stdin.take()) {
-        // Detached writer. On OS thread-exhaustion the closure is dropped, closing
-        // `si` so the child sees empty stdin — degraded, but never a panic or hang.
-        let _ = std::thread::Builder::new().spawn(move || {
-            let _ = si.write_all(&bytes);
-        });
-    }
-    let stdout_join = match (stdout_buf, child.stdout.take()) {
-        (Some(buf), Some(mut so)) => {
-            let drain = move || {
-                let mut v = Vec::new();
-                let _ = so.read_to_end(&mut v);
-                if let Ok(mut b) = buf.lock() {
-                    b.extend_from_slice(&v);
-                }
-            };
-            // On OS thread-exhaustion the closure (owning `so`/`buf`) is dropped,
-            // closing the pipe's read end; the child then sees EPIPE on stdout rather
-            // than the shell hanging — degraded capture, never a panic or deadlock.
-            std::thread::Builder::new().spawn(drain).ok()
-        }
-        _ => None,
-    };
-    // Drain stderr on this thread (the third concurrent stream).
-    if let (Some(buf), Some(mut se)) = (stderr_buf, child.stderr.take()) {
-        let mut v = Vec::new();
-        let _ = se.read_to_end(&mut v);
-        if let Ok(mut b) = buf.lock() {
-            b.extend_from_slice(&v);
-        }
-    }
-
     let status = child.wait();
-    if let Some(j) = stdout_join {
-        let _ = j.join();
-    }
     drop(interrupt_guard);
 
     match status {
@@ -2403,42 +2348,6 @@ pub fn exec_external(
             sh.set_status(code);
             Ok(())
         }
-    }
-}
-
-/// Translate a NON-buffered descriptor into a `Stdio` for a child. Buffered
-/// descriptors (`ReadBuf`/`WriteBuf`) are handled by the pipe bridge in
-/// `exec_external` before this is reached; the arms here remain a safe fallback
-/// (inherit) for any fd the bridge does not special-case.
-fn stdio_for(sh: &Shell, fd: u32) -> R<Stdio> {
-    match sh.fds.get(fd) {
-        // Map to the REAL stream the entry names, not to this position: after
-        // `1>&2` fd 1 holds `Inherit(2)`, so the child's stdout must go to the
-        // shell's stderr. `try_clone_to_owned` is the safe dup; if it fails the
-        // positional inherit is the harmless fallback.
-        Some(Fd::Inherit(n)) => Ok(inherit_stream(*n)),
-        None => Ok(Stdio::inherit()),
-        Some(Fd::Null) => Ok(Stdio::null()),
-        Some(Fd::File(f)) => match f.try_clone() {
-            Ok(c) => Ok(Stdio::from(c)),
-            Err(_) => Ok(Stdio::inherit()),
-        },
-        Some(Fd::Closed) => Ok(Stdio::null()),
-        Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_)) => Ok(Stdio::inherit()),
-    }
-}
-
-/// A `Stdio` for the process's own stream `n` (0/1/2).
-fn inherit_stream(n: u8) -> Stdio {
-    use std::os::fd::AsFd;
-    let cloned = match n {
-        0 => std::io::stdin().as_fd().try_clone_to_owned(),
-        1 => std::io::stdout().as_fd().try_clone_to_owned(),
-        _ => std::io::stderr().as_fd().try_clone_to_owned(),
-    };
-    match cloned {
-        Ok(owned) => Stdio::from(owned),
-        Err(_) => Stdio::inherit(),
     }
 }
 
