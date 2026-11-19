@@ -272,7 +272,7 @@ pub(crate) fn environment(
     home: &Path,
     path: &[PathBuf],
     runtime: bool,
-) -> Vec<(OsString, OsString)> {
+) -> [(OsString, OsString); 5] {
     let mut search = OsString::new();
     search.push(ALIAS_DIR);
     search.push(":");
@@ -283,13 +283,26 @@ pub(crate) fn environment(
     search.push(PROGRAM_DIR);
     search.push(":");
     search.push(if runtime { RUNTIME_PATH } else { PATH });
-    vec![
+    [
         ("HOME".into(), home.as_os_str().to_os_string()),
         ("LANG".into(), LANG.into()),
         ("PATH".into(), search),
         ("TERM".into(), TERM.into()),
         ("TMPDIR".into(), TMPDIR.into()),
     ]
+}
+
+/// Stage 2 consults the CA bundle in the assembled root. On hosts with
+/// another trust layout the clients keep their native defaults.
+pub(crate) fn ca_environment(bundle_present: bool) -> &'static [(&'static str, &'static str)] {
+    if bundle_present {
+        &[
+            ("SSL_CERT_FILE", authority::CA_BUNDLE_PATH),
+            ("SSL_CERT_DIR", "/etc/ssl/certs"),
+        ]
+    } else {
+        &[]
+    }
 }
 
 /// Whether `path` may be one of the entry's `PATH` directories, by its
@@ -2906,6 +2919,14 @@ mod tests {
 
     #[test]
     fn the_environment_is_fixed_but_for_home_and_path() {
+        assert!(ca_environment(false).is_empty());
+        assert_eq!(
+            ca_environment(true),
+            &[
+                ("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"),
+                ("SSL_CERT_DIR", "/etc/ssl/certs"),
+            ]
+        );
         let fixed = environment(Path::new("/s/home"), &[], false);
         let keys: Vec<_> = fixed.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);

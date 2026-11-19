@@ -1573,7 +1573,9 @@ mod confinement {
         // environment is the fixed `workspace::environment`, the spec's
         // path directories first on its `PATH`.
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 6);
-        assert_eq!(TRANSITION.matches(".envs(").count(), 2);
+        assert_eq!(TRANSITION.matches(".envs(").count(), 3);
+        assert!(TRANSITION
+            .contains("workspace::ca_environment(Path::new(authority::CA_BUNDLE_PATH).is_file())"));
         // The one variable outside the validated list, and only through its
         // autotest-gated helper.
         assert_eq!(

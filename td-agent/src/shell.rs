@@ -218,8 +218,8 @@ pub fn keep_whole_environment() {
 }
 
 /// The environment a call's process gets: `PATH`, `HOME`, `TMPDIR` and
-/// `LANG` as the tool host has them, or everything it has in an unconfined
-/// workspace, and `TERM=dumb` (§8).
+/// `LANG`, the jail's CA settings when present, and `TERM=dumb` (§8).
+/// Unconfined workspaces keep the tool host's whole environment.
 pub fn environment() -> Vec<(OsString, OsString)> {
     if WHOLE_ENVIRONMENT.load(Ordering::Relaxed) {
         let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
@@ -228,10 +228,21 @@ pub fn environment() -> Vec<(OsString, OsString)> {
         env.push(("TERM".into(), "dumb".into()));
         return env;
     }
-    let mut env: Vec<(OsString, OsString)> = ["PATH", "HOME", "TMPDIR", "LANG"]
-        .into_iter()
-        .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?)))
-        .collect();
+    confined_environment(|key| std::env::var_os(key))
+}
+
+fn confined_environment(lookup: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ]
+    .into_iter()
+    .filter_map(|name| Some((OsString::from(name), lookup(name)?)))
+    .collect();
     env.push(("TERM".into(), "dumb".into()));
     env
 }
@@ -720,11 +731,27 @@ mod tests {
     #[test]
     fn a_jailed_call_gets_only_the_names_it_is_given() {
         assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
-        for (name, _) in environment() {
+        let environment = confined_environment(|key| Some(key.into()));
+        for key in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            assert!(environment.iter().any(|(k, v)| k == key && v == key));
+        }
+        assert_eq!(
+            confined_environment(|_| None),
+            [("TERM".into(), "dumb".into())]
+        );
+        for (name, _) in environment {
             assert!(
-                ["PATH", "HOME", "TMPDIR", "LANG", "TERM"]
-                    .iter()
-                    .any(|given| name == *given),
+                [
+                    "PATH",
+                    "HOME",
+                    "TMPDIR",
+                    "LANG",
+                    "TERM",
+                    "SSL_CERT_FILE",
+                    "SSL_CERT_DIR"
+                ]
+                .iter()
+                .any(|given| name == *given),
                 "{name:?}"
             );
         }

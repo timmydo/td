@@ -4162,7 +4162,9 @@ null device as standard error. Its environment is exactly `HOME` (the
 spec's home), `LANG=C.UTF-8`, `PATH` (the read-only alias directory, then
 the spec's path directories in order, then the read-only admitted program
 directory, then the ordinary directories and a store-based host's system
-profile, or with a runtime td's `/bin` and then `/usr/bin`), `TERM=dumb` and `TMPDIR=/tmp`; it
+profile, or with a runtime td's `/bin` and then `/usr/bin`), `TERM=dumb` and `TMPDIR=/tmp`. When the assembled root contains
+`/etc/ssl/certs/ca-certificates.crt`, the entry also gets `SSL_CERT_FILE`
+naming that bundle and `SSL_CERT_DIR=/etc/ssl/certs`. It
 starts in the first worktree, else in the home. No cgroup is created and
 no data limit set: an instance keeps its launcher's cgroup and whatever
 limit it inherits, and says so with one named diagnostic,

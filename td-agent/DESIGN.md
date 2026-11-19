@@ -3982,7 +3982,8 @@ Every instance has:
   Git maintenance keep their separate restrictive filter.
 - **Inheritance:** no descriptor but the instance's pipe, no runtime
   directory, and an environment scrubbed to `PATH`, `HOME`, `TMPDIR`,
-  `LANG` and `TERM=dumb`. `PATH` begins with the host's own `PATH`
+  `LANG` and `TERM=dumb`, plus `SSL_CERT_FILE` and `SSL_CERT_DIR` when
+  the jail finds the system CA bundle. `PATH` begins with the host's own `PATH`
   directories as they resolve, those inside a system tree the instance
   binds, each once and at most 16 (`jail::system_path`, td-jail's
   `path` spec key); the admitted read-only programs follow, then td-jail's
@@ -7129,7 +7130,8 @@ sorts what matched and returns the first 1,000, saying when either bound
 cut it short.
 
 `shell` runs `sh -c` with its environment cleared to `PATH`, `HOME`,
-`TMPDIR` and `LANG` as the host has them and `TERM=dumb`, standard input
+`TMPDIR`, `LANG` and the jail’s `SSL_CERT_FILE` and `SSL_CERT_DIR` when
+present, with `TERM=dumb`, standard input
 empty and standard error on standard output's pipe, read through a queue
 of 16 pieces so unread output waits in the pipe. `timeout_ms` is from 1
 to 600,000, and a `workdir` that is not a directory is refused naming

@@ -7947,6 +7947,11 @@ fn run_stage2_workspace(
         .args(&plan.arguments)
         .env_clear()
         .envs(workspace::environment(&plan.home, &plan.path, plan.runtime))
+        .envs(
+            workspace::ca_environment(Path::new(authority::CA_BUNDLE_PATH).is_file())
+                .iter()
+                .copied(),
+        )
         .stdin(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stdout(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stderr(Stdio::from(

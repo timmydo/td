@@ -5803,13 +5803,10 @@ impl Session {
         let thread = std::thread::Builder::new()
             .name("approved-host-command".into())
             .spawn(move || {
-                let answer = crate::shell::run(
-                    crate::shell::shell(&command, &workdir, false),
-                    timeout,
-                    &stop,
-                    &mut |_| {},
-                )
-                .map(|exit| exit.render());
+                let mut host = crate::shell::shell(&command, &workdir, false);
+                host.env_remove("SSL_CERT_FILE").env_remove("SSL_CERT_DIR");
+                let answer =
+                    crate::shell::run(host, timeout, &stop, &mut |_| {}).map(|exit| exit.render());
                 let _ = send.send(answer);
             });
         let thread = match thread {
