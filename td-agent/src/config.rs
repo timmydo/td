@@ -178,6 +178,7 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     "pypi.org",
     "files.pythonhosted.org",
     "codeload.github.com",
+    "raw.githubusercontent.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "proxy.golang.org",
@@ -3789,8 +3790,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             DEFAULT_ALLOWLIST
         );
+        assert!(DEFAULT_ALLOWLIST.contains(&"raw.githubusercontent.com"));
         assert!(!DEFAULT_ALLOWLIST.iter().any(|host| [
             "github.com",
+            "api.github.com",
             "crates.io",
             "registry.npmjs.org"
         ]
