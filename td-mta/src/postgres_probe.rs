@@ -750,7 +750,7 @@ fn connect_authenticated_until(
         .dbname(request.database)
         .password(request.password)
         .application_name("td-mta-postgres")
-        .options("-c statement_timeout=5000 -c lock_timeout=1000 -c search_path=pg_catalog")
+        .options("-c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog")
         .ssl_mode(if session.is_some() {
             SslMode::Require
         } else {

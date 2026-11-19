@@ -1165,6 +1165,8 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
         .unwrap()
         .store_epoch;
+    // This administrative writer relies on the common startup setting.
+    sql(&fixture, "ALTER TABLE td_mta.config_materials ADD CONSTRAINT fixture_idle_timeout CHECK (current_setting('idle_in_transaction_session_timeout')::interval = interval '10 seconds')");
     for kind in [
         Kind::RelayPassword,
         Kind::CertificateChain,
