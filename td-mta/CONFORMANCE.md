@@ -595,12 +595,15 @@ delivers a verified eight-bit fixture source using 8BITMIME and checks route
 backoff reset, then observes the original message delivered after the real
 startup guard and persisted retry deadline, both of the 60-second minimum
 retry interval its profiles are served with (POSTGRES.md section 219).
-It checks durable recipient
-states and actual DATA receipt, including the binary attachment encoding. It confirms the stable clock through local
-control, then kills the process during a later MAIL and checks that a new
+It checks durable recipient states and actual DATA receipt, including the
+binary attachment encoding. The fixture establishes the initial clock
+checkpoint by confirmation. After an orderly restart it checks that an
+early confirmation is refused and observes expiry and its Inbox notice
+without further confirmation. It then kills the process during a later
+MAIL and checks that a new
 owner recovers Prepared after the abandoned lease expires. That interrupted
 message has expired meanwhile; recovery records a non-dispatchable expiry-wait
-marker while terminal expiry remains held for clock confirmation. This qualifies the bounded plain-text path,
+marker during the restarted guard’s stable interval. This qualifies the bounded plain-text path,
 not maximum-size throughput or every SMTP failure interleaving.
 
 

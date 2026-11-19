@@ -2261,7 +2261,7 @@ bounded SQL array batch rather than one protocol exchange per recipient.
 
 This path preserves near-expiry/overdue responsibility using the QUEUE.md
 expiry-wait marker and retires the active attempt without declaring terminal
-failure. Clock-confirmed expiry remains a
+failure. Clock-guarded expiry remains a
 separate activation prerequisite. A backwards last-attempt timestamp refuses.
 Runtime clock discontinuity validation and the monotonic restart guard of
 the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
@@ -3592,7 +3592,7 @@ current attempt had reached AcceptancePossible.
 Temporary refusals schedule each recipient using the shared bounded jitter
 policy; earlier uncertainty yields OutcomeUnknown, otherwise RetryWait.
 A retry that cannot precede expiry records expires_at as the nonterminal
-expiry-wait marker for the separate clock-confirmed expiry path. Permanent refusals terminate retries, retaining
+expiry-wait marker for the separate clock-guarded expiry path. Permanent refusals terminate retries, retaining
 OutcomeUnknown for prior uncertainty and Failed otherwise; a genuine refusal
 can be retained after expiry. Result rows, submission completion and pending
 failure notice, attempt retirement, history and receipt commit together.
@@ -3683,9 +3683,9 @@ rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.
 The prepared `queue_clock::Guard` pairs database UTC with samples from one
 process-local monotonic domain. Startup permits fresh dispatch but holds
 attempted recipients for the minimum retry interval of monotonic time (five
-minutes by default, section 219). Expiry remains held until an explicitly
-authorized queue clock-confirm operation observes that interval of stable
-progress. The caller must check database due times, ownership and route
+minutes by default, section 219). Expiry opens after that interval when
+the relay can establish continuity with its last clean clock checkpoint.
+The caller must check database due times, ownership and route
 health separately; a status snapshot is neither a permit nor historical
 transport authority.
 
@@ -3694,15 +3694,47 @@ direction pauses all new dispatch and expiry, resets the stable interval and
 revokes confirmation. Individual sample-to-sample discontinuities are checked separately so that a
 jump cannot hide by canceling prior drift. Smaller observations do not move
 the comparison anchor.
-A database primary change forces the same hold even when its clock matches.
-Elapsed time alone never clears these holds. Invalid UTC or monotonic regression
-poisons that guard until runtime reconstruction, which repeats startup holds.
+An explicitly signaled primary change forces the same hold even when its
+clock matches. The serving relay pins the configured endpoint and cannot
+distinguish a primary replaced behind that endpoint with agreeing clocks.
 
-This bounded, allocation-free guard supplies scheduling and health decisions
-only. Wiring database sample acquisition, failover detection, authenticated
-clock-confirm, bounded expiry and the production scheduler remains activation
-work. Existing prepared storage publishers do not imply those runtime checks.
+The relay's exclusively locked private runtime directory holds its
+mode-0600 `queue-clock` checkpoint. A checksum binds its clock evidence
+to the database epoch, profile, database name, verified endpoint and
+server name, Linux boot ID and time namespace. Only trusted directory
+writers may replace it. Before even attempting to acquire or renew a
+route lease, the relay replaces the clean checkpoint with a dirty record,
+syncing the file and parent directory. A failed owner operation therefore
+cannot leave clean evidence to admit a later restart. After successful
+worker drain and lease release it may publish a clean checkpoint.
 
+For explicit confirmation the relay starts a database sample after the
+request. A hold before acceptance cancels the request. Under the guard,
+the relay accepts the fresh sample and immediately uses it as the trusted
+clock anchor. It then saves that UTC as a dirty cleanup cutoff outside
+the guard. Status stays `requested` until the save completes. A later
+hold reports `held` and bases cleanup on the last trusted observation.
+Finishing the save leaves that hold or a newer request intact. A save
+error invalidates the guard and stops the worker. A crash before atomic
+replacement can recover the previous cutoff. After replacement it can
+recover the accepted cutoff. Either dirty record still holds expiry.
+
+Each running relay checks UTC against its own monotonic ticks. Across
+processes the seconds in `/proc/uptime` bound elapsed awake time from
+above because they include suspend. The checkpoint carries both ends of
+the UTC projection. On restart they allow any elapsed awake time from zero
+through the boot-time difference, including centisecond rounding and
+sampling latency. Both extremes must agree with database UTC within five
+minutes and the upper bound on this individual gap must be at most five
+minutes. The range carries across clean restarts, so many short shutdowns
+can also exhaust the margin. Fresh confirmation resets the range. Process
+ticks and live expiry tokens are never carried across generations.
+
+Missing, damaged, dirty or differently bound evidence, unreadable boot
+time, an excessive gap or ambiguous clock discrepancy leaves overdue
+recipients pending until explicit confirmation. Fresh dispatch and
+guarded retry can continue. A discontinuity observed while running
+still pauses dispatch.
 
 ## 117. Prepared due-retry publication
 
@@ -3731,10 +3763,11 @@ exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
 historical replay and the separate fresh-recipient path.
 
 
-## 118. Clock-confirmed expiry admission
+## 118. Clock-guarded expiry admission
 
-The queue clock guard admits one expiry batch per monotonic second, only
-while explicitly confirmed. Each batch remains limited to 100 recipients by
+The queue clock guard admits one expiry batch per monotonic second after
+a stable startup with clock continuity, or after explicit confirmation.
+Each batch remains limited to 100 recipients by
 the storage publisher. A failed or abandoned attempt consumes its admission;
 there is no refund or catch-up burst. Runtime expiry workers must share one
 guard for their admitted queue and preserve the database-wide owner fences.
@@ -3743,13 +3776,11 @@ The retained token fixes a UTC cutoff and a nonrenewable ten-second maximum
 publication deadline. The publisher must check it again before commit with
 fresh paired database UTC and local monotonic time. Clock holds, confirmation
 replacement, backward UTC and elapsed deadlines permanently retire the token.
-A process-unique checked confirmation identity prevents transfer to another
+A process-unique checked validation identity prevents transfer to another
 guard; these ephemeral tokens and identities are never persisted. Every
 observed UTC regression advances a checked expiry generation, including
 subthreshold steps seen by another user of the shared guard. Recovery of UTC
-does not restore an older token; it cannot erase the intervening observation. The token
-is not a live transport permission. Database expiry mutation and runtime
-scheduler/authenticated confirmation wiring remain separate work.
+does not restore an older token. The token admits only terminal expiry.
 
 
 ## 119. Prepared queue expiry storage
@@ -3778,7 +3809,7 @@ material, rolls back all new DDL on obstruction, and includes the prior version
 starts no scheduler; the fenced publisher and runtime wiring remain work.
 
 
-## 120. Fenced clock-confirmed expiry publisher
+## 120. Fenced clock-guarded expiry publisher
 
 The prepared expiry publisher binds a random operation to one submission,
 route-owner claim and generation. Historical receipt inspection precedes
@@ -3788,11 +3819,10 @@ Uncertain COMMIT results require settlement of that same retained operation.
 
 New publication requires current policy and unexpired ownership under the
 configuration/account/route locks. Database UTC is paired with the supplied
-runtime clock's monotonic domain and admitted by its shared confirmed guard.
+runtime clock's monotonic domain and admitted by its shared clock guard.
 The database-wide progress row serializes publishers and requires a UTC
 second since its previous publication sample. That persisted bound supplements
-the guard's monotonic interval; neither enables catch-up or bypasses explicit
-clock confirmation. The retained cutoff never advances during the operation.
+the guard's monotonic interval; neither enables catch-up or clears a discontinuity hold. The retained cutoff never advances during the operation.
 
 For an overdue submission, one transaction selects at most 100 pending rows
 in ordinal order. Fresh Queued becomes Failed/Expired with no attempt phase.
@@ -6085,8 +6115,7 @@ absence (section 165) clears it for the next expiry turn to rederive.
 Settlement never retries publication or changes recipient state.
 
 The underlying expiry transaction retains fresh policy and owner fencing,
-explicit queue-clock confirmation after the real stability hold of the
-minimum retry interval,
+the queue-clock admission rules of sections 116 and 118,
 process-local and database-wide spacing, at most 100 recipients, current
 attempt reservation handling, uncertainty preservation and one account
 sequence change. Admission does not confirm or replace the shared clock
@@ -6749,9 +6778,9 @@ unresolved custody; durable phase recovery on restart remains conservative.
 
 The process starts its retry guard of the minimum retry interval from database UTC and its one
 monotonic clock. New mail may dispatch while retries wait. Expiry scans precede
-dispatch; the private queue clock confirmation operation in CONFIG.md enables
-at most one 100-recipient expiry batch per second. Overdue work remains held
-until confirmation. Authentication and TLS failures publish a route pause;
+dispatch. With validated clock evidence, a stable relay can process at
+most one 100-recipient expiry batch per second. CONFIG.md describes how
+to confirm the clock when startup evidence is ambiguous or a jump is observed. Authentication and TLS failures publish a route pause;
 network failures, including DNS idle timeout while the original cap remains
 live, publish route backoff. A local exhausted cap does not diagnose the route.
 Durably accepted final DATA resets consecutive route failures. Success and
@@ -7070,15 +7099,20 @@ neither failure holds back the other's progress (an account whose usage
 counters disagree with its leases still retires submissions), and neither
 holds the account lock longer than its own bounded batch.
 
-Deletion is irreversible and time-driven, so the relay calls it only right
-after a queue clock observation whose guard reports the stable status retry
-dispatch needs (no discontinuity, the minimum retry interval of
-UTC/monotonic progress),
-passing that observation's database UTC; the transaction refuses with Clock
-if the database clock has since moved more than a minute from it. Unlike
-expiry it does not wait for administrator confirmation, so an unattended
-relay still reclaims; a clock step that predates the relay's start is no
-more detectable here than for dispatch.
+The relay waits for the minimum retry interval of stable samples after
+startup and each observed clock discontinuity before running cleanup.
+A dispatch hold still permits cleanup after that interval. Until explicit
+confirmation the cleanup cutoff is the earlier of current database UTC
+and the last pre-hold UTC advanced by monotonic elapsed time. This cap
+protects records timestamped against the previously trusted clock. A
+record stamped during a backward excursion can become eligible early
+when database UTC returns to its former value. Each transaction
+checks ownership and refuses a database clock more than a minute from
+the observation. On an ambiguous restart the relay advances the last saved
+trusted cutoff by local monotonic progress, including after a host reboot
+when the database binding still matches. A first activation or a
+checkpoint without a matching cutoff requires one clock confirmation
+before time-based cleanup.
 
 The relay calls both on idle and active account turns, sharing one
 10-second deadline so the turn stays well inside the 30-second owner
@@ -7300,8 +7334,7 @@ milliseconds between failure and next attempt; recipient retry admission
 schema 42; the upgrade only widens constraints, so no existing row needs
 repair. The native serving fixture checks that no route-health CHECK
 keeps the old bound, and runs its profiles at 60 seconds, so its real
-restart guard, persisted retry deadline and clock confirmation take 60
-seconds rather than five minutes; fresh delivery and the route reset must
+restart guard and persisted retry floor take 60 seconds; fresh delivery and the route reset must
 finish within that hold, which the fixture asserts by elapsed time before
 it checks the earlier failure is still held.
 
@@ -7658,7 +7691,7 @@ Published slots are never replaced while the worker runs. One fresh database
 UTC sample initializes the shared queue-clock guard; historical receipt time
 and later account acquisition never reset it. Renewal timestamps do not feed
 that guard out of order. Existing restart/retry rules of the minimum retry
-interval and explicit expiry confirmation rules continue across the entire process.
+interval and expiry admission rules apply across the entire process.
 
 An explicit route-repair request remains pending until every configured account
 has been visited. An account without a repair hold completes a fresh observation;

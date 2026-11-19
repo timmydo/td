@@ -298,7 +298,7 @@ is bounded by expiry. If no eligible time precedes expiry, persist exactly
 expires_at as a nonterminal expiry-wait marker, preserving actual replies and
 uncertainty while retiring the active attempt. Dispatch requires both
 next_attempt_at <= now and now < expires_at, so that equality can never send,
-even after a backward clock change. Clock-confirmed expiry later makes the
+even after a backward clock change. Clock-guarded expiry later makes the
 terminal transition. The marker is not a retry that bypasses minimum delay.
 
 Route backoff uses the same bounds, shared across recipients; bad credentials
@@ -315,14 +315,13 @@ change these authoritative times.
 
 A UTC discontinuity exceeding five minutes, whatever F, relative to
 monotonic elapsed time pauses new dispatch and expiry before any more terminal transitions.
-At startup, any already-overdue pending submission is held for clock
-validation, not immediately expired. An administrator must confirm the UTC
-clock through a named queue clock-confirm operation after at least F of
-stable UTC/monotonic progress; until then health exposes the hold.
-This is deliberately conservative for a restart after a long outage: no
-durable row/format is added, and a restart repeats the validation if items
-remain overdue. Non-overdue items may dispatch after the normal restart guard.
-After confirmation, process at most one 100-recipient expiry batch per second,
+At startup terminal expiry waits for F of stable samples and continuity
+with a clean relay checkpoint (POSTGRES.md section 116). If the clock
+cannot be established across restarts, verify database UTC and request
+`queue-clock-confirm` after F. A detected discontinuity in a running
+relay needs the same explicit confirmation. Every new process observes F
+again before retrying attempted deliveries or publishing expiry.
+Process at most one 100-recipient expiry batch per monotonic second,
 yielding to interactive work; expiry is not one unbounded catch-up sweep.
 
 Manual retry may move an eligible pending recipient earlier only after the
@@ -369,7 +368,12 @@ update, including cancellation and failure-notice updates.
 Retain completed submission records and their blobs for at least 30 days
 after completion by default, whatever their recipients' outcomes; the relay
 then retires them, with their attempts and receipts (POSTGRES.md section
-216). Retired delivery attempts and their receipts of any submission are
+216). At the default limits, even promptly delivered mail can use an
+account's 1,000 submission slots or 256 MiB of distinct transmitted blobs
+within a rolling 30-day period. The first exhausted limit blocks new
+submissions until retirement releases capacity. Pending submissions and
+completed records awaiting cleanup also count.
+Retired delivery attempts and their receipts of any submission are
 reclaimed sooner, at a later attempt publication (POSTGRES.md section 218);
 each recipient keeps its own attempt count, replies and uncertainty. Failed
 and terminal OutcomeUnknown records retire once their failure notice is

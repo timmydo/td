@@ -236,18 +236,18 @@ fn exchange_queue(
             _ => b"IDLE\n",
         },
         b"CLOCK-CONFIRM\n" if queue.is_some() => {
-            if let Some(queue) = queue {
-                queue.request_confirmation();
-            }
-            b"REQUESTED\n"
-        }
-        b"CLOCK-STATUS\n" if queue.is_some() => {
-            if queue.is_some_and(|queue| queue.expiry_enabled()) {
-                b"CONFIRMED\n"
+            if queue.is_some_and(|queue| queue.request_confirmation()) {
+                b"REQUESTED\n"
             } else {
-                b"HELD\n"
+                b"REFUSED\n"
             }
         }
+        b"CLOCK-STATUS\n" if queue.is_some() => match queue.map(|q| q.clock_status()) {
+            Some("confirmed") => b"CONFIRMED\n",
+            Some("requested") => b"REQUESTED\n",
+            Some("refused") => b"REFUSED\n",
+            _ => b"HELD\n",
+        },
         b"STOP\n" => {
             control.user_stop();
             b"REQUESTED\n"

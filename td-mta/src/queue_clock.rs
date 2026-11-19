@@ -1,4 +1,9 @@
 //! Process-local queue clock validation; status is not transport authority.
+#[path = "queue_clock_control.rs"]
+mod control;
+pub(crate) use control::ClockControl;
+#[path = "queue_clock_evidence.rs"]
+pub(crate) mod evidence;
 use crate::ports::Time;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,9 +31,9 @@ pub(crate) fn admit_database(
 /// UTC/monotonic disagreement beyond this is a clock discontinuity, whatever
 /// the retry floor.
 const DISCONTINUITY_MS: u64 = 300_000;
-static NEXT_CONFIRMATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_VALIDATION: AtomicU64 = AtomicU64::new(1);
 
-fn next_confirmation(counter: &AtomicU64) -> Result<u64, Error> {
+fn next_validation(counter: &AtomicU64) -> Result<u64, Error> {
     let mut current = counter.load(Ordering::Relaxed);
     for _ in 0..32 {
         let next = current.checked_add(1).ok_or(Error::Invalid)?;
@@ -76,17 +81,39 @@ pub struct Status {
     pub fresh_dispatch: bool,
     pub retry: bool,
     pub expiry: bool,
+    /// Elapsed stable progress also admits cleanup during a dispatch hold.
+    pub retention: bool,
+}
+
+/// Database observation and the latest UTC that cleanup may use to age data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionTime {
+    pub(crate) observed: i64,
+    pub(crate) cutoff: i64,
+}
+
+impl From<i64> for RetentionTime {
+    fn from(observed: i64) -> Self {
+        Self {
+            observed,
+            cutoff: observed,
+        }
+    }
 }
 
 /// Feed database UTC paired with this runtime's one monotonic tick domain.
-/// Recreate at process startup; never persist or transfer its local ticks.
+/// A new guard holds expiry and age-based cleanup until trusted clock
+/// evidence is restored or an operator confirms. Its ticks stay local.
 pub struct Guard {
     floor: RetryFloor,
     anchor: Time,
+    range: Option<evidence::Range>,
+    retention_anchor: Option<Time>,
     last: Time,
     stable_since: u64,
     paused: bool,
-    confirmation: Option<u64>,
+    validation: u64,
+    pub(crate) control: Option<std::sync::Arc<ClockControl>>,
     invalid: bool,
     next_expiry: Option<u64>,
     expiry_epoch: u64,
@@ -95,7 +122,7 @@ pub struct Guard {
 /// One admitted expiry batch of at most 100 recipients. Keep this token until
 /// commit and validate it again before publication; it grants no SMTP authority.
 pub struct Expiry {
-    confirmation: u64,
+    validation: u64,
     expiry_epoch: u64,
     sample: Time,
     deadline: u64,
@@ -119,10 +146,13 @@ impl Guard {
         Ok(Self {
             floor,
             anchor: sample,
+            range: None,
+            retention_anchor: None,
             last: sample,
             stable_since: sample.monotonic.0,
             paused: false,
-            confirmation: None,
+            validation: next_validation(&NEXT_VALIDATION)?,
+            control: None,
             invalid: false,
             next_expiry: None,
             expiry_epoch: 0,
@@ -130,20 +160,32 @@ impl Guard {
     }
 
     fn hold(&mut self, sample: Time) {
+        if self.range.take().is_some() {
+            self.retention_anchor = Some(self.last);
+        }
+        if let Some(control) = &self.control {
+            control.hold();
+        }
         self.anchor = sample;
         self.stable_since = sample.monotonic.0;
         self.paused = true;
-        self.confirmation = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.invalid = true;
+        if let Some(control) = &self.control {
+            control.invalidate();
+        }
     }
 
     pub fn observe(&mut self, sample: Time) -> Result<Status, Error> {
         if self.invalid || sample.utc_ms < 0 || sample.monotonic < self.last.monotonic {
-            self.invalid = true;
+            self.invalidate();
             return Err(Error::Invalid);
         }
         if sample.utc_ms < self.last.utc_ms {
             self.expiry_epoch = self.expiry_epoch.checked_add(1).ok_or_else(|| {
-                self.invalid = true;
+                self.invalidate();
                 Error::Invalid
             })?;
         }
@@ -153,10 +195,20 @@ impl Guard {
             let monotonic_elapsed = i128::from(sample.monotonic.0) - i128::from(prior.monotonic.0);
             (utc_elapsed - monotonic_elapsed).abs() > i128::from(DISCONTINUITY_MS)
         });
-        if discontinuity {
+        let elapsed = sample.monotonic.0 - self.anchor.monotonic.0;
+        if discontinuity
+            || self
+                .range
+                .is_some_and(|range| !range.agrees(sample.utc_ms, elapsed))
+        {
             self.hold(sample);
         }
         self.last = sample;
+        if self.stable() {
+            if let Some(control) = &self.control {
+                control.stable(self.status().expiry);
+            }
+        }
         Ok(self.status())
     }
 
@@ -174,12 +226,23 @@ impl Guard {
         if !self.stable() {
             return Err(Error::Unstable);
         }
-        let confirmation = next_confirmation(&NEXT_CONFIRMATION).inspect_err(|_| {
-            self.invalid = true;
+        self.accept_confirmation(sample)?;
+        if let Some(control) = &self.control {
+            control.confirmed();
+        }
+        Ok(self.status())
+    }
+
+    fn accept_confirmation(&mut self, sample: Time) -> Result<(), Error> {
+        let validation = next_validation(&NEXT_VALIDATION).inspect_err(|_| {
+            self.invalidate();
         })?;
         self.paused = false;
-        self.confirmation = Some(confirmation);
-        Ok(self.status())
+        self.anchor = sample;
+        self.range = Some(evidence::Range::point(sample.utc_ms));
+        self.retention_anchor = Some(sample);
+        self.validation = validation;
+        Ok(())
     }
 
     /// Admit at most one expiry batch per monotonic second on this shared guard.
@@ -202,7 +265,7 @@ impl Guard {
             .ok_or(Error::Invalid)?;
         self.next_expiry = Some(next);
         Ok(Expiry {
-            confirmation: self.confirmation.ok_or(Error::Unstable)?,
+            validation: self.validation,
             expiry_epoch: self.expiry_epoch,
             sample,
             deadline,
@@ -210,7 +273,7 @@ impl Guard {
         })
     }
 
-    /// Fresh confirmation and this guard's original monotonic domain remain
+    /// The validation identity and this guard's original monotonic domain remain
     /// mandatory; elapsed deadlines, backward UTC or a new hold retire the token.
     pub fn validate_expiry(&mut self, value: &mut Expiry, sample: Time) -> Result<(), Error> {
         let status = match self.observe(sample) {
@@ -222,7 +285,7 @@ impl Guard {
         };
         if value.invalid
             || !status.expiry
-            || self.confirmation != Some(value.confirmation)
+            || self.validation != value.validation
             || self.expiry_epoch != value.expiry_epoch
             || sample.monotonic.0 >= value.deadline
             || sample.monotonic < value.sample.monotonic
@@ -234,6 +297,30 @@ impl Guard {
         Ok(())
     }
 
+    fn cleanup_cutoff(&self) -> Option<i64> {
+        if self.invalid {
+            return None;
+        }
+        let observed = self.last.utc_ms;
+        if self.range.is_some() {
+            return Some(observed);
+        }
+        let anchor = self.retention_anchor?;
+        // A forward UTC step cannot age data by the size of the step.
+        let elapsed = self.last.monotonic.0.checked_sub(anchor.monotonic.0)?;
+        Some(observed.min(anchor.utc_ms.saturating_add_unsigned(elapsed)))
+    }
+
+    pub(crate) fn retention_time(&self) -> Option<RetentionTime> {
+        if !self.stable() {
+            return None;
+        }
+        Some(RetentionTime {
+            observed: self.last.utc_ms,
+            cutoff: self.cleanup_cutoff()?,
+        })
+    }
+
     fn stable(&self) -> bool {
         self.last.monotonic.0.saturating_sub(self.stable_since) >= self.floor.millis()
     }
@@ -242,9 +329,41 @@ impl Guard {
         Status {
             fresh_dispatch: !self.paused,
             retry: !self.paused && self.stable(),
-            expiry: !self.paused && self.confirmation.is_some(),
+            expiry: self.range.is_some() && !self.paused && self.stable(),
+            retention: self.retention_anchor.is_some() && self.stable(),
         }
     }
+}
+
+/// The foreground scheduler accepts the requested sample under the guard.
+/// The durable write may outlive its validation; it only saves a cleanup cutoff.
+pub(crate) fn observe_request(
+    guard: &std::sync::Mutex<Guard>,
+    sample: Time,
+    save: impl FnOnce(i64) -> Result<(), Error>,
+) -> Result<(Status, Option<RetentionTime>), Error> {
+    {
+        let mut clock = guard.lock().map_err(|_| Error::Invalid)?;
+        let status = clock.observe(sample)?;
+        if !clock
+            .control
+            .as_ref()
+            .is_some_and(|control| control.begin_save())
+        {
+            return Ok((status, clock.retention_time()));
+        }
+        clock.accept_confirmation(sample)?;
+    }
+    let saved = save(sample.utc_ms);
+    let mut clock = guard.lock().map_err(|_| Error::Invalid)?;
+    saved.inspect_err(|_| clock.invalidate())?;
+    if clock.invalid {
+        return Err(Error::Invalid);
+    }
+    if let Some(control) = &clock.control {
+        control.saved();
+    }
+    Ok((clock.status(), clock.retention_time()))
 }
 
 #[cfg(test)]
@@ -263,25 +382,27 @@ mod tests {
         fresh_dispatch: true,
         retry: false,
         expiry: false,
+        retention: false,
     };
     const RETRY: Status = Status {
-        fresh_dispatch: true,
         retry: true,
-        expiry: false,
+        ..FRESH
     };
     const READY: Status = Status {
         fresh_dispatch: true,
         retry: true,
         expiry: true,
+        retention: true,
     };
     const HELD: Status = Status {
         fresh_dispatch: false,
         retry: false,
         expiry: false,
+        retention: false,
     };
 
     #[test]
-    fn startup_retry_interval_and_expiry_confirmation_are_separate() {
+    fn stable_startup_without_clock_evidence_admits_only_dispatch_and_retry() {
         let mut guard = Guard::new(time(1_000_000, 700)).unwrap();
         assert_eq!(guard.observe(time(1_000_000, 700)), Ok(FRESH));
         assert_eq!(
@@ -297,6 +418,58 @@ mod tests {
     }
 
     #[test]
+    fn control_never_takes_the_smtp_guard_and_a_slow_save_preserves_newer_requests() {
+        use std::sync::{Arc, Mutex};
+        let control = Arc::new(ClockControl::default());
+        let mut clock = Guard::new(time(0, 0)).unwrap();
+        clock.control = Some(control.clone());
+        let guard = Mutex::new(clock);
+        {
+            let mut smtp = guard.try_lock().unwrap();
+            assert!(!control.request());
+            smtp.observe(time(300_000, 300_000)).unwrap();
+            assert!(control.request());
+            assert_eq!(control.status(), "requested");
+        }
+        // This query began before the request and cannot fulfill it.
+        let mut saved = false;
+        let (status, _) = observe_request(&guard, time(300_001, 300_001), |_| {
+            saved = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!saved && !status.expiry);
+        control.start_sample();
+        let (status, _) = observe_request(&guard, time(300_002, 300_002), |_| {
+            let mut smtp = guard.try_lock().unwrap();
+            assert_eq!(control.status(), "requested");
+            assert!(control.request());
+            smtp.observe(time(1_000_000, 300_003)).unwrap();
+            assert_eq!(control.status(), "held");
+            smtp.observe(time(1_300_000, 600_003)).unwrap();
+            assert!(control.request()); // A newer request survives the old save.
+            Ok(())
+        })
+        .unwrap();
+        assert!(!status.expiry);
+        assert_eq!(control.status(), "requested");
+        control.start_sample();
+        let (status, _) = observe_request(&guard, time(1_300_001, 600_004), |_| {
+            guard
+                .try_lock()
+                .unwrap()
+                .observe(time(1_300_003, 600_006))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(status.expiry);
+        let clock = guard.lock().unwrap();
+        assert_eq!(clock.anchor, time(1_300_001, 600_004));
+        assert_eq!(clock.last, time(1_300_003, 600_006));
+        assert_eq!(control.status(), "confirmed");
+    }
+
+    #[test]
     fn both_clock_jump_directions_hold_until_fresh_explicit_confirmation() {
         for jump in [-300_001, 300_001] {
             let mut guard = Guard::new(time(1_000_000, 0)).unwrap();
@@ -307,7 +480,13 @@ mod tests {
                 guard.confirm(time(shifted + 299_999, 600_000)),
                 Err(Error::Unstable)
             );
-            assert_eq!(guard.observe(time(shifted + 300_000, 600_001)), Ok(HELD));
+            assert_eq!(
+                guard.observe(time(shifted + 300_000, 600_001)),
+                Ok(Status {
+                    retention: true,
+                    ..HELD
+                })
+            );
             assert_eq!(guard.confirm(time(shifted + 300_000, 600_001)), Ok(READY));
         }
     }
@@ -344,6 +523,26 @@ mod tests {
         assert_eq!(guard.observe(time(1_660_001, 60_001)), Ok(HELD));
         assert_eq!(guard.confirm(time(1_660_001, 60_001)), Err(Error::Unstable));
         assert_eq!(guard.confirm(time(1_660_002, 60_002)), Ok(READY));
+    }
+
+    #[test]
+    fn cleanup_progress_during_a_hold_excludes_forward_steps() {
+        let mut guard = Guard::new(time(1_000_000, 0)).unwrap();
+        guard.confirm(time(1_300_000, 300_000)).unwrap();
+        guard.observe(time(9_000_000, 300_001)).unwrap();
+        assert_eq!(guard.retention_time(), None);
+        guard.observe(time(19_000_000, 300_002)).unwrap();
+        let status = guard.observe(time(19_300_000, 600_002)).unwrap();
+        assert!(!status.retry && !status.expiry && status.retention);
+        assert_eq!(
+            guard.retention_time(),
+            Some(RetentionTime {
+                observed: 19_300_000,
+                cutoff: 1_600_002,
+            })
+        );
+        guard.confirm(time(19_300_000, 600_002)).unwrap();
+        assert_eq!(guard.retention_time(), Some(19_300_000.into()));
     }
 
     #[test]
@@ -399,8 +598,12 @@ mod tests {
         );
     }
     #[test]
-    fn expiry_admission_requires_confirmation_and_spaces_whole_batches() {
+    fn expiry_admission_requires_stability_and_spaces_whole_batches() {
         let mut guard = Guard::new(time(1_000_000, 0)).unwrap();
+        assert!(matches!(
+            guard.admit_expiry(time(1_299_999, 299_999)),
+            Err(Error::Unstable)
+        ));
         assert!(matches!(
             guard.admit_expiry(time(1_300_000, 300_000)),
             Err(Error::Unstable)
@@ -519,8 +722,8 @@ mod tests {
     #[test]
     fn expiry_identity_and_regression_counters_refuse_exhaustion() {
         let counter = AtomicU64::new(u64::MAX - 1);
-        assert_eq!(next_confirmation(&counter), Ok(u64::MAX - 1));
-        assert_eq!(next_confirmation(&counter), Err(Error::Invalid));
+        assert_eq!(next_validation(&counter), Ok(u64::MAX - 1));
+        assert_eq!(next_validation(&counter), Err(Error::Invalid));
         let mut guard = Guard::new(time(1_000_000, 0)).unwrap();
         guard.expiry_epoch = u64::MAX;
         assert_eq!(guard.observe(time(999_999, 1)), Err(Error::Invalid));

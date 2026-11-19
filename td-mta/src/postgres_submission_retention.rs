@@ -4,6 +4,7 @@ use crate::{
     postgres_probe::{self, Request},
     postgres_publication as publication,
     postgres_route_owners::{self as owners, Claim},
+    queue_clock::RetentionTime,
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
@@ -45,7 +46,7 @@ pub fn retire(
     deadline: Instant,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: impl Into<RetentionTime>,
 ) -> Result<u64, Error> {
     run(
         Step::Retire,
@@ -54,7 +55,7 @@ pub fn retire(
         deadline,
         claim,
         generation,
-        stable_at,
+        stable_at.into(),
     )
 }
 
@@ -69,7 +70,7 @@ pub fn reclaim_uploads(
     deadline: Instant,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: impl Into<RetentionTime>,
 ) -> Result<u64, Error> {
     run(
         Step::UploadLeases,
@@ -78,7 +79,7 @@ pub fn reclaim_uploads(
         deadline,
         claim,
         generation,
-        stable_at,
+        stable_at.into(),
     )
 }
 
@@ -90,7 +91,7 @@ pub fn reclaim_account(
     deadline: Instant,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: impl Into<RetentionTime>,
 ) -> Result<u64, Error> {
     run(
         Step::AccountResources,
@@ -99,7 +100,7 @@ pub fn reclaim_account(
         deadline,
         claim,
         generation,
-        stable_at,
+        stable_at.into(),
     )
 }
 
@@ -117,7 +118,7 @@ fn run(
     deadline: Instant,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: RetentionTime,
 ) -> Result<u64, Error> {
     let claim = claim.clone();
     postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
@@ -145,7 +146,7 @@ async fn lock(
     client: &Client,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: RetentionTime,
 ) -> Result<i64, Error> {
     if !owners::begin(client, claim, true, true)
         .await
@@ -156,17 +157,17 @@ async fn lock(
     let now = owners::check_locked(client, claim, generation)
         .await
         .map_err(Error::Owner)?;
-    if now.abs_diff(stable_at) > CLOCK_SLACK_MS.unsigned_abs() {
+    if now.abs_diff(stable_at.observed) > CLOCK_SLACK_MS.unsigned_abs() {
         return Err(Error::Clock);
     }
-    Ok(now)
+    Ok(now.min(stable_at.cutoff))
 }
 
 async fn reclaim_locked(
     client: &Client,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: RetentionTime,
 ) -> Result<(u64, u64), Error> {
     let now = lock(client, claim, generation, stable_at).await?;
     let account = claim.binding().account();
@@ -216,7 +217,7 @@ async fn retire_locked(
     client: &Client,
     claim: &Claim,
     generation: u64,
-    stable_at: i64,
+    stable_at: RetentionTime,
 ) -> Result<u64, Error> {
     let now = lock(client, claim, generation, stable_at).await?;
     let cutoff = now.checked_sub(RETENTION_MS).ok_or(Error::Integrity)?;

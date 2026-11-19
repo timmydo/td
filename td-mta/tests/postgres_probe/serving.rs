@@ -103,6 +103,20 @@ pub(super) fn exercise(
     );
     drop((smtp, https, https_ipv4));
     let (mut cloud, cloud_runtime) = start("cloud");
+    let clock_command = |operation: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args([operation, "--runtime"])
+            .arg(&cloud_runtime)
+            .output()
+            .unwrap();
+        let result = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            output.status.success(),
+            !(operation == "queue-clock-confirm" && result.contains("refused")),
+            "{result}"
+        );
+        result
+    };
     let (mut desktop, desktop_runtime) = start("desktop");
     let mut smtp = BufReader::new(TcpStream::connect(smtp_address).unwrap());
     smtp.get_mut()
@@ -418,6 +432,20 @@ pub(super) fn exercise(
         let reply = post(&td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/set",{"accountId":account_wire,"update":{id:{"undoStatus":"canceled"}}},"cancel"]]}).to_string());
         (reply, id.to_owned())
     };
+    // The first relay has no trusted history yet. Establish a baseline
+    // before queuing mail. Its next same-boot restart must reuse it.
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if clock_command("queue-clock-confirm").contains("requested") {
+            break;
+        }
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    while !clock_command("queue-clock-status").contains("confirmed") {
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let first = enqueue();
     let wait = |query: &str, expected: &str, seconds: u64| {
         let end = std::time::Instant::now() + Duration::from_secs(seconds);
@@ -486,6 +514,9 @@ pub(super) fn exercise(
     let held_from = std::time::Instant::now();
     let restarted = start("cloud");
     cloud = restarted.0;
+    // A local publication failure must leave Pending without partial mail.
+    sql(fixture, "CREATE SEQUENCE public.notice_attempts; CREATE FUNCTION public.refuse_notice() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$ BEGIN PERFORM nextval('public.notice_attempts'); RAISE EXCEPTION 'fixture storage refusal'; END $$; CREATE TRIGGER refuse_notice BEFORE INSERT ON td_mta.emails FOR EACH ROW WHEN (NEW.origin=4) EXECUTE FUNCTION public.refuse_notice()");
+    assert!(clock_command("queue-clock-confirm").contains("refused"));
     wait(
         "SELECT count(*) FROM td_mta.recipients WHERE state=4",
         "1",
@@ -510,19 +541,6 @@ pub(super) fn exercise(
         150,
     );
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 2);
-    let clock_command = |operation: &str| {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args([operation, "--runtime"])
-            .arg(&cloud_runtime)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        String::from_utf8(output.stdout).unwrap()
-    };
-    // A local publication failure must leave Pending without partial mail.
-    sql(fixture, "CREATE SEQUENCE public.notice_attempts; CREATE FUNCTION public.refuse_notice() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$ BEGIN PERFORM nextval('public.notice_attempts'); RAISE EXCEPTION 'fixture storage refusal'; END $$; CREATE TRIGGER refuse_notice BEFORE INSERT ON td_mta.emails FOR EACH ROW WHEN (NEW.origin=4) EXECUTE FUNCTION public.refuse_notice()");
-    assert!(clock_command("queue-clock-status").contains("held"));
-    assert!(clock_command("queue-clock-confirm").contains("requested"));
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while !clock_command("queue-clock-status").contains("confirmed") {
         assert!(std::time::Instant::now() < end);

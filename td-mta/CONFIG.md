@@ -1852,16 +1852,16 @@ operations, and a serving process notices within about 30 seconds and drains
 and reloads itself, with a brief listener gap. If it cannot serve the new
 configuration, or the database is unreachable just then, the process exits.
 
-`queue-clock-status --runtime PATH` reports `held` or `confirmed` for relay
-expiry. `queue-clock-confirm --runtime PATH` requests clock confirmation on
-that process through its private control socket. The acknowledgment is
-`requested`, not completion: check status afterward. Confirmation before
-the process's minimum retry interval (five minutes unless `serve
---minimum-retry-seconds` shortens it) of stable database UTC/monotonic
-progress is refused; submit
-again afterward. A restart, reload or clock discontinuity restores the hold. This
-operation permits bounded overdue expiry under QUEUE.md; it does not move
-retry deadlines earlier.
+`queue-clock-status --runtime PATH` reports `held` during startup. A
+clean restart with matching clock evidence reports `confirmed` after the
+minimum retry interval of stable database UTC/monotonic progress. First
+activation, a missing checkpoint, a crash, or an ambiguous clock requires
+the operator to verify database UTC and use `queue-clock-confirm --runtime
+PATH`. Preserve the relay's private runtime directory between service
+restarts. POSTGRES.md section 116 specifies the clock evidence. A request before a stable interval
+returns `refused`. An admitted request reports `requested` until the
+worker samples database UTC again. Check clock status for its outcome.
+The interval defaults to five minutes and follows `--minimum-retry-seconds`.
 
 `queue-route-repair --runtime PATH` explicitly requests release of a TLS or
 authentication pause after selecting a newer repaired configuration and

@@ -465,13 +465,16 @@ Run these commands as the relay service identity against its runtime path:
 /opt/td-mta/bin/td-mta queue-route-repair --runtime /run/td-mta-relay
 ```
 
-Clock status reports `held` or `confirmed`. Confirmation is eligible only
-after the minimum retry interval of stable database UTC/monotonic progress:
-five minutes unless `serve --minimum-retry-seconds` shortens it. Its immediate
-`requested` result acknowledges the request; inspect status afterward and
-request again if it was too early. Restart or clock discontinuity restores
-the hold. Confirmation permits bounded overdue expiry; it does not move
-retry deadlines earlier.
+The installed services keep the relay's `queue-clock` checkpoint in
+`STATE/PROFILE/runtime`. Custom service managers must retain that
+directory across stops to resume unattended expiry. After a clean
+same-boot restart with clock continuity, expiry opens after the minimum
+retry interval (five minutes by default) and status reports `confirmed`.
+On first activation, following a crash, or after ambiguous downtime or a
+clock jump, verify database UTC and run `queue-clock-confirm` after the
+stable interval. An early request
+returns `refused`. For a `requested` response, check status again for
+`confirmed` or `refused`. Retry a refused request after stable progress.
 
 For a route paused by TLS or authentication failure, publish a newer repaired
 configuration, restart the relay with that selection, then request route

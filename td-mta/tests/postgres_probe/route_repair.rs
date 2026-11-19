@@ -167,7 +167,7 @@ pub(super) fn exercise(
         ),
         "1"
     );
-    let now = sql(
+    let now: i64 = sql(
         fixture,
         "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
     )

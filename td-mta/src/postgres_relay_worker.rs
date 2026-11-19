@@ -14,7 +14,7 @@ use crate::{
     postgres_relay_data::Retained,
     postgres_route_owners as owners,
     postgres_runtime_profile::PublishedProfile,
-    queue_clock::Guard,
+    queue_clock::{evidence::Journal, ClockControl, RetentionTime},
     smtp_receiving::Control,
     tls_admission::HandshakePool,
     tls_io::TLS_WIRE_BYTES,
@@ -123,10 +123,9 @@ fn next_retention(
 /// is stable; decided once, so the idle reader closes exactly when it runs.
 fn retention_due(
     state: &multi::AccountState,
-    status: crate::queue_clock::Status,
-    observed_at: i64,
-) -> Option<i64> {
-    (status.retry && Instant::now() >= state.retention_at).then_some(observed_at)
+    time: Option<RetentionTime>,
+) -> Option<RetentionTime> {
+    time.filter(|_| Instant::now() >= state.retention_at)
 }
 fn pause(control: &Control, duration: Duration) {
     let end = Instant::now() + duration;
@@ -139,13 +138,15 @@ fn pause(control: &Control, duration: Duration) {
 /// worker's minimum retry interval.
 #[derive(Default)]
 pub struct QueueControl {
-    confirm: AtomicBool,
-    confirmed: AtomicBool,
+    clock: Arc<ClockControl>,
     repair: AtomicU64,
 }
 impl QueueControl {
-    pub fn request_confirmation(&self) {
-        self.confirm.store(true, Ordering::Release);
+    pub fn request_confirmation(&self) -> bool {
+        self.clock.request()
+    }
+    pub fn clock_status(&self) -> &'static str {
+        self.clock.status()
     }
     pub fn request_repair(&self) {
         let mut current = self.repair.load(Ordering::Acquire);
@@ -187,9 +188,6 @@ impl QueueControl {
             _ => "idle",
         }
     }
-    pub fn expiry_enabled(&self) -> bool {
-        self.confirmed.load(Ordering::Acquire)
-    }
 }
 pub struct Worker<'a, 'r> {
     pub queue: &'a QueueControl,
@@ -200,6 +198,8 @@ pub struct Worker<'a, 'r> {
     pub handshakes: &'a HandshakePool,
     pub maximum: u64,
     pub retry_floor: crate::queue_clock::RetryFloor,
+    /// Private runtime directory locked by the serving control endpoint.
+    pub runtime: &'a str,
 }
 impl Worker<'_, '_> {
     pub fn run(&self, control: &Control, ready: &AtomicBool) -> Result<(), Error> {
@@ -211,6 +211,7 @@ impl Worker<'_, '_> {
         worker: &Dispatches<'_, '_>,
         settlement: &ReadSlots,
         source_slots: &ReadSlots,
+        journal: &Journal<'_>,
         claim: &owners::Claim,
         generation: u64,
         control: &Control,
@@ -220,6 +221,7 @@ impl Worker<'_, '_> {
         mut expiry_turn: Option<&mut multi::ExpiryTurn>,
         mut buffers: Buffers,
     ) -> Result<Buffers, Error> {
+        self.queue.clock.start_sample();
         state.empty = false;
         state.active = database(worker.pending.identity())?.is_some();
         if state.active || self.queue.repair_request().is_some() {
@@ -249,9 +251,9 @@ impl Worker<'_, '_> {
             };
             if let Some(observed_at) = observed {
                 state.empty = true;
-                let status = self.observe_queue_clock(worker, observed_at)?;
+                let (_, time) = self.observe_queue_clock(worker, journal, observed_at)?;
                 // Quiet accounts reclaim too; the reader stays open otherwise.
-                let due = retention_due(state, status, observed_at);
+                let due = retention_due(state, time);
                 if due.is_some() {
                     idle_reader.close();
                 }
@@ -343,8 +345,8 @@ impl Worker<'_, '_> {
             &mut meter(cap),
         ))?;
         state.active |= !expiry.candidates.is_empty();
-        let status = self.observe_queue_clock(worker, expiry.observed_at)?;
-        let due = retention_due(state, status, expiry.observed_at);
+        let (status, time) = self.observe_queue_clock(worker, journal, expiry.observed_at)?;
+        let due = retention_due(state, time);
         self.retain(worker, claim, generation, control, state, due)?;
         if let Some(turn) = expiry_turn {
             let mut limited = false;
@@ -481,7 +483,7 @@ impl Worker<'_, '_> {
         generation: u64,
         control: &Control,
         state: &mut multi::AccountState,
-        stable_at: Option<i64>,
+        stable_at: Option<RetentionTime>,
     ) -> Result<(), Error> {
         let Some(observed_at) = stable_at else {
             return Ok(());
@@ -545,21 +547,15 @@ impl Worker<'_, '_> {
     fn observe_queue_clock(
         &self,
         worker: &Dispatches<'_, '_>,
+        journal: &Journal<'_>,
         observed_at: i64,
-    ) -> Result<crate::queue_clock::Status, Error> {
+    ) -> Result<(crate::queue_clock::Status, Option<RetentionTime>), Error> {
         let sample = Time {
             utc_ms: observed_at,
             monotonic: self.clock.sample()?.monotonic,
         };
-        let status = {
-            let mut guard = worker.guard.lock().map_err(|_| Error::Custody)?;
-            if self.queue.confirm.swap(false, Ordering::AcqRel) {
-                let _ = guard.confirm(sample);
-            }
-            guard.observe(sample).map_err(|_| Error::Custody)?
-        };
-        self.queue.confirmed.store(status.expiry, Ordering::Release);
-        Ok(status)
+        crate::queue_clock::observe_request(&worker.guard, sample, |utc| journal.confirmed(utc))
+            .map_err(|_| Error::Custody)
     }
     fn success(
         &self,
@@ -905,6 +901,43 @@ fn health(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn early_confirmations_are_reported_and_do_not_release_later_holds() {
+        let queue = QueueControl::default();
+        let time = |utc_ms, ms| Time {
+            utc_ms,
+            monotonic: ports::Tick(ms),
+        };
+        let mut guard = crate::queue_clock::Guard::new(time(0, 0)).unwrap();
+        guard.control = Some(Arc::clone(&queue.clock));
+        let guard = Mutex::new(guard);
+        assert!(!queue.request_confirmation());
+        assert_eq!(queue.clock_status(), "refused");
+        guard
+            .lock()
+            .unwrap()
+            .observe(time(300_000, 300_000))
+            .unwrap();
+        assert_eq!(queue.clock_status(), "refused");
+        assert!(queue.request_confirmation());
+        queue.clock.start_sample();
+        crate::queue_clock::observe_request(&guard, time(300_000, 300_000), |_| Ok(())).unwrap();
+        assert_eq!(queue.clock_status(), "confirmed");
+        assert!(queue.request_confirmation());
+        // A separate dispatch observation sees the jump before the next poll.
+        guard
+            .lock()
+            .unwrap()
+            .observe(time(900_000, 300_001))
+            .unwrap();
+        assert!(!queue.request_confirmation());
+        crate::queue_clock::observe_request(&guard, time(1_200_000, 600_001), |_| Ok(())).unwrap();
+        assert_eq!(queue.clock_status(), "refused");
+        assert!(queue.request_confirmation());
+        queue.clock.start_sample();
+        crate::queue_clock::observe_request(&guard, time(1_200_001, 600_002), |_| Ok(())).unwrap();
+        assert_eq!(queue.clock_status(), "confirmed");
+    }
     #[test]
     fn retention_steps_alternate_and_a_skipped_step_leads_the_next_round() {
         use RetentionStep::{Retire, Uploads};

@@ -265,6 +265,15 @@ pub(super) fn run(
     control: &Control,
     ready: &AtomicBool,
 ) -> Result<(), Error> {
+    let mut path = [0; crate::store_fs::MAX_PATH_BYTES];
+    let mut path = crate::bounded::TextBuffer::new(&mut path);
+    database(path.format(format_args!("{}/queue-clock", worker.runtime)))?;
+    let journal = database(crate::queue_clock::evidence::Journal::begin(
+        std::path::Path::new(database(path.as_str())?),
+        worker.request,
+        worker.profile.binding().epoch(),
+        worker.profile.binding().profile(),
+    ))?;
     let mut bytes = [0; 16];
     database(SystemEntropy::try_new())?
         .fill(&mut bytes)
@@ -321,13 +330,9 @@ pub(super) fn run(
             pause(control, Duration::from_millis(250));
         }
     };
-    let guard = Arc::new(Mutex::new(database(Guard::with_retry_floor(
-        Time {
-            utc_ms: observed,
-            monotonic: worker.clock.sample()?.monotonic,
-        },
-        worker.retry_floor,
-    ))?));
+    let mut guard = database(journal.start(observed, worker.clock.as_ref(), worker.retry_floor))?;
+    guard.control = Some(Arc::clone(&worker.queue.clock));
+    let guard = Arc::new(Mutex::new(guard));
     let slots = database(ReadSlots::new(2))?;
     let settlement = database(ReadSlots::new(1))?;
     let source_slots = database(ReadSlots::new(2))?;
@@ -378,6 +383,7 @@ pub(super) fn run(
                         &dispatch,
                         &settlement,
                         &source_slots,
+                        &journal,
                         &claim,
                         grant.generation,
                         control,
@@ -414,7 +420,7 @@ pub(super) fn run(
                         let end = Instant::now() + duration;
                         while !control.stop_requested()
                             && worker.queue.repair_request().is_none()
-                            && !worker.queue.confirm.load(Ordering::Acquire)
+                            && worker.queue.clock_status() != "requested"
                             && Instant::now() < end
                         {
                             if idle_reader
@@ -448,7 +454,8 @@ pub(super) fn run(
         worker.trust,
         Instant::now() + Duration::from_secs(10),
         &leases,
-    )))
+    )))?;
+    database(journal.finish(&dispatch.guard, worker.clock.as_ref()))
 }
 
 fn leases(
@@ -469,6 +476,7 @@ fn leases(
 mod tests {
     use super::*;
     use crate::ports::Tick;
+    use crate::queue_clock::Guard;
 
     #[test]
     fn empty_rounds_bound_scan_rate_and_activity_restores_prompt_polling() {

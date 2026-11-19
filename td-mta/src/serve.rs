@@ -631,6 +631,7 @@ fn run_once(
                         handshakes: &handshakes,
                         maximum: limits.message_bytes as u64,
                         retry_floor: options.retry_floor,
+                        runtime: runtime_path,
                     };
                     Some(
                         std::thread::Builder::new()
