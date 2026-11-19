@@ -382,8 +382,7 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
             match place.repositories {
                 None => format!(
                     "- Workspace: {}, {what}. It is the working directory: shell runs there unless told otherwise, and glob and grep search there by default.\n\
-                     - Shared directories: {shared}.\n\
-                     - Git: none. The workspace is not a git repository, and this conversation has no git tools; do not guess at branches or repository state.",
+                     - Shared directories: {shared}.",
                     shown(place.directory)
                 ),
                 Some(repositories) => {
@@ -599,6 +598,12 @@ mod tests {
             assert!(block.contains(line), "{line}: {block}");
         }
         assert!(!block.contains("Git: none"), "{block}");
+        let unmanaged = Place {
+            repositories: None,
+            ..place
+        };
+        let ordinary = environment(0, "td", Some(&unmanaged));
+        assert!(!ordinary.lines().any(|line| line.starts_with("- Git:")));
         // Only an unconfined workspace's says it has no jail (DESIGN.md §8).
         assert!(!block.contains("Confinement:"), "{block}");
         let loose = Place {

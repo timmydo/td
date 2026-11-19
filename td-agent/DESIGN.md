@@ -7338,8 +7338,8 @@ the whole conversation:
   repository, branch or shell, and that the model is not to guess at
   them but to ask for what it needs; or, in a workspace, its directory,
   which is the working directory, whether td-agent made it or it is the
-  person's, the shared directories, each read-only or read-write, and
-  that there is no git.
+  person's, and the shared directories, each read-only or read-write.
+  Git details are included for worktrees managed by td-agent.
 
 A workspace conversation's static text has its
 own paragraph where the others say they cannot read or change files
