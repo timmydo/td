@@ -298,7 +298,7 @@ struct Slot<'s, 'cfg, 'spf, B: Storage + 's> {
     final_reply: bool,
     spf_ticket: Option<crate::smtp_spf::Ticket<'spf>>,
     spf_result: Option<crate::spf::Outcome>,
-    dkim_report: Option<crate::dkim::Report>,
+    authentication: Option<dkim_worker::MessageAuthentication>,
     data_timing: Option<crate::performance::Timer>,
     commit_wait: Option<crate::performance::Timer>,
 }
@@ -325,7 +325,7 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
         self.final_reply = false;
         self.spf_ticket = None;
         self.spf_result = None;
-        self.dkim_report = None;
+        self.authentication = None;
     }
 }
 
@@ -505,7 +505,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 final_reply: false,
                 spf_ticket: None,
                 spf_result: None,
-                dkim_report: None,
+                authentication: None,
                 data_timing: None,
                 commit_wait: None,
             }));
@@ -541,7 +541,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     .name(name)
                     .stack_size(dkim_worker::STACK_BYTES)
                     .spawn_scoped(scope, || {
-                        self.verify_dkim(&slots, &finished, &main, control, resolvers)
+                        self.verify_message(&slots, &finished, &main, control, resolvers)
                     })
                     .ok()
             });
@@ -647,12 +647,13 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             slot.phase = Phase::Network;
                         }
                         if let Phase::AwaitAuthentication { until } = slot.phase {
-                            let result = match spf {
+                            let result = slot.spf_result.or_else(|| match spf {
                                 Some(service) => service.poll(index, slot.spf_ticket.as_ref()),
                                 None => Some(crate::spf::Outcome::Temperror),
-                            };
+                            });
+                            slot.spf_result = result;
                             if now < until && stopping.is_none() {
-                                if slot.dkim_report.is_none() && dkim_thread.is_some() {
+                                if slot.authentication.is_none() && dkim_thread.is_some() {
                                     wake_dkim = true;
                                     continue;
                                 }
@@ -660,8 +661,9 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     continue;
                                 }
                             }
-                            slot.dkim_report
-                                .get_or_insert_with(crate::dkim::Report::unavailable);
+                            slot.authentication.get_or_insert_with(
+                                dkim_worker::MessageAuthentication::unavailable,
+                            );
                             slot.freeze_spf(result);
                             slot.phase = Phase::Network;
                         }
@@ -697,7 +699,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                             )
                                         });
                                         slot.spf_result = None;
-                                        slot.dkim_report = None;
+                                        slot.authentication = None;
                                     }
                                     let connection = slot.connection()?;
                                     let network = connection.network_mut()?;
@@ -959,10 +961,11 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             // Keep the full original commit budget, including on nearly expired DATA.
             let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds);
             if until > now && !control.stop_requested() && (dkim_available || result.is_none()) {
+                slot.spf_result = result;
                 slot.phase = Phase::AwaitAuthentication { until };
                 return Ok(());
             }
-            slot.dkim_report = Some(crate::dkim::Report::unavailable());
+            slot.authentication = Some(dkim_worker::MessageAuthentication::unavailable());
             slot.freeze_spf(result);
         }
         let deadline = after(now, seconds)?.min(transport_deadline);
@@ -1143,9 +1146,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     crate::performance::Timer::start(crate::performance::Phase::SmtpCommit);
                 let job = slot.delivery.as_mut().ok_or(Error::Conflict)?;
                 if !prepared {
-                    if let Err(error) =
-                        job.prepare_with_auth(cap, slot.spf_result, slot.dkim_report.take())
-                    {
+                    let authentication = slot.authentication.take().ok_or(Error::Conflict)?;
+                    let spf = slot.spf_result.ok_or(Error::Conflict)?;
+                    if let Err(error) = job.prepare_with_dmarc(
+                        cap,
+                        Some(spf),
+                        Some(authentication.dkim),
+                        Some(authentication.dmarc.finish(spf)),
+                    ) {
                         return self.delivery_refused(slot, work, error, control);
                     }
                 }

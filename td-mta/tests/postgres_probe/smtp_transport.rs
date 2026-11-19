@@ -138,6 +138,15 @@ impl<J: Job> Job for ObservedJob<J> {
     ) -> Result<(), smtp_storage::Failure> {
         self.inner.prepare_with_auth(deadline, spf, dkim)
     }
+    fn prepare_with_dmarc(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<td_mta::spf::Outcome>,
+        dkim: Option<td_mta::dkim::Report>,
+        dmarc: Option<td_mta::dmarc::Report>,
+    ) -> Result<(), smtp_storage::Failure> {
+        self.inner.prepare_with_dmarc(deadline, spf, dkim, dmarc)
+    }
     fn commit(&mut self) -> Result<smtp_storage::Completion, smtp_storage::Failure> {
         if self.gated {
             self.probe.state.lock().unwrap().entered = true;
@@ -575,6 +584,7 @@ pub(super) fn exercise(
                 let trace = sql(fixture, "SELECT split_part(split_part(encode(substring(bytes FROM 1 FOR 8192),'escape'), E'\\r\\nReceived: ', 1), 'X-TD-DKIM-Results: ', 2) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('football.example.com','UTF8') in bytes)>0");
                 assert!(trace.starts_with("incomplete;"), "{trace}");
                 assert!(!trace.contains("result=pass"));
+                assert!(trace.contains("\r\nX-TD-DMARC-Result: temperror;"), "{trace}");
                 // A new session from the address is greeted, then refused at MAIL.
                 let greeted = Instant::now() + Duration::from_secs(20);
                 let mut again = loop {

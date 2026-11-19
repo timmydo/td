@@ -321,7 +321,8 @@ impl Limits {
                 count: self.smtp_sessions,
                 bytes_each: sum(
                     "smtp slot",
-                    &[self.header_bytes, recipient_bytes, 64 * KIB, 16 * KIB],
+                    // One KiB retains the author and policy domains through commit.
+                    &[self.header_bytes, recipient_bytes, 64 * KIB, 16 * KIB, KIB],
                 )?,
             },
             Reservation {
@@ -388,7 +389,7 @@ impl Limits {
                 bytes_each: crate::smtp_spf::STACK_BYTES + MIB,
             },
             Reservation {
-                name: "direct DKIM worker and scratch",
+                name: "direct DKIM and DMARC worker and scratch",
                 count: 1,
                 bytes_each: crate::smtp_receiving::DKIM_STACK_BYTES + 3 * MIB,
             },
@@ -497,7 +498,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 442_156_288);
+        assert_eq!(plan.total_bytes(), 442_164_480);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -575,7 +576,7 @@ mod tests {
                     smtp_sessions: 9,
                     ..defaults
                 },
-                376_064 + 512 * KIB,
+                377_088 + 512 * KIB,
             ),
             (
                 Limits {

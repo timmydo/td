@@ -1100,10 +1100,14 @@ the signing domain and covers the selected header fields. When a signature
 includes an `l=` tag, it covers only that many canonicalized body bytes. Signatures
 using RSA-SHA256 with 1,024 through 4,096-bit keys and Ed25519-SHA256 are
 eligible. The local result records the algorithm and actual key size.
-A signing domain can differ from the visible From domain. DMARC alignment
-is a separate check planned in IMPLEMENTATION.md F02. Section 46 of
-POSTGRES.md describes how to inspect local observations. All DKIM outcomes
-use the same recipient, quota and delivery policy.
+Direct MX evaluates DMARC against the original From field and the receiver's
+own SPF and DKIM observations. A passing result requires alignment of an
+authenticated identifier with the author domain under the published policy.
+RFC 9989 DNS tree walks discover inherited policies and organizational
+domains for relaxed alignment. The receiver records the outcome locally.
+Mail with any result can reach Inbox, including mail claiming a hosted
+domain with a published reject policy. Section 46 of POSTGRES.md gives the
+inspection queries.
 
 Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
 ACME HTTP-01 challenges and
@@ -1561,7 +1565,9 @@ for the owner's lifetime, consistent with restart-only resolver changes.
 
 Direct receiving uses separate SPF and DKIM workers. SPF queries derive from
 the SMTP envelope and published policy. DKIM queries TXT at the selector's
-`_domainkey` name. Both workers send DNS questions only to configured numeric
+`_domainkey` name. The DKIM worker also queries
+`_dmarc` TXT records to discover policy and compare organizational domains.
+Both workers send DNS questions only to configured numeric
 resolvers, have no application-dial capability, and keep their per-message
 work separate from the configured relay/ACME cache.
 

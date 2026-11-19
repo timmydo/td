@@ -58,6 +58,15 @@ pub trait Job: Send {
     ) -> Result<(), Failure> {
         self.prepare_with_spf(deadline, spf)
     }
+    fn prepare_with_dmarc(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<crate::spf::Outcome>,
+        dkim: Option<crate::dkim::Report>,
+        _dmarc: Option<crate::dmarc::Report>,
+    ) -> Result<(), Failure> {
+        self.prepare_with_auth(deadline, spf, dkim)
+    }
     fn commit(&mut self) -> Result<Completion, Failure>;
 }
 /// Construction admits fixed capacity; no method may wait for peer input.

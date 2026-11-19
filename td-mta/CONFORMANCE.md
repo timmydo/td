@@ -657,7 +657,12 @@ Direct-MX DKIM fixtures include the RSA-SHA256 and Ed25519-SHA256 signed
 message and public keys in RFC 8463 Appendix A. The native IPv6 SMTP and
 PostgreSQL fixture serves the selector TXT records on loopback, delivers
 the original message and verifies the local 1,024-bit RSA and 256-bit
-Ed25519 observations alongside a sender-supplied lookalike field.
+Ed25519 observations alongside a sender-supplied lookalike field. Under a
+strict DMARC policy, those signatures authenticate the From domain even
+though SPF fails. The documented query counts only the local pass. A
+separate unsigned message claiming the hosted domain fails DMARC under
+`p=reject` and reaches both local accounts with identical observations.
+A silent resolver still permits custody and yields a temporary DMARC result.
 
 ## Local delivery-failure notices
 

@@ -32,7 +32,7 @@ changing that validator requires an explicit atomic implementation update.
 
 | Component | Count | Bytes each | Total |
 | --- | ---: | ---: | ---: |
-| SMTP slots | 8 | 376064 | 3008512 |
+| SMTP slots | 8 | 377088 | 3016704 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | JMAP dispatch method heap | 3 | 2097152 | 6291456 |
 | Body/search jobs | 3 | 22298624 | 66895872 |
@@ -43,7 +43,7 @@ changing that validator requires an explicit atomic implementation update.
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
 | Direct SPF worker stack and evaluation scratch | 1 | 2097152 | 2097152 |
-| Direct DKIM worker stack and verification scratch | 1 | 4194304 | 4194304 |
+| Direct DKIM and DMARC worker stack and verification scratch | 1 | 4194304 | 4194304 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 11 | 262144 | 2883584 |
 | Unix connector stacks | 8 | 262144 | 2097152 |
@@ -59,10 +59,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **442156288** |
+| **Total** | | | **442164480** |
 
-The total is approximately 421.67 MiB against a 512 MiB configured budget;
-the remaining 94714624 bytes are unassigned headroom, not another cache.
+The total is approximately 421.68 MiB against a 512 MiB configured budget;
+the remaining 94706432 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -437,7 +437,14 @@ including the DNS packet and header descriptors. Verification examines up
 to four signatures, 1,024 fields in the first 256 KiB of headers, 128 signed
 field names per signature and 16 KiB per signature or key tag list.
 Repeated body canonicalization modes and lengths reuse a digest within
-the message. SPF and DKIM share the
+the message. The same worker evaluates DMARC, using the original From
+field and the SPF result published for this envelope. It uses the same
+resolver, scratch reservation and deadline. The author scan examines up
+to 1,024 fields and 256 KiB of headers, with at most 16 KiB for From.
+Policy discovery visits at most eight names in each DNS tree walk and
+shares answers between walks in this message. A slot reserves 1 KiB for
+the retained DMARC result and its author and policy domains. The generated DMARC field
+uses 566 bytes for every outcome. SPF, DKIM and DMARC share the
 same final wait of up to 200 ms. Queued observations expire within that
 window, including when the full commit budget needs the time. An incomplete
 observation is recorded on delivery.

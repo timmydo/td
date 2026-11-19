@@ -2932,10 +2932,10 @@ evaluated signature with its signing domain, selector and available key size.
 Section 46 of POSTGRES.md covers local inspection. Outbound signing belongs
 to the smart host.
 
-DMARC remains planned. Define alignment and organizational-domain discovery
-using the applicable standards and a reviewed data strategy. Record DMARC
-results locally before considering enforcement. Aggregate or failure report
-generation requires separate design.
+Direct MX observes DMARC with RFC 9989 DNS policy discovery and identifier
+alignment. The local trace and inspection query cover accepted mail,
+including mail claiming a hosted domain. Enforcement and aggregate or
+failure report generation require separate design.
 
 **F03 — Catch-all.** Add an explicit per-domain fallback only after exact aliases,
 with predictable quota/admission behavior and tests for rejected domains. No

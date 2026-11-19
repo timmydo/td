@@ -210,7 +210,7 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
         [
             ("DATA\r\n", "354"),
             (
-                "Subject: SMTP fanout\r\n\r\nBoth local accounts\r\n.\r\n",
+                "From: Owner <main@example.test>\r\nSubject: SMTP fanout\r\n\r\nBoth local accounts\r\n.\r\n",
                 "250",
             ),
         ]
@@ -230,7 +230,8 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool)
     // All recipients retain the same trusted observation in their immutable copy.
     assert_eq!(sql(fixture, "SELECT bool_and(accounts >= 2 AND variants = 1 AND observed)
         FROM (SELECT blob_id, count(DISTINCT account) AS accounts, count(DISTINCT bytes) AS variants,
-            bool_and(position(convert_to(E'\\r\\nX-TD-DKIM-Results: none; receiver=localhost\\r\\n', 'UTF8') in bytes) > 0) AS observed
+            bool_and(position(convert_to(E'\\r\\nX-TD-DKIM-Results: none; receiver=localhost\\r\\n', 'UTF8') in bytes) > 0 AND
+                position(convert_to(E'\\r\\nX-TD-DMARC-Result: fail; author=example.test; policy-domain=example.test\\r\\n', 'UTF8') in bytes) > 0) AS observed
         FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('Subject: SMTP fanout', 'UTF8') in bytes)>0 GROUP BY blob_id) AS copies"), "t");
     if many {
         // Sequence increments are visible even while A's deferred trigger holds COMMIT.

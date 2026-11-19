@@ -139,7 +139,7 @@ pub(super) fn exercise(
     exchange(b"RCPT TO:<main@example.test>\r\n", "250");
     exchange(b"RCPT TO:<@example.test:outside@remote.test>\r\n", "550");
     exchange(b"DATA\r\n", "354");
-    let mut signed = Vec::from(&b"Bcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\nX-TD-DKIM-Results: fail (sender supplied)\r\n"[..]);
+    let mut signed = Vec::from(&b"Bcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\nX-TD-DKIM-Results: fail (sender supplied)\r\nX-TD-DMARC-Result: fail; author=spoof.test; policy-domain=spoof.test\r\n"[..]);
     signed.extend_from_slice(super::dkim_vectors::MESSAGE);
     signed.extend_from_slice(b".\r\n");
     exchange(&signed, "250");
@@ -169,6 +169,9 @@ pub(super) fn exercise(
         assert!(local_trace.contains(signature), "{local_trace}");
     }
     assert!(incoming.contains("\r\nX-TD-DKIM-Results: fail (sender supplied)\r\n"));
+    assert!(local_trace.contains("\r\nX-TD-DMARC-Result: pass; author=football.example.com; policy-domain=football.example.com\r\n"), "{local_trace}");
+    assert!(incoming
+        .contains("\r\nX-TD-DMARC-Result: fail; author=spoof.test; policy-domain=spoof.test\r\n"));
     let query = include_str!("../../POSTGRES.md")
         .split_once("### Inspecting direct-MX DKIM observations")
         .unwrap()
@@ -180,6 +183,20 @@ pub(super) fn exercise(
         .unwrap()
         .0;
     assert_eq!(sql(fixture, query), "pass|1024|football.example.com|1");
+    let dmarc_query = include_str!("../../POSTGRES.md")
+        .split_once("### Inspecting direct-MX DMARC observations")
+        .unwrap()
+        .1
+        .split_once("```sql\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    assert_eq!(
+        sql(fixture, dmarc_query),
+        "pass|football.example.com|football.example.com|1"
+    );
     assert!(smtp_address.is_ipv6() && https_address.is_ipv6());
     assert_eq!(
         sql(

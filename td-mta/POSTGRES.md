@@ -2016,7 +2016,7 @@ Passive receipt facts confer no authority. The receiving service supplies this t
 Preparation validates bounded SMTP metadata, non-NUL DATA with complete CRLF
 lines of arbitrary length within the selected message ceiling, and a root-header
 ceiling of at most 1 MiB. It uses the shared receiving header and trace formatter: prepend the
-server Return-Path, the local SPF and DKIM observations when present, and
+server Return-Path, the local SPF, DKIM and DMARC observations when present, and
 the Received field in that order, strip supplied Return-Path fields, retain
 root identifiers and keep body bytes unchanged. The header scanner borrows the already admitted immutable DATA, so tentative
 field-name bytes that become body consume work but no extra header backing
@@ -2045,7 +2045,7 @@ envelope provenance, recipient rows, Inbox membership, history and quota usage.
 The receiver stores its verdict in the immutable message body alongside its
 own Received field. All fanout copies retain the same trace. A raw download
 begins with Return-Path, then Received-SPF for an observed direct delivery,
-then X-TD-DKIM-Results when observed, then Received. The folded Received-SPF properties identify the receiver,
+then X-TD-DKIM-Results and X-TD-DMARC-Result when observed, then Received. The folded Received-SPF properties identify the receiver,
 socket peer, HELO/EHLO and effective envelope sender. The result `none`
 means an evaluation found no applicable SPF policy or usable sender domain.
 Older direct deliveries have Received immediately after Return-Path and
@@ -2122,6 +2122,53 @@ SELECT parts[1] AS outcome, parts[2]::integer AS rsa_bits,
 FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
     E'\r\n\tresult=([a-z]+); a=rsa-sha256; bits=([0-9]+); d=([A-Za-z0-9.-]+);', 'g') AS m(parts)
 GROUP BY 1, 2, 3 ORDER BY 4 DESC, 3, 2, 1;
+```
+
+### Inspecting direct-MX DMARC observations
+
+Direct MX writes one local `X-TD-DMARC-Result` field immediately before its
+Received field. It records the DMARC outcome, the visible From domain and
+the DNS domain that supplied the policy when available. A dash marks an
+unavailable domain. The receiver accepts DNS A-labels in From. A raw
+Unicode domain requires IDNA conversion and yields a temporary result on
+this SMTP profile. Multiple mailboxes with the same domain can supply one
+author. Distinct domains or multiple From fields are ambiguous.
+Older deliveries can lack this observation. A sender's
+own fields appear below the receiver's Received line.
+
+Run this read-only query on the primary to assess recent traffic. It counts
+account copies in the most recent 1,000 retained direct deliveries. A
+`pass` means an authenticated SPF or DKIM identifier aligned with the author.
+A `fail` means a policy was found and the available evidence established
+alignment failure. An absent policy yields `none`. Temporary or incomplete
+checks yield `temperror`. A missing or ambiguous author can yield
+`permerror`. Every outcome follows ordinary SMTP delivery policy, including
+mail claiming a hosted domain whose owner publishes `p=reject`.
+
+For a missing or invalid `p`, or an invalid `sp` or `np`, the receiver
+follows RFC 9989 section 4.10.1. With a valid reporting URI in `rua`, it
+evaluates alignment under the monitoring policy. Otherwise, it records a
+policy error. Reporting URIs are checked locally. The difference between
+the RFC's two descriptions of a missing `p` is recorded in
+[RFC erratum 9236](https://mailarchive.ietf.org/arch/msg/dmarc/PLyfRTXCYKRgss8WQonFqif0OkM/).
+
+```sql
+WITH recent AS (
+    SELECT account, blob_id FROM td_mta.emails
+    WHERE origin = 1 AND gateway IS NULL
+    ORDER BY received_at DESC, account, id
+    LIMIT 1000
+), traces AS (
+    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 8192), 'escape'),
+                      E'\r\nReceived: ', 1) AS prefix
+    FROM recent r JOIN td_mta.blob_chunks c
+      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
+)
+SELECT parts[1] AS outcome, parts[2] AS author, parts[3] AS policy_domain,
+       count(*) AS account_copies
+FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
+    E'\r\nX-TD-DMARC-Result: ([a-z]+); author=([A-Za-z0-9.-]+); policy-domain=([A-Za-z0-9.-]+)\r\n') AS m(parts)
+GROUP BY 1, 2, 3 ORDER BY 4 DESC, 2, 3, 1;
 ```
 
 ## 47. Verified submission input preparation

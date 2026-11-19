@@ -268,7 +268,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 442156288 bytes (about 421.67 MiB), including the
+default plan is 442164480 bytes (about 421.68 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
@@ -277,8 +277,9 @@ Schema-35 search-field reuse adds 20 MiB of planning scratch per body job
 (60 MiB at the default three jobs). This covers bounded PostgreSQL result,
 encoded field and decoded field overlap; it is allocated only when needed.
 Explicit budgets close to the previous plan must be raised before upgrading.
-Direct MX reserves 2 MiB for the SPF worker and 4 MiB for the DKIM
-worker. Each reservation includes its stack and DNS and evaluation scratch.
+Direct MX reserves 2 MiB for the SPF worker and 4 MiB for the shared DKIM
+and DMARC worker. Each reservation includes its stack and evaluation scratch.
+DMARC adds 1 KiB per SMTP slot for the retained result and its domains.
 The default remains 512 MiB. Owner search backfill runs separately and needs
 headroom for one complete bounded interpretation and its encoded copy.
 Persistent HTTP responses add a bounded 16-KiB pipelined-tail copy per body
@@ -875,15 +876,17 @@ visible action.
 The direct-MX SPF and DKIM workers query the same configured numeric
 resolvers as the relay. SPF lookups can expose the peer address and envelope
 identity through policy macros. DKIM lookups disclose a selector and signing
-domain in a TXT query. Choose resolvers suitable for this traffic. With no
-usable reply, direct receiving records the outcome locally and uses its
+domain in a TXT query. DMARC TXT lookups can disclose the From domain and
+ancestors of the domains being checked for alignment. Choose resolvers
+suitable for this traffic. With no usable reply, direct receiving records
+the outcome locally and uses its
 ordinary delivery policy. New resolver settings take effect on restart.
 
-Direct SMTP reserves 4,193 bytes plus three times the listener hostname's byte
+Direct SMTP reserves 4,759 bytes plus three times the listener hostname's byte
 length for generated trace headers and the separator. The configured
 `header_bytes` must cover this reserve, and `message_bytes` must exceed
 it. The advertised SMTP SIZE subtracts the reserve. For a listener named
-`mx.example.net`, allow 4,235 bytes for the trace when upgrading a tightly
+`mx.example.net`, allow 4,801 bytes for the trace when upgrading a tightly
 sized configuration.
 
 M04b2c3c1 implements `config::outbound` for complete typed inputs. It retains

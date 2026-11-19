@@ -85,6 +85,10 @@ impl Relay {
                 if packet.get(n.saturating_sub(4)..n.saturating_sub(2)) == Some(&[0, 16]) {
                     let record = match packet.get(12..n.saturating_sub(4)) {
                         Some(b"\x07example\x04test\x00") => Some("v=spf1 -all"),
+                        Some(b"\x06_dmarc\x07example\x04test\x00")
+                        | Some(b"\x06_dmarc\x08football\x07example\x03com\x00") => {
+                            Some("v=DMARC1; p=reject; adkim=s; aspf=s")
+                        }
                         Some(b"\x04test\x0a_domainkey\x08football\x07example\x03com\x00") => {
                             Some(super::dkim_vectors::RSA_TXT)
                         }

@@ -488,23 +488,32 @@ const DKIM_FIXED_BYTES: usize = b"X-TD-DKIM-Results: incomplete; receiver=".len(
     + crate::dkim::MAX_SIGNATURES * DKIM_ROW_BYTES
     + 7;
 
-pub(crate) fn auth_trace_allowance(hostname: &str) -> Result<usize, Error> {
+const DMARC_BYTES: usize =
+    b"X-TD-DMARC-Result: permerror; author=; policy-domain=".len() + 2 * DKIM_NAME_BYTES + 7;
+
+fn dkim_trace_allowance(hostname: &str) -> Result<usize, Error> {
     Ok(spf_trace_allowance(hostname)? + DKIM_FIXED_BYTES + hostname.len())
+}
+
+pub(crate) fn auth_trace_allowance(hostname: &str) -> Result<usize, Error> {
+    Ok(dkim_trace_allowance(hostname)? + DMARC_BYTES)
 }
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Observations<'a> {
     pub spf: Option<crate::spf::Outcome>,
     pub dkim: Option<&'a crate::dkim::Report>,
+    pub dmarc: Option<&'a crate::dmarc::Report>,
 }
 
 impl Observations<'_> {
     pub fn allowance(self, hostname: &str) -> Result<usize, Error> {
-        match (self.spf, self.dkim) {
-            (None, None) => trace_allowance(hostname),
-            (Some(_), None) => spf_trace_allowance(hostname),
-            (Some(_), Some(_)) => auth_trace_allowance(hostname),
-            (None, Some(_)) => Err(Error::Invalid),
+        match (self.spf, self.dkim, self.dmarc) {
+            (None, None, None) => trace_allowance(hostname),
+            (Some(_), None, None) => spf_trace_allowance(hostname),
+            (Some(_), Some(_), None) => dkim_trace_allowance(hostname),
+            (Some(_), Some(_), Some(_)) => auth_trace_allowance(hostname),
+            _ => Err(Error::Invalid),
         }
     }
 }
@@ -557,12 +566,39 @@ fn dkim_trace(
             }
         }
     }
+    finish_field(output, start, DKIM_FIXED_BYTES + hostname.len())
+}
+
+fn dmarc_trace(output: &mut String, report: &crate::dmarc::Report) -> Result<(), Error> {
+    let start = output.len();
+    let valid = [report.author.as_deref(), report.policy_domain.as_deref()]
+        .into_iter()
+        .flatten()
+        .all(|name| crate::config::values::certificate_name(name).is_ok());
+    let (outcome, author, policy) = if valid {
+        (
+            report.outcome.as_str(),
+            report.author.as_deref(),
+            report.policy_domain.as_deref(),
+        )
+    } else {
+        ("temperror", None, None)
+    };
+    write!(
+        output,
+        "X-TD-DMARC-Result: {outcome}; author={}; policy-domain={}",
+        author.unwrap_or("-"),
+        policy.unwrap_or("-")
+    )
+    .map_err(|_| Error::Capacity)?;
+    finish_field(output, start, DMARC_BYTES)
+}
+
+fn finish_field(output: &mut String, start: usize, length: usize) -> Result<(), Error> {
     // Fill with folded comments to give every verdict and timeout the same
     // stored length. Each physical line contains text and stays below 998 bytes.
     let used = output.len() - start;
-    let mut remaining = (DKIM_FIXED_BYTES + hostname.len() - 2)
-        .checked_sub(used)
-        .ok_or(Error::Capacity)?;
+    let mut remaining = (length - 2).checked_sub(used).ok_or(Error::Capacity)?;
     while remaining > 0 {
         let fold = if remaining > 996 {
             (remaining - 5).min(996)
@@ -631,7 +667,9 @@ pub(crate) fn trace(
         .map_err(|_| ports::Error::Capacity)?;
     write!(output, "Return-Path: <{}>\r\n", receipt.reverse_path)
         .map_err(|_| ports::Error::Capacity)?;
-    if observed.dkim.is_some() && observed.spf.is_none() {
+    if (observed.dkim.is_some() && observed.spf.is_none())
+        || (observed.dmarc.is_some() && observed.dkim.is_none())
+    {
         return Err(Error::Invalid);
     }
     if let Some(result) = observed.spf {
@@ -655,6 +693,9 @@ pub(crate) fn trace(
     }
     if let Some(report) = observed.dkim {
         dkim_trace(&mut output, hostname, report)?;
+    }
+    if let Some(report) = observed.dmarc {
+        dmarc_trace(&mut output, report)?;
     }
     write!(output, "Received: from {} (", receipt.ehlo).map_err(|_| ports::Error::Capacity)?;
     match receipt.peer {
@@ -717,6 +758,7 @@ mod spf_tests {
             Observations {
                 spf: observed,
                 dkim: None,
+                dmarc: None,
             },
         )
     }
@@ -761,6 +803,7 @@ mod spf_tests {
                 Observations {
                     spf: Some(Outcome::Pass),
                     dkim: Some(report),
+                    dmarc: None,
                 },
             )
         };
@@ -783,7 +826,7 @@ mod spf_tests {
         assert!(field(&render(&unavailable).unwrap()).starts_with("incomplete; receiver="));
         assert_eq!(render(&unavailable).unwrap().len(), unsigned.len());
         assert_eq!(
-            auth_trace_allowance(host).unwrap() - spf_trace_allowance(host).unwrap(),
+            dkim_trace_allowance(host).unwrap() - spf_trace_allowance(host).unwrap(),
             2299 + host.len()
         );
         assert!(
@@ -847,7 +890,8 @@ mod spf_tests {
                 Some("gateway"),
                 Observations {
                     spf: Some(Outcome::Pass),
-                    dkim: Some(&none)
+                    dkim: Some(&none),
+                    dmarc: None,
                 }
             ),
             Err(Error::Invalid)
@@ -860,11 +904,85 @@ mod spf_tests {
                 None,
                 Observations {
                     spf: None,
-                    dkim: Some(&none)
+                    dkim: Some(&none),
+                    dmarc: None,
                 }
             ),
             Err(Error::Invalid)
         );
+    }
+
+    #[test]
+    fn dmarc_field_has_a_fixed_charge_and_ends_the_local_auth_trace() {
+        use crate::dmarc::{Outcome as Dmarc, Report};
+        let host = "mx.example.test";
+        let dkim = crate::dkim::Report::unavailable();
+        let render = |report: &Report| {
+            render_auth(
+                host,
+                "sender.test",
+                "owner@sender.test",
+                None,
+                Observations {
+                    spf: Some(Outcome::Fail),
+                    dkim: Some(&dkim),
+                    dmarc: Some(report),
+                },
+            )
+            .unwrap()
+        };
+        let longest = [
+            "x".repeat(63),
+            "y".repeat(63),
+            "z".repeat(63),
+            "a".repeat(61),
+        ]
+        .join(".");
+        let reference = render(&Report::unavailable());
+        let earlier = render_auth(
+            host,
+            "sender.test",
+            "owner@sender.test",
+            None,
+            Observations {
+                spf: Some(Outcome::Fail),
+                dkim: Some(&dkim),
+                dmarc: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(reference.len() - earlier.len(), DMARC_BYTES);
+        assert_eq!(auth_trace_allowance(host).unwrap(), 4759 + 3 * host.len());
+        let (prefix, suffix) = reference.split_once("X-TD-DMARC-Result: ").unwrap();
+        assert!(prefix.contains("X-TD-DKIM-Results: "));
+        assert!(suffix.starts_with("temperror; "));
+        assert!(suffix.contains("\r\nReceived: "));
+        for outcome in [
+            Dmarc::None,
+            Dmarc::Pass,
+            Dmarc::Fail,
+            Dmarc::Temperror,
+            Dmarc::Permerror,
+        ] {
+            let report = Report {
+                outcome,
+                author: Some(longest.clone()),
+                policy_domain: Some(longest.clone()),
+            };
+            let trace = render(&report);
+            assert_eq!(trace.len(), reference.len());
+            assert!(trace.contains(&format!(
+                "X-TD-DMARC-Result: {}; author={longest}; policy-domain={longest}\r\n",
+                outcome.as_str()
+            )));
+            assert!(trace.lines().all(|line| line.len() <= 998));
+        }
+        let invalid = Report {
+            outcome: Dmarc::Pass,
+            author: Some("x\r\nForged: pass".into()),
+            policy_domain: None,
+        };
+        assert_eq!(render(&invalid), reference);
     }
 
     const OUTCOMES: &[Outcome] = &[

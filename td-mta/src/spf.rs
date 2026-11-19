@@ -88,32 +88,37 @@ impl From<DnsError> for Outcome {
     }
 }
 
-/// Called only for a direct SMTP peer. An empty reverse path uses
-/// postmaster@HELO; the original envelope remains fixed through recursion.
+/// RFC 7208 MAIL FROM identity, shared by SPF evaluation and DMARC alignment.
+pub(crate) fn mailfrom_identity<'a>(
+    helo: &'a str,
+    reverse_path: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let (local, domain) = if reverse_path.is_empty() {
+        ("postmaster", helo)
+    } else {
+        reverse_path.rsplit_once('@')?
+    };
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+    (domain.contains('.') && crate::config::values::certificate_name(domain).is_ok()).then_some((
+        if local.is_empty() {
+            "postmaster"
+        } else {
+            local
+        },
+        domain,
+    ))
+}
+
+/// Called only for a direct SMTP peer. The original envelope remains fixed through recursion.
 pub(crate) fn evaluate(
     dns: &mut impl Dns,
     peer: IpAddr,
     helo: &str,
     reverse_path: &str,
 ) -> Outcome {
-    let (local, domain) = if reverse_path.is_empty() {
-        ("postmaster", helo)
-    } else if let Some((local, domain)) = reverse_path.rsplit_once('@') {
-        (
-            if local.is_empty() {
-                "postmaster"
-            } else {
-                local
-            },
-            domain,
-        )
-    } else {
+    let Some((local, domain)) = mailfrom_identity(helo, reverse_path) else {
         return Outcome::None;
     };
-    let domain = domain.strip_suffix('.').unwrap_or(domain);
-    if !domain.contains('.') || crate::config::values::certificate_name(domain).is_err() {
-        return Outcome::None;
-    }
     let mut check = Evaluation {
         dns,
         peer: peer.to_canonical(),

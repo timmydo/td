@@ -249,6 +249,7 @@ enum Stage {
         Deadline,
         Option<crate::spf::Outcome>,
         Option<crate::dkim::Report>,
+        Option<crate::dmarc::Report>,
     ),
     Done,
 }
@@ -490,6 +491,15 @@ impl Job for Delivery<'_, '_> {
         spf: Option<crate::spf::Outcome>,
         dkim: Option<crate::dkim::Report>,
     ) -> Result<(), Failure> {
+        self.prepare_with_dmarc(deadline, spf, dkim, None)
+    }
+    fn prepare_with_dmarc(
+        &mut self,
+        deadline: Deadline,
+        spf: Option<crate::spf::Outcome>,
+        dkim: Option<crate::dkim::Report>,
+        dmarc: Option<crate::dmarc::Report>,
+    ) -> Result<(), Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -502,17 +512,17 @@ impl Job for Delivery<'_, '_> {
             return Err(Failure::Refused(Error::Deadline));
         }
         charge(&self.backend.clock, &mut self.meter, Charge::default())?;
-        self.stage = Stage::Prepared(deadline, spf, dkim);
+        self.stage = Stage::Prepared(deadline, spf, dkim, dmarc);
         Ok(())
     }
     fn commit(&mut self) -> Result<Completion, Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let Stage::Prepared(deadline, spf, dkim) = &mut self.stage else {
+        let Stage::Prepared(deadline, spf, dkim, dmarc) = &mut self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
-        let (deadline, spf, dkim) = (*deadline, *spf, dkim.take());
+        let (deadline, spf, dkim, dmarc) = (*deadline, *spf, dkim.take(), dmarc.take());
         self.stage = Stage::Done;
         charge(
             &self.backend.clock,
@@ -569,6 +579,7 @@ impl Job for Delivery<'_, '_> {
                     crate::receiving_headers::Observations {
                         spf,
                         dkim: dkim.as_ref(),
+                        dmarc: dmarc.as_ref(),
                     },
                 )
             },
