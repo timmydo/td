@@ -6,6 +6,18 @@ use std::{
     time::Instant,
 };
 
+pub(crate) fn retry_accept(error: &std::io::Error) -> bool {
+    // Linux accept forwards pending connection errors. Resource pressure also
+    // retries after a scan delay; invalid listening descriptors still fail.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+    ) || matches!(
+        error.raw_os_error(),
+        Some(12 | 23 | 24 | 64 | 71 | 92 | 95 | 100 | 101 | 105 | 112 | 113)
+    )
+}
+
 /// Confirm the caller established the configured IPv6-only family policy.
 #[allow(deprecated)]
 pub(crate) fn ipv6_only(listener: &std::net::TcpListener) -> Result<bool, Error> {

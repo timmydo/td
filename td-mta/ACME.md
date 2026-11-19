@@ -89,8 +89,11 @@ exact URL spelling in signed requests. Redirects are refused. Responses have
 16 KiB header, 64 KiB decoded-body and 128 KiB total-wire ceilings. Framing
 supports Content-Length, simple chunked encoding and authenticated TLS EOF;
 ambiguous lengths, encodings and duplicate critical headers are refused.
-HTTP-01 admits one connection at a time, at most 120 per minute, with 4 KiB
-request and two-second exchange limits. It returns only the exact current
+HTTP-01 serves two concurrent requests with a 4 KiB request limit and a
+five-second connection lifetime. Each peer occupies at most one slot. When
+both are occupied a different peer can replace the oldest connection idle
+for at least a second. The responder retries temporary accept failures,
+including descriptor exhaustion, between service turns. It returns only the exact current
 host/token authorization while the local lease cache remains fresh. Multiple
 names are authorized sequentially; an answer remains available until its
 authorization is valid.

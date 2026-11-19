@@ -2362,9 +2362,6 @@ td-mta/src/account_configuration.rs	unchecked-growth-or-clone	2
 td-mta/src/acme.rs	allocating-conversion	3
 td-mta/src/acme.rs	allocation-macro	13
 td-mta/src/acme.rs	unchecked-growth-or-clone	10
-td-mta/src/acme/challenge.rs	allocating-constructor	1
-td-mta/src/acme/challenge.rs	allocation-macro	1
-td-mta/src/acme/challenge.rs	unchecked-growth-or-clone	2
 td-mta/src/acme/http.rs	direct-reservation	1
 td-mta/src/acme/http.rs	unchecked-growth-or-clone	1
 td-mta/src/acme/order.rs	allocating-conversion	12

@@ -506,7 +506,8 @@ health snapshot and 24 KiB descriptors/challenge data/counters. HTTP-01 emits
 from the existing validated challenge bytes without occupying a worker. It
 has no general body upload path. The control worker uses its other five
 regions serially; main never borrows a region still owned by that worker.
-HTTP-01 allows one slot per peer, one request per connection, and a five-second
+HTTP-01 allows one slot per IPv4 address or IPv6 /64 (including mapped IPv4
+as its IPv4 address), one request per connection, and a five-second
 total lifetime. When full, a new peer may replace the oldest slot that has made
 no progress for one second; otherwise refuse it. Close after the response.
 This bounds simple slot pinning, not distributed denial of service.
