@@ -111,6 +111,10 @@ fn a_request_is_one_exact_bounded_line() {
     );
     let runtime = Request::parse(b"start tools freedesktop-sdk-25-08 linux\n").unwrap();
     assert_eq!(runtime.verb, shell(Some("freedesktop-sdk-25-08"), "linux"));
+    let Verb::Launch(launch) = &runtime.verb else {
+        panic!("{runtime:?}");
+    };
+    assert_eq!(launch.words().unwrap(), ["/bin/sh", "-i"]);
     // A command's words are hex, so any argument is one word: an empty
     // one, one with spaces, a newline or a quote.
     let line = format!(

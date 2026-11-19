@@ -4054,8 +4054,11 @@ into `/td/store`). With a runtime, the host's `/usr`, `/lib` and `/lib64`
 are not bound: the held runtime tree is bound at `/usr` as an
 application's runtime is (`MS_BIND`, remounted read-only, `nosuid,nodev`,
 executable), and `/lib` and `/lib64` are links to `/usr/lib` and
-`/usr/lib64`, the application kind's loader aliases alone; td's `/bin`
-and `/sbin` stay the host's. A host `/run` or `/etc` link that names or
+`/usr/lib64`, the application kind's loader aliases. The read-only root recreates
+td's `/bin` symlinks with `sh` pointing to `/usr/bin/bash` and `curl` to
+`/usr/bin/curl`. Stage 2 checks both links and requires ordinary executable files in the
+held runtime’s own `bin` directory.
+`/sbin` stays the host's. A host `/run` or `/etc` link that names or
 resolves into `/usr`, `/lib` or `/lib64` is then not recreated, since
 there it would name the runtime's file. Without persistent scratch, `/run` holds only a store-based host's
 `current-system` link, to its resolved target when that lies in a bound

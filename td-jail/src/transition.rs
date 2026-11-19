@@ -208,9 +208,11 @@ const RUNTIME_ALIASES: &[(&str, &str)] = &[
     ("lib64", "/usr/lib64"),
     ("sbin", "/usr/sbin"),
 ];
-/// A workspace's runtime takes the loader's directories alone: td's own
-/// `/bin` stays (WORKLOADS.md, "Runtimes").
+/// A workspace takes the loader directories and two tools from its runtime.
 const WORKSPACE_RUNTIME_ALIASES: &[(&str, &str)] = &[("lib", "/usr/lib"), ("lib64", "/usr/lib64")];
+const WORKSPACE_RUNTIME_TOOLS: &[(&str, &str)] =
+    &[("sh", "/usr/bin/bash"), ("curl", "/usr/bin/curl")];
+
 /// A workspace's runtime supplies the loader's files in place of the
 /// host's, and nothing else of its `/etc`.
 const WORKSPACE_RUNTIME_ETC_ALLOWLIST: &[&str] = &["ld.so.cache", "ld.so.conf", "ld.so.conf.d"];
@@ -7168,7 +7170,7 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         }
     }
     for name in workspace::SYSTEM_TREES {
-        if plan.runtime.is_some() && workspace::RUNTIME_TREES.contains(name) {
+        if !bind_workspace_system_tree(name, plan.runtime.is_some()) {
             continue;
         }
         bind_system_tree(name)?;
@@ -7181,6 +7183,9 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         ));
     }
     if let Some(runtime) = &plan.runtime {
+        let bin = crate::text(format_args!("{NEW_ROOT}/bin"))?;
+        create_dir(&bin, 0o755)?;
+        install_workspace_bin_links(Path::new("/bin"), Path::new(&bin))?;
         create_dir(&format!("{NEW_ROOT}{RUNTIME_ROOT}"), 0o555)?;
         mount_runtime_tree(&runtime.files, WORKSPACE_RUNTIME_ALIASES)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
@@ -7208,6 +7213,49 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         mount_grant(entry, false)?;
     }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn bind_workspace_system_tree(name: &str, runtime: bool) -> bool {
+    !(runtime && (name == "bin" || workspace::RUNTIME_TREES.contains(&name)))
+}
+
+// td's image provides a farm of links into its store. Recreate the farm
+// on the new root before it becomes read-only so shebangs and PATH agree.
+fn install_workspace_bin_links(host: &Path, bin: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(host)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if WORKSPACE_RUNTIME_TOOLS
+            .iter()
+            .any(|(tool, _)| name == *tool)
+        {
+            continue;
+        }
+        let target = fs::read_link(entry.path())?;
+        symlink(target, workspace::joined(bin, &name)?)?;
+    }
+    for (tool, target) in WORKSPACE_RUNTIME_TOOLS {
+        symlink(target, workspace::joined(bin, OsStr::new(tool))?)?;
+    }
+    Ok(())
+}
+
+/// The caller supplies a fixed /usr/bin path beneath the held mount.
+/// Neither bin nor the executable may redirect through a writable tree.
+fn require_runtime_tool(target: &Path) -> io::Result<()> {
+    let bin = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing runtime bin directory"))?;
+    let executable = fs::symlink_metadata(target)?;
+    if !fs::symlink_metadata(bin)?.is_dir()
+        || !executable.is_file()
+        || executable.mode() & 0o111 == 0
+    {
+        return Err(io::Error::other(
+            "runtime tool must be a direct executable in the runtime bin directory",
+        ));
+    }
+    Ok(())
 }
 
 /// One host system tree as the host has it: a link is the same link, a
@@ -7462,7 +7510,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     require_planned_rows(plan, &mountinfo)?;
     let mut programs = false;
     for name in workspace::SYSTEM_TREES {
-        if plan.runtime && workspace::RUNTIME_TREES.contains(name) {
+        if !bind_workspace_system_tree(name, plan.runtime) {
             continue;
         }
         let path = format!("/{name}");
@@ -7497,6 +7545,15 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     }
     if plan.runtime {
         require_runtime_tree(&mountinfo, token, WORKSPACE_RUNTIME_ALIASES)?;
+        for (tool, target) in WORKSPACE_RUNTIME_TOOLS {
+            let link = workspace::joined(Path::new("/bin"), OsStr::new(tool))?;
+            if fs::read_link(link)? != Path::new(target) {
+                return Err(io::Error::other(
+                    "workspace tool link differs from the plan",
+                ));
+            }
+            require_runtime_tool(Path::new(target))?;
+        }
     }
     for name in if plan.persistent {
         BTreeSet::new()
@@ -7883,7 +7940,7 @@ fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<(
     planned.extend(
         workspace::SYSTEM_TREES
             .iter()
-            .filter(|name| !(plan.runtime && workspace::RUNTIME_TREES.contains(name)))
+            .filter(|name| bind_workspace_system_tree(name, plan.runtime))
             .map(|name| Path::new("/").join(name)),
     );
     planned.extend(plan.trees().map(Path::to_path_buf));
@@ -8298,7 +8355,14 @@ mod tests {
         assert!(require_planned_rows(&plan(true), &base).is_ok());
         // Below the runtime's tree, or at a replaced tree's link: the
         // host's own trees may carry mounts, a runtime's carries none.
-        for stray in ["/usr/lib/x", "/usr/etc", "/lib", "/lib64/y"] {
+        for stray in [
+            "/usr/lib/x",
+            "/usr/etc",
+            "/lib",
+            "/lib64/y",
+            "/bin",
+            "/bin/sh",
+        ] {
             let rows = [base.clone(), row(9, stray)].concat();
             assert!(require_planned_rows(&plan(false), &rows).is_ok(), "{stray}");
             assert!(require_planned_rows(&plan(true), &rows).is_err(), "{stray}");
@@ -8330,6 +8394,46 @@ mod tests {
         assert!(in_system_tree(Path::new("/usr/bin"), false));
         assert!(!in_system_tree(Path::new("/usr/bin"), true));
         assert!(in_system_tree(Path::new("/td/store"), true));
+    }
+
+    #[test]
+    fn workspace_runtime_bin_keeps_native_links_and_selects_shell_and_curl() {
+        let root = td_fs::TempDir::new("workspace-bin").unwrap();
+        let host = root.join("host");
+        let bin = root.join("bin");
+        fs::create_dir(&host).unwrap();
+        fs::create_dir(&bin).unwrap();
+        for (tool, target) in [
+            ("git", "/td/store/git/bin/git"),
+            ("sh", "/td/store/sh/bin/td-sh"),
+            ("curl", "/td/store/net/bin/td-net"),
+        ] {
+            symlink(target, host.join(tool)).unwrap();
+        }
+        install_workspace_bin_links(&host, &bin).unwrap();
+        for (tool, target) in [
+            ("git", "/td/store/git/bin/git"),
+            ("sh", "/usr/bin/bash"),
+            ("curl", "/usr/bin/curl"),
+        ] {
+            assert_eq!(fs::read_link(bin.join(tool)).unwrap(), Path::new(target));
+        }
+    }
+
+    #[test]
+    fn workspace_runtime_tools_cannot_link_out_of_the_held_tree() {
+        let root = td_fs::TempDir::new("workspace-tool-target").unwrap();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let program = bin.join("bash");
+        fs::write(&program, b"").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).unwrap();
+        require_runtime_tool(&program).unwrap();
+        symlink(&program, bin.join("curl")).unwrap();
+        assert!(require_runtime_tool(&bin.join("curl")).is_err());
+        let alias = root.join("redirect");
+        symlink(&bin, &alias).unwrap();
+        assert!(require_runtime_tool(&alias.join("bash")).is_err());
     }
 
     /// td-builder's guard (builder/src/stage0.rs, `HostFacts`) knows a

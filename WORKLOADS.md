@@ -159,7 +159,8 @@ every workload that names it:
 - **a Flathub runtime**, such as `org.freedesktop.Platform//25.08`, at
   `/usr`, with td-jail's `/bin /sbin /lib /lib64` aliases into it for
   application launches and `/lib /lib64` only for workspace launches,
-  where td's `/bin` stays first on `PATH`;
+  where `/bin` stays first on the system path and its `sh` and `curl`
+  links select the runtime’s Bash in sh mode and its curl;
 - **a layered application**: a Flathub runtime at `/usr` plus the
   application's tree at `/app`.
 

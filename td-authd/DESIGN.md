@@ -2226,8 +2226,9 @@ is not ordered with them (below).
 
 ### Launches
 
-`start` asks for td's `/bin/sh -i`, resolved, never a shell the caller
-names; `run` for the command its words give, on a PTY or on pipes. For an
+`start` asks for `/bin/sh -i`. Root resolves the native shell on the
+host. With a runtime the relay resolves the fixed path inside the jail.
+No caller selects this shell; `run` for the command its words give, on a PTY or on pipes. For an
 admitted launch root:
 
 1. reads the ledger as every consumer does and requires the sandbox's

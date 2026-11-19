@@ -1373,7 +1373,7 @@ fn repository_chain(source: &Path, target: &Path) -> io::Result<Vec<FilesystemGr
 
 /// `base` joined with the relative `name`, as `Path::join` joins them, in
 /// fallibly grown storage.
-fn joined(base: &Path, name: &OsStr) -> io::Result<PathBuf> {
+pub(crate) fn joined(base: &Path, name: &OsStr) -> io::Result<PathBuf> {
     let oom = |_| io::Error::from(io::ErrorKind::OutOfMemory);
     let (base, name) = (base.as_os_str().as_bytes(), name.as_bytes());
     let slash = !base.is_empty() && !base.ends_with(b"/");

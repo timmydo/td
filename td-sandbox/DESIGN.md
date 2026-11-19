@@ -172,7 +172,9 @@ root refuses a runtime that is not installed before it answers.
 The jail binds the runtime store's `current` tree read-only at `/usr`,
 with `/lib` and `/lib64` links into it, and takes the runtime's
 `ld.so.cache`, `ld.so.conf` and `ld.so.conf.d` into `/etc` in place of the
-host's. td's `/bin` stays, first on `PATH` before `/usr/bin`, and no
+host's. The workspace's `/bin` precedes `/usr/bin` and reproduces td's
+links except for `sh` and `curl`, which select the runtime's Bash in sh
+mode and its curl. No
 `LD_LIBRARY_PATH` is set, so the runtime's loader cache serves the
 runtime's programs. td's own programs are static or linked against td's
 imported Debian glibc, and nothing requires one to carry a `RUNPATH`
@@ -271,7 +273,7 @@ boot. Live media state lasts only as long as that live home does.
 
 `shell` and `run` send one launch request, `start NAME RUNTIME TERM` or
 `run NAME RUNTIME pty|pipes TERM WORD...`, each word `x` and its
-argument's bytes in lowercase hex. `shell` runs td's `/bin/sh -i`, which
+argument's bytes in lowercase hex. `shell` runs the workspace's `/bin/sh -i`, which
 root names; no shell the caller names is offered. Root answers `ok`, or
 `refused` and why. After `ok` root starts td-jail's workspace kind as the
 sandbox's account with the accepted connection on its stdin and stdout,

@@ -178,8 +178,25 @@ pub(crate) struct Launch {
     pub(crate) runtime: Option<&'static str>,
     pub(crate) mode: Mode,
     pub(crate) term: String,
-    /// The program and its arguments; none for td's shell.
+    /// The program and its arguments; none for the workspace shell.
     pub(crate) command: Option<Vec<String>>,
+}
+
+impl Launch {
+    fn words(&self) -> Result<Vec<String>, String> {
+        if let Some(command) = &self.command {
+            return copied(command);
+        }
+        if self.runtime.is_some() {
+            // The runtime's /bin/sh exists only after td-jail builds /bin.
+            return copied(&[SHELL, "-i"]);
+        }
+        let native = fs::canonicalize(SHELL).map_err(|e| message(format_args!("{SHELL}: {e}")))?;
+        let shell = native
+            .to_str()
+            .ok_or_else(|| message(format_args!("{} is not UTF-8", native.display())))?;
+        copied(&[shell, "-i"])
+    }
 }
 
 /// A workspace instance's td-jail profile: `development` shares the
@@ -945,10 +962,10 @@ fn helper(
 }
 
 /// A copy of `words` in fallibly grown storage.
-fn copied(words: &[String]) -> Result<Vec<String>, String> {
+fn copied(words: &[impl AsRef<str>]) -> Result<Vec<String>, String> {
     let mut copy = allocation::with_capacity(words.len()).map_err(refused)?;
     for word in words {
-        allocation::push(&mut copy, owned(word)?).map_err(refused)?;
+        allocation::push(&mut copy, owned(word.as_ref())?).map_err(refused)?;
     }
     Ok(copy)
 }
@@ -1692,20 +1709,7 @@ impl Serve for Root<'_> {
         let table = grant_views::publish(Kind::Sandbox, name, uid)?;
         let network = table.network(Kind::Sandbox, name);
         let entry = fs::canonicalize(ENTRY).map_err(|e| message(format_args!("{ENTRY}: {e}")))?;
-        let command = match &launch.command {
-            Some(command) => copied(command)?,
-            None => {
-                let shell =
-                    fs::canonicalize(SHELL).map_err(|e| message(format_args!("{SHELL}: {e}")))?;
-                let shell = shell
-                    .to_str()
-                    .ok_or_else(|| message(format_args!("{} is not UTF-8", shell.display())))?;
-                let mut words = allocation::with_capacity(2).map_err(refused)?;
-                allocation::push(&mut words, owned(shell)?).map_err(refused)?;
-                allocation::push(&mut words, owned("-i")?).map_err(refused)?;
-                words
-            }
-        };
+        let command = launch.words()?;
         let text = spec_text(network, launch.runtime, &entry, &Kind::Sandbox.home(uid))?;
         let spec = specs().write(uid, id, &text)?;
         Ok(Prepared {

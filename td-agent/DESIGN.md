@@ -4785,7 +4785,9 @@ runtime on a development host, where it would replace the host's `/usr`,
 and one with no `current`, directing the human to install the runtime
 in td-software (including `freedesktop-sdk-25-08`); otherwise it binds
 that generation read-only at `/usr` with `/lib` and `/lib64` links into
-it, ends the entry's `PATH` with `/bin:/usr/bin`, takes the
+it, supplies `/bin/sh` and `/bin/curl` from the runtime's Bash and curl
+beside td's other `/bin` links, ends the entry's `PATH` with
+`/bin:/usr/bin`, takes the
 runtime's loader files into `/etc`, and holds the runtime's `current`
 for the instance's life. Each refusal fails that instance's launch, and
 the tool reports td-jail's reason. td-agent keeps the name to its

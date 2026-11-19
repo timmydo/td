@@ -1844,7 +1844,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x5f7221258ec5d3d1;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x48b5bc7296ae3585;
-const WORKSPACE_FINGERPRINT: u64 = 0xd1b24147eea7819a;
+const WORKSPACE_FINGERPRINT: u64 = 0x5c43b1cfacb834f3;
 const APPLICATION_FINGERPRINT: u64 = 0xd216cde5d8075fd7;
 
 fn fingerprint(source: &str) -> u64 {

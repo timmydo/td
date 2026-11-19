@@ -440,12 +440,15 @@ fn rust_probe_inside() -> Result<(), Box<dyn Error>> {
 const RUNTIME_PROBE: &str = r#"#!/bin/sh
 echo ready
 read -r request
+[ -n "$BASH_VERSION" ] && exec 9>"$0.lock" && flock -n 9 && echo "shell=fd-inherited"
+rm -f "$0.lock"
+curl --version | grep -q '^curl ' && echo "curl=upstream"
 touch /usr/x 2>/dev/null || echo "usr=read-only"
 echo "lib=$(readlink /lib)"
 echo "lib64=$(readlink /lib64)"
 echo "cache=$(stat -c %d:%i /etc/ld.so.cache)"
 echo "runtime-cache=$(stat -c %d:%i /usr/etc/ld.so.cache)"
-echo "path=$PATH"
+[ "$PATH" = "$HOME/.local/bin:/opt/workspace/path:/opt/workspace/bin:/bin:/usr/bin" ] && echo "path=runtime"
 "#;
 
 /// The runtime this test names: Firefox's, so installing Firefox in
@@ -546,10 +549,12 @@ fn a_runtime_workspace_binds_the_held_runtime_at_usr() -> Result<(), Box<dyn Err
     assert_eq!(ready, b"ready\n", "{reply}\n{stderr}");
     assert!(held, "the launch did not hold {}", selection.display());
     for line in [
+        "shell=fd-inherited",
+        "curl=upstream",
         "usr=read-only",
         "lib=/usr/lib",
         "lib64=/usr/lib64",
-        "path=/opt/workspace/path:/opt/workspace/bin:/bin:/usr/bin",
+        "path=runtime",
     ] {
         assert!(
             reply.lines().any(|got| got == line),
