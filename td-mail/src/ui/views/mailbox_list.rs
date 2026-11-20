@@ -960,6 +960,12 @@ impl View for MailboxListView {
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
         match response {
+            BackendResponse::MailboxStateChanged => {
+                for entry in self.email_cache.values_mut() {
+                    entry.last_refreshed = SystemTime::UNIX_EPOCH;
+                }
+                false
+            }
             BackendResponse::Mailboxes(result) => {
                 self.loading = false;
                 if std::mem::take(&mut self.reconnect_noted) {
@@ -969,12 +975,17 @@ impl View for MailboxListView {
                     Ok(mailboxes) => {
                         let mut mailboxes = mailboxes.clone();
                         Self::sort_mailboxes(&mut mailboxes);
+                        let selected = self.mailboxes.get(self.cursor).and_then(|held| {
+                            mailboxes.iter().position(|mailbox| mailbox.id == held.id)
+                        });
+                        if selected.is_none() {
+                            self.delete_confirm_mode = false;
+                        }
+                        self.cursor = selected
+                            .unwrap_or_else(|| self.cursor.min(mailboxes.len().saturating_sub(1)));
                         self.mailboxes = mailboxes;
                         self.error = None;
                         self.last_refreshed = Some(SystemTime::now());
-                        if self.cursor >= self.mailboxes.len() && !self.mailboxes.is_empty() {
-                            self.cursor = self.mailboxes.len() - 1;
-                        }
                     }
                     Err(e) => {
                         self.error = Some(format!("Failed to fetch mailboxes: {}", e));
@@ -983,6 +994,7 @@ impl View for MailboxListView {
                 true
             }
             BackendResponse::Emails {
+                pushed: false,
                 mailbox_id,
                 emails,
                 total,
@@ -1132,11 +1144,15 @@ impl View for MailboxListView {
     }
 
     fn trigger_idle_sync(&mut self) -> bool {
-        if self.loading || self.create_mode || self.delete_confirm_mode {
+        if self.loading || !self.accepts_folder_refresh() {
             return false;
         }
         self.request_refresh("mailbox_list.idle_sync");
         true
+    }
+
+    fn accepts_folder_refresh(&self) -> bool {
+        !self.create_mode && !self.delete_confirm_mode && self.setup_step.is_none()
     }
 
     fn on_reveal(&mut self) -> bool {
@@ -1729,6 +1745,7 @@ mod tests {
     fn filtered_results_do_not_replace_the_folder_cache() {
         let (mut view, _) = make_view();
         let page = |filtered, skipped| BackendResponse::Emails {
+            pushed: false,
             mailbox_id: "m1".into(),
             emails: Ok(Vec::new()),
             total: None,

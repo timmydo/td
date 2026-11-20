@@ -44,6 +44,7 @@ version = "0.1.0"
 name = "td-mail"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-civil",
  "td-encoding",
  "td-fetch-client",

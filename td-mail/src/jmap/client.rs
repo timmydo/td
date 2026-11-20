@@ -357,6 +357,7 @@ fn uri_encode(value: &str) -> String {
 
 pub struct JmapClient {
     trust: AccountTrust,
+    pub(crate) events: Option<super::events::Source>,
     username: String,
     password: String,
     api_url: String,
@@ -394,6 +395,7 @@ impl JmapClient {
     pub(crate) fn unreachable_for_tests() -> Self {
         JmapClient {
             trust: AccountTrust::default(),
+            events: None,
             username: "tester".to_string(),
             password: String::new(),
             api_url: "https://mail.invalid/jmap".to_string(),
@@ -554,7 +556,7 @@ impl JmapClient {
     /// who receives the request. Lower-cased, since the scheme and the
     /// host are case-insensitive, and without the scheme's default port,
     /// which names the same receiver spelled or not.
-    fn origin(url: &str) -> Option<String> {
+    pub(super) fn origin(url: &str) -> Option<String> {
         let scheme_end = url.find("://")?;
         let rest = url.get(scheme_end + 3..)?;
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -622,7 +624,7 @@ impl JmapClient {
             }
             trust.unix_socket = Some(path.to_string());
         }
-        let (_final_url, response_text) =
+        let (final_url, response_text) =
             Self::fetch_with_auth_following_redirects(well_known_url, &auth, 5, &trust)?;
 
         log_debug!("[JMAP] Session response received, parsing...");
@@ -669,7 +671,14 @@ impl JmapClient {
             account_id,
             if submission { "listed" } else { "not listed" }
         );
+        let events = session.event_source_url.as_deref().and_then(|template| {
+            if trust.pem.is_some() || trust.unix_socket.is_some() {
+                return None;
+            }
+            super::events::Source::new(well_known_url, &final_url, template, auth, &account_id)
+        });
         let client = JmapClient {
+            events,
             trust,
             username: username.to_string(),
             password: password.to_string(),
@@ -936,9 +945,10 @@ impl JmapClient {
         limit: u32,
         position: u32,
         search_text: Option<&str>,
-        received_after: Option<&str>,
-        received_before: Option<&str>,
+        received_range: (Option<&str>, Option<&str>),
+        calculate_total: bool,
     ) -> Result<EmailQueryResult, JmapError> {
+        let (received_after, received_before) = received_range;
         log_info!(
             "[JMAP] Email/query for mailbox: {} (limit: {}, position: {}, search: {}, after: {:?}, before: {:?})",
             mailbox_id,
@@ -986,6 +996,7 @@ impl JmapClient {
                     "filter": filter,
                     "sort": [{ "property": "receivedAt", "isAscending": false }],
                     "collapseThreads": false,
+                    "calculateTotal": calculate_total,
                     "limit": limit,
                     "position": position
                 }),
@@ -1015,9 +1026,14 @@ impl JmapClient {
                     query_response.ids.len(),
                     query_response.total
                 );
+                let total = if calculate_total {
+                    query_response.prefix_total(limit)
+                } else {
+                    query_response.total
+                };
                 return Ok(EmailQueryResult {
                     ids: query_response.ids,
-                    total: query_response.total,
+                    total,
                     position: query_response.position,
                     search_skipped: query_response.search_skipped,
                 });

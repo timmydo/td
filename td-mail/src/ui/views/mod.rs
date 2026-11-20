@@ -21,6 +21,10 @@ pub mod rules_preview;
 pub mod thread_view;
 pub mod unified_inbox;
 
+/// Maximum background refresh prefix of a message list, or one configured
+/// page if larger. Keep deep pages stable while the reader is using them.
+const REFRESH_MAX: u32 = 1000;
+
 use super::input::Key;
 use crate::backend::BackendResponse;
 use std::sync::OnceLock;
@@ -214,6 +218,14 @@ pub trait View {
     /// Trigger a background sync after the UI has been idle.
     /// Returns true if this changed view state and should re-render.
     fn trigger_idle_sync(&mut self) -> bool {
+        false
+    }
+    /// A folder prompt can depend on the displayed listing.
+    fn accepts_folder_refresh(&self) -> bool {
+        true
+    }
+    /// Start a pending pushed refresh when this view is shown and ready.
+    fn refresh_changed_emails(&mut self) -> bool {
         false
     }
     /// Called when this view becomes the top of the stack again after a child
@@ -562,5 +574,27 @@ mod tests {
         };
         assert_eq!(key, "message:Loading...");
         assert_eq!(text(4), "Load\ning.\n..");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+fn pushed_page(
+    mailbox: &str,
+    requested: u32,
+    raw: td_json::Json,
+    emails: Vec<crate::jmap::types::Email>,
+) -> crate::backend::BackendResponse {
+    let query = crate::jmap::types::EmailQueryResponse::from_json(&raw).unwrap();
+    crate::backend::BackendResponse::Emails {
+        pushed: true,
+        mailbox_id: mailbox.into(),
+        total: query.prefix_total(requested),
+        loaded: query.ids.len() as u32,
+        position: query.position,
+        search_skipped: query.search_skipped,
+        emails: Ok(emails),
+        filtered: false,
+        thread_counts: Default::default(),
     }
 }

@@ -334,6 +334,11 @@ commits a draft and receives a new state on the open connection. A reconnect
 with the old ID receives current state. It also checks that device revocation
 ends an open stream.
 
+td-mail consumes Email and Mailbox events from same-origin HTTPS using
+the public trust roots. Its broker fixture covers fragmented frames,
+catch-up and cancellation. Its window tests cover unread counts during
+composition and the selection retained across a list refresh.
+
 ## Mailbox query availability
 
 The PostgreSQL dispatcher currently returns unknownMethod for Mailbox/query

@@ -71,6 +71,9 @@ const ATTACH_CHORD: &str = "C-S-a";
 /// choose it, as Return does.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
+/// Leave room for all account backends to start in the 32-task mail jail.
+const MAX_ACCOUNTS_WITH_PUSH: usize = 16;
+
 /// Wait on a fire-and-forget child in a detached thread so it does not linger
 /// as a zombie. `Child` has no reaping `Drop` impl, so a dropped handle leaks a
 /// PID slot for the lifetime of td-mail. A thread the jail's task cap
@@ -177,6 +180,9 @@ impl Setup {
             self.my_email_regex.clone(),
             self.spam_config.clone(),
             self.spam_model.clone(),
+            !self.offline
+                && self.sync_interval_secs.is_some()
+                && self.accounts.len() <= MAX_ACCOUNTS_WITH_PUSH,
         )?;
         let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
             origin: origin.to_string(),
@@ -184,7 +190,7 @@ impl Setup {
         if !self.offline {
             self.ask_connection(account, &cmd_tx, false);
         }
-        Ok(Live { cmd_tx, resp_rx })
+        Ok(Live::new(cmd_tx, resp_rx))
     }
 
     /// Asks the connector for the account's connection, for the backend
@@ -230,6 +236,19 @@ fn reply_from(account: &AccountConfig) -> String {
 struct Live {
     cmd_tx: Sender<BackendCommand>,
     resp_rx: Receiver<BackendResponse>,
+    changed: bool,
+    fetching_changes: bool,
+}
+
+impl Live {
+    fn new(cmd_tx: Sender<BackendCommand>, resp_rx: Receiver<BackendResponse>) -> Self {
+        Self {
+            cmd_tx,
+            resp_rx,
+            changed: false,
+            fetching_changes: false,
+        }
+    }
 }
 
 /// A connection to make: the account, the backend it is for, and whether
@@ -1180,6 +1199,27 @@ impl Session {
         }
         if let Some(note) = &self.note {
             scene.status = note.clone();
+        } else if self.sync_interval.is_some()
+            && !self.setup.offline
+            && matches!(scene.body, Body::Edit { focused: true, .. })
+            && self.side() == Side::None
+        {
+            let inbox = self
+                .sidebar
+                .folders(self.draft_account())
+                .and_then(|folders| {
+                    folders
+                        .iter()
+                        .find(|folder| folder.role.as_deref() == Some("inbox"))
+                });
+            if let Some(inbox) = inbox {
+                if let Ok(status) = td_alloc::format(format_args!(
+                    "Inbox: {} unread | {}",
+                    inbox.unread_emails, scene.status
+                )) {
+                    scene.status = status;
+                }
+            }
         }
         scene
     }
@@ -2276,9 +2316,27 @@ impl Handler for Session {
         for index in 0..self.live.len() {
             while let Some(response) = self.live.get(index).and_then(|l| l.resp_rx.try_recv().ok())
             {
+                let response = match response {
+                    BackendResponse::MailboxStateChanged => {
+                        if let Some(live) = self.live.get_mut(index) {
+                            live.changed = self.sync_interval.is_some() && !self.setup.offline;
+                        }
+                        continue;
+                    }
+                    BackendResponse::ChangedMailboxes(result) => {
+                        if let Some(live) = self.live.get_mut(index) {
+                            live.fetching_changes = false;
+                        }
+                        self.stack
+                            .handle_response(index, &BackendResponse::MailboxStateChanged);
+                        let Ok(folders) = result else { continue };
+                        BackendResponse::Mailboxes(Ok(folders))
+                    }
+                    other => other,
+                };
                 if let BackendResponse::Mailboxes(result) = &response {
                     self.sidebar.listed(index, result);
-                    if self.side() != Side::None {
+                    if self.side() != Side::None || self.editing(false) {
                         self.redraw();
                     }
                 }
@@ -2295,6 +2353,29 @@ impl Handler for Session {
                 self.hold_draft();
                 self.take_pending();
             }
+            if let Some(live) = self.live.get_mut(index) {
+                if live.changed
+                    && !live.fetching_changes
+                    && (self.stack.top_account() != Some(index)
+                        || self
+                            .stack
+                            .current()
+                            .is_none_or(|v| v.accepts_folder_refresh()))
+                {
+                    live.changed = false;
+                    live.fetching_changes = live
+                        .cmd_tx
+                        .send(BackendCommand::RefreshChangedMailboxes)
+                        .is_ok();
+                }
+            }
+        }
+        if self
+            .stack
+            .current_mut()
+            .is_some_and(|v| v.refresh_changed_emails())
+        {
+            self.redraw();
         }
         self.take_pending();
         self.settle_close();
@@ -2320,8 +2401,10 @@ impl Handler for Session {
                 // not shown, and the shown one while a view is over its
                 // page. On top, the page syncs itself, and declines while
                 // it asks a question a listing under it could change.
-                let several = self.setup.accounts.len() > 1;
-                if several {
+                // Single-account drafts display their own inbox count.
+                let refresh_counts =
+                    self.setup.accounts.len() > 1 || (!self.setup.offline && self.editing(false));
+                if refresh_counts {
                     let page_on_top =
                         self.stack.depth() == 1 && self.stack.root_account() == Some(self.current);
                     for (index, live) in self.live.iter().enumerate() {
@@ -2332,7 +2415,7 @@ impl Handler for Session {
                         }
                     }
                 }
-                if synced || several {
+                if synced || refresh_counts {
                     self.last_idle_sync = Instant::now();
                 }
             }
@@ -2597,7 +2680,7 @@ mod frame_tests {
         let setup = setup();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (resp_tx, resp_rx) = mpsc::channel();
-        let mut session = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, mouse).unwrap();
+        let mut session = Session::new(setup, vec![Live::new(cmd_tx, resp_rx)], 0, mouse).unwrap();
         resp_tx
             .send(BackendResponse::Mailboxes(Ok(vec![
                 mailbox("1", "INBOX", "inbox", 12, 3),
@@ -2658,16 +2741,7 @@ mod frame_tests {
         let (test_answer, test_rx) = mpsc::channel();
         let (work_tx, work_cmds) = mpsc::channel();
         let (work_answer, work_rx) = mpsc::channel();
-        let live = vec![
-            Live {
-                cmd_tx: test_tx,
-                resp_rx: test_rx,
-            },
-            Live {
-                cmd_tx: work_tx,
-                resp_rx: work_rx,
-            },
-        ];
+        let live = vec![Live::new(test_tx, test_rx), Live::new(work_tx, work_rx)];
         let mut session = Session::new(setup, live, 0, false).unwrap();
         key(&mut session, "Tab");
         assert!(session.shown().contains("Accounts | "));
@@ -2768,16 +2842,7 @@ mod frame_tests {
         let (test_answer, test_rx) = mpsc::channel();
         let (work_tx, work_cmds) = mpsc::channel();
         let (work_answer, work_rx) = mpsc::channel();
-        let live = vec![
-            Live {
-                cmd_tx: test_tx,
-                resp_rx: test_rx,
-            },
-            Live {
-                cmd_tx: work_tx,
-                resp_rx: work_rx,
-            },
-        ];
+        let live = vec![Live::new(test_tx, test_rx), Live::new(work_tx, work_rx)];
         let mut session = Session::new(setup, live, 0, true).unwrap();
         test_answer
             .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
@@ -2868,16 +2933,7 @@ mod frame_tests {
         let (test_answer, test_rx) = mpsc::channel();
         let (work_tx, work_cmds) = mpsc::channel();
         let (work_answer, work_rx) = mpsc::channel();
-        let live = vec![
-            Live {
-                cmd_tx: test_tx,
-                resp_rx: test_rx,
-            },
-            Live {
-                cmd_tx: work_tx,
-                resp_rx: work_rx,
-            },
-        ];
+        let live = vec![Live::new(test_tx, test_rx), Live::new(work_tx, work_rx)];
         let mut session = Session::new(setup, live, 0, true).unwrap();
         test_answer
             .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
@@ -3016,6 +3072,93 @@ mod frame_tests {
         assert!(work_cmds
             .try_iter()
             .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+    }
+
+    #[test]
+    fn idle_draft_refreshes_the_single_inbox_count_without_a_stream() {
+        let state = td_fs::TempDir::new("td-mail-idle-draft").unwrap();
+        let (mut session, commands, responses) = session(false);
+        session.setup.draft_dir = Some(state.path().join("drafts"));
+        session.setup.offline = false;
+        session.sync_interval = Some(Duration::from_secs(60));
+        key(&mut session, "c");
+        key(&mut session, "x");
+        let draft = text(&session);
+        session.last_user_activity = Instant::now() - Duration::from_secs(61);
+        session.last_idle_sync = session.last_user_activity;
+        session.poll(0);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { .. })
+        ));
+        responses
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "1", "INBOX", "inbox", 14, 5,
+            )])))
+            .unwrap();
+        session.poll(0);
+        assert!(commands.try_recv().is_err());
+        assert!(session.shown().contains("Inbox: 5 unread"));
+        assert_eq!(text(&session), draft);
+    }
+
+    #[test]
+    fn push_updates_the_open_accounts_counts_without_interrupting_a_draft() {
+        let state = td_fs::TempDir::new("td-mail-push-draft").unwrap();
+        let (mut session, commands, responses) = session(false);
+        session.setup.draft_dir = Some(state.path().join("drafts"));
+        session.setup.offline = false;
+        responses
+            .send(BackendResponse::MailboxStateChanged)
+            .unwrap();
+        session.poll(0);
+        assert!(commands.try_recv().is_err(), "automatic sync is off");
+        session.sync_interval = Some(Duration::from_secs(60));
+        key(&mut session, "c");
+        key(&mut session, "x");
+        let draft = text(&session);
+        let tab = session.pane.tab();
+        for _ in 0..2 {
+            responses
+                .send(BackendResponse::MailboxStateChanged)
+                .unwrap();
+        }
+        session.poll(0);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::RefreshChangedMailboxes)
+        ));
+        // Further hints can accumulate in at most one follow-up, even when
+        // another request's cached mailbox listing arrives in between.
+        for _ in 0..2 {
+            responses
+                .send(BackendResponse::MailboxStateChanged)
+                .unwrap();
+        }
+        responses
+            .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
+                "1", "INBOX", "inbox", 12, 3,
+            )])))
+            .unwrap();
+        session.poll(0);
+        assert!(commands.try_recv().is_err());
+        responses
+            .send(BackendResponse::ChangedMailboxes(Ok(vec![mailbox(
+                "1", "INBOX", "inbox", 13, 4,
+            )])))
+            .unwrap();
+        session.poll(0);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::RefreshChangedMailboxes)
+        ));
+        assert!(commands.try_recv().is_err());
+        assert_eq!(session.sidebar.folders(0).unwrap()[0].unread_emails, 4);
+        assert!(session.editing(false));
+        assert_eq!(session.pane.tab(), tab);
+        assert_eq!(text(&session), draft);
+        let shown = session.shown();
+        assert!(shown.contains("Inbox: 4 unread"), "{shown}");
     }
 
     /// `two_accounts_answering`, `test` listing an inbox and 40 folders
@@ -3315,6 +3458,7 @@ mod frame_tests {
             extra: std::collections::HashMap::new(),
         };
         let answer = |inbox: &str, email| BackendResponse::Emails {
+            pushed: false,
             search_skipped: 0,
             filtered: false,
             mailbox_id: inbox.to_string(),
@@ -4810,7 +4954,7 @@ mod frame_tests {
         setup.accounts = vec![work.clone()];
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (_resp_tx, resp_rx) = mpsc::channel();
-        let mut session = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, false).unwrap();
+        let mut session = Session::new(setup, vec![Live::new(cmd_tx, resp_rx)], 0, false).unwrap();
         key(&mut session, "c");
         assert!(
             text(&session).starts_with("From: Work <me@work.test>\nTo: \n"),
@@ -5437,7 +5581,7 @@ mod frame_tests {
         let setup = setup();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (resp_tx, resp_rx) = mpsc::channel();
-        let mut empty = Session::new(setup, vec![Live { cmd_tx, resp_rx }], 0, true).unwrap();
+        let mut empty = Session::new(setup, vec![Live::new(cmd_tx, resp_rx)], 0, true).unwrap();
         resp_tx
             .send(BackendResponse::Mailboxes(Ok(Vec::new())))
             .unwrap();

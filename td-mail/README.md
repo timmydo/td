@@ -474,6 +474,17 @@ not change its destination policy: the td image service still refuses
 loopback. The host launcher installed by `./install-apps` permits local
 mail-server requests while keeping public-content fetches off loopback.
 
+The interactive client watches mailbox and email changes over a streamed
+GET to the configured HTTPS origin using td-fetch’s public roots. The
+stream sends the account’s Basic credential and follows no redirects.
+Accounts using a private CA or a Unix socket use timed and manual refresh
+through the broker’s counted requests. Up to two accounts can watch at once.
+Windows with more than sixteen accounts use timed refresh for all accounts.
+The CLI and offline windows never open event streams. Each successful stream connection
+requests current mailbox counts, including after a disconnect. Stream
+failures retry after two seconds, backing off to one minute. The broker
+bounds each response to 512 KiB and td-mail bounds each event to 8 KiB.
+
 Each account sets exactly one of `secret = "td-pass"`, `secret = "portal"`, `password_file`, or `password_command`.
 
 `password_command` runs through `sh -c`, so it works only where td-mail has
@@ -557,10 +568,15 @@ the tree narrow and widen it, from 12 cells to half the window; a name
 too long for the tree is cut short with `…` a cell before its unread
 count. A window narrower than three default trees (72 cells) shows the
 tree over the views only while it has the keys, and has no width to
-change. Switching accounts connects nothing again; the tree's counts
-follow each account's folder fetches,
-and with `sync_interval` set, every idle interval asks every account,
-whatever view is shown. If an account cannot be reached
+change. Switching accounts connects nothing again. With automatic sync
+enabled, a JMAP state-change notification refreshes the affected account's
+folder counts even while you compose. When the account tree is hidden,
+the draft's status row shows the inbox unread count. A push refresh
+keeps the selected message visible when a server limits the first page. While
+you browse later pages, folder counts stay current and the list keeps its
+loaded pages until you refresh it or reopen the folder. Idle refresh also checks for
+changes when push is unavailable. Set `sync_interval_secs = 0` to turn off
+both forms of automatic sync. If an account cannot be reached
 (server down, network not up yet, placeholder credentials), td-mail lists
 what its cache holds instead of exiting, and everything it cannot serve
 from the cache says why the connection failed
@@ -570,9 +586,11 @@ waiting its turn; an account already connected goes on serving with its
 connection meanwhile and refreshes its folders once the new one is made.
 Every account's backend scores and trains the one spam model, so
 training in one account is not lost to another's save. Each account
-costs the window a thread, and the packaged jail caps td-mail's tasks at
-32, so a configuration of more than about twenty accounts fails to
-start there.
+costs the window a backend thread. Up to two accounts can watch for changes
+at the same time; other accounts use idle refresh. A configuration with
+more than 16 accounts uses idle refresh for every account, leaving capacity
+for account backends and the bounded fetch-socket connector. The packaged
+jail caps td-mail's tasks at 32.
 
 Optional rules file path defaults to `rules.toml` next to your config; override with `--rules=PATH`.
 

@@ -191,6 +191,7 @@ pub struct JmapSession {
     pub api_url: String,
     pub download_url: Option<String>,
     pub upload_url: Option<String>,
+    pub event_source_url: Option<String>,
     /// The core capability's `maxSizeUpload`, when the session names it.
     pub max_size_upload: Option<u64>,
     pub max_objects_in_set: Option<u64>,
@@ -241,6 +242,10 @@ impl JmapSession {
             api_url: req_str(obj, "apiUrl")?,
             download_url: opt_str(obj, "downloadUrl")?,
             upload_url: opt_str(obj, "uploadUrl")?,
+            event_source_url: present(obj, "eventSourceUrl")
+                .and_then(Json::as_str)
+                .filter(|url| url.len() <= super::events::MAX_URL)
+                .and_then(|url| td_alloc::string(url).ok()),
             max_size_upload,
             max_objects_in_set,
             max_objects_in_get,
@@ -508,10 +513,20 @@ pub struct EmailQueryResponse {
     pub ids: Vec<String>,
     pub position: u32,
     pub total: Option<u32>,
+    pub limit: Option<u32>,
     pub search_skipped: u32,
 }
 
 impl EmailQueryResponse {
+    /// An uncapped or server-capped short first page exhausted the query.
+    pub fn prefix_total(&self, requested: u32) -> Option<u32> {
+        self.total.or_else(|| {
+            let loaded = u32::try_from(self.ids.len()).ok()?;
+            let limit = self.limit.unwrap_or(requested).min(requested);
+            (self.position == 0 && self.search_skipped == 0 && loaded < limit).then_some(loaded)
+        })
+    }
+
     pub fn from_json(value: &Json) -> Result<Self, JsonError> {
         let obj = object(value, "EmailQueryResponse")?;
         let ids = present(obj, "ids").ok_or_else(|| missing("ids"))?;
@@ -526,6 +541,7 @@ impl EmailQueryResponse {
             ids: strs(ids, "ids")?,
             position: def_u32(obj, "position")?,
             total,
+            limit: opt_u32(obj, "limit")?,
             search_skipped,
         })
     }

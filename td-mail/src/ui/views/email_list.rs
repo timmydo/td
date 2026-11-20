@@ -84,13 +84,14 @@ pub struct EmailListView {
     last_loaded_count: u32,
     loading: bool,
     loading_more: bool,
+    changed: bool,
     error: Option<String>,
     pending_click: bool,
     pending_reply_request: Option<(String, bool)>,
     pending_compose: Option<String>,
     pending_rules_preview: Option<(String, RulesDryRunResult)>,
     mailboxes: Vec<Mailbox>,
-    move_mode: bool,
+    move_source: Option<String>,
     move_cursor: usize,
     search_mode: bool,
     search_input: String,
@@ -136,13 +137,14 @@ impl EmailListView {
             last_loaded_count: 0,
             loading: true,
             loading_more: false,
+            changed: false,
             error: None,
             pending_click: false,
             pending_reply_request: None,
             pending_compose: None,
             pending_rules_preview: None,
             mailboxes,
-            move_mode: false,
+            move_source: None,
             move_cursor: 0,
             search_mode: false,
             search_input: String::new(),
@@ -178,14 +180,20 @@ impl EmailListView {
     }
 
     fn request_refresh(&mut self, origin: &str) {
-        self.next_query_position = 0;
-        self.last_loaded_count = 0;
+        self.request_prefix(origin, self.page_size);
+    }
+
+    fn request_prefix(&mut self, origin: &str, page_size: u32) {
+        if origin != crate::backend::CHANGED_EMAILS {
+            self.next_query_position = 0;
+            self.last_loaded_count = 0;
+        }
         self.loading = true;
         self.loading_more = false;
         let _ = self.cmd_tx.send(BackendCommand::QueryEmails {
             origin: origin.to_string(),
             mailbox_id: self.mailbox_id.clone(),
-            page_size: self.page_size,
+            page_size,
             position: 0,
             search_query: self.active_search.clone(),
             received_after: None,
@@ -329,7 +337,7 @@ impl EmailListView {
     /// The messages, the mailbox picker while moving, or the word for a
     /// list there is nothing to show of.
     fn body(&self) -> Body<'_> {
-        if self.move_mode {
+        if self.move_source.is_some() {
             return Body::List {
                 total: self.mailboxes.len(),
                 selected: self.move_cursor,
@@ -373,7 +381,7 @@ impl EmailListView {
         // typed, and the picker its place in the mailboxes.
         let base = if self.search_mode {
             "RET:search Esc:cancel".to_string()
-        } else if self.move_mode {
+        } else if self.move_source.is_some() {
             format!(
                 "Move to mailbox: {}/{} | n/p:navigate RET:move Esc:cancel",
                 self.move_cursor + 1,
@@ -718,7 +726,7 @@ impl View for EmailListView {
     fn scene(&self) -> Scene<'_> {
         let (labels, keys) = if self.search_mode {
             (SEARCH_LABELS, SEARCH_KEYS)
-        } else if self.move_mode {
+        } else if self.move_source.is_some() {
             (MOVE_LABELS, MOVE_KEYS)
         } else {
             (LIST_LABELS, LIST_KEYS)
@@ -767,10 +775,10 @@ impl View for EmailListView {
         }
 
         // Move mode: mailbox picker
-        if self.move_mode {
+        if self.move_source.is_some() {
             match key {
                 Key::Escape | Key::Char('q') => {
-                    self.move_mode = false;
+                    self.move_source = None;
                 }
                 Key::Char('n') | Key::Char('j') | Key::Down => {
                     if !self.mailboxes.is_empty() && self.move_cursor + 1 < self.mailboxes.len() {
@@ -786,9 +794,13 @@ impl View for EmailListView {
                     if let Some(target_id) =
                         self.mailboxes.get(self.move_cursor).map(|m| m.id.clone())
                     {
-                        if let Some(email) = self.emails.get(self.cursor).cloned() {
+                        let source = self
+                            .move_source
+                            .as_deref()
+                            .and_then(|id| self.emails.iter().position(|email| email.id == id));
+                        if let Some(from_index) = source {
+                            let email = self.emails.remove(from_index);
                             let op_id = self.next_op_id();
-                            let from_index = self.cursor;
                             self.pending_write_ops.insert(
                                 op_id,
                                 PendingWriteOp::Move {
@@ -801,7 +813,6 @@ impl View for EmailListView {
                                 id: email.id.clone(),
                                 to_mailbox_id: target_id,
                             });
-                            self.emails.remove(from_index);
                             if self.cursor >= self.emails.len() && self.cursor > 0 {
                                 self.cursor -= 1;
                             }
@@ -820,7 +831,7 @@ impl View for EmailListView {
                                 );
                             }
                         }
-                        self.move_mode = false;
+                        self.move_source = None;
                     }
                 }
                 Key::ScrollUp => {
@@ -1038,8 +1049,11 @@ impl View for EmailListView {
                 ViewAction::Continue
             }
             Key::Char('m') => {
-                if !self.emails.is_empty() && !self.mailboxes.is_empty() {
-                    self.move_mode = true;
+                if !self.mailboxes.is_empty() {
+                    self.move_source = self
+                        .emails
+                        .get(self.cursor)
+                        .and_then(|email| td_alloc::string(&email.id).ok());
                     self.move_cursor = 0;
                 }
                 ViewAction::Continue
@@ -1153,6 +1167,10 @@ impl View for EmailListView {
             return changed;
         }
         match response {
+            BackendResponse::MailboxStateChanged => {
+                self.changed = true;
+                false
+            }
             BackendResponse::EmailListPreview {
                 mailbox_id,
                 emails,
@@ -1170,6 +1188,7 @@ impl View for EmailListView {
                 true
             }
             BackendResponse::Emails {
+                pushed,
                 mailbox_id,
                 emails,
                 total,
@@ -1181,6 +1200,19 @@ impl View for EmailListView {
             } if *mailbox_id == self.mailbox_id => {
                 self.loading = false;
                 self.loading_more = false;
+                if *pushed {
+                    let Ok(fresh) = emails else { return true };
+                    let complete = total.is_some_and(|n| *loaded >= n);
+                    if !complete
+                        && (*loaded < self.next_query_position
+                            || (total.is_none() && *loaded < self.page_size)
+                            || self.emails.get(self.cursor).is_some_and(|selected| {
+                                !fresh.iter().any(|email| email.id == selected.id)
+                            }))
+                    {
+                        return true;
+                    }
+                }
                 self.total = *total;
                 self.last_loaded_count = *loaded;
                 self.next_query_position = position.saturating_add(*loaded);
@@ -1227,15 +1259,21 @@ impl View for EmailListView {
                                     _ => None,
                                 })
                                 .collect();
-                            if inflight_move_ids.is_empty() {
-                                self.emails = emails.clone();
+                            let fresh: Vec<Email> = if inflight_move_ids.is_empty() {
+                                emails.clone()
                             } else {
-                                self.emails = emails
+                                emails
                                     .iter()
                                     .filter(|e| !inflight_move_ids.contains(e.id.as_str()))
                                     .cloned()
-                                    .collect();
-                            }
+                                    .collect()
+                            };
+                            self.cursor = self
+                                .emails
+                                .get(self.cursor)
+                                .and_then(|held| fresh.iter().position(|email| email.id == held.id))
+                                .unwrap_or_else(|| self.cursor.min(fresh.len().saturating_sub(1)));
+                            self.emails = fresh;
                             self.thread_counts = thread_counts.clone();
                             for (id, seen, value) in pending_keywords {
                                 if seen {
@@ -1405,10 +1443,36 @@ impl View for EmailListView {
     }
 
     fn trigger_idle_sync(&mut self) -> bool {
-        if self.loading || self.move_mode || self.search_mode {
+        if self.loading
+            || self.move_source.is_some()
+            || self.search_mode
+            || self.next_query_position > self.last_loaded_count
+        {
             return false;
         }
         self.request_refresh("email_list.idle_sync");
+        true
+    }
+
+    fn refresh_changed_emails(&mut self) -> bool {
+        if !self.changed
+            || self.loading
+            || self.search_mode
+            || self.move_source.is_some()
+            || self.next_query_position > self.last_loaded_count
+        {
+            return false;
+        }
+        let cap = super::REFRESH_MAX.max(self.page_size);
+        let cursor = u32::try_from(self.cursor).unwrap_or(u32::MAX);
+        if cursor >= cap {
+            return false;
+        }
+        self.changed = false;
+        let size = self
+            .next_query_position
+            .max(cursor.saturating_add(self.page_size));
+        self.request_prefix(crate::backend::CHANGED_EMAILS, size.min(cap));
         true
     }
 }
@@ -1503,6 +1567,124 @@ mod tests {
         view.thread_counts.insert("thread-B".to_string(), (1, 1));
 
         (view, cmd_rx)
+    }
+
+    #[test]
+    fn a_pushed_refresh_defers_for_search_and_keeps_the_selected_message() {
+        let (mut view, commands) = make_view();
+        view.cursor = 1;
+        view.search_mode = true;
+        view.on_response(&BackendResponse::MailboxStateChanged);
+        assert!(!view.refresh_changed_emails());
+        assert!(commands.try_recv().is_err());
+        view.search_mode = false;
+        assert!(view.refresh_changed_emails());
+        assert!(!view.refresh_changed_emails());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::QueryEmails { .. })
+        ));
+        let fresh = BackendResponse::Emails {
+            pushed: true,
+            mailbox_id: view.mailbox_id.clone(),
+            emails: Ok(vec![
+                make_email("arrival", "thread-C"),
+                make_email("email-1", "thread-A"),
+                make_email("email-2", "thread-A"),
+            ]),
+            total: Some(3),
+            position: 0,
+            loaded: 3,
+            search_skipped: 0,
+            filtered: false,
+            thread_counts: HashMap::new(),
+        };
+        assert!(view.on_response(&fresh));
+        assert_eq!(view.emails.get(view.cursor).unwrap().id, "email-2");
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn failed_or_capped_push_keeps_rows_selection_and_next_page() {
+        let (mut view, commands) = make_view();
+        view.cursor = 2;
+        view.page_size = 3;
+        view.next_query_position = 3;
+        view.last_loaded_count = 3;
+        view.total = Some(8);
+        for result in [
+            Err("read failed".to_string()),
+            Ok(vec![make_email("arrival", "thread-C")]),
+        ] {
+            view.on_response(&BackendResponse::MailboxStateChanged);
+            assert!(view.refresh_changed_emails());
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(BackendCommand::QueryEmails { position: 0, .. })
+            ));
+            let reply = BackendResponse::Emails {
+                pushed: true,
+                mailbox_id: view.mailbox_id.clone(),
+                emails: result,
+                total: None,
+                position: 0,
+                loaded: 1,
+                search_skipped: 0,
+                filtered: false,
+                thread_counts: HashMap::new(),
+            };
+            view.on_response(&reply);
+            assert_eq!(view.emails.len(), 3);
+            assert_eq!(view.emails[view.cursor].id, "email-3");
+            assert_eq!(
+                (view.total, view.next_query_position, view.last_loaded_count),
+                (Some(8), 3, 3)
+            );
+            assert!(view.error.is_none());
+            assert!(view.can_load_more());
+        }
+        assert!(view.request_load_more());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::QueryEmails { position: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn push_accepts_a_short_first_page_but_preserves_rows_at_the_advertised_cap() {
+        let (mut view, _commands) = make_view();
+        view.cursor = 2;
+        view.next_query_position = 3;
+        view.last_loaded_count = 3;
+        let mut raw = td_json::json!({"accountId":"a","queryState":"q","position":0,"ids":["email-1","email-2"],"limit":2});
+        let fresh = || vec![make_email("email-1", "t"), make_email("email-2", "t")];
+        let reply = super::super::pushed_page(&view.mailbox_id, 50, raw.clone(), fresh());
+        view.on_response(&reply);
+        assert_eq!(view.emails.len(), 3);
+        assert_eq!(view.emails[view.cursor].id, "email-3");
+        raw.insert("limit", 4);
+        view.on_response(&super::super::pushed_page(
+            &view.mailbox_id,
+            50,
+            raw,
+            fresh(),
+        ));
+        assert_eq!(view.total, Some(2));
+        assert_eq!(view.emails.len(), 2);
+        assert_eq!(view.emails[view.cursor].id, "email-2");
+    }
+
+    #[test]
+    fn a_later_page_stays_in_place_during_push_and_idle_sync() {
+        let (mut view, commands) = make_view();
+        view.cursor = 2;
+        view.next_query_position = 3;
+        view.last_loaded_count = 1;
+        view.on_response(&BackendResponse::MailboxStateChanged);
+        assert!(!view.refresh_changed_emails());
+        assert!(!view.trigger_idle_sync());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(view.emails[view.cursor].id, "email-3");
     }
 
     /// Every row the scene's list names, in order.
@@ -1636,7 +1818,7 @@ mod tests {
 
         // Enter move mode
         view.handle_key(Key::Char('m'), 24);
-        assert!(view.move_mode);
+        assert!(view.move_source.is_some());
 
         // Select the second mailbox (Archive) and confirm
         view.handle_key(Key::Char('n'), 24);
@@ -1654,6 +1836,35 @@ mod tests {
             }
         }
         assert!(found_move_email, "expected MoveEmail command for move");
+    }
+
+    #[test]
+    fn folder_picker_cannot_move_a_replacement_row_when_its_message_disappears() {
+        let (mut view, cmd_rx) = make_view();
+        view.cursor = 1;
+        view.on_response(&BackendResponse::MailboxStateChanged);
+        assert!(view.refresh_changed_emails());
+        view.handle_key(Key::Char('m'), 24);
+        view.handle_key(Key::Down, 24);
+        let reply = BackendResponse::Emails {
+            pushed: true,
+            mailbox_id: view.mailbox_id.clone(),
+            emails: Ok(vec![
+                make_email("email-1", "thread-A"),
+                make_email("other", "thread-B"),
+            ]),
+            total: Some(2),
+            position: 0,
+            loaded: 2,
+            search_skipped: 0,
+            filtered: false,
+            thread_counts: HashMap::new(),
+        };
+        view.on_response(&reply);
+        view.handle_key(Key::Enter, 24);
+        assert!(!cmd_rx
+            .try_iter()
+            .any(|cmd| matches!(cmd, BackendCommand::MoveEmail { .. })));
     }
 
     #[test]
@@ -2042,6 +2253,7 @@ mod tests {
         assert_eq!(view.last_loaded_count, 0);
         assert!(view.last_refreshed.is_none());
         let final_response = BackendResponse::Emails {
+            pushed: false,
             filtered: false,
             search_skipped: 0,
             mailbox_id: view.mailbox_id.clone(),
@@ -2139,6 +2351,7 @@ mod tests {
                 .collect();
             assert_eq!(operations.len(), 2);
             let completed = BackendResponse::Emails {
+                pushed: false,
                 filtered: false,
                 search_skipped: 0,
                 mailbox_id: view.mailbox_id.clone(),
@@ -2188,6 +2401,7 @@ mod tests {
         let (mut view, _) = make_view();
         view.active_search = Some("invoice".into());
         let response = |position, skipped, emails| BackendResponse::Emails {
+            pushed: false,
             mailbox_id: view.mailbox_id.clone(),
             emails: Ok(emails),
             total: None,

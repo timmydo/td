@@ -49,9 +49,6 @@ const KEYS: &[Key] = &[
 /// view too.
 const FIRST_OP: u64 = 1 << 40;
 
-/// The most messages a refresh asks one account for at once.
-const REFRESH_MAX: u32 = 1000;
-
 /// An account's inbox as the view is given it: the account's place in
 /// the session, its name, its backend, the From its replies and drafts
 /// use, the folders an archive or a delete moves to, and its folders as
@@ -75,8 +72,10 @@ struct Part {
     /// Its messages, newest first, as fetched page by page.
     emails: Vec<Email>,
     loading: bool,
+    changed: bool,
     /// How many messages its last fetch asked for.
     requested: u32,
+    paged: bool,
     /// Older messages are still unfetched.
     more: bool,
     error: Option<String>,
@@ -147,7 +146,9 @@ impl UnifiedInboxView {
                     inbox,
                     emails: Vec::new(),
                     loading: false,
+                    changed: false,
                     requested: 0,
+                    paged: false,
                     more: false,
                     error: None,
                 })
@@ -181,6 +182,10 @@ impl UnifiedInboxView {
     /// waiting on a move), bounded, so its answer replaces them all and
     /// none is kept unchecked.
     fn query(&mut self, index: usize, position: u32) {
+        self.query_from(index, position, "unified_inbox");
+    }
+
+    fn query_from(&mut self, index: usize, position: u32, origin: &str) {
         let moving = self
             .pending
             .values()
@@ -193,20 +198,20 @@ impl UnifiedInboxView {
         let size = if position == 0 {
             let fetched =
                 u32::try_from(part.emails.len().saturating_add(moving)).unwrap_or(u32::MAX);
-            fetched.clamp(page_size, REFRESH_MAX.max(page_size))
+            fetched.clamp(page_size, super::REFRESH_MAX.max(page_size))
         } else {
             page_size
         };
         let Some(id) = part.id.clone() else {
             let _ = part.inbox.cmd_tx.send(BackendCommand::FetchMailboxes {
-                origin: "unified_inbox".to_string(),
+                origin: origin.to_string(),
             });
             return;
         };
         part.loading = true;
         part.requested = size;
         let _ = part.inbox.cmd_tx.send(BackendCommand::QueryEmails {
-            origin: "unified_inbox".to_string(),
+            origin: origin.to_string(),
             mailbox_id: id,
             page_size: size,
             position,
@@ -296,6 +301,36 @@ impl UnifiedInboxView {
     fn selected(&self) -> Option<(usize, &Email)> {
         let &(part, email) = self.rows.get(self.cursor)?;
         Some((part, self.parts.get(part)?.emails.get(email)?))
+    }
+
+    fn push_covers_view(
+        &self,
+        index: usize,
+        fresh: &[Email],
+        loaded: u32,
+        total: Option<u32>,
+    ) -> bool {
+        if self.parts.iter().any(|p| p.paged) {
+            return false;
+        }
+        if total.is_some_and(|n| loaded >= n) {
+            return true;
+        }
+        if self.parts.get(index).is_none_or(|p| {
+            (loaded as usize) < p.emails.len() || (total.is_none() && loaded < p.requested)
+        }) {
+            return false;
+        }
+        let Some((selected_part, selected)) = self.selected() else {
+            return true;
+        };
+        if selected_part == index {
+            fresh.iter().any(|e| e.id == selected.id)
+        } else {
+            // A shorter window here can hide another account's selected row.
+            let horizon = fresh.iter().filter_map(|e| e.received_at.as_deref()).min();
+            selected.received_at.as_deref() >= horizon
+        }
     }
 
     fn next_op(&mut self) -> u64 {
@@ -692,6 +727,12 @@ impl View for UnifiedInboxView {
             return changed;
         }
         match response {
+            BackendResponse::MailboxStateChanged => {
+                if let Some(part) = self.parts.get_mut(index) {
+                    part.changed = true;
+                }
+                false
+            }
             BackendResponse::RulesRun {
                 mailbox_id,
                 result: Err(error),
@@ -722,6 +763,7 @@ impl View for UnifiedInboxView {
                         }
                         part.id = id;
                         part.emails.clear();
+                        part.paged = false;
                         part.more = false;
                         part.error = None;
                         self.rebuild(hold);
@@ -736,6 +778,7 @@ impl View for UnifiedInboxView {
                 }
             }
             BackendResponse::Emails {
+                pushed,
                 mailbox_id,
                 emails,
                 total,
@@ -743,6 +786,19 @@ impl View for UnifiedInboxView {
                 loaded,
                 ..
             } => {
+                if *pushed
+                    && !emails
+                        .as_ref()
+                        .is_ok_and(|fresh| self.push_covers_view(index, fresh, *loaded, *total))
+                {
+                    if let Some(part) = self.parts.get_mut(index) {
+                        if part.id.as_deref() == Some(mailbox_id.as_str()) {
+                            part.loading = false;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 let hold = self.key_at(self.cursor);
                 let moving: HashSet<String> = self
                     .pending
@@ -762,6 +818,7 @@ impl View for UnifiedInboxView {
                 part.loading = false;
                 match emails {
                     Ok(emails) => {
+                        part.paged = *position > 0;
                         let fresh = emails.iter().filter(|e| !moving.contains(&e.id)).cloned();
                         if *position == 0 {
                             // It asked for all that was fetched: the whole
@@ -853,8 +910,30 @@ impl View for UnifiedInboxView {
     }
 
     fn trigger_idle_sync(&mut self) -> bool {
+        if self.parts.iter().any(|p| p.paged || p.loading) {
+            return false;
+        }
         self.refresh();
         true
+    }
+
+    fn refresh_changed_emails(&mut self) -> bool {
+        if self.parts.iter().any(|p| p.paged) {
+            return false;
+        }
+        let mut started = false;
+        for index in 0..self.parts.len() {
+            if let Some(part) = self.parts.get_mut(index) {
+                if part.changed && !part.loading {
+                    part.changed = false;
+                    if part.id.is_some() {
+                        self.query_from(index, 0, crate::backend::CHANGED_EMAILS);
+                        started = true;
+                    }
+                }
+            }
+        }
+        started
     }
 }
 
@@ -922,6 +1001,7 @@ mod tests {
 
     fn emails(mailbox_id: &str, list: Vec<Email>) -> BackendResponse {
         BackendResponse::Emails {
+            pushed: false,
             search_skipped: 0,
             filtered: false,
             mailbox_id: mailbox_id.to_string(),
@@ -1195,6 +1275,7 @@ mod tests {
 
     fn page(mailbox_id: &str, list: Vec<Email>, position: u32, loaded: u32) -> BackendResponse {
         BackendResponse::Emails {
+            pushed: false,
             search_skipped: 0,
             filtered: false,
             mailbox_id: mailbox_id.to_string(),
@@ -1208,6 +1289,83 @@ mod tests {
 
     fn selected_id(view: &UnifiedInboxView) -> String {
         view.selected().unwrap().1.id.clone()
+    }
+
+    #[test]
+    fn a_push_during_an_inbox_read_refreshes_only_that_account_when_ready() {
+        let (mut view, home, work) = two(50);
+        view.on_account_response(1, &BackendResponse::MailboxStateChanged);
+        assert!(!view.refresh_changed_emails());
+        view.on_account_response(1, &emails("w-in", vec![email("w1", "2026-01-01")]));
+        assert!(view.refresh_changed_emails());
+        assert!(!view.refresh_changed_emails());
+        assert!(
+            matches!(work.try_recv(), Ok(BackendCommand::QueryEmails { mailbox_id, .. }) if mailbox_id == "w-in")
+        );
+        assert!(home.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_or_short_push_preserves_another_accounts_selected_row() {
+        let (mut view, home, _work) = two(2);
+        view.on_account_response(
+            0,
+            &page("h-in", vec![email("h3", "03"), email("h1", "01")], 0, 2),
+        );
+        view.on_account_response(1, &page("w-in", vec![email("w2", "02")], 0, 1));
+        view.cursor = 1;
+        assert_eq!(selected_id(&view), "w2");
+        for result in [
+            Err("read failed".to_string()),
+            Ok(vec![email("h4", "04"), email("h3", "03")]),
+        ] {
+            view.on_account_response(0, &BackendResponse::MailboxStateChanged);
+            assert!(view.refresh_changed_emails());
+            assert!(matches!(
+                home.try_recv(),
+                Ok(BackendCommand::QueryEmails { position: 0, .. })
+            ));
+            let reply = BackendResponse::Emails {
+                pushed: true,
+                mailbox_id: "h-in".into(),
+                emails: result,
+                total: Some(6),
+                position: 0,
+                loaded: 2,
+                search_skipped: 0,
+                filtered: false,
+                thread_counts: HashMap::new(),
+            };
+            view.on_account_response(0, &reply);
+            assert_eq!(selected_id(&view), "w2");
+            assert_eq!(view.rows.len(), 3);
+            assert_eq!(view.parts[0].emails[1].id, "h1");
+            assert!(view.parts[0].more);
+            assert!(view.parts[0].error.is_none());
+        }
+        view.cursor = 2;
+        view.load_more();
+        assert!(matches!(
+            home.try_recv(),
+            Ok(BackendCommand::QueryEmails { position: 2, .. })
+        ));
+        view.on_account_response(0, &page("h-in", vec![email("h0", "00")], 2, 1));
+        view.on_account_response(1, &BackendResponse::MailboxStateChanged);
+        assert!(!view.refresh_changed_emails());
+        assert!(!view.trigger_idle_sync());
+        assert_eq!(view.parts[0].emails.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_first_page_without_a_count_removes_the_last_unified_row() {
+        let (mut view, _home, _work) = two(50);
+        view.on_account_response(0, &page("h-in", vec![email("old", "01")], 0, 1));
+        let raw = td_json::json!({"accountId":"h","queryState":"q","position":0,"ids":[]});
+        let empty = super::super::pushed_page("h-in", 50, raw, vec![]);
+        view.on_account_response(0, &empty);
+        assert!(view.selected().is_none());
+        assert!(view.rows.is_empty());
+        assert!(!view.parts[0].more);
     }
 
     /// The cursor stays on its message when new mail of its account

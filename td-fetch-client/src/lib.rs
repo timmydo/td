@@ -78,8 +78,6 @@ impl Response {
 /// A streamed reply: its head, then its body a frame at a time as the
 /// origin sends it. Dropping it closes the connection, which is how a
 /// caller stops a stream early; the service then closes the origin's.
-/// Neither application streams yet; the stream's items, like `post`, stay
-/// in the one text all the same.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Stream {
@@ -276,6 +274,7 @@ pub fn get_public_within(
             unix_socket: None,
             tls_ca: None,
             redirects: Some(0),
+            connect: None,
             stream: false,
             public: true,
             deadline,
@@ -305,7 +304,28 @@ pub fn get_stream(
     limit: Option<u64>,
     redirects: Option<u32>,
 ) -> Result<Stream, Error> {
-    stream("GET", url, headers, &[], limit, redirects)
+    stream("GET", url, headers, &[], limit, redirects, None)
+}
+
+/// Stream a GET with redirects disabled. The connector receives td-fetch's
+/// configured broker socket path. A caller can put a deadline on the local
+/// dial and retain a shutdown handle before sending credentials or waiting
+/// for the response head.
+pub fn get_stream_with_connector(
+    url: &str,
+    headers: &[(&str, &str)],
+    limit: u64,
+    connect: &dyn Fn(PathBuf) -> std::io::Result<UnixStream>,
+) -> Result<Stream, Error> {
+    stream(
+        "GET",
+        url,
+        headers,
+        &[],
+        Some(limit),
+        Some(0),
+        Some(connect),
+    )
 }
 
 /// `post`, with the reply's body handed over as the origin sends it: a
@@ -317,7 +337,7 @@ pub fn post_stream(
     body: &[u8],
     limit: Option<u64>,
 ) -> Result<Stream, Error> {
-    stream("POST", url, headers, body, limit, None)
+    stream("POST", url, headers, body, limit, None, None)
 }
 
 /// A counted GET or POST using public roots when `tls_ca` is absent,
@@ -341,6 +361,7 @@ pub fn request_with_ca(
         Shape {
             unix_socket: None,
             redirects: Some(0),
+            connect: None,
             stream: false,
             public: false,
             deadline: None,
@@ -371,6 +392,7 @@ pub fn request_with_unix_socket(
             unix_socket: Some(path),
             tls_ca: None,
             redirects: Some(0),
+            connect: None,
             stream: false,
             public: false,
             deadline: None,
@@ -398,6 +420,7 @@ fn request(
             unix_socket: None,
             tls_ca: None,
             redirects,
+            connect: None,
             stream: false,
             public: false,
             deadline: None,
@@ -413,6 +436,7 @@ fn stream(
     body: &[u8],
     limit: Option<u64>,
     redirects: Option<u32>,
+    connect: Option<Connector<'_>>,
 ) -> Result<Stream, Error> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     let (mut reader, written) = send(
@@ -425,6 +449,7 @@ fn stream(
             unix_socket: None,
             tls_ca: None,
             redirects,
+            connect,
             stream: true,
             public: false,
             deadline: None,
@@ -452,7 +477,9 @@ fn stream(
 }
 
 /// A request's optional framing and per-request PEM trust bundle.
+type Connector<'a> = &'a dyn Fn(PathBuf) -> std::io::Result<UnixStream>;
 struct Shape<'a> {
+    connect: Option<Connector<'a>>,
     tls_ca: Option<&'a [u8]>,
     unix_socket: Option<&'a str>,
     redirects: Option<u32>,
@@ -477,6 +504,7 @@ fn send(
         return Err(Error::Malformed("method must be GET or POST".into()));
     }
     let Shape {
+        connect,
         redirects,
         stream,
         public,
@@ -505,7 +533,11 @@ fn send(
     check_head(url, headers)?;
     let path = socket_path()
         .ok_or_else(|| Error::Io(no_socket(std::env::var_os("XDG_RUNTIME_DIR").as_deref())))?;
-    let mut socket = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
+    let mut socket = match connect {
+        Some(open) => open(path),
+        None => UnixStream::connect(path),
+    }
+    .map_err(|e| Error::Io(format!("connect: {e}")))?;
     // Both directions: a service that stopped reading a large body would
     // otherwise hold the writer past the reply's own bound.
     socket

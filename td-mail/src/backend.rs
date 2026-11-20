@@ -14,8 +14,11 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use td_json::{Json, ObjectBuilder, ToJson};
 
+pub(crate) const CHANGED_EMAILS: &str = "mailbox state change";
+
 /// Commands sent from the UI thread to the backend thread.
 pub enum BackendCommand {
+    RefreshChangedMailboxes,
     FetchMailboxes {
         origin: String,
     },
@@ -159,6 +162,8 @@ pub enum BackendCommand {
 
 /// Responses sent from the backend thread to the UI thread.
 pub enum BackendResponse {
+    MailboxStateChanged,
+    ChangedMailboxes(Result<Vec<Mailbox>, String>),
     AccountReadOnly(bool),
     Mailboxes(Result<Vec<Mailbox>, String>),
     MailboxCreated {
@@ -177,6 +182,7 @@ pub enum BackendResponse {
         total: Option<u32>,
     },
     Emails {
+        pushed: bool,
         mailbox_id: String,
         emails: Result<Vec<Email>, String>,
         total: Option<u32>,
@@ -916,6 +922,7 @@ pub fn spawn(
     my_email_regex: Arc<UserRegex>,
     spam_config: SpamConfig,
     spam_model: SharedModel,
+    watch_events: bool,
 ) -> Result<
     (
         mpsc::Sender<BackendCommand>,
@@ -942,20 +949,23 @@ pub fn spawn(
                 None
             }
         };
-        backend_loop(
-            client,
-            connecting,
-            cmd_rx,
-            resp_tx,
-            rules,
-            custom_headers,
-            rules_mailbox_regex,
-            my_email_regex,
-            cache,
-            reopen.then_some(account_name),
-            spam_config,
-            spam_model,
-        );
+        crate::jmap::events::during(watch_events, &resp_tx, |watcher| {
+            backend_loop(
+                client,
+                connecting,
+                cmd_rx,
+                &resp_tx,
+                watcher,
+                rules,
+                custom_headers,
+                rules_mailbox_regex,
+                my_email_regex,
+                cache,
+                reopen.then_some(account_name),
+                spam_config,
+                spam_model,
+            );
+        });
     });
     match spawned {
         Ok(_) => Ok((cmd_tx, resp_rx)),
@@ -1000,6 +1010,12 @@ fn handle_offline_command(
     reason: Option<&str>,
 ) -> bool {
     match cmd {
+        BackendCommand::RefreshChangedMailboxes => {
+            let _ = resp_tx.send(BackendResponse::ChangedMailboxes(Err(offline_error(
+                "cannot refresh mailbox changes",
+                reason,
+            ))));
+        }
         BackendCommand::FetchMailboxes { origin } => {
             log_info!(
                 "[Backend/offline] cmd#{} FetchMailboxes origin='{}'",
@@ -1037,17 +1053,27 @@ fn handle_offline_command(
                 origin,
                 mailbox_id
             );
-            // Only serve first page, no search/date filters
-            if *position != 0
+            // A push must check the live mailbox, even when a cache exists.
+            let pushed = origin == CHANGED_EMAILS;
+            if pushed
+                || *position != 0
                 || search_query.is_some()
                 || received_after.is_some()
                 || received_before.is_some()
             {
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    pushed,
                     search_skipped: 0,
                     filtered: false,
                     mailbox_id: mailbox_id.clone(),
-                    emails: Err(offline_error("search and pagination not available", reason)),
+                    emails: Err(offline_error(
+                        if pushed {
+                            "live mailbox unavailable"
+                        } else {
+                            "search and pagination not available"
+                        },
+                        reason,
+                    )),
                     total: None,
                     position: *position,
                     loaded: 0,
@@ -1068,6 +1094,7 @@ fn handle_offline_command(
                         Ok(cached_emails)
                     };
                     let _ = resp_tx.send(BackendResponse::Emails {
+                        pushed: false,
                         search_skipped: 0,
                         filtered: false,
                         mailbox_id: mailbox_id.clone(),
@@ -1079,6 +1106,7 @@ fn handle_offline_command(
                     });
                 } else {
                     let _ = resp_tx.send(BackendResponse::Emails {
+                        pushed: false,
                         search_skipped: 0,
                         filtered: false,
                         mailbox_id: mailbox_id.clone(),
@@ -1091,6 +1119,7 @@ fn handle_offline_command(
                 }
             } else {
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    pushed: false,
                     search_skipped: 0,
                     filtered: false,
                     mailbox_id: mailbox_id.clone(),
@@ -1815,7 +1844,8 @@ fn backend_loop(
     client: Option<JmapClient>,
     connecting: bool,
     cmd_rx: mpsc::Receiver<BackendCommand>,
-    resp_tx: mpsc::Sender<BackendResponse>,
+    resp_tx: &mpsc::Sender<BackendResponse>,
+    mut watcher: Option<&mut crate::jmap::events::Watch<'_, '_>>,
     rules: Arc<Vec<CompiledRule>>,
     custom_headers: Arc<Vec<String>>,
     rules_mailbox_regex: Arc<UserRegex>,
@@ -1828,9 +1858,12 @@ fn backend_loop(
     let mut cached_mailboxes: Vec<Mailbox> = Vec::new();
     let mut command_seq: u64 = 0;
     let mut client = client;
+    if let Some(watcher) = watcher.as_deref_mut() {
+        watcher.select(client.as_mut().and_then(|client| client.events.take()));
+    }
     let mut connecting = connecting;
     let mut cache = cache;
-    let mut read_only = account_access(client.as_ref(), cache.as_ref(), &resp_tx, false);
+    let mut read_only = account_access(client.as_ref(), cache.as_ref(), resp_tx, false);
     // What arrived while the connection was pending, answered in order
     // once it is decided: nothing is answered from the cache that the
     // connection then supersedes, and no fetch fails as offline while
@@ -1916,8 +1949,7 @@ fn backend_loop(
                         );
                     }
                     cache = Some(opened);
-                    read_only =
-                        account_access(client.as_ref(), cache.as_ref(), &resp_tx, read_only);
+                    read_only = account_access(client.as_ref(), cache.as_ref(), resp_tx, read_only);
                 }
             }
         }
@@ -1927,10 +1959,13 @@ fn backend_loop(
         // then on, replaying what the cache queued as a backend started
         // online replays it.
         match cmd {
-            BackendCommand::Connect(connected) => {
+            BackendCommand::Connect(mut connected) => {
+                if let Some(watcher) = watcher.as_deref_mut() {
+                    watcher.select(connected.events.take());
+                }
                 background_bodies.0.clear();
                 log_info!("[Backend] cmd#{} Connect", command_seq);
-                read_only = account_access(Some(&connected), cache.as_ref(), &resp_tx, read_only);
+                read_only = account_access(Some(&connected), cache.as_ref(), resp_tx, read_only);
                 if let Some(cache) = cache.as_ref() {
                     replay_queued_mutations(
                         &connected,
@@ -1978,7 +2013,7 @@ fn backend_loop(
                     command_seq = command_seq.wrapping_add(1);
                     handle_offline_command(
                         &cmd,
-                        &resp_tx,
+                        resp_tx,
                         &cache,
                         &mut cached_mailboxes,
                         command_seq,
@@ -2005,7 +2040,7 @@ fn backend_loop(
         if client.is_none() {
             if handle_offline_command(
                 &cmd,
-                &resp_tx,
+                resp_tx,
                 &cache,
                 &mut cached_mailboxes,
                 command_seq,
@@ -2026,7 +2061,16 @@ fn backend_loop(
         };
 
         match cmd {
-            BackendCommand::FetchMailboxes { origin } => {
+            BackendCommand::FetchMailboxes { .. } | BackendCommand::RefreshChangedMailboxes => {
+                let changed = matches!(cmd, BackendCommand::RefreshChangedMailboxes);
+                let origin = if let BackendCommand::FetchMailboxes { ref origin } = cmd {
+                    origin.as_str()
+                } else {
+                    if let Some(watcher) = watcher.as_deref_mut() {
+                        watcher.refresh_started();
+                    }
+                    "mailbox change"
+                };
                 log_info!(
                     "[Backend] cmd#{} FetchMailboxes origin='{}'",
                     command_seq,
@@ -2035,7 +2079,7 @@ fn backend_loop(
 
                 // For TUI, serve cached mailboxes instantly then follow with live data.
                 // CLI expects one response per command, so skip the cached pre-response there.
-                if !origin.starts_with("cli") {
+                if !changed && !origin.starts_with("cli") {
                     if let Some(ref cache) = cache {
                         if let Some(cached_mboxes) = cache.get_mailboxes() {
                             if !cached_mboxes.is_empty() {
@@ -2057,7 +2101,11 @@ fn backend_loop(
                         cache.put_mailboxes(mailboxes);
                     }
                 }
-                let _ = resp_tx.send(BackendResponse::Mailboxes(result));
+                let _ = resp_tx.send(if changed {
+                    BackendResponse::ChangedMailboxes(result)
+                } else {
+                    BackendResponse::Mailboxes(result)
+                });
             }
             BackendCommand::CreateMailbox { name } => {
                 let result = client
@@ -2109,7 +2157,8 @@ fn backend_loop(
 
                 // For TUI open flows, serve cached mailbox emails immediately so
                 // folder open is instant. CLI expects one response per command.
-                let can_serve_cached_first = !origin.starts_with("cli")
+                let can_serve_cached_first = origin != CHANGED_EMAILS
+                    && !origin.starts_with("cli")
                     && position == 0
                     && search_query.is_none()
                     && received_after.is_none()
@@ -2123,6 +2172,7 @@ fn backend_loop(
                                 .map(|m| m.total_emails);
                             let cached_loaded = cached_emails.len() as u32;
                             let _ = resp_tx.send(BackendResponse::Emails {
+                                pushed: false,
                                 search_skipped: 0,
                                 filtered: false,
                                 mailbox_id: mailbox_id.clone(),
@@ -2145,8 +2195,8 @@ fn backend_loop(
                             page_size,
                             position,
                             search_query.as_deref(),
-                            received_after.as_deref(),
-                            received_before.as_deref(),
+                            (received_after.as_deref(), received_before.as_deref()),
+                            origin == CHANGED_EMAILS,
                         )
                         .map_err(|e| e.to_string())?;
                     let total = query.total;
@@ -2437,6 +2487,7 @@ fn backend_loop(
                 }
 
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    pushed: origin == CHANGED_EMAILS,
                     filtered: search_query.is_some()
                         || received_after.is_some()
                         || received_before.is_some(),
@@ -4406,7 +4457,8 @@ mod tests {
                 Some(JmapClient::unreachable_for_tests()),
                 false,
                 cmd_rx,
-                resp_tx,
+                &resp_tx,
+                None,
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
                 Arc::new(UserRegex::compile(".*").unwrap()),
@@ -4730,7 +4782,8 @@ mod tests {
                 None,
                 true,
                 cmd_rx,
-                resp_tx,
+                &resp_tx,
+                None,
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
                 regex(),
@@ -4864,7 +4917,8 @@ mod tests {
                 None,
                 true,
                 cmd_rx,
-                resp_tx,
+                &resp_tx,
+                None,
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
                 regex(),
@@ -4916,7 +4970,8 @@ mod tests {
                 None,
                 false,
                 cmd_rx,
-                resp_tx,
+                &resp_tx,
+                None,
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
                 regex(),

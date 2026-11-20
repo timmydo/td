@@ -362,6 +362,7 @@ fn cmd_connect(state: &mut CliState, input: &Value) -> Value {
         state.config.spam.clone(),
         // The one backend: the model as the last one saved it.
         crate::spam::load_shared(),
+        false,
     );
     let (cmd_tx, resp_rx) = match spawned {
         Ok(ends) => ends,
