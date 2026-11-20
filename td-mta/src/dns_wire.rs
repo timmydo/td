@@ -101,6 +101,20 @@ impl Name {
         self.bytes.get(..usize::from(self.used)).unwrap_or_default()
     }
 
+    pub(crate) fn in_zone(&self, zone: &Self) -> bool {
+        let mut suffix = self.wire();
+        while let Some((&length, rest)) = suffix.split_first() {
+            if suffix == zone.wire() {
+                return true;
+            }
+            let Some(next) = rest.get(usize::from(length)..) else {
+                return false;
+            };
+            suffix = next;
+        }
+        false
+    }
+
     fn empty() -> Self {
         Self {
             bytes: [0; MAX_NAME_BYTES],

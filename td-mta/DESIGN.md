@@ -1539,12 +1539,18 @@ the next Question. The original configured host remains the TLS identity.
 
 Convert each accepted response TTL to an absolute monotonic expiry before
 issuing another query, and retain the earliest alias/address expiry. Never
-restart an earlier TTL at final completion. TTL zero and an empty family make
-the combined result current-lookup-only: its valid_until may already be at or
-before completion, and cannot authorize a later cache hit. An empty family
-has no decoded negative TTL, so caching that absence alongside positive data
-would be unjustified. Stage addresses privately and publish the caller prefix
-only after both families complete and the original budget still permits it;
+restart an earlier TTL at final completion. For a NOERROR response with no
+addresses or CNAME to follow, a single IN SOA in the authority section can
+establish the missing family's lifetime. Its owner must enclose the queried
+name at a DNS label boundary. Decode both SOA names and its five 32-bit
+fields. The lifetime is the minimum of the SOA TTL, SOA.MINIMUM and a local
+one-hour cap ([RFC 2308 §§3,5](https://www.rfc-editor.org/rfc/rfc2308#section-5)).
+The earliest positive, alias or missing-family expiry governs the combined set.
+A zero TTL or NXDOMAIN makes the set usable only for this call. The same
+rule applies to an otherwise valid empty response with an absent, ambiguous
+or unrelated SOA. Malformed RDATA in the selected SOA rejects the response.
+Stage addresses privately and publish the caller prefix only after both
+families complete and the original budget still permits it;
 errors leave caller addresses unchanged. Configured-name admission, worker
 scheduling and cache integration remain separate owners.
 
@@ -1571,8 +1577,7 @@ strictly future expiry. Unknown names, expired caller deadlines and insufficient
 output capacity refuse before network work. Expired entries are retired before
 refresh; failures never serve stale data. Every miss creates one bounded work
 meter under the caller's original deadline and uses the configured resolver
-order. Zero-TTL and missing-family results are returned for the current call
-but never inserted. A cache hit that expires before final publication refuses.
+order. Only a positive result with future combined expiry is inserted. A cache hit that expires before final publication refuses.
 The caller output prefix changes only after the final clock check; errors
 preserve it. Configuration borrows, resolver order and generation stay fixed
 for the owner's lifetime, consistent with restart-only resolver changes.

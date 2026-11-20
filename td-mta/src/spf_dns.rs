@@ -140,7 +140,7 @@ fn decode(
     kind: Query,
     remaining: usize,
 ) -> Result<Message<Option<Answer>>, WireError> {
-    dns_reply::parse(packet, question, |rows| {
+    dns_reply::parse(packet, question, |rows, _authority| {
         if rows.is_empty() {
             return Ok(None);
         }

@@ -526,7 +526,7 @@ no packet buffer or cache is allocated per attempt. CNAME chains are not cached.
 1..4 explicit numeric resolver endpoints and restricts ACME operational URLs to
 the directory origin. Offline migration may own one additional bounded endpoint
 slot for its explicit source origin, released at job exit. Entries retain
-only the final address set and minimum chain/address TTL. A job returns at
+only the final address set and the earliest alias, address or missing-family expiry. A job returns at
 most 16 addresses. Do not
 allocate one packet/name buffer per waiting lookup. Expired entries are
 replaced in place. Configuration fixes names/resolvers; this is not a recursive

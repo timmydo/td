@@ -10,7 +10,7 @@ use td_mime::work::{Charge, Stop};
 
 /// Run on the fixed resolver worker. Servers and host must come from the
 /// admitted configuration. The host remains the TLS identity after lookup.
-/// Output is published only on success; no cache or negative TTL is inferred.
+/// Output is published only after both families complete.
 /// Each family uses the supplied alias allowance independently. The caller's
 /// allowance is restored on return; this operation completes both chains.
 pub fn lookup(
@@ -37,7 +37,7 @@ pub fn lookup(
             let question = Question::from_name(*name, kind, u16::from_be_bytes(id));
             match dns_transport::exchange(*server, &question, budget, packet) {
                 Ok(Reply::ResponseCode(3)) => {
-                    return Ok((Reply::NoData, check(budget)?));
+                    return Ok((Reply::NoData { ttl: 0 }, check(budget)?));
                 }
                 Ok(Reply::ResponseCode(_)) | Ok(Reply::Truncated) => last = Error::Dns,
                 Ok(reply) => return Ok((reply, check(budget)?)),
@@ -165,10 +165,8 @@ fn collect(
                     result.until = result.until.min(until);
                     break;
                 }
-                Reply::NoData => {
-                    // No SOA negative TTL is decoded. Do not cache absence of
-                    // either family as part of an otherwise positive set.
-                    result.until = result.until.min(received);
+                Reply::NoData { ttl } => {
+                    result.until = result.until.min(until).min(expiry(received, ttl)?);
                     break;
                 }
                 Reply::Truncated | Reply::ResponseCode(_) => return Err(Error::Dns),
@@ -263,13 +261,38 @@ mod tests {
         assert!(result.addresses[2].is_ipv6());
     }
     #[test]
+    fn single_family_cache_expires_at_the_first_address_alias_or_negative_expiry() {
+        let original = name("relay.test");
+        let alias = name("alias.test");
+        for (address, cname, negative, expected) in
+            [(1, 60, 60, 1100), (60, 1, 60, 1200), (60, 60, 1, 1300)]
+        {
+            let result = collect(&original, 8, |current, kind, _| {
+                Ok(if kind == AddressType::A {
+                    (addresses(current, kind, address, 1), Tick(100))
+                } else if current == &original {
+                    (
+                        chain(current, kind, std::slice::from_ref(&alias), false, cname),
+                        Tick(200),
+                    )
+                } else {
+                    assert_eq!(current, &alias);
+                    (Reply::NoData { ttl: negative }, Tick(300))
+                })
+            })
+            .unwrap();
+            assert_eq!(result.until, Tick(expected));
+            assert_eq!(result.count, 1);
+        }
+    }
+    #[test]
     fn missing_family_and_zero_ttl_are_current_lookup_only() {
         let original = name("relay.test");
         for missing in [false, true] {
             let result = collect(&original, 8, |current, kind, _| {
                 Ok((
                     if kind == AddressType::Aaaa && missing {
-                        Reply::NoData
+                        Reply::NoData { ttl: 0 }
                     } else {
                         addresses(current, kind, if missing { 60 } else { 0 }, 1)
                     },
@@ -281,7 +304,10 @@ mod tests {
             assert_eq!(result.count, if missing { 1 } else { 2 });
         }
         assert!(matches!(
-            collect(&original, 8, |_, _, _| Ok((Reply::NoData, Tick(0)))),
+            collect(&original, 8, |_, _, _| Ok((
+                Reply::NoData { ttl: 0 },
+                Tick(0)
+            ))),
             Err(Error::Dns)
         ));
         assert_eq!(expiry(Tick(u64::MAX), 1), Err(Error::Invalid));
@@ -307,7 +333,7 @@ mod tests {
             let mut count = 0;
             let result = collect(&original, 8, |current, kind, remaining| {
                 if kind == AddressType::Aaaa {
-                    return Ok((Reply::NoData, Tick(0)));
+                    return Ok((Reply::NoData { ttl: 0 }, Tick(0)));
                 }
                 if count < hops {
                     assert_eq!(remaining, 8 - count);
@@ -525,7 +551,7 @@ mod tests {
             let mut calls = 0;
             let result = collect(&original, 8, |current, kind, _| {
                 if kind == AddressType::Aaaa {
-                    return Ok((Reply::NoData, Tick(0)));
+                    return Ok((Reply::NoData { ttl: 0 }, Tick(0)));
                 }
                 calls += 1;
                 let targets = if calls == 1 {

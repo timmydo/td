@@ -344,8 +344,17 @@ mod tests {
         bytes
     }
     #[test]
-    fn rebuilt_resolvers_reuse_positive_cache_but_not_zero_ttl_or_missing_family() {
-        for (ttl, both) in [(0, true), (60, true), (60, false)] {
+    fn rebuilt_resolvers_cache_single_stack_hosts_with_a_negative_lifetime() {
+        for (ttl, missing, soa) in [
+            (0, 0, false),
+            (60, 0, false),
+            (60, 28, false),
+            (60, 28, true),
+            (60, 1, true),
+        ] {
+            let both = missing == 0;
+            let cacheable = ttl != 0 && (both || soa);
+            let queries = if cacheable { 2 } else { 4 };
             let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
@@ -353,13 +362,22 @@ mod tests {
             let endpoint = socket.local_addr().unwrap();
             thread::scope(|scope| {
                 scope.spawn(|| {
-                    for _ in 0..if ttl == 0 || !both { 4 } else { 2 } {
+                    for _ in 0..queries {
                         let mut bytes = [0; 512];
                         let (size, peer) = socket.recv_from(&mut bytes).unwrap();
                         let mut response = answer(&bytes[..size], ttl);
-                        if !both && bytes[size - 3] == 28 {
+                        if bytes[size - 3] == missing {
                             response.truncate(size);
                             response[7] = 0;
+                            if soa {
+                                response[9] = 1;
+                                // SOA for test., with compressed names and MINIMUM 40s.
+                                response.extend_from_slice(b"\xc0\x12\x00\x06\x00\x01");
+                                response.extend_from_slice(&60u32.to_be_bytes());
+                                response.extend_from_slice(b"\x00\x18\xc0\x0c\xc0\x0c");
+                                response.extend_from_slice(&[0; 16]);
+                                response.extend_from_slice(&40u32.to_be_bytes());
+                            }
                         }
                         socket.send_to(&response, peer).unwrap();
                     }
@@ -389,21 +407,22 @@ mod tests {
 
                         let result = owner.resolve(host, deadline, &mut output).unwrap();
                         assert_eq!(result.count, if both { 2 } else { 1 });
-                        assert!(output[0].is_ipv4());
+                        assert_eq!(output[0].is_ipv4(), missing != 1);
                         if both {
                             assert!(output[1].is_ipv6());
                         } else {
                             assert_eq!(output[1], sentinel);
                         }
-                        if ttl != 0 && both {
+                        if cacheable {
                             if let Some(expiry) = expiry {
                                 assert_eq!(result.valid_until, expiry);
                             }
                             expiry = Some(result.valid_until);
+                            entropy.fail.set(true);
                         }
                         assert!(output[2..].iter().all(|a| *a == sentinel));
                     }
-                    assert_eq!(count.get(), if ttl == 0 || !both { 4 } else { 2 });
+                    assert_eq!(count.get(), queries);
                     let mut owner = Configured::new(
                         out,
                         cert,
@@ -414,7 +433,7 @@ mod tests {
                         &mut cache,
                     )
                     .unwrap();
-                    assert_eq!(owner.cache.entries[0].is_some(), ttl != 0 && both);
+                    assert_eq!(owner.cache.entries[0].is_some(), cacheable);
                     let before = output;
                     assert_eq!(
                         owner.resolve("incoming.example.test", deadline, &mut output),

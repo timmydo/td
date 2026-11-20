@@ -10,7 +10,9 @@ pub const MAX_ADDRESSES: usize = 16;
 pub enum Reply {
     Truncated,
     ResponseCode(u8),
-    NoData,
+    NoData {
+        ttl: u32,
+    },
     Alias {
         name: Name,
         hops: usize,
@@ -97,6 +99,13 @@ pub(crate) fn target(packet: &[u8], record: Record, skip: usize) -> Result<Name,
     }
     Ok(name)
 }
+fn seconds(ttl: u32) -> u32 {
+    if ttl & 0x8000_0000 != 0 {
+        0
+    } else {
+        ttl
+    }
+}
 fn record(packet: &[u8], at: usize) -> Result<(Record, usize), Error> {
     let (_, used) = Name::read(packet, at)?;
     let fixed = at.checked_add(used).ok_or(Error::Invalid)?;
@@ -125,7 +134,7 @@ fn record(packet: &[u8], at: usize) -> Result<(Record, usize), Error> {
         class,
         data: u16::try_from(data).map_err(|_| Error::Invalid)?,
         length,
-        ttl: if ttl & 0x8000_0000 != 0 { 0 } else { ttl },
+        ttl: seconds(ttl),
     };
     if class == 1 {
         match kind {
@@ -151,8 +160,8 @@ pub fn read(packet: &[u8], question: &Question, remaining_aliases: usize) -> Res
     if remaining_aliases > MAX_ALIASES {
         return Err(Error::Capacity);
     }
-    match parse(packet, question.wire(), |answers| {
-        extract(packet, question, answers, remaining_aliases)
+    match parse(packet, question.wire(), |answers, authority| {
+        extract(packet, question, answers, authority, remaining_aliases)
     })? {
         Message::Truncated => Ok(Reply::Truncated),
         Message::ResponseCode(code) => Ok(Reply::ResponseCode(code)),
@@ -169,7 +178,7 @@ pub(crate) enum Message<T> {
 pub(crate) fn parse<T>(
     packet: &[u8],
     question: WireQuestion<'_>,
-    extract: impl FnOnce(&[Record]) -> Result<T, Error>,
+    extract: impl FnOnce(&[Record], &[Record]) -> Result<T, Error>,
 ) -> Result<Message<T>, Error> {
     if packet.len() > MAX_PACKET_BYTES {
         return Err(Error::Capacity);
@@ -194,14 +203,15 @@ pub(crate) fn parse<T>(
         return Ok(Message::Truncated);
     }
     let answers = usize::from(word(packet, 6)?);
-    let total = answers + usize::from(word(packet, 8)?) + usize::from(word(packet, 10)?);
+    let authority_end = answers + usize::from(word(packet, 8)?);
+    let total = authority_end + usize::from(word(packet, 10)?);
     if total > MAX_RECORDS {
         return Err(Error::Capacity);
     }
     let mut records = [Record::default(); MAX_RECORDS];
     for index in 0..total {
         let (rr, end) = record(packet, position)?;
-        if index < answers {
+        if index < authority_end {
             *records.get_mut(index).ok_or(Error::Capacity)? = rr;
         }
         position = end;
@@ -212,12 +222,17 @@ pub(crate) fn parse<T>(
     if flags & 0x000f != 0 {
         return Ok(Message::ResponseCode((flags & 0x000f) as u8));
     }
-    extract(records.get(..answers).ok_or(Error::Capacity)?).map(Message::Answer)
+    extract(
+        records.get(..answers).ok_or(Error::Capacity)?,
+        records.get(answers..authority_end).ok_or(Error::Capacity)?,
+    )
+    .map(Message::Answer)
 }
 fn extract(
     packet: &[u8],
     question: &Question,
     records: &[Record],
+    authority: &[Record],
     remaining_aliases: usize,
 ) -> Result<Reply, Error> {
     let mut values = [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MAX_ADDRESSES];
@@ -245,8 +260,39 @@ fn extract(
             path,
         })
     } else {
-        Ok(Reply::NoData)
+        Ok(Reply::NoData {
+            ttl: negative_ttl(packet, question.name(), authority)?,
+        })
     }
+}
+
+// RFC 2308 §§3,5. The configured recursive resolver can return a cached
+// negative answer, so AA need not be set. Only the enclosing zone's SOA
+// in the authority section can give the omitted address family a lifetime.
+fn negative_ttl(packet: &[u8], name: &Name, authority: &[Record]) -> Result<u32, Error> {
+    const MAX_NEGATIVE_SECONDS: u32 = 3600;
+    let mut soas = authority.iter().filter(|rr| rr.kind == 6 && rr.class == 1);
+    let Some(soa) = soas.next() else { return Ok(0) };
+    let (zone, _) = Name::read(packet, usize::from(soa.owner))?;
+    if soas.next().is_some() || !name.in_zone(&zone) {
+        return Ok(0);
+    }
+    let start = usize::from(soa.data);
+    let end = start + usize::from(soa.length);
+    let bounded = packet.get(..end).ok_or(Error::Invalid)?;
+    let (_, mname) = Name::read(bounded, start)?;
+    let (_, rname) = Name::read(bounded, start + mname)?;
+    let (parameters, minimum) = bounded
+        .get(start + mname + rname..)
+        .and_then(<[u8]>::split_last_chunk::<4>)
+        .ok_or(Error::Invalid)?;
+    if parameters.len() != 16 {
+        return Err(Error::Invalid);
+    }
+    Ok(soa
+        .ttl
+        .min(seconds(u32::from_be_bytes(*minimum)))
+        .min(MAX_NEGATIVE_SECONDS))
 }
 
 pub(crate) fn address(packet: &[u8], rr: Record) -> Result<IpAddr, Error> {
@@ -460,6 +506,48 @@ mod tests {
         }
     }
     #[test]
+    fn only_a_complete_zone_soa_in_authority_supplies_the_negative_lifetime() {
+        let q = query(AddressType::Aaaa);
+        let soa = |owner: &str, ttl: u32, minimum: u32| {
+            let mut data = vec![0xc0, 0x0c, 0xc0, 0x0c];
+            data.extend_from_slice(&[0; 16]);
+            data.extend_from_slice(&minimum.to_be_bytes());
+            rr(owner, 6, ttl, &data)
+        };
+        for (ttl, minimum, expected) in [
+            (30, 300, 30),
+            (300, 30, 30),
+            (6000, 5000, 3600),
+            (0, 30, 0),
+            (30, 0, 0),
+            (1 << 31, 30, 0),
+            (30, 1 << 31, 0),
+        ] {
+            for zone in ["TEST", "RELAY.TEST"] {
+                assert_eq!(
+                    read(&packet(&q, &[], &[soa(zone, ttl, minimum)], &[]), &q),
+                    Ok(Reply::NoData { ttl: expected })
+                );
+            }
+        }
+        let row = soa("test", 30, 30);
+        let one = std::slice::from_ref(&row);
+        for packet in [
+            packet(&q, one, &[], &[]),
+            packet(&q, &[], &[], one),
+            packet(&q, &[], &[soa("other.test", 30, 30)], &[]),
+            packet(&q, &[], &[row.clone(), row.clone()], &[]),
+        ] {
+            assert_eq!(read(&packet, &q), Ok(Reply::NoData { ttl: 0 }));
+        }
+        for fields in [vec![0xc0], vec![0xc0, 12], vec![0; 21], vec![0; 23]] {
+            assert_eq!(
+                read(&packet(&q, &[], &[rr("test", 6, 30, &fields)], &[]), &q),
+                Err(Error::Invalid)
+            );
+        }
+    }
+    #[test]
     fn answer_section_only_and_complete_framing() {
         let q = query(AddressType::A);
         let row = rr("relay.test", 1, 10, &[192, 0, 2, 1]);
@@ -473,7 +561,7 @@ mod tests {
                 ),
                 &q
             ),
-            Ok(Reply::NoData)
+            Ok(Reply::NoData { ttl: 0 })
         );
         let bytes = packet(&q, &[row], &[], &[]);
         for size in 0..bytes.len() {
@@ -524,7 +612,7 @@ mod tests {
         assert_eq!(read(&failed, &q), Ok(Reply::ResponseCode(3)));
         let mut dnssec_bits = packet(&q, &[], &[], &[]);
         dnssec_bits[3] |= 0x30;
-        assert_eq!(read(&dnssec_bits, &q), Ok(Reply::NoData));
+        assert_eq!(read(&dnssec_bits, &q), Ok(Reply::NoData { ttl: 0 }));
     }
     #[test]
     fn fixed_record_address_and_alias_limits() {
@@ -545,7 +633,7 @@ mod tests {
             assert_eq!(
                 read(&packet(&q, &[], &rows, &[]), &q),
                 if count == 256 {
-                    Ok(Reply::NoData)
+                    Ok(Reply::NoData { ttl: 0 })
                 } else {
                     Err(Error::Capacity)
                 }
