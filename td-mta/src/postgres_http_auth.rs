@@ -2,7 +2,7 @@
 use crate::{
     clock::RuntimeClock,
     device_credentials::Presented,
-    http_auth::{Authenticator, Principal},
+    http_auth::{Authenticator, EventCredential, EventObservation, Principal},
     ports::{Deadline, Error},
     postgres_input::Loaded,
     postgres_probe::{self, AuthenticationSession, Mode},
@@ -87,6 +87,47 @@ impl Authenticator for Authentication<'_> {
         password: &[u8],
         deadline: Deadline,
     ) -> Result<Option<Principal>, Error> {
+        let deadline = self.deadline(deadline)?;
+        let Some((_, binding)) = self.accounts.iter().find(|(name, _)| *name == username) else {
+            return Ok(None);
+        };
+        let Some(presented) = Presented::parse(password) else {
+            return Ok(None);
+        };
+        match self.with_session(deadline, |session| {
+            session.authenticate(binding, presented, deadline)
+        }) {
+            Ok(principal) => Ok(Some(principal)),
+            Err(Error::Forbidden) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn observe_events(
+        &self,
+        principal: Principal,
+        credential: EventCredential<&[u8]>,
+        deadline: Deadline,
+    ) -> Result<EventObservation, Error> {
+        let deadline = self.deadline(deadline)?;
+        let (_, binding) = self
+            .accounts
+            .iter()
+            .find(|(_, binding)| binding.account() == principal.account)
+            .ok_or(Error::Forbidden)?;
+        let credential = match credential {
+            EventCredential::Password(bytes) => {
+                EventCredential::Password(Presented::parse(bytes).ok_or(Error::Forbidden)?)
+            }
+            EventCredential::Continued(stamp) => EventCredential::Continued(stamp),
+        };
+        self.with_session(deadline, |session| {
+            session.observe_events(binding, principal, credential, deadline)
+        })
+    }
+}
+impl Authentication<'_> {
+    fn deadline(&self, deadline: Deadline) -> Result<Instant, Error> {
         let now = Instant::now();
         let deadline = self.clock.deadline_instant(deadline)?.min(
             now.checked_add(Duration::from_secs(10))
@@ -95,12 +136,13 @@ impl Authenticator for Authentication<'_> {
         if now >= deadline {
             return Err(Error::Deadline);
         }
-        let Some((_, binding)) = self.accounts.iter().find(|(name, _)| *name == username) else {
-            return Ok(None);
-        };
-        if Presented::parse(password).is_none() {
-            return Ok(None);
-        }
+        Ok(deadline)
+    }
+    fn with_session<T>(
+        &self,
+        deadline: Instant,
+        observe: impl FnOnce(&mut AuthenticationSession) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let mut state = self.state.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => Error::Busy,
             TryLockError::Poisoned(_) => Error::Invalid,
@@ -130,12 +172,7 @@ impl Authenticator for Authentication<'_> {
         if state.session.is_none() {
             state.session = Some(self.connect(deadline)?);
         }
-        let presented = Presented::parse(password).ok_or(Error::Invalid)?;
-        let result = state
-            .session
-            .as_mut()
-            .ok_or(Error::Invalid)?
-            .authenticate(binding, presented, deadline);
+        let result = observe(state.session.as_mut().ok_or(Error::Invalid)?);
         let result = if Instant::now() >= deadline {
             Err(Error::Deadline)
         } else {
@@ -153,7 +190,7 @@ impl Authenticator for Authentication<'_> {
             );
         }
         if result.is_err()
-            && !(result == Err(Error::Forbidden)
+            && !(matches!(result, Err(Error::Forbidden))
                 && state
                     .session
                     .as_ref()
@@ -161,14 +198,8 @@ impl Authenticator for Authentication<'_> {
         {
             drop(state.session.take());
         }
-        match result {
-            Ok(principal) => Ok(Some(principal)),
-            Err(Error::Forbidden) => Ok(None),
-            Err(error) => Err(error),
-        }
+        result
     }
-}
-impl Authentication<'_> {
     fn retire_idle(&self, closing: bool) -> Result<(), Error> {
         let mut state = self.state.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => Error::Busy,

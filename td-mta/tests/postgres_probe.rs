@@ -2844,6 +2844,8 @@ mod search_index;
 mod isolated_services;
 #[path = "postgres_probe/serving.rs"]
 mod serving;
+#[path = "postgres_probe/serving_events.rs"]
+mod serving_events;
 #[path = "postgres_probe/serving_relay.rs"]
 mod serving_relay;
 

@@ -1954,11 +1954,11 @@ strictly below https_connections, reserving capacity for other requests. The
 profile-neutral resource planner permits zero for receive-only profiles; mailbox-access
 startup additionally validates Core-specific admission. EventSource GET uses
 the Session URL template and an independent stream ceiling within the shared
-HTTPS/per-peer connection caps. These streams currently emit requested pings
-only; live Mail StateChange capture remains unimplemented. td-mail reads by
-requests and does not consume this endpoint. closeafter=state therefore waits
-without treating a ping as a state event. A zero ping interval keeps the stream silent until
-revocation, disconnect, shutdown or the absolute connection deadline. Each
+HTTPS/per-peer connection caps. A stream emits the selected account states
+on first connection, and emits changes after successful authorization checks.
+A matching Last-Event-ID suppresses the initial frame. With closeafter=state
+the response ends after its first state frame. Setting ping to zero disables
+keepalive events. Each
 output frame has a fixed stall deadline. Event streams do not consume the
 API/upload body permit.
 ## Account-scoped identity preparation

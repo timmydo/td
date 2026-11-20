@@ -8302,6 +8302,7 @@ The mailbox-access Session advertises Core and Mail, names the sole Mail
 primary account and marks it read-only. HTTPS envelope admission accepts
 those two capabilities; Submission and unimplemented methods remain explicit
 errors. The native real-client fixture in CONFORMANCE.md qualifies the
-request-driven read flow. Mail StateChange delivery is not wired: the existing
-EventSource endpoint emits only requested pings and td-mail does not use it.
+request-driven read flow. The advertised EventSource URL also serves
+account-scoped state changes. Clients retrieve changed objects through the
+ordinary JMAP methods.
 No generic-client or complete RFC Mail claim follows from this activation.

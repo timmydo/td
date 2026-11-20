@@ -137,6 +137,25 @@ impl https_upload::Backend for Service<'_, '_, '_> {
     fn session(&self) -> Option<&Session> {
         Some(self.session)
     }
+    fn event_snapshot(
+        &self,
+        identity: crate::ports::ViewIdentity,
+    ) -> Result<crate::jmap_events::Snapshot, Error> {
+        if identity.epoch != self.binding.epoch() || identity.account != self.binding.account() {
+            return Err(Error::Forbidden);
+        }
+        let submission = self
+            .session
+            .capabilities()
+            .contains(&crate::jmap_request::SUBMISSION);
+        let catalog = if submission {
+            self.binding.identity_catalog()
+        } else {
+            None
+        };
+        let identity_state = catalog.map(|value| value.state(identity)).transpose()?;
+        crate::jmap_events::Snapshot::mail(identity, submission, identity_state)
+    }
     fn receive(
         &self,
         request: https_upload::Request<'_>,
@@ -230,10 +249,10 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 ReadIsolation::RepeatableReadOnly,
                 deadline,
                 |worker| {
-                    let binding = self.binding.clone();
+                    let binding = crate::postgres_snapshot::ReadBinding::from(self.binding);
                     let identity = worker.run(|client| {
                         Box::pin(async move {
-                            crate::postgres_snapshot::observe(client, &binding, presented).await
+                            crate::postgres_snapshot::observe(client, binding, presented).await
                         })
                     })?;
                     let identity = match identity {

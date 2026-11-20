@@ -2724,10 +2724,10 @@ is exposed by authenticated discovery now that its required endpoints are
 active. Mail reads, read/star assignments, mailbox moves and root-folder
 creation and empty-folder deletion are exposed for td-mail. The account permits those writes; POLICY.md
 specifies its Mailbox rights.
-CONFORMANCE.md records the actual client/TLS evidence. EventSource
-still emits only pings: td-mail does not consume it. Future Mail state delivery
-requires passive state capture without blocking the network reactor or holding
-a store view across socket work; this profile makes no such claim.
+CONFORMANCE.md records the client/TLS evidence. For an EventSource stream the
+authentication worker observes the authorized account's state in a bounded
+database transaction. The network thread sends a passive snapshot. Idle
+streams hold a connection slot and release the database view between samples.
 
 ## Device Email update transaction foundation
 

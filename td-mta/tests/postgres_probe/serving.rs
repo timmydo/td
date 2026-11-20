@@ -1,3 +1,4 @@
+use super::serving_events as events;
 use super::{certificate, deadline, sql, Fixture, ProbeChild, PASSWORD};
 use std::{
     fs,
@@ -510,7 +511,7 @@ pub(super) fn exercise(
         assert!(std::time::Instant::now() < until);
         std::thread::sleep(Duration::from_millis(50));
     }
-    let first = enqueue();
+    let first = events::observe_change(&session, https_address, &fixture.ca, &encoded, enqueue);
     let wait = |query: &str, expected: &str, seconds: u64| {
         let end = std::time::Instant::now() + Duration::from_secs(seconds);
         loop {
@@ -925,12 +926,27 @@ pub(super) fn exercise(
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(query(https_address).starts_with("HTTP/1.1 200"));
+    let mut events = events::open(&session, https_address, &fixture.ca, &encoded, "no", None);
+    let _ = events::state(&mut events, account_wire);
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();
     td_mta::postgres_devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke)
         .unwrap();
     assert!(query(https_address).starts_with("HTTP/1.1 401"));
+    let mut tail = Vec::new();
+    if let Err(error) = events.read_to_end(&mut tail) {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            "{error}"
+        );
+    }
+    assert!(tail.is_empty(), "revoked device received another frame");
     for (child, runtime) in [(&mut cloud, cloud_runtime), (&mut desktop, desktop_runtime)] {
         let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
             .args(["stop", "--runtime"])

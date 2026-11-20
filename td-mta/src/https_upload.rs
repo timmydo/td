@@ -99,11 +99,10 @@ pub trait Backend: Sync {
     fn session(&self) -> Option<&crate::jmap_session::Session> {
         None
     }
-    /// Called by the network reactor: must not block or acquire a store view.
+    /// Project a passive authorized observation into just the advertised types.
     fn event_snapshot(
         &self,
-        _device: DeviceId,
-        _deadline: Deadline,
+        _identity: crate::ports::ViewIdentity,
     ) -> Result<crate::jmap_events::Snapshot, Error> {
         Err(Error::NotFound)
     }

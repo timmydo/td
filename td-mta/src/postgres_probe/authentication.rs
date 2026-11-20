@@ -1,7 +1,10 @@
 //! Fresh device observations through one finite qualified read session.
 use super::{Error, ReadIsolation, ReadSession, Request};
 use crate::{
-    device_credentials::Presented, http_auth::Principal, ports, postgres_runtime_profile::Binding,
+    device_credentials::Presented,
+    http_auth::{EventCredential, EventObservation, Principal},
+    ports,
+    postgres_runtime_profile::Binding,
     postgres_snapshot,
 };
 use std::time::Instant;
@@ -28,6 +31,36 @@ impl AuthenticationSession {
     pub(crate) fn retire(self, deadline: Instant) {
         self.0.retire(deadline);
     }
+    pub(crate) fn observe_events(
+        &mut self,
+        binding: &Binding,
+        principal: Principal,
+        credential: EventCredential<Presented>,
+        deadline: Instant,
+    ) -> Result<EventObservation, ports::Error> {
+        let binding = postgres_snapshot::ReadBinding::from(binding);
+        self.0
+            .read(
+                binding.epoch,
+                ReadIsolation::RepeatableReadOnly,
+                deadline,
+                move |client| {
+                    Box::pin(async move {
+                        match postgres_snapshot::observe_events(
+                            client, binding, principal, credential,
+                        )
+                        .await
+                        {
+                            Ok(observation) => Ok(Some(observation)),
+                            Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),
+                            Err(_) => Err(ports::Error::Invalid),
+                        }
+                    })
+                },
+            )
+            .map_err(connection)??
+            .ok_or(ports::Error::Forbidden)
+    }
     pub(crate) fn authenticate(
         &mut self,
         binding: &Binding,
@@ -35,17 +68,17 @@ impl AuthenticationSession {
         deadline: Instant,
     ) -> Result<Principal, ports::Error> {
         let device = presented.id();
-        let binding = binding.clone();
+        let binding = postgres_snapshot::ReadBinding::from(binding);
         self.0
             .read(
-                binding.epoch(),
+                binding.epoch,
                 ReadIsolation::RepeatableReadOnly,
                 deadline,
                 move |client| {
                     Box::pin(async move {
-                        match postgres_snapshot::observe(client, &binding, presented).await {
+                        match postgres_snapshot::observe(client, binding, presented).await {
                             Ok(_) => Ok(Some(Principal {
-                                account: binding.account(),
+                                account: binding.account,
                                 device,
                             })),
                             Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),

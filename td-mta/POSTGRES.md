@@ -2696,12 +2696,15 @@ credentials survive the initial device observation for subsequent fresh
 storage authorization. Ordinary responses and EventSource clear them before
 output; other client retirement also clears them.
 
-The current service still supplies its local device registry. This increment
-activates no database-backed listener and grants no authority from parsing
-alone. The cutover must supply runtime-qualified primary lookup, fresh
-method authorization and service readiness/backoff, including its independent
-health/settlement connection capacity. DESIGN.md and RESOURCES.md own the
-worker lifecycle and active resource boundaries.
+EventSource uses that worker's PostgreSQL session to verify the selected
+configuration, account and device and capture the account sequence in one
+read-only transaction. Before sending headers it checks the password, then
+discards it. An open stream retains a digest derived from the authenticated
+device row. Each subsequent observation checks that digest and revocation
+status. Observations expire five seconds after their start, including time
+spent reading the database. The network thread pauses output until the next
+observation succeeds. DESIGN.md and RESOURCES.md own the worker lifecycle
+and connection limits.
 
 ## 64. Request credentials at the body-worker boundary
 

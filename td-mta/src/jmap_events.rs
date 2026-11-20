@@ -92,6 +92,30 @@ pub struct Snapshot {
     identity: Option<IdentityState>,
 }
 impl Snapshot {
+    pub(crate) fn mail(
+        view: crate::ports::ViewIdentity,
+        submission: bool,
+        identity: Option<IdentityState>,
+    ) -> Result<Self, Error> {
+        let types = [
+            DataType::Mailbox,
+            DataType::Thread,
+            DataType::Email,
+            DataType::Submission,
+        ];
+        let states = types.map(|kind| DataState {
+            kind,
+            account: view.account,
+            epoch: view.epoch,
+            sequence: view.committed_sequence,
+        });
+        let visible = if submission {
+            states.as_slice()
+        } else {
+            states.get(..3).ok_or(Error::Invalid)?
+        };
+        Self::new(view.account, visible, identity)
+    }
     pub fn new(
         account: AccountId,
         data: &[DataState],
@@ -352,6 +376,45 @@ mod tests {
             Err(Error::Capacity)
         );
     }
+    #[test]
+    fn events_expose_the_same_data_state_as_account_reads() {
+        let view = crate::ports::ViewIdentity {
+            account: AccountId::from_bytes([1; 16]),
+            epoch: StoreEpoch::from_bytes([2; 16]),
+            committed_sequence: Sequence::from_u64(12),
+            history_floor: Sequence::from_u64(4),
+        };
+        let identity = IdentityState {
+            account: view.account,
+            epoch: view.epoch,
+            digest: [3; 32],
+        };
+        for submission in [true, false] {
+            let snapshot =
+                Snapshot::mail(view, submission, submission.then_some(identity)).unwrap();
+            for (index, kind) in [
+                DataType::Mailbox,
+                DataType::Thread,
+                DataType::Email,
+                DataType::Submission,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    snapshot.data[index],
+                    (submission || kind != DataType::Submission).then_some(DataState {
+                        account: view.account,
+                        epoch: view.epoch,
+                        sequence: view.committed_sequence,
+                        kind
+                    })
+                );
+            }
+            assert_eq!(snapshot.identity, submission.then_some(identity));
+        }
+    }
+
     #[test]
     fn state_frames_filter_coalesce_and_wait_for_flush() {
         let mut stream =

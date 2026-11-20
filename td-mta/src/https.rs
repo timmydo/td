@@ -125,6 +125,7 @@ enum Phase {
     Upload,
     Download,
     Api,
+    EventRead,
     Events,
     Response,
     Complete,
@@ -212,8 +213,18 @@ impl Transport for Connection {
         }
     }
 }
+const EVENT_SAMPLE_MS: u64 = 5_000;
+
+struct EventSample {
+    observed: Tick,
+    stamp: [u8; 32],
+    snapshot: crate::jmap_events::Snapshot,
+    expires: Deadline,
+}
 struct EventState {
-    stream: crate::jmap_events::Stream,
+    options: crate::jmap_events::Options,
+    stream: Option<crate::jmap_events::Stream>,
+    sample: Option<Result<EventSample, Error>>,
     headers: bool,
     pending: bool,
     last: Tick,
@@ -226,6 +237,11 @@ struct ApiWorker<'a> {
 fn clear_head(client: &mut Client) {
     let previous = std::mem::replace(&mut client.head, HeadReader::new(Box::<[u8]>::default()));
     client.head = HeadReader::new(previous.into_storage());
+}
+impl Client {
+    fn deadline(&self) -> Deadline {
+        self.absolute.min(self.phase_deadline).min(self.idle)
+    }
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -551,7 +567,12 @@ impl Https<'_> {
                         control,
                     };
                     let mut maintained = Instant::now();
+                    let mut event_cursor = 0;
                     while !done.load(Ordering::Acquire) {
+                        if control.stop_requested() {
+                            std::thread::park_timeout(SCAN);
+                            continue;
+                        }
                         if maintained.elapsed() >= Duration::from_secs(1) {
                             match self.authentication.maintain() {
                                 Ok(()) | Err(Error::Busy) => (),
@@ -562,7 +583,14 @@ impl Https<'_> {
                             }
                             maintained = Instant::now();
                         }
-                        for cell in &slots {
+                        let mut next_event = None;
+                        for (index, cell) in slots
+                            .iter()
+                            .enumerate()
+                            .cycle()
+                            .skip(event_cursor)
+                            .take(slots.len())
+                        {
                             let mut slot = match cell.try_lock() {
                                 Ok(slot) => slot,
                                 Err(TryLockError::WouldBlock) => continue,
@@ -571,17 +599,38 @@ impl Https<'_> {
                                     return;
                                 }
                             };
-                            let Some(client) =
-                                slot.as_mut().filter(|c| c.phase == Phase::Authenticate)
-                            else {
+                            let Some(client) = slot.as_mut() else {
                                 continue;
                             };
+                            if client.phase == Phase::EventRead && next_event.is_none() {
+                                next_event = Some((index, cell));
+                            }
+                            if client.phase != Phase::Authenticate {
+                                continue;
+                            }
                             if let Err(error) = self.authenticate(client) {
                                 if error == Error::WriterStopped {
                                     control.fail();
                                     return;
                                 }
                                 *slot = None;
+                            }
+                        }
+                        // Check all waiting sign-ins between any two stream samples.
+                        if let Some((index, cell)) = next_event
+                            .filter(|_| !control.stop_requested() && !done.load(Ordering::Acquire))
+                        {
+                            event_cursor = (index + 1) % slots.len();
+                            if let Ok(mut slot) = cell.try_lock() {
+                                if let Some(client) =
+                                    slot.as_mut().filter(|c| c.phase == Phase::EventRead)
+                                {
+                                    let sample = self.event_sample(client);
+                                    if let Some(event) = &mut client.events {
+                                        event.sample = Some(sample);
+                                    }
+                                    client.phase = Phase::Events;
+                                }
                             }
                         }
                         std::thread::park_timeout(SCAN);
@@ -928,7 +977,9 @@ impl Https<'_> {
                 if matches!(
                     client.phase,
                     Phase::Tls | Phase::Authenticate | Phase::Upload | Phase::Download | Phase::Api
-                ) {
+                ) || (client.phase == Phase::EventRead
+                    && !client.deadline().expired(time.monotonic))
+                {
                     continue;
                 }
                 let mut wake_body = false;
@@ -941,11 +992,13 @@ impl Https<'_> {
                     control,
                 ) {
                     Ok(true) => {
-                        wake_auth = client.phase == Phase::Authenticate;
+                        wake_auth = matches!(client.phase, Phase::Authenticate | Phase::EventRead);
                         if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
                             wake_body = true;
                         }
-                        if client.phase == Phase::Close && client.events.take().is_some() {
+                        if matches!(client.phase, Phase::Close | Phase::Response)
+                            && client.events.take().is_some()
+                        {
                             event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
                         }
                         if client.phase == Phase::Close
@@ -1131,10 +1184,7 @@ impl Https<'_> {
         control: &Control,
     ) -> Result<bool, Error> {
         let time = self.clock.sample()?;
-        if client.absolute.expired(time.monotonic)
-            || client.phase_deadline.expired(time.monotonic)
-            || client.idle.expired(time.monotonic)
-        {
+        if client.deadline().expired(time.monotonic) {
             return Ok(false);
         }
         match client.phase {
@@ -1215,7 +1265,6 @@ impl Https<'_> {
                             if let Some(attempt) = client.attempt.take() {
                                 attempts.authenticated(attempt);
                             }
-                            let device = principal.device;
                             if let Some(backend) = self.backend(principal.account, client.origin) {
                                 if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
                                     if head.method != "POST" {
@@ -1322,31 +1371,17 @@ impl Https<'_> {
                                                         .map(|()| true);
                                                 }
                                             };
-                                        let snapshot =
-                                            match backend.event_snapshot(device, client.absolute) {
-                                                Ok(snapshot) => snapshot,
-                                                Err(Error::Busy) => return Ok(true),
-                                                Err(Error::Forbidden) => {
-                                                    return self
-                                                        .respond(client, 401, time.utc_ms)
-                                                        .map(|()| true);
-                                                }
-                                                Err(error) => return Err(error),
-                                            };
-                                        let stream = crate::jmap_events::Stream::new(
+                                        client.events = Some(EventState {
                                             options,
-                                            snapshot,
-                                            head.last_event_id,
-                                            time.monotonic,
-                                        )?;
+                                            stream: None,
+                                            sample: None,
+                                            headers: true,
+                                            pending: false,
+                                            last: time.monotonic,
+                                        });
                                         client.principal = Some(principal);
                                         client.keep_alive = false;
-                                        self.begin_events(
-                                            client,
-                                            stream,
-                                            time.utc_ms,
-                                            time.monotonic,
-                                        )?;
+                                        client.phase = Phase::EventRead;
                                         *event_count =
                                             event_count.checked_add(1).ok_or(Error::Capacity)?;
                                         return Ok(true);
@@ -1378,7 +1413,7 @@ impl Https<'_> {
                 }
                 self.respond(client, status, time.utc_ms)?;
             }
-            Phase::Events => return self.events(client, time.monotonic),
+            Phase::Events => return self.events(client, time.monotonic, time.utc_ms),
             Phase::Response => {
                 let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
                 if client.sent < client.response.len() {
@@ -1453,9 +1488,12 @@ impl Https<'_> {
                     &mut client.drain_left,
                 );
             }
-            Phase::Tls | Phase::Authenticate | Phase::Upload | Phase::Download | Phase::Api => {
-                return Err(Error::Invalid)
-            }
+            Phase::Tls
+            | Phase::Authenticate
+            | Phase::EventRead
+            | Phase::Upload
+            | Phase::Download
+            | Phase::Api => return Err(Error::Invalid),
         }
         Ok(true)
     }
@@ -1727,6 +1765,47 @@ impl Https<'_> {
             }
         }
     }
+    fn event_sample(&self, client: &Client) -> Result<EventSample, Error> {
+        let now = self.clock.sample()?.monotonic;
+        let expires = Deadline::after(now, EVENT_SAMPLE_MS)?;
+        let deadline = expires.min(client.deadline());
+        if deadline.expired(now) {
+            return Err(Error::Deadline);
+        }
+        let principal = client.principal.ok_or(Error::Forbidden)?;
+        let event = client.events.as_ref().ok_or(Error::Invalid)?;
+        if now < event.last {
+            return Err(Error::Deadline);
+        }
+        let proof = match event.sample.as_ref() {
+            Some(Ok(sample)) => http_auth::EventCredential::Continued(sample.stamp),
+            Some(Err(error)) => return Err(*error),
+            None => http_auth::EventCredential::Password(
+                client
+                    .credentials
+                    .as_ref()
+                    .ok_or(Error::Forbidden)?
+                    .password(),
+            ),
+        };
+        let observation = self
+            .authentication
+            .observe_events(principal, proof, deadline)?;
+        let backend = self
+            .backend(principal.account, client.origin)
+            .ok_or(Error::Forbidden)?;
+        let snapshot = backend.event_snapshot(observation.identity)?;
+        let finished = self.clock.sample()?.monotonic;
+        if finished < now || deadline.expired(finished) {
+            return Err(Error::Deadline);
+        }
+        Ok(EventSample {
+            observed: finished,
+            stamp: observation.credential_stamp,
+            snapshot,
+            expires,
+        })
+    }
     fn begin_events(
         &self,
         client: &mut Client,
@@ -1749,12 +1828,7 @@ impl Https<'_> {
         write!(&mut client.response,
             "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
             http_date(utc_ms)?)?;
-        client.events = Some(EventState {
-            stream,
-            headers: true,
-            pending: false,
-            last: now,
-        });
+        client.events.as_mut().ok_or(Error::Invalid)?.stream = Some(stream);
         client.sent = 0;
         if let Some(timing) = client.timing.take() {
             timing.finish(crate::performance::Outcome::Success);
@@ -1764,22 +1838,37 @@ impl Https<'_> {
         client.idle = idle;
         Ok(())
     }
-    fn events(&self, client: &mut Client, now: Tick) -> Result<bool, Error> {
-        let state = client.events.as_mut().ok_or(Error::Invalid)?;
-        if now < state.last {
+    fn events(&self, client: &mut Client, now: Tick, utc_ms: i64) -> Result<bool, Error> {
+        let event = client.events.as_mut().ok_or(Error::Invalid)?;
+        if now < event.last {
             return Err(Error::WriterStopped);
         }
-        state.last = now;
-        let principal = client.principal.ok_or(Error::Invalid)?;
-        let backend = self
-            .backend(principal.account, client.origin)
-            .ok_or(Error::Invalid)?;
-        let snapshot = match backend.event_snapshot(principal.device, client.absolute) {
-            Ok(snapshot) => snapshot,
-            Err(Error::Busy) => return Ok(true),
-            Err(error) => return Err(error),
+        event.last = now;
+        let sample = match event.sample.as_ref().ok_or(Error::Invalid)? {
+            Ok(sample) => sample,
+            Err(error) if event.headers && client.sent == 0 => {
+                client.response.clear();
+                let status = if *error == Error::Forbidden { 401 } else { 503 };
+                self.respond(client, status, utc_ms)?;
+                return Ok(true);
+            }
+            Err(_) => return Ok(false),
         };
-        let event = client.events.as_mut().ok_or(Error::Invalid)?;
+        if now < sample.observed {
+            return Ok(false);
+        }
+        if sample.expires.expired(now) {
+            client.phase = Phase::EventRead;
+            return Ok(true);
+        }
+        let snapshot = sample.snapshot;
+        let Some(stream) = event.stream.as_mut() else {
+            let head = client.head.head().map_err(|_| Error::Invalid)?;
+            let stream =
+                crate::jmap_events::Stream::new(event.options, snapshot, head.last_event_id, now)?;
+            self.begin_events(client, stream, utc_ms, now)?;
+            return Ok(true);
+        };
         let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
         if event.headers {
             if client.sent < client.response.len() {
@@ -1798,7 +1887,7 @@ impl Https<'_> {
             }
             return Ok(true);
         }
-        let frame = event.stream.prepare(snapshot, now)?;
+        let frame = stream.prepare(snapshot, now)?;
         if frame.is_empty() {
             // A silent stream still detects EOF; no pipelined requests are accepted.
             return match connection.read(&mut client.input)? {
@@ -1818,11 +1907,11 @@ impl Https<'_> {
                 _ => return Ok(false),
             }
         } else if connection.flush()? == FlushProgress::Complete {
-            event.stream.acknowledge(self.clock.sample()?.monotonic)?;
+            stream.acknowledge(self.clock.sample()?.monotonic)?;
             event.pending = false;
             client.sent = 0;
             client.idle = client.absolute;
-            if event.stream.closed() {
+            if stream.closed() {
                 client.phase = Phase::Close;
                 client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
                 client.idle = client.phase_deadline;

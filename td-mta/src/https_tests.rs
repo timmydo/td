@@ -1130,9 +1130,12 @@ fn account_origin_upload_policy(first_read_only: bool) {
             wait(|| ready.load(Ordering::Acquire));
             // Two pipelined discovery requests must select authority afresh,
             // even when account and allowed origin change on the same TLS connection.
-            let discovery = |username: &str, password: &str, host: &str| {
+            let request = |path: &str, username: &str, password: &str, host: &str| {
                 let authorization = base64(format!("{username}:{password}").as_bytes());
-                format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port())
+                format!("GET {path} HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port())
+            };
+            let discovery = |username: &str, password: &str, host: &str| {
+                request("/.well-known/jmap", username, password, host)
             };
             let mut peer = client(address, &lease, clock.clone());
             let pipeline = discovery("first", "first-password", "localhost")
@@ -1217,6 +1220,10 @@ fn account_origin_upload_policy(first_read_only: bool) {
                 }
             }
             }
+            let mut event_client = client(address, &lease, Arc::<Now>::clone(&clock));
+            let event_request = request("/jmap/events?types=Mailbox&closeafter=state&ping=0", "first", "first-password", "localhost");
+            send(&mut event_client, event_request.as_bytes());
+            assert_eq!(full_reply(&mut event_client).0, 503);
             assert_ne!(first.session.state().unwrap(), first_alias.session.state().unwrap());
             for (host, origin, expected) in [("unlisted.test", &origin_text, 421), ("alias.test", &origin_text, 403), ("localhost", &alias_text, 403)] {
                 std::thread::sleep(Duration::from_millis(250));

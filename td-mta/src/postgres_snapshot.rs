@@ -1,7 +1,13 @@
 //! Shared selected-profile admission for finite primary read snapshots.
 use crate::{
-    device_credentials::Presented, format::Sequence, ports::ViewIdentity, postgres_devices,
-    postgres_runtime_profile::Binding, postgres_schema,
+    device_credentials::Presented,
+    format::Sequence,
+    ids::{AccountId, StoreEpoch},
+    ports::ViewIdentity,
+    postgres_devices,
+    postgres_runtime_profile::Binding,
+    postgres_schema,
+    postgres_selection::Selection,
 };
 use tokio_postgres::{types::Type, Client};
 
@@ -15,6 +21,24 @@ pub(crate) enum Error {
     Integrity,
     Database,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct ReadBinding {
+    pub(crate) account: AccountId,
+    pub(crate) epoch: StoreEpoch,
+    selection: Selection,
+    jmap: bool,
+}
+impl From<&Binding> for ReadBinding {
+    fn from(binding: &Binding) -> Self {
+        Self {
+            account: binding.account(),
+            epoch: binding.epoch(),
+            selection: binding.selection(),
+            jmap: binding.roles().jmap(),
+        }
+    }
+}
+
 pub(crate) async fn begin(
     client: &Client,
     binding: &Binding,
@@ -30,16 +54,45 @@ pub(crate) async fn begin(
         return Err(Error::Epoch);
     }
     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
-    observe(client, binding, presented).await
+    observe(client, binding.into(), presented).await
 }
 
 // The caller owns a freshly qualified transaction and its migration lock.
 pub(crate) async fn observe(
     client: &Client,
-    binding: &Binding,
+    binding: ReadBinding,
     presented: Presented,
 ) -> Result<ViewIdentity, Error> {
-    if !binding.roles().jmap() {
+    selected(client, binding).await?;
+    postgres_devices::authenticate(client, binding.account, presented)
+        .await
+        .map_err(Error::Credential)?
+        .ok_or(Error::Unauthenticated)?;
+    identity(client, binding).await
+}
+
+pub(crate) async fn observe_events(
+    client: &Client,
+    binding: ReadBinding,
+    principal: crate::http_auth::Principal,
+    credential: crate::http_auth::EventCredential<Presented>,
+) -> Result<crate::http_auth::EventObservation, Error> {
+    if principal.account != binding.account {
+        return Err(Error::Unauthenticated);
+    }
+    selected(client, binding).await?;
+    let credential_stamp = postgres_devices::event_stamp(client, principal, credential)
+        .await
+        .map_err(Error::Credential)?
+        .ok_or(Error::Unauthenticated)?;
+    Ok(crate::http_auth::EventObservation {
+        credential_stamp,
+        identity: identity(client, binding).await?,
+    })
+}
+
+async fn selected(client: &Client, binding: ReadBinding) -> Result<(), Error> {
+    if !binding.jmap {
         return Err(Error::Policy);
     }
     let selected = client
@@ -51,19 +104,19 @@ pub(crate) async fn observe(
         .map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
     let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-    if generation.number() != binding.selection().generation
-        || version != Some(binding.selection().version.as_bytes().as_slice())
+    if generation.number() != binding.selection.generation
+        || version != Some(binding.selection.version.as_bytes().as_slice())
     {
         return Err(Error::Policy);
     }
-    postgres_devices::authenticate(client, binding.account(), presented)
-        .await
-        .map_err(Error::Credential)?
-        .ok_or(Error::Unauthenticated)?;
+    Ok(())
+}
+
+async fn identity(client: &Client, binding: ReadBinding) -> Result<ViewIdentity, Error> {
     let row = client
         .query_typed_one(
             "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1",
-            &[(&binding.account().as_bytes().as_slice(), Type::BYTEA)],
+            &[(&binding.account.as_bytes().as_slice(), Type::BYTEA)],
         )
         .await
         .map_err(|_| Error::Database)?;
@@ -73,8 +126,8 @@ pub(crate) async fn observe(
         return Err(Error::Integrity);
     }
     Ok(ViewIdentity {
-        account: binding.account(),
-        epoch: binding.epoch(),
+        account: binding.account,
+        epoch: binding.epoch,
         committed_sequence,
         history_floor,
     })

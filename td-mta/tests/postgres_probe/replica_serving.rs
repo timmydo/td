@@ -329,6 +329,27 @@ certificate = "public"
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let reply = td_json::parse_slice(&bytes).unwrap();
         assert_eq!(reply["methodResponses"][1][0].as_str(), Some("Email/get"));
+        if profile == "local" {
+            let stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut events = super::serving_events::request(
+                stream,
+                &session,
+                "localhost",
+                "http://localhost",
+                &authorization,
+                "state",
+                None,
+            );
+            let (_, state) = super::serving_events::state(&mut events, &account_wire);
+            assert_eq!(
+                reply["methodResponses"][1][1]["state"].as_str(),
+                Some(state.as_str())
+            );
+            assert_eq!(events.read(&mut [0]).unwrap(), 0);
+        }
         let rights = &reply["methodResponses"][0][1]["list"][0]["myRights"];
         assert_eq!(rights["mayReadItems"].as_bool(), Some(true));
         for name in [

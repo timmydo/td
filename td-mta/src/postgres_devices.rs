@@ -431,13 +431,54 @@ pub(crate) async fn authenticate(
     account: AccountId,
     presented: Presented,
 ) -> Result<Option<DeviceId>, Error> {
+    let device = presented.id();
+    let (salt, expected, active) = credential_row(client, account, device).await?;
+    let matched = presented
+        .matches(account, &salt, &expected)
+        .map_err(|_| Error::Crypto)?;
+    Ok((active && matched).then_some(presented.id()))
+}
+
+/// Compare an admitted stream with the current row without keeping a password
+/// or a database verifier in its connection slot.
+pub(crate) async fn event_stamp(
+    client: &Client,
+    principal: crate::http_auth::Principal,
+    credential: crate::http_auth::EventCredential<Presented>,
+) -> Result<Option<[u8; 32]>, Error> {
+    use crate::http_auth::EventCredential;
+    let (salt, verifier, active) =
+        credential_row(client, principal.account, principal.device).await?;
+    let stamp = hash(&[
+        b"td-mta event credential v1",
+        principal.account.as_bytes(),
+        principal.device.as_bytes(),
+        &salt,
+        &verifier,
+    ])?;
+    let matched = match credential {
+        EventCredential::Password(presented) => {
+            presented.id() == principal.device
+                && presented
+                    .matches(principal.account, &salt, &verifier)
+                    .map_err(|_| Error::Crypto)?
+        }
+        EventCredential::Continued(expected) => Provider.equal_digest(&stamp, &expected),
+    };
+    Ok((active && matched).then_some(stamp))
+}
+async fn credential_row(
+    client: &Client,
+    account: AccountId,
+    device: DeviceId,
+) -> Result<([u8; 32], [u8; 32], bool), Error> {
     let rows = client.query_typed("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
-                &[(&account.as_bytes().as_slice(), Type::BYTEA), (&presented.id().as_bytes().as_slice(), Type::BYTEA)])
+                &[(&account.as_bytes().as_slice(), Type::BYTEA), (&device.as_bytes().as_slice(), Type::BYTEA)])
                 .await.map_err(|_| Error::Database)?;
     if rows.len() > 1 {
         return Err(Error::Invalid);
     }
-    let (salt, expected, active) = if let Some(row) = rows.first() {
+    Ok(if let Some(row) = rows.first() {
         let salt: &[u8] = row.try_get(0).map_err(|_| Error::Invalid)?;
         let expected: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
         let revoked: Option<i64> = row.try_get(2).map_err(|_| Error::Invalid)?;
@@ -448,11 +489,7 @@ pub(crate) async fn authenticate(
         )
     } else {
         ([0; 32], [0; 32], false)
-    };
-    let matched = presented
-        .matches(account, &salt, &expected)
-        .map_err(|_| Error::Crypto)?;
-    Ok((active && matched).then_some(presented.id()))
+    })
 }
 
 fn hash(parts: &[&[u8]]) -> Result<[u8; 32], Error> {

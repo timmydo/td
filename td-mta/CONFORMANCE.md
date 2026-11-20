@@ -56,8 +56,7 @@ address/message headers, decoded custom headers, explicit null for an absent
 header, missing email IDs, and omission of unrequested body properties.
 This validates that projection at the backend boundary; preview interaction
 and queued rule replay are not driven through the real td-mail UI here.
-EventSource emits pings only; Mail StateChange integration remains absent and
-is not used by td-mail. Activation follows
+EventSource reports changes to the authenticated account. Activation follows
 the supported td-mail workflow tests, not every reference-table row.
 M22/M24 still own real-client and complete release coverage. API.md and
 QUEUE.md fix state/error and submission policies.
@@ -328,16 +327,12 @@ is integrated into the live Core runtime described below.
 The HTTPS fixture exercises discovery metadata against the prepared Session,
 origin-form and absolute-form authority, fixed/chunked Core requests, ordered
 responses/references/problems, upload publication and raw downloads. Event
-coverage includes requested pings, ping=0 silence, unknown reconnect IDs,
-connection-limit refusal, simultaneous API traffic, revocation and shutdown.
-The passive EventSource tests exercise StateChange coalescing, filtering,
-last-event-ID replay avoidance and closeafter=state. Core exposes no stateful
-account data type. The live stream still produces pings only; this read
-profile does not claim Mail StateChange events. The real-client fixture below
-qualifies the request-driven td-mail flow independently of passive SSE tests.
-td-mail does not consume EventSource; it refreshes on its configured idle-sync
-interval (60 seconds by default) and on manual refresh. Live Mail events
-remain deferred.
+coverage includes frame coalescing, type selection, pings and reconnect IDs
+in the encoder tests. The PostgreSQL foreground fixture follows the HTTPS
+Session's event URL. It reads an initial Email state, resumes with that ID,
+commits a draft and receives a new state on the open connection. A reconnect
+with the old ID receives current state. It also checks that device revocation
+ends an open stream.
 
 ## Mailbox query availability
 

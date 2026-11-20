@@ -3371,8 +3371,11 @@ one worker at a time. Uploads additionally own a single ingress permit,
 matching the shared native upload buffer and advertised upload concurrency.
 ADMISSION.md owns request lifetimes.
 Discovery retires the 32 KiB credential head and decoded credentials before
-allocating its at-most 32 KiB Session response. EventSource retains only its fixed frame and passive
-snapshot; it never holds a store view or a response file. The prepared
+allocating its at-most 32 KiB Session response. Each EventSource slot holds
+a fixed frame and passive state for its authenticated device. The existing
+authentication worker handles waiting sign-ins between snapshot reads and
+rotates among stream slots. It releases the store view before the network
+thread sends a frame. The prepared
 Session is shared startup metadata. These bounds fit the existing per-client
 scratch reservation; integrated whole-service measurement remains pending.
 

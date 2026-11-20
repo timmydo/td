@@ -239,6 +239,10 @@ pub(super) fn exercise(
     assert!(reply.contains("urn:ietf:params:jmap:mail"), "{reply}");
     let session = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
     let source_account = &session["accounts"].as_obj().unwrap().first().unwrap().0;
+    let mut events =
+        super::serving_events::open(&session, https_addr, &fixture.ca, &basic, "state", None);
+    let _ = super::serving_events::state(&mut events, source_account);
+    assert_eq!(events.read(&mut [0]).unwrap(), 0);
     let body = format!(
         r#"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{{"accountId":"{source_account}"}},"received"]]}}"#
     );

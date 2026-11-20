@@ -2805,7 +2805,7 @@ td-mta/src/postgres_final_capacity.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_header_cache.rs	direct-reservation	3
 td-mta/src/postgres_header_cache.rs	unchecked-growth-or-clone	7
 td-mta/src/postgres_http_api.rs	heap-owner	1
-td-mta/src/postgres_http_api.rs	unchecked-growth-or-clone	3
+td-mta/src/postgres_http_api.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_http_cancellations.rs	heap-owner	1
 td-mta/src/postgres_http_cancellations.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_http_drafts.rs	direct-reservation	3
@@ -2866,7 +2866,6 @@ td-mta/src/postgres_prepared_failure.rs	heap-owner	3
 td-mta/src/postgres_prepared_failure.rs	unchecked-growth-or-clone	5
 td-mta/src/postgres_probe.rs	heap-owner	11
 td-mta/src/postgres_probe.rs	unchecked-growth-or-clone	4
-td-mta/src/postgres_probe/authentication.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/framing.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/mutation.rs	heap-owner	2
 td-mta/src/postgres_probe/mutation.rs	unchecked-growth-or-clone	3

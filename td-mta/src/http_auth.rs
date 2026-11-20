@@ -81,6 +81,19 @@ pub struct Principal {
     pub device: DeviceId,
 }
 
+/// An event stream drops its password before sending headers. Later observations
+/// bind the device to the credential verified at stream admission.
+pub enum EventCredential<T> {
+    Password(T),
+    Continued([u8; 32]),
+}
+
+#[derive(Clone, Copy)]
+pub struct EventObservation {
+    pub identity: crate::ports::ViewIdentity,
+    pub credential_stamp: [u8; 32],
+}
+
 /// Call only after TLS or private Unix socket admission and configured-origin checks.
 /// This observation is not a mutation guard or permanent connection authority.
 pub trait Authenticator: Sync {
@@ -93,6 +106,15 @@ pub trait Authenticator: Sync {
     /// Release retained resources on their owning thread before it exits.
     fn close(&self) -> Result<(), Error> {
         Ok(())
+    }
+    /// Called only on the fixed authentication worker, in a finite read job.
+    fn observe_events(
+        &self,
+        _principal: Principal,
+        _credential: EventCredential<&[u8]>,
+        _deadline: Deadline,
+    ) -> Result<EventObservation, Error> {
+        Err(Error::NotFound)
     }
     fn authenticate(
         &self,
