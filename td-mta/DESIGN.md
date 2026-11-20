@@ -1402,7 +1402,7 @@ Initial default ceilings (validated together at startup):
 
 | Resource | Default limit |
 | --- | --- |
-| Simultaneous inbound SMTP sessions | 8, at most 2 per peer address |
+| Simultaneous inbound SMTP sessions | 8, at most 2 per SMTP peer key |
 | Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
 | Active HTTPS connections | 8, at most 7 per network address, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
@@ -1879,15 +1879,13 @@ its owning worker; Busy maintenance defers without stopping service. No database
 transaction spans peer input. POSTGRES specifies its independent connection,
 per-job authority, wire allowances and durable-outcome retirement rules.
 
-DATA admission additionally permits at most two resident jobs per socket peer
-address across the four total jobs, independent of connection limits. A peer
-behind NAT shares that allowance; this is address fairness, not sender identity
-or a defense against distributed senders. It uses the existing bounded
-pre-354 retry path and leaves HTTPS connection limits unchanged.
+Session admission (across listeners and within each listener), DATA admission
+and the accepted-mail rate use the same socket peer key: the exact IPv4 address
+(IPv4-mapped IPv6 included) or the IPv6 /64. DATA admission permits at most two
+resident jobs per key across the four total jobs. A full DATA allowance uses
+the bounded pre-354 retry path.
 
-Accepted mail is also rate-limited per peer key: the exact IPv4 address
-(IPv4-mapped IPv6 included) or the IPv6 /64, which one host can hold
-entirely. A key may spend a burst of 100 messages and 4,096 64 KiB blocks
+A key may spend a burst of 100 messages and 4,096 64 KiB blocks
 (256 MiB), refilled at one message per 30 seconds and one block per 5,273
 ms (about 1 GiB a day). A message counts once however many local accounts
 it reached: each account's intake from the key is bounded alike, and a
@@ -1911,10 +1909,8 @@ keys, a /48 65,536, each with its own burst, so account quotas remain the
 backstop. Senders behind one key share its budget: a NAT pool, or a large
 provider sending from one /64, where one of its users can delay (never
 lose) the provider's other mail here, as filling an account's quota would
-refuse everyone's. Session and DATA bounds count exact addresses, so the
-in-flight overshoot past a throttled key is the per-peer session limit
-(two by default) for an IPv4 key but up to the listener's session limit
-for an IPv6 /64. State
+refuse everyone's. The per-peer session limit (two by default) bounds the
+in-flight overshoot past a throttled key for both address families. State
 is per process and resets on restart or reload, so several receiving
 processes multiply the budget. There is no per-account aggregate rate,
 which any distributed sender could use to block one account's mail. A
@@ -3054,7 +3050,9 @@ through a current-user mode-0600 pathname socket in a mode-0700 directory.
 It does not open a TCP listener, manufacture TLS verification, or require a
 certificate. CONFIG.md and SCHEMA.md own declaration and lifetime exclusion.
 Its fixed logical origin is `http://localhost`; network JMAP continues to
-require HTTPS. Local peers share a bounded authentication-attempt bucket.
+require HTTPS. A private profile owns its connection pool and authentication
+worker. Local peers share that profile's bounded sign-in budget. Connections
+and sign-in attempts on a public HTTPS profile consume its own limits.
 All account authorization, durable-write, body integrity and read-only
 replica rules are unchanged. The transport choice does not select replica
 mode or grant write authority. Clients must explicitly bind this logical

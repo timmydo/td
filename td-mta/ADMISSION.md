@@ -118,11 +118,12 @@ retained slot reserves completion capacity before dispatch. Finalization
 captures the configured commit deadline once, before queueing, and retries
 keep it. Begin-DATA ticket contention may retry only before admission,
 under the original queued admission cap. The PostgreSQL adapter admits four
-resident DATA jobs across all listeners and accounts, at most two per actual
-socket peer address; the fixed storage worker
-continues to serialize publication. Accepted mail is
-rate-limited per peer key, refusing MAIL with 421 4.7.0
-and closing (DESIGN.md section 9). A paused DATA sender consumes one permit,
+resident DATA jobs across all listeners and accounts, at most two per
+peer key. Session limits, DATA admission and the accepted-mail rate use the
+socket peer's IPv4 address (including IPv4-mapped addresses) or IPv6 /64.
+The fixed storage worker serializes publication. On rate exhaustion, the
+receiver replies to MAIL with 421 4.7.0 and closes (DESIGN.md section 9).
+A paused DATA sender consumes one permit,
 and exhaustion waits before 354 without allocating another incoming body.
 
 For an HTTP transfer of admitted maximum B bytes, use

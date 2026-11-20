@@ -48,10 +48,10 @@ Five processes use the selected MTA executable:
 - `td-mta-migadu.service`: production outbound relay profile.
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
-The inbound SMTP listener permits eight simultaneous sessions. DATA admission
-remains bounded to four jobs overall and two per peer. These are separate
-limits: increasing listener capacity does not remove the per-peer DATA bound.
-Each peer key (an IPv4 address or IPv6 /64) may also deliver bursts of 100
+The inbound SMTP listener permits eight simultaneous sessions. The SMTP session
+and DATA limits share a peer key: an IPv4 address (including IPv4-mapped
+addresses) or an IPv6 /64. DATA admission has its own fixed limits of four
+jobs overall and two per peer. Each peer key may also deliver bursts of 100
 messages and 256 MiB, then 120 messages an hour and about 1 GiB a day; beyond
 that its MAIL commands receive `421 4.7.0` until the balance refills, and the
 sender retries. `smtp_rate_refused` performance counters show refusals (busy)

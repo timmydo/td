@@ -10,6 +10,7 @@ use crate::{
     ports::{Clock, Commit, CommitFailure, Deadline, Error},
     postgres_receiving::{self, Message},
     postgres_smtp_receiving::{self as owner, Receiving},
+    smtp_rate::PeerKey,
     smtp_storage::{Begin, Commits, Completion, Failure, Job, Storage},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,7 +202,7 @@ impl Backend<'_> {
 }
 struct Admissions {
     occupied: [AtomicBool; crate::limits::SMTP_DATA_JOBS],
-    peers: Mutex<[Option<IpAddr>; crate::limits::SMTP_DATA_JOBS]>,
+    peers: Mutex<[Option<PeerKey>; crate::limits::SMTP_DATA_JOBS]>,
 }
 impl Admissions {
     fn new() -> Self {
@@ -211,6 +212,7 @@ impl Admissions {
         }
     }
     fn acquire(&self, peer: IpAddr) -> Result<Permit<'_>, Failure> {
+        let key = PeerKey::from(peer);
         let mut peers = self.peers.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => Failure::Retry,
             TryLockError::Poisoned(_) => Failure::Refused(Error::Invalid),
@@ -219,7 +221,7 @@ impl Admissions {
             .occupied
             .iter()
             .zip(peers.iter())
-            .filter(|(busy, label)| busy.load(Ordering::Acquire) && **label == Some(peer))
+            .filter(|(busy, label)| busy.load(Ordering::Acquire) && **label == Some(key))
             .count()
             >= crate::limits::SMTP_DATA_PER_PEER
         {
@@ -230,7 +232,7 @@ impl Admissions {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                *label = Some(peer);
+                *label = Some(key);
                 return Ok(Permit(occupied));
             }
         }
@@ -653,13 +655,16 @@ mod admission_tests {
     #[test]
     fn peer_capacity_preserves_other_peers_and_releases_without_lock() {
         let slots = Admissions::new();
-        let first = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let second = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let v4 = Ipv4Addr::new(192, 0, 2, 1);
+        let first = IpAddr::V4(v4);
+        let mapped = IpAddr::V6(v4.to_ipv6_mapped());
+        let second = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+        let sibling = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 2));
         let a = slots.acquire(first).unwrap();
-        let b = slots.acquire(first).unwrap();
+        let b = slots.acquire(mapped).unwrap();
         assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
         let c = slots.acquire(second).unwrap();
-        let d = slots.acquire(second).unwrap();
+        let d = slots.acquire(sibling).unwrap();
         assert!(matches!(
             slots.acquire(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             Err(Failure::Retry)
@@ -668,6 +673,7 @@ mod admission_tests {
         std::thread::scope(|scope| scope.spawn(|| drop(a)).join().unwrap());
         assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
         drop(lock);
+        assert!(matches!(slots.acquire(second), Err(Failure::Retry)));
         let replacement = slots.acquire(first).unwrap();
         assert!(matches!(slots.acquire(first), Err(Failure::Retry)));
         drop((b, c, d, replacement));

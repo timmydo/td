@@ -4601,8 +4601,9 @@ original meter prepays publication I/O for every target, so a large fanout may
 refuse within the fixed work allowance even when each mailbox has quota.
 
 The PostgreSQL SMTP adapter separately admits at most four resident incoming
-DATA buffers, at most two per socket peer address, each reserved up front to the configured message ceiling minus
-trace allowance. A paused sender retains its buffer and permit but no database
+DATA buffers, at most two per SMTP peer key (DESIGN.md section 9). Each
+reserves the configured message ceiling minus the trace allowance. A paused
+sender retains its buffer and permit but no database
 connection or storage-worker execution time. The singleton storage worker
 serializes preparation and publication, retaining at most one additional
 filtered body and one uncertain operation. Body preparation preserves the

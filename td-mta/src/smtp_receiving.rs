@@ -14,6 +14,7 @@ use crate::{
         TlsVersion, Transport,
     },
     smtp_network::{Network, Progress},
+    smtp_rate::PeerKey,
     smtp_session::{Pending, Settings},
     smtp_starttls::{self, Upgrade},
     smtp_storage::{self, Job as _, Storage},
@@ -329,6 +330,26 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
     }
 }
 
+fn session_capacity(
+    occupied: &[Option<(usize, PeerKey)>],
+    candidate: (usize, PeerKey),
+    listener_limit: usize,
+    listener_peer_limit: usize,
+    profile_peer_limit: usize,
+) -> bool {
+    let mut listener_sessions = 0;
+    let mut listener_peer_sessions = 0;
+    let mut profile_peer_sessions = 0;
+    for &entry in occupied.iter().flatten() {
+        listener_sessions += usize::from(entry.0 == candidate.0);
+        listener_peer_sessions += usize::from(entry == candidate);
+        profile_peer_sessions += usize::from(entry.1 == candidate.1);
+    }
+    listener_sessions < listener_limit
+        && listener_peer_sessions < listener_peer_limit
+        && profile_peer_sessions < profile_peer_limit
+}
+
 /// Charge the peer's last acceptance, then decide its next MAIL.
 fn rate_turn(
     rates: &mut crate::smtp_rate::PeerRates,
@@ -336,7 +357,7 @@ fn rate_turn(
     network: &mut Network<'_>,
     now: Tick,
 ) {
-    let key = crate::smtp_rate::PeerKey::from(peer);
+    let key = PeerKey::from(peer);
     if let Some(charge) = network.take_accepted() {
         rates.charge(key, charge, now);
     }
@@ -822,25 +843,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                         continue;
                                     }
                                     let peer = transport.peer_addr().ip();
-                                    let count = occupied
-                                        .iter()
-                                        .flatten()
-                                        .filter(|(l, _)| *l == index)
-                                        .count();
-                                    let peer_count = occupied
-                                        .iter()
-                                        .flatten()
-                                        .filter(|(_, p)| *p == peer)
-                                        .count();
-                                    let local_peer = occupied
-                                        .iter()
-                                        .flatten()
-                                        .filter(|(l, p)| *l == index && *p == peer)
-                                        .count();
-                                    if count >= listener.row.session_limit.unwrap_or(0)
-                                        || peer_count >= limits.smtp_per_peer
-                                        || local_peer >= listener.row.per_peer_limit.unwrap_or(0)
-                                    {
+                                    let candidate = (index, PeerKey::from(peer));
+                                    if !session_capacity(
+                                        &occupied,
+                                        candidate,
+                                        listener.row.session_limit.unwrap_or(0),
+                                        listener.row.per_peer_limit.unwrap_or(0),
+                                        limits.smtp_per_peer,
+                                    ) {
                                         let _ =
                                             transport.write(b"421 4.3.2 Service unavailable\r\n");
                                         transport.abort();
@@ -880,7 +890,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     slot.peer = peer;
                                     slot.phase = Phase::Network;
                                     if let Some(entry) = occupied.get_mut(free) {
-                                        *entry = Some((index, peer));
+                                        *entry = Some(candidate);
                                     }
                                 }
                                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
@@ -1368,6 +1378,22 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_peer_limits_apply_within_and_across_listeners() {
+        let key = |prefix, host| {
+            PeerKey::from(IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, prefix, 0, 0, 0, host,
+            )))
+        };
+        let occupied = [Some((0, key(1, 1))), Some((1, key(1, 2))), None];
+        let sibling = key(1, 3);
+        assert!(!session_capacity(&occupied, (0, sibling), 8, 1, 3));
+        assert!(session_capacity(&occupied, (2, sibling), 8, 1, 3));
+        assert!(!session_capacity(&occupied, (2, sibling), 8, 1, 2));
+        assert!(session_capacity(&occupied, (0, key(2, 1)), 8, 1, 2));
+        assert!(!session_capacity(&occupied, (0, key(2, 1)), 1, 1, 2));
+    }
 
     #[test]
     fn pending_accept_errors_retry_but_broken_listener_fails() {
