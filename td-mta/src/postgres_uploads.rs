@@ -230,10 +230,8 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn begin(client: &Client, upload: &Upload) -> Result<(), Error> {
-    let schema = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+async fn begin(client: &postgres_probe::ScopedClient, upload: &Upload) -> Result<(), Error> {
+    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
     if schema.store_epoch != upload.binding.epoch() {
         return Err(Error::Epoch);
     }

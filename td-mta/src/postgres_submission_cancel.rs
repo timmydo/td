@@ -254,7 +254,7 @@ pub fn prepare_frontend(
     })
 }
 async fn begin(
-    client: &Client,
+    client: &postgres_probe::ScopedClient,
     value: &Cancellation,
     policy: bool,
     write: bool,
@@ -265,7 +265,8 @@ async fn begin(
             .map_err(Error::Owner);
     }
     let binding = value.binding();
-    let schema = crate::postgres_schema::lock_and_inspect(client)
+    let schema = client
+        .inspect_schema()
         .await
         .map_err(|e| Error::Owner(owners::Error::Schema(e)))?;
     if schema.store_epoch != binding.epoch() {

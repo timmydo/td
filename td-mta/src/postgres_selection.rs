@@ -185,7 +185,7 @@ pub fn inspect(
 ) -> Result<Option<Selection>, Error> {
     postgres_probe::with_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client)
+            let schema = client.inspect_schema()
                 .await
                 .map_err(Error::Schema)?;
             if schema.store_epoch != change.epoch {
@@ -229,9 +229,7 @@ pub fn publish(
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client)
-                .await
-                .map_err(Error::Schema)?;
+            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
             if schema.store_epoch != change.epoch {
                 return Err(Error::Epoch);
             }
@@ -336,7 +334,7 @@ pub fn observe(
     epoch: StoreEpoch,
 ) -> Result<Option<Selection>, Error> {
     postgres_probe::with_client(request, trust, deadline, move |client| Box::pin(async move {
-        let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+        let schema = client.inspect_schema().await.map_err(Error::Schema)?;
         if schema.store_epoch != epoch { return Err(Error::Epoch); }
         let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).await.map_err(|_| Error::Database)?;
         selection(&row)

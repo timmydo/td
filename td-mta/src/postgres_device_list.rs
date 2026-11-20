@@ -1,7 +1,7 @@
 //! Bounded historical device metadata for explicit administration.
 use super::{
-    device_credentials, postgres_probe, postgres_schema, AccountId, DeviceId, Error, Request,
-    StoreEpoch, TrustStore, DEVICE_RECORDS,
+    device_credentials, postgres_probe, AccountId, DeviceId, Error, Request, StoreEpoch,
+    TrustStore, DEVICE_RECORDS,
 };
 use std::time::Instant;
 
@@ -25,7 +25,7 @@ pub fn list(
 ) -> Result<Vec<DeviceSummary>, Error> {
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
             if schema.store_epoch != epoch {
                 return Err(Error::Epoch);
             }

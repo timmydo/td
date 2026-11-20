@@ -112,12 +112,13 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
     ))
 }
 pub(crate) async fn begin(
-    client: &Client,
+    client: &postgres_probe::ScopedClient,
     claim: &Claim,
     policy: bool,
     write: bool,
 ) -> Result<bool, Error> {
-    if postgres_schema::lock_and_inspect(client)
+    if client
+        .inspect_schema()
         .await
         .map_err(Error::Schema)?
         .store_epoch
@@ -127,26 +128,6 @@ pub(crate) async fn begin(
     }
     begin_transaction(client).await?;
     lock_account_policy(client, claim, policy, write).await
-}
-pub(crate) async fn begin_scoped<'a>(
-    scope: postgres_probe::ScopedClient<'a>,
-    claim: &Claim,
-    policy: bool,
-    write: bool,
-) -> Result<(&'a Client, bool), Error> {
-    if scope
-        .inspect_schema()
-        .await
-        .map_err(Error::Schema)?
-        .store_epoch
-        != claim.binding.epoch()
-    {
-        return Err(Error::Epoch);
-    }
-    let client = scope.client();
-    begin_transaction(client).await?;
-    let current = lock_account_policy(client, claim, policy, write).await?;
-    Ok((client, current))
 }
 pub(crate) async fn begin_transaction(client: &Client) -> Result<(), Error> {
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
@@ -634,24 +615,22 @@ fn update_many(
     let values = prepare_leases(leases)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result =
-        postgres_probe::with_scoped_mutation_client(request, trust, deadline, move |scope| {
-            Box::pin(async move {
-                let first = &values.first().ok_or(Error::Integrity)?.0;
-                if scope
-                    .inspect_schema()
-                    .await
-                    .map_err(Error::Schema)?
-                    .store_epoch
-                    != first.binding.epoch()
-                {
-                    return Err(Error::Epoch);
-                }
-                let client = scope.client();
-                begin_transaction(client).await?;
-                update_many_body(client, &values, release, &marker).await
-            })
-        });
+    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            let first = &values.first().ok_or(Error::Integrity)?.0;
+            if client
+                .inspect_schema()
+                .await
+                .map_err(Error::Schema)?
+                .store_epoch
+                != first.binding.epoch()
+            {
+                return Err(Error::Epoch);
+            }
+            begin_transaction(client).await?;
+            update_many_body(client, &values, release, &marker).await
+        })
+    });
     finish(result, &attempted)
 }
 fn prepare_leases(leases: &[(&Claim, u64)]) -> Result<Vec<(Claim, u64)>, Error> {

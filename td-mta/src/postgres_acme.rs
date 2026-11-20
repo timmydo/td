@@ -6,7 +6,6 @@ use crate::{
     },
     ids::StoreEpoch,
     postgres_probe::{self, Request},
-    postgres_schema,
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
@@ -41,8 +40,9 @@ fn profile(name: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn check(client: &tokio_postgres::Client, epoch: StoreEpoch) -> Result<(), Error> {
-    if postgres_schema::lock_and_inspect(client)
+async fn check(client: &postgres_probe::ScopedClient, epoch: StoreEpoch) -> Result<(), Error> {
+    if client
+        .inspect_schema()
         .await
         .map_err(|_| Error::Database)?
         .store_epoch

@@ -311,7 +311,7 @@ pub fn with_email<T>(
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
         let metadata = worker.run(|client| Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
             if schema.store_epoch != selected.epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
             postgres_devices::authenticate(client, selected.account, presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
@@ -624,15 +624,13 @@ fn with_pinned_blob_inner<T>(
 }
 
 async fn blob_snapshot(
-    client: &tokio_postgres::Client,
+    client: &postgres_probe::ScopedClient,
     binding: Binding,
     blob: BlobId,
     maximum: u64,
     presented: Presented,
 ) -> Result<(BlobMetadata, Option<i64>), Error> {
-    let schema = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }
@@ -732,14 +730,12 @@ pub(crate) fn blob_metadata(
 }
 
 async fn reauthorize_blob(
-    client: &tokio_postgres::Client,
+    client: &postgres_probe::ScopedClient,
     binding: Binding,
     presented: Presented,
     expires: Option<i64>,
 ) -> Result<(), Error> {
-    let schema = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }

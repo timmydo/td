@@ -80,9 +80,7 @@ pub fn publish(
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client)
-                .await
-                .map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             if receipt.store_epoch != creation.epoch {
                 return Err(Error::Epoch);
             }
@@ -178,7 +176,7 @@ pub fn inspect(
 ) -> Result<Creation, Error> {
     let result = postgres_probe::with_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout = 10000").await.map_err(|_| Error::Database)?;
             let rows = client.query("SELECT inbox FROM td_mta.account_bootstraps WHERE account=$1 LIMIT 2", &[&account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;

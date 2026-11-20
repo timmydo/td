@@ -2,7 +2,7 @@
 use crate::{
     config::{composition, load, stanza, storage, stream},
     ids::StoreEpoch,
-    postgres_configuration_store as versions, postgres_probe, postgres_schema, postgres_selection,
+    postgres_configuration_store as versions, postgres_probe, postgres_selection,
 };
 use std::time::Instant;
 use td_json::{json, Json};
@@ -30,7 +30,7 @@ pub fn inspect(
         .map_err(|_| Error)?;
     let (mut rows, quotas) = configured(&sources)?;
     let db = postgres_probe::with_capacity_client(request,trust,deadline, |client| Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client).await.map_err(|_| ())?;
+            let schema = client.inspect_schema().await.map_err(|_| ())?;
             if schema.store_epoch != epoch { return Err(()); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=5000; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| ())?;
             let values = database(client, &quotas).await?;

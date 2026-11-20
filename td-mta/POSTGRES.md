@@ -94,7 +94,11 @@ absent; refuse even an existing empty namespace and never replace a store.
 Incompatible upgrades require all instances to drain and stop; no mixed-version
 deployment is promised initially. Serving database connections acquire a shared
 session-level advisory lock on the fixed migration key before checking schema
-compatibility and retain it until closure. Retained Body/Envelope validators
+compatibility and retain it until closure. A one-shot operation uses that
+connection's verified schema version and store epoch. Every reconnect verifies
+the ledger and the requested role anew. Owner preparation opens without this
+qualification and checks the schema required by its operation.
+Retained Body/Envelope validators
 (sections 180 and 187) instead take the same key's shared transaction-level
 lock on each turn, fully revalidate schema/epoch and Runtime access before
 application reads, and acknowledge rollback before returning. The fixed HTTPS

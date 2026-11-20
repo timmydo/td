@@ -101,9 +101,7 @@ pub fn insert(
     let marker = attempted.clone();
     let result = postgres_probe::with_material_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client)
-                .await
-                .map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             if receipt.store_epoch != epoch {
                 return Err(Error::Epoch);
             }
@@ -164,9 +162,7 @@ pub fn read(
     };
     let result = postgres_probe::with_material_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client)
-                .await
-                .map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             if receipt.store_epoch != epoch {
                 return Err(Error::Epoch);
             }

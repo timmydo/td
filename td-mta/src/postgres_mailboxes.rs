@@ -104,7 +104,7 @@ pub fn list(
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
             if schema.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
             let device = postgres_devices::authenticate(client, account, presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;

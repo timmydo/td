@@ -110,14 +110,12 @@ pub fn inspect(
 }
 
 async fn write(
-    client: &tokio_postgres::Client,
+    client: &postgres_probe::ScopedClient,
     epoch: StoreEpoch,
     profile: String,
     mut records: Vec<String>,
 ) -> Result<Written, Error> {
-    let receipt = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+    let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
     if receipt.store_epoch != epoch {
         return Err(Error::Epoch);
     }
@@ -197,14 +195,12 @@ async fn write(
 }
 
 async fn read(
-    client: &tokio_postgres::Client,
+    client: &postgres_probe::ScopedClient,
     epoch: StoreEpoch,
     before: i64,
     limit: i64,
 ) -> Result<Page, Error> {
-    let receipt = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+    let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
     if receipt.store_epoch != epoch {
         return Err(Error::Epoch);
     }

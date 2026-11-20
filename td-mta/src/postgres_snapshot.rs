@@ -40,16 +40,14 @@ impl From<&Binding> for ReadBinding {
 }
 
 pub(crate) async fn begin(
-    client: &Client,
+    client: &crate::postgres_probe::ScopedClient,
     binding: &Binding,
     presented: Presented,
 ) -> Result<ViewIdentity, Error> {
     if !binding.roles().jmap() {
         return Err(Error::Policy);
     }
-    let schema = postgres_schema::lock_and_inspect(client)
-        .await
-        .map_err(Error::Schema)?;
+    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }

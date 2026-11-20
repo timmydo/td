@@ -44,7 +44,7 @@ pub fn inspect(
     account: AccountId,
 ) -> Result<Report, Error> {
     let result=postgres_probe::with_client(request,trust,deadline,move |client| Box::pin(async move {
-        let schema=postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+        let schema=client.inspect_schema().await.map_err(Error::Schema)?;
         if schema.store_epoch!=epoch { return Err(Error::Epoch); }
         client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
         let rows=client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2",&[&account.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;

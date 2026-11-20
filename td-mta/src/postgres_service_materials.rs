@@ -7,7 +7,6 @@ use crate::{
     postgres_materials,
     postgres_probe::{self, Request},
     postgres_runtime_access::{Error as AccessError, ServiceRole},
-    postgres_schema,
     postgres_selection::{self as selection, Error, Selection},
 };
 use std::time::Instant;
@@ -227,7 +226,7 @@ pub fn bind(
     let bindings = candidate.bindings;
     postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED;
                 SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000")

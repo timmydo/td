@@ -441,33 +441,19 @@ fn scoped_qualification(
         assert!(std::time::Instant::now() < until);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let inspect_logs = |request| {
+        td_mta::postgres_logs::inspect(request, trust, deadline(), binding.epoch(), None, 1)
+    };
     for request in [preparation, &runtime] {
-        for renewal in [false, true] {
-            let offset = std::fs::metadata(fixture.root.join("server.log"))
-                .unwrap()
-                .len() as usize;
-            if renewal {
-                renew(request).unwrap();
-            } else {
-                idle(request).unwrap();
-            }
-            super::body_checks::quiet(fixture);
-            let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
-            let reads = log[offset..].lines().filter(|line| {
-                line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")
-            }).count();
-            assert_eq!(reads, 1, "one schema qualification per operation");
-            assert_eq!(
-                sql(
-                    fixture,
-                    &format!(
-                        "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
-                        schema::MIGRATION_KEY
-                    )
-                ),
-                "t"
-            );
-        }
+        assert_one_ledger_read(fixture, || {
+            idle(request).unwrap();
+        });
+        assert_one_ledger_read(fixture, || {
+            renew(request).unwrap();
+        });
+        assert_one_ledger_read(fixture, || {
+            inspect_logs(request).unwrap();
+        });
     }
     retained_idle(fixture, &runtime, trust, &claim, grant.generation);
     retained_renewal(fixture, &runtime, trust, &claim, grant.generation);
@@ -513,6 +499,10 @@ fn scoped_qualification(
             Err(hints::Error::Owner(owners::Error::Epoch))
         );
         assert_eq!(renew(request), Err(owners::Error::Epoch));
+        assert_eq!(
+            inspect_logs(request).err(),
+            Some(td_mta::postgres_logs::Error::Epoch)
+        );
     }
     sql(
         fixture,
@@ -539,6 +529,10 @@ fn scoped_qualification(
         sql(fixture, change);
         assert_eq!(idle(&runtime), Err(hints::Error::Connection(error)));
         assert_eq!(renew(&runtime), Err(owners::Error::Connection(error)));
+        assert_eq!(
+            inspect_logs(&runtime).err(),
+            Some(td_mta::postgres_logs::Error::Connection(error))
+        );
         sql(fixture, restore);
         idle(&runtime).unwrap();
     }
@@ -554,6 +548,29 @@ fn scoped_qualification(
         "t"
     );
     owners::release_many(&runtime, trust, deadline(), &[(&claim, grant.generation)]).unwrap();
+}
+
+fn assert_one_ledger_read(fixture: &Fixture, operation: impl FnOnce()) {
+    let offset = std::fs::metadata(fixture.root.join("server.log"))
+        .unwrap()
+        .len() as usize;
+    operation();
+    super::body_checks::quiet(fixture);
+    let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
+    let reads = log[offset..].lines().filter(|line| {
+                line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")
+            }).count();
+    assert_eq!(reads, 1, "one schema qualification per operation");
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock({})",
+                td_mta::postgres_schema::MIGRATION_KEY
+            )
+        ),
+        "t"
+    );
 }
 
 fn retained_idle(

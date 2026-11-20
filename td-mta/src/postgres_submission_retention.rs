@@ -100,7 +100,7 @@ impl Step {
 /// Begin the relay's account transaction: the account row FOR UPDATE under
 /// a current owner fence, returning database time near the stable sample.
 async fn lock(
-    client: &Client,
+    client: &postgres_probe::ScopedClient,
     claim: &Claim,
     generation: u64,
     stable_at: RetentionTime,

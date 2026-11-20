@@ -234,7 +234,7 @@ pub fn inspect(
     deadline: Instant,
 ) -> Result<Receipt, Error> {
     let result = postgres_probe::with_client(request, trust, deadline, |client| {
-        Box::pin(lock_and_inspect(client))
+        Box::pin(client.inspect_schema())
     })
     .map_err(Error::Connection)?;
     if Instant::now() >= deadline {

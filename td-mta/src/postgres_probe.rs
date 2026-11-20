@@ -1,4 +1,4 @@
-//! Inert worker-side PostgreSQL connection qualification; no serving activation.
+//! PostgreSQL connection qualification and bounded worker-owned I/O.
 use crate::{
     clock::{RuntimeClock, TlsClockSource},
     ports::{Clock, Deadline, FlushProgress, IoProgress, Transport},
@@ -112,7 +112,7 @@ pub(crate) fn with_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(request, trust, deadline, 64 * 1024, Input::new(), operation)
 }
@@ -123,7 +123,7 @@ pub(crate) fn with_capacity_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -140,7 +140,7 @@ pub(crate) fn with_material_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -157,7 +157,7 @@ pub(crate) fn with_mailbox_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -169,74 +169,28 @@ pub(crate) fn with_mailbox_client<T>(
     )
 }
 
-/// One fresh operation's client and continuously held migration qualification.
-/// Construction stays here; neither the client nor its receipt can be replaced.
-pub(crate) struct ScopedClient<'a> {
-    client: &'a tokio_postgres::Client,
+/// A worker-owned connection and the schema receipt protected by its session lock.
+/// Preparation connects without a receipt and inspects at the operation boundary.
+pub(crate) struct ScopedClient {
+    client: tokio_postgres::Client,
     runtime_schema: Option<crate::postgres_schema::Receipt>,
 }
-impl<'a> ScopedClient<'a> {
-    pub(crate) fn client(&self) -> &'a tokio_postgres::Client {
-        self.client
+impl std::ops::Deref for ScopedClient {
+    type Target = tokio_postgres::Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
     }
+}
+impl ScopedClient {
     pub(crate) async fn inspect_schema(
         &self,
     ) -> Result<crate::postgres_schema::Receipt, crate::postgres_schema::Error> {
         match self.runtime_schema {
             Some(receipt) => Ok(receipt),
-            None => crate::postgres_schema::lock_and_inspect(self.client).await,
+            None => crate::postgres_schema::lock_and_inspect(&self.client).await,
         }
     }
-}
-
-pub(crate) fn with_scoped_mailbox_client<T>(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
-) -> Result<T, Error> {
-    with_scoped_output_limit(
-        request,
-        trust,
-        deadline,
-        64 * 1024,
-        Input::mailboxes(),
-        operation,
-    )
-}
-
-pub(crate) fn with_scoped_mutation_client<T>(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
-) -> Result<T, Error> {
-    with_scoped_output_limit(
-        request,
-        trust,
-        deadline,
-        128 * 1024,
-        Input::mutations(),
-        operation,
-    )
-}
-
-fn with_scoped_output_limit<T>(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    output_limit: usize,
-    input: Input,
-    operation: impl for<'a> FnOnce(ScopedClient<'a>) -> Pin<Box<dyn Future<Output = T> + 'a>>,
-) -> Result<T, Error> {
-    let (mut worker, runtime_schema) =
-        connect_worker_with_schema(request, trust, deadline, output_limit, input, MAX_DURATION)?;
-    worker.run(move |client| {
-        operation(ScopedClient {
-            client,
-            runtime_schema,
-        })
-    })
 }
 
 // At most 256 Email rows and 257 distinct mailbox rows, with protocol overhead.
@@ -244,7 +198,7 @@ pub(crate) fn with_mutation_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -261,7 +215,7 @@ pub(crate) fn with_cancellation_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -278,7 +232,7 @@ pub(crate) fn with_batch_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -295,7 +249,7 @@ pub(crate) fn with_upload_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -314,7 +268,7 @@ pub(crate) fn with_import_client<T>(
     deadline: Instant,
     body_length: u64,
     guarded: bool,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     let mut worker = connect_worker_bounded(
         request,
@@ -333,7 +287,7 @@ pub(crate) fn with_import_mailbox_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     guarded: bool,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -354,7 +308,7 @@ pub(crate) fn with_reconcile_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -372,7 +326,7 @@ pub(crate) fn with_fanout_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     accounts: usize,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
         return Err(Error::Invalid);
@@ -392,7 +346,7 @@ pub(crate) fn with_notice_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -409,7 +363,7 @@ pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_migration_client(request, trust, deadline, MAX_DURATION, operation)
 }
@@ -419,7 +373,7 @@ pub(crate) fn with_migration_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     maximum: Duration,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     // Prepared names grow with the driver's process-wide statement counter.
     let mut worker = connect_worker_bounded(
@@ -438,7 +392,7 @@ pub(crate) fn with_configuration_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -456,7 +410,7 @@ fn with_output_limit<T>(
     deadline: Instant,
     output_limit: usize,
     input: Input,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     let mut worker = connect_worker(request, trust, deadline, output_limit, input)?;
     worker.run(operation)
@@ -567,23 +521,11 @@ fn connect_worker_bounded(
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
-    connect_worker_with_schema(request, trust, deadline, output_limit, input, maximum)
-        .map(|(worker, _)| worker)
-}
-
-fn connect_worker_with_schema(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    output_limit: usize,
-    input: Input,
-    maximum: Duration,
-) -> Result<(Worker, Option<crate::postgres_schema::Receipt>), Error> {
     let mut worker =
         connect_authenticated_bounded(request, trust, deadline, output_limit, input, maximum)?;
     let mode = request.mode;
-    let runtime_schema = if mode != Mode::Preparation {
-        Some(worker.run(|client| {
+    if mode != Mode::Preparation {
+        let schema = worker.run(|client| {
             Box::pin(async move {
                 let receipt = crate::postgres_schema::lock_and_inspect(client)
                     .await
@@ -591,11 +533,14 @@ fn connect_worker_with_schema(
                 qualify_runtime_mode(client, mode, Some(receipt.store_epoch)).await?;
                 Ok(receipt)
             })
-        })??)
-    } else {
-        None
-    };
-    Ok((worker, runtime_schema))
+        })??;
+        worker
+            .client
+            .as_mut()
+            .ok_or(Error::Database)?
+            .runtime_schema = Some(schema);
+    }
+    Ok(worker)
 }
 
 pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
@@ -791,7 +736,10 @@ fn connect_authenticated_until(
     drop(handshake_timing);
     timing.succeeded();
     Ok(Worker {
-        client: Some(client),
+        client: Some(ScopedClient {
+            client,
+            runtime_schema: None,
+        }),
         connection: Box::pin(connection),
         deadline,
         waker,
@@ -804,7 +752,7 @@ fn connect_authenticated_until(
 }
 
 pub(crate) struct Worker {
-    client: Option<tokio_postgres::Client>,
+    client: Option<ScopedClient>,
     connection: Pin<Box<tokio_postgres::Connection<Io<Network>, Io<Secure>>>>,
     deadline: Instant,
     waker: Waker,
@@ -875,9 +823,7 @@ impl Worker {
 
     pub(crate) fn run<T>(
         &mut self,
-        operation: impl for<'a> FnOnce(
-            &'a tokio_postgres::Client,
-        ) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+        operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
     ) -> Result<T, Error> {
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbWork);
         if let Some(error) = self.failed {

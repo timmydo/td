@@ -5,11 +5,10 @@ use crate::{
     ports::{self, BlobReader},
     postgres_body::{self, BlobMetadata},
     postgres_probe::{self, Request},
-    postgres_route_owners as owners, postgres_schema,
+    postgres_route_owners as owners,
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::Client;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadError {
@@ -97,12 +96,13 @@ fn admit(
 }
 
 async fn snapshot(
-    client: &Client,
+    client: &postgres_probe::ScopedClient,
     value: Dispatch,
     maximum: u64,
 ) -> Result<BodyMetadata, ReadError> {
     let binding = value.claim.binding();
-    let schema = postgres_schema::lock_and_inspect(client)
+    let schema = client
+        .inspect_schema()
         .await
         .map_err(|e| ReadError::Body(postgres_body::Error::Schema(e)))?;
     if schema.store_epoch != binding.epoch() {

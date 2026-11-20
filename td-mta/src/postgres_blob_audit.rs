@@ -31,7 +31,7 @@ pub fn inspect(
 ) -> Result<BlobMetadata, Error> {
     let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
         let metadata = worker.run(|client| Box::pin(async move {
-            let schema=postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let schema=client.inspect_schema().await.map_err(Error::Schema)?;
             if schema.store_epoch!=epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
             let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id) FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id WHERE a.id=$1 AND b.id=$2 LIMIT 2",&[&account.as_bytes().as_slice(),&blob.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;

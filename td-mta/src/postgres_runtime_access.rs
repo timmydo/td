@@ -176,9 +176,7 @@ pub fn inspect(
 ) -> Result<Receipt, Error> {
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client)
-                .await
-                .map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
             qualify(client).await?;
             Ok(receipt)
         })

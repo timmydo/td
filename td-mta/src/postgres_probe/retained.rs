@@ -201,7 +201,9 @@ impl ReadSession {
         operation: impl for<'a> FnOnce(&'a Client) -> Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>
             + 'static,
     ) -> Result<Result<T, E>, Error> {
-        self.read_worker(epoch, isolation, deadline, |worker| worker.run(operation))
+        self.read_worker(epoch, isolation, deadline, |worker| {
+            worker.run(|client| operation(client))
+        })
     }
     pub(crate) fn read_worker<T, E>(
         &mut self,

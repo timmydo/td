@@ -57,9 +57,9 @@ pub fn idle_observation(
     generation: u64,
 ) -> Result<Option<i64>, Error> {
     let claim = claim.clone();
-    postgres_probe::with_scoped_mailbox_client(request, trust, deadline, move |scope| {
+    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let (client, current_policy) = owners::begin_scoped(scope, &claim, true, false)
+            let current_policy = owners::begin(client, &claim, true, false)
                 .await
                 .map_err(Error::Owner)?;
             if !current_policy {
