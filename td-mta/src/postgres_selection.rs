@@ -39,6 +39,7 @@ pub enum Error {
     Epoch,
     Conflict,
     Integrity,
+    ServiceProfiles,
     Capacity,
     Crypto,
     Database,
@@ -223,7 +224,7 @@ pub fn publish(
     if candidate.digest() != &change.source_digest {
         return Err(Error::Conflict);
     }
-    drop(candidate);
+    let bindings = candidate.bindings;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
@@ -279,6 +280,9 @@ pub fn publish(
             if digest != change.source_digest {
                 return Err(Error::Conflict);
             }
+            bindings
+                .replace_if_installed(client, change.version)
+                .await?;
             let bytes = generation.to_be_bytes();
             let changed = client.execute("UPDATE td_mta.config_selection SET generation=$1,version_id=$2 WHERE singleton=true", &[&bytes.as_slice(), &change.version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
             if changed != 1 {

@@ -151,8 +151,14 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
 }
 
 pub(super) fn publish_fixture_pair(fixture: &Fixture) {
+    publish_fixture_pair_as(fixture, fixture.request());
+}
+
+pub(super) fn publish_fixture_pair_as(
+    fixture: &Fixture,
+    request: td_mta::postgres_probe::Request<'_>,
+) {
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let request = fixture.request();
     let epoch = postgres_schema::inspect(&request, &trust, deadline())
         .unwrap()
         .store_epoch;

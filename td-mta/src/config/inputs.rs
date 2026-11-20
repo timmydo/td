@@ -25,6 +25,16 @@ pub enum Target {
     GatewayCa(u8),
 }
 impl Target {
+    pub(crate) fn needed_by(self, roles: super::profile::Roles) -> bool {
+        match self {
+            Self::TextSignature(_) | Self::HtmlSignature(_) => roles.jmap(),
+            Self::RelayPassword | Self::RelayCa => roles.relay(),
+            Self::CertificateKey(_) | Self::CertificateChain(_) => roles.receive() || roles.jmap(),
+            Self::GatewayCa(_) => roles.receive(),
+            Self::AcmeCa => false,
+        }
+    }
+
     /// Raw file bytes, excluding the extra byte needed to detect overflow.
     pub const fn maximum_bytes(self) -> usize {
         match self {

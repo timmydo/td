@@ -1231,7 +1231,7 @@ only its owned tool directory. The process fixture owns editor/compositor
 cleanup. A hard-killed wrapper can leave its uniquely named scratch
 directory behind.
 
-## Native mail read fixture
+## Native mail fixtures
 
 The td-mta native crypto-cargo test leg also builds the checkout's td-mail
 binary and td-net unit-test executable offline. Native source preparation
@@ -1239,8 +1239,9 @@ warms both locked external closures; each build verifies its archived inputs.
 Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
 them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
-plain-text send and foreground-service cases. Each requires a positive passing
-libtest summary and exit success. These three native cases use the host release
+plain-text send, foreground-service, deployment WAL replay and service-login
+provisioning cases. Each requires a positive passing libtest summary and exit
+success. These five native cases use the host release
 profile with debug information retained, matching the native MTA build and
 performance harness. Their real operation deadlines include hashing and TLS;
 an unoptimized full-size body hash can exhaust a deadline before database work
@@ -1248,13 +1249,15 @@ starts. Ordinary unit and documentation tests retain the test profile. This
 does not change target compiler flags or relax an operation deadline.
 Host preparation must put PostgreSQL 17 on
 `PATH`: the directory of the first `initdb` there must also hold `postgres`,
-`pg_ctl`, `psql`, `pg_dump` and `pg_restore`, and `postgres --version` must
-report release 17. The restore fixture uses the same installation for its
-archive round trip. The
+`pg_ctl`, `psql`, `pg_dump`, `pg_restore`, `pg_receivewal`, `pg_basebackup`
+and `pg_verifybackup`, and `postgres --version` must report release 17.
+The deployment fixtures exercise streaming backup and exact recovery, and
+verified TLS, SCRAM and per-role grants, on disposable clusters. Interactive
+service-login tests use util-linux `setsid` to exercise detached password
+prompting. The
 wrapper checks this before any test runs and names what is missing; the
 fixtures find the same directory on `PATH` themselves, so no variable names
-it. The fixtures own disposable clusters; no existing database service or
-public endpoint is required.
+it. The fixtures require no existing database service or public endpoint.
 
 td-mta/CONFORMANCE.md records what this native client fixture proves. Its
 private root certificate enters only the isolated fetch test process behind

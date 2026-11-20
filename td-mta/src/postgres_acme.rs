@@ -101,12 +101,41 @@ pub fn active(
 ) -> Result<Active, Error> {
     profile(name)?;
     let name = name.to_owned();
-    postgres_probe::with_material_client(request,trust,deadline,move|client|Box::pin(async move {
-        check(client,epoch).await?;
-        let row=client.query_opt("SELECT active_generation,chain,key,settings_hash FROM td_mta.acme_profiles WHERE profile=$1 AND active_generation>0",&[&name]).await.map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
-        let active=Active{generation:row.try_get(0).map_err(|_|Error::Database)?,settings:row.try_get::<_,&[u8]>(3).map_err(|_|Error::Database)?.try_into().map_err(|_|Error::Invalid)?,chain:row.try_get(1).map_err(|_|Error::Database)?,key:row.try_get(2).map_err(|_|Error::Database)?};
-        if active.generation<=0||active.chain.is_empty()||active.chain.len()>65536||active.key.is_empty()||active.key.len()>1024 {return Err(Error::Invalid);} Ok(active)
-    })).map_err(|_|Error::Database)?
+    let query = if crate::postgres_service_materials::scoped(request) {
+        "SELECT active_generation,chain,key,settings_hash FROM td_mta_service.active_certificates WHERE profile=$1 AND active_generation>0"
+    } else {
+        "SELECT active_generation,chain,key,settings_hash FROM td_mta.acme_profiles WHERE profile=$1 AND active_generation>0"
+    };
+    postgres_probe::with_material_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            check(client, epoch).await?;
+            let row = client
+                .query_opt(query, &[&name])
+                .await
+                .map_err(|_| Error::Database)?
+                .ok_or(Error::Conflict)?;
+            let active = Active {
+                generation: row.try_get(0).map_err(|_| Error::Database)?,
+                settings: row
+                    .try_get::<_, &[u8]>(3)
+                    .map_err(|_| Error::Database)?
+                    .try_into()
+                    .map_err(|_| Error::Invalid)?,
+                chain: row.try_get(1).map_err(|_| Error::Database)?,
+                key: row.try_get(2).map_err(|_| Error::Database)?,
+            };
+            if active.generation <= 0
+                || active.chain.is_empty()
+                || active.chain.len() > 65536
+                || active.key.is_empty()
+                || active.key.len() > 1024
+            {
+                return Err(Error::Invalid);
+            }
+            Ok(active)
+        })
+    })
+    .map_err(|_| Error::Database)?
 }
 pub struct Writer<'a, 'r> {
     pub request: &'a Request<'r>,
@@ -200,14 +229,32 @@ pub fn generations(
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Vec<(String, i64)>, Error> {
-    postgres_probe::with_client(request,trust,deadline,move|client|Box::pin(async move {
-        check(client,epoch).await?;
-        let rows=client.query("SELECT profile,active_generation FROM td_mta.acme_profiles ORDER BY profile LIMIT 17",&[]).await.map_err(|_|Error::Database)?;
-        if rows.len()>16{return Err(Error::Capacity);}
-        let mut result=Vec::with_capacity(rows.len());
-        for row in rows {result.push((row.try_get(0).map_err(|_|Error::Database)?,row.try_get(1).map_err(|_|Error::Database)?));}
-        Ok(result)
-    })).map_err(|_|Error::Database)?
+    let query = if crate::postgres_service_materials::scoped(request) {
+        "SELECT profile,active_generation FROM td_mta_service.active_certificates ORDER BY profile LIMIT 17"
+    } else {
+        "SELECT profile,active_generation FROM td_mta.acme_profiles ORDER BY profile LIMIT 17"
+    };
+    postgres_probe::with_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            check(client, epoch).await?;
+            let rows = client
+                .query(query, &[])
+                .await
+                .map_err(|_| Error::Database)?;
+            if rows.len() > 16 {
+                return Err(Error::Capacity);
+            }
+            let mut result = Vec::with_capacity(rows.len());
+            for row in rows {
+                result.push((
+                    row.try_get(0).map_err(|_| Error::Database)?,
+                    row.try_get(1).map_err(|_| Error::Database)?,
+                ));
+            }
+            Ok(result)
+        })
+    })
+    .map_err(|_| Error::Database)?
 }
 
 pub struct Status {

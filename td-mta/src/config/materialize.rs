@@ -63,12 +63,12 @@ impl<E> Failure<E> {
 /// ```compile_fail,E0451
 /// use td_mta::config::{materialize::ResolvedText, storage::Candidate, text::Handle};
 /// fn forge(candidate: Candidate, password: Handle) -> ResolvedText {
-///     ResolvedText { candidate, password }
+///     ResolvedText { candidate, password: Some(password) }
 /// }
 /// ```
 pub struct ResolvedText {
     candidate: storage::Candidate,
-    password: text::Handle,
+    password: Option<text::Handle>,
 }
 impl fmt::Debug for ResolvedText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,7 +81,8 @@ impl ResolvedText {
     }
     /// Trusted control-worker access only; no authentication or output authority.
     pub fn relay_password(&self) -> Result<&str, text::Code> {
-        self.candidate.material_text(self.password)
+        self.candidate
+            .material_text(self.password.ok_or(text::Code::Reference)?)
     }
     /// Missing signature files produce empty strings; indices use raw-ID order.
     pub fn signatures(&self, index: usize) -> Result<Option<Signatures<'_>>, text::Code> {
@@ -133,6 +134,9 @@ impl ResolvedProfile {
     pub fn into_storage(self) -> storage::Storage {
         self.text.into_storage()
     }
+    pub(crate) fn into_candidate(self) -> storage::Candidate {
+        self.text.candidate
+    }
     pub(crate) fn resolved_text(&self) -> &ResolvedText {
         &self.text
     }
@@ -175,7 +179,7 @@ pub fn read_text<R: io::Read, E>(
     scratch: &mut [u8],
     open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
 ) -> Result<ResolvedText, Failure<E>> {
-    read_candidate(loaded.into_candidate(), scratch, open)
+    read_candidate(loaded.into_candidate(), scratch, open, None)
 }
 
 /// Decode selected-profile signatures/password without losing its role set.
@@ -188,7 +192,18 @@ pub fn read_profile_text<R: io::Read, E>(
     open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
 ) -> Result<ResolvedProfile, Failure<E>> {
     let (candidate, roles) = loaded.into_parts();
-    read_candidate(candidate, scratch, open).map(|text| ResolvedProfile { text, roles })
+    read_candidate(candidate, scratch, open, None).map(|text| ResolvedProfile { text, roles })
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn read_service_text<R: io::Read, E>(
+    loaded: load::PreparedProfile,
+    scratch: &mut [u8],
+    open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
+) -> Result<ResolvedProfile, Failure<E>> {
+    let (candidate, roles) = loaded.into_parts();
+    read_candidate(candidate, scratch, open, Some(roles))
+        .map(|text| ResolvedProfile { text, roles })
 }
 
 #[allow(clippy::result_large_err)]
@@ -196,6 +211,7 @@ fn read_candidate<R: io::Read, E>(
     mut candidate: storage::Candidate,
     scratch: &mut [u8],
     mut open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
+    roles: Option<super::profile::Roles>,
 ) -> Result<ResolvedText, Failure<E>> {
     let mut active_target = None;
     let result = (|| {
@@ -214,6 +230,9 @@ fn read_candidate<R: io::Read, E>(
                     let Some(kind) = target.material_kind() else {
                         return Ok(None);
                     };
+                    if roles.is_some_and(|roles| !target.needed_by(roles)) {
+                        return Ok(None);
+                    }
                     active_target = Some(target);
                     let mut reader = open(reference).map_err(Error::Input)?;
                     material::read(kind, &mut reader, scratch.0)
@@ -246,10 +265,15 @@ fn read_candidate<R: io::Read, E>(
                 _ => return Err(Error::Invariant),
             }
         }
-        candidate
-            .signatures_complete()
-            .map_err(|_| Error::Invariant)?;
-        password.ok_or(Error::Invariant)
+        if roles.is_none_or(|roles| roles.jmap()) {
+            candidate
+                .signatures_complete()
+                .map_err(|_| Error::Invariant)?;
+        }
+        if roles.is_none_or(|roles| roles.relay()) && password.is_none() {
+            return Err(Error::Invariant);
+        }
+        Ok(password)
     })();
     match result {
         Ok(password) => Ok(ResolvedText {

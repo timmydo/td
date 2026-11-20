@@ -212,7 +212,7 @@ pub(super) fn exercise(
         sql(fixture, &format!("UPDATE td_mta.route_health SET repair_generation=NULL WHERE account=decode('{account}','hex') AND route_name LIKE 'held-%'"));
     };
     let held_live = std::cell::Cell::new(true);
-    let relay = super::serving_relay::Relay::multi(fixture, relay_socket, relay_dns);
+    let relay = super::serving_relay::Relay::accepting(fixture, relay_socket, relay_dns, "multi");
     let local = td_fs::TempDir::new("ma").unwrap();
     fs::set_permissions(local.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let ca = local.join("ca.pem");
@@ -400,41 +400,19 @@ pub(super) fn exercise(
         String::from_utf8(result.stdout).unwrap()
     };
     assert!(queue_command("queue-route-repair").contains("requested"));
-    let submit = |index: usize,
-                  name: &str,
-                  account: AccountId,
-                  identity: IdentityId,
-                  email: &str| {
-        let authorization = basic(name, devices[index].password());
-        let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-        let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
-        let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
-        let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
-        let mailboxes = query(&authorization, "POST", "/jmap/api", "application/json",
-            &td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":account},"m"]]}).to_string());
-        let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
-        let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
-            .as_str()
-            .unwrap();
-        let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
-            ["Email/set",{"accountId":account,"create":{"draft":{
-                "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":email}],"to":[{"email":"recipient@example.test"}],"subject":"Account relay","messageId":["multi-relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Private sender.","isEncodingProblem":false,"isTruncated":false}}
-            }}},"0"],
-            ["EmailSubmission/set",{"accountId":account,"create":{"submission":{"emailId":"#draft","identityId":identity}}},"1"]
-        ]}).to_string();
-        let reply = query(
-            &authorization,
-            "POST",
-            "/jmap/api",
-            "application/json",
-            &body,
-        );
-        let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
-        value["methodResponses"][1][1]["created"]["submission"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{reply}"))
-            .to_string()
-    };
+    let submit =
+        |index: usize, name: &str, account: AccountId, identity: IdentityId, email: &str| {
+            let authorization = basic(name, devices[index].password());
+            submit_draft(account, identity, email, |body| {
+                query(
+                    &authorization,
+                    "POST",
+                    "/jmap/api",
+                    "application/json",
+                    body,
+                )
+            })
+        };
     let submit_a = || {
         submit(
             0,
@@ -777,4 +755,34 @@ fn uncertain_upload(
 #[ignore = "real local PostgreSQL 17 tools required"]
 fn real_postgres_multiple_account_sessions_are_isolated() {
     super::exercise_configuration(super::ConfigurationExercise::MultiAccount);
+}
+
+pub(super) fn submit_draft(
+    account: AccountId,
+    identity: IdentityId,
+    email: &str,
+    post: impl Fn(&str) -> String,
+) -> String {
+    let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
+    let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
+    let mailboxes = post(
+            &td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":account},"m"]]}).to_string());
+    let mailboxes = td_json::parse(mailboxes.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let mailbox = mailboxes["methodResponses"][0][1]["list"][0]["id"]
+        .as_str()
+        .unwrap();
+    let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
+            ["Email/set",{"accountId":account,"create":{"draft":{
+                "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},"from":[{"email":email}],"to":[{"email":"recipient@example.test"}],"subject":"Account relay","messageId":["multi-relay@example.test"],"sentAt":"2026-10-13T12:00:59Z","textBody":[{"partId":"text","type":"text/plain"}],"bodyValues":{"text":{"value":"Private sender.","isEncodingProblem":false,"isTruncated":false}}
+            }}},"0"],
+            ["EmailSubmission/set",{"accountId":account,"create":{"submission":{"emailId":"#draft","identityId":identity}}},"1"]
+        ]}).to_string();
+    let reply = post(&body);
+    let value = td_json::parse(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+    value["methodResponses"][1][1]["created"]["submission"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{reply}"))
+        .to_string()
 }

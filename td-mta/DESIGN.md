@@ -1036,7 +1036,21 @@ operations are `rt_sigprocmask(SIG_BLOCK)` and `rt_sigtimedwait`, over an
 eight-byte mask containing only those two signals. No handler, descriptor,
 FFI, allocation, pointer retention or signal-disposition change is involved.
 The mask remains in force until this one-command process exits. Other CLI
-commands never install it. Source confinement pins the full raw module and
+commands in that binary use their documented signal policy. The separate
+deployment supervisor uses the same two operations while it holds the
+activation lock to run its fenced recovery on termination. PRODUCTION.md
+describes the independently retained controller and its recovery commands.
+Its unprivileged clock-transfer helper pins each path component with a
+metadata-only no-follow descriptor relative to the preceding directory.
+It checks ownership, permissions, regular-file type and size on the held
+inodes. The controller's one scoped `openat` boundary is recorded in
+UNSAFE.md section 22. This preserves search-only parent permissions on
+both GNU and musl Linux.
+Each SMTP or JMAP listener probe constructs a runtime clock, TLS clock
+handle and client configuration behind the three `Arc`s required by the
+transport and TLS APIs. The allocation inventory records those three
+sites. Each sampling worker reuses its configuration across handshakes.
+Source confinement pins the full raw module and
 its callers. Process-directed supervisor/terminal signals use the same
 orderly stop path as the private control command; thread-directed signals
 are not a control interface. Cold configuration and storage setup retain inherited signal behavior;
@@ -3122,3 +3136,19 @@ nonblocking application-log producer. OBSERVABILITY.md owns their numeric
 peer attribution, fixed reason/status vocabulary, sampling and queued-versus-
 delivered distinction. No protocol acceptance, retry or durable publication
 rule is relaxed by diagnostic collection.
+
+## Production service authority
+
+The coordinated production deployment assigns a separate Linux UID and
+PostgreSQL login to the HTTPS frontend, SMTP receiver, each relay and ACME.
+The owner derives access to selected input material and active listener
+certificates when it publishes configuration. A receiving process can insert
+mail and use its listener key. It has no database access to relay passwords,
+ACME account state or stored message bodies. Relay workers share queue
+authority and can read the credentials of their own selected route. Their
+database login can read the primary body store used for outbound delivery,
+including bodies outside their queue. The
+frontend retains the mail and device authority required by JMAP. PostgreSQL,
+owner administration and backup remain trusted. POSTGRES.md documents the
+role contract and PRODUCTION.md describes the cutover and rollback. Single-user
+installations can serve the same profiles with the shared runtime login.

@@ -34,6 +34,9 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/isolated_grants.rs"]
+mod isolated_grants;
+
 #[path = "postgres_probe/replica_copy.rs"]
 mod replica_copy;
 #[path = "postgres_probe/replica_graph.rs"]
@@ -2837,6 +2840,8 @@ mod multi_relay;
 #[path = "postgres_probe/search_index.rs"]
 mod search_index;
 
+#[path = "postgres_probe/isolated_services.rs"]
+mod isolated_services;
 #[path = "postgres_probe/serving.rs"]
 mod serving;
 #[path = "postgres_probe/serving_relay.rs"]
@@ -2909,6 +2914,14 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     });
     timed("audit_scaling::exercise", audit_scaling::exercise);
     timed("configuration MultiAccount", real_postgres_multi_account);
+    timed(
+        "production service material rotation",
+        real_postgres_service_secrets_follow_selected_profile_and_rotation,
+    );
+    timed(
+        "production service isolation",
+        real_postgres_isolated_services,
+    );
     timed("configuration Serving", || {
         exercise_configuration(ConfigurationExercise::Serving)
     });
@@ -2946,7 +2959,24 @@ fn real_postgres_account_routes_keep_submission_and_delivery_policies_separate()
     exercise_configuration(ConfigurationExercise::AccountRoutes);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_isolated_services() {
+    exercise_configuration(ConfigurationExercise::ServiceIsolation);
+}
+
+#[path = "postgres_probe/service_materials.rs"]
+mod service_materials;
+
+#[test]
+#[ignore = "real PostgreSQL 17 and private trusted TMPDIR required"]
+fn real_postgres_service_secrets_follow_selected_profile_and_rotation() {
+    exercise_configuration(ConfigurationExercise::ServiceMaterials);
+}
+
 enum ConfigurationExercise {
+    ServiceMaterials,
+    ServiceIsolation,
     HttpAuthentication,
     AccountRoutes,
     FolderReconcile,
@@ -3069,6 +3099,10 @@ certificate = "public"
         key = Version::from_bytes([3; 16]),
         ca = Version::from_bytes([4; 16])
     );
+    if matches!(exercise, ConfigurationExercise::ServiceMaterials) {
+        service_materials::exercise(&fixture, &trust, epoch, &shared, &desktop);
+        return;
+    }
     let desktop = if let (Some(relay), Some(dns)) = (&relay_socket, &relay_dns) {
         desktop
             .replace(
@@ -3677,6 +3711,18 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::ServiceIsolation) {
+        isolated_services::exercise(
+            &fixture,
+            &request,
+            &trust,
+            epoch,
+            &shared,
+            &desktop,
+            &connection,
+        );
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::FolderReconcile) {
         folder_reconcile::exercise(&fixture, &request, &trust, epoch, &connection);
         return;
@@ -3836,7 +3882,9 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::AccountAdmin
+                ConfigurationExercise::ServiceIsolation
+                | ConfigurationExercise::ServiceMaterials
+                | ConfigurationExercise::AccountAdmin
                 | ConfigurationExercise::AccountRoutes
                 | ConfigurationExercise::MultiAccount
                 | ConfigurationExercise::Imports

@@ -3716,6 +3716,25 @@ module, allowance/instruction counts, import and caller inventory. Real
 child-process tests exercise both signals and cleanup; T3 records their
 separate signal sender. Both architectures require execution qualification.
 
+The separate Rust deployment controller imports this signal module for
+its root supervisor. It blocks both signals after acquiring the activation
+lock and before spawning workers. Its command loop latches a stop request
+and enters the existing cutover recovery path. Child commands reset both
+signals through GNU env so PostgreSQL utilities retain normal shutdown
+behavior.
+
+Service-credential clock transfer in the deployment controller uses one
+function-scoped allowance in `isolation_path_sys.rs`. Its sole FFI entry
+is Linux libc `openat` with a borrowed directory descriptor, one checked
+1–255 byte component in a NUL-terminated 256-byte stack buffer, and
+`O_PATH | O_NOFOLLOW | O_CLOEXEC`. Ancestor opens also set `O_DIRECTORY`.
+The leaf name is fixed to `queue-clock`. The caller supplies no flags or
+creation mode. A successful return transfers one new descriptor to a Rust
+`File`. The kernel retains no pointer. This allows a search-only parent
+and pins the leaf inode before any data read, including with static musl,
+where `OpenOptions::custom_flags` masks `O_PATH` as an access-mode bit.
+The confinement test pins the entire module and its callers.
+
 The native ACME command uses the same fixed signal operations: it blocks
 before binding HTTP-01 and creating its sole responder worker, then polls
 between bounded issuance turns and during scheduled waits. A network turn

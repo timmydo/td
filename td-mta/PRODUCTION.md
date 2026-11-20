@@ -432,6 +432,10 @@ comparing performance: process-local counters reset on restart.
 
 ## Activate and verify
 
+The commands in this section use the shared production service identity.
+After the identity migration, use the role-specific UIDs and runtime paths in
+[Isolating production service accounts](#isolating-production-service-accounts).
+
 Updates briefly interrupt listeners. PostgreSQL and stored mail remain in
 place. Pause the aggregate health timer for this window, stop all five MTA
 processes, then switch the link. Do not continue if any service fails to stop.
@@ -529,6 +533,10 @@ from td-mail and the changed behavior with an appropriate acceptance test.
 Readiness does not prove a remote recipient accepted an outbound message.
 
 ## Roll back a binary-only update
+
+To return across the Linux and database identity cutover, use the recorded
+job's shared-service rollback procedure in
+[Isolating production service accounts](#isolating-production-service-accounts).
 
 Use the **recorded** previous executable, not whichever release happens to be
 second in a directory listing. Returning to a release older than upload lease
@@ -764,7 +772,7 @@ backup for rollback across this schema change.
 
 ## Deploy from the development machine
 
-Run `./td-mta/deploy` in the reviewed development checkout. The command
+Run `./td-mta/deploy` from the root of the reviewed development checkout. The command
 fetches shared main, selects the newest first-parent descendant of the
 installed release with a passing main-integration verdict on this machine,
 and sends that exact Git object to claw1 using the production SSH identity.
@@ -775,8 +783,19 @@ To deploy the fetched main tip even when its integration verdict is missing
 or failed, run `./td-mta/deploy --skip-tests`. The deployment receipt records
 the override. Ancestry, production preflight, schema recovery, and service
 verification still run as applicable.
+The launcher builds the Rust controller from a clean checkout of its
+submitted commit, using Cargo's frozen dependency set, the
+`x86_64-unknown-linux-musl` Rust standard library and `rust-lld`.
+The development machine needs the cached Cargo dependencies, the host C
+compiler, GNU readelf, Git, SSH, td-mail and the checkout's built
+`target/release/td-builder` Cargo runner. The launcher checks the executable for dynamic dependencies,
+checks its SHA-256 after transfer, and retains the verified executable
+separately from the candidate mail release. Each private job directory
+links to its controller for recovery.
+
 A detached systemd job owns each activation through SSH disconnects.
-Its root-only receipt path is printed before activation. The development
+Each job runs one activation. The launcher prints the private receipt
+path before activation and creates a new job for a retry. The development
 machine checks authenticated public JMAP before and after the job using
 td-mail account xyz882015 (override with `--jmap-account NAME`). The
 second check records both observations in public-jmap.json beside the receipt.
@@ -820,6 +839,100 @@ return. Keep recovery inputs and the original data through the rollback
 window.
 
 
+### Isolating production service accounts
+
+Use the supervised `td-mta/deploy` path for the first release with
+`service_grants` in `postgres schema-plan`. It treats the identity change
+as a database migration even if the ledger version is already current.
+Reserve the same recovery volume, time and primary-device space as for a
+schema migration. The personal systemd and Shepherd installer continues
+to use its existing operating-system account and runtime login.
+
+The deployment creates five locked Linux accounts and five PostgreSQL
+SCRAM logins. For each of `frontend`, `receive`, `relay`, `migadu` and
+`acme`, the Linux name is `td-mta-ROLE` and the database name is
+`td_mta_ROLE`. PostgreSQL and trusted maintenance continue to run as
+`td-mta`. The original owner and shared runtime connection files belong
+to that trusted account. Each public process sees its own private state
+at the path its unit already names. On the host the corresponding
+connection file is `/var/lib/td-mta-services/ROLE/runtime-connection`.
+The four serving profiles have their control socket and scratch directory
+under `/var/lib/td-mta-services/ROLE/ROLE/`.
+
+Before the first cutover, inspect the host-local aggregate health unit with
+`systemctl cat td-mta-health.service`. Any probe that directly opens a
+serving process's old control socket needs to invoke the corresponding
+`td-mta-maint-mail-ROLE.service` readiness job. It works under either
+identity configuration. Keep its database, backup and certificate probes.
+The controller stages the notification monitor and digest configuration from
+the existing private configuration. Its sudoers entry permits only the
+eight fixed readiness and performance commands as the four service UIDs.
+After changing notification recipients or checks in the managed `config.json`,
+run `sudo ./td-mta-deploy --refresh-notifications` from
+the root-owned isolated deployment job directory. It validates those eight
+commands and atomically refreshes the derived private configuration. The
+next monitor and digest invocation use the new settings.
+
+1. The controller saves root-only credentials in
+   `/var/lib/td-mta-operator/service-passwords.json`. Back up that file
+   alongside the protected bootstrap archive. On the private rehearsal
+   cluster it creates the five logins, binds the selected configuration's
+   secrets and qualifies each grant set. Each of the four serving logins
+   cold-loads its selected profile, TLS policy and inputs before writer
+   admission. Their profile names and single-role assignments must match
+   this roster. ACME uses its own database login. The controller repeats
+   the checks on
+   the final cold copy. The installed HBA uses verified loopback TLS and
+   SCRAM. The local setup-admin peer rule exists only on the private copies.
+2. With writers fenced, the controller installs the systemd identity
+   drop-ins and verifies effective accounts and filesystem permissions.
+   After opening writers it checks all five database sessions, listener
+   PIDs, Linux UIDs, capabilities, control sockets, ACME certificate,
+   public SMTP/JMAP and scheduled health. The original binary and primary
+   can both be restored automatically before writer admission.
+3. To repeat the checks, run `postgres runtime-check --connection-file
+   /var/lib/td-mta-services/ROLE/runtime-connection` with the installed
+   td-mta binary as each service's Linux user. Inspect
+   `systemctl show UNIT -p User -p Group -p MainPID`. For each mail
+   profile run its named readiness job, then start
+   `td-mta-maint-backup-status.service` and `td-mta-health.service`.
+   Run `acme-status` as `td-mta-acme` with its own connection file and
+   the certificate profile and minimum validity used above.
+4. After writer admission, keep the selected primary and subsequent mail.
+   To return to the recorded shared deployment, run the following from
+   the root-owned directory of the **identity cutover** job while its
+   candidate is still the selected release. Inspect `shared-rollback.json`
+   and repeat the public JMAP and SMTP checks afterward.
+
+   ```sh
+   sudo ./td-mta-deploy --restore-shared-services
+   ```
+
+   Older job directories contain a private receipt and a deployment archive.
+   For rollback or notification refresh in one of those directories, stay
+   in the original job directory and invoke the absolute path to
+   `td-mta-deploy` from a newer verified Rust job under
+   `/var/lib/td-mta-operator/`. The Rust controller recovers the original
+   job fields from the private receipt.
+
+   This command qualifies the previous binary against the current epoch,
+   configuration and shared grants, fences the writers, restores the
+   original unit identities and switches the binary on the same primary.
+   Both directions transfer the two relay clock checkpoints under the
+   writer fence. The relay validates the database identity, checksum,
+   boot and elapsed interval as on an ordinary restart. Check
+   `queue-clock-status` for **both** `relay` and `migadu` after the
+   retry interval, using the corresponding UID and runtime directory.
+   If either remains held, verify database UTC independently, run
+   `queue-clock-confirm` for that relay and check for `confirmed`
+   as described in DEPLOYMENT.md.
+   An incompatible ledger or grant set requires a compatible forward fix.
+   The role logins, private directories and root vault are retained for
+   a subsequent isolated cutover. A binary rollback between two
+   isolated releases keeps the identities and must qualify all five logins.
+   A logical restore that only includes the `td_mta` schema requires the
+   owner binding step and service grants again before admitting writers.
+
 On claw1 the root-only libpq service file is
 `/var/lib/td-mta-operator/physical-backup/service.conf`. Its
 `cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
@@ -831,6 +944,6 @@ selected configuration, sampled emails, recipients and body chunks.
 The backup volume directory is `/data/td-mta-physical-recovery`, root:root
 0700 on the separate data disk. The owner login uses the scheduled backup
 libpq profile in `/var/lib/td-mta/backup-control/service.conf`.
-The host uses its installed Python 3.11+, PostgreSQL 17 tools, systemd,
+The host uses its installed PostgreSQL 17 tools, systemd,
 nftables, rsync with --fsync, tar, util-linux and the native build
 toolchain. Database passwords stay in protected files on claw1.

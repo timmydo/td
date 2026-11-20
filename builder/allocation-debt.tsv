@@ -2378,6 +2378,7 @@ td-mta/src/admission/quota.rs	unchecked-growth-or-clone	2
 td-mta/src/application_log.rs	allocating-constructor	1
 td-mta/src/application_log.rs	allocating-conversion	1
 td-mta/src/application_log.rs	unchecked-growth-or-clone	2
+td-mta/src/bin/td-mta-deploy/probes.rs	heap-owner	3
 td-mta/src/blob_body_json_tests.rs	allocating-conversion	10
 td-mta/src/blob_body_json_tests.rs	allocation-macro	8
 td-mta/src/blob_body_json_tests.rs	unchecked-growth-or-clone	6

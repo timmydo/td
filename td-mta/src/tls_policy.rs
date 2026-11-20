@@ -167,6 +167,8 @@ pub struct TlsPolicies {
 /// Which configured roles were compiled, not runtime health or publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyCoverage {
+    ListenersOnly,
+    RelayOnly,
     ClientsOnly,
     Complete,
 }
@@ -213,6 +215,26 @@ impl TlsPolicies {
             clock,
             open,
             PolicyCoverage::Complete,
+        )
+    }
+
+    pub(crate) fn prepare_service<R: Read>(
+        reserved: GenerationConstruction<Self>,
+        configuration: &crate::config::materialize::ResolvedProfile,
+        clock: Arc<ClockHandle>,
+        open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    ) -> Result<PreparedGeneration<Self>, Error> {
+        let coverage = if configuration.roles().relay() {
+            PolicyCoverage::RelayOnly
+        } else {
+            PolicyCoverage::ListenersOnly
+        };
+        Self::prepare_coverage(
+            reserved,
+            configuration.resolved_text(),
+            clock,
+            open,
+            coverage,
         )
     }
 
@@ -660,14 +682,24 @@ fn build<R: Read>(
     let profiles = graph.certificates().map_err(|_| Error::Invalid)?;
     let mut policies = Vec::new();
     let capacity = match coverage {
-        PolicyCoverage::ClientsOnly => 2,
-        PolicyCoverage::Complete => MAX_POLICIES,
+        PolicyCoverage::ClientsOnly | PolicyCoverage::RelayOnly => 2,
+        PolicyCoverage::Complete | PolicyCoverage::ListenersOnly => MAX_POLICIES,
     };
     policies
         .try_reserve_exact(capacity)
         .map_err(|_| Error::Capacity)?;
-    if coverage == PolicyCoverage::ClientsOnly {
-        append_clients(&mut policies, configuration, profiles, &clock, open)?;
+    if matches!(
+        coverage,
+        PolicyCoverage::ClientsOnly | PolicyCoverage::RelayOnly
+    ) {
+        append_clients(
+            &mut policies,
+            configuration,
+            profiles,
+            &clock,
+            open,
+            coverage == PolicyCoverage::ClientsOnly,
+        )?;
         return Ok(TlsPolicies { policies, coverage });
     }
     let mut identities = Vec::new();
@@ -679,6 +711,13 @@ fn build<R: Read>(
             .profile(index)
             .map_err(|_| Error::Invalid)?
             .ok_or(Error::Invalid)?;
+        if coverage == PolicyCoverage::ListenersOnly
+            && !graph
+                .serves_certificate(profile.name)
+                .map_err(|_| Error::Invalid)?
+        {
+            continue;
+        }
         let mut names = [""; graph::MAX_NAMES_PER_CERTIFICATE];
         let mut count = 0usize;
         for index in 0..graph.binding_count() {
@@ -876,6 +915,13 @@ fn build<R: Read>(
             .gateway(i)
             .map_err(|_| Error::Invalid)?
             .ok_or(Error::Invalid)?;
+        if coverage == PolicyCoverage::ListenersOnly
+            && !graph
+                .serves_gateway(gateway.name)
+                .map_err(|_| Error::Invalid)?
+        {
+            continue;
+        }
         let ca = read(
             MaterialRequest {
                 kind: MaterialKind::GatewayCa,
@@ -919,7 +965,9 @@ fn build<R: Read>(
             TrustStore::from_pem(&ca.0).map_err(|_| Error::Tls)?;
         }
     }
-    append_clients(&mut policies, configuration, profiles, &clock, open)?;
+    if coverage == PolicyCoverage::Complete {
+        append_clients(&mut policies, configuration, profiles, &clock, open, true)?;
+    }
     if policies.len() > MAX_POLICIES {
         return Err(Error::Capacity);
     }
@@ -956,6 +1004,7 @@ fn append_clients<R: Read>(
     profiles: certificate::View<'_, '_>,
     clock: &Arc<ClockHandle>,
     open: &mut impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    include_acme: bool,
 ) -> Result<(), Error> {
     let relay = configuration
         .candidate()
@@ -985,6 +1034,9 @@ fn append_clients<R: Read>(
             )?,
         },
     )?;
+    if !include_acme {
+        return Ok(());
+    }
     if let Some(acme) = profiles.acme().map_err(|_| Error::Invalid)? {
         push(
             policies,

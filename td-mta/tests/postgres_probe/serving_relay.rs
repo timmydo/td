@@ -31,8 +31,13 @@ impl Relay {
     pub(super) fn new(fixture: &Fixture, socket: TcpListener, dns: UdpSocket) -> Self {
         Self::build(fixture, socket, dns, "cloud", false)
     }
-    pub(super) fn multi(fixture: &Fixture, socket: TcpListener, dns: UdpSocket) -> Self {
-        Self::build(fixture, socket, dns, "multi", true)
+    pub(super) fn accepting(
+        fixture: &Fixture,
+        socket: TcpListener,
+        dns: UdpSocket,
+        profile: &str,
+    ) -> Self {
+        Self::build(fixture, socket, dns, profile, true)
     }
     fn build(
         fixture: &Fixture,

@@ -151,37 +151,71 @@ pub fn read(
     version: Version,
     kind: Kind,
 ) -> Result<Material, Error> {
+    let scoped = crate::postgres_service_materials::scoped(request);
+    let metadata_query = if scoped {
+        "SELECT kind, length, checksum, chunk_count FROM td_mta_service.materials WHERE id = $1 LIMIT 2"
+    } else {
+        "SELECT kind, length, checksum, chunk_count FROM td_mta.config_materials WHERE id = $1 LIMIT 2"
+    };
+    let chunks_query = if scoped {
+        "SELECT ordinal, bytes FROM td_mta_service.material_chunks WHERE material_id = $1 ORDER BY ordinal LIMIT 3"
+    } else {
+        "SELECT ordinal, bytes FROM td_mta.config_material_chunks WHERE material_id = $1 ORDER BY ordinal LIMIT 3"
+    };
     let result = postgres_probe::with_material_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
-            if receipt.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .await.map_err(|_| Error::Database)?;
-            let rows = client.query("SELECT kind, length, checksum, chunk_count FROM td_mta.config_materials WHERE id = $1 LIMIT 2",
-                &[&version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if rows.is_empty() { return Err(Error::Missing); }
-            if rows.len() != 1 { return Err(Error::Integrity); }
+            let receipt = postgres_schema::lock_and_inspect(client)
+                .await
+                .map_err(Error::Schema)?;
+            if receipt.store_epoch != epoch {
+                return Err(Error::Epoch);
+            }
+            client
+                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await
+                .map_err(|_| Error::Database)?;
+            let rows = client
+                .query(metadata_query, &[&version.as_bytes().as_slice()])
+                .await
+                .map_err(|_| Error::Database)?;
+            if rows.is_empty() {
+                return Err(Error::Missing);
+            }
+            if rows.len() != 1 {
+                return Err(Error::Integrity);
+            }
             let row = rows.first().ok_or(Error::Integrity)?;
             let stored_kind: i16 = row.try_get(0).map_err(|_| Error::Integrity)?;
-            if stored_kind != kind as i16 { return Err(Error::Kind); }
+            if stored_kind != kind as i16 {
+                return Err(Error::Kind);
+            }
             let length: i32 = row.try_get(1).map_err(|_| Error::Integrity)?;
             let length = usize::try_from(length).map_err(|_| Error::Integrity)?;
             let digest: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
             let count: i16 = row.try_get(3).map_err(|_| Error::Integrity)?;
-            if !kind.accepts(length) || digest.len() != 32
-                || usize::try_from(count).ok() != Some(length.div_ceil(CHUNK)) {
+            if !kind.accepts(length)
+                || digest.len() != 32
+                || usize::try_from(count).ok() != Some(length.div_ceil(CHUNK))
+            {
                 return Err(Error::Integrity);
             }
-            let chunks = client.query("SELECT ordinal, bytes FROM td_mta.config_material_chunks WHERE material_id = $1 ORDER BY ordinal LIMIT 3",
-                &[&version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if chunks.len() != length.div_ceil(CHUNK) { return Err(Error::Integrity); }
+            let chunks = client
+                .query(chunks_query, &[&version.as_bytes().as_slice()])
+                .await
+                .map_err(|_| Error::Database)?;
+            if chunks.len() != length.div_ceil(CHUNK) {
+                return Err(Error::Integrity);
+            }
             let mut bytes = Vec::new();
-            bytes.try_reserve_exact(length).map_err(|_| Error::Capacity)?;
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| Error::Capacity)?;
             for (index, chunk) in chunks.iter().enumerate() {
                 let ordinal: i16 = chunk.try_get(0).map_err(|_| Error::Integrity)?;
                 let data: &[u8] = chunk.try_get(1).map_err(|_| Error::Integrity)?;
                 if usize::try_from(ordinal).ok() != Some(index)
-                    || data.len() != length.saturating_sub(bytes.len()).min(CHUNK) {
+                    || data.len() != length.saturating_sub(bytes.len()).min(CHUNK)
+                {
                     return Err(Error::Integrity);
                 }
                 bytes.extend_from_slice(data);
@@ -191,7 +225,8 @@ pub fn read(
             }
             Ok(Material { kind, bytes })
         })
-    }).map_err(Error::Connection)?;
+    })
+    .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }

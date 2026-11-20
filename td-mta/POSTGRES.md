@@ -1474,8 +1474,8 @@ supplies a fixed public encoding for retaining the same change across process
 restart; callers must persist it before publication. Encoding support does not
 activate administration.
 
-Selected-source reads capture a passive generation/version, then verify the
-immutable source bytes and all profiles/materials. A concurrent publication
+Owner-side selected-source reads capture a passive generation/version, then
+verify the immutable source bytes and all profiles/materials. A concurrent publication
 can supersede that generation before return. Consumers must fence current
 policy at runtime admission/publication rather than treat the returned
 candidate as authority. Store-epoch checks apply to each connection, including
@@ -1491,10 +1491,15 @@ profile name and roles. It does not open listeners, publish a runtime
 configuration, enable relay/ACME workers or provide device authorization.
 No conversion to the legacy file-serving input is introduced.
 
-Loading captures the selected version and revalidates every profile/material,
-then resolves the requested profile using the exact same composition, text
-material and TLS preparation path as candidate validation. It requires the
-configured account's durable bootstrap receipt. All material comes from the
+Loading verifies the selected version's source digest, composes every profile
+and checks shared quotas and route declarations. A dedicated service login
+must match the requested profile and roles. It opens the text and TLS inputs
+that role uses, through the owner-bound views described in the runtime-role
+section. For example, a receiving process prepares its listener identities
+while a relay prepares its configured transport and password. The shared
+runtime login revalidates every profile and material before resolving the
+requested profile. Both paths require the configured account's durable
+bootstrap receipt. All material comes from the
 database under the original deadline; there is no filesystem fallback.
 The caller's TLS generation reservation remains in its original domain and
 is released on failure. The returned resolved text contains secrets and has
@@ -2406,10 +2411,10 @@ cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
 `postgres runtime-check --connection-file PATH` checks the current schema and
 one dedicated runtime login's effective data privileges. It closes the
 connection before returning and neither grants privileges nor activates a
-profile. Startup/reconnect integration remains runtime integration work; a successful
-cold check is not authority for a later connection.
+profile. Each serving connection qualifies its own login and schema before
+using its runtime authority.
 
-The initial runtime login must be separate from the owner, have no role
+Each runtime login must be separate from the owner, have no role
 memberships, and have none of SUPERUSER, CREATEDB, CREATEROLE, REPLICATION or
 BYPASSRLS. It must not own the database or application objects or have database CREATE or
 application-schema CREATE privileges. This dedicated-login policy also
@@ -2419,8 +2424,38 @@ are outside this application-schema boundary. Provider administration and
 arbitrary externally installed SECURITY DEFINER functions are not audited by
 this check; database administrators remain trusted.
 
-The exact table privilege roster lives in `postgres_runtime_access::TABLES`.
-All current tables require SELECT. Mail data and receipt tables require
+Production services use five dedicated PostgreSQL logins. The server's
+authenticated session user selects the exact table and column privileges in
+`postgres_runtime_access::ServiceRole::grants`. Each primary serving login
+must match its selected profile name and roles. The ACME command has its own
+login. Every service can read the schema ledger, runtime barrier and replica
+source marker for admission.
+
+| Login | Additional database authority |
+| --- | --- |
+| `td_mta_receive` | Publish SMTP mail to the Inbox, maintain thread and change history, charge quotas and write application logs. Existing blob bodies, device verifiers and the outbound queue are inaccessible. |
+| `td_mta_frontend` | Authenticate devices, read and mutate mailbox data through JMAP, create uploads and submissions and cancel submissions. Device credential administration and route ownership remain separate. |
+| `td_mta_relay`, `td_mta_migadu` | Deliver submissions, track attempts, produce failure notices and reclaim retired submissions and uploads. Both workers operate on the same queue tables and can read the shared body store, including stored incoming mail and drafts. The configured route and ownership fences distinguish their application operations. |
+| `td_mta_acme` | Read and update certificate issuance state and publish certificates. Mail storage and the service configuration views are inaccessible. |
+
+For the four serving profiles, the only path to secret material is through
+owner-defined security-barrier views in `td_mta_service`. The views bind
+the session user and active configuration version to that profile's allowed
+material IDs and certificate profiles. Shared material, such as a TLS key
+used by both SMTP and HTTPS, is available to each profile that uses it.
+Relay transport credentials are specific to their configured profiles.
+Only ACME directly accesses `td_mta.acme_profiles`.
+
+Qualification checks every application table, including tables absent from
+that login's grant plan. Missing grants, extra privileges, PUBLIC grants,
+delegation and extra column grants refuse admission. The catalog check
+covers system columns as well as user-defined columns. The schema owner
+applies each role's grants and qualifies the corresponding service
+connection. PRODUCTION.md describes the coordinated cutover and rollback.
+
+The shared-login contract remains available for single-login installations.
+The table inventory lives in `postgres_runtime_access::TABLES`. In this
+mode all current tables require SELECT. Mail data and receipt tables require
 INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
 receipts, bootstrap receipts and reserved import tables are read-only.
 Upload leases require SELECT, INSERT and DELETE, so upload publication and
@@ -2433,7 +2468,7 @@ Application tables must be ordinary logged tables without row security.
 Extra/missing tables, grant options, TRUNCATE, REFERENCES, TRIGGER and MAINTAIN
 privileges refuse. Column grants are checked as well as table grants.
 
-Provision the dedicated login through PostgreSQL/provider administration;
+Provision the shared login through PostgreSQL/provider administration;
 keep its password out of argv. For a fresh `td_mta_runtime` login, the owner
 can grant the current schema privileges atomically as follows:
 
@@ -8729,7 +8764,11 @@ unfiltered folder cache. CLI results and warning logs expose the skipped count.
 lock and validates the ledger through its last installed migration. It
 reports the current and target versions, the store epoch, the ordered
 pending versions, the required schema USAGE, and target table and column
-grants for the existing dedicated primary runtime login. Role membership,
+grants for the shared primary runtime login (`primary_grants`) and for each
+isolated production profile (`service_grants`). Each profile maps table
+names in `td_mta` to the required SQL privilege list. Tables absent from
+that profile's map receive no grant. The deployer provisions the three
+filtered views separately for the four serving profiles. Role membership,
 ownership, maintenance state and effective privileges are qualified by
 `runtime-check` after migration. An empty pending list means the ledger is current. A
 corrupt, missing or newer ledger fails. Planning changes no SQL objects.

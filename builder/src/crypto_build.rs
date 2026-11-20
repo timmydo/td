@@ -117,7 +117,8 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     );
     // Before any test runs, over the PATH the fixtures inherit.
     if matches!(action, "test" | "perf") && name == "td-mta" {
-        postgres_bin(&path)?;
+        let extra = if action == "test" { BACKUP_TOOLS } else { &[] };
+        postgres_bin(&path, extra)?;
     }
     let vendor = crate::host_bin::prepare_mail_vendor(root)?;
     let vendor = vendor
@@ -299,10 +300,12 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         return Err(format!("crypto {action} failed: {status}"));
     }
     if let Some((mail, fetch)) = live_fixture {
-        for case in [
-            "real_postgres_td_mail_reads_and_downloads",
-            "real_postgres_td_mail_sends_plain_text",
-            "real_postgres_executable_receives_and_serves_database_profiles",
+        for (selector, target, case) in [
+            ("--test", "postgres_probe", "real_postgres_td_mail_reads_and_downloads"),
+            ("--test", "postgres_probe", "real_postgres_td_mail_sends_plain_text"),
+            ("--test", "postgres_probe", "real_postgres_executable_receives_and_serves_database_profiles"),
+            ("--bin", "td-mta-deploy", "physical::postgres_test::real_postgres_backup_replays_to_exact_marker_without_later_mail"),
+            ("--bin", "td-mta-deploy", "service_database::postgres_test::real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants"),
         ] {
             let mut fixture = command("test", manifest);
             fixture
@@ -313,8 +316,8 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
                 .env("TD_TEST_TRUSTED_ROOT", "private")
                 .args([
                     "--release",
-                    "--test",
-                    "postgres_probe",
+                    selector,
+                    target,
                     "--",
                     "--exact",
                     case,
@@ -328,19 +331,20 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     Ok(None)
 }
 
-/// The PostgreSQL 17 directory the native mail fixtures take from `path`:
-/// the directory of its first `initdb`, which must also hold `postgres`,
-/// `pg_ctl`, `psql`, `pg_dump` and `pg_restore`, as the fixtures require, with what its
-/// `postgres --version` reports.
-pub(crate) fn postgres_bin(path: &str) -> Result<(PathBuf, String)> {
-    let need = "native mail tests need PostgreSQL 17's initdb, postgres, pg_ctl, psql, pg_dump and pg_restore in one PATH directory";
+const MAIL_POSTGRES_TOOLS: &[&str] = &["postgres", "pg_ctl", "psql", "pg_dump", "pg_restore"];
+const BACKUP_TOOLS: &[&str] = &["pg_receivewal", "pg_basebackup", "pg_verifybackup"];
+
+/// Resolve one complete PostgreSQL 17 tool directory from PATH's first initdb.
+fn postgres_bin(path: &str, extra: &[&str]) -> Result<(PathBuf, String)> {
+    let need =
+        "native mail tests require the PostgreSQL 17 server, client and backup tools together";
     let initdb = crate::stage0::find_in_path(path, "initdb")
         .ok_or_else(|| format!("{need}: no initdb on PATH"))?;
     let bin = initdb
         .parent()
         .filter(|dir| dir.is_absolute())
         .ok_or_else(|| format!("{need}: initdb is in a relative PATH entry"))?;
-    for name in ["postgres", "pg_ctl", "psql", "pg_dump", "pg_restore"] {
+    for &name in MAIL_POSTGRES_TOOLS.iter().chain(extra) {
         if !crate::stage0::is_exec(&bin.join(name)) {
             return Err(format!(
                 "{need}: {} has initdb but no {name}",
@@ -489,28 +493,44 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
         let path = format!("{}:{}", early.display(), late.display());
-        let err = postgres_bin(&path).unwrap_err();
+        let err = postgres_bin(&path, BACKUP_TOOLS).unwrap_err();
         assert!(err.ends_with("no initdb on PATH"), "{err}");
-        for name in ["initdb", "pg_ctl", "psql", "pg_dump", "pg_restore"] {
+        tool(&late, "initdb", "exit 0");
+        for &name in MAIL_POSTGRES_TOOLS.iter().chain(BACKUP_TOOLS) {
             tool(&late, name, "exit 0");
         }
         tool(&late, "postgres", "echo 'postgres (PostgreSQL) 17.10'");
         tool(&early, "initdb", "exit 0");
         tool(&early, "pg_ctl", "exit 0");
-        let err = postgres_bin(&path).unwrap_err();
+        let err = postgres_bin(&path, BACKUP_TOOLS).unwrap_err();
         assert!(err.contains(&format!("{} has initdb but no postgres", early.display())));
         tool(&early, "postgres", "echo 'postgres (PostgreSQL) 16.4'");
-        tool(&early, "psql", "exit 0");
-        tool(&early, "pg_dump", "exit 0");
-        tool(&early, "pg_restore", "exit 0");
-        let err = postgres_bin(&path).unwrap_err();
+        for name in [
+            "psql",
+            "pg_dump",
+            "pg_restore",
+            "pg_receivewal",
+            "pg_basebackup",
+            "pg_verifybackup",
+        ] {
+            if name == "pg_receivewal" {
+                assert!(postgres_bin(&path, &[]).unwrap_err().contains("16.4"));
+            }
+            let err = postgres_bin(&path, BACKUP_TOOLS).unwrap_err();
+            assert!(
+                err.contains(&format!("{} has initdb but no {name}", early.display())),
+                "{err}"
+            );
+            tool(&early, name, "exit 0");
+        }
+        let err = postgres_bin(&path, BACKUP_TOOLS).unwrap_err();
         assert!(
             err.contains("reports \"postgres (PostgreSQL) 16.4\""),
             "{err}"
         );
         std::fs::remove_file(early.join("initdb")).unwrap();
         assert_eq!(
-            postgres_bin(&path).unwrap(),
+            postgres_bin(&path, BACKUP_TOOLS).unwrap(),
             (late.clone(), "postgres (PostgreSQL) 17.10".to_string())
         );
     }

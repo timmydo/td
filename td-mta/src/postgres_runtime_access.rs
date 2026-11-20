@@ -1,4 +1,7 @@
 //! Cold runtime-role qualification; no grants, DDL or serving admission.
+mod service;
+pub use service::ServiceRole;
+
 use crate::{
     postgres_probe::{self, Request},
     postgres_schema::{self, Receipt},
@@ -19,7 +22,7 @@ const ROLE: &str = "SELECT current_user=session_user AND r.rolcanlogin
     AND NOT pg_catalog.has_schema_privilege(n.oid,'CREATE,USAGE WITH GRANT OPTION')
     AND n.nspowner<>r.oid
     AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
-        WHERE c.relnamespace=n.oid AND c.relowner=r.oid)
+        WHERE c.relnamespace=n.oid AND c.relowner=r.oid),current_user::text
     FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_namespace n ON n.nspname='td_mta'
     JOIN pg_catalog.pg_database d ON d.datname=current_database()
     WHERE r.rolname=current_user";
@@ -244,6 +247,33 @@ async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error
     if !row.try_get::<_, bool>(0).map_err(|_| Error::Database)? {
         return Err(Error::Role);
     }
+    let user: &str = row.try_get(1).map_err(|_| Error::Database)?;
+    if let Some(role) = ServiceRole::for_login(user) {
+        if authority != Authority::Primary {
+            return Err(Error::Role);
+        }
+        service::qualify(client, role).await?;
+    } else {
+        qualify_shared(client, authority).await?;
+    }
+    let rows = client
+        .query_typed(
+            "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
+            &[],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let row = rows.first().ok_or(Error::Maintenance)?;
+    if rows.len() != 1
+        || !row.try_get::<_, bool>(0).map_err(|_| Error::Database)?
+        || row.try_get::<_, bool>(1).map_err(|_| Error::Database)?
+    {
+        return Err(Error::Maintenance);
+    }
+    Ok(())
+}
+
+async fn qualify_shared(client: &Client, authority: Authority) -> Result<(), Error> {
     let limit = i64::try_from(TABLES.len() + 1).map_err(|_| Error::Privileges)?;
     let rows = client
         .query_typed(PRIVILEGES, &[(&limit, tokio_postgres::types::Type::INT8)])
@@ -286,20 +316,6 @@ async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error
         if !allowed {
             return Err(Error::Privileges);
         }
-    }
-    let rows = client
-        .query_typed(
-            "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
-            &[],
-        )
-        .await
-        .map_err(|_| Error::Database)?;
-    let row = rows.first().ok_or(Error::Maintenance)?;
-    if rows.len() != 1
-        || !row.try_get::<_, bool>(0).map_err(|_| Error::Database)?
-        || row.try_get::<_, bool>(1).map_err(|_| Error::Database)?
-    {
-        return Err(Error::Maintenance);
     }
     Ok(())
 }

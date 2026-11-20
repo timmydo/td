@@ -74,13 +74,26 @@ struct OwnedProfile {
 /// preparation time only; startup must revalidate before service admission.
 /// This cannot be forged from raw source bytes:
 /// ```compile_fail,E0451
-/// use td_mta::{ids::StoreEpoch, postgres_configuration::{Candidate, SharedQuotas}};
-/// fn forge(epoch: StoreEpoch, quotas: SharedQuotas) -> Candidate {
-///     Candidate { epoch, shared: Vec::new(), profiles: Vec::new(),
-///         digest: [0; 32], quotas, submission_routes: Vec::new() }
+/// use td_mta::postgres_configuration::{Candidate, ProfileInventory};
+/// fn forge(inventory: ProfileInventory) -> Candidate {
+///     Candidate { bindings: Default::default(), inventory }
 /// }
 /// ```
 pub struct Candidate {
+    pub(crate) bindings: crate::postgres_service_materials::Bindings,
+    pub(crate) inventory: ProfileInventory,
+}
+
+impl std::ops::Deref for Candidate {
+    type Target = ProfileInventory;
+    fn deref(&self) -> &ProfileInventory {
+        &self.inventory
+    }
+}
+
+/// Structurally checked profile sources, route declarations and shared quotas.
+/// Reading this metadata grants no authority to import or select a configuration.
+pub struct ProfileInventory {
     epoch: StoreEpoch,
     shared: Vec<u8>,
     profiles: Vec<OwnedProfile>,
@@ -88,7 +101,7 @@ pub struct Candidate {
     quotas: SharedQuotas,
     submission_routes: Vec<(AccountId, crate::postgres_routes::Route)>,
 }
-impl Candidate {
+impl ProfileInventory {
     pub fn epoch(&self) -> StoreEpoch {
         self.epoch
     }
@@ -151,6 +164,30 @@ pub fn prepare(
     shared: &[u8],
     profiles: &[Profile<'_>],
 ) -> Result<Candidate, Error> {
+    let (inventory, bindings) = build(request, trust, deadline, epoch, shared, profiles, true)?;
+    Ok(Candidate {
+        inventory,
+        bindings,
+    })
+}
+
+// The selected version was already validated by the publishing owner. Other
+// profiles provide structural route declarations, never credentials.
+fn build(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    epoch: StoreEpoch,
+    shared: &[u8],
+    profiles: &[Profile<'_>],
+    validate_materials: bool,
+) -> Result<
+    (
+        ProfileInventory,
+        crate::postgres_service_materials::Bindings,
+    ),
+    Error,
+> {
     if deadline
         .checked_duration_since(Instant::now())
         .filter(|allowance| {
@@ -191,6 +228,7 @@ pub fn prepare(
     profiles
         .try_reserve_exact(ordered.len())
         .map_err(|_| Error::Capacity)?;
+    let mut bindings = crate::postgres_service_materials::Bindings::default();
     let mut quotas = None;
     let mut outbound_profiles = Vec::new();
     outbound_profiles
@@ -210,30 +248,37 @@ pub fn prepare(
         if Instant::now() >= deadline {
             return Err(Error::Deadline);
         }
-        let set = GenerationSet::at_startup();
-        let (resolved, policies) = resolve_profile(
-            ProfileInput {
-                request,
-                trust,
-                deadline,
-                epoch,
-                shared,
-                profile,
-                clock: clock.clone(),
-            },
-            storage,
-            &mut pending,
-            &mut scratch,
-            set.reserve().map_err(|_| Error::Provider)?,
-        )?;
-        drop(policies);
-        let current = SharedQuotas::from_plan(resolved.candidate().resources().admission());
+        let input = ProfileInput {
+            request,
+            trust,
+            deadline,
+            epoch,
+            shared,
+            profile,
+            clock: clock.clone(),
+        };
+        let parsed = if validate_materials {
+            let set = GenerationSet::at_startup();
+            let (resolved, _) = resolve_profile(
+                input,
+                storage,
+                &mut pending,
+                &mut scratch,
+                set.reserve().map_err(|_| Error::Provider)?,
+                false,
+            )?;
+            resolved.into_candidate()
+        } else {
+            parse_profile(&input, storage, &mut pending, &mut scratch)?
+                .into_parts()
+                .0
+        };
+        let current = SharedQuotas::from_plan(parsed.resources().admission());
         if quotas.is_some_and(|expected| expected != current) {
             return Err(Error::SharedQuotas);
         }
         quotas = Some(current);
-        let relay = resolved
-            .candidate()
+        let relay = parsed
             .outbound()
             .map_err(|_| Error::Profile)?
             .relay()
@@ -244,10 +289,7 @@ pub fn prepare(
             return Err(Error::RouteConflict);
         }
         if profiles.is_empty() {
-            let catalog = resolved
-                .candidate()
-                .identities()
-                .map_err(|_| Error::Profile)?;
+            let catalog = parsed.identities().map_err(|_| Error::Profile)?;
             for index in 0..catalog.account_count() {
                 let account = catalog
                     .account_at(index)
@@ -265,7 +307,10 @@ pub fn prepare(
                 }
             }
         }
-        storage = resolved.into_storage();
+        if validate_materials {
+            bindings.include_profile(profile, &parsed)?;
+        }
+        storage = parsed.into_storage();
         let name = String::from_utf8(copy(profile.name.as_bytes())?).map_err(|_| Error::Name)?;
         profiles.push(OwnedProfile {
             route,
@@ -286,7 +331,7 @@ pub fn prepare(
             .ok_or(Error::OutboundProfile)?;
         submission_routes.push((account, profile.route.clone()));
     }
-    let mut candidate = Candidate {
+    let mut candidate = ProfileInventory {
         epoch,
         shared: copy(shared)?,
         profiles,
@@ -298,7 +343,7 @@ pub fn prepare(
     if Instant::now() >= deadline {
         return Err(Error::Deadline);
     }
-    Ok(candidate)
+    Ok((candidate, bindings))
 }
 
 pub(crate) struct ProfileInput<'a, 'r> {
@@ -311,6 +356,35 @@ pub(crate) struct ProfileInput<'a, 'r> {
     pub clock: Arc<ClockHandle>,
 }
 
+pub(crate) fn selected_sources(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    epoch: StoreEpoch,
+    sources: &crate::postgres_configuration_store::Sources,
+) -> Result<ProfileInventory, Error> {
+    let (shared, profiles) = sources.parts().map_err(|_| Error::Profile)?;
+    build(request, trust, deadline, epoch, shared, &profiles, false).map(|(inventory, _)| inventory)
+}
+
+fn parse_profile(
+    input: &ProfileInput<'_, '_>,
+    storage: storage::Storage,
+    pending: &mut stanza::Pending,
+    scratch: &mut [u8],
+) -> Result<load::PreparedProfile, Error> {
+    let source = composition::Source::new(input.shared, input.profile.source, scratch)
+        .map_err(Error::Composition)?;
+    load::read_profile(
+        storage,
+        pending,
+        scratch,
+        &mut source.reader(),
+        input.profile.roles,
+    )
+    .map_err(|_| Error::Profile)
+}
+
 // Candidate validation and runtime preparation use exactly the same source,
 // material and TLS path. The caller owns the generation reservation.
 pub(crate) fn resolve_profile(
@@ -319,6 +393,7 @@ pub(crate) fn resolve_profile(
     pending: &mut stanza::Pending,
     scratch: &mut [u8],
     reserved: GenerationConstruction<TlsPolicies>,
+    isolated: bool,
 ) -> Result<
     (
         materialize::ResolvedProfile,
@@ -329,30 +404,39 @@ pub(crate) fn resolve_profile(
     if Instant::now() >= input.deadline {
         return Err(Error::Deadline);
     }
-    let source = composition::Source::new(input.shared, input.profile.source, scratch)
-        .map_err(Error::Composition)?;
-    let prepared = load::read_profile(
-        storage,
-        pending,
-        scratch,
-        &mut source.reader(),
-        input.profile.roles,
-    )
-    .map_err(|_| Error::Profile)?;
+    let prepared = parse_profile(&input, storage, pending, scratch)?;
     let mut loader = Loader::new(input.request, input.trust, input.epoch, input.deadline);
-    let resolved =
-        materialize::read_profile_text(prepared, scratch, |reference| loader.open_input(reference))
-            .map_err(|failure| match failure.error() {
-                materialize::Error::Input(error) => Error::Material(*error),
-                _ => Error::Text,
-            })?;
+    let read_text = if isolated {
+        materialize::read_service_text
+    } else {
+        materialize::read_profile_text
+    };
+    let resolved = read_text(
+        prepared,
+        scratch,
+        |reference: crate::config::inputs::Reference<'_>| loader.open_input(reference),
+    )
+    .map_err(|failure| match failure.error() {
+        materialize::Error::Input(error) => Error::Material(*error),
+        _ => Error::Text,
+    })?;
     let mut material_error = None;
-    let policies = TlsPolicies::prepare_profile(reserved, &resolved, input.clock, |reference| {
-        loader.open_tls(reference).map_err(|error| {
-            material_error = Some(error);
-            crate::ports::Error::Invalid
-        })
-    })
+    let prepare = if isolated {
+        TlsPolicies::prepare_service
+    } else {
+        TlsPolicies::prepare_profile
+    };
+    let policies = prepare(
+        reserved,
+        &resolved,
+        input.clock,
+        |reference: crate::tls_policy::MaterialRequest<'_>| {
+            loader.open_tls(reference).map_err(|error| {
+                material_error = Some(error);
+                crate::ports::Error::Invalid
+            })
+        },
+    )
     .map_err(|_| material_error.map_or(Error::Provider, Error::Material))?;
     if Instant::now() >= input.deadline {
         return Err(Error::Deadline);
@@ -363,7 +447,7 @@ pub(crate) fn resolve_profile(
 pub(crate) const DIGEST_DOMAIN: &[u8] = b"td-mta PostgreSQL configuration sources v1\0";
 
 pub(crate) fn visit_bytes(
-    candidate: &Candidate,
+    candidate: &ProfileInventory,
     mut write: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     write(DIGEST_DOMAIN)?;
@@ -387,7 +471,7 @@ pub(crate) fn visit_bytes(
     Ok(())
 }
 
-fn digest(candidate: &Candidate) -> Result<[u8; 32], Error> {
+fn digest(candidate: &ProfileInventory) -> Result<[u8; 32], Error> {
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     visit_bytes(candidate, |bytes| {
         hash.update(bytes).map_err(|_| Error::Crypto)

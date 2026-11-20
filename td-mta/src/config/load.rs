@@ -63,7 +63,7 @@ pub struct PreparedProfile {
     roles: super::profile::Roles,
 }
 impl PreparedProfile {
-    pub(super) fn into_parts(self) -> (storage::Candidate, super::profile::Roles) {
+    pub(crate) fn into_parts(self) -> (storage::Candidate, super::profile::Roles) {
         (self.loaded.into_candidate(), self.roles)
     }
     pub fn candidate(&self) -> &storage::Candidate {

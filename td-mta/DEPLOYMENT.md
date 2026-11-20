@@ -1348,3 +1348,8 @@ retains the existing ten-second operation deadline and per-frame validation.
 These cold owner/host command paths retain bounded standard collection/JSON
 allocation debt in the reviewed inventory; they do not claim allocation safety
 or extend the serving path's allocation boundary.
+
+The production systemd cutover provisions separate service identities and private
+connection files. Follow “Isolating production service accounts” in PRODUCTION.md
+for that upgrade and its rollback. The personal systemd and Shepherd definitions
+continue to use the single-user installation described here.

@@ -308,6 +308,9 @@ pub(super) fn status(args: impl Iterator<Item = OsString>) -> Result<bool, Confi
     .map_err(|_| config_failure("acme", "resolution"))?;
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
+        if !acme_login(request.user) {
+            return Err(config_failure("acme", "runtime"));
+        }
         request.mode = Mode::Runtime;
         let receipt = match td_mta::postgres_runtime_access::inspect(
             &request,
@@ -337,6 +340,11 @@ pub(super) fn status(args: impl Iterator<Item = OsString>) -> Result<bool, Confi
     Err(config_failure("acme", "connection"))
 }
 
+fn acme_login(user: &str) -> bool {
+    use td_mta::postgres_runtime_access::ServiceRole;
+    ServiceRole::for_login(user).is_none_or(|role| role == ServiceRole::Acme)
+}
+
 // Claiming before bind establishes an ACME row under the shared schema lock.
 // Empty-database replica initialization subsequently refuses that row.
 fn claim_turn<'a>(
@@ -364,6 +372,9 @@ fn claim_turn<'a>(
     let mut selected = None;
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
+        if !acme_login(request.user) {
+            return Err(acme::Error::Database);
+        }
         request.mode = Mode::Runtime;
         match td_mta::postgres_runtime_access::inspect(&request, &loaded.trust, until) {
             Ok(receipt) => {

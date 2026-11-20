@@ -265,13 +265,41 @@ pub fn load(
         return Err(Error::Deadline);
     }
     values::profile_name(profile).map_err(|_| Error::Name)?;
-    let (selected, candidate) = selection::read(request, trust, deadline, epoch)
-        .map_err(Error::Selection)?
-        .ok_or(Error::Unselected)?;
+    let (selected, candidate) = if let Some(role) =
+        crate::postgres_runtime_access::ServiceRole::for_login(request.user)
+    {
+        if role.name() != profile {
+            return Err(Error::Name);
+        }
+        let selected = selection::observe(request, trust, deadline, epoch)
+            .map_err(Error::Selection)?
+            .ok_or(Error::Unselected)?;
+        let sources = crate::postgres_configuration_store::read_sources(
+            request,
+            trust,
+            deadline,
+            epoch,
+            selected.version,
+        )
+        .map_err(|e| Error::Selection(selection::Error::Configuration(e)))?;
+        let inventory = configuration::selected_sources(request, trust, deadline, epoch, &sources)
+            .map_err(Error::Configuration)?;
+        (selected, inventory)
+    } else {
+        let (selected, candidate) = selection::read(request, trust, deadline, epoch)
+            .map_err(Error::Selection)?
+            .ok_or(Error::Unselected)?;
+        (selected, candidate.inventory)
+    };
     let chosen = (0..candidate.profile_count())
         .filter_map(|index| candidate.profile(index))
         .find(|entry| entry.name == profile)
         .ok_or(Error::MissingProfile)?;
+    if let Some(role) = crate::postgres_runtime_access::ServiceRole::for_login(request.user) {
+        if !crate::postgres_service_materials::serves(role, chosen) {
+            return Err(Error::Name);
+        }
+    }
     let mut name = String::new();
     name.try_reserve_exact(profile.len())
         .map_err(|_| Error::Capacity)?;
@@ -300,6 +328,7 @@ pub fn load(
         &mut pending,
         &mut scratch,
         reserved,
+        crate::postgres_service_materials::scoped(request),
     )
     .map_err(Error::Configuration)?;
     let catalog = configuration

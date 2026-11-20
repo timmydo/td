@@ -183,6 +183,7 @@ mod postgres_search;
 pub mod postgres_search_prepare;
 pub mod postgres_selection;
 mod postgres_sequence;
+pub mod postgres_service_materials;
 mod postgres_settlement;
 mod postgres_snapshot;
 pub mod postgres_submission_input;

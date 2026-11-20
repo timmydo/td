@@ -51,6 +51,15 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "f7e46e8ad468ae532adc78bb332ddb5d71bc6b1daee69f2392ac39054c0562bc",
             );
+        } else if relative == "td-mta/src/bin/td-mta-deploy/isolation_path_sys.rs" {
+            assert_eq!(words(&source, "unsafe"), 3);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
+            assert_eq!(source.matches("fn openat(").count(), 1);
+            assert_eq!(source.matches("File::from_raw_fd(fd)").count(), 1);
+            fingerprint(
+                &source,
+                "4882f995efc4ed3f923ac204288b6e1f2c89ec24685e2422b343fce619cf846a",
+            );
         } else if relative == "td-mta/src/listener_sys.rs" {
             assert_eq!(words(&source, "unsafe"), 3);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 2);
@@ -84,10 +93,34 @@ fn scan(root: &Path, path: &Path) {
             assert!(!source.contains("allow(unsafe_code"), "{relative}");
             assert!(!source.contains("global_allocator"), "{relative}");
         }
+        if relative == "td-mta/src/bin/td-mta-deploy/isolation_helper.rs" {
+            assert_eq!(source.matches("mod path_sys;").count(), 1);
+            assert_eq!(
+                source
+                    .matches("path_sys::directory(&current, normal_name(component)?)")
+                    .count(),
+                1
+            );
+            assert_eq!(source.matches("path_sys::journal(&directory)").count(), 1);
+            assert_eq!(words(&source, "path_sys"), 3);
+        } else {
+            assert_eq!(words(&source, "path_sys"), 0, "{relative}");
+        }
         match relative {
             "td-mta/src/main.rs" => {
                 assert_eq!(source.matches("mod signal_sys;").count(), 1);
                 assert_eq!(words(&source, "signal_sys"), 1);
+            }
+            "td-mta/src/bin/td-mta-deploy/main.rs" => {
+                assert!(source.contains("#![deny(unsafe_code)]"));
+                assert!(source.contains(r#"#[path = "../../signal_sys.rs"]"#));
+                assert_eq!(source.matches("mod signal_sys;").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 2);
+            }
+            "td-mta/src/bin/td-mta-deploy/common.rs" => {
+                assert_eq!(source.matches("crate::signal_sys::block()").count(), 1);
+                assert_eq!(source.matches("crate::signal_sys::requested()").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 2);
             }
             "td-mta/src/serve.rs" => {
                 assert_eq!(source.matches("super::signal_sys::block()").count(), 1);

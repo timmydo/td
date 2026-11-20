@@ -42,6 +42,7 @@ enum Operation {
     Upgrade,
     Inspect,
     RuntimeCheck,
+    ServiceProfileCheck,
 }
 impl Operation {
     fn parse(value: &OsStr) -> Option<Self> {
@@ -52,6 +53,7 @@ impl Operation {
             "schema-upgrade" => Some(Self::Upgrade),
             "schema-inspect" => Some(Self::Inspect),
             "runtime-check" => Some(Self::RuntimeCheck),
+            "service-profile-check" => Some(Self::ServiceProfileCheck),
             _ => None,
         }
     }
@@ -63,6 +65,7 @@ impl Operation {
             Self::Upgrade => "postgres-schema-upgrade",
             Self::Inspect => "postgres-schema-inspect",
             Self::RuntimeCheck => "postgres-runtime-check",
+            Self::ServiceProfileCheck => "postgres-service-profile-check",
         }
     }
 }
@@ -247,13 +250,31 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
                 }
                 write!(out, "\"{table}\":\"{grants}\"")?;
             }
+            write!(out, "}},\"service_grants\":{{")?;
+            for (index, role) in td_mta::postgres_runtime_access::ServiceRole::ALL
+                .iter()
+                .enumerate()
+            {
+                if index > 0 {
+                    write!(out, ",")?;
+                }
+                write!(out, "\"{}\":{{", role.name())?;
+                for (index, (table, grants)) in role.grants().enumerate() {
+                    if index > 0 {
+                        write!(out, ",")?;
+                    }
+                    write!(out, "\"{table}\":\"{grants}\"")?;
+                }
+                write!(out, "}}")?;
+            }
             writeln!(out, "}}}}")?;
             Ok(ExitCode::SUCCESS)
         }
         Ok(Outcome::Runtime(receipt)) => {
+            let profile_checked = operation == Operation::ServiceProfileCheck;
             writeln!(
                 io::stdout().lock(),
-                "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{}\",\"runtime_privileges_checked\":true,\"profile_checked\":false}}",
+                "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{}\",\"runtime_privileges_checked\":true,\"profile_checked\":{profile_checked}}}",
                 receipt.version,
                 receipt.store_epoch
             )?;
@@ -286,29 +307,56 @@ fn check(
     timeout: Duration,
 ) -> Result<Outcome, (&'static str, &'static str)> {
     with_addresses_timeout(loaded, timeout, |request, deadline| {
-        if operation == Operation::RuntimeCheck {
-            return td_mta::postgres_runtime_access::inspect(request, &loaded.trust, deadline)
-                .map(Outcome::Runtime)
-                .map_err(|error| {
-                    use td_mta::postgres_runtime_access::Error;
-                    match error {
-                        Error::Connection(error) => {
-                            AttemptError::from(postgres_schema::Error::Connection(error))
+        if matches!(
+            operation,
+            Operation::RuntimeCheck | Operation::ServiceProfileCheck
+        ) {
+            let receipt =
+                td_mta::postgres_runtime_access::inspect(request, &loaded.trust, deadline)
+                    .map_err(|error| {
+                        use td_mta::postgres_runtime_access::Error;
+                        match error {
+                            Error::Connection(error) => {
+                                AttemptError::from(postgres_schema::Error::Connection(error))
+                            }
+                            Error::Schema(error) => AttemptError::from(error),
+                            Error::Role => {
+                                AttemptError::Failed("runtime", "owner-or-privileged-role")
+                            }
+                            Error::Maintenance => {
+                                AttemptError::Failed("runtime", "maintenance-barrier")
+                            }
+                            Error::Replica => AttemptError::Failed("runtime", "replica-read-only"),
+                            Error::Privileges => {
+                                AttemptError::Failed("runtime", "incorrect-data-privileges")
+                            }
+                            Error::Database => {
+                                AttemptError::Failed("runtime", "privilege-check-failed")
+                            }
                         }
-                        Error::Schema(error) => AttemptError::from(error),
-                        Error::Role => AttemptError::Failed("runtime", "owner-or-privileged-role"),
-                        Error::Maintenance => {
-                            AttemptError::Failed("runtime", "maintenance-barrier")
-                        }
-                        Error::Replica => AttemptError::Failed("runtime", "replica-read-only"),
-                        Error::Privileges => {
-                            AttemptError::Failed("runtime", "incorrect-data-privileges")
-                        }
-                        Error::Database => {
-                            AttemptError::Failed("runtime", "privilege-check-failed")
-                        }
-                    }
-                });
+                    })?;
+            if operation == Operation::ServiceProfileCheck {
+                use td_mta::{generations::GenerationSet, postgres_runtime_access::ServiceRole};
+                let role = ServiceRole::for_login(request.user)
+                    .filter(|role| *role != ServiceRole::Acme)
+                    .ok_or(AttemptError::Failed("profile", "serving-login-required"))?;
+                let runtime = postgres_probe::Request {
+                    mode: postgres_probe::Mode::Runtime,
+                    ..*request
+                };
+                let generations = GenerationSet::at_startup();
+                td_mta::postgres_runtime_profile::load(
+                    &runtime,
+                    &loaded.trust,
+                    deadline,
+                    receipt.store_epoch,
+                    role.name(),
+                    GenerationSet::reserve(&generations)
+                        .map_err(|_| AttemptError::Failed("profile", "generation-capacity"))?,
+                )
+                .map_err(|_| AttemptError::Failed("profile", "profile-preparation-failed"))?;
+            }
+            return Ok(Outcome::Runtime(receipt));
         }
         match operation {
             Operation::Probe => postgres_probe::probe(request, &loaded.trust, deadline)
@@ -326,7 +374,9 @@ fn check(
             Operation::Inspect => {
                 postgres_schema::inspect(request, &loaded.trust, deadline).map(Outcome::Schema)
             }
-            Operation::RuntimeCheck => Err(postgres_schema::Error::Invalid),
+            Operation::RuntimeCheck | Operation::ServiceProfileCheck => {
+                Err(postgres_schema::Error::Invalid)
+            }
         }
         .map_err(AttemptError::from)
     })
@@ -452,6 +502,7 @@ mod tests {
             "schema-plan",
             "schema-upgrade",
             "runtime-check",
+            "service-profile-check",
         ] {
             assert!(parse(&[operation, "--connection-file", "/private/db"]).is_some());
             assert!(parse(&[

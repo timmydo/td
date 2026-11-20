@@ -37,7 +37,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
         "td-alloc" => "07b5c782ce2647c93f6b40d95ef7f65fe9850f87091f9be8738e8f9e965ec5f1",
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "720198b066801724a9d45a0cdc85d9c61f20033a6610795bb7cd897fe165b443",
-        "td-mta" => "7df4048742b09def988eb623c7344f10ba331852db6dd434f669d219f887f8e8",
+        "td-mta" => "688f02cac597de03132414496cb447423836ba337a5e30da9a89736d539bcb14",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "dd14b103b756c1ca3c63dce4af68a72b3bf9ca6ddf732bd384eb7b1564996730",

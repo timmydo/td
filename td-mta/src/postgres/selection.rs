@@ -14,6 +14,7 @@ use td_mta::{
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Operation {
+    Bind,
     Prepare,
     Publish,
     Inspect,
@@ -21,6 +22,7 @@ pub(super) enum Operation {
 impl Operation {
     pub(super) fn parse(value: &OsStr) -> Option<Self> {
         match value.to_str()? {
+            "service-material-bind" => Some(Self::Bind),
             "config-selection-prepare" => Some(Self::Prepare),
             "config-select" => Some(Self::Publish),
             "config-selection-inspect" => Some(Self::Inspect),
@@ -29,6 +31,7 @@ impl Operation {
     }
     fn name(self) -> &'static str {
         match self {
+            Self::Bind => "postgres-service-material-bind",
             Self::Prepare => "postgres-config-selection-prepare",
             Self::Publish => "postgres-config-select",
             Self::Inspect => "postgres-config-selection-inspect",
@@ -36,6 +39,7 @@ impl Operation {
     }
 }
 enum Input {
+    Bind(StoreEpoch),
     Prepare {
         epoch: StoreEpoch,
         version: Version,
@@ -54,7 +58,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
         let value = args.next()?.into_string().ok()?;
         match flag.to_str()? {
             "--connection-file" if connection.is_none() => connection = Some(value),
-            "--epoch" if operation == Operation::Prepare && epoch.is_none() => {
+            "--epoch"
+                if matches!(operation, Operation::Prepare | Operation::Bind) && epoch.is_none() =>
+            {
                 epoch = Some(StoreEpoch::parse(&value).ok()?)
             }
             "--version" if operation == Operation::Prepare && version.is_none() => {
@@ -69,7 +75,10 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
                 }
                 generation = Some(value.parse().ok()?);
             }
-            "--request" if operation != Operation::Prepare && request.is_none() => {
+            "--request"
+                if matches!(operation, Operation::Publish | Operation::Inspect)
+                    && request.is_none() =>
+            {
                 request = Some(decode_hex(&value)?)
             }
             _ => return None,
@@ -78,6 +87,7 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
     Some(Options {
         connection: connection?,
         input: match operation {
+            Operation::Bind => Input::Bind(epoch?),
             Operation::Prepare => Input::Prepare {
                 epoch: epoch?,
                 version: version?,
@@ -133,6 +143,21 @@ pub(super) fn run(
         }
     };
     let change = match options.input {
+        Input::Bind(epoch) => {
+            return match with_addresses(&loaded, |request, deadline| {
+                td_mta::postgres_service_materials::bind(request, &loaded.trust, deadline, epoch)
+                    .map_err(classify)
+            }) {
+                Ok(selected) => {
+                    writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"generation\":{},\"version\":\"{}\"}}",selected.generation,selected.version)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err((stage, code)) => {
+                    report_error(name, stage, code)?;
+                    Ok(ExitCode::FAILURE)
+                }
+            };
+        }
         Input::Prepare {
             epoch,
             version,
@@ -172,7 +197,9 @@ pub(super) fn run(
         Operation::Inspect => {
             selection::inspect(request, &loaded.trust, deadline, change).map_err(classify)
         }
-        Operation::Prepare => Err(AttemptError::Failed("selection", "invalid-operation")),
+        Operation::Prepare | Operation::Bind => {
+            Err(AttemptError::Failed("selection", "invalid-operation"))
+        }
     });
     match result {
         Ok(receipt) => {
@@ -208,6 +235,7 @@ pub(super) fn classify(error: Error) -> AttemptError {
                 Error::Epoch => "epoch-mismatch",
                 Error::Conflict => "request-or-generation-conflict",
                 Error::Integrity => "selection-integrity",
+                Error::ServiceProfiles => "required-service-profiles",
                 Error::Capacity => "selection-capacity",
                 Error::Crypto => "crypto",
                 Error::Database => "query-failed",

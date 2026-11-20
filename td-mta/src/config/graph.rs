@@ -711,6 +711,46 @@ impl<'s, 't> View<'s, 't> {
             .view(self.text)
             .map_err(|_| invariant())
     }
+    pub(crate) fn serves_certificate(self, name: &str) -> Result<bool, Error> {
+        let listeners = self.listeners()?;
+        let mut https = false;
+        for index in 0..listeners.len() {
+            let row = listeners
+                .listener(index)
+                .map_err(|_| invariant())?
+                .ok_or_else(invariant)?;
+            if row.certificate == Some(name) {
+                return Ok(true);
+            }
+            https |= row.kind == listener::Kind::Https;
+        }
+        if https {
+            let domains = self.domains()?;
+            for index in 0..domains.len() {
+                let row = domains
+                    .domain(index)
+                    .map_err(|_| invariant())?
+                    .ok_or_else(invariant)?;
+                if row.certificate == Some(name) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn serves_gateway(self, name: &str) -> Result<bool, Error> {
+        let listeners = self.listeners()?;
+        for index in 0..listeners.len() {
+            let row = listeners
+                .listener(index)
+                .map_err(|_| invariant())?
+                .ok_or_else(invariant)?;
+            if row.gateway == Some(name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn gateways(self) -> Result<gateway::View<'s, 't>, Error> {
         self.records
             .inputs

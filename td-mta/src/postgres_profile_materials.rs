@@ -25,7 +25,7 @@ pub enum Error {
 
 /// The legacy selected-profile syntax still calls these fields paths. This
 /// adapter accepts only a canonical database version, never a filesystem path.
-fn version(reference: &str) -> Result<Version, Error> {
+pub(crate) fn version(reference: &str) -> Result<Version, Error> {
     reference
         .strip_prefix(PREFIX)
         .and_then(|id| Version::parse(id).ok())
