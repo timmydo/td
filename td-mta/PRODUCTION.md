@@ -831,7 +831,9 @@ PostgreSQL shutdown can extend the interruption beyond the budget. Use
 The job records the active timers and conditions the mail and scheduled
 writer services on a durable deployment fence. During schema cutover a
 temporary nftables output rule reserves the loopback database connection
-for the root operator. It verifies the named restore point and selected
+for the root operator. Before pausing mail the job validates the complete
+firewall batch with `nft --check`. It applies the same batch atomically
+after stopping the writers. It verifies the named restore point and selected
 mail evidence before attempting DDL. A preseeded, primary-device copy
 is synchronized by content after clean PostgreSQL shutdown. Budget
 space for this additional data directory and time to read both copies.

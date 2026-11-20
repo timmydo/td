@@ -65,6 +65,22 @@ fn has_firewall(host: &Host, table: &str) -> R<bool> {
         .lines()
         .any(|line| line.split_ascii_whitespace().eq(["table", "inet", table])))
 }
+
+fn firewall_command(host: &Host, table: &str, check: bool) -> R<Command> {
+    let rules = fmt(format_args!(
+        "create table inet {table}\n\
+         add chain inet {table} output {{ type filter hook output priority -10; policy accept; }}\n\
+         add rule inet {table} output ip daddr 127.0.0.1 tcp dport 35432 meta skuid != 0 reject with tcp reset\n"
+    ))?;
+    let mut cmd = host.cmd("nft");
+    if check {
+        cmd.arg("--check");
+    }
+    // nft reopens file input; the supervisor gives children a socket for stdin.
+    cmd.arg(rules);
+    Ok(cmd)
+}
+
 fn drop_firewall(host: &Host, table: &str) -> R<()> {
     host.run(host.cmd("nft").args(["delete", "table", "inet", table]))
 }
@@ -150,6 +166,10 @@ impl Deployment {
         unit_names(&units, ".timer")
     }
     pub(super) fn prepare_fence(&mut self, require_ready: bool, recovery: bool) -> R<()> {
+        if recovery {
+            self.host
+                .run(&mut firewall_command(&self.host, &self.table, true)?)?;
+        }
         self.timers = self.active_timers()?;
         require(
             ["td-mta-maint-backup.timer", "td-mta-health.timer"]
@@ -253,15 +273,9 @@ impl Deployment {
         }
         self.config(&self.previous, &[], !shared_rollback && self.isolated)?;
         if recovery {
-            let table = &self.table;
-            let rules=fmt(format_args!("create table inet {table}\nadd chain inet {table} output {{ type filter hook output priority -10; policy accept; }}\nadd rule inet {table} output ip daddr 127.0.0.1 tcp dport 35432 meta skuid != 0 reject with tcp reset\n"))?;
+            let mut cmd = firewall_command(&self.host, &self.table, false)?;
             self.firewall = true;
-            self.host.exec(
-                self.host.cmd("nft").args(["-f", "-"]),
-                rules.as_bytes(),
-                Duration::from_secs(40),
-                true,
-            )?;
+            self.host.run(&mut cmd)?;
         }
         self.check_source()?;
         require(self.sql("owner","SELECT NOT EXISTS(SELECT FROM pg_stat_activity WHERE datname IS NOT NULL AND pid<>pg_backend_pid()),NOT EXISTS(SELECT FROM pg_prepared_xacts)",&[],false)?=="t|t","database writers")?;
@@ -468,6 +482,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn nft_checks_and_applies_the_same_batch_as_one_argument() {
+        let host = Host::default();
+        let batch = "create table inet td_mta_deploy_Ab12\n\
+                     add chain inet td_mta_deploy_Ab12 output { type filter hook output priority -10; policy accept; }\n\
+                     add rule inet td_mta_deploy_Ab12 output ip daddr 127.0.0.1 tcp dport 35432 meta skuid != 0 reject with tcp reset\n";
+        for check in [true, false] {
+            let cmd = firewall_command(&host, "td_mta_deploy_Ab12", check).unwrap();
+            let mut args = cmd.get_args().skip_while(|arg| *arg != "nft");
+            assert_eq!(args.next(), Some("nft".as_ref()));
+            if check {
+                assert_eq!(args.next(), Some("--check".as_ref()));
+            }
+            assert_eq!(args.next(), Some(batch.as_ref()));
+            assert_eq!(args.next(), None);
+        }
+    }
 
     #[test]
     fn missing_acknowledgement_requires_proof_of_both_writer_fences() {
