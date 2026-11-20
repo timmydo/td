@@ -1895,6 +1895,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn framework_desktop_drivers_are_builtin_after_config_resolution() {
+        for driver in [
+            "DRM_AMDGPU",
+            "DRM_AMD_DC",
+            "DRM_AMD_DC_FP",
+            "BLK_DEV_NVME",
+            "USB_XHCI_PCI",
+            "USB_HID",
+            "TCG_CRB",
+            "X86_AMD_PSTATE",
+            "AMD_IOMMU",
+            "R8169",
+            "REALTEK_PHY",
+            "MT7925E",
+            "SND_HDA_INTEL",
+            "SND_HDA_CODEC_ALC269",
+            "SND_HDA_CODEC_HDMI_ATI",
+        ] {
+            assert!(locked(&format!("CONFIG_{driver}=y")), "{driver}");
+        }
+    }
+
     /// The Ryzen desktop's I225-V NIC, the RTC interfaces td-time uses, a
     /// KVM host for QEMU guests, the filesystems removable and foreign
     /// disks carry, each with the character sets its default mount options

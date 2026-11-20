@@ -11,11 +11,66 @@ pub const DIR: &str = "lib/firmware";
 /// Where the notices sit in the output.
 pub const NOTICES_DIR: &str = "share/licenses/linux-firmware";
 
-/// What the drivers built into the kernel request at probe, each by its pin and
-/// the name the driver asks for: the Phoenix and Cezanne GPUs, then Wi-Fi. For
-/// iwlwifi, the highest API the kernel accepts for each family; the files are
-/// the driver's names, linked in linux-firmware from `intel/iwlwifi/`.
+/// Each built-in driver's firmware pin and request path. The iwlwifi files
+/// use the highest supported API for each family and the names the driver
+/// requests, which linux-firmware links from `intel/iwlwifi/`.
 pub const FIRMWARE: &[(&str, &str)] = &[
+    (
+        "linux-firmware-amdgpu-dcn-3-5-1-dmcub-source",
+        "amdgpu/dcn_3_5_1_dmcub.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-imu-source",
+        "amdgpu/gc_11_5_1_imu.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-me-source",
+        "amdgpu/gc_11_5_1_me.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-mec-source",
+        "amdgpu/gc_11_5_1_mec.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-mes1-source",
+        "amdgpu/gc_11_5_1_mes1.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-mes-2-source",
+        "amdgpu/gc_11_5_1_mes_2.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-pfp-source",
+        "amdgpu/gc_11_5_1_pfp.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-rlc-source",
+        "amdgpu/gc_11_5_1_rlc.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-psp-14-0-1-ta-source",
+        "amdgpu/psp_14_0_1_ta.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-psp-14-0-1-toc-source",
+        "amdgpu/psp_14_0_1_toc.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-sdma-6-1-1-source",
+        "amdgpu/sdma_6_1_1.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-vcn-4-0-6-source",
+        "amdgpu/vcn_4_0_6.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-vcn-4-0-6-1-source",
+        "amdgpu/vcn_4_0_6_1.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-vpe-6-1-1-source",
+        "amdgpu/vpe_6_1_1.bin",
+    ),
     (
         "linux-firmware-amdgpu-gc-11-0-1-imu-source",
         "amdgpu/gc_11_0_1_imu.bin",
@@ -448,6 +503,35 @@ mod tests {
                     if *file == format!("{{in:{pin}}}")
                         && *to == format!("{{out}}/lib/firmware/{name}")
             )));
+        }
+    }
+
+    #[test]
+    fn framework_desktop_firmware_uses_the_driver_request_names() {
+        for name in [
+            "amdgpu/dcn_3_5_1_dmcub.bin",
+            "amdgpu/gc_11_5_1_imu.bin",
+            "amdgpu/gc_11_5_1_me.bin",
+            "amdgpu/gc_11_5_1_mec.bin",
+            "amdgpu/gc_11_5_1_mes1.bin",
+            "amdgpu/gc_11_5_1_mes_2.bin",
+            "amdgpu/gc_11_5_1_pfp.bin",
+            "amdgpu/gc_11_5_1_rlc.bin",
+            "amdgpu/psp_14_0_1_ta.bin",
+            "amdgpu/psp_14_0_1_toc.bin",
+            "amdgpu/sdma_6_1_1.bin",
+            "amdgpu/vcn_4_0_6.bin",
+            "amdgpu/vcn_4_0_6_1.bin",
+            "amdgpu/vpe_6_1_1.bin",
+            "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
+            "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
+        ] {
+            let pin = FIRMWARE
+                .iter()
+                .find(|(_, path)| *path == name)
+                .and_then(|(key, _)| crate::source_pins::by_key(key))
+                .unwrap_or_else(|| panic!("missing firmware {name}"));
+            assert!(pin.url.ends_with(&format!("/{name}")), "{name}");
         }
     }
 

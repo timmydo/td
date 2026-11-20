@@ -165,7 +165,8 @@ code belongs to no class here and needs an amendment to this file.
 
 Some hardware runs code td cannot build: the ThinkPad T14s Gen 4 AMD's
 Qualcomm WCN6855 Wi-Fi and Phoenix Radeon GPU, the Ryzen 5700G
-desktop's Cezanne Radeon GPU, and the Intel, MediaTek, Realtek and Qualcomm
+desktop's Cezanne Radeon GPU, the Framework Desktop's Strix Halo Radeon GPU,
+and the Intel, MediaTek, Realtek and Qualcomm
 Wi-Fi chips the roster lists, load their firmware from the host when
 their drivers probe. td takes such firmware as upstream bytes from linux-firmware's
 tagged tree, each file a pin with a reviewed URL and SHA-256, listed in

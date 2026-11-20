@@ -23,6 +23,7 @@ linux-firmware-amd-ucode-fam1ah-source kzhlwlr9r53r48mbd6y9ky5c7hmrg6x6-linux-fi
 linux-firmware-amd-ucode-license-source z4c0pamb4f6809fhk32aalj2vsffxycq-linux-firmware-amd-ucode-license-source
 linux-firmware-amd-ucode-source f2l9b3v9rn6xyajrp8il7f24mfqx0c6w-linux-firmware-amd-ucode-source
 linux-firmware-amdgpu-dcn-3-1-4-dmcub-source 639m8ngg6xa7zy4g29q6r54zx4n6y3dl-linux-firmware-amdgpu-dcn-3-1-4-dmcub-source
+linux-firmware-amdgpu-dcn-3-5-1-dmcub-source 2y76g6r5465kq97m52h14n2qjb7zgi47-linux-firmware-amdgpu-dcn-3-5-1-dmcub-source
 linux-firmware-amdgpu-gc-11-0-1-imu-source msiwa2192ss51pk94nvanddcgbhky40s-linux-firmware-amdgpu-gc-11-0-1-imu-source
 linux-firmware-amdgpu-gc-11-0-1-me-source ws3ykq42ikpzihdgwxmkacim9cfkxw1w-linux-firmware-amdgpu-gc-11-0-1-me-source
 linux-firmware-amdgpu-gc-11-0-1-mec-source c0kxvpxnb0l2r7ph6s9773w0119rkjfm-linux-firmware-amdgpu-gc-11-0-1-mec-source
@@ -30,6 +31,13 @@ linux-firmware-amdgpu-gc-11-0-1-mes-2-source r1vmvns7psd1isljad4w1zqy40i1x8b0-li
 linux-firmware-amdgpu-gc-11-0-1-mes1-source 74z0vvi37531pk86kqd2mm04ac3hx0rq-linux-firmware-amdgpu-gc-11-0-1-mes1-source
 linux-firmware-amdgpu-gc-11-0-1-pfp-source al2cd7zkfy2qwqn7484b1pf9wbcw3cn1-linux-firmware-amdgpu-gc-11-0-1-pfp-source
 linux-firmware-amdgpu-gc-11-0-1-rlc-source ssphrrcwj2dg2yz0kv57mzbf7mk8w1xq-linux-firmware-amdgpu-gc-11-0-1-rlc-source
+linux-firmware-amdgpu-gc-11-5-1-imu-source s5v3rdp2gzxkr093d56mn8spwn3sd2l5-linux-firmware-amdgpu-gc-11-5-1-imu-source
+linux-firmware-amdgpu-gc-11-5-1-me-source bifj2wx31ad7706ngdblq4f1lmzz1hjc-linux-firmware-amdgpu-gc-11-5-1-me-source
+linux-firmware-amdgpu-gc-11-5-1-mec-source 4clnga7nbpj0zh0b39w4l30lzravkjf7-linux-firmware-amdgpu-gc-11-5-1-mec-source
+linux-firmware-amdgpu-gc-11-5-1-mes-2-source nf31yy85z3k8q2f8fz5m6pd5hv5w34v2-linux-firmware-amdgpu-gc-11-5-1-mes-2-source
+linux-firmware-amdgpu-gc-11-5-1-mes1-source ypqgi23grzy84gzg9r4hvr7m3vf4jic5-linux-firmware-amdgpu-gc-11-5-1-mes1-source
+linux-firmware-amdgpu-gc-11-5-1-pfp-source 65381xx7zkm5fsjp87qkqq5zphwpk76i-linux-firmware-amdgpu-gc-11-5-1-pfp-source
+linux-firmware-amdgpu-gc-11-5-1-rlc-source 7519zjvp2f92w1zamhz5xnblsrxrdkm3-linux-firmware-amdgpu-gc-11-5-1-rlc-source
 linux-firmware-amdgpu-green-sardine-asd-source md2hvaj91gp2s5gaq513dmx0zyhcc5sf-linux-firmware-amdgpu-green-sardine-asd-source
 linux-firmware-amdgpu-green-sardine-ce-source q3nnrlwhrfqcn5jd49cpgm96mdjrmzlf-linux-firmware-amdgpu-green-sardine-ce-source
 linux-firmware-amdgpu-green-sardine-dmcub-source r7ifyg5cmrykvjfh13m6dfvlbr6hh0sz-linux-firmware-amdgpu-green-sardine-dmcub-source
@@ -43,8 +51,14 @@ linux-firmware-amdgpu-green-sardine-vcn-source zqzw848vdz994xbb26z3hk7g2m46fc0q-
 linux-firmware-amdgpu-license-source lkw7lv56wra9vmx0h5zikfnryzsjxndy-linux-firmware-amdgpu-license-source
 linux-firmware-amdgpu-psp-13-0-4-ta-source 5xy2rj06zshvj3f2b4hsqnnhw6m6xzql-linux-firmware-amdgpu-psp-13-0-4-ta-source
 linux-firmware-amdgpu-psp-13-0-4-toc-source bdxjh6jca30si1lf0n6lxh709sxli9py-linux-firmware-amdgpu-psp-13-0-4-toc-source
+linux-firmware-amdgpu-psp-14-0-1-ta-source rmag49il5vvawppsjp7d1safx8xz50c3-linux-firmware-amdgpu-psp-14-0-1-ta-source
+linux-firmware-amdgpu-psp-14-0-1-toc-source rfvzbdvl86cbff2zyd3i6vmaxss41xq7-linux-firmware-amdgpu-psp-14-0-1-toc-source
 linux-firmware-amdgpu-sdma-6-0-1-source kbxm2c49zhpbbxxhi4x2qbjv2a4rk8ld-linux-firmware-amdgpu-sdma-6-0-1-source
+linux-firmware-amdgpu-sdma-6-1-1-source 17pg56aww3g36klggkp69cjpmlva25wy-linux-firmware-amdgpu-sdma-6-1-1-source
 linux-firmware-amdgpu-vcn-4-0-2-source abxgbm9xl0wimc1j0vh9lx86xhy9ak2i-linux-firmware-amdgpu-vcn-4-0-2-source
+linux-firmware-amdgpu-vcn-4-0-6-1-source w5x0fw5j6mazydc9pacma84nyna4w17k-linux-firmware-amdgpu-vcn-4-0-6-1-source
+linux-firmware-amdgpu-vcn-4-0-6-source zwhpbx6qj3akwfhy72hkpam7ap4fqkyp-linux-firmware-amdgpu-vcn-4-0-6-source
+linux-firmware-amdgpu-vpe-6-1-1-source j3hk9jyxrs6i8f5q20lxms17s1x095fr-linux-firmware-amdgpu-vpe-6-1-1-source
 linux-firmware-ath10k-qca6174-board-2-source awcqqxidgm5lksff0f3916j9rddnjjcs-linux-firmware-ath10k-qca6174-board-2-source
 linux-firmware-ath10k-qca6174-board-source 45lk81x0553zi4hvjf7nc528s2ijpnsg-linux-firmware-ath10k-qca6174-board-source
 linux-firmware-ath10k-qca6174-firmware-6-source 799p1986japbh74hwxabhwmjviz884mz-linux-firmware-ath10k-qca6174-firmware-6-source

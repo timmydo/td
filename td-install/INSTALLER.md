@@ -110,6 +110,28 @@ volumes mount at boot, and removable media mount for the owner while
 the session is unlocked (td-disks/DESIGN.md). None of this has been
 tried on the machine.
 
+The Framework Desktop with a Ryzen AI Max 385 or Max+ 395 is a desktop
+image target. The deployment carries the firmware AMDGPU requests for
+the Strix Halo Radeon 8050S and 8060S and the MT7925 firmware for RZ717
+Wi-Fi. The RTL8126 wired port uses r8169 with the PHY's onboard defaults.
+The optional RTL8126A patch is a script interpreted by the host kernel,
+so td omits it. Link negotiation and throughput need testing on the board.
+The kernel builds in the NVMe and xHCI controllers, USB HID, AMD fTPM
+transport, ALC269-family codec driver for the rear ALC623 jack, and AMD
+HDMI/DisplayPort audio. td supports one active display. Bluetooth pairing,
+USB4 tunnelling and GPU or NPU compute are outside this desktop profile.
+
+Physical validation is pending. On each board, boot the live USB with a
+monitor attached and Secure Boot off (F2, Administer Secure Boot, Enforce
+Secure Boot). Select the UEFI USB device with F12. Check keyboard and
+mouse in the installer and confirm it lists the intended NVMe disk.
+After installation, cold-boot through the selector. Check that the PIN
+prompt stays visible and the deployment reaches the desktop, then run
+`hwcheck`. Test HDMI and DisplayPort one at
+a time, wired DHCP and traffic, a Wi-Fi join, and playback through the
+rear jack and display. The Ryzen AI Max+ PRO 495 board also uses gfx1151;
+its complete device and firmware inventory still needs verification.
+
 For machines td has not met, the kernel also builds in families that need no
 firmware, or run without their optional firmware: Intel platforms' VT-d, VMD
 (NVMe disks in VMD-based RST mode; AHCI-remapped RST must still be turned off in

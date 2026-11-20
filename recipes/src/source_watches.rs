@@ -218,6 +218,32 @@ const WATCHES: &[(&str, Watch)] = &[
     ("linux-firmware-amd-ucode-fam1ah-source", LINUX_FIRMWARE),
     ("linux-firmware-amd-ucode-license-source", LINUX_FIRMWARE),
     (
+        "linux-firmware-amdgpu-dcn-3-5-1-dmcub-source",
+        LINUX_FIRMWARE,
+    ),
+    ("linux-firmware-amdgpu-gc-11-5-1-imu-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-gc-11-5-1-me-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-gc-11-5-1-mec-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-mes1-source",
+        LINUX_FIRMWARE,
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-5-1-mes-2-source",
+        LINUX_FIRMWARE,
+    ),
+    ("linux-firmware-amdgpu-gc-11-5-1-pfp-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-gc-11-5-1-rlc-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-psp-14-0-1-ta-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-amdgpu-psp-14-0-1-toc-source",
+        LINUX_FIRMWARE,
+    ),
+    ("linux-firmware-amdgpu-sdma-6-1-1-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-vcn-4-0-6-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-vcn-4-0-6-1-source", LINUX_FIRMWARE),
+    ("linux-firmware-amdgpu-vpe-6-1-1-source", LINUX_FIRMWARE),
+    (
         "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
         LINUX_FIRMWARE,
     ),
