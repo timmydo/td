@@ -1,0 +1,16 @@
+[Unit]
+Description=td-mta-maint-mail-{0}
+
+[Service]
+User=td-mta
+Group=td-mta
+ProtectSystem=strict
+ProtectHome=yes
+MemoryMax=512M
+TasksMax=32
+Type=oneshot
+ExecStart=:"/opt/td-mta/bin/td-mta" "status" "--json" "--require-ready" "--runtime" "/var/lib/td-mta/mail/{0}/runtime"
+UMask=0077
+TimeoutStartSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes

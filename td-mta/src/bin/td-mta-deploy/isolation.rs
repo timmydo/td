@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 #[path = "isolation_files.rs"]
-mod files;
+pub(crate) mod files;
 #[path = "isolation_helper.rs"]
 mod scoped;
 #[cfg(test)]

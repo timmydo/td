@@ -1,0 +1,203 @@
+//! Permanent production readiness jobs shared by both service identity layouts.
+use crate::common::{child, fmt, owned, require, Host};
+use crate::isolation::files::{self, Setting};
+use crate::R;
+use std::path::Path;
+use td_json::Json;
+
+const HEALTH: &str = "td-mta-health.service";
+const HEALTH_CHECKS: &str = include_str!("units/zz-readiness-jobs.conf");
+const UNIT_DIR: &str = "/etc/systemd/system";
+const BUS_PATH: &str = "/org/freedesktop/systemd1/unit/td_2dmta_2dhealth_2eservice";
+
+pub(crate) fn settings(dir: &Path) -> R<Vec<Setting>> {
+    let mut list = Vec::new();
+    for role in crate::activate::PROFILES {
+        let name = fmt(format_args!("td-mta-maint-mail-{role}"))?;
+        let text = fmt(format_args!(
+            include_str!("units/readiness.service.in"),
+            role
+        ))?;
+        td_alloc::push(
+            &mut list,
+            Setting {
+                path: child(dir, &fmt(format_args!("{name}.service"))?)?,
+                text,
+                mode: 0o644,
+            },
+        )?;
+    }
+    td_alloc::push(
+        &mut list,
+        Setting {
+            path: child(dir, "td-mta-health.service.d/zz-readiness-jobs.conf")?,
+            text: owned(HEALTH_CHECKS)?,
+            mode: 0o644,
+        },
+    )?;
+    Ok(list)
+}
+
+fn socket_role(argv: &[Json]) -> Option<&str> {
+    let (runtime, command) = argv.split_last()?;
+    let args = [
+        "/opt/td-mta/bin/td-mta",
+        "status",
+        "--json",
+        "--require-ready",
+        "--runtime",
+    ];
+    if !command
+        .iter()
+        .map(Json::as_str)
+        .eq(args.into_iter().map(Some))
+    {
+        return None;
+    }
+    runtime
+        .as_str()?
+        .strip_prefix("/var/lib/td-mta/mail/")?
+        .strip_suffix("/runtime")
+}
+
+fn arguments<'a>(row: &'a Json, expected_flags: &[&str]) -> R<&'a [Json]> {
+    let [path, argv, flags, ..] = row.as_arr().ok_or("invalid ExecStartEx row")? else {
+        return Err("short ExecStartEx row".into());
+    };
+    let argv = argv.as_arr().ok_or("invalid ExecStartEx arguments")?;
+    require(
+        flags.as_arr().is_some_and(|flags| {
+            flags
+                .iter()
+                .map(Json::as_str)
+                .eq(expected_flags.iter().copied().map(Some))
+        }) && path.as_str().is_some()
+            && argv.first() == Some(path),
+        "unexpected health command flags or executable",
+    )?;
+    Ok(argv)
+}
+
+// ExecStart= resets the whole list. Compare systemd's parsed argv and flags
+// before publishing it so a host-local check cannot silently disappear.
+fn check_commands(property: &Json, allow_old_sockets: bool) -> R<()> {
+    let rows = property
+        .get("data")
+        .and_then(Json::as_arr)
+        .ok_or("missing ExecStartEx")?;
+    let mut retained = HEALTH_CHECKS
+        .lines()
+        .filter_map(|l| l.strip_prefix("ExecStart="))
+        .filter(|l| !l.is_empty());
+    for row in rows {
+        let argv = arguments(row, &[])?;
+        if allow_old_sockets
+            && socket_role(argv).is_some_and(|r| crate::activate::PROFILES.contains(&r))
+        {
+            continue;
+        }
+        require(
+            retained.next().is_some_and(|line| {
+                argv.iter()
+                    .map(Json::as_str)
+                    .eq(line.split_ascii_whitespace().map(Some))
+            }),
+            "production aggregate health command differs from the managed checks",
+        )?;
+    }
+    require(
+        retained.next().is_none(),
+        "missing production aggregate health check",
+    )
+}
+
+fn command_property(host: &Host, unit: &str, path: &str) -> R<Json> {
+    let props = host.out(host.cmd("systemctl").args([
+        "show",
+        "-p",
+        "LoadState",
+        "-p",
+        "Type",
+        "-p",
+        "RemainAfterExit",
+        unit,
+    ]))?;
+    require(
+        ["LoadState=loaded", "Type=oneshot", "RemainAfterExit=no"]
+            .iter()
+            .all(|p| props.lines().any(|l| l == *p)),
+        "health unit must run a fresh oneshot at each invocation",
+    )?;
+    let reply = host.out(host.cmd("busctl").args([
+        "--json=short",
+        "get-property",
+        "org.freedesktop.systemd1",
+        path,
+        "org.freedesktop.systemd1.Service",
+        "ExecStartEx",
+    ]))?;
+    Ok(td_json::parse(&reply)?)
+}
+
+fn check_job(property: &Json, role: &str) -> R<()> {
+    let Some([row]) = property.get("data").and_then(Json::as_arr) else {
+        return Err("readiness job must run exactly one command".into());
+    };
+    require(
+        socket_role(arguments(row, &["no-env-expand"])?) == Some(role),
+        "readiness job must check its own runtime",
+    )
+}
+
+fn qualify(host: &Host) -> R<()> {
+    check_commands(&command_property(host, HEALTH, BUS_PATH)?, false)?;
+    for role in crate::activate::PROFILES {
+        let unit = fmt(format_args!("td-mta-maint-mail-{role}.service"))?;
+        let path = fmt(format_args!(
+            "/org/freedesktop/systemd1/unit/td_2dmta_2dmaint_2dmail_2d{role}_2eservice"
+        ))?;
+        check_job(&command_property(host, &unit, &path)?, role)?;
+    }
+    for property in ["Requires", "After"] {
+        let names = host.out(host.cmd("systemctl").args(["show", "-P", property, HEALTH]))?;
+        for role in crate::activate::PROFILES {
+            let unit = fmt(format_args!("td-mta-maint-mail-{role}.service"))?;
+            require(
+                names.split_ascii_whitespace().any(|v| v == unit),
+                "missing aggregate readiness dependency",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare(host: &Host) -> R<()> {
+    let mut missing = Vec::new();
+    for file in settings(Path::new(UNIT_DIR))? {
+        if !files::present(&file)? {
+            td_alloc::push(&mut missing, file)?;
+        }
+    }
+    host.run(host.cmd("systemctl").arg("daemon-reload"))?;
+    if missing.is_empty() {
+        return qualify(host);
+    }
+    check_commands(&command_property(host, HEALTH, BUS_PATH)?, true)?;
+    let mut created = td_alloc::with_capacity(missing.len())?;
+    let result = files::install_tracking(host, &missing, |file| {
+        Ok(td_alloc::push(&mut created, file)?)
+    })
+    .and_then(|()| host.run(host.cmd("systemctl").arg("daemon-reload")))
+    .and_then(|()| qualify(host));
+    if result.is_err() {
+        let recovery = Host::default();
+        recovery.recover();
+        files::rollback(created)?;
+        recovery.run(recovery.cmd("systemctl").arg("daemon-reload"))?;
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "tests/readiness.rs"]
+mod tests;

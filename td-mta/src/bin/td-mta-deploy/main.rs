@@ -9,6 +9,7 @@ mod physical;
 #[path = "tests/postgres_fixture.rs"]
 mod postgres_fixture;
 mod probes;
+mod readiness;
 mod service_database;
 #[path = "../../signal_sys.rs"]
 mod signal_sys;

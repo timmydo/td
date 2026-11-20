@@ -875,11 +875,16 @@ connection file is `/var/lib/td-mta-services/ROLE/runtime-connection`.
 The four serving profiles have their control socket and scratch directory
 under `/var/lib/td-mta-services/ROLE/ROLE/`.
 
-Before the first cutover, inspect the host-local aggregate health unit with
-`systemctl cat td-mta-health.service`. Any probe that directly opens a
-serving process's old control socket needs to invoke the corresponding
-`td-mta-maint-mail-ROLE.service` readiness job. It works under either
-identity configuration. Keep its database, backup and certificate probes.
+On the production systemd host, the deployment controller installs the four
+`td-mta-maint-mail-ROLE.service` readiness jobs and makes
+`td-mta-health.service` require and wait for them before running its
+database, ACME, certificate and backup checks. During preflight it compares
+systemd's effective command arguments and flags with the managed checks.
+A changed or additional command requires reconciling the aggregate unit
+before deployment. The readiness jobs run as the shared account until
+the service identity drop-ins are installed. Rolling those identities back
+restores the shared account for the same jobs. Both layouts use the same
+health timer.
 The controller stages the notification monitor and digest configuration from
 the existing private configuration. Its sudoers entry permits only the
 eight fixed readiness and performance commands as the four service UIDs.

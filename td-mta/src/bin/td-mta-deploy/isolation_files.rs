@@ -10,10 +10,10 @@ use td_alloc::{push, push_str};
 
 const SYSTEMD: &str = "/etc/systemd/system";
 const SUDOERS: &str = "/etc/sudoers.d/td-mta-readiness";
-pub(super) struct Setting {
+pub(crate) struct Setting {
     pub path: PathBuf,
-    pub(super) text: String,
-    pub(super) mode: u32,
+    pub(crate) text: String,
+    pub(crate) mode: u32,
 }
 
 pub(super) fn status_args(performance: bool) -> &'static [&'static str] {
@@ -168,7 +168,7 @@ pub(super) fn trusted_binary(path: &Path) -> R<()> {
     Err("production executable symlink depth".into())
 }
 
-fn present(file: &Setting) -> R<bool> {
+pub(crate) fn present(file: &Setting) -> R<bool> {
     match safe_parents(&file.path) {
         Err(e)
             if e.downcast_ref::<std::io::Error>()
@@ -229,6 +229,14 @@ pub(super) fn publish(host: &Host, staged: &Path, target: &Path) -> R<()> {
 }
 
 pub(super) fn install(host: &Host, files: &[Setting]) -> R<()> {
+    install_tracking(host, files, |_| Ok(()))
+}
+
+pub(crate) fn install_tracking<'a>(
+    host: &Host,
+    files: &'a [Setting],
+    mut created: impl FnMut(&'a Setting) -> R<()>,
+) -> R<()> {
     for file in files {
         if present(file)? {
             continue;
@@ -254,13 +262,18 @@ pub(super) fn install(host: &Host, files: &[Setting]) -> R<()> {
         if file.mode == 0o440 {
             host.run(host.cmd("visudo").arg("-cf").arg(&staged))?;
         }
-        publish(host, &staged, &file.path)?;
+        let result = publish(host, &staged, &file.path);
+        // mv can complete before its supervisor observes cancellation.
+        if result.is_ok() || !staged.try_exists()? {
+            created(file)?;
+        }
+        result?;
         File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
 
-pub(super) fn rollback(files: &[Setting]) -> R<()> {
+pub(crate) fn rollback<'a>(files: impl IntoIterator<Item = &'a Setting>) -> R<()> {
     let mut managed = Vec::new();
     for file in files {
         if present(file)? {

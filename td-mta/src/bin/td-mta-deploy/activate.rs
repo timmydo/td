@@ -33,7 +33,7 @@ const FENCE: &str = "/var/lib/td-mta-operator/deployment-fence";
 const PERMIT: &str = "/run/td-mta-deployment-primary.permit";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const PG: &str = "td-mta-postgres.service";
-const PROFILES: &[&str] = &["frontend", "receive", "relay", "migadu"];
+pub(crate) const PROFILES: &[&str] = &["frontend", "receive", "relay", "migadu"];
 const ACME: &str = "td-mta-acme-production.service";
 const UNITS: &[&str] = &[
     "td-mta-frontend.service",
@@ -309,6 +309,7 @@ impl Deployment {
             "production release changed",
         )?;
         self.check_source()?;
+        crate::readiness::prepare(&self.host)?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;

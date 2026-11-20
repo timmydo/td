@@ -242,6 +242,28 @@ fn unit_install_and_rollback_recover_partial_install_and_preserve_operator_files
     let tmp = TempDir::new_in(Path::new("/run"), "isolation-settings").unwrap();
     let list = files::settings(tmp.path(), &tmp.path().join("sudoers")).unwrap();
     let host = Host::default();
+    let readiness = crate::readiness::settings(tmp.path()).unwrap();
+    // Adopt an existing installation with just the three original jobs.
+    files::install(&host, &readiness[..3]).unwrap();
+    let existing = fs::metadata(&readiness[0].path).unwrap().ino();
+    let mut added = Vec::new();
+    files::install_tracking(&host, &readiness, |file| {
+        added.push(file);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(added.len(), 2);
+    files::rollback(added).unwrap();
+    assert!(readiness[..3]
+        .iter()
+        .all(|file| files::present(file).unwrap()));
+    assert!(readiness[3..]
+        .iter()
+        .all(|file| !files::present(file).unwrap()));
+    files::install(&host, &readiness).unwrap();
+    files::install(&host, &readiness).unwrap();
+    assert_eq!(existing, fs::metadata(&readiness[0].path).unwrap().ino());
+    assert!(files::installed(&readiness).unwrap());
     files::install(&host, &list[..1]).unwrap();
     assert!(files::installed(&list)
         .unwrap_err()
@@ -273,6 +295,7 @@ fn unit_install_and_rollback_recover_partial_install_and_preserve_operator_files
     files::rollback(&list).unwrap();
     files::rollback(&list).unwrap();
     assert!(!files::installed(&list).unwrap());
+    assert!(files::installed(&readiness).unwrap());
     symlink(&foreign, &unit.path).unwrap();
     assert!(install().is_err());
     assert_eq!(fs::read(&foreign).unwrap(), b"[Service]\nPrivateTmp=yes\n");
