@@ -142,8 +142,11 @@ sudo journalctl -u td-mta-health.service -u td-mta-maint-backup.service --since 
 
 The older `td-mta-backup.timer`, `td-mta-acme.service` and
 `td-mta-acme-public.service` are disabled; they are not the production workers.
-Daily notifications are configured separately below. Local backups are not
-off-host copies; these timers do not provide off-host backup delivery. The Stalwart migration jobs are retired as described below.
+Daily notifications are configured separately below. The scheduled dumps live
+on the VM's attached disk. The designated off-host recovery destination is the
+development machine. Its first production drill is recorded below. Unattended pulls require a
+dedicated export-only SSH identity and an installed export-capable helper.
+The recovery-host jobs and their enablement procedure are in [DEPLOYMENT.md](DEPLOYMENT.md#pull-backups-to-a-recovery-host).
 
 ## Daily notifications and bounded disk growth
 
@@ -290,6 +293,17 @@ restore, and the disposable cluster was stopped and removed. These checks cover
 this archive's database restore and body integrity; they do not activate a
 recovered service or cover mail arriving after its snapshot. [DEPLOYMENT.md](DEPLOYMENT.md#local-logical-backup-and-an-isolated-restore-drill)
 owns the repeatable drill procedure.
+
+On 2026-11-20 UTC the development machine restored the production archive
+`backup-1795058100-3649257.dump` from the preceding day's 03:15 UTC backup.
+The 528,164,058-byte file and its original receipt were copied over pinned SSH
+using read-only access on the VM. The local restore verified 3 accounts, 27
+mailboxes, 34,029 Emails, 34,049 bodies and 816,826,743 body bytes. The
+archive remains in `/mnt/backup/test/td-mta/copies`. The JSON report
+`/mnt/backup/test/td-mta/verified-20261120T024604Z.json` identifies the
+exact digest. Scratch under the same private recovery root was removed.
+This was a one-time drill. The development machine's daily pull and weekly
+restore schedules still require provisioning and enablement.
 
 ## Choose and build an update
 

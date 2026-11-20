@@ -9,11 +9,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "install_mta_backup/drill.rs"]
+mod drill;
+pub(super) use drill::restore_drill;
+#[path = "install_mta_backup/transfer.rs"]
+pub(super) mod transfer;
+
 const HELP: &str = "Usage: ./install-td-mta --backup --service-file PATH --service NAME\n  --destination PATH [--max-archive-bytes N] [--max-total-bytes N] [--retain N]\n\nRuns PostgreSQL 17 pg_dump and validates its archive directory with pg_restore.\nDestination must already exist, be owned by this user and have mode 0700.\nThe libpq service/password files must be provisioned separately (DEPLOYMENT.md).\nDefault bounds: 1 GiB per archive, 8 GiB total, 30 completed backups.\nRetains the newest completed backup even when space admission refuses.\nNever restores a database or activates mail. Schedule this command explicitly.\n";
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const CHUNK: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(600);
+const RECEIVER_MARKER: &str = "offhost-receiver-v1";
+
+pub(super) fn valid_ceiling(bytes: u64) -> bool {
+    (1..=1024 * GIB).contains(&bytes)
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Bounds {
@@ -28,8 +39,7 @@ impl Bounds {
         retain: 30,
     };
     pub fn new(archive_bytes: u64, total_bytes: u64, retain: u64) -> Result<Self> {
-        if archive_bytes == 0
-            || archive_bytes > 1024 * GIB
+        if !valid_ceiling(archive_bytes)
             || total_bytes < archive_bytes.saturating_mul(2) + 65536
             || !(1..=1000).contains(&retain)
         {
@@ -447,7 +457,17 @@ fn tool_version(program: &str, opts: &Options, path: PathBuf) -> Result<String> 
     Ok(value.trim().into())
 }
 
-fn destination_lock(destination: &Path) -> Result<File> {
+struct DestinationLock(File);
+
+impl Drop for DestinationLock {
+    fn drop(&mut self) {
+        // A concurrent fork may still hold a duplicate of this open file
+        // description until exec. Release ownership when publication ends.
+        let _ = self.0.unlock();
+    }
+}
+
+fn destination_lock(destination: &Path) -> Result<DestinationLock> {
     let lock_path = destination.join("lock");
     let (_, _, entries) = inventory(destination)?;
     match fs::symlink_metadata(&lock_path) {
@@ -477,7 +497,7 @@ fn destination_lock(destination: &Path) -> Result<File> {
     if !crate::sys::flock_try_exclusive(lock.as_raw_fd()).map_err(|e| e.to_string())? {
         return Err("another backup owns this destination".into());
     }
-    Ok(lock)
+    Ok(DestinationLock(lock))
 }
 
 fn backup(opts: &Options) -> Result<()> {
@@ -492,6 +512,9 @@ fn backup(opts: &Options) -> Result<()> {
         return Err("backup destination must be owned by this user".into());
     }
     let _lock = destination_lock(&opts.destination)?;
+    if receiver_initialized(&opts.destination)? {
+        return Err("off-host recovery directory cannot receive locally produced backups".into());
+    }
     cleanup_interrupted(&opts.destination)?;
     // Includes the archive receipt and bounded tool-validation output.
     let reserve = opts.archive_bytes + 65536;
@@ -596,21 +619,47 @@ pub(super) fn run(args: &[String]) -> ExitCode {
     }
 }
 
+fn receiver_initialized(dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(dir.join(RECEIVER_MARKER)) {
+        Ok(m)
+            if m.is_file()
+                && m.uid() == crate::sys::getuid()
+                && m.mode() & 0o077 == 0
+                && m.len() == 0 =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err("invalid off-host recovery directory marker".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("cannot inspect off-host recovery directory marker".into()),
+    }
+}
+
 // Readiness observes the receipt and file length; it does not verify contents.
-fn receipt_created(input: &str, archive: &Archive) -> Result<u64> {
+fn receipt_created(input: &str, archive: &Archive, receiver: bool) -> Result<u64> {
+    if receiver {
+        let receipt = drill::parse_receipt(input.as_bytes())?;
+        receipt.matches_archive(archive, receiver)?;
+        return Ok(receipt.created);
+    }
     let receipt = crate::json::parse(input).map_err(|_| "invalid backup receipt")?;
-    let number = |key| match receipt.get(key) {
-        Some(Json::Num(value)) => value.parse::<u64>().map_err(|_| "invalid receipt number"),
-        _ => Err("missing receipt number"),
-    };
-    if number("schema")? != 1
-        || number("bytes")? != archive.bytes
+    if receipt_number(&receipt, "schema")? != 1
+        || receipt_number(&receipt, "bytes")? != archive.bytes
         || archive.bytes == 0
         || receipt.get("archive").and_then(Json::as_str) != archive.path.to_str()
     {
         return Err("backup receipt does not match archive".into());
     }
-    Ok(number("created_unix_seconds")?)
+    receipt_number(&receipt, "created_unix_seconds")
+}
+
+fn receipt_number(receipt: &Json, key: &str) -> Result<u64> {
+    match receipt.get(key) {
+        Some(Json::Num(value)) => value
+            .parse::<u64>()
+            .map_err(|_| "invalid receipt number".into()),
+        _ => Err("missing receipt number".into()),
+    }
 }
 
 fn freshness(created: u64, now: u64, maximum_age: u64, last_error: bool) -> &'static str {
@@ -650,12 +699,13 @@ fn status_options(args: &[String]) -> Result<(PathBuf, u64)> {
 }
 
 fn backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
-    super::install_mta_setup::trusted_ancestors(destination)?;
-    let metadata = fs::symlink_metadata(destination).map_err(|e| e.to_string())?;
-    if metadata.uid() != crate::sys::getuid() || metadata.mode() & 0o777 != 0o700 {
-        return Err("backup destination must be owned by this user with mode 0700".into());
-    }
+    drill::private_directory(destination)?;
+    observe_backup_status(destination, maximum_age)
+}
+
+fn observe_backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
     let (archives, total, _) = inventory(destination)?;
+    let receiver = receiver_initialized(destination)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -665,12 +715,12 @@ fn backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
     let health = match archives.last() {
         None => "missing",
         Some(archive) => {
-            let bytes = super::install_mta_setup::protected_input(
+            let bytes = super::install_mta_setup::read_private_input(
                 &archive.path.with_extension("json"),
                 65536,
             )?;
             let input = std::str::from_utf8(&bytes).map_err(|_| "invalid receipt encoding")?;
-            let stamp = receipt_created(input, archive)?;
+            let stamp = receipt_created(input, archive, receiver)?;
             created = Json::Num(stamp.to_string());
             if let Some(seconds) = now.checked_sub(stamp) {
                 age = Json::Num(seconds.to_string());
@@ -753,6 +803,19 @@ mod tests {
             .write_all(b"{}")
             .unwrap();
         file
+    }
+
+    #[test]
+    fn lock_release_does_not_wait_for_a_duplicate_descriptor() {
+        let tmp = crate::test_temp::TempDir::new("backup-lock-release").unwrap();
+        let lock = destination_lock(tmp.path()).unwrap();
+        let duplicate = lock.0.try_clone().unwrap();
+        assert!(destination_lock(tmp.path()).is_err());
+        drop(lock);
+        let next = destination_lock(tmp.path()).unwrap();
+        drop(duplicate);
+        assert!(destination_lock(tmp.path()).is_err());
+        drop(next);
     }
 
     #[test]
@@ -936,7 +999,8 @@ mod tests {
             bytes: 12,
         };
         let receipt = r#"{"schema":1,"created_unix_seconds":100,"bytes":12,"archive":"/private/backup-9999-1.dump"}"#;
-        assert_eq!(receipt_created(receipt, &archive).unwrap(), 100);
+        assert_eq!(receipt_created(receipt, &archive, false).unwrap(), 100);
+        assert!(receipt_created(receipt, &archive, true).is_err());
         assert_eq!(freshness(100, 200, 100, false), "ready");
         assert_eq!(freshness(100, 201, 100, false), "stale");
         assert_eq!(freshness(100, 99, 100, false), "future");
@@ -950,7 +1014,7 @@ mod tests {
                 "\"created_unix_seconds\":-1",
             ),
         ] {
-            assert!(receipt_created(&bad, &archive).is_err());
+            assert!(receipt_created(&bad, &archive, false).is_err());
         }
     }
 

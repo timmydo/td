@@ -11,10 +11,14 @@ mod install_mta_backup;
 mod install_mta_notifications;
 #[path = "install_mta_operations.rs"]
 mod install_mta_operations;
+#[path = "install_mta_restore_engine.rs"]
+mod install_mta_restore_engine;
 #[path = "install_mta_setup.rs"]
 mod install_mta_setup;
 #[path = "install_mta_tls.rs"]
 mod install_mta_tls;
+#[path = "install_mta_backup/restore_layout.rs"]
+pub(crate) mod restore_layout;
 const HELP: &str = "Usage: ./install-td-mta [--prefix PATH]
        ./install-td-mta --services-only --connection-file PATH --state-dir PATH
            --profile NAME [--profile NAME ...] [--prefix PATH]
@@ -39,6 +43,8 @@ Use --notifications-monitor|--notifications-preview|--notifications-digest --con
 for the generated bounded collector and local daily digest.
 Use --backup --help for bounded host PostgreSQL logical backups.
 Use --backup-status --help for read-only backup freshness checks.
+Use --restore-drill --help to verify the newest scheduled dump in an isolated cluster.
+Use --pull-backup --help for off-host copies through an export-only SSH identity.
 ";
 
 #[derive(Debug)]
@@ -472,6 +478,21 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|v| v == "--operations-services") {
         return install_mta_operations::run(args.get(1..).unwrap_or_default());
+    }
+    if args == ["--backup-restore-drill-jail"] {
+        return install_mta_restore_engine::jail();
+    }
+    if args == ["--backup-restore-drill-worker"] {
+        return install_mta_restore_engine::worker();
+    }
+    if let Some((flag, rest)) = args.split_first() {
+        match flag.as_str() {
+            "--restore-drill" => return install_mta_backup::restore_drill(rest),
+            "--export-latest-backup" | "--receive-backup" | "--pull-backup" => {
+                return install_mta_backup::transfer::run(flag, rest);
+            }
+            _ => (),
+        }
     }
     if args.first().is_some_and(|v| v == "--backup-status") {
         return install_mta_backup::status(args.get(1..).unwrap_or_default());

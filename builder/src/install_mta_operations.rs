@@ -1,5 +1,5 @@
 //! Explicit host schedules for existing mail operations; no service activation.
-use super::install_mta_backup::Bounds;
+use super::install_mta_backup::{transfer, Bounds};
 use super::{absolute, directory, profile_name, scheme, shell, systemd, text, write_new, Result};
 use crate::json::Json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use td_engine::allocation;
 
 const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PATH [--prefix PATH]
   [--mail-profile NAME ...]
@@ -20,6 +21,9 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
   [--backup-service-file PATH --backup-service NAME --backup-destination PATH
    --postgres-bin PATH [--tool-library-dir PATH]
    [--backup-max-archive-bytes N] [--backup-max-total-bytes N] [--backup-retain N]]
+  [--backup-drill-scratch-directory PATH --backup-destination PATH
+   --postgres-bin PATH [--tool-library-dir PATH]
+   [--backup-pull-host SSH_ALIAS [--backup-max-archive-bytes N]]]
   [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
    --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
@@ -31,9 +35,15 @@ anything. Search preparation runs one bounded page per minute, waits five minute
 after each cycle, and has a separate freshness check. Body scrubbing runs one bounded page per minute, starts a new cycle
 a day after completion, and has a separate freshness check. Mail, certificate and backup freshness checks run every 15 minutes;
 backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
-require 30 days remaining; backups must be at most two days old. PostgreSQL 17
-and protected backup credentials must already be provisioned. Backup defaults are
-1 GiB/archive, 8 GiB/directory and 30 archives; override with --backup-* bounds. See td-mta/DEPLOYMENT.md.
+require 30 days remaining; backups must be at most two days old. The local backup
+writer requires PostgreSQL 17 and protected credentials. Its default limits are
+1 GiB/archive, 8 GiB/directory and 30 archives; override with --backup-* bounds.
+An optional restore drill runs Sundays at 05:15 local time. Drill-only schedules
+use an archive destination and a separate private scratch directory. An optional
+SSH pull refreshes the recovery copy daily at 04:15 using the operator's SSH config.
+On systemd, the Sunday pull and drill share the 05:15 activation.
+The recovery copy is checked every 15 minutes using the original backup time.
+See td-mta/DEPLOYMENT.md.
 ";
 
 struct Options {
@@ -45,6 +55,7 @@ struct Options {
     tls: Vec<PathBuf>,
     openssl: Option<PathBuf>,
     backup: Option<Backup>,
+    drill: Option<RestoreDrill>,
     scrub: Option<Scrub>,
     search: Option<Scrub>,
     renewal: Option<Renewal>,
@@ -68,12 +79,41 @@ struct Renewal {
     argv: Vec<String>,
     environment: Vec<String>,
 }
+struct BackupPull {
+    host: String,
+    ceiling: Option<u64>,
+}
+struct RestoreDrill {
+    pull: Option<BackupPull>,
+    destination: PathBuf,
+    scratch: PathBuf,
+    tools: PostgresTools,
+}
+struct PostgresTools {
+    bin: PathBuf,
+    library: Option<PathBuf>,
+}
+impl PostgresTools {
+    fn environment(&self) -> Result<Vec<String>> {
+        let mut env = Vec::new();
+        for (key, dir) in [
+            ("PATH", Some(&self.bin)),
+            ("LD_LIBRARY_PATH", self.library.as_ref()),
+        ] {
+            if let Some(dir) = dir {
+                let entry = allocation::format(format_args!("{key}={}", text(dir)?))
+                    .map_err(|_| String::new())?;
+                allocation::push(&mut env, entry).map_err(|_| String::new())?;
+            }
+        }
+        Ok(env)
+    }
+}
 struct Backup {
     service_file: PathBuf,
     service: String,
     destination: PathBuf,
-    postgres_bin: PathBuf,
-    library: Option<PathBuf>,
+    tools: PostgresTools,
     bounds: Option<Bounds>,
 }
 
@@ -117,6 +157,8 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--backup-service-file"
             | "--backup-service"
             | "--backup-destination"
+            | "--backup-pull-host"
+            | "--backup-drill-scratch-directory"
             | "--backup-max-archive-bytes"
             | "--backup-max-total-bytes"
             | "--backup-retain"
@@ -196,15 +238,70 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     } else {
         None
     };
-    let backup_keys = [
+    let postgres_tools = || -> Result<PostgresTools> {
+        let bin = required("--postgres-bin")?;
+        let library = path("--tool-library-dir")?;
+        if text(&bin)?.contains(':')
+            || library
+                .as_ref()
+                .is_some_and(|p| p.to_string_lossy().contains(':'))
+        {
+            return Err("tool directories cannot contain PATH separators".into());
+        }
+        Ok(PostgresTools { bin, library })
+    };
+    let writer = [
         "--backup-service-file",
         "--backup-service",
-        "--backup-destination",
-        "--backup-max-archive-bytes",
         "--backup-max-total-bytes",
         "--backup-retain",
-    ];
-    let backup = if backup_keys.iter().any(|k| values.contains_key(k)) {
+    ]
+    .iter()
+    .any(|key| values.contains_key(key));
+    let pull = if let Some(host) = values.get("--backup-pull-host") {
+        if writer || !values.contains_key("--backup-drill-scratch-directory") {
+            return Err(
+                "backup pull requires a recovery drill without local backup writer options".into(),
+            );
+        }
+        if !transfer::valid_host(host) {
+            return Err("invalid backup SSH host alias".into());
+        }
+        let ceiling = values
+            .get("--backup-max-archive-bytes")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .ok()
+                    .filter(|n| transfer::valid_ceiling(*n))
+                    .ok_or("invalid backup pull archive byte limit")
+            })
+            .transpose()?;
+        Some(BackupPull {
+            host: allocation::string(host).map_err(|_| String::new())?,
+            ceiling,
+        })
+    } else {
+        None
+    };
+    let drill = if let Some(scratch) = path("--backup-drill-scratch-directory")? {
+        let destination = required("--backup-destination")?;
+        if scratch.starts_with(&destination) || destination.starts_with(&scratch) {
+            return Err("backup and drill scratch directories must be separate".into());
+        }
+        Some(RestoreDrill {
+            pull,
+            destination,
+            scratch,
+            tools: postgres_tools()?,
+        })
+    } else {
+        None
+    };
+    let backup = if writer
+        || (values.contains_key("--backup-max-archive-bytes")
+            && !values.contains_key("--backup-pull-host"))
+        || (drill.is_none() && values.contains_key("--backup-destination"))
+    {
         let service = values
             .get("--backup-service")
             .ok_or("missing --backup-service")?;
@@ -215,15 +312,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
                 .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
         {
             return Err("invalid libpq service name".into());
-        }
-        let postgres_bin = required("--postgres-bin")?;
-        let library = path("--tool-library-dir")?;
-        if text(&postgres_bin)?.contains(':')
-            || library
-                .as_ref()
-                .is_some_and(|p| p.to_string_lossy().contains(':'))
-        {
-            return Err("tool directories cannot contain PATH separators".into());
         }
         let bounds = if [
             "--backup-max-archive-bytes",
@@ -250,8 +338,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             service_file: required("--backup-service-file")?,
             service: (*service).into(),
             destination: required("--backup-destination")?,
-            postgres_bin,
-            library,
+            tools: postgres_tools()?,
             bounds,
         })
     } else {
@@ -265,7 +352,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     .iter()
     .any(|key| values.contains_key(key))
     {
-        let postgres = required("--postgres-bin")?;
+        let tools = postgres_tools()?;
         let openssl = required("--openssl-bin")?;
         let tls_dir = required("--postgres-tls-dir")?;
         let data = required("--postgres-data-dir")?;
@@ -277,13 +364,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         if port == 0 {
             return Err("PostgreSQL port must be nonzero".into());
         }
-        let mut environment = vec![format!("PATH={}", text(&postgres)?)];
-        if let Some(library) = path("--tool-library-dir")? {
-            environment.push(format!("LD_LIBRARY_PATH={}", text(&library)?));
-        }
-        if environment.iter().any(|value| value.contains(':')) {
-            return Err("tool directories cannot contain PATH separators".into());
-        }
         Some(Renewal {
             argv: vec![
                 "install-td-mta".into(),
@@ -293,18 +373,19 @@ fn options(args: &[String], home: &str) -> Result<Options> {
                 "--data-dir".into(),
                 text(&data)?.into(),
                 "--postgres-bin".into(),
-                text(&postgres)?.into(),
+                text(&tools.bin)?.into(),
                 "--openssl-bin".into(),
                 text(&openssl)?.into(),
                 "--port".into(),
                 port.to_string(),
             ],
-            environment,
+            environment: tools.environment()?,
         })
     } else {
         None
     };
     if backup.is_none()
+        && drill.is_none()
         && renewal.is_none()
         && ["--postgres-bin", "--tool-library-dir"]
             .iter()
@@ -374,6 +455,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         && scrub.is_none()
         && search.is_none()
         && backup.is_none()
+        && drill.is_none()
         && renewal.is_none()
         && notification.is_none()
     {
@@ -388,6 +470,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         tls,
         openssl,
         backup,
+        drill,
         scrub,
         search,
         renewal,
@@ -398,6 +481,8 @@ fn options(args: &[String], home: &str) -> Result<Options> {
 #[derive(Clone, Copy)]
 enum Schedule {
     Daily,
+    DailyPull,
+    WeeklyDrill { pull_first: bool },
     Digest(u8),
     QuarterHour,
     Minute,
@@ -477,10 +562,6 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
         }
     }
     if let Some(backup) = &opts.backup {
-        let mut env = vec![format!("PATH={}", text(&backup.postgres_bin)?)];
-        if let Some(library) = &backup.library {
-            env.push(format!("LD_LIBRARY_PATH={}", text(library)?));
-        }
         let mut argv = vec![
             text(&helper)?.into(),
             "install-td-mta".into(),
@@ -502,20 +583,75 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                 bounds.retain.to_string(),
             ]);
         }
-        add("backup".into(), argv, env, Schedule::Daily);
+        add(
+            "backup".into(),
+            argv,
+            backup.tools.environment()?,
+            Schedule::Daily,
+        );
+    }
+    let host_command = |args: &[&str]| -> Result<Vec<String>> {
+        let mut argv = Vec::new();
+        for arg in [text(&helper)?, "install-td-mta"].iter().chain(args) {
+            let arg = allocation::string(arg).map_err(|_| String::new())?;
+            allocation::push(&mut argv, arg).map_err(|_| String::new())?;
+        }
+        Ok(argv)
+    };
+    let recovery = opts
+        .drill
+        .as_ref()
+        .and_then(|drill| drill.pull.as_ref().map(|pull| (drill, pull)));
+    if let Some((drill, pull)) = recovery {
+        let mut argv = host_command(&[
+            "--pull-backup",
+            "--host",
+            &pull.host,
+            "--destination",
+            text(&drill.destination)?,
+        ])?;
+        if let Some(limit) = pull.ceiling {
+            let flag = allocation::string("--max-archive-bytes").map_err(|_| String::new())?;
+            let value = allocation::format(format_args!("{limit}")).map_err(|_| String::new())?;
+            allocation::push(&mut argv, flag).map_err(|_| String::new())?;
+            allocation::push(&mut argv, value).map_err(|_| String::new())?;
+        }
+        add("backup-pull".into(), argv, Vec::new(), Schedule::DailyPull);
+    }
+    if let Some(destination) = opts
+        .backup
+        .as_ref()
+        .map(|backup| &backup.destination)
+        .or_else(|| recovery.map(|(drill, _)| &drill.destination))
+    {
         add(
             "backup-status".into(),
-            vec![
-                text(&helper)?.into(),
-                "install-td-mta".into(),
-                "--backup-status".into(),
-                "--destination".into(),
-                text(&backup.destination)?.into(),
-                "--maximum-age-seconds".into(),
-                "172800".into(),
-            ],
-            vec![],
+            host_command(&[
+                "--backup-status",
+                "--destination",
+                text(destination)?,
+                "--maximum-age-seconds",
+                "172800",
+            ])?,
+            Vec::new(),
             Schedule::QuarterHour,
+        );
+    }
+    if let Some(drill) = &opts.drill {
+        let destination = text(&drill.destination)?;
+        add(
+            "backup-drill".into(),
+            host_command(&[
+                "--restore-drill",
+                "--destination",
+                destination,
+                "--scratch-directory",
+                text(&drill.scratch)?,
+            ])?,
+            drill.tools.environment()?,
+            Schedule::WeeklyDrill {
+                pull_first: drill.pull.is_some(),
+            },
         );
     }
     if let Some(renewal) = &opts.renewal {
@@ -605,10 +741,10 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
 }
 
 fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
-    let seconds = if matches!(job.schedule, Schedule::Daily | Schedule::Digest(_)) {
-        2700
-    } else {
-        120
+    let seconds = match job.schedule {
+        Schedule::WeeklyDrill { .. } => 4500,
+        Schedule::Daily | Schedule::DailyPull | Schedule::Digest(_) => 2700,
+        Schedule::QuarterHour | Schedule::Minute => 120,
     };
     let exec = job
         .argv
@@ -621,8 +757,13 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .iter()
         .map(|v| format!("Environment={}\n", systemd(v)))
         .collect::<String>();
+    let ordering = if matches!(job.schedule, Schedule::WeeklyDrill { pull_first: true }) {
+        "Wants=td-mta-maint-backup-pull.service\nAfter=td-mta-maint-backup-pull.service\n"
+    } else {
+        ""
+    };
     let unit = format!(
-        "[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n",
+        "[Unit]\nDescription={}\n{ordering}\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n",
         job.name
     );
     let digest_calendar = if let Schedule::Digest(hour) = job.schedule {
@@ -638,6 +779,10 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
     };
     let schedule = match job.schedule {
         Schedule::Digest(_) => &digest_calendar,
+        Schedule::WeeklyDrill { .. } => "OnCalendar=Sun *-*-* 05:15:00\nPersistent=true\n",
+        Schedule::DailyPull => {
+            "OnCalendar=Mon..Sat *-*-* 04:15:00\nOnCalendar=Sun *-*-* 05:15:00\nPersistent=true\n"
+        }
         Schedule::Daily => "OnCalendar=*-*-* 03:15:00\nPersistent=true\n",
         Schedule::QuarterHour => "OnBootSec=2min\nOnUnitActiveSec=15min\n",
         Schedule::Minute => "OnBootSec=2min\nOnUnitActiveSec=1min\n",
@@ -653,6 +798,8 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
     };
     let event = match job.schedule {
         Schedule::Digest(_) => &digest_event,
+        Schedule::WeeklyDrill { .. } => "(calendar-event #:days-of-week '(sunday) #:hours '(5) #:minutes '(15))",
+        Schedule::DailyPull => "(calendar-event #:hours '(4) #:minutes '(15))",
         Schedule::Daily => "(calendar-event #:hours '(3) #:minutes '(15))",
         Schedule::QuarterHour => "(calendar-event #:minutes '(0 15 30 45))",
         Schedule::Minute => {
@@ -800,6 +947,12 @@ fn notification_config(opts: &Options, jobs: &[Job]) -> Result<Option<Json>> {
 }
 
 fn install(opts: &Options) -> Result<()> {
+    if let Some(drill) = &opts.drill {
+        super::restore_layout::qualify(
+            &drill.tools.bin,
+            drill.tools.library.as_ref().map(|path| path.as_os_str()),
+        )?;
+    }
     let jobs = jobs(opts)?;
     let notification = notification_config(opts, &jobs)?;
     let config_path = opts.state.join(".operations/notifications/config.json");
@@ -845,7 +998,11 @@ fn install(opts: &Options) -> Result<()> {
             write_new(&config_path, config.to_canonical().as_bytes())?;
         }
     }
-    if opts.backup.is_some() || opts.renewal.is_some() || opts.notification.is_some() {
+    if opts.backup.is_some()
+        || opts.drill.is_some()
+        || opts.renewal.is_some()
+        || opts.notification.is_some()
+    {
         // A stable command path keeps schedules independent of the source checkout.
         let releases = opts.prefix.join("lib/td-mta/host-tools");
         directory(&releases, 0o755)?;
@@ -1014,6 +1171,186 @@ mod tests {
     }
 
     #[test]
+    fn weekly_drill_can_run_on_a_recovery_host_or_beside_a_backup() {
+        let mut input = args(&[
+            "--state-dir",
+            "/state",
+            "--prefix",
+            "/operator",
+            "--backup-destination",
+            "/offline/archives",
+            "--backup-drill-scratch-directory",
+            "/scratch/restore space",
+            "--postgres-bin",
+            "/tools/bin",
+            "--tool-library-dir",
+            "/tools/lib",
+        ]);
+        let opts = options(&input, "/home/a").unwrap();
+        let generated = jobs(&opts).unwrap();
+        assert_eq!(generated.len(), 1);
+        let drill = generated.first().unwrap();
+        assert_eq!(drill.name, "td-mta-maint-backup-drill");
+        assert_eq!(
+            drill.argv,
+            [
+                "/operator/bin/td-mta-operator",
+                "install-td-mta",
+                "--restore-drill",
+                "--destination",
+                "/offline/archives",
+                "--scratch-directory",
+                "/scratch/restore space"
+            ]
+        );
+        assert_eq!(
+            drill.environment,
+            ["PATH=/tools/bin", "LD_LIBRARY_PATH=/tools/lib"]
+        );
+        let generated = files(drill, &opts.state).unwrap();
+        assert!(generated[0].1.contains("TimeoutStartSec=4500"));
+        assert!(!generated[0].1.contains("backup-pull.service"));
+        assert!(generated[0]
+            .1
+            .contains("\"--scratch-directory\" \"/scratch/restore space\""));
+        assert!(generated[1]
+            .1
+            .contains("OnCalendar=Sun *-*-* 05:15:00\nPersistent=true"));
+        assert!(generated[2]
+            .1
+            .contains("#:days-of-week '(sunday) #:hours '(5) #:minutes '(15)"));
+        assert!(generated[2].1.contains("#:max-duration 4500"));
+        assert!(generated[2].1.contains("#:wait-for-termination? #t"));
+        let mut incomplete = input.clone();
+        incomplete.extend(args(&["--backup-retain", "3"]));
+        assert!(options(&incomplete, "/home/a").is_err());
+        for alias in ["/offline/archives", "/offline/archives/nested", "/offline"] {
+            let mut overlap = input.clone();
+            *overlap
+                .iter_mut()
+                .find(|v| *v == "/scratch/restore space")
+                .unwrap() = alias.into();
+            assert!(options(&overlap, "/home/a").is_err());
+        }
+        input.extend(args(&[
+            "--backup-service",
+            "mail",
+            "--backup-service-file",
+            "/private/service",
+        ]));
+        let opts = options(&input, "/home/a").unwrap();
+        let generated = jobs(&opts).unwrap();
+        assert_eq!(
+            generated
+                .iter()
+                .map(|job| job.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "td-mta-maint-backup",
+                "td-mta-maint-backup-status",
+                "td-mta-maint-backup-drill"
+            ]
+        );
+        assert!(generated[2]
+            .argv
+            .iter()
+            .all(|arg| arg != "/private/service"));
+    }
+
+    #[test]
+    fn recovery_pull_precedes_the_drill_and_inherits_the_ssh_environment() {
+        let mut input = args(&[
+            "--state-dir",
+            "/state",
+            "--prefix",
+            "/operator",
+            "--backup-destination",
+            "/archives",
+            "--postgres-bin",
+            "/pg17/bin",
+            "--tool-library-dir",
+            "/pg17/lib",
+            "--backup-pull-host",
+            "mx-recovery",
+        ]);
+        assert!(options(&input, "/home/a").is_err());
+        input.extend(args(&["--backup-drill-scratch-directory", "/scratch"]));
+        let opts = options(&input, "/home/a").unwrap();
+        let jobs_default = jobs(&opts).unwrap();
+        assert_eq!(jobs_default.len(), 3);
+        let pull = jobs_default.first().unwrap();
+        assert_eq!(pull.name, "td-mta-maint-backup-pull");
+        assert_eq!(
+            pull.argv,
+            [
+                "/operator/bin/td-mta-operator",
+                "install-td-mta",
+                "--pull-backup",
+                "--host",
+                "mx-recovery",
+                "--destination",
+                "/archives",
+            ]
+        );
+        assert!(pull.environment.is_empty());
+        let status = &jobs_default[1];
+        assert_eq!(status.name, "td-mta-maint-backup-status");
+        assert_eq!(
+            status.argv,
+            [
+                "/operator/bin/td-mta-operator",
+                "install-td-mta",
+                "--backup-status",
+                "--destination",
+                "/archives",
+                "--maximum-age-seconds",
+                "172800",
+            ]
+        );
+        assert!(status.environment.is_empty());
+        assert!(matches!(status.schedule, Schedule::QuarterHour));
+        let drill = &jobs_default[2];
+        assert_eq!(drill.name, "td-mta-maint-backup-drill");
+        let weekly = files(drill, &opts.state).unwrap();
+        assert!(weekly[0].1.contains(
+            "Wants=td-mta-maint-backup-pull.service\nAfter=td-mta-maint-backup-pull.service\n"
+        ));
+        assert!(!weekly[0].1.contains("Requires="));
+        assert!(weekly[1].1.contains("OnCalendar=Sun *-*-* 05:15:00"));
+        assert!(!weekly[2].1.contains("backup-pull"));
+        for (flag, value) in [
+            ("--backup-service-file", "/private/service"),
+            ("--backup-service", "mail"),
+            ("--backup-max-total-bytes", "1000"),
+            ("--backup-retain", "4"),
+            ("--backup-max-archive-bytes", "0"),
+            ("--backup-max-archive-bytes", "1099511627777"),
+        ] {
+            let mut conflict = input.clone();
+            conflict.extend(args(&[flag, value]));
+            assert!(options(&conflict, "/home/a").is_err(), "{flag} {value}");
+        }
+        let mut invalid = input.clone();
+        *invalid.iter_mut().find(|a| *a == "mx-recovery").unwrap() = "-oCommand".into();
+        assert!(options(&invalid, "/home/a").is_err());
+
+        input.extend(args(&["--backup-max-archive-bytes", "4294967296"]));
+        let opts = options(&input, "/home/a").unwrap();
+        let generated = files(&jobs(&opts).unwrap()[0], &opts.state).unwrap();
+        for index in [0, 2] {
+            let text = &generated[index].1;
+            assert!(text.contains("\"--pull-backup\" \"--host\" \"mx-recovery\""));
+            assert!(text.contains("\"--max-archive-bytes\" \"4294967296\""));
+            assert!(!text.contains("/pg17/"));
+        }
+        assert!(generated[1].1.contains(
+            "OnCalendar=Mon..Sat *-*-* 04:15:00\nOnCalendar=Sun *-*-* 05:15:00\nPersistent=true"
+        ));
+        assert!(generated[2].1.contains("#:hours '(4) #:minutes '(15)"));
+        assert!(generated[2].1.contains("#:wait-for-termination? #t"));
+    }
+
+    #[test]
     fn backup_overrides_share_runtime_validation_and_reach_both_supervisors() {
         let base = args(&[
             "--state-dir",
@@ -1113,6 +1450,37 @@ mod tests {
         assert!(files(&jobs[0], &opts.state).unwrap()[1]
             .1
             .contains("OnCalendar=*-*-* 03:15:00"));
+    }
+
+    #[test]
+    fn unsupported_drill_package_refuses_installation_before_creating_paths() {
+        let tmp = crate::test_temp::TempDir::new("mail-unsupported-postgres").unwrap();
+        let prefix = tmp.path().join("prefix");
+        let state = tmp.path().join("state");
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("initdb"), "").unwrap();
+        let opts = options(
+            &args(&[
+                "--prefix",
+                prefix.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--backup-drill-scratch-directory",
+                "/restore/scratch",
+                "--backup-destination",
+                "/restore/backups",
+                "--postgres-bin",
+                bin.to_str().unwrap(),
+            ]),
+            "/home/a",
+        )
+        .unwrap();
+        assert!(install(&opts)
+            .unwrap_err()
+            .contains("unsupported PostgreSQL restore package"));
+        assert!(!prefix.exists());
+        assert!(!state.exists());
     }
 
     #[test]

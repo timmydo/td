@@ -111,13 +111,19 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             "crypto host qualification is not yet defined for {host}"
         ));
     }
-    let path = format!(
+    let mut path = format!(
         "{rustpath}:{ccpath}:{}",
         std::env::var("PATH").unwrap_or_default()
     );
     // Before any test runs, over the PATH the fixtures inherit.
     if matches!(action, "test" | "perf") && name == "td-mta" {
         let extra = if action == "test" { BACKUP_TOOLS } else { &[] };
+        if action == "test" {
+            // The native restore fixture clears Cargo's test library path.
+            let layout = crate::install_mta::restore_layout::from_path(&path, None)?;
+            path = td_engine::allocation::format(format_args!("{}:{path}", layout.bin.display()))
+                .map_err(|_| String::new())?;
+        }
         postgres_bin(&path, extra)?;
     }
     let vendor = crate::host_bin::prepare_mail_vendor(root)?;
@@ -327,6 +333,21 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             fixture.stdout(Stdio::piped());
             crate::native_tests::run_cases(fixture)?;
         }
+        let mut drill = command("test", "builder/Cargo.toml");
+        drill
+            .env("TD_TEST_TRUSTED_ROOT", "private")
+            .args([
+                "--release",
+                "--test",
+                "mail_restore_drill",
+                "--",
+                "--ignored",
+                "--exact",
+                "real_archive_round_trip",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped());
+        crate::native_tests::run_cases(drill)?;
     }
     Ok(None)
 }

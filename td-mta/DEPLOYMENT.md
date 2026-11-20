@@ -155,9 +155,12 @@ independent scheduled operations with the same installer:
 Select any complete group independently: mail profiles, managed certificate
 profiles with their connection file, private certificate files with an explicit
 OpenSSL executable, the four backup arguments, or the local PostgreSQL renewal
-group described below. Repeat profiles/certificate
-files up to 32 per kind. All paths are absolute. The mail state directory is the
-same one used when generating the foreground services. Provision the backup
+group described below. Recovery hosts can independently select the
+[weekly restore drill and daily backup pull](#pull-backups-to-a-recovery-host).
+Repeat profiles/certificate
+files up to 32 per kind. All paths are absolute. On a mail host, use the state directory
+configured for its foreground services. A recovery-only host has its own
+private operations state directory. Provision the backup
 destination and credentials as described below; generation does not create or
 validate them. `--tool-library-dir` optionally supplies the PostgreSQL tools'
 host library directory. Their PATH contains only `--postgres-bin`; retain that
@@ -676,8 +679,9 @@ complete. Retain a checksum, timestamp, PostgreSQL version and application
 release/schema version alongside the archive. `--list` alone checks the
 archive directory, not whether its data can be restored.
 
-Retain protected bootstrap material separately: database owner/runtime login
-credentials and role/grant provisioning, database TLS trust, the local CA key
+Retain protected bootstrap material separately: database login credentials
+for the owner and each service, role/grant provisioning, database
+TLS trust, the local CA key
 if used, profile source files, current selection receipts, the td-mail device
 password and its per-account CA configuration, and the matching executable
 release. `pg_dump` does not include cluster roles, server configuration,
@@ -731,6 +735,132 @@ Schedule with a supervisor that records failures and inspect backup age as
 well as exit status. Local retention alone does not protect against disk
 loss. Retain protected bootstrap material separately and perform isolated
 restore drills before treating the backup as recoverable.
+
+### Restore the latest scheduled backup
+
+Run the recovery helper as an unprivileged user on a Linux host with
+PostgreSQL 17. Provide two separate owned mode-0700 directories with
+trusted parents. The first holds scheduled dumps and their receipts. The
+second holds the disposable database and needs space for its uncompressed
+tables, indexes and PostgreSQL working files. Protect both volumes at rest.
+A dump includes message bodies, TLS private keys and the relay credential.
+The drill requires Linux user, mount, PID and network namespaces and a
+PostgreSQL 17 server, client and extensions matching the dump (including
+`pg_trgm` for indexed mail). It reserves 2 GiB of free space in addition to
+a scratch allowance of 12 times the archive size, with a 4 GiB minimum and
+64 GiB maximum. It monitors free space and scratch usage during its one-hour
+run limit. Provide a filesystem quota when a hard disk limit is required.
+
+Install the server and client from one PostgreSQL 17 package. The helper
+finds `initdb` on PATH, resolves profile links, and checks the package's
+`initdb`, `postgres`, `psql` and `pg_restore` versions. Generating a
+drill schedule performs the same check on `--postgres-bin` before writing
+the helper or service definitions. Supported binary directories are:
+
+- Guix's `/gnu/store/<package>/bin`, including links from a user profile;
+- Debian's `/usr/lib/postgresql/17/bin` and the extracted deployment's
+  `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin`;
+- the RPM directory `/usr/pgsql-17/bin` and the source installation's
+  `/usr/local/pgsql/bin`.
+
+The jail mounts package binaries, libraries and shared resources read-only.
+Keep private configuration and live cluster data outside those directories.
+On Guix the runtime also uses the immutable public `/gnu/store` for its
+dynamic loader and dependencies. The host account's profile and home
+directory are outside the jail.
+
+```text
+./install-td-mta --restore-drill --destination /home/alice/mail-backups \
+  --scratch-directory /home/alice/mail-drill
+```
+
+The helper selects the newest completed archive, checks its original byte
+count and SHA-256, and restores the same open file. An empty destination or
+a damaged newest archive fails the drill. Inside a disposable namespace,
+PostgreSQL listens on a private Unix socket and restores in one transaction.
+An independent reader checks the recorded migration checksums against the
+application's immutable migrations and the common store epoch. It compares
+the set of ordinary mail tables with the catalog for the restored version,
+checks mail references, and verifies chunk order, byte lengths and each
+stored body's SHA-256. The drill omits
+original ownership, grants, subscriptions and tablespace placement. Keep the
+source role/bootstrap material for the separate recovery procedure.
+On success stdout contains one JSON record with the archive name, creation
+time, SHA-256, archive bytes,
+account, mailbox, Email and body counts, and total verified body bytes.
+Save that record and the job result. Check backup age independently with
+`--backup-status`: a successful restore can be from an old snapshot.
+
+### Pull backups to a recovery host
+
+Use a separately protected recovery volume on the designated development
+machine. Start with an empty mode-0700 copies directory and a separate
+mode-0700 scratch directory. Provision a dedicated SSH identity on the
+recovery host. Configure its SSH alias with the backup source hostname,
+the backup-owning user, `IdentityFile`, `IdentitiesOnly yes`, and a
+`UserKnownHostsFile` containing the independently verified host key.
+Allow this identity on the source **only** through a restricted forced
+command. For example, prefix its public key in the source user's
+`authorized_keys` with the following options, substituting the actual
+retained helper path and scheduled backup directory:
+
+```text
+restrict,command="/opt/td-mta/bin/td-mta-operator install-td-mta --export-latest-backup --destination /var/lib/td-mta/backups/scheduled"
+```
+
+Install the export-capable helper on the source before enabling pulls.
+The recovery host needs read access through this identity only. Keep the
+production database login on the source. Run the first copy, age check
+and drill under the identity that will own the scheduled jobs:
+
+```text
+./install-td-mta --pull-backup --host td-mta-backup-source \
+  --destination /home/alice/recovery/copies
+./install-td-mta --backup-status --destination /home/alice/recovery/copies \
+  --maximum-age-seconds 172800
+./install-td-mta --restore-drill --destination /home/alice/recovery/copies \
+  --scratch-directory /home/alice/recovery/drill
+```
+
+The pull uses noninteractive SSH with strict host-key checking and no
+forwarding. It verifies the original receipt and waits for the exporter's
+successful exit before publishing the new dump. It keeps the latest two
+completed generations. Allow room for a third during transfer. The
+per-archive limit defaults to 1 GiB and can be raised with
+`--max-archive-bytes` if the source limit rises. For an independently
+protected transport, `--export-latest-backup --destination SOURCE` writes
+the receipt and dump to stdout and `--receive-backup --destination COPIES`
+reads that stream from stdin. Handle the stream as secret-bearing data.
+
+To generate the recovery host's systemd or Shepherd jobs:
+
+```text
+./install-td-mta --operations-services --prefix /home/alice/.local \
+  --state-dir /home/alice/.local/state/td-mta-recovery \
+  --backup-destination /home/alice/recovery/copies \
+  --backup-drill-scratch-directory /home/alice/recovery/drill \
+  --postgres-bin /usr/lib/postgresql/17/bin --backup-pull-host td-mta-backup-source
+```
+
+If the source archive ceiling exceeds 1 GiB, supply the same
+`--backup-max-archive-bytes` when generating the pull job.
+Enable the generated jobs under the recovery user after the initial drill
+succeeds. On systemd the pull runs at 04:15 local time Monday through
+Saturday. On Sunday the pull and drill are both scheduled at 05:15, with the
+drill ordered after the pull. Missed runs catch up. Starting the drill manually
+also requests a pull. A failed pull still permits checking the last local copy.
+On Shepherd the pull runs daily at 04:15 and the drill runs Sundays at 05:15.
+Both supervisors check the source snapshot age every 15 minutes and report a
+copy older than 48 hours. Inspect the individual job results. The newest
+successful drill identifies exactly which snapshot was tested. A weekly success provides no
+evidence about a later archive. To drill archives already supplied locally,
+omit `--backup-pull-host`. Retain the separate bootstrap material listed
+above, including credentials for the deployment's per-service roles. Actual
+service recovery also requires fencing the old writer, establishing a fresh
+epoch, reviewing configuration and quarantining uncertain deliveries under
+[POSTGRES.md](POSTGRES.md).
+
+### Compare a fenced source with a manual restore
 
 A drill restores into a fresh cluster with no TCP listener and a private Unix
 socket. Use absolute paths without whitespace for this example's `pg_ctl -o`

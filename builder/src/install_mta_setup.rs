@@ -260,7 +260,7 @@ pub(super) fn trusted_ancestors(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_private_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(super) fn read_private_input(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("input {}: {e}", path.display()))?;
     if !meta.is_file()
         || meta.uid() != crate::sys::getuid()

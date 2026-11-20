@@ -730,6 +730,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    if p == MAIL_RESTORE_FIXTURE {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     if HOST_ONLY_ENGINE_SOURCES.contains(&p) {
         // Host-side branch tooling that lives in the engine crate but is not
         // the engine: reachable only from its own subcommand, and reading
@@ -6133,6 +6138,19 @@ const CRATE_LEG_SOURCES: &[&str] = &[
     "builder/src/test_root.rs",
 ];
 
+const MAIL_RESTORE_FIXTURE: &str = "builder/tests/mail_restore_drill.rs";
+
+fn mail_restore_input(p: &str) -> bool {
+    matches!(
+        p,
+        MAIL_RESTORE_FIXTURE
+            | "builder/src/install_mta.rs"
+            | "builder/src/install_mta_setup.rs"
+            | "builder/src/install_mta_backup.rs"
+            | "builder/src/install_mta_restore_engine.rs"
+    ) || p.starts_with("builder/src/install_mta_backup/")
+}
+
 /// A builder path no crate leg can observe: its workspace legs, which run
 /// whenever crate legs are narrowed, are the whole of what it owes.
 fn builder_workspace_only(p: &str) -> bool {
@@ -6144,7 +6162,10 @@ fn builder_workspace_only(p: &str) -> bool {
 /// evaluator is a workspace binary too, and owes beyond its workspace legs
 /// only the crates that read its sources.
 fn workspace_only_change(p: &str) -> bool {
-    builder_workspace_only(p) || recipe_definition(p) || evaluator_source(p)
+    p == MAIL_RESTORE_FIXTURE
+        || builder_workspace_only(p)
+        || recipe_definition(p)
+        || evaluator_source(p)
 }
 
 /// `td-recipe-eval`'s own tree: its entry file and the `td_recipe_eval`
@@ -6184,6 +6205,12 @@ fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec
     for p in changed {
         if p.contains("..") {
             return None;
+        }
+        if mail_restore_input(p) {
+            // The native mail leg runs the host operator against PostgreSQL 17.
+            push_unique(&mut selected, "td-mta");
+            workspace_only = true;
+            continue;
         }
         if workspace_only_change(p) {
             workspace_only = true;
@@ -11553,6 +11580,29 @@ mod tests {
         assert!(path_output(&root, "td-mime/DESIGN.md").contains("Selected checks: none"));
         for path in ["td-mime-extra/src/lib.rs", "td-mime/../td-sh/src/main.rs"] {
             assert!(path_output(&root, path).contains("td-builder check"));
+        }
+    }
+
+    #[test]
+    fn restore_drill_and_its_host_sources_select_native_mail() {
+        for file in [
+            MAIL_RESTORE_FIXTURE,
+            "builder/src/install_mta_backup/transfer.rs",
+            "builder/src/install_mta_restore_engine.rs",
+        ] {
+            let selected = changed_roster_crates(&[], &[file.into()]).unwrap();
+            assert_eq!(selected, ["td-mta"]);
+        }
+
+        let root = repo_root();
+        if root.join("td-mta/Cargo.toml").is_file() {
+            let commands = cargo_test_cmds(&root, &[MAIL_RESTORE_FIXTURE.into()]).unwrap();
+            assert!(commands
+                .iter()
+                .any(|c| c == "cargo test --frozen --workspace"));
+            assert!(commands
+                .iter()
+                .any(|c| c.contains("crypto-cargo test --manifest-path td-mta/Cargo.toml")));
         }
     }
 

@@ -118,8 +118,8 @@ builder/src/install_mta_notifications.rs	allocation-macro	27
 builder/src/install_mta_notifications.rs	heap-owner	1
 builder/src/install_mta_notifications.rs	unchecked-growth-or-clone	40
 builder/src/install_mta_operations.rs	allocating-conversion	61
-builder/src/install_mta_operations.rs	allocation-macro	61
-builder/src/install_mta_operations.rs	unchecked-growth-or-clone	27
+builder/src/install_mta_operations.rs	allocation-macro	53
+builder/src/install_mta_operations.rs	unchecked-growth-or-clone	25
 builder/src/install_mta_setup.rs	allocating-conversion	62
 builder/src/install_mta_setup.rs	allocation-macro	89
 builder/src/install_mta_setup.rs	heap-owner	3

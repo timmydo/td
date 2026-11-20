@@ -1247,12 +1247,23 @@ performance harness. Their real operation deadlines include hashing and TLS;
 an unoptimized full-size body hash can exhaust a deadline before database work
 starts. Ordinary unit and documentation tests retain the test profile. This
 does not change target compiler flags or relax an operation deadline.
-Host preparation must put PostgreSQL 17 on
-`PATH`: the directory of the first `initdb` there must also hold `postgres`,
+Host preparation must put PostgreSQL 17 on `PATH`. The native tests
+resolve the first `initdb` to its package directory, which must also hold `postgres`,
 `pg_ctl`, `psql`, `pg_dump`, `pg_restore`, `pg_receivewal`, `pg_basebackup`
 and `pg_verifybackup`, and `postgres --version` must report release 17.
+The native test preflight also checks that the first `initdb` resolves
+to a supported restore-drill package and that its companion tools can run.
+Use a Guix PostgreSQL 17 profile or store package, Debian's
+`/usr/lib/postgresql/17`, the extracted deployment's
+`/opt/td-mta/postgresql/usr/lib/postgresql/17`, the RPM layout
+`/usr/pgsql-17` or the standard `/usr/local/pgsql` installation.
+The test host needs unprivileged Linux namespaces and PostgreSQL's catalog,
+shared libraries and extensions. The performance harness launches its
+database directly and accepts other PostgreSQL 17 package layouts.
 The deployment fixtures exercise streaming backup and exact recovery, and
-verified TLS, SCRAM and per-role grants, on disposable clusters. Interactive
+verified TLS, SCRAM and per-role grants, on disposable clusters. The native
+mail leg also runs the host operator’s scheduled logical backup, off-host
+transfer and isolated restore drill against a disposable PostgreSQL cluster. Interactive
 service-login tests use util-linux `setsid` to exercise detached password
 prompting. The
 wrapper checks this before any test runs and names what is missing; the

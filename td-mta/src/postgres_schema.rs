@@ -382,3 +382,34 @@ fn checksum(ddl: &str) -> Result<[u8; 32], Error> {
     digest.update(ddl.as_bytes()).map_err(|_| Error::Crypto)?;
     digest.finish().map_err(|_| Error::Crypto)
 }
+
+#[cfg(test)]
+mod restore_drill_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_verifier_pins_every_immutable_migration() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The host helper can travel without this crate. Check its compact pins
+        // against the same byte strings and digest function that write the ledger.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../builder/src/install_mta_backup/restore_migrations.sha256");
+        let pins = std::fs::read_to_string(path)?;
+        let mut hashes = pins.lines();
+        assert_eq!(MIGRATIONS.len(), VERSION as usize);
+        for (index, ddl) in MIGRATIONS.iter().enumerate() {
+            let digest = checksum(ddl).map_err(|_| "cannot compute migration checksum")?;
+            let mut expected = [0; 64];
+            crate::wire::hex(&digest, &mut expected)
+                .map_err(|_| "cannot encode migration checksum")?;
+            assert_eq!(
+                hashes.next(),
+                Some(std::str::from_utf8(&expected)?),
+                "migration {}",
+                index + 1
+            );
+        }
+        assert_eq!(hashes.next(), None, "unexpected restore verifier digest");
+        Ok(())
+    }
+}
