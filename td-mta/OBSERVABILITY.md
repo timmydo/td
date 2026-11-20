@@ -327,7 +327,7 @@ can shorten the retained history; at the global maximum the ring retains about
 
 Writers flush at most 16 records per transaction with a two-second overall
 DNS/connection/operation deadline, a 50 ms row-lock wait, and one-second statement
-timeouts. The writer re-resolves the configured endpoint for every connection. Only a
+timeouts. The writer uses the bootstrap address policy in POSTGRES.md section 10. Only a
 transport failure before entering the append operation can try another address
 within that same deadline. Logging uses asynchronous commit and never retries
 an uncertain commit. Mail acceptance never depends on diagnostic persistence. Each idle

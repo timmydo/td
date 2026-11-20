@@ -17,6 +17,7 @@ pub enum Error {
 /// Intentionally has no Debug implementation: the URI contains credentials.
 /// Parsing neither reads files/environment nor connects to a database.
 pub struct Bootstrap {
+    pub(crate) addresses: crate::postgres_resolver::Cache,
     host: String,
     socket: Option<td_fs::SocketPath>,
     port: u16,
@@ -81,7 +82,7 @@ impl Bootstrap {
             None => (endpoint, 5432),
         };
         // The TLS facade authenticates a DNS name, never an IP literal or
-        // a URI-encoded host/socket path. Resolve this name again on reconnect.
+        // a URI-encoded host/socket path.
         if !host.is_empty() && !valid_host(host) {
             return Err(Error::Endpoint);
         }
@@ -132,6 +133,7 @@ impl Bootstrap {
             }
         };
         Ok(Self {
+            addresses: Default::default(),
             host: host.to_ascii_lowercase(),
             socket,
             port,

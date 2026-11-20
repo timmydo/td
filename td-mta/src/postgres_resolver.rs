@@ -6,11 +6,14 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 const MAX_DURATION: Duration = Duration::from_secs(5);
+// getaddrinfo supplies no authoritative DNS TTL.
+const REUSE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_ADDRESSES: usize = 16;
 const MAX_REPLY: usize = 1024;
 const HEADER: &str = "td-mta-dns-1";
@@ -22,10 +25,11 @@ pub enum Error {
     Spawn,
     Resolver,
     Protocol,
+    Capacity,
 }
 
 /// executable is the caller's trusted td-mta binary, not a shell or command.
-/// Each call resolves anew. The caller owns admission/concurrency limits.
+/// A parsed TCP bootstrap owns one short-lived positive answer.
 pub fn resolve(
     executable: &Path,
     bootstrap: &Bootstrap,
@@ -35,20 +39,67 @@ pub fn resolve(
         remaining_time(deadline)?;
         return Ok(vec![Endpoint::Unix(*path)]);
     }
-    if !executable.is_absolute() {
+    if !executable.is_absolute() || remaining(deadline)? > MAX_DURATION {
         return Err(Error::Invalid);
     }
-    resolve_host(
-        executable,
-        bootstrap.host().ok_or(Error::Invalid)?,
-        deadline,
-    )
-    .map(|addresses| {
-        addresses
-            .into_iter()
-            .map(|address| Endpoint::Tcp((address, bootstrap.port()).into()))
-            .collect()
-    })
+    let host = bootstrap.host().ok_or(Error::Invalid)?;
+    let endpoints = bootstrap
+        .addresses
+        .resolve(Instant::now, bootstrap.port(), || {
+            resolve_host(executable, host, deadline)
+        })?;
+    remaining_time(deadline)?;
+    Ok(endpoints)
+}
+
+struct Answer {
+    started: Instant,
+    addresses: Vec<IpAddr>,
+}
+
+#[derive(Default)]
+pub(crate) struct Cache(Mutex<Option<Answer>>);
+
+impl Cache {
+    fn resolve(
+        &self,
+        clock: impl Fn() -> Instant,
+        port: u16,
+        lookup: impl FnOnce() -> Result<Vec<IpAddr>, Error>,
+    ) -> Result<Vec<Endpoint>, Error> {
+        if let Ok(current) = self.0.try_lock() {
+            if let Some(answer) = current.as_ref() {
+                if clock()
+                    .checked_duration_since(answer.started)
+                    .is_some_and(|age| age < REUSE_WINDOW)
+                {
+                    return endpoints(&answer.addresses, port);
+                }
+            }
+        }
+        // Resolve outside the lock. Callers keep independent deadlines on a miss.
+        let started = clock();
+        let addresses = lookup()?;
+        let endpoints = endpoints(&addresses, port)?;
+        if let Ok(mut current) = self.0.try_lock() {
+            if current
+                .as_ref()
+                .is_none_or(|answer| answer.started <= started)
+            {
+                *current = Some(Answer { started, addresses });
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
+fn endpoints(addresses: &[IpAddr], port: u16) -> Result<Vec<Endpoint>, Error> {
+    let mut endpoints = td_alloc::with_capacity(addresses.len()).map_err(|_| Error::Capacity)?;
+    for &address in addresses {
+        td_alloc::push(&mut endpoints, Endpoint::Tcp((address, port).into()))
+            .map_err(|_| Error::Capacity)?;
+    }
+    Ok(endpoints)
 }
 
 /// Bounded resolution for one already-authorized service endpoint.
@@ -243,6 +294,119 @@ fn helper_reply(input: &mut impl Read, output: &mut impl Write) -> Result<(), Er
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn positive_answers_expire_from_lookup_start_and_errors_are_not_retained() {
+        let cache = Cache::default();
+        let first = IpAddr::from([192, 0, 2, 1]);
+        let next = IpAddr::from([192, 0, 2, 2]);
+        let now = Instant::now();
+        let deadline = now + REUSE_WINDOW;
+        let cold = cache
+            .resolve(|| now, 1234, || Ok(vec![next, first]))
+            .unwrap();
+        assert_eq!(cold, endpoints(&[next, first], 1234).unwrap());
+        assert_eq!(
+            td_alloc::with_reservation_limit(0, || cache.resolve(
+                || now,
+                1234,
+                || Err(Error::Spawn)
+            )),
+            Err(Error::Capacity)
+        );
+        assert_eq!(
+            cache.resolve(
+                || deadline - Duration::from_nanos(1),
+                1234,
+                || Err(Error::Spawn)
+            ),
+            Ok(cold),
+        );
+        assert_eq!(
+            cache.resolve(|| deadline, 1234, || Err(Error::Resolver)),
+            Err(Error::Resolver)
+        );
+        assert_eq!(
+            cache
+                .resolve(|| deadline, 1234, || Ok(vec![first]))
+                .unwrap(),
+            endpoints(&[first], 1234).unwrap()
+        );
+        let other = Cache::default();
+        assert_eq!(
+            other.resolve(|| deadline, 1234, || Err(Error::Spawn)),
+            Err(Error::Spawn)
+        );
+    }
+
+    #[test]
+    fn slow_lookup_does_not_get_another_window_on_completion() {
+        let cache = Cache::default();
+        let now = std::cell::Cell::new(Instant::now());
+        let first = IpAddr::from([192, 0, 2, 1]);
+        cache
+            .resolve(
+                || now.get(),
+                5432,
+                || {
+                    now.set(now.get() + REUSE_WINDOW);
+                    Ok(vec![first])
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cache.resolve(|| now.get(), 5432, || Err(Error::Spawn)),
+            Err(Error::Spawn)
+        );
+    }
+
+    #[test]
+    fn a_warm_bootstrap_still_enforces_the_callers_limits() {
+        let bootstrap = Bootstrap::parse("postgresql://u:p@localhost/db", "frontend").unwrap();
+        let first = IpAddr::from([192, 0, 2, 1]);
+        let now = Instant::now();
+        let expected = bootstrap
+            .addresses
+            .resolve(|| now, 5432, || Ok(vec![first]))
+            .unwrap();
+        let absent_helper = Path::new("/unused-helper");
+        assert_eq!(
+            resolve(absent_helper, &bootstrap, now),
+            Err(Error::Deadline)
+        );
+        let too_long = now + MAX_DURATION + Duration::from_secs(5);
+        assert_eq!(
+            resolve(absent_helper, &bootstrap, too_long),
+            Err(Error::Invalid)
+        );
+        let allowed = now + MAX_DURATION;
+        assert_eq!(
+            resolve(Path::new("td-mta"), &bootstrap, allowed),
+            Err(Error::Invalid)
+        );
+        assert_eq!(resolve(absent_helper, &bootstrap, allowed), Ok(expected));
+    }
+
+    #[test]
+    fn overlapping_lookups_keep_the_newer_answer() {
+        let cache = Cache::default();
+        let first = IpAddr::from([192, 0, 2, 1]);
+        let next = IpAddr::from([192, 0, 2, 2]);
+        let now = Instant::now();
+        let later = now + Duration::from_millis(10);
+        cache
+            .resolve(
+                || now,
+                5432,
+                || {
+                    cache.resolve(|| later, 5432, || Ok(vec![next]))?;
+                    Ok(vec![first])
+                },
+            )
+            .unwrap();
+        let cached = cache.resolve(|| later, 5432, || Err(Error::Spawn)).unwrap();
+        assert_eq!(cached, endpoints(&[next], 5432).unwrap());
+    }
 
     #[test]
     fn reply_is_complete_bounded_unique_and_typed() {

@@ -1460,9 +1460,9 @@ bounded std-only DNS adapter with explicit UDP/TCP deadlines and A/AAAA/CNAME
 limits; do not hide uninterruptible resolver work in unbounded threads.
 The PostgreSQL bootstrap/writer endpoint is a separate cold-path exception:
 POSTGRES.md section 10 uses a disposable, deadline-owned system-resolver
-process, with a five-second cap and fresh lookup on each call. It does not
-implement the mail-routing Resolver port or supply a TTL; trusted platform
-resolver configuration and cache policy apply within that child.
+process with a five-second cap. A parsed bootstrap can reuse a positive
+answer for one second from lookup start. The child uses the trusted platform
+resolver, which supplies no TTL. Mail-routing DNS uses its own Resolver port.
 Never perform recipient-MX lookups for outbound mail. Saturation produces SMTP
 temporary failure, HTTP/JMAP limit responses, or bounded retry, as appropriate.
 

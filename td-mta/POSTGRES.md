@@ -73,8 +73,9 @@ A protected Unix-domain socket is a separately explicit local transport,
 with SCRAM database login and trusted socket-directory ownership.
 It does not silently replace a failed TLS connection. Initial authentication
 is PostgreSQL SCRAM over verified TLS or the private socket; cloud identity-token login is
-not required for the initial runtime integration. Resolve the configured writer endpoint
-again on reconnect, within bounded DNS and connection deadlines.
+not required for the initial runtime integration. Select addresses for the configured
+writer endpoint within bounded DNS and connection deadlines, under the one-second
+positive-answer policy in section 10.
 
 Startup connects, verifies writable-primary status and supported schema,
 loads and validates a complete profile/configuration generation, checks
@@ -498,7 +499,8 @@ URI (`postgres://` is also accepted). Credentials and database are explicit;
 there are no environment defaults, password files, service-name expansion,
 multiple hosts or Unix-socket fallback. For TCP, HOST is an ASCII DNS name, including
 localhost, authenticated by the TLS facade; literal IPs, numeric address
-shorthand, numeric final labels and encoded hosts are refused. The default port is 5432. Reconnect must resolve HOST again.
+shorthand, numeric final labels and encoded hosts are refused. The default port
+is 5432. TLS verifies HOST on every connection.
 
 The optional query accepts `sslmode=verify-full` and an absolute
 `sslrootcert` path, each at most once. Verification is mandatory even without
@@ -531,12 +533,22 @@ For an explicit Unix bootstrap, `postgres_resolver::resolve` returns the
 single typed socket endpoint under the supplied deadline, without launching
 a child. For TCP it accepts the parsed bootstrap, the caller's
 trusted absolute td-mta executable path and an absolute deadline at most five seconds
-away. It starts that executable in private resolver mode with a cleared
+away. On a cache miss it starts that executable in private resolver mode with a cleared
 environment, hostname-only stdin, bounded stdout and discarded stderr.
 No connection URI, credentials, profile or trust bytes enter the child.
-Each invocation performs a fresh system resolver lookup; any system DNS
-cache retains its own TTL policy. This is not database connection retry or
-service activation.
+One parsed bootstrap may reuse its most recent positive answer, in resolver
+order, for one second from lookup start. A hit never extends that interval.
+The platform supplies no DNS TTL. If the address changes, a new connection
+can see the old answer until the interval expires. Existing transport
+fallback, TLS hostname verification, primary qualification and mutation
+settlement apply as usual. The next lookup after expiry consults the system
+resolver even if all recent connections failed. Negative answers and expired
+answers are never served from the cache.
+
+Each profile load starts empty. The cache retains at most sixteen IP
+addresses, with no credentials or trust material. Concurrent misses can run
+independently within the existing worker limits, without waiting for another
+caller's helper. The dedicated outbound HTTP lookup has no such cache.
 
 The child uses the platform resolver and may consult trusted host resolver
 configuration. Blocking libc/NSS resolution stays outside service workers.
@@ -2852,9 +2864,9 @@ the active receive/JMAP service constructs these owners.
 
 ## 72. Reserved fresh runtime reads
 
-`Snapshot::open_resolved` reserves a process-local read slot before starting
-DNS, then resolves the protected bootstrap endpoint afresh and forces runtime
-connection qualification. The same slot and original finite allowance cover
+`Snapshot::open_resolved` reserves a process-local read slot before selecting
+addresses for the protected bootstrap endpoint and qualifying the runtime
+connection. The same slot and original finite allowance cover
 resolution, all attempted addresses, authentication and snapshot ownership.
 Only transport connection failures advance to another resolved address;
 policy, credential, schema and database failures have no fallback.
@@ -2958,7 +2970,7 @@ not a persistent database index or a latency guarantee.
 The prepared HTTP backend serves raw blobs and direct MIME-part locators
 through the existing shared download encoder. Target account and observed
 device must match before connection admission. It reserves two read slots
-before fresh DNS: one for the verified body snapshot, one for fresh primary
+before endpoint resolution: one for the verified body snapshot, one for fresh primary
 reauthorization before the callback. Both runtime connections qualify the
 database role. The snapshot, MIME processing and transmission share the
 original deadline capped at thirty seconds; no reconnect renews that budget.
@@ -3015,7 +3027,7 @@ survive that transition. The connection slot remains reserved until the next
 method reopens it or drops the reservation; this is conservative capacity
 accounting, not a retained database transaction.
 
-Reopening performs fresh DNS, runtime-role qualification and full device
+Reopening performs bounded endpoint resolution, runtime-role qualification and full device
 secret authentication against the original profile/account binding. It
 captures a new account state. The original deadline is capped once at read
 admission and never extended by closing or reopening. The reservation stores
@@ -3031,7 +3043,7 @@ or production PostgreSQL service is activated here.
 The prepared HTTPS backend admits td-mail's standalone Email/set keyword
 updates through the shared bounded request parser and response reservation.
 It closes its authenticated read snapshot before mutation and reserves a
-connection slot before fresh DNS. Runtime connections check the selected
+connection slot before endpoint resolution. Runtime connections check the selected
 profile, account, device secret and optional Email state under transaction
 locks. Read-only batches retain their existing single snapshot. Mixed batches
 cannot invoke this mutation adapter. Draft creation remains outside this
@@ -3618,7 +3630,7 @@ validator under its account write lock. Readiness writes no mail or receipt
 and does not replace fresh publication authorization or reserve quota.
 
 The owner reserves
-foreground capacity before fresh resolution and retains one ten-second phase
+foreground capacity before endpoint resolution and retains one ten-second phase
 under the caller's deadline. Errors remain typed; no local fallback or listener
 activation is introduced. The runtime-role PostgreSQL fixture covers success,
 missing Inbox, incoherent Inbox history, stale selection,
@@ -7648,8 +7660,8 @@ fail the request.
 A session admits at most 64 jobs within sixty seconds of creation. Each job
 keeps its own original deadline, capped at ten seconds including initial DNS,
 TCP, TLS and SCRAM. Before starting a later job whose complete allowance would
-outlive the session, the adapter closes the old connection and performs fresh
-DNS/TLS/SCRAM admission. The existing fixed authentication worker checks local
+outlive the session, the adapter closes the old connection, selects addresses
+under section 10 and repeats TLS/SCRAM admission. The existing fixed authentication worker checks local
 idle state once per second, outside client-slot locks, and retires a session
 when fewer than ten seconds of its original lifetime remain or its job count
 is exhausted. This maintenance performs no authorization query, driver health

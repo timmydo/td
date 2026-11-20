@@ -103,7 +103,7 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
 
 /// The prepared session must belong
 /// to this binding. HTTPS and response retention must share this exact clock.
-/// Read capacity is reserved before fresh DNS; no SQL runs on the reactor.
+/// Read capacity is reserved before endpoint resolution. Workers own all SQL.
 pub struct Service<'s, 'sr, 'a> {
     pub loaded: &'s Loaded,
     pub executable: &'s Path,

@@ -2931,7 +2931,6 @@ td-mta/src/postgres_replica_source.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_replica_transition.rs	direct-reservation	1
 td-mta/src/postgres_replica_transition.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_resolver.rs	allocating-constructor	4
-td-mta/src/postgres_resolver.rs	allocating-conversion	1
 td-mta/src/postgres_resolver.rs	allocation-macro	2
 td-mta/src/postgres_resolver.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_route_health.rs	heap-owner	1

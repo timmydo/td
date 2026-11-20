@@ -248,7 +248,7 @@ impl<'a> Snapshot<'a> {
         }
         Self::open(slots, request, trust, deadline, binding, password)
     }
-    /// Fresh DNS and primary snapshot admission share one reserved slot and
+    /// Endpoint resolution and primary snapshot admission share one reserved slot and
     /// original allowance. Only transport connection failures try another
     /// resolved address; policy, authentication and database failures refuse.
     pub fn open_resolved(
@@ -420,7 +420,7 @@ impl<'a> Snapshot<'a> {
     }
 }
 impl<'a> BetweenMethods<'a> {
-    /// Fresh DNS, runtime-role qualification and full credential authentication
+    /// Endpoint resolution, runtime-role qualification and full credential authentication
     /// on the original profile/account binding and reserved capacity.
     pub fn reopen(
         self,
