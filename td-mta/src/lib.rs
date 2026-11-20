@@ -1,5 +1,5 @@
 //! Service foundations and direct SMTP receiving; no automatic listener activation.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod admission;
 pub use td_mime::body_charset;
@@ -192,6 +192,7 @@ mod postgres_summaries;
 pub mod postgres_summary_backfill;
 pub mod preview_json;
 pub mod property_selection;
+mod readiness_sys;
 pub mod recipient_sweep;
 pub mod reference_sweep;
 pub mod replica_source;

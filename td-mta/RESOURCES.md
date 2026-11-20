@@ -20,6 +20,12 @@ returning a fixed-size ledger. It allocates no pools and starts no workers.
 format. Local IDs are distinct 16-byte types with canonical lowercase hex;
 they convey no authorization. Derived MIME-part wire IDs belong to M02.
 
+
+Each live PostgreSQL driver uses three descriptors: its connected TCP or
+Unix socket and both ends of its private worker-wake socket pair. This
+applies to each admitted fresh connection and each retained connection,
+including while idle. POSTGRES.md describes readiness and retirement.
+
 ## Default reservation
 
 All quantities below are bytes. This is a planning estimate for each
@@ -3325,8 +3331,8 @@ The TLS pool has exactly `tls_handshakes` workers and retains the receiver's
 shared HandshakePool. Idle initial sockets take no handshake permit or
 blocking wait. An admitted handshake stays with one worker, which waits for
 wire input in at most 50 ms blocking slices within the original deadline.
-The socket returns to nonblocking mode after each wait; slice timeout does
-not retire it. Stop is checked between slices. Pending output uses bounded
+The socket stays nonblocking during readiness waits. Slice timeout retains
+the connection. Stop is checked between slices. Pending output uses bounded
 turns with a one-millisecond wait. Network scans and idle worker scans retain
 the five-millisecond bound. Stack planning counts nine other fixed roles
 plus these TLS workers; this is not a measured stack/RSS guarantee. Each nonblocking network turn reads at most 16 KiB, parses

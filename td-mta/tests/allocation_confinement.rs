@@ -26,6 +26,35 @@ fn fingerprint(source: &str, expected: &str) {
     );
 }
 
+fn readiness_users(relative: &str, source: &str) {
+    let uses = match relative {
+        "td-mta/src/lib.rs" => {
+            assert!(source.contains("mod readiness_sys;"));
+            1
+        }
+        "td-mta/src/transport.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            assert!(compact.contains("readiness_sys::wait(Connected::Tcp(self.connected()?),Interest{read:true,write:false,},None,until,)"));
+            2
+        }
+        "td-mta/src/postgres_probe/driver.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            assert!(compact.contains("readiness_sys::wait(socket.wire.descriptor().map_err(|_|Error::Transport)?,socket.interest,Some(&self.receiver),deadline,)"));
+            assert!(compact.contains(
+                "let(sender,receiver)=UnixStream::pair().map_err(|_|Error::Transport)?;"
+            ));
+            assert!(compact.contains("receiver,signal:Arc::new(Signal{"));
+            assert_eq!(words(source, "receiver"), 6);
+            assert_eq!(source.matches("impl DriverTransport for ").count(), 2);
+            assert!(source.contains("self.connected().map(Connected::Tcp)"));
+            assert!(source.contains("self.connected().map(Connected::Unix)"));
+            2
+        }
+        _ => 0,
+    };
+    assert_eq!(words(source, "readiness_sys"), uses, "{relative}");
+}
+
 fn scan(root: &Path, path: &Path) {
     for entry in std::fs::read_dir(path).unwrap() {
         let entry = entry.unwrap();
@@ -43,7 +72,16 @@ fn scan(root: &Path, path: &Path) {
             continue;
         }
         let source = std::fs::read_to_string(&path).unwrap();
-        if relative == "td-mta/src/signal_sys.rs" {
+        readiness_users(relative, &source);
+        if relative == "td-mta/src/readiness_sys.rs" {
+            assert_eq!(words(&source, "unsafe"), 2);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
+            assert_eq!(source.matches("std::arch::asm!").count(), 2);
+            fingerprint(
+                &source,
+                "64eae2313159fa13ce0ce88b6a21cb1d717ad6d215b81a42384fc23c30947cf6",
+            );
+        } else if relative == "td-mta/src/signal_sys.rs" {
             assert_eq!(words(&source, "unsafe"), 2);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
             assert_eq!(source.matches("std::arch::asm!").count(), 2);
@@ -249,7 +287,8 @@ fn scan(root: &Path, path: &Path) {
 fn allocation_surface_is_separate_and_exact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let library = include_str!("../src/lib.rs");
-    assert_eq!(library.matches("#![forbid(unsafe_code)]").count(), 1);
+    assert_eq!(library.matches("#![deny(unsafe_code)]").count(), 1);
+    assert_eq!(library.matches("mod readiness_sys;").count(), 1);
     assert_eq!(
         include_str!("../src/main.rs")
             .matches("#![deny(unsafe_code)]")

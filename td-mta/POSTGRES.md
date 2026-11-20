@@ -424,22 +424,20 @@ late stream is closed. Repeated failures cannot accumulate unbounded threads.
 These helpers exist only while dialing Unix endpoints, with at most 2 MiB
 of requested stack reservation per process, in addition to thread overhead.
 
-The private async adapter belongs to one worker. Reads during driver polls
-remain nonblocking: the pinned driver polls reads before flushing writes, so
-blocking there could prevent the request from reaching PostgreSQL. Socket
-writes block only under the current operation deadline. After a complete
-poll without socket progress or a driver channel wakeup, the worker waits
-for socket readability with a deadline-bounded TCP peek. Unix waits retain
-one consumed byte and return it before subsequent reads; no protocol byte is lost.
-The adapter restores nonblocking mode before the next driver poll. Idle
-health checks never wait for readability. One private synchronized owner
-shares this socket between the adapter and its worker; no cloned socket,
-Tokio runtime, network/time driver, background task or concurrent query is
-introduced. Connect, TLS handshake, each retained job and teardown use their
-own existing deadline, without renewal. Cleanup waits at most its existing
-100-ms allowance. All loop turns and final success check the original
-deadline. Native crypto work remains subject to TLS.md's between-call
-deadline limitations.
+One worker polls the request future and the PostgreSQL connection on its
+own thread. TCP and Unix reads and writes stay nonblocking during startup,
+queries and shutdown. The worker retries after socket bytes, TLS record
+processing or a driver wake. Once idle it waits in Linux `ppoll` for
+the read and write directions that actually blocked, together with a
+private wake socket. Channel wakes can interrupt that wait. LISTEN uses
+the same mechanism within the caller's slice; idle health checks return
+directly. Each live driver owns one database socket and two local wake
+descriptors. Connection setup fails if it cannot reserve the pair.
+
+The caller and driver share one database connection. Connect, handshake,
+each retained job and teardown keep their original deadlines, including
+the 100 ms cleanup cap. A signal-interrupted wait recomputes time left.
+Native crypto work remains subject to TLS.md's between-call limits.
 
 Before driver intake, cap backend frames at 128 KiB including their length
 word, 128 frames and one MiB total for the entire connection. Fragmented

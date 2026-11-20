@@ -11,12 +11,8 @@ use std::{
     io,
     net::{SocketAddr, TcpStream},
     pin::{pin, Pin},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    task::{Context, Poll, Wake, Waker},
-    thread,
+    sync::Arc,
+    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 use td_crypto::{ClientConfig, ClockHandle, TlsProtocol, TlsSession, TrustStore};
@@ -734,15 +730,8 @@ fn connect_authenticated_until(
             )
         }
     };
-    let activity = Arc::new(AtomicBool::new(false));
-    let socket = Arc::new(Mutex::new(DriverSocket {
-        transport,
-        deadline: connect_deadline,
-    }));
-    let transport = Network {
-        socket: socket.clone(),
-        activity: activity.clone(),
-    };
+    let driver = Driver::new(transport, connect_deadline)?;
+    let transport = Network(Arc::clone(&driver));
     let mut config = Config::new();
     config
         .host(request.server_name)
@@ -785,33 +774,29 @@ fn connect_authenticated_until(
             (raw, Encryption::Local)
         }
     };
-    let waker = Waker::from(Arc::new(WorkerWake(thread::current(), activity.clone())));
+    let waker = driver.waker();
     let mut context = Context::from_waker(&waker);
     let mut handshake_timing =
         crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
     let mut connect = pin!(config.connect_raw(raw, connector));
     let (client, connection) = loop {
         remaining(connect_deadline)?;
-        activity.store(false, Ordering::Relaxed);
+        driver.begin_poll(connect_deadline)?;
         if let Poll::Ready(result) = connect.as_mut().poll(&mut context) {
             break result.map_err(|_| Error::Database)?;
         }
-        if !activity.load(Ordering::Relaxed) {
-            wait_socket(&socket, connect_deadline)?;
-        }
+        driver.wait_until(connect_deadline)?;
     };
     handshake_timing.succeeded();
     drop(handshake_timing);
     timing.succeeded();
-    socket.lock().map_err(|_| Error::Transport)?.deadline = deadline;
     Ok(Worker {
         client: Some(client),
         connection: Box::pin(connection),
         deadline,
         waker,
         failed: None,
-        activity,
-        socket,
+        driver,
         validation_window,
         audit_windows: false,
         relay_wake: false,
@@ -824,8 +809,7 @@ pub(crate) struct Worker {
     deadline: Instant,
     waker: Waker,
     failed: Option<Error>,
-    activity: Arc<AtomicBool>,
-    socket: Arc<Mutex<DriverSocket>>,
+    driver: Arc<Driver>,
     validation_window: Option<windows::Windows>,
     audit_windows: bool,
     relay_wake: bool,
@@ -850,7 +834,6 @@ impl Worker {
     }
     pub(crate) fn constrain_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
         self.deadline = self.deadline.min(deadline);
-        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         self.check()
     }
     pub(crate) fn check_deadline(&mut self) -> Result<(), Error> {
@@ -866,7 +849,6 @@ impl Worker {
     // No query or round trip: drain available asynchronous messages so an idle
     // cached read cannot hide a terminal connection error behind a notice.
     pub(crate) fn check(&mut self) -> Result<(), Error> {
-        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -876,9 +858,9 @@ impl Worker {
                 self.failed = Some(error);
                 return Err(error);
             }
-            self.activity.store(false, Ordering::Relaxed);
+            self.driver.begin_poll(self.deadline)?;
             match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Pending if !self.activity.load(Ordering::Relaxed) => return Ok(()),
+                Poll::Pending if !self.driver.active() => return Ok(()),
                 Poll::Pending => {}
                 Poll::Ready(Some(Ok(message))) => {
                     self.relay_wake |= relay_notification(&message);
@@ -897,7 +879,6 @@ impl Worker {
             &'a tokio_postgres::Client,
         ) -> Pin<Box<dyn Future<Output = T> + 'a>>,
     ) -> Result<T, Error> {
-        self.socket.lock().map_err(|_| Error::Transport)?.deadline = self.deadline;
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbWork);
         if let Some(error) = self.failed {
             return Err(error);
@@ -917,7 +898,7 @@ impl Worker {
                 self.failed = Some(error);
                 return Err(error);
             }
-            self.activity.store(false, Ordering::Relaxed);
+            self.driver.begin_poll(self.deadline)?;
             if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
                 if let Some(window) = audit_window {
                     window.finish().map_err(|_| Error::Database)?;
@@ -936,11 +917,9 @@ impl Worker {
                     return Err(Error::Database);
                 }
             }
-            if !self.activity.load(Ordering::Relaxed) {
-                if let Err(error) = wait_socket(&self.socket, self.deadline) {
-                    self.failed = Some(error);
-                    return Err(error);
-                }
+            if let Err(error) = self.driver.wait_until(self.deadline) {
+                self.failed = Some(error);
+                return Err(error);
             }
         }
     }
@@ -958,14 +937,11 @@ impl Drop for Worker {
         let until = self
             .deadline
             .min(Instant::now() + Duration::from_millis(100));
-        if let Ok(mut socket) = self.socket.lock() {
-            socket.deadline = until;
-        } else {
-            return;
-        }
         let mut context = Context::from_waker(&self.waker);
         while Instant::now() < until {
-            self.activity.store(false, Ordering::Relaxed);
+            if self.driver.begin_poll(until).is_err() {
+                return;
+            }
             match self.connection.as_mut().poll_message(&mut context) {
                 Poll::Ready(None) => {
                     timing.succeeded();
@@ -973,8 +949,8 @@ impl Drop for Worker {
                 }
                 Poll::Ready(Some(Err(_))) => return,
                 Poll::Ready(Some(Ok(_))) => (),
-                Poll::Pending if !self.activity.load(Ordering::Relaxed) => {
-                    if wait_socket(&self.socket, until).is_err() {
+                Poll::Pending if !self.driver.active() => {
+                    if self.driver.wait_until(until).is_err() {
                         return;
                     }
                 }
@@ -1021,136 +997,8 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
         .ok_or(Error::Deadline)
 }
 
-struct WorkerWake(thread::Thread, Arc<AtomicBool>);
-impl Wake for WorkerWake {
-    fn wake(self: Arc<Self>) {
-        self.1.store(true, Ordering::Relaxed);
-        self.0.unpark();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.1.store(true, Ordering::Relaxed);
-        self.0.unpark();
-    }
-}
-
-// TLS can consume an encrypted header and report no plaintext yet. Track
-// actual socket progress below it so the worker does not sleep on that work.
-struct DriverSocket {
-    transport: Box<dyn DriverTransport>,
-    deadline: Instant,
-}
-
-trait DriverTransport: Transport + Send {
-    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error>;
-    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error>;
-    fn write_until(
-        &mut self,
-        input: &[u8],
-        until: Instant,
-    ) -> Result<IoProgress, crate::ports::Error>;
-}
-impl DriverTransport for TcpTransport {
-    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error> {
-        self.wait_readable_slice(until)
-    }
-    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error> {
-        self.wait_readable(until)
-    }
-    fn write_until(
-        &mut self,
-        input: &[u8],
-        until: Instant,
-    ) -> Result<IoProgress, crate::ports::Error> {
-        self.write_until(input, until)
-    }
-}
-impl DriverTransport for UnixTransport {
-    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error> {
-        self.wait_readable_slice(until)
-    }
-    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error> {
-        self.wait_readable(until)
-    }
-    fn write_until(
-        &mut self,
-        input: &[u8],
-        until: Instant,
-    ) -> Result<IoProgress, crate::ports::Error> {
-        self.write_until(input, until)
-    }
-}
-
-fn wait_socket(socket: &Mutex<DriverSocket>, deadline: Instant) -> Result<(), Error> {
-    socket
-        .lock()
-        .map_err(|_| Error::Transport)?
-        .transport
-        .wait_readable(deadline)
-        .map_err(|error| {
-            if error == crate::ports::Error::Deadline {
-                Error::Deadline
-            } else {
-                Error::Transport
-            }
-        })
-}
-
-struct Network {
-    socket: Arc<Mutex<DriverSocket>>,
-    activity: Arc<AtomicBool>,
-}
-impl Network {
-    fn progress(
-        &self,
-        result: Result<IoProgress, crate::ports::Error>,
-    ) -> Result<IoProgress, crate::ports::Error> {
-        if matches!(result, Ok(IoProgress::Bytes(count)) if count > 0) {
-            self.activity.store(true, Ordering::Relaxed);
-        }
-        result
-    }
-}
-impl Transport for Network {
-    fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
-        let result = self
-            .socket
-            .lock()
-            .map_err(|_| crate::ports::Error::Invalid)?
-            .transport
-            .read(output);
-        self.progress(result)
-    }
-    fn write(&mut self, input: &[u8]) -> Result<IoProgress, crate::ports::Error> {
-        let result = {
-            let mut socket = self
-                .socket
-                .lock()
-                .map_err(|_| crate::ports::Error::Invalid)?;
-            let deadline = socket.deadline;
-            socket.transport.write_until(input, deadline)
-        };
-        self.progress(result)
-    }
-    fn flush(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-        self.socket
-            .lock()
-            .map_err(|_| crate::ports::Error::Invalid)?
-            .transport
-            .flush()
-    }
-    fn close(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-        self.socket
-            .lock()
-            .map_err(|_| crate::ports::Error::Invalid)?
-            .transport
-            .close()
-    }
-    fn abort(&mut self) {
-        if let Ok(mut socket) = self.socket.lock() {
-            socket.transport.abort();
-        }
-    }
-}
+mod driver;
+use driver::{Driver, DriverTransport, Network};
 
 type Secure = TlsIo<Network, Box<[u8; TLS_WIRE_BYTES]>>;
 struct Connector {
@@ -1196,7 +1044,7 @@ impl tls::TlsConnect<Io<Network>> for Connector {
                 Box::new([0; TLS_WIRE_BYTES]),
             )
             .map_err(|_| refused())?;
-            poll_fn(|_| match secure.handshake() {
+            poll_fn(|cx| match secure.drive(cx, |wire| wire.handshake()) {
                 Ok(Some(_)) => Poll::Ready(Ok(())),
                 Ok(None) => Poll::Pending,
                 Err(_) => Poll::Ready(Err(refused())),
@@ -1217,9 +1065,25 @@ impl tls::TlsStream for Io<Secure> {
     }
 }
 
-// Private to this worker: read Pending never blocks a driver write. After
-// a complete poll with no socket or channel progress, the owner waits for
-// readability. No external reactor or concurrent operation uses this socket.
+// Network records actual wire progress and blocked directions. TLS may also
+// consume a buffered record or queue ciphertext without touching the socket.
+trait DriverIo: Transport {
+    fn drive<R>(&mut self, _cx: &Context<'_>, op: impl FnOnce(&mut Self) -> R) -> R {
+        op(self)
+    }
+}
+impl DriverIo for Network {}
+impl DriverIo for Secure {
+    fn drive<R>(&mut self, cx: &Context<'_>, op: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.buffered_state();
+        let result = op(self);
+        if self.buffered_state() != before {
+            cx.waker().wake_by_ref();
+        }
+        result
+    }
+}
+
 struct Io<T> {
     transport: T,
     input: Option<Input>,
@@ -1237,10 +1101,10 @@ impl<T> Io<T> {
 fn refused() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
-impl<T: Transport + Unpin> AsyncRead for Io<T> {
+impl<T: DriverIo + Unpin> AsyncRead for Io<T> {
     fn poll_read(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if output.remaining() == 0 {
@@ -1251,7 +1115,7 @@ impl<T: Transport + Unpin> AsyncRead for Io<T> {
         let Some(bytes) = output.initialize_unfilled().get_mut(..length) else {
             return Poll::Ready(Err(refused()));
         };
-        match this.transport.read(bytes) {
+        match this.transport.drive(cx, |wire| wire.read(bytes)) {
             Ok(IoProgress::Bytes(count)) => {
                 let Some(received) = bytes.get(..count) else {
                     return Poll::Ready(Err(refused()));
@@ -1271,10 +1135,10 @@ impl<T: Transport + Unpin> AsyncRead for Io<T> {
         }
     }
 }
-impl<T: Transport + Unpin> AsyncWrite for Io<T> {
+impl<T: DriverIo + Unpin> AsyncWrite for Io<T> {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
@@ -1293,7 +1157,7 @@ impl<T: Transport + Unpin> AsyncWrite for Io<T> {
             this.transport.abort();
             return Poll::Ready(Err(refused()));
         }
-        match this.transport.write(bytes) {
+        match this.transport.drive(cx, |wire| wire.write(bytes)) {
             Ok(IoProgress::Bytes(count)) if count <= bytes.len() => {
                 this.output_left -= count;
                 if this
@@ -1310,11 +1174,11 @@ impl<T: Transport + Unpin> AsyncWrite for Io<T> {
             _ => Poll::Ready(Err(refused())),
         }
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        progress(self.get_mut().transport.flush())
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        progress(self.get_mut().transport.drive(cx, Transport::flush))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        progress(self.get_mut().transport.close())
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        progress(self.get_mut().transport.drive(cx, Transport::close))
     }
 }
 fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Result<()>> {
@@ -1345,7 +1209,7 @@ use framing::Input;
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::{net::TcpListener, thread};
 
     #[test]
     fn transport_tick_never_expires_before_exact_worker_allowance() {
@@ -1387,35 +1251,73 @@ mod tests {
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let activity = Arc::new(AtomicBool::new(false));
-        let mut network = Network {
-            socket: Arc::new(Mutex::new(DriverSocket {
-                transport: Box::new(TcpTransport::from_stream(socket).unwrap()),
-                deadline: Instant::now() + Duration::from_secs(5),
-            })),
-            activity: activity.clone(),
-        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let driver = Driver::new(
+            Box::new(TcpTransport::from_stream(socket).unwrap()),
+            deadline,
+        )
+        .unwrap();
+        let mut network = Network(Arc::clone(&driver));
         let mut byte = [0];
         assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
         assert_eq!(network.flush(), Ok(FlushProgress::Complete));
-        assert!(!activity.load(Ordering::Relaxed));
+        assert!(!driver.active());
         peer.write_all(b"x").unwrap();
         let stop = Instant::now() + Duration::from_secs(1);
         while network.read(&mut byte).unwrap() == IoProgress::Pending {
-            assert!(!activity.load(Ordering::Relaxed));
+            assert!(!driver.active());
             assert!(Instant::now() < stop);
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(byte, *b"x");
-        assert!(activity.load(Ordering::Relaxed));
-        activity.store(false, Ordering::Relaxed);
+        assert!(driver.active());
+        driver.begin_poll(deadline).unwrap();
         assert_eq!(network.write(b"y"), Ok(IoProgress::Bytes(1)));
-        assert!(activity.load(Ordering::Relaxed));
+        assert!(driver.active());
         peer.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"y");
-        activity.store(false, Ordering::Relaxed);
+        driver.begin_poll(deadline).unwrap();
         assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
-        assert!(!activity.load(Ordering::Relaxed));
+        assert!(!driver.active());
+    }
+
+    #[test]
+    fn pending_output_leaves_the_same_driver_free_to_read() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let (mut raw, mut peer) = UnixStream::pair().unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let chunk = [1; crate::transport::SOCKET_CHUNK];
+        let mut queued = 0;
+        loop {
+            match raw.write(&chunk) {
+                Ok(0) => panic!("closed fixture"),
+                Ok(n) => queued += n as u64,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("fill socket: {other:?}"),
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let driver =
+            Driver::new(Box::new(UnixTransport::from_stream(raw).unwrap()), deadline).unwrap();
+        let mut network = Network(Arc::clone(&driver));
+        let mut byte = [0];
+        assert_eq!(network.write(&chunk), Ok(IoProgress::Pending));
+        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
+        peer.write_all(b"x").unwrap();
+        assert!(driver.wait(deadline).unwrap());
+        assert_eq!(network.read(&mut byte), Ok(IoProgress::Bytes(1)));
+        assert_eq!(byte, *b"x");
+
+        driver.begin_poll(deadline).unwrap();
+        assert_eq!(network.write(&chunk), Ok(IoProgress::Pending));
+        assert!(!driver
+            .wait(Instant::now() + Duration::from_millis(10))
+            .unwrap());
+        let drained =
+            io::copy(&mut std::io::Read::take(&mut peer, queued), &mut io::sink()).unwrap();
+        assert_eq!(drained, queued);
+        assert!(driver.wait(deadline).unwrap());
+        assert_eq!(network.write(&chunk), Ok(IoProgress::Bytes(chunk.len())));
     }
 
     struct WindowTransport {
@@ -1423,6 +1325,7 @@ mod tests {
         calls: usize,
         aborted: bool,
     }
+    impl DriverIo for WindowTransport {}
     impl Transport for WindowTransport {
         fn read(&mut self, _: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
             Ok(IoProgress::Pending)
@@ -1464,11 +1367,7 @@ mod tests {
         let window = io.input.as_ref().unwrap().window().unwrap();
         window.begin().unwrap();
         window.output(64 * 1024 - 2).unwrap();
-        let waker = Waker::from(Arc::new(WorkerWake(
-            thread::current(),
-            Arc::new(AtomicBool::new(false)),
-        )));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert!(Pin::new(&mut io)
             .poll_write(&mut context, b"ab")
             .is_pending());

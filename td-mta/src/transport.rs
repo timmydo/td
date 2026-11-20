@@ -82,90 +82,26 @@ impl TcpTransport {
         }
     }
 
-    // Admitted PostgreSQL and HTTPS owners use these waits between progress
-    // turns. Restore nonblocking mode before returning to the TLS adapter.
-    pub(crate) fn wait_readable(&mut self, until: Instant) -> Result<(), Error> {
-        let result = self.blocking(until, true, |socket| socket.peek(&mut [0]));
-        result.map(|_| ())
+    pub(crate) fn connected(&self) -> Result<&TcpStream, Error> {
+        self.socket
+            .as_ref()
+            .ok_or(self.failure.unwrap_or(Error::Invalid))
     }
 
     /// A scheduler slice may expire without retiring a healthy connection.
     pub(crate) fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, Error> {
-        self.blocking_slice(until, true, |socket| socket.peek(&mut [0]))
-            .map(|count| count.is_some())
-    }
-
-    pub(crate) fn write_until(
-        &mut self,
-        input: &[u8],
-        until: Instant,
-    ) -> Result<IoProgress, Error> {
-        if input.is_empty() {
-            return Ok(IoProgress::Pending);
-        }
-        if self.write_closed {
-            return self.write(input);
-        }
-        let bytes = input
-            .get(..input.len().min(SOCKET_CHUNK))
-            .ok_or(Error::Invalid)?;
-        let count = self.blocking(until, false, |socket| socket.write(bytes))?;
-        self.progress(Ok(count), false)
-    }
-
-    fn blocking(
-        &mut self,
-        until: Instant,
-        reading: bool,
-        operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
-    ) -> Result<usize, Error> {
-        self.blocking_slice(until, reading, operation)?
-            .ok_or_else(|| self.fail(Error::Deadline))
-    }
-
-    fn blocking_slice(
-        &mut self,
-        until: Instant,
-        reading: bool,
-        mut operation: impl FnMut(&mut TcpStream) -> io::Result<usize>,
-    ) -> Result<Option<usize>, Error> {
-        let result = (|| {
-            let socket = self.socket()?;
-            socket.set_nonblocking(false).map_err(Error::from)?;
-            loop {
-                let Some(allowance) = until
-                    .checked_duration_since(Instant::now())
-                    .filter(|value| !value.is_zero())
-                else {
-                    return Ok(None);
-                };
-                if reading {
-                    socket.set_read_timeout(Some(allowance))
-                } else {
-                    socket.set_write_timeout(Some(allowance))
-                }
-                .map_err(Error::from)?;
-                match operation(socket) {
-                    Ok(count) => return Ok(Some(count)),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        })();
-        let restored = (|| {
-            let socket = self.socket()?;
-            socket.set_nonblocking(true).map_err(Error::from)?;
-            socket.set_read_timeout(None).map_err(Error::from)?;
-            socket.set_write_timeout(None).map_err(Error::from)
-        })();
-        match result.and_then(|count| restored.map(|()| count)) {
-            Ok(count) => Ok(count),
-            Err(error) => Err(self.fail(error)),
-        }
+        use crate::readiness_sys::{self, Connected, Interest, Ready};
+        readiness_sys::wait(
+            Connected::Tcp(self.connected()?),
+            Interest {
+                read: true,
+                write: false,
+            },
+            None,
+            until,
+        )
+        .map(|ready| !matches!(ready, Ready::Timeout))
+        .map_err(|error| self.fail(error.into()))
     }
 
     fn socket(&mut self) -> Result<&mut TcpStream, Error> {

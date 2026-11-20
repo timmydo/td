@@ -2864,8 +2864,9 @@ td-mta/src/postgres_mime_evidence.rs	unchecked-growth-or-clone	12
 td-mta/src/postgres_phase_current.rs	unchecked-growth-or-clone	5
 td-mta/src/postgres_prepared_failure.rs	heap-owner	3
 td-mta/src/postgres_prepared_failure.rs	unchecked-growth-or-clone	5
-td-mta/src/postgres_probe.rs	heap-owner	11
-td-mta/src/postgres_probe.rs	unchecked-growth-or-clone	4
+td-mta/src/postgres_probe.rs	heap-owner	8
+td-mta/src/postgres_probe.rs	unchecked-growth-or-clone	1
+td-mta/src/postgres_probe/driver.rs	heap-owner	2
 td-mta/src/postgres_probe/framing.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/mutation.rs	heap-owner	2
 td-mta/src/postgres_probe/mutation.rs	unchecked-growth-or-clone	3

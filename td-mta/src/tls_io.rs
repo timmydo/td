@@ -153,6 +153,17 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
         Ok((input, output))
     }
 
+    /// Local changes can enable the next driver poll without socket readiness.
+    pub(crate) fn buffered_state(&self) -> (td_crypto::TlsStatus, usize, usize, usize, bool) {
+        (
+            self.session.status(),
+            self.input_used,
+            self.output_start,
+            self.output_end,
+            self.network_eof,
+        )
+    }
+
     fn check_deadline(&self, handshaking: bool) -> Result<(), Error> {
         check_deadlines(
             self.clock.as_ref(),

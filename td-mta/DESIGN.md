@@ -1027,7 +1027,11 @@ mail/storage code and the direct dependency do not see it. F04 records what
 of its qualification remains before deployment. Retaining Rustls means
 td-crypto still has an external TLS implementation.
 
-The production library retains `forbid(unsafe_code)`. The binary denies it
+The library denies `unsafe_code` with one function-scoped exception for
+Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
+`readiness_sys.rs` borrows a socket and an optional worker wake receiver
+for one deadline-bounded wait. UNSAFE.md section 22 pins the syscall ABI.
+The binary denies unsafe code
 with function-scoped termination and listener exceptions recorded in
 UNSAFE.md section 22. The signal boundary stays in `signal_sys.rs`. On x86-64 and aarch64 Linux, serve blocks SIGINT and
 SIGTERM before starting workers, then consumes them synchronously with
@@ -1067,7 +1071,7 @@ the checked numeric address and listens with backlog 128. One scoped raw
 instruction and one fresh descriptor adoption are confined and fingerprinted
 as specified in UNSAFE.md section 22. OwnedFd closes all failure paths;
 IPv4 retains std binding. No pointer, descriptor or socket-option escape
-hatch enters the safe library. The configured port and family are verified
+hatch enters the library. The configured port and family are verified
 again by the receiving adapters before readiness.
 The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
@@ -2210,7 +2214,7 @@ IPv4 or IPv6-only listeners. The binary's confined `listener_sys` adapter
 sets IPV6_V6ONLY before bind, independent of kernel defaults, and both safe
 protocol adapters verify that option for IPv6 caller-bound sockets. Separate
 IPv4 and IPv6 binds can share a port; scoped and mapped IPv6 binds remain
-refused. Library protocol/storage code still forbids unsafe code.
+refused.
 A fixed HTTPS network thread scans bounded slots, with a fixed TLS worker
 pool sized by the configured shared handshake limit. Native session
 construction and pending handshakes stay on those workers; idle sockets
@@ -2218,8 +2222,8 @@ retain connection slots without taking handshake permits.
 Each worker peeks nonblocking for initial TLS bytes before reserving a
 shared permit, and retries a busy pool within the original handshake
 deadline. Once admitted, a handshake stays with one worker. When it needs
-wire input, that worker uses a blocking socket peek with at most a 50 ms
-slice, capped by the original deadline, then restores nonblocking mode.
+wire input, that worker waits for readability for at most a 50 ms slice,
+capped by the original deadline. The socket stays nonblocking.
 Slice expiry retains the connection; deadline expiry or I/O failure retires
 it. Stop is checked between slices. Pending TLS output receives bounded
 turns with a one-millisecond wait instead of spinning. Other socket turns

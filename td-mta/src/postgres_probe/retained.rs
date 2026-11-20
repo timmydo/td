@@ -168,14 +168,7 @@ impl ReadSession {
         }
         // A timeout means no hint, not a failed SQL operation. The caller
         // bounds each wait so control requests and retirement stay responsive.
-        let readable = self
-            .worker
-            .socket
-            .lock()
-            .map_err(|_| Error::Transport)?
-            .transport
-            .wait_readable_slice(deadline)
-            .map_err(|_| Error::Transport)?;
+        let readable = self.worker.driver.wait(deadline)?;
         match readable {
             true => self.relay_notified(Instant::now() + Duration::from_millis(50)),
             false => Ok(false),
