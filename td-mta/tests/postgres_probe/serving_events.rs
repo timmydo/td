@@ -1,4 +1,4 @@
-use super::smtp_transport::{upgrade_protocol, TlsDriver};
+use super::smtp_transport::{upgrade_with_lifetime, TlsDriver};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
@@ -13,11 +13,12 @@ pub(super) fn open(
     close_after: &str,
     last_id: Option<&str>,
 ) -> BufReader<TlsDriver> {
-    let (tls, _) = upgrade_protocol(
+    let (tls, _) = upgrade_with_lifetime(
         TcpStream::connect(address).unwrap(),
         Arc::new(td_mta::clock::RuntimeClock::new()),
         ca,
         td_crypto::TlsProtocol::Http1,
+        std::time::Duration::from_secs(td_mta::admission::timers::SESSION_SECONDS),
     );
     let host = format!("localhost:{}", address.port());
     request(

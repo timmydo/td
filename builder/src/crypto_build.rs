@@ -207,27 +207,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         .stdout(Stdio::piped());
         return crate::native_tests::run_cases(cmd).map(|()| None);
     }
-    if action == "perf" {
-        // On demand only: no gate selects it. Release, as td-mta M23 measures,
-        // with the release build's profile so the two share artifacts.
-        let mut cmd = command("test", manifest);
-        cmd.env("TD_TEST_TRUSTED_ROOT", "private")
-            .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
-            .env("CARGO_PROFILE_RELEASE_STRIP", "none")
-            .args([
-                "--release",
-                "--test",
-                "postgres_probe",
-                "--",
-                "--exact",
-                "real_postgres_performance_harness",
-                "--ignored",
-                "--nocapture",
-            ])
-            .stdout(Stdio::piped());
-        return crate::native_tests::run_cases(cmd).map(|()| None);
-    }
-    let mut cmd = command(action, manifest);
+    let mut cmd = command(if action == "perf" { "test" } else { action }, manifest);
     if action == "build" {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("release target: {e}"))?;
         let target = Path::new(&target_dir)
@@ -250,25 +230,34 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             receipt,
         }));
     }
+    let inbox_perf = action == "perf"
+        && std::env::var_os("TD_MTA_PERF_INBOX_ONLY").as_deref() == Some(std::ffi::OsStr::new("1"));
     let mut live_fixture = None;
-    if action == "test" && name == "td-mta" {
+    if name == "td-mta" && (action == "test" || inbox_perf) {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("crypto fixture target: {e}"))?;
         let target = Path::new(&target_dir)
             .canonicalize()
             .map_err(|e| format!("crypto fixture target: {e}"))?;
-        let mut peer = command("test", "td-crypto/Cargo.toml");
-        peer.args(["--lib", "--no-run"]);
-        cmd.env(
-            "TD_MTA_TEST_TLS_PEER",
-            fixture_executable(
-                peer,
-                "td_crypto",
-                crate::crypto_isolated::ArtifactKind::LibraryTest,
-                &target,
-            )?,
-        );
+        if action == "test" {
+            let mut peer = command("test", "td-crypto/Cargo.toml");
+            peer.args(["--lib", "--no-run"]);
+            cmd.env(
+                "TD_MTA_TEST_TLS_PEER",
+                fixture_executable(
+                    peer,
+                    "td_crypto",
+                    crate::crypto_isolated::ArtifactKind::LibraryTest,
+                    &target,
+                )?,
+            );
+        }
+        let mut build_mail = command("build", "td-mail/Cargo.toml");
+        if inbox_perf {
+            crate::check_loop::warm_mail_client_sources(root)?;
+            build_mail.arg("--release");
+        }
         let mail = fixture_executable(
-            command("build", "td-mail/Cargo.toml"),
+            build_mail,
             "td-mail",
             crate::crypto_isolated::ArtifactKind::Installed,
             &target,
@@ -279,6 +268,9 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             .ok_or("fetch fixture vendor path must be UTF-8")?;
         let quoted = td_engine::json::Json::Str(net_vendor.into()).to_json_string();
         let mut fetch = command("test", "net/Cargo.toml");
+        if inbox_perf {
+            fetch.arg("--release");
+        }
         fetch.args([
             "--bin",
             "td-net",
@@ -293,6 +285,29 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             &target,
         )?;
         live_fixture = Some((mail, fetch));
+    }
+    if action == "perf" {
+        // On demand only: no gate selects it. Release, as td-mta M23 measures,
+        // with the release build's profile so the two share artifacts.
+        if let Some((mail, fetch)) = live_fixture {
+            cmd.env("TD_MTA_TEST_MAIL", mail)
+                .env("TD_MTA_TEST_FETCH", fetch);
+        }
+        cmd.env("TD_TEST_TRUSTED_ROOT", "private")
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "1")
+            .env("CARGO_PROFILE_RELEASE_STRIP", "none")
+            .args([
+                "--release",
+                "--test",
+                "postgres_probe",
+                "--",
+                "--exact",
+                "real_postgres_performance_harness",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped());
+        return crate::native_tests::run_cases(cmd).map(|()| None);
     }
     if action == "clippy" {
         cmd.args(["--all-targets", "--", "-D", "warnings"]);

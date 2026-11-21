@@ -20,21 +20,21 @@ use td_mta::{
     tls_policy::TlsPolicies,
 };
 
-struct Process(Child);
+pub(super) struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
-struct Client {
+pub(super) struct Client {
     process: Process,
     input: std::process::ChildStdin,
     output: mpsc::Receiver<String>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 impl Client {
-    fn start(config: &std::path::Path, root: &std::path::Path) -> Self {
+    pub(super) fn start(config: &std::path::Path, root: &std::path::Path) -> Self {
         Self::start_with_state(config, root, root)
     }
     fn start_with_state(
@@ -79,7 +79,7 @@ impl Client {
             reader: Some(reader),
         }
     }
-    fn ask(&mut self, request: Json) -> Json {
+    pub(super) fn ask(&mut self, request: Json) -> Json {
         writeln!(self.input, "{request}").unwrap();
         self.input.flush().unwrap();
         let line = self.output.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -95,6 +95,40 @@ impl Drop for Client {
         }
     }
 }
+pub(super) fn client_setup(
+    fixture: &Fixture,
+    runtime: &std::path::Path,
+    origin: &str,
+    password: &[u8],
+) -> (PathBuf, Process) {
+    let config = runtime.join("mail.toml");
+    fs::write(&config, format!("[account.test]\nwell_known_url = \"{origin}/.well-known/jmap\"\nusername = \"user\"\npassword_command = \"printf {}\"\n[mail]\nreply_from = \"main@example.test\"\n", std::str::from_utf8(password).unwrap())).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let fetch_socket = runtime.join("td-fetch/socket");
+    let fetch = Process(
+        Command::new(std::env::var_os("TD_MTA_TEST_FETCH").unwrap())
+            .args([
+                "--exact",
+                "fetchd::tests::mail_read_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TD_TEST_FETCH_ROOT", fixture.root.join("root.der"))
+            .current_dir(runtime)
+            .env("TD_TEST_FETCH_SOCKET", "td-fetch/socket")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stop_at = Instant::now() + Duration::from_secs(10);
+    while !fetch_socket.exists() {
+        assert!(Instant::now() < stop_at, "fetch fixture startup");
+        thread::sleep(Duration::from_millis(10));
+    }
+    (config, fetch)
+}
+
 struct Stop<'a>(&'a Control);
 impl Drop for Stop<'_> {
     fn drop(&mut self) {
@@ -275,34 +309,8 @@ pub(super) fn exercise(
         assert_eq!(responses.used().unwrap(), 0);
         assert!(!responses.admission_stopped());
     }
-    let config = runtime.join("mail.toml");
-    fs::write(&config, format!("[account.test]\nwell_known_url = \"{origin}/.well-known/jmap\"\nusername = \"user\"\npassword_command = \"printf {}\"\n", std::str::from_utf8(device.password()).unwrap())).unwrap();
-    let mut mail_config = fs::read_to_string(&config).unwrap();
-    mail_config.push_str("[mail]\nreply_from = \"main@example.test\"\n");
-    fs::write(&config, mail_config).unwrap();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    let fetch_socket = runtime.join("td-fetch/socket");
-    let _fetch = Process(
-        Command::new(std::env::var_os("TD_MTA_TEST_FETCH").unwrap())
-            .args([
-                "--exact",
-                "fetchd::tests::mail_read_fixture",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("TD_TEST_FETCH_ROOT", fixture.root.join("root.der"))
-            .current_dir(&runtime)
-            .env("TD_TEST_FETCH_SOCKET", "td-fetch/socket")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
+    let (config, _fetch) = client_setup(fixture, &runtime, &origin, device.password());
     let stop_at = Instant::now() + Duration::from_secs(10);
-    while !fetch_socket.exists() {
-        assert!(Instant::now() < stop_at, "fetch fixture startup");
-        thread::sleep(Duration::from_millis(10));
-    }
     let handshakes = td_mta::tls_admission::HandshakePool::new(2).unwrap();
     let ready = AtomicBool::new(false);
     let control = Control::default();

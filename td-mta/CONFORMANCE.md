@@ -477,6 +477,19 @@ one a refused download. A 503 is a storage or service failure, not
 contention. Each is retried after 50 ms, at most 1000 times; any other
 status fails.
 
+`TD_MTA_PERF_INBOX_ONLY=1` runs the `https_inbox_refresh` scenario alone
+with the same performance command. It builds release td-mail and the td-net
+test fetch broker, delivers one message over SMTP and connects td-mail once
+to the desktop profile. For each of two windows, it measures the Linux
+`https-network` thread's voluntary context switches over ten idle seconds
+(a proxy for blocking and waking). It then times 32 successful td-mail
+`query_emails` commands for the same Inbox. A warm-up command and one-second
+inter-request pauses stay outside the distribution. The reported latency
+includes client, fetch broker, TLS, server and database time. The second
+window holds one authenticated Email push stream open throughout. A second
+SMTP delivery must advance that stream's state after the timings. Use the
+same host, workload and build profile for before/after comparisons.
+
 `TD_MTA_PERF_PROJECTIONS_ONLY=1` seeds four distinct messages over SMTP and
 measures Email/get headers, previews, body values and attachment lists with
 two persistent HTTPS clients and 32 requests each per case. Each source nests

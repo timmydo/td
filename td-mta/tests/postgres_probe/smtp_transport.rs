@@ -234,6 +234,16 @@ pub(super) fn upgrade_protocol(
     ca: &[u8],
     protocol: td_crypto::TlsProtocol,
 ) -> (TlsDriver, i64) {
+    upgrade_with_lifetime(stream, clock, ca, protocol, Duration::from_secs(120))
+}
+
+pub(super) fn upgrade_with_lifetime(
+    stream: TcpStream,
+    clock: Arc<RuntimeClock>,
+    ca: &[u8],
+    protocol: td_crypto::TlsProtocol,
+    lifetime: Duration,
+) -> (TlsDriver, i64) {
     let trust = td_crypto::TrustStore::from_pem(ca).unwrap();
     let tls_clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(
         clock.clone(),
@@ -245,7 +255,7 @@ pub(super) fn upgrade_protocol(
         TcpTransport::from_stream(stream).unwrap(),
         session,
         clock,
-        Deadline::after(now, 120_000).unwrap(),
+        Deadline::after(now, lifetime.as_millis().try_into().unwrap()).unwrap(),
         Deadline::after(now, 15_000).unwrap(),
         Box::new([0; TLS_WIRE_BYTES]),
         Box::new([0; TLS_WIRE_BYTES]),

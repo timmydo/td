@@ -667,6 +667,7 @@ struct Response {
 struct Jmap {
     address: SocketAddr,
     ca: Vec<u8>,
+    device: td_mta::postgres_devices::Creation,
     authorization: String,
     next_start: Mutex<Option<Instant>>,
 }
@@ -694,6 +695,7 @@ impl Jmap {
             address,
             ca: fixture.ca.clone(),
             authorization,
+            device,
             next_start: Mutex::new(None),
         }
     }
@@ -1250,6 +1252,16 @@ pub(super) fn exercise(
         ),
     );
     let desktop = Service::start(&local, &connection, "desktop");
+    match std::env::var("TD_MTA_PERF_INBOX_ONLY").as_deref() {
+        Ok("1") => {
+            let _cloud = Service::start(&local, &connection, "cloud");
+            let jmap = Jmap::new(fixture, https_address);
+            inbox::measure(fixture, &local, &desktop, &jmap, smtp_address);
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => (),
+        _ => panic!("TD_MTA_PERF_INBOX_ONLY must be absent or 1"),
+    }
     match std::env::var("TD_MTA_PERF_PROJECTIONS_ONLY").as_deref() {
         Ok("1") => {
             let cloud = Service::start(&local, &connection, "cloud");
@@ -1298,3 +1310,6 @@ pub(super) fn exercise(
         knobs.idle_seconds,
     );
 }
+
+#[path = "performance_inbox.rs"]
+mod inbox;
