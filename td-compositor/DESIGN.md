@@ -162,8 +162,13 @@ on, and the reason the reservation has a test of its own: fullscreen is the
 one arrangement with no gap, so it is the only one whose pixels would reach
 row 0 if the reservation were dropped.
 
-It shows load, memory, uptime and a clock. Metrics come from `/proc`
-and the clock samples `SystemTime`; timezone data uses ordinary files.
+The status line shows load, CPU temperature, memory, uptime and a clock.
+Load is the one-minute average. Temperature is the hottest readable Intel
+coretemp package or AMD k10temp die, rounded to whole degrees Celsius.
+On AMD the control temperature is the fallback when the die channel is
+unavailable. The bar samples these drivers under `/sys/class/hwmon` and
+shows `TEMP ?` if neither supplies a reading. Load, memory and uptime come
+from `/proc`. The clock samples `SystemTime` and reads ordinary timezone files.
 The bar adds no unsafe syscall surface. Memory is total minus
 MemAvailable rather than minus MemFree,
 which counts neither cache nor reclaimable slab and reads alarmingly low on

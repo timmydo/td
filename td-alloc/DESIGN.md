@@ -147,6 +147,13 @@ can contain false positives such as nonallocating custom `push` methods. Reviewi
 failures remain required. A baseline is a record of debt, not permission
 to add unchecked allocation to existing code.
 
+The compositor's CPU temperature sampler admits the standard library's
+owned directory entry path when enumerating the kernel's hwmon class.
+Stable Rust exposes both the entry name and path as owned values. The
+sampler holds one such path at a time, drops it before the next device,
+and uses fixed buffers for attribute paths and values. The remaining
+infallible allocation in `DirEntry::path` is specific to this enumeration.
+
 Migration proceeds at operation boundaries: parsers and decoded buffers,
 then rendering, networking and storage. Replace an operation's diagnostics
 and fallback paths along with its main allocations. Shared ownership that

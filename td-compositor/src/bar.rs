@@ -1,7 +1,8 @@
 use crate::clock::Clock;
 use crate::text::{Text, CELL_HEIGHT};
 use crate::ui;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,7 +14,6 @@ pub const BAR_HEIGHT: usize = 24;
 /// The text cell centred down the band.
 const TEXT_TOP: usize = (BAR_HEIGHT - CELL_HEIGHT) / 2;
 const TEXT_LEFT: usize = 8;
-const SEPARATOR: &str = "  ";
 pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];
 pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];
 /// Air either side of a workspace number inside its own cell. The cell is the
@@ -73,6 +73,7 @@ pub enum Address {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Readings {
     pub load_centi: Option<u64>,
+    temperature: CpuTemperature,
     pub used_kb: Option<u64>,
     pub total_kb: Option<u64>,
     pub uptime_secs: Option<u64>,
@@ -95,6 +96,7 @@ impl Readings {
             .and_then(|text| meminfo_kb(text, "MemAvailable"));
         Self {
             load_centi: loadavg.as_deref().and_then(parse_load_centi),
+            temperature: CpuTemperature::sample(sys_root),
             // Used is what a person means by "how much is gone", which is
             // total minus AVAILABLE — MemFree counts neither cache nor
             // reclaimable slab and reads alarmingly low on an idle machine.
@@ -108,6 +110,74 @@ impl Readings {
             link: sample_link(proc_root, sys_root),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CpuTemperature(Option<i32>);
+
+impl CpuTemperature {
+    fn sample(sys_root: &Path) -> Self {
+        let mut path = [0; 4096];
+        let readings = sysfs_child(&mut path, sys_root, b"class/hwmon")
+            .and_then(|class| std::fs::read_dir(class).ok());
+        let hottest = readings
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let chip = entry.path();
+                let mut name = [0; 64];
+                let driver = attribute(&chip, b"name", &mut name)?;
+                let millidegrees = |file: &[u8]| {
+                    let mut value = [0; 64];
+                    attribute(&chip, file, &mut value)?
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|v| (-273_150..=200_000).contains(v))
+                };
+                match driver {
+                    "coretemp" => millidegrees(b"temp1_input"),
+                    // Tdie is the die reading. Tctl can include a fan-control offset.
+                    "k10temp" => {
+                        millidegrees(b"temp2_input").or_else(|| millidegrees(b"temp1_input"))
+                    }
+                    _ => None,
+                }
+            })
+            .max();
+        Self(hottest.map(|m| (m + m.signum() * 500) / 1000))
+    }
+}
+
+impl std::fmt::Display for CpuTemperature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(degrees) => write!(f, "{degrees}°C"),
+            None => f.write_str("?"),
+        }
+    }
+}
+
+// Kernel attribute names and values are small. Keep the per-tick path and
+// read buffers bounded, including when a test supplies its own sysfs root.
+fn sysfs_child<'a>(buffer: &'a mut [u8], dir: &Path, name: &[u8]) -> Option<&'a Path> {
+    let mut output = &mut *buffer;
+    let length = output.len();
+    output.write_all(dir.as_os_str().as_bytes()).ok()?;
+    output.write_all(b"/").ok()?;
+    output.write_all(name).ok()?;
+    let used = length - output.len();
+    Some(Path::new(std::ffi::OsStr::from_bytes(buffer.get(..used)?)))
+}
+
+fn attribute<'a>(dir: &Path, name: &[u8], buffer: &'a mut [u8; 64]) -> Option<&'a str> {
+    let mut path = [0; 4096];
+    let mut file = std::fs::File::open(sysfs_child(&mut path, dir, name)?).ok()?;
+    let n = file.read(buffer).ok()?;
+    if n == buffer.len() {
+        return None;
+    }
+    std::str::from_utf8(buffer.get(..n)?).ok().map(str::trim)
 }
 
 /// The interface, whether it is up, and its address. Each is answered on its
@@ -309,7 +379,7 @@ fn human_uptime(secs: u64) -> String {
 /// The line, left to right. A reading that could not be taken shows its
 /// label with `?` rather than vanishing, so a bar with a broken source looks
 /// broken instead of looking like a machine with less to report.
-pub fn line(clock: &Clock, readings: &Readings) -> String {
+fn line(clock: &Clock, readings: &Readings) -> Result<String, crate::allocation::FormatError> {
     let load = readings.load_centi.map_or_else(
         || "LOAD ?".to_string(),
         |centi| format!("LOAD {}.{:02}", centi / 100, centi % 100),
@@ -352,7 +422,10 @@ pub fn line(clock: &Clock, readings: &Readings) -> String {
             format!("NET {name} {state}")
         }
     };
-    [net, load, memory, uptime, clock].join(SEPARATOR)
+    let temperature = readings.temperature;
+    crate::allocation::format(format_args!(
+        "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {clock}"
+    ))
 }
 
 /// The workspaces the strip names: those holding a window, and the ACTIVE one
@@ -667,7 +740,10 @@ fn tick(
     reported: &mut Reported,
 ) -> Tick {
     let readings = Readings::sample(proc_root, sys_root, epoch_secs);
-    let line = line(clock, &readings);
+    let Ok(line) = line(clock, &readings) else {
+        // Keep the previous line and retry on the next tick.
+        return Tick::Continue(None);
+    };
     // The guard is released BEFORE anything is printed. `eprintln!` takes
     // stderr's own lock and blocks on a slow console, and holding the runtime
     // across that would stop the compositor over the least important thing on
@@ -762,6 +838,10 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    fn line(clock: &Clock, readings: &Readings) -> String {
+        super::line(clock, readings).unwrap()
+    }
+
     struct Fixture {
         proc_root: std::path::PathBuf,
         sys_root: std::path::PathBuf,
@@ -851,8 +931,39 @@ Local:
         assert_eq!(readings.uptime_secs, Some(187_245));
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD 0.42  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
+            "NET ?  LOAD 0.42  TEMP ?  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
         );
+    }
+
+    #[test]
+    fn cpu_temperature_is_the_hottest_readable_cpu_package_next_to_load() {
+        let root = crate::temp_dir::TempDir::new("td-bar-temperature").unwrap();
+        let chip = |id: &str, name: &str, control: &str, die: &str| {
+            let dir = root.path().join("class/hwmon").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (file, text) in [
+                ("name", name),
+                ("temp1_input", control),
+                ("temp2_input", die),
+            ] {
+                std::fs::write(dir.join(file), text).unwrap();
+            }
+        };
+        std::fs::write(root.path().join("loadavg"), "0.42 1 2").unwrap();
+        let sample = || {
+            line(
+                &Clock::Utc,
+                &Readings::sample(root.path(), root.path(), Some(0)),
+            )
+        };
+        chip("hwmon0", "nvme", "99000", "100000");
+        assert!(sample().contains("LOAD 0.42  TEMP ?  MEM"));
+        chip("hwmon3", "k10temp", "85000", "60500");
+        assert!(sample().contains("LOAD 0.42  TEMP 61°C  MEM"));
+        chip("hwmon1", "coretemp", "72000", "89000");
+        assert!(sample().contains("TEMP 72°C"));
+        chip("hwmon3", "k10temp", "85000", "bad");
+        assert!(sample().contains("TEMP 85°C"));
     }
 
     #[test]
@@ -1082,7 +1193,7 @@ Local:
         assert_eq!(readings, Readings::default());
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?"
+            "NET ?  LOAD ?  TEMP ?  MEM ?  UP ?  CLOCK ?"
         );
 
         // Present but unparseable is the same answer, and each field fails on
@@ -1095,7 +1206,7 @@ Local:
         assert_eq!(readings.uptime_secs, None);
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
+            "NET ?  LOAD ?  TEMP ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
         );
     }
 
@@ -1612,6 +1723,7 @@ Local:
             &Clock::Utc,
             &Readings {
                 load_centi: Some(1_234),
+                temperature: CpuTemperature(Some(-12)),
                 used_kb: Some(2_800_000),
                 total_kb: Some(8_039_384),
                 uptime_secs: Some(187_245),
