@@ -269,3 +269,12 @@ their optional host generators live under `tests/`.
 System FIDO discovery excludes the virtual device with physical path
 `td/firefox-passkeys`, including before its Firefox group is assigned.
 The shared 64-byte HID codec also frames and decodes diagnostic PINGs.
+
+The website hardware adapter rebuilds each command from an admitted
+website request. It shares the physical worker's operation lock with td
+login and disk operations. A fresh PIN exchange allows one verification
+attempt. Protocols with permission-bearing tokens request only the
+website RP and makeCredential or getAssertion permission. The browser
+receives a sanitized CTAP response. The hardware credential's private
+key stays on the authenticator. Silent handle probes require the fixed
+hash of empty client data and an explicit credential list.

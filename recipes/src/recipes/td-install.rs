@@ -115,6 +115,10 @@ const TPM_AND_FIDO: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/web_request.rs"),
     ),
     (
+        "{src}/td-fido/src/web_key.rs",
+        include_str!("../../../td-fido/src/web_key.rs"),
+    ),
+    (
         "{src}/td-fido/src/fido_enroll.rs",
         include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),

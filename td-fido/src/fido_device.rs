@@ -121,6 +121,14 @@ pub struct Device {
 }
 
 impl Device {
+    /// Selection is repeated for each website transaction. The root worker
+    /// subsequently pins the chosen attachment and takes the normal HID lock.
+    pub fn website_devices() -> Result<Vec<Self>, String> {
+        let mut keys = Self::discover()?;
+        keys.retain(|key| key.yubikey);
+        Ok(keys)
+    }
+
     pub fn discover() -> Result<Vec<Self>, String> {
         require_root()?;
         let mut found = Vec::new();

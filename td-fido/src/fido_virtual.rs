@@ -66,6 +66,7 @@ pub(crate) enum Attestation {
 /// The getInfo claims and fixed behaviour of one virtual key.
 #[derive(Clone)]
 pub(crate) struct Config {
+    pub(crate) rp: &'static str,
     pub(crate) versions: &'static [&'static str],
     /// None omits getInfo's extensions member.
     pub(crate) extensions: Option<&'static [&'static str]>,
@@ -92,6 +93,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            rp: RP_ID,
             versions: &["FIDO_2_0", "FIDO_2_1"],
             extensions: Some(&["hmac-secret"]),
             pin_support: true,
@@ -963,7 +965,7 @@ impl Authenticator {
     fn make_credential(&mut self, value: &Value<'_>) -> Result<Vec<u8>, u8> {
         let hash = bytes(value, 1)?.ok_or(MISSING_PARAMETER)?;
         let rp = field(value, Value::Unsigned(2))?.ok_or(MISSING_PARAMETER)?;
-        if text(rp, Value::Text("id"))? != Some(RP_ID) {
+        if text(rp, Value::Text("id"))? != Some(self.config.rp) {
             return Err(INVALID_PARAMETER);
         }
         field(value, Value::Unsigned(3))?.ok_or(MISSING_PARAMETER)?;
@@ -988,7 +990,7 @@ impl Authenticator {
         if !up {
             return Err(INVALID_OPTION);
         }
-        let uv = self.authorized(value, RP_ID, hash, (8, 9), MAKE_CREDENTIAL)?;
+        let uv = self.authorized(value, self.config.rp, hash, (8, 9), MAKE_CREDENTIAL)?;
         if !uv && self.state.pin.is_some() {
             return Err(PUAT_REQUIRED);
         }
@@ -1015,7 +1017,7 @@ impl Authenticator {
         let key = SecretScalar::from_bytes(Box::new(private)).unwrap();
         let public = key.public_key().unwrap();
         let flags = 0x41 | if uv { 0x04 } else { 0 } | if hmac_secret { 0x80 } else { 0 };
-        let mut data = crypto::digest(RP_ID.as_bytes()).to_vec();
+        let mut data = crypto::digest(self.config.rp.as_bytes()).to_vec();
         data.push(flags | self.script.backup);
         data.extend(self.state.counter.to_be_bytes());
         data.extend(self.config.aaguid);
@@ -1079,7 +1081,7 @@ impl Authenticator {
         self.check_list(&allowed)?;
         let index = allowed
             .iter()
-            .filter(|_| rp == RP_ID)
+            .filter(|_| rp == self.config.rp)
             .find_map(|id| self.visible(id, uv))
             .ok_or(NO_CREDENTIALS)?;
         if up {
@@ -1100,7 +1102,7 @@ impl Authenticator {
             flags |= 0x80;
         }
         self.state.counter += 1;
-        let mut data = crypto::digest(RP_ID.as_bytes()).to_vec();
+        let mut data = crypto::digest(self.config.rp.as_bytes()).to_vec();
         data.push(flags);
         data.extend(self.state.counter.to_be_bytes());
         if let Some(secret) = &secret {

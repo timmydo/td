@@ -299,7 +299,9 @@ fn info() -> Result<Vec<u8>> {
         e.head(0, 5)?;
         e.head(0, hid::MAX_MESSAGE as u64)?;
         e.head(0, 7)?;
-        e.head(0, web_request::MAX_CREDENTIALS as u64)?;
+        // Firefox filters longer lists one handle at a time so each
+        // attachment, even a CTAP 2.0 key, accepts the resulting batch.
+        e.head(0, 1)?;
         e.head(0, 8)?;
         e.head(0, 1023)?;
         e.finish()
