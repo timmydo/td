@@ -349,7 +349,7 @@ struct Slot<'s, 'cfg, 'spf, B: Storage + 's> {
     spf_result: Option<crate::spf::Outcome>,
     authentication: Option<dkim_worker::MessageAuthentication>,
     data_timing: Option<crate::performance::Timer>,
-    commit_wait: Option<crate::performance::Timer>,
+    commit_wait_timing: Option<crate::performance::Timer>,
 }
 impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
     fn connection(&mut self) -> Result<&mut Connection<'cfg>, Error> {
@@ -367,7 +367,7 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, '_, B> {
 
     fn retire(&mut self) {
         self.data_timing.take();
-        self.commit_wait.take();
+        self.commit_wait_timing.take();
         self.delivery.take();
         self.connection.take();
         self.phase = Phase::Empty;
@@ -580,7 +580,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 spf_result: None,
                 authentication: None,
                 data_timing: None,
-                commit_wait: None,
+                commit_wait_timing: None,
             }));
             occupied.push(None);
         }
@@ -1050,6 +1050,9 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds);
             if until > now && !control.stop_requested() && (dkim_available || result.is_none()) {
                 slot.spf_result = result;
+                slot.commit_wait_timing = Some(crate::performance::Timer::start(
+                    crate::performance::Phase::SmtpAuthenticationWait,
+                ));
                 slot.phase = Phase::AwaitAuthentication { until };
                 return Ok(());
             }
@@ -1064,7 +1067,10 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             if let Some(timing) = slot.data_timing.take() {
                 timing.finish(crate::performance::Outcome::Success);
             }
-            slot.commit_wait = Some(crate::performance::Timer::start(
+            if let Some(authentication) = slot.commit_wait_timing.take() {
+                authentication.finish(crate::performance::Outcome::Success);
+            }
+            slot.commit_wait_timing = Some(crate::performance::Timer::start(
                 crate::performance::Phase::SmtpCommitWait,
             ));
         }
@@ -1235,7 +1241,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }
             Work::Write => return self.write_data(slot, cap, control),
             Work::Commit { prepared } => {
-                if let Some(timing) = slot.commit_wait.take() {
+                if let Some(timing) = slot.commit_wait_timing.take() {
                     timing.finish(crate::performance::Outcome::Success);
                 }
                 let timing =
@@ -1361,7 +1367,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
     ) -> Result<(), Error> {
         slot.data_timing.take();
-        slot.commit_wait.take();
+        slot.commit_wait_timing.take();
         if matches!(error, smtp_storage::Failure::HeaderLimit) {
             slot.spf_ticket = None;
             slot.delivery.take();
@@ -1389,7 +1395,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         control: &Control,
     ) -> Result<(), Error> {
         slot.data_timing.take();
-        slot.commit_wait.take();
+        slot.commit_wait_timing.take();
         slot.spf_ticket = None;
         slot.delivery.take();
         let network = slot.connection()?.network_mut()?;

@@ -537,7 +537,10 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `chunk_verify` | Qualified Email/get batch SQL, length/ordinal and SHA-256 verification before bytes become readable; resident cache hits do not repeat it. |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
-| `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
+| `smtp_data` | Successful DATA admission through queuing for commit, including the 354 reply, peer arrival, network scheduling and the final authentication wait; retirement or refusal before completion counts as failure |
+| `smtp_authentication_wait` | Time spent waiting after the terminating dot for the inbound authentication observations. Completion includes taking a timeout result. |
+| `smtp_database_commit` | The synchronous PostgreSQL COMMIT request through acknowledgement in SMTP fanout, inside `smtp_publish`. |
+| `smtp_final_reply` | From queuing the successful storage result on the SMTP session to transport acknowledgement of the final reply flush, including worker handoff and socket scheduling. |
 | `smtp_commit_wait` | Completed DATA queued through the first storage-worker publication attempt; expiry or retirement before service counts as failure; excludes later busy retry delays |
 | `jmap_email_get` | Email/get projection time after argument validation through retained result publication; failed JMAP methods count even when the enclosing HTTP response is 200 |
 | `jmap_headers` | Per-message header scratch preparation and root-header decoding/serialization on a cache miss. Excludes prior body verification. |

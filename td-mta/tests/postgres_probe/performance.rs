@@ -275,7 +275,7 @@ impl Service {
         service
     }
 
-    fn report_phases(&self, after: &str) {
+    fn phases(&self) -> td_json::Json {
         let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
             .args(["performance-status", "--runtime"])
             .arg(&self.runtime)
@@ -288,6 +288,11 @@ impl Service {
         );
         let snapshot = td_json::parse_slice(&output.stdout).unwrap();
         assert_eq!(snapshot["status"].as_str(), Some("ok"));
+        snapshot
+    }
+
+    fn report_phases(&self, after: &str) {
+        let snapshot = self.phases();
         report(
             "server_phases",
             &format!(
@@ -1251,6 +1256,15 @@ pub(super) fn exercise(
             large_bytes = knobs.large_bytes,
         ),
     );
+    match std::env::var("TD_MTA_PERF_SMTP_TIMINGS_ONLY").as_deref() {
+        Ok("1") => {
+            let cloud = Service::start(&local, &connection, "cloud");
+            smtp_timings::measure(fixture, &cloud, smtp_address, &knobs);
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => (),
+        _ => panic!("TD_MTA_PERF_SMTP_TIMINGS_ONLY must be absent or 1"),
+    }
     let desktop = Service::start(&local, &connection, "desktop");
     match std::env::var("TD_MTA_PERF_INBOX_ONLY").as_deref() {
         Ok("1") => {
@@ -1313,3 +1327,6 @@ pub(super) fn exercise(
 
 #[path = "performance_inbox.rs"]
 mod inbox;
+
+#[path = "performance_smtp_timings.rs"]
+mod smtp_timings;

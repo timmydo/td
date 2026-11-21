@@ -222,11 +222,14 @@ pub(crate) async fn publish_body(
             write_delivery(client, delivery, state, deadline).await?,
         ));
     }
+    let mut timing =
+        crate::performance::Timer::start(crate::performance::Phase::SmtpDatabaseCommit);
     marker.store(true, Ordering::Relaxed);
     client
         .batch_execute("COMMIT")
         .await
         .map_err(|_| Error::Indeterminate)?;
+    timing.succeeded();
     Ok(FanoutOutcome { accounts })
 }
 

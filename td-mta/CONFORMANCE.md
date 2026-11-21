@@ -437,6 +437,18 @@ which the services inherit. Each scenario prints one `td-mta-perf
   may be stored twice only after a deferral at its dot, which the server
   answers when publication is uncertain, or a close following it;
   `deferrals`, `closed_after_dot` and `duplicates` count those.
+- Set `TD_MTA_PERF_SMTP_TIMINGS_ONLY=1` and `TD_MTA_PERF_SMTP_STREAMS=1`
+  to attribute final-dot latency to individual successful transactions. Use
+  1–100 messages. One sender uses the same small and large bodies as intake.
+  Each `smtp_transaction` row reports the client interval and server phase
+  deltas in microseconds. A NOOP after the timed reply synchronizes the
+  final flush before the control snapshot. The fixture checks one successful
+  sample per phase, zero lost samples and the final stored count.
+  `smtp_database_commit` is part of `smtp_publish`, and both preparation and
+  publication are part of `smtp_commit`. The difference between the client
+  interval and the disjoint server phases also includes dot transit, receiver
+  scheduling, and delivery of the reply. Snapshot collection between messages
+  changes pacing. The configured recursive DNS endpoint is silent.
 - `jmap_fetch`: one client with a fresh device credential reads the
   delivered mailbox one request at a time: five session discoveries,
   256-ID `Email/query` pages, 64-ID `Email/get` batches for blob and

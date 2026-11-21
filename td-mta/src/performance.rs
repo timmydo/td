@@ -58,6 +58,9 @@ pub enum Phase {
     ResponseLedgerLock,
     ResponseLedgerQuota,
     SmtpRateRefused,
+    SmtpAuthenticationWait,
+    SmtpDatabaseCommit,
+    SmtpFinalReply,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -111,6 +114,9 @@ impl Phase {
         Self::ResponseLedgerLock,
         Self::ResponseLedgerQuota,
         Self::SmtpRateRefused,
+        Self::SmtpAuthenticationWait,
+        Self::SmtpDatabaseCommit,
+        Self::SmtpFinalReply,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -164,6 +170,9 @@ impl Phase {
             Self::ResponseLedgerLock => "response_ledger_lock",
             Self::ResponseLedgerQuota => "response_ledger_quota",
             Self::SmtpRateRefused => "smtp_rate_refused",
+            Self::SmtpAuthenticationWait => "smtp_authentication_wait",
+            Self::SmtpDatabaseCommit => "smtp_database_commit",
+            Self::SmtpFinalReply => "smtp_final_reply",
         }
     }
 }

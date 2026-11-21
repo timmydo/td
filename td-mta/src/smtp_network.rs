@@ -51,6 +51,7 @@ pub struct Network<'a> {
     refusal_reported: bool,
     work: Option<Work>,
     reply_grace: Option<Deadline>,
+    reply_timing: Option<crate::performance::Timer>,
     session_deadline: Deadline,
     transport_deadline: Deadline,
     idle_deadline: Deadline,
@@ -80,6 +81,7 @@ impl<'a> Network<'a> {
             refusal_reported: false,
             work: None,
             reply_grace: None,
+            reply_timing: None,
             session_deadline,
             transport_deadline,
             idle_deadline: after(now, plan.limits().smtp_idle_seconds)?,
@@ -151,10 +153,16 @@ impl<'a> Network<'a> {
         clock: &(impl Clock + ?Sized),
     ) -> Result<(), Error> {
         let now = self.complete_work(Work::Commit, clock)?;
+        let accepted = result.is_ok();
         self.session.committed(result)?;
         self.data_deadline = None;
         if matches!(self.session.pending(), Pending::Reply { .. }) {
             self.reply_grace = Some(self.finishing_deadline(now)?);
+            if accepted {
+                self.reply_timing = Some(crate::performance::Timer::start(
+                    crate::performance::Phase::SmtpFinalReply,
+                ));
+            }
         }
         Ok(())
     }
@@ -297,6 +305,7 @@ impl<'a> Network<'a> {
         self.end = 0;
         self.work = None;
         self.reply_grace = None;
+        self.reply_timing.take();
         self.closing = Closing::Closed;
     }
 
@@ -388,6 +397,9 @@ impl<'a> Network<'a> {
                     return Err(Error::Invalid);
                 } else if transport.flush()? == FlushProgress::Complete {
                     self.session.reply_sent()?;
+                    if let Some(timing) = self.reply_timing.take() {
+                        timing.finish(crate::performance::Outcome::Success);
+                    }
                     self.written = 0;
                     self.refusal_reported = false;
                     let grace = self.reply_grace.take();
