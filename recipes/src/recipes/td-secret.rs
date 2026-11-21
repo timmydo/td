@@ -67,6 +67,10 @@ const FIDO_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/fido_disk.rs"),
     ),
     (
+        "{src}/td-fido/src/web_assertion.rs",
+        include_str!("../../../td-fido/src/web_assertion.rs"),
+    ),
+    (
         "{src}/td-fido/src/fido_enroll.rs",
         include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),

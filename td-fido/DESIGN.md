@@ -25,6 +25,14 @@ prerequisites" onward):
 - `fido_ctap`: the getAssertion and silent identify codecs, credential
   fingerprints and DER signatures; `fido_enroll`: getInfo negotiation
   and makeCredential with proof of possession.
+- `web_assertion`: a website's CTAP2 getAssertion command and reply.
+  The caller binds an authorized RP ID and client-data hash to one
+  presentation. The codec excludes td's internal RP, requires a touch,
+  checks the signed RP hash and requested UV flag, and restricts the
+  returned credential to the allow list when supplied. A discoverable
+  result carries a user handle. Multiple accounts require selection; the
+  codec releases no assertion in that case. The website verifies the
+  signature. This codec neither admits a caller nor opens a device.
 - `fido_pin`: PIN protocols one and two, the PIN and pinUvAuthToken
   flows, hmac-secret and the login profile; `fido_transaction`: one
   owned PIN transaction over a `Channel`. Since increment 8b the login
