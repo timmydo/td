@@ -8848,6 +8848,25 @@ could before roles existed. A controller's volume or mute lands in the
 same per-stream value the owning application sets, so the application can
 undo it. td-agent's unconfined workspace runs as the human (WORKLOADS.md)
 and is therefore a controller.
+A controller also sets the output's level and mute with `SET_SINK_VOLUME`
+and `SET_SINK_MUTE`, captured in both selector forms from the pinned
+runtime's libpulse 17.0, sees them in sink info, and every controller,
+the writer included, hears one sink change event for a write that changed
+something and none for one that did not, even when the writer is dropped
+in the same pass. A setter naming the sink both ways or neither, or
+carrying a level vector that is empty, wider than stereo or holds an
+invalid volume, is `INVALID` and changes nothing. The level multiplies
+the summed mix before saturation, so a stream's effective gain is its own
+times the output's; mute is a flag beside the level, and a change reaches
+the device from the next mixed period. A player's sink write is refused with
+`NOTIMPLEMENTED` before its arguments are read, its sink info always
+reports unity and unmuted, and no sink event reaches it, so its view of
+the output is the one the captured fixtures describe. A protocol volume
+is an amplitude by the cube of its fraction of unity, libpulse's own
+`pa_sw_volume_to_linear` and the inverse of what Firefox's backend
+applies before sending, and nothing is amplified above unity. A sink
+named by its decimal index resolves as the index: `pactl` sends
+`pactl get-sink-volume 0` as the name `"0"`.
 A final readable AF_UNIX queue is consumed before a simultaneous hangup;
 device loss queues `PLAYBACK_STREAM_KILLED` for one nonblocking attempt and
 then closes, so a backpressured client may observe EOF instead of that

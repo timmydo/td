@@ -126,31 +126,36 @@ pub struct Voice {
 /// Harmonics of the base rather than arbitrary frequencies, because a harmonic
 /// series is what makes a mixing fault audible: two unrelated tones beat, and
 /// beating is hard to tell from a broken mixer, while a harmonic stack either
-/// sounds like one richer note or sounds wrong. Each voice is attenuated by the
-/// count so the sum stays inside full scale instead of relying on the clip.
+/// sounds like one richer note or sounds wrong. Each voice is attenuated to an
+/// amplitude of one over the count so the sum stays inside full scale instead
+/// of relying on the clip. Volumes are on the protocol's cubic taper
+/// (`mixer::gain`), so that amplitude is the cube root of the fraction; one
+/// voice is exactly unity.
 pub fn plan(base: Tone, count: u32, volume_norm: u32) -> Vec<Voice> {
     let count = count.max(1);
+    let volume = (volume_norm as f32 * (1.0 / count as f32).cbrt()) as u32;
     (0..count)
         .map(|index| Voice {
             tone: Tone {
                 hertz: base.hertz.saturating_mul(index.saturating_add(1)),
                 amplitude: base.amplitude,
             },
-            volume: volume_norm / count,
+            volume,
         })
         .collect()
 }
 
 /// What the mixer will produce for `voices` at `frame`.
 ///
-/// The same arithmetic as `Mixer::mix` — per-stream gain in `f32`, summed, then
-/// clamped into an `i16` — so the fixture's oracle is the mixer's own answer
-/// rather than an approximation of it.
-pub fn expected(spec: Spec, voices: &[Voice], frame: u64, volume_norm: u32) -> i16 {
+/// The same arithmetic as `Mixer::mix` with the output at unity — per-stream
+/// `mixer::gain` in `f32`, summed, then clamped into an `i16` — so the
+/// fixture's oracle is the mixer's own answer rather than an approximation of
+/// it.
+pub fn expected(spec: Spec, voices: &[Voice], frame: u64) -> i16 {
     let mut sum = 0.0f32;
     for voice in voices {
         let sample = f32::from(Generator::sample_at(spec, voice.tone, frame));
-        sum += sample * (voice.volume as f32 / volume_norm.max(1) as f32);
+        sum += sample * crate::mixer::gain(voice.volume);
     }
     sum.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
@@ -396,5 +401,50 @@ mod tests {
         assert_eq!(scale(-32768, i32::MAX), i16::MIN + 1);
         assert_eq!(scale(32768, 0), 0);
         assert_eq!(scale(32768, -5), 0);
+    }
+
+    /// The rendered oracle is what the mixer plays. Three voices mixed in one
+    /// pass are, sample for sample, what `expected` computes; each voice's
+    /// amplitude is a third, not a twenty-seventh, because the plan reads the
+    /// taper; and one voice is exactly unity.
+    #[test]
+    fn the_rendered_oracle_is_what_the_mixer_plays() {
+        use crate::mixer::{gain, Mixer, VOLUME_NORM};
+        use crate::sink::{AudioSink, MemorySink};
+        let spec = Spec::fixed();
+        let single = plan(Tone::fixture(), 1, VOLUME_NORM);
+        assert_eq!(
+            single.iter().map(|voice| voice.volume).collect::<Vec<_>>(),
+            [VOLUME_NORM]
+        );
+        let voices = plan(Tone::fixture(), 3, VOLUME_NORM);
+        for voice in &voices {
+            let amplitude = gain(voice.volume);
+            assert!(
+                (amplitude - 1.0 / 3.0).abs() < 1e-4 && amplitude <= 1.0 / 3.0,
+                "{amplitude}"
+            );
+        }
+        let frames = 64usize;
+        let mut sink = MemorySink::new(spec, 256, 64);
+        let mut mixer = Mixer::new(spec);
+        let mut scratch = Vec::new();
+        for voice in &voices {
+            let id = mixer.open(1024).unwrap();
+            mixer.set_volume(id, voice.volume).unwrap();
+            Generator::new(spec, voice.tone).fill(&mut scratch, frames);
+            mixer.write(id, &scratch).unwrap();
+        }
+        sink.start().unwrap();
+        mixer.pump(&mut sink).unwrap();
+        let played = sink.samples();
+        assert_eq!(played.len(), frames * 2);
+        let rendered: Vec<i16> = (0..frames as u64)
+            .flat_map(|frame| {
+                let sample = expected(spec, &voices, frame);
+                [sample, sample]
+            })
+            .collect();
+        assert_eq!(played, rendered);
     }
 }

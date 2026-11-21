@@ -614,7 +614,7 @@ impl<S: AudioSink> Server<S> {
         };
         self.clients.push(Client {
             stream,
-            session: Session::new(self.spec, index),
+            session: Session::new(self.spec, index).with_output_control(role == Role::Controller),
             peer,
             role,
             pending: Vec::new(),
@@ -649,9 +649,10 @@ impl<S: AudioSink> Server<S> {
         }
     }
 
-    /// The one fan-out of another connection's sink-input event. Only
+    /// The one fan-out of another connection's sink-input or sink event. Only
     /// controllers hear it: a player learns of no stream but its own, whose
-    /// events its session already delivered locally.
+    /// events its session already delivered locally, and of no change to the
+    /// output, which in its view never changes.
     fn notify_controllers(&mut self, origin: Option<usize>, event: u32, index: u32) {
         for (recipient, client) in self.clients.iter_mut().enumerate() {
             if Some(recipient) != origin && client.role == Role::Controller {
@@ -988,7 +989,13 @@ impl<S: AudioSink> Server<S> {
             if index >= self.clients.len() {
                 continue;
             }
-            let removed = self.clients.remove(index);
+            let mut removed = self.clients.remove(index);
+            // A change it made this pass outlives it — the output's level stays
+            // where it set it — so the event announcing it is relayed before
+            // the client goes, not discarded with it.
+            for (event, sink_index) in removed.session.take_global_events() {
+                self.notify_controllers(None, event, sink_index);
+            }
             removed_sink_inputs.extend(removed.session.sink_input_indexes());
             self.disconnected = self.disconnected.saturating_add(1);
         }
@@ -1822,6 +1829,295 @@ mod tests {
             }
             reader.u32().ok()
         })
+    }
+
+    /// The REPLY packet answering `expected_tag`, if one arrived.
+    fn reply_packet(bytes: &[u8], expected_tag: u32) -> Option<Vec<u8>> {
+        control_packets(bytes).into_iter().find(|packet| {
+            let mut reader = tag::Reader::new(packet);
+            reader.u32().ok() == Some(command::REPLY) && reader.u32().ok() == Some(expected_tag)
+        })
+    }
+
+    /// The level and mute a `GET_SINK_INFO` reply reports.
+    fn reported_output(reply: &[u8]) -> (Vec<u32>, bool) {
+        let mut reader = tag::Reader::new(reply);
+        // Command, tag, index, name, description, sample spec, channel map,
+        // owner module: then the cvolume and the mute flag.
+        for _ in 0..8 {
+            reader.skip().unwrap();
+        }
+        (reader.cvolume().unwrap(), reader.boolean().unwrap())
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|at| u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Master volume and mute, end to end over the socket. A controller sets
+    /// both with the packets the pinned libpulse 17.0 actually sends, sees
+    /// them in sink info, and its fellow controller hears one sink CHANGE
+    /// event per write. A player's sink writes are a command this server does
+    /// not have — even malformed, because they are refused before parsing —
+    /// and its view of the sink stays byte-identical: unity, unmuted, and no
+    /// event.
+    #[test]
+    fn a_controller_sets_the_output_level_and_a_player_neither_can_nor_sees_it() {
+        let (mut server, path) = server("master-volume");
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut setter = UnixStream::connect(&path).unwrap();
+        let mut watcher = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut setter, &mut watcher] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        server.pass().unwrap();
+        server.pass().unwrap();
+        for socket in [&mut player, &mut setter, &mut watcher] {
+            let _ = drain_socket(socket);
+        }
+        for socket in [&mut player, &mut setter, &mut watcher] {
+            socket
+                .write_all(&build(command::SUBSCRIBE, 10, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let sink_info = build(command::GET_SINK_INFO, 11, |writer| {
+            writer.u32(0).null_string();
+        });
+        player.write_all(&sink_info).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut watcher);
+        let _ = drain_socket(&mut setter);
+        let player_view_before = reply_packet(&drain_socket(&mut player), 11).unwrap();
+
+        // The player: refused before the arguments are read.
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut probes = build(command::SET_SINK_VOLUME, 20, |writer| {
+            writer.u32(0).null_string().cvolume(&[half, half]);
+        });
+        probes.extend(build(command::SET_SINK_MUTE, 21, |writer| {
+            writer.u32(0).null_string().boolean(true);
+        }));
+        probes.extend(build(command::SET_SINK_VOLUME, 22, |writer| {
+            writer.u32(0);
+        }));
+        player.write_all(&probes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut player);
+        for probe in [20, 21, 22] {
+            assert_eq!(
+                error_code(&answers, probe),
+                Some(crate::proto::error::NOTIMPLEMENTED),
+                "player probe {probe}"
+            );
+        }
+        assert_eq!(
+            server.clients.len(),
+            3,
+            "the malformed write disconnected nobody"
+        );
+        assert_eq!(
+            (server.mixer.master_volume(), server.mixer.master_muted()),
+            (crate::mixer::VOLUME_NORM, false)
+        );
+        assert_eq!(subscription_events(&drain_socket(&mut watcher)), Vec::new());
+
+        // The controller, with libpulse 17.0's own bytes, unchanged: each is
+        // td-pulse's fixture, found in its source rather than retyped. Each
+        // batch is one pass and its tags are distinct within it. By name at
+        // 75%, then by index with uneven channels; then mute by index; then
+        // pactl's mute of the sink named "0", which is already muted.
+        let fixtures = include_str!("../../td-pulse/src/proto.rs");
+        let batches: &[&[(&str, u32, usize)]] = &[
+            &[
+                (
+                    "4c000000244c000000034cffffffff744044454641554c545f53494e4b400076020000c0000000c000",
+                    3,
+                    1,
+                ),
+                ("4c000000244c000000024c000000004e76020000800000004000", 2, 1),
+            ],
+            &[("4c000000274c000000034c000000004e31", 3, 1)],
+            &[("4c000000274c000000024cffffffff74300031", 2, 0)],
+        ];
+        let sink_change = (subscription::EVENT_SINK | subscription::EVENT_CHANGE, 0);
+        for batch in batches {
+            let mut writes = Vec::new();
+            for (hex, _, _) in *batch {
+                assert!(fixtures.contains(hex), "{hex} is not a td-pulse capture");
+                writes.extend(control(&unhex(hex)));
+            }
+            setter.write_all(&writes).unwrap();
+            server.pass().unwrap();
+            server.pass().unwrap();
+            let answers = drain_socket(&mut setter);
+            let mut changes = 0;
+            for &(_, tag_value, changed) in *batch {
+                assert!(
+                    reply_packet(&answers, tag_value).is_some(),
+                    "captured write tag {tag_value} was answered with a REPLY"
+                );
+                changes += changed;
+            }
+            // The writer hears its own change once, as Pulse's subscribers
+            // do, every other controller hears it once, and a write that
+            // changes nothing is announced to nobody.
+            assert_eq!(subscription_events(&answers), vec![sink_change; changes]);
+            assert_eq!(
+                subscription_events(&drain_socket(&mut watcher)),
+                vec![sink_change; changes]
+            );
+        }
+        assert_eq!(
+            (server.mixer.master_volume(), server.mixer.master_muted()),
+            (0x8000, true),
+            "the loudest channel of the last level, and muted"
+        );
+
+        // Each sees the sink as its role allows.
+        setter.write_all(&sink_info).unwrap();
+        player.write_all(&sink_info).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let controller_view = reply_packet(&drain_socket(&mut setter), 11).unwrap();
+        assert_eq!(reported_output(&controller_view), (vec![0x8000; 2], true));
+        let player_answers = drain_socket(&mut player);
+        assert_eq!(subscription_events(&player_answers), Vec::new());
+        assert_eq!(
+            reply_packet(&player_answers, 11).unwrap(),
+            player_view_before,
+            "the player's sink is unchanged to the byte"
+        );
+        assert_eq!(
+            reported_output(&player_view_before),
+            (vec![crate::mixer::VOLUME_NORM; 2], false)
+        );
+
+        // A selector naming no sink is NOENTITY, and changes nothing.
+        setter
+            .write_all(&build(command::SET_SINK_MUTE, 30, |writer| {
+                writer
+                    .u32(tag::INVALID_INDEX)
+                    .string("elsewhere")
+                    .boolean(false);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            error_code(&drain_socket(&mut setter), 30),
+            Some(crate::proto::error::NOENTITY)
+        );
+        assert!(server.mixer.master_muted());
+        assert_eq!(subscription_events(&drain_socket(&mut watcher)), Vec::new());
+
+        // Malformed requests are INVALID, as Pulse answers, and change
+        // nothing: no channels (no loudest one to take), PA_VOLUME_INVALID
+        // (above every level), three channels on a stereo sink, and a
+        // selector that names the sink both ways or neither.
+        let invalid = tag::INVALID_INDEX;
+        let mut probes = build(command::SET_SINK_VOLUME, 40, |writer| {
+            writer.u32(0).null_string().cvolume(&[]);
+        });
+        probes.extend(build(command::SET_SINK_VOLUME, 41, |writer| {
+            writer.u32(0).null_string().cvolume(&[0x1000, 0xFFFF_FFFF]);
+        }));
+        probes.extend(build(command::SET_SINK_VOLUME, 42, |writer| {
+            writer.u32(0).null_string().cvolume(&[0x1000; 3]);
+        }));
+        probes.extend(build(command::SET_SINK_VOLUME, 43, |writer| {
+            writer.u32(0).string("td-audio").cvolume(&[0x1000, 0x1000]);
+        }));
+        probes.extend(build(command::SET_SINK_MUTE, 44, |writer| {
+            writer.u32(invalid).null_string().boolean(false);
+        }));
+        setter.write_all(&probes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut setter);
+        for probe in 40..=44 {
+            assert_eq!(
+                error_code(&answers, probe),
+                Some(crate::proto::error::INVALID),
+                "probe {probe}"
+            );
+        }
+        assert_eq!(
+            (server.mixer.master_volume(), server.mixer.master_muted()),
+            (0x8000, true)
+        );
+        assert_eq!(subscription_events(&answers), Vec::new());
+        assert_eq!(subscription_events(&drain_socket(&mut watcher)), Vec::new());
+    }
+
+    /// A controller whose one read holds a valid sink write and then a frame
+    /// that breaks its schema is dropped in that pass. The level it set
+    /// outlives it, so the event announcing the level must too.
+    #[test]
+    fn a_dropped_controllers_last_change_is_still_announced() {
+        let (mut server, path) = server("dropped-setter");
+        let mut setter = UnixStream::connect(&path).unwrap();
+        let mut watcher = UnixStream::connect(&path).unwrap();
+        for socket in [&mut setter, &mut watcher] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        server.pass().unwrap();
+        watcher
+            .write_all(&build(command::SUBSCRIBE, 10, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut setter);
+        let _ = drain_socket(&mut watcher);
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut writes = build(command::SET_SINK_VOLUME, 20, |writer| {
+            writer.u32(0).null_string().cvolume(&[half, half]);
+        });
+        // A mute with no selector name or value: a schema failure.
+        writes.extend(build(command::SET_SINK_MUTE, 21, |writer| {
+            writer.u32(0);
+        }));
+        setter.write_all(&writes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(server.clients.len(), 1, "the setter was dropped");
+        assert_eq!(server.mixer.master_volume(), half);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut watcher)),
+            vec![(subscription::EVENT_SINK | subscription::EVENT_CHANGE, 0)]
+        );
+    }
+
+    /// `pactl get-sink-volume 0` names the sink `"0"` with an invalid index —
+    /// libpulse 17.0's own bytes below — and a Pulse server resolves a decimal
+    /// name as the index. Any role may look the sink up this way.
+    #[test]
+    fn a_sink_named_by_its_number_is_the_sink() {
+        let (mut server, _path) = server("numeric-name");
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        player.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        player
+            .write_all(&control(&unhex("4c000000154c000000024cffffffff743000")))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let reply = reply_packet(&drain_socket(&mut player), 2).expect("sink info");
+        assert_eq!(
+            reported_output(&reply),
+            (vec![crate::mixer::VOLUME_NORM; 2], false)
+        );
     }
 
     /// An application account is a player. Another connection's stream is

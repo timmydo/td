@@ -275,8 +275,13 @@ pub struct Session {
     next_channel: u64,
     client_index: u32,
     subscribed: u32,
-    /// Sink-input changes for the daemon to relay to the other connections'
-    /// subscribers that are controllers.
+    /// Whether this connection may set and see the output's level and mute.
+    /// Set by the daemon from the role fixed at accept (§K.5); false is the
+    /// player's view, in which the sink is always at unity and unmuted and a
+    /// write to it is a command this server does not have.
+    controls_output: bool,
+    /// Sink-input and sink changes for the daemon to relay to the other
+    /// connections' subscribers that are controllers.
     global_events: Vec<(u32, u32)>,
     global_requests: Vec<GlobalRequest>,
     output_overflowed: bool,
@@ -298,12 +303,20 @@ impl Session {
             next_channel: 0,
             client_index,
             subscribed: 0,
+            controls_output: false,
             global_events: Vec::new(),
             global_requests: Vec::new(),
             output_overflowed: false,
             input_deferred: false,
             now_usec: 0,
         }
+    }
+
+    /// A controller's session: it may set the output's level and mute, and
+    /// sees them as they are.
+    pub fn with_output_control(mut self, controls: bool) -> Self {
+        self.controls_output = controls;
+        self
     }
 
     /// The negotiated version, once authenticated.
@@ -730,11 +743,19 @@ impl Session {
             command::GET_PLAYBACK_LATENCY => self.latency(reader, tag, version, mixer),
             command::SET_SINK_INPUT_VOLUME => self.set_volume(reader, tag, mixer),
             command::SET_SINK_INPUT_MUTE => self.set_mute(reader, tag, mixer),
+            command::SET_SINK_VOLUME if self.controls_output => {
+                self.set_sink_volume(reader, tag, mixer)
+            }
+            command::SET_SINK_MUTE if self.controls_output => {
+                self.set_sink_mute(reader, tag, mixer)
+            }
             command::UPDATE_PLAYBACK_STREAM_PROPLIST => self.update_proplist(reader, tag),
             _ => {
                 // §K.3's list is what playback needs; anything else is a
                 // control-panel feature this server does not have. Saying so
                 // exactly is what lets a client fall back rather than hang.
+                // A player's sink write lands here unparsed, so its view of
+                // the output stays the one the captured fixtures describe.
                 self.error(tag, error::NOTIMPLEMENTED);
                 Ok(())
             }
@@ -840,8 +861,9 @@ impl Session {
         }
         let spec = self.sample_spec();
         let state = sink_state(mixer);
+        let view = self.output_view(mixer);
         self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version, state);
+            write_sink_info(writer, spec, version, state, view);
         });
         Ok(())
     }
@@ -856,8 +878,9 @@ impl Session {
         reader.finish().map_err(Disconnect::Schema)?;
         let spec = self.sample_spec();
         let state = sink_state(mixer);
+        let view = self.output_view(mixer);
         self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version, state);
+            write_sink_info(writer, spec, version, state, view);
         });
         Ok(())
     }
@@ -1412,7 +1435,7 @@ impl Session {
         let index = reader.u32().map_err(Disconnect::Schema)?;
         let volumes = reader.cvolume().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        if !matches!(volumes.len(), 1 | 2) {
+        if !valid_cvolume(&volumes) {
             self.error(tag, error::INVALID);
             return Ok(());
         }
@@ -1496,6 +1519,85 @@ impl Session {
             sink_input_index,
         );
         Ok(())
+    }
+
+    /// `SET_SINK_VOLUME` from a controller: the selector `GET_SINK_INFO`
+    /// takes, then a cvolume. One level for the output, the loudest channel's,
+    /// as a stream's is.
+    fn set_sink_volume(
+        &mut self,
+        mut reader: tag::Reader<'_>,
+        tag: u32,
+        mixer: &mut Mixer,
+    ) -> Result<(), Disconnect> {
+        let index = reader.u32().map_err(Disconnect::Schema)?;
+        let name = reader.string().map_err(Disconnect::Schema)?;
+        let volumes = reader.cvolume().map_err(Disconnect::Schema)?;
+        reader.finish().map_err(Disconnect::Schema)?;
+        // An empty vector has no loudest channel, and PA_VOLUME_INVALID is
+        // above every valid level: either would otherwise land as unity.
+        if !one_selector(index, name.as_deref()) || !valid_cvolume(&volumes) {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        }
+        if !sink_lookup_matches(index, name.as_deref()) {
+            self.error(tag, error::NOENTITY);
+            return Ok(());
+        }
+        let before = (mixer.master_volume(), mixer.master_muted());
+        let volume = volumes.iter().copied().max().unwrap_or(VOLUME_NORM);
+        mixer.set_master_volume(volume);
+        self.reply(tag, |_| {});
+        self.announce_output_change(before, mixer);
+        Ok(())
+    }
+
+    /// One sink CHANGE event when a write changed the output, and none when
+    /// it set what was already there.
+    fn announce_output_change(&mut self, before: (u32, bool), mixer: &Mixer) {
+        if (mixer.master_volume(), mixer.master_muted()) != before {
+            self.announce(
+                subscription::EVENT_SINK | subscription::EVENT_CHANGE,
+                SINK_INDEX,
+            );
+        }
+    }
+
+    /// `SET_SINK_MUTE` from a controller: the same selector, then a boolean.
+    fn set_sink_mute(
+        &mut self,
+        mut reader: tag::Reader<'_>,
+        tag: u32,
+        mixer: &mut Mixer,
+    ) -> Result<(), Disconnect> {
+        let index = reader.u32().map_err(Disconnect::Schema)?;
+        let name = reader.string().map_err(Disconnect::Schema)?;
+        let muted = reader.boolean().map_err(Disconnect::Schema)?;
+        reader.finish().map_err(Disconnect::Schema)?;
+        if !one_selector(index, name.as_deref()) {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        }
+        if !sink_lookup_matches(index, name.as_deref()) {
+            self.error(tag, error::NOENTITY);
+            return Ok(());
+        }
+        let before = (mixer.master_volume(), mixer.master_muted());
+        mixer.set_master_mute(muted);
+        self.reply(tag, |_| {});
+        self.announce_output_change(before, mixer);
+        Ok(())
+    }
+
+    /// The output's level and mute as this connection may see them: as they
+    /// are for a controller, and unity and unmuted for a player, whose view
+    /// of the one sink never changes.
+    fn output_view(&self, mixer: &Mixer) -> (u32, bool) {
+        if self.controls_output {
+            (mixer.master_volume(), mixer.master_muted())
+        } else {
+            (VOLUME_NORM, false)
+        }
     }
 
     fn apply_volume(&mut self, index: u32, volumes: &[u32], mixer: &mut Mixer) -> bool {
@@ -1651,9 +1753,33 @@ fn attribute_frames(requested: u32, default_ms: u64, spec: Spec, frame_bytes: u6
     }
 }
 
-/// Resolve the only sink by either of Pulse's ordinary selector forms.
+/// The only sink's index written as a name. `pactl` names even a numbered
+/// sink — `pactl get-sink-volume 0` sends an invalid index and the name
+/// `"0"`, captured from the pinned libpulse 17.0 — and a Pulse server
+/// resolves a decimal name as the index.
+const SINK_INDEX_NAME: &str = "0";
+
+/// `PA_VOLUME_MAX`: the largest valid volume. `PA_VOLUME_INVALID` is the one
+/// value above it.
+const VOLUME_VALID_MAX: u32 = 0x7FFF_FFFF;
+
+/// A cvolume this stereo server can take: one or two channels, every value a
+/// valid volume. Pulse answers `INVALID` otherwise, and libpulse refuses to
+/// send one.
+fn valid_cvolume(volumes: &[u32]) -> bool {
+    matches!(volumes.len(), 1 | 2) && volumes.iter().all(|&volume| volume <= VOLUME_VALID_MAX)
+}
+
+/// A setter names its sink exactly one way: an index and a NULL name, or an
+/// invalid index and a name. Both or neither is `INVALID`, as Pulse answers;
+/// `GET_SINK_INFO` keeps the `NOENTITY` it has always given a player.
+fn one_selector(index: u32, name: Option<&str>) -> bool {
+    (index == tag::INVALID_INDEX) == name.is_some()
+}
+
+/// Resolve the only sink by any of Pulse's ordinary selector forms.
 fn named_sink_matches(name: &str) -> bool {
-    matches!(name, SINK_NAME | "@DEFAULT_SINK@")
+    matches!(name, SINK_NAME | "@DEFAULT_SINK@" | SINK_INDEX_NAME)
 }
 
 /// A lookup carries exactly one selector: either the sink index or its name.
@@ -1684,7 +1810,13 @@ fn sink_state(mixer: &Mixer) -> u32 {
     }
 }
 
-fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32, state: u32) {
+fn write_sink_info(
+    writer: &mut tag::Writer,
+    spec: SampleSpec,
+    version: u32,
+    state: u32,
+    (volume, muted): (u32, bool),
+) {
     writer
         .u32(SINK_INDEX)
         .string(SINK_NAME)
@@ -1692,8 +1824,8 @@ fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32, sta
         .sample_spec(spec)
         .channel_map(&CHANNEL_MAP)
         .u32(OWNER_MODULE)
-        .cvolume(&[VOLUME_NORM, VOLUME_NORM])
-        .boolean(false)
+        .cvolume(&[volume, volume])
+        .boolean(muted)
         // There is no monitor source: td does not offer loopback capture of
         // what is playing, and naming one that cannot be opened would be worse
         // than admitting there is none.
@@ -1735,6 +1867,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::sink::{AudioSink, MemorySink};
+
+    /// The numeric name is the index written out, not a second sink.
+    #[test]
+    fn the_sinks_numeric_name_is_its_index() {
+        assert_eq!(SINK_INDEX_NAME, SINK_INDEX.to_string());
+    }
 
     fn unhex(text: &str) -> Vec<u8> {
         text.as_bytes()

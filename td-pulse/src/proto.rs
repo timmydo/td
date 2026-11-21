@@ -184,8 +184,17 @@ pub mod command {
     /// `PA_SUBSCRIPTION_MASK_ALL`.
     pub const SUBSCRIBE: u32 = 35;
 
+    /// A `u32` index, a string and a cvolume, one of the index and the name
+    /// invalid as in `GET_SINK_INFO`. Captured in both forms from the pinned
+    /// runtime's libpulse 17.0.
+    pub const SET_SINK_VOLUME: u32 = 36;
+
     /// A `u32` index and a cvolume.
     pub const SET_SINK_INPUT_VOLUME: u32 = 37;
+
+    /// A `u32` index, a string and a boolean, in `SET_SINK_VOLUME`'s two
+    /// forms. Captured in both from the same libpulse 17.0.
+    pub const SET_SINK_MUTE: u32 = 39;
 
     /// `channel` and a boolean. Captured in both directions.
     pub const CORK_PLAYBACK_STREAM: u32 = 41;
@@ -332,7 +341,9 @@ pub fn command_name(command: u32) -> Option<&'static str> {
         command::GET_SOURCE_INFO_LIST => "GET_SOURCE_INFO_LIST",
         command::GET_SINK_INPUT_INFO => "GET_SINK_INPUT_INFO",
         command::SUBSCRIBE => "SUBSCRIBE",
+        command::SET_SINK_VOLUME => "SET_SINK_VOLUME",
         command::SET_SINK_INPUT_VOLUME => "SET_SINK_INPUT_VOLUME",
+        command::SET_SINK_MUTE => "SET_SINK_MUTE",
         command::CORK_PLAYBACK_STREAM => "CORK_PLAYBACK_STREAM",
         command::FLUSH_PLAYBACK_STREAM => "FLUSH_PLAYBACK_STREAM",
         command::TRIGGER_PLAYBACK_STREAM => "TRIGGER_PLAYBACK_STREAM",
@@ -402,12 +413,63 @@ mod tests {
 00000872656e616d6564004e";
     }
 
+    /// CAPTURED from the pinned Firefox runtime (freedesktop 25.08), whose
+    /// libpulse is 17.0: its own `pactl` and, for the by-index forms `pactl`
+    /// never sends, `pa_context_set_sink_{volume,mute}_by_index` driven from
+    /// the runtime's Python, each run under the runtime's loader against a
+    /// logging relay in front of td-audio's server.
+    mod captured_17 {
+        /// `set_sink_volume_by_index(0, {0x8000, 0x4000})`, tag 2: the index,
+        /// a NULL name, then a two-channel cvolume.
+        pub const SET_SINK_VOLUME_BY_INDEX: &str =
+            "4c000000244c000000024c000000004e76020000800000004000";
+        /// `pactl set-sink-volume @DEFAULT_SINK@ 75%`, tag 3: an invalid
+        /// index, the name, then 75% of `PA_VOLUME_NORM` on both channels.
+        /// pactl's percentages are linear in the volume value; the curve is
+        /// the server's.
+        // One unbroken literal: td-audio's controller test finds each of
+        // these strings in this file to prove it replays them unchanged.
+        pub const SET_SINK_VOLUME_BY_NAME: &str =
+            "4c000000244c000000034cffffffff744044454641554c545f53494e4b400076020000c0000000c000";
+        /// `set_sink_mute_by_index(0, true)`, tag 3.
+        pub const SET_SINK_MUTE_BY_INDEX: &str = "4c000000274c000000034c000000004e31";
+        /// `set_sink_mute_by_index(0, false)`, tag 4.
+        pub const SET_SINK_UNMUTE_BY_INDEX: &str = "4c000000274c000000044c000000004e30";
+        /// `pactl set-sink-mute 0 1`, tag 2: pactl names even a numbered sink,
+        /// so this is an invalid index and the NAME `"0"`.
+        pub const SET_SINK_MUTE_BY_NUMBER_NAME: &str = "4c000000274c000000024cffffffff74300031";
+        /// `pactl get-sink-volume 0`, tag 2: the same numeric name, which a
+        /// Pulse server resolves as the index.
+        pub const GET_SINK_INFO_BY_NUMBER_NAME: &str = "4c000000154c000000024cffffffff743000";
+    }
+
     /// Every fixture's first value is the command number this module pins. This
     /// is the test that ties the table to the bytes: change a constant and the
     /// captured packet stops agreeing with it.
     #[test]
     fn every_pinned_command_matches_its_captured_packet() {
-        let cases: [(&str, u32); 12] = [
+        let cases: &[(&str, u32)] = &[
+            (
+                captured_17::SET_SINK_VOLUME_BY_INDEX,
+                command::SET_SINK_VOLUME,
+            ),
+            (
+                captured_17::SET_SINK_VOLUME_BY_NAME,
+                command::SET_SINK_VOLUME,
+            ),
+            (captured_17::SET_SINK_MUTE_BY_INDEX, command::SET_SINK_MUTE),
+            (
+                captured_17::SET_SINK_UNMUTE_BY_INDEX,
+                command::SET_SINK_MUTE,
+            ),
+            (
+                captured_17::SET_SINK_MUTE_BY_NUMBER_NAME,
+                command::SET_SINK_MUTE,
+            ),
+            (
+                captured_17::GET_SINK_INFO_BY_NUMBER_NAME,
+                command::GET_SINK_INFO,
+            ),
             (
                 captured::GET_PLAYBACK_LATENCY,
                 command::GET_PLAYBACK_LATENCY,
@@ -439,7 +501,7 @@ mod tests {
                 command::UPDATE_PLAYBACK_STREAM_PROPLIST,
             ),
         ];
-        for (hex, expected) in cases {
+        for &(hex, expected) in cases {
             let bytes = unhex(hex);
             let mut reader = tag::Reader::new(&bytes);
             assert_eq!(
@@ -448,6 +510,66 @@ mod tests {
                 "captured packet {hex} is not command {expected}"
             );
         }
+    }
+
+    /// The sink setters take `GET_SINK_INFO`'s selector — an index and a NULL
+    /// name, or an invalid index and a name — and then their value: a cvolume
+    /// for the level, a boolean tag byte for mute.
+    #[test]
+    fn the_sink_setters_carry_a_selector_then_their_value() {
+        /// The command, then the selector; the reader is left on the value.
+        fn selector(reader: &mut tag::Reader<'_>) -> (u32, u32, Option<String>) {
+            let command = reader.u32().unwrap();
+            let _tag = reader.u32().unwrap();
+            let index = reader.u32().unwrap();
+            (command, index, reader.string().unwrap())
+        }
+        for (hex, index, name, volumes) in [
+            (
+                captured_17::SET_SINK_VOLUME_BY_INDEX,
+                0,
+                None,
+                [0x8000, 0x4000],
+            ),
+            (
+                captured_17::SET_SINK_VOLUME_BY_NAME,
+                tag::INVALID_INDEX,
+                Some("@DEFAULT_SINK@"),
+                [0xC000, 0xC000],
+            ),
+        ] {
+            let bytes = unhex(hex);
+            let mut reader = tag::Reader::new(&bytes);
+            let (command, got_index, got_name) = selector(&mut reader);
+            assert_eq!(command, command::SET_SINK_VOLUME);
+            assert_eq!((got_index, got_name.as_deref()), (index, name));
+            assert_eq!(reader.cvolume().unwrap(), volumes);
+            reader.finish().unwrap();
+        }
+        for (hex, index, name, muted) in [
+            (captured_17::SET_SINK_MUTE_BY_INDEX, 0, None, true),
+            (captured_17::SET_SINK_UNMUTE_BY_INDEX, 0, None, false),
+            (
+                captured_17::SET_SINK_MUTE_BY_NUMBER_NAME,
+                tag::INVALID_INDEX,
+                Some("0"),
+                true,
+            ),
+        ] {
+            let bytes = unhex(hex);
+            let mut reader = tag::Reader::new(&bytes);
+            let (command, got_index, got_name) = selector(&mut reader);
+            assert_eq!(command, command::SET_SINK_MUTE);
+            assert_eq!((got_index, got_name.as_deref()), (index, name));
+            assert_eq!(reader.boolean().unwrap(), muted);
+            reader.finish().unwrap();
+        }
+        let bytes = unhex(captured_17::GET_SINK_INFO_BY_NUMBER_NAME);
+        let mut reader = tag::Reader::new(&bytes);
+        let (command, index, name) = selector(&mut reader);
+        assert_eq!(command, command::GET_SINK_INFO);
+        assert_eq!((index, name.as_deref()), (tag::INVALID_INDEX, Some("0")));
+        reader.finish().unwrap();
     }
 
     /// `GET_SINK_INFO` carries an index and a name, one of which is invalid —
@@ -622,7 +744,7 @@ mod tests {
     /// silently route one command to the other's handler.
     #[test]
     fn no_two_commands_share_a_number() {
-        let all = [
+        let all: &[u32] = &[
             command::ERROR,
             command::REPLY,
             command::CREATE_PLAYBACK_STREAM,
@@ -637,7 +759,9 @@ mod tests {
             command::GET_SOURCE_INFO_LIST,
             command::GET_SINK_INPUT_INFO,
             command::SUBSCRIBE,
+            command::SET_SINK_VOLUME,
             command::SET_SINK_INPUT_VOLUME,
+            command::SET_SINK_MUTE,
             command::CORK_PLAYBACK_STREAM,
             command::FLUSH_PLAYBACK_STREAM,
             command::TRIGGER_PLAYBACK_STREAM,
@@ -651,12 +775,11 @@ mod tests {
             command::SUBSCRIBE_EVENT,
             command::STARTED,
         ];
-        let mut sorted = all;
-        sorted.sort_unstable();
-        let mut deduped = sorted.to_vec();
+        let mut deduped = all.to_vec();
+        deduped.sort_unstable();
         deduped.dedup();
         assert_eq!(deduped.len(), all.len(), "a command number is used twice");
-        for number in all {
+        for &number in all {
             assert!(command_name(number).is_some(), "{number} has no name");
         }
         assert_eq!(command_name(9999), None);

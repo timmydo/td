@@ -43,6 +43,17 @@ pub const VOLUME_NORM: u32 = 0x1_0000;
 /// making either louder.
 pub const VOLUME_MAX: u32 = VOLUME_NORM;
 
+/// The amplitude a protocol volume stands for: the cube of its fraction of
+/// `VOLUME_NORM`, which is libpulse's own `pa_sw_volume_to_linear`. A client
+/// that sets a linear amplitude converts it with the inverse curve first
+/// (Firefox's backend does), and a person's 5% steps sound even rather than
+/// crowding all the audible change into the bottom of the range. Above unity
+/// is refused here as it is everywhere else.
+pub fn gain(volume: u32) -> f32 {
+    let fraction = volume.min(VOLUME_MAX) as f32 / VOLUME_NORM as f32;
+    fraction * fraction * fraction
+}
+
 /// The most this mixer will hold queued across ALL streams.
 ///
 /// The per-stream ceiling, the streams-per-client cap and the client cap are
@@ -314,6 +325,12 @@ pub struct Mixer {
     /// The next id `open` will issue. Monotonic and never reused, so a stream
     /// that has been removed cannot be confused with a later one.
     next_id: u64,
+    /// The output's level, in protocol volume units, and its mute: applied
+    /// to the summed mix, after every stream's own gain and before
+    /// saturation. Mute is a flag beside the level, as a stream's is, so
+    /// unmuting restores what was set.
+    master_volume: u32,
+    master_muted: bool,
 }
 
 impl Mixer {
@@ -335,7 +352,27 @@ impl Mixer {
             retired_priming_contributed: false,
             retired_pending_contribution_end: 0,
             next_id: 0,
+            master_volume: VOLUME_NORM,
+            master_muted: false,
         }
+    }
+
+    /// Set the output's level. Takes effect on the next mixed period; what
+    /// the device ring already holds plays at the old level.
+    pub fn set_master_volume(&mut self, volume: u32) {
+        self.master_volume = volume.min(VOLUME_MAX);
+    }
+
+    pub fn set_master_mute(&mut self, muted: bool) {
+        self.master_muted = muted;
+    }
+
+    pub fn master_volume(&self) -> u32 {
+        self.master_volume
+    }
+
+    pub fn master_muted(&self) -> bool {
+        self.master_muted
     }
 
     pub fn target_floor_frames(&self) -> u64 {
@@ -975,7 +1012,7 @@ impl Mixer {
             stream.pending_contribution_end = available;
             stream.pending_blocks_short_start = !released;
             stream.running = true;
-            let gain = stream.volume as f32 / VOLUME_NORM as f32;
+            let gain = gain(stream.volume);
             for index in 0..available.saturating_mul(channels) {
                 let low = stream.queue.pop_front().unwrap_or(0);
                 let high = stream.queue.pop_front().unwrap_or(0);
@@ -1008,11 +1045,20 @@ impl Mixer {
         self.pending.clear();
         self.pending_at = 0;
         self.pending.reserve(samples.saturating_mul(SAMPLE_BYTES));
+        let master = if self.master_muted {
+            0.0
+        } else {
+            gain(self.master_volume)
+        };
         for sample in &self.accumulator {
+            // The master multiplies the SUM, before saturation: two loud
+            // streams turned down together come out as their quieter sum, not
+            // as a clipped sum turned down.
+            //
             // Saturating summation: a mix that would exceed full scale clips
             // rather than wrapping, because a wrap is a click and a clip is
             // loudness.
-            let clamped = sample.clamp(f32::from(i16::MIN), f32::from(i16::MAX));
+            let clamped = (sample * master).clamp(f32::from(i16::MIN), f32::from(i16::MAX));
             self.pending
                 .extend_from_slice(&(clamped as i16).to_le_bytes());
         }
@@ -2393,12 +2439,96 @@ mod tests {
         mixer.pump(&mut sink).unwrap();
         assert_eq!(
             sink.samples().first().copied(),
-            Some(500),
-            "half of one stream, and none of a stream at zero"
+            Some(125),
+            "half volume is an eighth of the amplitude, and zero is none"
         );
         // Volume above unity is refused rather than applied.
         mixer.set_volume(StreamId(1), VOLUME_NORM * 4).unwrap();
         assert_eq!(mixer.find(StreamId(1)).unwrap().volume, VOLUME_NORM);
+    }
+
+    /// The taper is libpulse's: the cube of the fraction of unity, exact at
+    /// the points a person's steps land on, and capped at unity.
+    #[test]
+    fn volume_maps_to_amplitude_by_the_cube() {
+        assert_eq!(gain(0), 0.0);
+        assert_eq!(gain(VOLUME_NORM / 4), 1.0 / 64.0);
+        assert_eq!(gain(VOLUME_NORM / 2), 0.125);
+        assert_eq!(gain(VOLUME_NORM / 4 * 3), 27.0 / 64.0);
+        assert_eq!(gain(VOLUME_NORM), 1.0);
+        assert_eq!(gain(VOLUME_NORM * 4), 1.0, "nothing above unity");
+    }
+
+    /// One pass of two streams at `levels`, with the master at `master`.
+    fn mixed(levels: [i16; 2], master: u32, muted: bool) -> Vec<i16> {
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 2);
+        let mut mixer = Mixer::new(Spec::fixed());
+        mixer.set_master_volume(master);
+        mixer.set_master_mute(muted);
+        for (id, level) in [(1, levels[0]), (2, levels[1])] {
+            mixer.create(StreamId(id), 1000).unwrap();
+            mixer.write(StreamId(id), &stereo(&[level, level])).unwrap();
+        }
+        sink.start().unwrap();
+        mixer.pump(&mut sink).unwrap();
+        sink.samples()
+    }
+
+    /// The master multiplies the SUM, before saturation. Two streams at
+    /// 30,000 sum past full scale; at half master the right answer is an
+    /// eighth of 60,000. Multiplying after the clamp would give an eighth of
+    /// 32,767 instead: quieter than asked, and distorted.
+    #[test]
+    fn the_master_gain_scales_the_sum_before_saturation() {
+        assert_eq!(
+            mixed([30_000, 30_000], VOLUME_NORM, false).first().copied(),
+            Some(i16::MAX),
+            "at unity the sum clips"
+        );
+        assert_eq!(
+            mixed([30_000, 30_000], VOLUME_NORM / 2, false)
+                .first()
+                .copied(),
+            Some(7_500)
+        );
+        // And a stream's own gain multiplies with the master's: 1,000 at a
+        // half-volume stream and a half master is 1,000 / 64.
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 2);
+        let mut mixer = Mixer::new(Spec::fixed());
+        mixer.set_master_volume(VOLUME_NORM / 2);
+        mixer.create(StreamId(1), 1000).unwrap();
+        mixer.set_volume(StreamId(1), VOLUME_NORM / 2).unwrap();
+        mixer.write(StreamId(1), &stereo(&[6_400, 6_400])).unwrap();
+        sink.start().unwrap();
+        mixer.pump(&mut sink).unwrap();
+        assert_eq!(sink.samples().first().copied(), Some(100));
+    }
+
+    /// Mute silences the output and is a flag beside the level, so unmuting
+    /// restores the level that was set; the master is capped at unity.
+    #[test]
+    fn the_master_mute_silences_and_unmute_restores_the_level() {
+        assert_eq!(
+            mixed([4_000, 4_000], VOLUME_NORM / 2, true),
+            vec![0; 4],
+            "muted"
+        );
+        assert_eq!(
+            mixed([4_000, 4_000], VOLUME_NORM / 2, false),
+            vec![1_000; 4],
+            "unmuted at the level that was set"
+        );
+        let mut mixer = Mixer::new(Spec::fixed());
+        mixer.set_master_volume(VOLUME_NORM / 2);
+        mixer.set_master_mute(true);
+        assert_eq!(
+            (mixer.master_volume(), mixer.master_muted()),
+            (VOLUME_NORM / 2, true)
+        );
+        mixer.set_master_mute(false);
+        assert_eq!(mixer.master_volume(), VOLUME_NORM / 2);
+        mixer.set_master_volume(VOLUME_NORM * 3);
+        assert_eq!(mixer.master_volume(), VOLUME_NORM, "nothing above unity");
     }
 
     /// Backpressure: a full stream queue shortens the client's write and counts

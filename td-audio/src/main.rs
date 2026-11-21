@@ -355,7 +355,7 @@ fn render(path: &Path, options: &Options) -> io::Result<()> {
         usize::try_from(frames.saturating_mul(spec.frame_bytes as u64)).unwrap_or(0),
     );
     for frame in 0..frames {
-        let sample = tone::expected(spec, &voices, frame, mixer::VOLUME_NORM).to_le_bytes();
+        let sample = tone::expected(spec, &voices, frame).to_le_bytes();
         for _ in 0..channels {
             pcm.extend_from_slice(&sample);
         }
@@ -434,7 +434,7 @@ fn verify_tone(arguments: &[OsString]) -> io::Result<()> {
     for channel in 0..wave.channels {
         let recorded = wave.channel(channel);
         let expected: Vec<i16> = (0..recorded.len() as u64)
-            .map(|frame| tone::expected(spec, &voices, frame, mixer::VOLUME_NORM))
+            .map(|frame| tone::expected(spec, &voices, frame))
             .collect();
         let correlation = wav::correlation(&recorded, &expected);
         if correlation < 0.9 {
