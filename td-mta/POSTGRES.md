@@ -8133,8 +8133,10 @@ admission; no failed SQL or response is retried transparently. Every failed
 download retires both sessions.
 
 Reserve both read permits before DNS, or two transient permits for a standalone
-call. The fixed-worker count and global read capacity do not grow; a download
-worker may now retain two idle permits. Cache borrows prevent retirement of the
+call. After a successful download, the worker checks the shared read-slot count.
+If the pool is full, it retires its authorization connection and releases that
+permit. With spare capacity it can keep both sessions warm. Other jobs may
+acquire a released permit immediately. Cache borrows prevent retirement of the
 active body reader during output. Sender maintenance can retire the idle
 checker during slow response writes; fixed-worker maintenance retires either
 idle session between requests. The retained connections never authorize one

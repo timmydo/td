@@ -7201,7 +7201,7 @@ fn exercise_http_read(
     let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
     let responses =
         ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
-    let slots = td_mta::postgres_read::ReadSlots::new(2).unwrap();
+    let slots = td_mta::postgres_read::ReadSlots::new(3).unwrap();
     let prepare_session = if drafts {
         td_mta::jmap_session::Session::mail_submission
     } else {
@@ -7283,9 +7283,8 @@ fn exercise_http_read(
                         )
                         .unwrap()
                     };
-                    let first = open();
-                    let second = open();
-                    drop((first, second));
+                    let all_views = [open(), open(), open()];
+                    drop(all_views);
                 }
             };
         let mut wire = http_fixture::Observed {
@@ -7897,18 +7896,21 @@ fn exercise_http_read(
     assert!(wire.is_empty());
     assert!(download(raw, password, true).0.is_err());
     download(raw, password, false).0.unwrap();
-    // One held read leaves only one slot: refuse before opening either of the
-    // download's two connections, then release its partial reservation.
+    // Leave only one slot before download admission, then release the
+    // partial reservation when a new worker cannot reserve its pair.
     *api_worker.borrow_mut() = None;
-    let held = td_mta::postgres_read::Snapshot::open_resolved(
-        &slots,
-        &loaded,
-        service.executable,
-        deadline(),
-        binding,
-        password,
-    )
-    .unwrap();
+    let hold_view = || {
+        td_mta::postgres_read::Snapshot::open_resolved(
+            &slots,
+            &loaded,
+            service.executable,
+            deadline(),
+            binding,
+            password,
+        )
+        .unwrap()
+    };
+    let held = [hold_view(), hold_view()];
     let (result, wire) = download(raw, password, false);
     assert!(matches!(
         result,
@@ -7916,7 +7918,10 @@ fn exercise_http_read(
     ));
     assert!(wire.is_empty());
     drop(held);
+    let active = hold_view();
     download(raw, password, false).0.unwrap();
+    let next = hold_view();
+    drop((active, next));
     if drafts {
         let mailbox = sql(
             fixture,
@@ -8322,7 +8327,106 @@ fn exercise_http_read(
         );
         damage(0);
         call(&get, password, device, false, false, false).0.unwrap();
+        // Complete a real download while the last two views are in use.
+        // Keep its worker and the unrelated snapshot alive through delivery.
+        let held = hold_view();
+        download(raw, password, false).0.unwrap();
+        commit_beside_idle_download(fixture, &service);
+        drop(held);
     }
+}
+
+fn receiving_input(fixture: &Fixture, profile: &str) -> td_mta::postgres_input::Loaded {
+    td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            profile,
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    }
+}
+
+fn receiving_message<'a>(
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    recipient_bytes: &'a mut [u8],
+) -> td_mta::postgres_receiving::Message<'a> {
+    use td_mta::format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt};
+    let recipients = ReceiptRecipients::encode(&["alice@example.test"], recipient_bytes).unwrap();
+    td_mta::postgres_receiving::Message {
+        bytes: b"Subject: retained receiving\r\n\r\nbody\r\n",
+        receipt: SmtpReceipt {
+            peer: "192.0.2.1".parse().unwrap(),
+            gateway: None,
+            tls: ReceiptTls::Tls13,
+            ehlo: "sender.example.test",
+            reverse_path: "sender@example.test",
+            recipients,
+        },
+        hostname: "mail.example.test",
+        extended: true,
+        header_bytes: binding.header_maximum(),
+        received_at: 1_700_000_000_000,
+    }
+}
+
+fn commit_beside_idle_download(
+    fixture: &Fixture,
+    service: &td_mta::postgres_http_api::Service<'_, '_, '_>,
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        generations::GenerationSet,
+        ports::{Clock, Deadline},
+        postgres_smtp_receiving::Receiving,
+        tls_policy::TlsPolicies,
+    };
+    let generations = GenerationSet::<TlsPolicies>::at_startup();
+    let profile = td_mta::postgres_runtime_profile::load(
+        &fixture.request(),
+        &service.loaded.trust,
+        deadline(),
+        service.binding.epoch(),
+        "cloud",
+        generations.reserve().unwrap(),
+    )
+    .unwrap();
+    let loaded = receiving_input(fixture, "cloud");
+    let receiving = Receiving {
+        loaded: &loaded,
+        executable: service.executable,
+        binding: profile.binding(),
+        additional: &[],
+        slots: service.slots,
+        clock: service.clock,
+    };
+    let until = Deadline::after(service.clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let mut storage = [0; 128];
+    let message = receiving_message(profile.binding(), &mut storage);
+    let mut meter = Meter::new(
+        until,
+        Charge {
+            io_bytes: 1024 * 1024,
+            output_bytes: 1024 * 1024,
+            records: 4096,
+            ..Default::default()
+        },
+    );
+    let committed = receiving.create(&message, until, &mut meter).unwrap();
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT count(*) FROM td_mta.emails WHERE id=decode('{}','hex')",
+                committed.email
+            )
+        ),
+        "1"
+    );
 }
 
 fn exercise_resolved_read(
@@ -8358,30 +8462,15 @@ fn exercise_resolved_read(
     .unwrap();
     assert_eq!(view.identity().account, binding.account());
     assert!(!view.mailbox_listing().unwrap().is_empty());
-    // Capacity refusal must happen before trying to launch this missing helper.
+    // A cold bootstrap makes helper launch observable even just after a read.
+    let cold = loaded("mail_runtime");
     assert_eq!(
-        Snapshot::open_resolved(
-            &slots,
-            &loaded_runtime,
-            &missing,
-            deadline(),
-            binding,
-            password
-        )
-        .err(),
+        Snapshot::open_resolved(&slots, &cold, &missing, deadline(), binding, password).err(),
         Some(Error::Busy)
     );
     drop(view);
     assert_eq!(
-        Snapshot::open_resolved(
-            &slots,
-            &loaded_runtime,
-            &missing,
-            deadline(),
-            binding,
-            password
-        )
-        .err(),
+        Snapshot::open_resolved(&slots, &cold, &missing, deadline(), binding, password).err(),
         Some(Error::Resolution(td_mta::postgres_resolver::Error::Spawn))
     );
     assert_eq!(
@@ -13497,18 +13586,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         smtp_session::{Pending as Action, Session, Settings},
         smtp_storage::{Begin, Failure, Job, Storage},
     };
-    let loaded = td_mta::postgres_input::Loaded {
-        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
-            &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
-                std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
-            ),
-            binding.profile(),
-        )
-        .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
-    };
+    let loaded = receiving_input(fixture, binding.profile());
     let clock = Arc::new(RuntimeClock::new());
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
     let slots = ReadSlots::new(1).unwrap();
@@ -13799,23 +13877,11 @@ fn exercise_smtp_receiving_owner(
     use td_mta::{
         admission::work::{Charge, Meter},
         clock::RuntimeClock,
-        format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
         ports::{Clock, Deadline, Error},
         postgres_read::ReadSlots,
         postgres_receiving as changes, postgres_smtp_receiving as owner,
     };
-    let loaded = td_mta::postgres_input::Loaded {
-        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
-            &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
-                std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
-            ),
-            binding.profile(),
-        )
-        .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
-    };
+    let loaded = receiving_input(fixture, binding.profile());
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let clock = RuntimeClock::new();
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
@@ -13882,23 +13948,7 @@ fn exercise_smtp_receiving_owner(
     );
     worker.ready(until(10_000)).unwrap();
     let mut recipient_bytes = [0; 1024];
-    let recipients =
-        ReceiptRecipients::encode(&["alice@example.test"], &mut recipient_bytes).unwrap();
-    let message = changes::Message {
-        bytes: b"Subject: retained receiving\r\n\r\nbody\r\n",
-        receipt: SmtpReceipt {
-            peer: "192.0.2.1".parse().unwrap(),
-            gateway: None,
-            tls: ReceiptTls::Tls13,
-            ehlo: "sender.example.test",
-            reverse_path: "sender@example.test",
-            recipients,
-        },
-        hostname: "mail.example.test",
-        extended: true,
-        header_bytes: binding.header_maximum(),
-        received_at: 1_700_000_000_000,
-    };
+    let message = receiving_message(binding, &mut recipient_bytes);
     let mut exhausted = Meter::new(until(10_000), Charge::default());
     assert_eq!(
         worker.create(&message, until(10_000), &mut exhausted),

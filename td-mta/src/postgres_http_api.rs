@@ -360,9 +360,10 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         sender.maintenance = Some(&maintenance);
         sender.completion.keep_alive = request.keep_alive;
         let result = self.download_body(request, &mut sender, cache);
-        if result.is_err() {
-            if let Some(cache) = cache {
-                cache.clear();
+        if let Some(cache) = cache {
+            match &result {
+                Ok(()) => cache.release_checker_if_full(self.slots),
+                Err(_) => cache.clear(),
             }
         }
         result.map_err(|error| {

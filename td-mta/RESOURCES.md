@@ -4679,10 +4679,11 @@ the existing transaction deadlines and driver limits.
 ## Retained download check connection
 
 A fixed HTTPS body worker alternates between its API reader and download
-checker; switching drops the former cache. A warm download retains one read
-permit for its checker and reserves one for its fresh body snapshot. Peak
-capacity remains two permits per download, and idle retention remains one per
-worker. No thread, message-sized buffer or peer registry is added. The 30-second
+sessions; switching drops the former cache. Each active download reserves
+two read permits. Its body reader and authorization checker can both remain
+idle between requests. If the shared pool is full when the response completes,
+the worker retires the checker before accepting another job. The next request
+must reserve and qualify a replacement before verification. The 30-second
 body allowance is unchanged; POSTGRES specifies the check session's finite
 wire windows, ten-second transactions and output-time retirement.
 

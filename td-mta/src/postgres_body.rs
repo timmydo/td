@@ -228,6 +228,13 @@ impl<'a> DownloadCache<'a> {
         self.body.clear();
         self.authorization.clear();
     }
+    pub(crate) fn release_checker_if_full(&self, slots: &crate::postgres_read::ReadSlots) {
+        // Keep the body reader warm. At the shared limit, give the checker's
+        // place back to the next SMTP, API or settlement operation.
+        if slots.at_capacity() {
+            self.authorization.clear();
+        }
+    }
     pub(crate) fn maintain(&self) {
         self.body.maintain();
         self.authorization.maintain();
@@ -1033,5 +1040,28 @@ impl crate::store_fs::VerifiedSource for Body<'_, '_> {
 impl crate::store_fs::VerifiedChunkSource for Body<'_, '_> {
     fn check(&mut self) -> Result<(), ports::Error> {
         self.check_cached()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::DownloadCache;
+    use crate::postgres_read::ReadSlots;
+    use std::time::Instant;
+
+    #[test]
+    fn completing_downloads_leave_capacity_for_another_foreground_job() {
+        for (views, workers) in [(2, 1), (6, 3)] {
+            let slots = ReadSlots::new(views).unwrap();
+            let caches: Vec<_> = (0..workers).map(|_| DownloadCache::new()).collect();
+            for cache in &caches {
+                cache.reserve(&slots, Instant::now()).unwrap();
+                cache.release_checker_if_full(&slots);
+            }
+            let next_job = slots.acquire().unwrap();
+            assert!(slots.at_capacity());
+            drop(next_job);
+        }
     }
 }

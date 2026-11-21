@@ -101,6 +101,10 @@ impl ReadSlots {
             used: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+    pub(crate) fn at_capacity(&self) -> bool {
+        self.used.load(std::sync::atomic::Ordering::Acquire) >= self.maximum
+    }
+
     pub(crate) fn acquire(&self) -> Result<ReadPermit<'_>, Error> {
         use std::sync::atomic::Ordering;
         let mut used = self.used.load(Ordering::Relaxed);
