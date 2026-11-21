@@ -89,6 +89,18 @@ impl<B: TlsWireStorage> SessionReservation<B> {
 }
 
 impl<B: TlsWireStorage> TlsConnection<B> {
+    pub(crate) fn socket(&self) -> Result<&std::net::TcpStream, Error> {
+        self.io.socket()
+    }
+    pub(crate) fn begin_turn(&mut self) -> crate::tls_io::BufferedState {
+        self.io.begin_turn()
+    }
+    pub(crate) fn wire_turn(
+        &self,
+        before: crate::tls_io::BufferedState,
+    ) -> crate::tls_io::WireTurn {
+        self.io.wire_turn(before)
+    }
     pub(crate) fn wait_handshake_input(
         &mut self,
         until: std::time::Instant,

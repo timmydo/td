@@ -315,6 +315,15 @@ impl Stream {
         self.length = 0;
         Ok(())
     }
+    pub(crate) fn next_ping(&self) -> Option<Tick> {
+        (self.options.ping_seconds != 0).then(|| {
+            Tick(
+                self.last_sent
+                    .0
+                    .saturating_add(self.options.ping_seconds * 1000),
+            )
+        })
+    }
     pub fn closed(&self) -> bool {
         self.closed
     }
@@ -447,12 +456,14 @@ mod tests {
         let id = std::str::from_utf8(&id).unwrap();
         let mut stream =
             Stream::new(options("*", "no", 5), snapshot(1), Some(id), Tick(100)).unwrap();
+        assert_eq!(stream.next_ping(), Some(Tick(5100)));
         assert!(stream.prepare(snapshot(1), Tick(5099)).unwrap().is_empty());
         assert_eq!(
             stream.prepare(snapshot(1), Tick(5100)).unwrap(),
             b"event: ping\ndata: {\"interval\":5}\n\n"
         );
         stream.acknowledge(Tick(5500)).unwrap();
+        assert_eq!(stream.next_ping(), Some(Tick(10500)));
         assert!(stream.prepare(snapshot(1), Tick(10499)).unwrap().is_empty());
         assert!(stream
             .prepare(snapshot(2), Tick(10500))

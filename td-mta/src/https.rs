@@ -24,10 +24,13 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, Mutex, TryLockError,
+        Arc, TryLockError,
     },
     time::{Duration, Instant},
 };
+
+pub(crate) mod wait;
+use wait::{Owner, Slot, Wait};
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
@@ -118,6 +121,7 @@ impl BoundListener {
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
+    Hello,
     Tls,
     Head,
     Authorize,
@@ -133,6 +137,7 @@ enum Phase {
     Drain,
 }
 struct Client {
+    wait: Wait,
     timing: Option<crate::performance::Timer>,
     response_outcome: crate::performance::Outcome,
     keep_alive: bool,
@@ -355,6 +360,14 @@ impl Drop for Finish<'_> {
     }
 }
 
+struct WorkerExit<'a>(&'a Control);
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.fail();
+        }
+    }
+}
 struct AuthenticationFinish<'a> {
     authentication: &'a dyn http_auth::Authenticator,
     control: &'a Control,
@@ -429,6 +442,7 @@ impl Https<'_> {
     }
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         if self.listeners.is_empty()
+            || self.listeners.len() > crate::config::listener::MAX_LISTENERS
             || self.handshakes.capacity() != self.resources.limits().tls_handshakes
         {
             return Err(Error::Invalid);
@@ -488,11 +502,11 @@ impl Https<'_> {
                 .map_err(|_| Error::Invalid)?;
         }
         let count = self.resources.limits().https_connections;
-        let mut slots: Vec<Mutex<Option<Client>>> = Vec::new();
+        let mut slots: Vec<Slot> = Vec::new();
         slots
             .try_reserve_exact(count)
             .map_err(|_| Error::Capacity)?;
-        slots.extend((0..count).map(|_| Mutex::new(None)));
+        slots.extend((0..count).map(|_| Slot::empty()));
         let done = AtomicBool::new(false);
         let body_count =
             u8::try_from(self.resources.https_body_workers()).map_err(|_| Error::Invalid)?;
@@ -514,8 +528,10 @@ impl Https<'_> {
             for index in 0..self.handshakes.capacity() {
                 match std::thread::Builder::new()
                     .name(format!("https-tls-{index}"))
-                    .spawn_scoped(scope, || self.tls_worker(&slots, &done, control))
-                {
+                    .spawn_scoped(scope, || {
+                        let _exit = WorkerExit(control);
+                        self.tls_worker(&slots, &done, control)
+                    }) {
                     Ok(worker) => tls_workers.push(worker),
                     Err(error) => {
                         done.store(true, Ordering::Release);
@@ -539,6 +555,7 @@ impl Https<'_> {
                 match std::thread::Builder::new()
                     .name(format!("https-body-{index}"))
                     .spawn_scoped(scope, || {
+                        let _exit = WorkerExit(control);
                         self.body_worker(&slots, &done, &body_warm, control)
                     }) {
                     Ok(worker) => uploaders.push(worker),
@@ -562,6 +579,7 @@ impl Https<'_> {
             let verifier = match std::thread::Builder::new()
                 .name("https-auth".into())
                 .spawn_scoped(scope, || {
+                    let _exit = WorkerExit(control);
                     let _finish = AuthenticationFinish {
                         authentication: self.authentication,
                         control,
@@ -584,6 +602,7 @@ impl Https<'_> {
                             maintained = Instant::now();
                         }
                         let mut next_event = None;
+                        let mut retry = false;
                         for (index, cell) in slots
                             .iter()
                             .enumerate()
@@ -591,23 +610,33 @@ impl Https<'_> {
                             .skip(event_cursor)
                             .take(slots.len())
                         {
-                            let mut slot = match cell.try_lock() {
+                            if cell.owned(Owner::Event) {
+                                if next_event.is_none() {
+                                    next_event = Some((index, cell));
+                                } else {
+                                    retry = true;
+                                }
+                                continue;
+                            }
+                            if !cell.owned(Owner::Auth) {
+                                continue;
+                            }
+                            let mut slot = match cell.client.try_lock() {
                                 Ok(slot) => slot,
-                                Err(TryLockError::WouldBlock) => continue,
+                                Err(TryLockError::WouldBlock) => {
+                                    retry = true;
+                                    continue;
+                                }
                                 Err(_) => {
                                     control.fail();
                                     return;
                                 }
                             };
-                            let Some(client) = slot.as_mut() else {
+                            let Some(client) =
+                                slot.as_mut().filter(|c| c.phase == Phase::Authenticate)
+                            else {
                                 continue;
                             };
-                            if client.phase == Phase::EventRead && next_event.is_none() {
-                                next_event = Some((index, cell));
-                            }
-                            if client.phase != Phase::Authenticate {
-                                continue;
-                            }
                             if let Err(error) = self.authenticate(client) {
                                 if error == Error::WriterStopped {
                                     control.fail();
@@ -615,13 +644,21 @@ impl Https<'_> {
                                 }
                                 *slot = None;
                             }
+                            if slot
+                                .as_ref()
+                                .is_some_and(|c| c.phase == Phase::Authenticate)
+                            {
+                                retry = true;
+                            } else {
+                                cell.leave_worker(slot, control);
+                            }
                         }
                         // Check all waiting sign-ins between any two stream samples.
                         if let Some((index, cell)) = next_event
                             .filter(|_| !control.stop_requested() && !done.load(Ordering::Acquire))
                         {
                             event_cursor = (index + 1) % slots.len();
-                            if let Ok(mut slot) = cell.try_lock() {
+                            if let Ok(mut slot) = cell.client.try_lock() {
                                 if let Some(client) =
                                     slot.as_mut().filter(|c| c.phase == Phase::EventRead)
                                 {
@@ -630,10 +667,17 @@ impl Https<'_> {
                                         event.sample = Some(sample);
                                     }
                                     client.phase = Phase::Events;
+                                    cell.leave_worker(slot, control);
                                 }
+                            } else {
+                                retry = true;
                             }
                         }
-                        std::thread::park_timeout(SCAN);
+                        std::thread::park_timeout(if retry {
+                            SCAN
+                        } else {
+                            Duration::from_secs(1).saturating_sub(maintained.elapsed())
+                        });
                     }
                 }) {
                 Ok(worker) => worker,
@@ -696,7 +740,7 @@ impl Https<'_> {
                 }
             }
             let retired = slots.iter().any(|slot| {
-                slot.lock().map_or(true, |slot| {
+                slot.client.lock().map_or(true, |slot| {
                     slot.as_ref()
                         .is_some_and(|client| client.stop_after_response)
                 })
@@ -708,13 +752,7 @@ impl Https<'_> {
             result
         })
     }
-    fn body_worker(
-        &self,
-        slots: &[Mutex<Option<Client>>],
-        done: &AtomicBool,
-        warm: &AtomicU8,
-        control: &Control,
-    ) {
+    fn body_worker(&self, slots: &[Slot], done: &AtomicBool, warm: &AtomicU8, control: &Control) {
         if td_crypto::SystemEntropy::try_new().is_err() {
             control.fail();
             return;
@@ -732,7 +770,10 @@ impl Https<'_> {
                 maintained = Instant::now();
             }
             for cell in slots {
-                let mut slot = match cell.try_lock() {
+                if !cell.owned(Owner::Body) {
+                    continue;
+                }
+                let mut slot = match cell.client.try_lock() {
                     Ok(slot) => slot,
                     Err(TryLockError::WouldBlock) => continue,
                     Err(_) => {
@@ -761,8 +802,9 @@ impl Https<'_> {
                     }
                     *slot = None;
                 }
+                cell.leave_worker(slot, control);
             }
-            std::thread::park_timeout(SCAN);
+            std::thread::park_timeout(Duration::from_secs(1).saturating_sub(maintained.elapsed()));
         }
     }
     fn authenticate(&self, client: &mut Client) -> Result<(), Error> {
@@ -806,13 +848,20 @@ impl Https<'_> {
         client.phase = Phase::Authorize;
         Ok(())
     }
-    fn tls_worker(&self, slots: &[Mutex<Option<Client>>], done: &AtomicBool, control: &Control) {
+    fn tls_worker(&self, slots: &[Slot], done: &AtomicBool, control: &Control) {
         // Network owns shutdown: an early worker exit would look like failure.
         while !done.load(Ordering::Acquire) {
+            let mut retry = false;
             for cell in slots {
-                let mut slot = match cell.try_lock() {
+                if !cell.owned(Owner::Tls) {
+                    continue;
+                }
+                let mut slot = match cell.client.try_lock() {
                     Ok(slot) => slot,
-                    Err(TryLockError::WouldBlock) => continue,
+                    Err(TryLockError::WouldBlock) => {
+                        retry = true;
+                        continue;
+                    }
                     Err(_) => {
                         control.fail();
                         return;
@@ -846,15 +895,28 @@ impl Https<'_> {
                         if !connection.wait_handshake_input(until)? {
                             // Pending TLS output gets another bounded turn; avoid spinning
                             // when a peer is not draining its receive window.
-                            std::thread::park_timeout(Duration::from_millis(1));
+                            // The outer worker park owns its unpark token.
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                     }
                 })();
                 if result.is_err() {
                     *slot = None;
                 }
+                if slot.as_ref().is_some_and(|c| c.phase == Phase::Tls) {
+                    retry = true;
+                } else {
+                    cell.leave_worker(slot, control);
+                }
             }
-            std::thread::park_timeout(SCAN);
+            if done.load(Ordering::Acquire) {
+                break;
+            }
+            if retry {
+                std::thread::park_timeout(SCAN);
+            } else {
+                std::thread::park();
+            }
         }
     }
     fn tls(&self, client: &mut Client) -> Result<(), Error> {
@@ -862,21 +924,7 @@ impl Https<'_> {
         if client.phase_deadline.expired(now) {
             return Err(Error::Deadline);
         }
-        if let Some(socket) = client.pending.as_ref() {
-            let mut first = [0; 1];
-            match socket.peek(&mut first) {
-                Ok(0) => return Err(Error::Tls),
-                Ok(_) => (),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    return Ok(())
-                }
-                Err(error) => return Err(error.into()),
-            }
+        if client.pending.is_some() {
             if client.timing.is_none() {
                 client.timing = Some(crate::performance::Timer::start(
                     crate::performance::Phase::HttpTls,
@@ -932,23 +980,26 @@ impl Https<'_> {
     }
     fn network(
         &self,
-        slots: &[Mutex<Option<Client>>],
+        slots: &[Slot],
         tls_workers: &[std::thread::ScopedJoinHandle<'_, ()>],
         uploaders: &[std::thread::ScopedJoinHandle<'_, ()>],
         verifier: &std::thread::ScopedJoinHandle<'_, ()>,
         body_active: &BodyPool,
         control: &Control,
     ) -> Result<(), Error> {
+        let receiver = control.https_wake.attach()?;
         for listener in self.listeners {
             listener.check_certificate(self.policies, self.clock.sample()?.utc_ms)?;
         }
         self.ready.store(true, Ordering::Release);
         let mut attempts = Attempts::default();
-        let mut peers = [None; 32];
+        let mut peers = [None; crate::limits::MAX_HTTPS_CONNECTIONS];
+        let mut listener_cursor = 0;
         let mut cursor = 0;
         let mut accept_after = Tick(0);
         let mut event_count = 0usize;
         while !control.stop_requested() {
+            receiver.consume()?;
             if tls_workers.iter().any(|worker| worker.is_finished())
                 || uploaders.iter().any(|worker| worker.is_finished())
                 || verifier.is_finished()
@@ -965,10 +1016,13 @@ impl Https<'_> {
                 let Some(cell) = slots.get(index) else {
                     return Err(Error::Invalid);
                 };
-                let mut slot = match cell.try_lock() {
-                    Ok(slot) => slot,
-                    Err(TryLockError::WouldBlock) => continue,
-                    Err(_) => return Err(Error::WriterStopped),
+                let guard = if cell.owned(Owner::Event) {
+                    cell.try_client()?
+                } else {
+                    cell.network_client()?
+                };
+                let Some(mut slot) = guard else {
+                    continue;
                 };
                 let Some(client) = slot.as_mut() else {
                     *peers.get_mut(index).ok_or(Error::Invalid)? = None;
@@ -982,6 +1036,11 @@ impl Https<'_> {
                 {
                     continue;
                 }
+                client.wait = Wait::Again;
+                let before = match client.connection.as_mut() {
+                    Some(Connection::Tls(c)) => Some(c.begin_turn()),
+                    _ => None,
+                };
                 let mut wake_body = false;
                 let mut wake_auth = false;
                 match self.step(
@@ -992,6 +1051,20 @@ impl Https<'_> {
                     control,
                 ) {
                     Ok(true) => {
+                        if let (Wait::Socket { .. }, Some(Connection::Tls(c)), Some(before)) =
+                            (client.wait, client.connection.as_ref(), before)
+                        {
+                            let turn = c.wire_turn(before);
+                            client.wait = if turn.moved {
+                                Wait::Again
+                            } else {
+                                Wait::Socket {
+                                    read: turn.read_blocked,
+                                    write: turn.write_blocked,
+                                }
+                            };
+                        }
+                        cell.assign(Owner::phase(client.phase));
                         wake_auth = matches!(client.phase, Phase::Authenticate | Phase::EventRead);
                         if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
                             wake_body = true;
@@ -1017,9 +1090,16 @@ impl Https<'_> {
                             event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
                         }
                         *slot = None;
+                        cell.assign(Owner::Network);
                     }
                 }
+                let wake_tls = cell.owned(Owner::Tls);
                 drop(slot);
+                if wake_tls {
+                    for worker in tls_workers {
+                        worker.thread().unpark();
+                    }
+                }
                 if wake_body {
                     for uploader in uploaders {
                         uploader.thread().unpark();
@@ -1030,12 +1110,21 @@ impl Https<'_> {
                 }
             }
             cursor = (cursor + 1) % slots.len();
-            for listener in self.listeners {
+            for listener in self
+                .listeners
+                .iter()
+                .cycle()
+                .skip(listener_cursor)
+                .take(self.listeners.len())
+            {
                 if time.monotonic < accept_after {
                     break;
                 }
                 let free = slots.iter().enumerate().find_map(|(index, cell)| {
-                    let slot = cell.try_lock().ok()?;
+                    if !cell.owned(Owner::Network) {
+                        return None;
+                    }
+                    let slot = cell.client.try_lock().ok()?;
                     slot.is_none().then_some((index, slot))
                 });
                 let Some((index, mut slot)) = free else {
@@ -1110,7 +1199,7 @@ impl Https<'_> {
                             continue;
                         }
                         (
-                            Phase::Tls,
+                            Phase::Hello,
                             Some(socket),
                             None,
                             self.timeouts.limits().handshake_seconds,
@@ -1137,6 +1226,7 @@ impl Https<'_> {
                     phase_deadline
                 };
                 let client = Client {
+                    wait: Wait::Again,
                     timing: None,
                     response_outcome: crate::performance::Outcome::Failed,
                     keep_alive: false,
@@ -1167,11 +1257,17 @@ impl Https<'_> {
                 };
                 *peers.get_mut(index).ok_or(Error::Invalid)? = Some(peer);
                 *slot = Some(client);
-                for worker in tls_workers {
-                    worker.thread().unpark();
-                }
             }
-            std::thread::sleep(SCAN);
+            listener_cursor = (listener_cursor + 1) % self.listeners.len();
+            if !control.stop_requested() {
+                wait::wait(
+                    &receiver,
+                    slots,
+                    self.listeners,
+                    accept_after,
+                    self.clock.as_ref(),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1188,6 +1284,22 @@ impl Https<'_> {
             return Ok(false);
         }
         match client.phase {
+            Phase::Hello => {
+                match client
+                    .pending
+                    .as_ref()
+                    .ok_or(Error::Invalid)?
+                    .peek(&mut [0])
+                {
+                    Ok(0) => return Ok(false),
+                    Ok(_) => client.phase = Phase::Tls,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        client.wait = Wait::READ
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
+                    Err(e) => return Err(e.into()),
+                }
+            }
             Phase::Head => {
                 let progress = if client.input_used != 0 {
                     IoProgress::Bytes(client.input_used)
@@ -1199,7 +1311,7 @@ impl Https<'_> {
                         .read(&mut client.input)?
                 };
                 match progress {
-                    IoProgress::Pending => (),
+                    IoProgress::Pending => client.wait = Wait::READ,
                     IoProgress::Closed => return Ok(false),
                     IoProgress::Bytes(n) => {
                         let result = client
@@ -1428,7 +1540,7 @@ impl Https<'_> {
                             )?
                             .min(client.phase_deadline);
                         }
-                        IoProgress::Pending => (),
+                        IoProgress::Pending => client.wait = Wait::WRITE,
                         IoProgress::Closed => return Ok(false),
                     }
                 } else if connection.flush()? == FlushProgress::Complete {
@@ -1443,6 +1555,8 @@ impl Https<'_> {
                     let now = self.clock.sample()?.monotonic;
                     client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
                     client.idle = client.phase_deadline;
+                } else {
+                    client.wait = Wait::WRITE;
                 }
             }
             Phase::Complete => {
@@ -1479,14 +1593,21 @@ impl Https<'_> {
                         return Err(Error::WriterStopped);
                     }
                     client.phase = Phase::Drain;
+                } else {
+                    client.wait = Wait::WRITE;
                 }
             }
             Phase::Drain => {
-                return drain(
+                let before = client.drain_left;
+                let live = drain(
                     client.connection.as_mut().ok_or(Error::Invalid)?,
                     &mut client.input,
                     &mut client.drain_left,
-                );
+                )?;
+                if live && before == client.drain_left {
+                    client.wait = Wait::READ;
+                }
+                return Ok(live);
             }
             Phase::Tls
             | Phase::Authenticate
@@ -1876,7 +1997,7 @@ impl Https<'_> {
                     IoProgress::Bytes(n) if n > 0 && n <= client.response.len() - client.sent => {
                         client.sent += n
                     }
-                    IoProgress::Pending => (),
+                    IoProgress::Pending => client.wait = Wait::WRITE,
                     _ => return Ok(false),
                 }
             } else if connection.flush()? == FlushProgress::Complete {
@@ -1884,6 +2005,8 @@ impl Https<'_> {
                 client.sent = 0;
                 client.response.clear();
                 client.idle = client.absolute;
+            } else {
+                client.wait = Wait::WRITE;
             }
             return Ok(true);
         }
@@ -1891,7 +2014,10 @@ impl Https<'_> {
         if frame.is_empty() {
             // A silent stream still detects EOF; no pipelined requests are accepted.
             return match connection.read(&mut client.input)? {
-                IoProgress::Pending => Ok(true),
+                IoProgress::Pending => {
+                    client.wait = Wait::READ;
+                    Ok(true)
+                }
                 _ => Ok(false),
             };
         }
@@ -1903,7 +2029,7 @@ impl Https<'_> {
         if client.sent < frame.len() {
             match connection.write(frame.get(client.sent..).ok_or(Error::Invalid)?)? {
                 IoProgress::Bytes(n) if n > 0 && n <= frame.len() - client.sent => client.sent += n,
-                IoProgress::Pending => (),
+                IoProgress::Pending => client.wait = Wait::WRITE,
                 _ => return Ok(false),
             }
         } else if connection.flush()? == FlushProgress::Complete {
@@ -1916,6 +2042,8 @@ impl Https<'_> {
                 client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
                 client.idle = client.phase_deadline;
             }
+        } else {
+            client.wait = Wait::WRITE;
         }
         Ok(true)
     }

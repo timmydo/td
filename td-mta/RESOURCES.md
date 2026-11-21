@@ -21,6 +21,12 @@ format. Local IDs are distinct 16-byte types with canonical lowercase hex;
 they convey no authorization. Derived MIME-part wire IDs belong to M02.
 
 
+An HTTPS network owner has one private Unix stream pair for worker completion
+and stop notifications. Its bounded poll array holds the read end, up to 16
+listeners and 32 connections. Polling borrows the original sockets, and
+worker-owned connections stay outside the wait. The array uses 400 bytes on
+the supported 64-bit targets.
+
 Each live PostgreSQL driver uses three descriptors: its connected TCP or
 Unix socket and both ends of its private worker-wake socket pair. This
 applies to each admitted fresh connection and each retained connection,

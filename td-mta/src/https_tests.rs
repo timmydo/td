@@ -362,7 +362,9 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 clock.1.fetch_add(2_000, Ordering::Relaxed);
                 let mut post = client(address, &lease, clock.clone());
                 let body = "x".repeat(32 * 1024);
-                let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: {}\r\n\r\n", body.len());
+                // Leave one byte outstanding so the peer is still draining when
+                // this client sends close_notify. A complete frame releases its slot.
+                let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: {}\r\n\r\n", body.len() + 1);
                 assert!(request(&mut post, head.as_bytes()).starts_with("HTTP/1.1 404 "));
                 std::thread::sleep(Duration::from_millis(100));
                 send(&mut post, body.as_bytes());

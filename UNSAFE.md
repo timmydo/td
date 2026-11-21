@@ -210,7 +210,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | library `ppoll(2)` on borrowed socket and optional wake descriptors; binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
+| 22 | `td-mta` | library `ppoll(2)` on bounded sets of borrowed connected sockets, listeners and wake receivers; binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 | 24 | `td-luks` | device-mapper ioctl requests; see §24 |
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
@@ -3686,15 +3686,19 @@ amends this section and `td-install/DESIGN.md`.
 
 The library denies `unsafe_code`. Its single function-scoped exception,
 `readiness_sys::ppoll`, invokes Linux `ppoll` (271 on x86-64, 73 on
-aarch64). The two eight-byte C-layout pollfd records hold a borrowed
-connected socket with read/write interests and an optional read-only wake
-descriptor (-1 when absent). A mutable two-i64 timespec bounds each call.
-The signal mask is null and its kernel size argument is eight. The kernel
-writes only the live records and timespec and retains no pointer. The
-caller retries EINTR under the original monotonic deadline and returns
-descriptor errors and hangups to the transport. Only typed TCP and Unix
-streams enter the wrapper. Confinement checks pin the two call sites,
-their arguments and the private wake socket pair. No descriptor is adopted.
+aarch64). Each eight-byte C-layout pollfd holds a transparent
+`BorrowedFd` and two 16-bit event fields. HTTPS admits at most 49 entries:
+one private Unix wake receiver, up to 16 TCP or Unix listeners and up
+to 32 connected TCP or Unix sockets. Only connected sockets can request
+writable readiness. PostgreSQL and single-socket transport waits pass
+one connected socket and optionally a private Unix wake receiver.
+All descriptors remain borrowed through the call. The syscall receives
+the length of the initialized slice and a mutable two-i64 timespec. Its
+signal mask is null and the mask size argument is eight. The kernel
+sets revents and may update the timeout before returning. The caller
+recomputes the remaining monotonic deadline after EINTR, treats a
+hangup or error as readiness and rejects POLLNVAL. Confinement checks
+pin the boundary, its callers and the private wake sources.
 
 The binary denies unsafe code, with one
 function-scoped allowance in `signal_sys.rs` and two in `listener_sys.rs`.

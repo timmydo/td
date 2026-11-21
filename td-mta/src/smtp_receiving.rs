@@ -90,6 +90,7 @@ pub enum State {
 }
 
 pub struct Control {
+    pub(crate) https_wake: crate::https::wait::Notifications,
     stop: AtomicBool,
     user_stopped: AtomicBool,
     state: AtomicU8,
@@ -100,6 +101,7 @@ impl Default for Control {
         Self {
             stop: AtomicBool::new(false),
             user_stopped: AtomicBool::new(false),
+            https_wake: Default::default(),
             state: AtomicU8::new(0),
             logging: None,
         }
@@ -138,6 +140,7 @@ impl Control {
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        self.https_wake.notify();
     }
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)

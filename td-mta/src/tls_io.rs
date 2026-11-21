@@ -64,7 +64,16 @@ pub struct TlsIo<T: Transport, B: TlsWireStorage> {
     ready: bool,
     write_closed: bool,
     failure: Option<Error>,
+    wire_turn: WireTurn,
 }
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WireTurn {
+    pub read_blocked: bool,
+    pub write_blocked: bool,
+    pub moved: bool,
+}
+pub(crate) type BufferedState = (td_crypto::TlsStatus, usize, usize, usize, bool);
 
 impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
     /// Consume a handshaking session and transport. Deadlines are absolute and
@@ -110,6 +119,7 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
             ready: false,
             write_closed: false,
             failure: None,
+            wire_turn: WireTurn::default(),
         })
     }
 
@@ -154,7 +164,7 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
     }
 
     /// Local changes can enable the next driver poll without socket readiness.
-    pub(crate) fn buffered_state(&self) -> (td_crypto::TlsStatus, usize, usize, usize, bool) {
+    pub(crate) fn buffered_state(&self) -> BufferedState {
         (
             self.session.status(),
             self.input_used,
@@ -246,6 +256,7 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
                 .ok_or(Error::Invalid)?;
             match self.transport.write(tail)? {
                 IoProgress::Bytes(count) if count > 0 && count <= tail.len() => {
+                    self.wire_turn.moved = true;
                     self.output_start =
                         self.output_start.checked_add(count).ok_or(Error::Invalid)?;
                     if self.output_start == self.output_end {
@@ -255,7 +266,10 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
                         return Ok(());
                     }
                 }
-                IoProgress::Pending => return Ok(()),
+                IoProgress::Pending => {
+                    self.wire_turn.write_blocked = true;
+                    return Ok(());
+                }
                 _ => return Err(Error::Invalid),
             }
         }
@@ -298,9 +312,13 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
                 .ok_or(Error::Invalid)?;
             match self.transport.read(remaining)? {
                 IoProgress::Bytes(count) if count > 0 && count <= remaining.len() => {
+                    self.wire_turn.moved = true;
                     self.input_used = self.input_used.checked_add(count).ok_or(Error::Invalid)?;
                 }
-                IoProgress::Pending => return Ok(()),
+                IoProgress::Pending => {
+                    self.wire_turn.read_blocked = true;
+                    return Ok(());
+                }
                 IoProgress::Closed => {
                     if self.input_used != 0 {
                         return Err(Error::Tls);
@@ -344,6 +362,20 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
 }
 
 impl<B: TlsWireStorage> TlsIo<crate::transport::TcpTransport, B> {
+    pub(crate) fn socket(&self) -> Result<&std::net::TcpStream, Error> {
+        self.transport.connected()
+    }
+    pub(crate) fn begin_turn(&mut self) -> BufferedState {
+        self.wire_turn = WireTurn::default();
+        self.buffered_state()
+    }
+    pub(crate) fn wire_turn(&self, before: BufferedState) -> WireTurn {
+        WireTurn {
+            moved: self.wire_turn.moved || self.buffered_state() != before,
+            ..self.wire_turn
+        }
+    }
+
     /// Wait for more wire bytes only after an operational read reported Pending.
     /// Buffered TLS work must run before waiting on the socket.
     pub(crate) fn wait_input(&mut self, until: std::time::Instant) -> Result<bool, Error> {
@@ -521,6 +553,7 @@ impl<T: Transport, B: TlsWireStorage> Transport for TlsIo<T, B> {
             }
             if !connection.write_closed {
                 if connection.transport.close()? == FlushProgress::Pending {
+                    connection.wire_turn.write_blocked = true;
                     return Ok(FlushProgress::Pending);
                 }
                 connection.write_closed = true;

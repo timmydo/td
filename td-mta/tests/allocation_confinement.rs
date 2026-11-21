@@ -37,6 +37,33 @@ fn readiness_users(relative: &str, source: &str) {
             assert!(compact.contains("readiness_sys::wait(Connected::Tcp(self.connected()?),Interest{read:true,write:false,},None,until,)"));
             2
         }
+        "td-mta/src/https/wait.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            for expected in [
+                "let(tx,socket)=UnixStream::pair()?;",
+                "*sender=Some(tx);",
+                "Ok(Receiver{owner:self,socket,})",
+                "PollSet::new(&receiver.socket)",
+                "(Some(Connection::Local(c)),None)=>Connected::Unix(c.connected()?)",
+                "(Some(Connection::Tls(c)),None)=>Connected::Tcp(c.socket()?)",
+                "(None,Some(socket))ifclient.phase==Phase::Hello=>Connected::Tcp(socket)",
+                "poll.add_connected(socket,Interest{read,write})",
+                "ListenerSocket::Tcp(l)=>poll.add_tcp_listener(l)",
+                "ListenerSocket::Unix(l)=>poll.add_unix_listener(l.socket())",
+            ] {
+                assert!(compact.contains(expected), "{relative}: {expected}");
+            }
+            for (token, count) in [
+                ("PollSet", 2),
+                ("Connected", 4),
+                ("add_connected", 1),
+                ("add_tcp_listener", 1),
+                ("add_unix_listener", 1),
+            ] {
+                assert_eq!(words(source, token), count, "{relative}: {token}");
+            }
+            1
+        }
         "td-mta/src/postgres_probe/driver.rs" => {
             let compact: String = source.split_whitespace().collect();
             assert!(compact.contains("readiness_sys::wait(socket.wire.descriptor().map_err(|_|Error::Transport)?,socket.interest,Some(&self.receiver),deadline,)"));
@@ -79,7 +106,7 @@ fn scan(root: &Path, path: &Path) {
             assert_eq!(source.matches("std::arch::asm!").count(), 2);
             fingerprint(
                 &source,
-                "64eae2313159fa13ce0ce88b6a21cb1d717ad6d215b81a42384fc23c30947cf6",
+                "6e12f632bffe256083dcf43b53117097287d0522d0d1d19aabefde41806b1dff",
             );
         } else if relative == "td-mta/src/signal_sys.rs" {
             assert_eq!(words(&source, "unsafe"), 2);

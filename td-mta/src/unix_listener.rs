@@ -71,6 +71,9 @@ impl PrivateListener {
     pub fn path(&self) -> &std::path::Path {
         self.path.as_path()
     }
+    pub(crate) fn socket(&self) -> &UnixListener {
+        &self.listener
+    }
     pub fn accept(&self) -> io::Result<UnixStream> {
         self.listener.accept().map(|(stream, _)| stream)
     }

@@ -1029,8 +1029,11 @@ td-crypto still has an external TLS implementation.
 
 The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
-`readiness_sys.rs` borrows a socket and an optional worker wake receiver
-for one deadline-bounded wait. UNSAFE.md section 22 pins the syscall ABI.
+`readiness_sys.rs` borrows connected sockets, listeners and wake receivers
+through each deadline-bounded wait. HTTPS can wait on a fixed set sized
+for its private wake receiver, 16 listeners and 32 client slots. PostgreSQL
+and single-connection transport waits use one or two entries. UNSAFE.md
+section 22 pins the syscall ABI.
 The binary denies unsafe code
 with function-scoped termination and listener exceptions recorded in
 UNSAFE.md section 22. The signal boundary stays in `signal_sys.rs`. On x86-64 and aarch64 Linux, serve blocks SIGINT and
@@ -2215,12 +2218,23 @@ sets IPV6_V6ONLY before bind, independent of kernel defaults, and both safe
 protocol adapters verify that option for IPv6 caller-bound sockets. Separate
 IPv4 and IPv6 binds can share a port; scoped and mapped IPv6 binds remain
 refused.
-A fixed HTTPS network thread scans bounded slots, with a fixed TLS worker
-pool sized by the configured shared handshake limit. Native session
-construction and pending handshakes stay on those workers; idle sockets
-retain connection slots without taking handshake permits.
-Each worker peeks nonblocking for initial TLS bytes before reserving a
-shared permit, and retries a busy pool within the original handshake
+The fixed HTTPS network thread gives each occupied slot one bounded turn,
+rotates the starting slot and listener, and processes available local work
+before waiting. Linux ppoll waits on listening sockets with room to accept,
+network-owned TCP and Unix clients, and a private worker/stop notification
+socket. Network-owned slot guards keep the borrowed sockets live through the
+wait. Authentication, event sampling, TLS negotiation and body operations run
+on their fixed workers, which return the slot and signal the network owner.
+A pending TLS operation waits on the directions blocked below TLS; wire or
+buffered record progress schedules another turn. Idle, phase, session,
+accept-backoff, event authorization and ping deadlines bound sleep. HTTPS
+certificate validity is sampled at least at each whole UTC second while idle
+and at each network pass. The authentication and body workers wake for their
+one-second maintenance when idle.
+The network owner peeks for the first TLS byte before waking the fixed TLS
+workers. Idle peers retain connection slots without taking handshake permits.
+Native session construction and pending handshakes stay on the workers.
+Each TLS worker reserves a shared permit, and retries a busy pool within the original handshake
 deadline. Once admitted, a handshake stays with one worker. When it needs
 wire input, that worker waits for readability for at most a 50 ms slice,
 capped by the original deadline. The socket stays nonblocking.

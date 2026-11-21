@@ -1,6 +1,8 @@
 //! Checked startup reservations, not allocation or measured RSS guarantees.
 use std::fmt;
 
+pub(crate) const MAX_HTTPS_CONNECTIONS: usize = 32;
+
 pub const KIB: usize = 1024;
 pub const MIB: usize = 1024 * KIB;
 /// Maximum immutable message size.
@@ -151,7 +153,7 @@ limits! {
     configurable {
         smtp_sessions: 8, 1, 32;
         smtp_per_peer: 2, 1, 32;
-        https_connections: 8, 1, 32;
+        https_connections: 8, 1, MAX_HTTPS_CONNECTIONS;
         tls_handshakes: 2, 1, 8;
         event_streams: 2, 0, 8;
         body_jobs: 3, 1, 8;
