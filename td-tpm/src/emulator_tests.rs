@@ -808,3 +808,38 @@ fn emulator_refuses_a_fresh_tpm_and_another_primary_before_seal_or_unseal() {
     );
     assert_eq!(fresh.counter(), 0);
 }
+
+#[test]
+#[ignore = "needs the pinned swtpm 0.10.1 on PATH"]
+fn device_pin_vault_survives_boot_measurements_and_requires_the_original_tpm_and_pin() {
+    let original = Emulator::start("vault-device");
+    let (_, primary_name) = original.client().storage_primary(None).unwrap();
+    let mut payload = PAYLOAD;
+    let sealed = original
+        .client()
+        .seal_device_pin(&primary_name, &pin(7), &mut payload)
+        .unwrap();
+    assert_eq!(payload, [0; 32]);
+    assert_eq!(
+        validate_auth_sealed_public(&sealed.object.public, &device_pin_policy_digest()),
+        Ok(DA_SEALED_ATTRIBUTES)
+    );
+    let open = |tpm: &Emulator, digits: u8| {
+        tpm.client().unseal_device_pin(
+            &sealed.primary_name,
+            &pin(digits),
+            &sealed.object.public,
+            &sealed.object.private,
+        )
+    };
+    assert_eq!(open(&original, 7).unwrap(), PAYLOAD);
+    original.measure();
+    assert_eq!(open(&original, 7).unwrap(), PAYLOAD);
+    assert_eq!(
+        open(&original, 8).unwrap_err().authorization(),
+        Some(AuthRefusal::AuthFail)
+    );
+    let other = Emulator::start("vault-other-device");
+    assert!(open(&other, 7).is_err());
+    assert!(!other.codes().contains(&UNSEAL));
+}

@@ -144,7 +144,14 @@ derivation.
 - **PolicyAuthValue.** `auth_policy_digest` and `PcrPolicy::auth_digest`
   are PolicyPCR, then PolicyAuthValue, then PolicyCommandCode(Unseal),
   from the zero digest: the tpm-pin policy. `policy_digest` is
-  unchanged.
+  unchanged. The device-only PIN profile extends the zero digest with
+  PolicyAuthValue and PolicyCommandCode(Unseal). Its fixedTPM, fixedParent
+  object counts wrong PINs against the TPM's lockout hierarchy. The caller
+  supplies a primary Name from trusted lockout provisioning and checks
+  the lockout parameters. An unprovisioned hierarchy gives no guess bound. Its PIN remains valid across boot measurements.
+  `seal_device_pin` and `unseal_device_pin` select this profile explicitly.
+  Unseal checks the public object's attributes and policy before using the
+  PIN, and checks the original primary Name before starting a salted session.
 - **Sealing with an authValue.** `seal_with_auth` seals a 1 to 128-byte
   payload under `auth_digest` beneath the unpersonalized storage
   primary, with an authValue of at most 32 bytes (`MAX_AUTH_VALUE`, the

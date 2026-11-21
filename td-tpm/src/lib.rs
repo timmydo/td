@@ -27,10 +27,10 @@ mod emulator_tests;
 mod lockout;
 mod session;
 pub use auth::{
-    auth_policy_digest, validate_auth_sealed_public, AuthRefusal, AuthSealed, DictionaryAttack,
-    DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA, POLICY_AUTH_VALUE, PT_LOCKOUT_COUNTER,
-    PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY, PT_MAX_AUTH_FAIL, PT_PERMANENT, RC_AUTH_FAIL,
-    RC_LOCKOUT,
+    auth_policy_digest, device_pin_policy_digest, validate_auth_sealed_public, AuthRefusal,
+    AuthSealed, DictionaryAttack, DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA, POLICY_AUTH_VALUE,
+    PT_LOCKOUT_COUNTER, PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY, PT_MAX_AUTH_FAIL, PT_PERMANENT,
+    RC_AUTH_FAIL, RC_LOCKOUT,
 };
 pub use lockout::{
     DaParameters, LockoutAuth, LockoutError, CLEAR, DICTIONARY_ATTACK_LOCK_RESET,
@@ -688,6 +688,19 @@ impl<T: Transport> Client<T> {
         parameters.extend_from_slice(&policy.selection.marshal());
         let (_, out) = self.call(POLICY_PCR, &[handle], None, &parameters, false)?;
         Reader(&out).end()?;
+        self.satisfy_unseal(
+            handle,
+            auth_value,
+            &policy_digest_from(policy.selection, &policy.pcr_digest, auth_value),
+        )
+    }
+
+    fn satisfy_unseal(
+        &mut self,
+        handle: u32,
+        auth_value: bool,
+        expected: &[u8; 32],
+    ) -> Result<(), String> {
         if auth_value {
             let (_, out) = self.call(POLICY_AUTH_VALUE, &[handle], None, &[], false)?;
             Reader(&out).end()?;
@@ -702,7 +715,6 @@ impl<T: Transport> Client<T> {
         Reader(&out).end()?;
         let (_, out) = self.call(POLICY_GET_DIGEST, &[handle], None, &[], false)?;
         let mut reader = Reader(&out);
-        let expected = policy_digest_from(policy.selection, &policy.pcr_digest, auth_value);
         if reader.blob()? != expected {
             return Err("TPM policy digest mismatch".into());
         }

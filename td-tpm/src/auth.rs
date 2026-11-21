@@ -38,6 +38,19 @@ pub fn auth_policy_digest(selection: PcrSelection, pcr_digest: &[u8; 32]) -> [u8
     policy_digest_from(selection, pcr_digest, true)
 }
 
+/// PolicyAuthValue and PolicyCommandCode(Unseal), from the zero digest.
+pub fn device_pin_policy_digest() -> [u8; 32] {
+    let mut hash = super::sha256::Sha256::new();
+    hash.update(&[0; 32]);
+    hash.update(&POLICY_AUTH_VALUE.to_be_bytes());
+    let first = hash.finalize();
+    let mut hash = super::sha256::Sha256::new();
+    hash.update(&first);
+    hash.update(&super::POLICY_COMMAND_CODE.to_be_bytes());
+    hash.update(&UNSEAL.to_be_bytes());
+    hash.finalize()
+}
+
 impl PcrPolicy {
     /// This PCR state's policy with PolicyAuthValue before the command
     /// code: the object's authValue must also authorize the Unseal.
@@ -137,8 +150,38 @@ impl<T: Transport> Client<T> {
     /// as it is marshaled and on every return path; `auth` stays the
     /// caller's to zero.
     pub fn seal_with_auth(
-        mut self,
+        self,
         policy: &PcrPolicy,
+        expected_primary: Option<&[u8]>,
+        auth: &[u8],
+        attributes: u32,
+        payload: &mut [u8],
+    ) -> Result<AuthSealed, String> {
+        self.seal_pin(Some(policy), expected_primary, auth, attributes, payload)
+    }
+
+    /// Seal a device-bound secret with a PIN. Firmware and deployment updates
+    /// may change boot measurements. The caller must supply the storage
+    /// primary Name from its trusted lockout provisioning and verify the
+    /// hierarchy's DA parameters. The object counts guesses against it.
+    pub fn seal_device_pin(
+        self,
+        primary_name: &[u8],
+        auth: &[u8],
+        payload: &mut [u8],
+    ) -> Result<AuthSealed, String> {
+        self.seal_pin(
+            None,
+            Some(primary_name),
+            auth,
+            DA_SEALED_ATTRIBUTES,
+            payload,
+        )
+    }
+
+    fn seal_pin(
+        mut self,
+        policy: Option<&PcrPolicy>,
         expected_primary: Option<&[u8]>,
         auth: &[u8],
         attributes: u32,
@@ -162,15 +205,15 @@ impl<T: Transport> Client<T> {
 
     fn seal_in_session(
         &mut self,
-        policy: &PcrPolicy,
+        policy: Option<&PcrPolicy>,
         expected_primary: Option<&[u8]>,
         auth: &[u8],
         attributes: u32,
         payload: &mut [u8],
     ) -> Result<AuthSealed, String> {
-        let digest = policy.auth_digest();
+        let digest = policy.map_or_else(device_pin_policy_digest, PcrPolicy::auth_digest);
         let trial = self.start_session(super::TRIAL_SESSION)?;
-        self.satisfy(trial, policy, true)?;
+        self.satisfy_pin(trial, policy)?;
         let primary = self.primary(None)?;
         if expected_primary.is_some_and(|name| name != primary.name) {
             return Err(OTHER_PRIMARY.into());
@@ -248,16 +291,38 @@ impl<T: Transport> Client<T> {
         private: &[u8],
     ) -> Result<Vec<u8>, UnsealError> {
         let unsealed =
-            self.unseal_with_auth_in_session(policy, primary_name, auth, public, private);
+            self.unseal_with_auth_in_session(Some(policy), primary_name, auth, public, private);
         unsealed.map_err(|message| UnsealError {
             refusal: self.refused,
             message,
         })
     }
 
+    /// Open precisely the DA-protected object created by seal_device_pin.
+    pub fn unseal_device_pin(
+        mut self,
+        primary_name: &[u8],
+        auth: &[u8],
+        public: &[u8],
+        private: &[u8],
+    ) -> Result<Vec<u8>, UnsealError> {
+        self.unseal_with_auth_in_session(None, primary_name, auth, public, private)
+            .map_err(|message| UnsealError {
+                refusal: self.refused,
+                message,
+            })
+    }
+
+    fn satisfy_pin(&mut self, handle: u32, policy: Option<&PcrPolicy>) -> Result<(), String> {
+        match policy {
+            Some(policy) => self.satisfy(handle, policy, true),
+            None => self.satisfy_unseal(handle, true, &device_pin_policy_digest()),
+        }
+    }
+
     fn unseal_with_auth_in_session(
         &mut self,
-        policy: &PcrPolicy,
+        policy: Option<&PcrPolicy>,
         primary_name: &[u8],
         auth: &[u8],
         public: &[u8],
@@ -265,10 +330,14 @@ impl<T: Transport> Client<T> {
     ) -> Result<Vec<u8>, String> {
         self.refused = None;
         bounded_auth(auth)?;
-        if sealed_policy(public, SEALED_ATTRIBUTES)
-            .or_else(|_| sealed_policy(public, DA_SEALED_ATTRIBUTES))
-            .is_err()
-        {
+        let admitted = match policy {
+            None => sealed_policy(public, DA_SEALED_ATTRIBUTES)
+                .is_ok_and(|found| found == device_pin_policy_digest()),
+            Some(_) => sealed_policy(public, SEALED_ATTRIBUTES)
+                .or_else(|_| sealed_policy(public, DA_SEALED_ATTRIBUTES))
+                .is_ok(),
+        };
+        if !admitted {
             return Err("sealed TPM object does not have the sealed format".into());
         }
         let primary = self.primary(None)?;
@@ -278,7 +347,7 @@ impl<T: Transport> Client<T> {
         let handle = self.load(primary.handle, public, private)?;
         let mut session =
             self.salted_session(primary.handle, &primary.x, &primary.y, POLICY_SESSION)?;
-        self.satisfy(session.handle, policy, true)?;
+        self.satisfy_pin(session.handle, policy)?;
         let name = object_name(public);
         let mut out = self.call_session(
             UNSEAL,
@@ -543,6 +612,15 @@ mod tests {
             validate_auth_sealed_public(&public, &policy.auth_digest()),
             Ok(DA_SEALED_ATTRIBUTES)
         );
+        assert!(Client::new(NoIo)
+            .unseal_device_pin(&[0; 34], &[1], &public, &[1])
+            .is_err());
+        let mut no_da = public.clone();
+        no_da[6] = 0x04;
+        no_da[10..42].copy_from_slice(&device_pin_policy_digest());
+        assert!(Client::new(NoIo)
+            .unseal_device_pin(&[0; 34], &[1], &no_da, &[1])
+            .is_err());
         public[6] = 0x04;
         assert_eq!(
             validate_auth_sealed_public(&public, &policy.auth_digest()),
@@ -632,8 +710,13 @@ mod tests {
                 unseal,
                 public: public.clone(),
             });
-            let unsealed =
-                client.unseal_with_auth_in_session(&policy, name, &vector("auth"), &public, &[1]);
+            let unsealed = client.unseal_with_auth_in_session(
+                Some(&policy),
+                name,
+                &vector("auth"),
+                &public,
+                &[1],
+            );
             let refused = client.refused;
             // Salted to the primary, not NULL.
             assert!(client
@@ -711,7 +794,7 @@ mod tests {
             });
             let mut payload = [0x42; 32];
             let sealed = client.seal_in_session(
-                &policy,
+                Some(&policy),
                 expected,
                 &vector("auth"),
                 DA_SEALED_ATTRIBUTES,
