@@ -704,6 +704,7 @@ mod tests {
                 "td-news",
                 "td-open",
                 "td-pass",
+                "td-passkeys",
                 "td-photo",
                 "td-png",
                 "td-portal",

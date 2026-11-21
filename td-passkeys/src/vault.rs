@@ -130,10 +130,20 @@ impl Vault {
     /// provisioning, independent of the metadata in this file.
     pub fn enroll<T: Transport>(
         directory: &File,
+        client: Client<T>,
+        primary: &[u8],
+        pin: &Pin,
+        choice: Enrollment,
+    ) -> Result<Self> {
+        Self::enroll_if(directory, client, primary, pin, choice, || true)
+    }
+    pub(crate) fn enroll_if<T: Transport>(
+        directory: &File,
         mut client: Client<T>,
         primary: &[u8],
         pin: &Pin,
         choice: Enrollment,
+        current: impl FnOnce() -> bool,
     ) -> Result<Self> {
         if !matches!(choice, Enrollment::AcceptLossOfOriginalTpm) {
             return Err(Error::Refused);
@@ -165,7 +175,7 @@ impl Vault {
             entries: Plain(Vec::new()),
             failed: false,
         };
-        vault.persist()?;
+        vault.persist(current)?;
         Ok(vault)
     }
     pub fn unlock<T: Transport>(
@@ -235,7 +245,7 @@ impl Vault {
     pub fn list(&self, mut f: impl FnMut(Account<'_>) -> Result<()>) -> Result<()> {
         self.visit(|item| f(item.account)).map(|_| ())
     }
-    fn persist(&mut self) -> Result<()> {
+    fn persist(&mut self, current: impl FnOnce() -> bool) -> Result<()> {
         // An uncertain rename or directory sync requires a fresh load.
         self.failed = true;
         let mut nonce = [0u8; 12];
@@ -246,19 +256,41 @@ impl Vault {
         td_alloc::extend_from_slice(&mut blob, &nonce)?;
         td_alloc::extend_from_slice(&mut blob, &sealed.0)?;
         td_alloc::extend_from_slice(&mut blob, &tag)?;
-        td_fs::replace_with(&self.place.path, &blob, 0o600, |file| {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            let meta = file.metadata()?;
-            if meta.uid() != self.place.owner || meta.nlink() != 1 || meta.mode() & 0o7777 != 0o600
-            {
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            }
-            Ok(())
-        })?;
+        td_fs::replace_if(
+            &self.place.path,
+            &blob,
+            0o600,
+            |file| {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                let meta = file.metadata()?;
+                if meta.uid() != self.place.owner
+                    || meta.nlink() != 1
+                    || meta.mode() & 0o7777 != 0o600
+                {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(())
+            },
+            || {
+                if current() {
+                    Ok(())
+                } else {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                }
+            },
+        )?;
         self.failed = false;
         Ok(())
     }
     pub fn register(&mut self, request: &Create<'_>, approval: Approval) -> Result<Vec<u8>> {
+        self.register_if(request, approval, || true)
+    }
+    pub(crate) fn register_if(
+        &mut self,
+        request: &Create<'_>,
+        approval: Approval,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Vec<u8>> {
         approval.flags(request.verify_user() || request.discoverable())?;
         let mut duplicate = None;
         let count = self.visit(|c| {
@@ -282,7 +314,7 @@ impl Vault {
         let mut next = Plain(self.without(duplicate.as_ref())?);
         put(&mut next.0, &created.0)?;
         self.entries = next;
-        self.persist()?;
+        self.persist(current)?;
         Ok(reply)
     }
     /// Check known handles for Firefox's empty-client-data list filter.
@@ -338,6 +370,6 @@ impl Vault {
     }
     pub fn delete(&mut self, id: &[u8; 32]) -> Result<()> {
         self.entries = Plain(self.without(Some(id))?);
-        self.persist()
+        self.persist(|| true)
     }
 }

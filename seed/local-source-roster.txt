@@ -19,7 +19,7 @@ td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-jso
 td-net-source net engine,td-alloc,td-inflate,td-fs,td-civil,td-primitives,td-tls-provider
 td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-alloc,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
-td-pass-source td-pass td-secret,td-alloc,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil,td-time,td-disks
+td-pass-source td-pass td-secret,td-passkeys,td-json,td-luks,td-primitives,td-protector,td-encoding,td-source-scan,td-alloc,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil,td-time,td-disks
 td-photo-source td-photo td-av1,td-civil,td-fs,td-jpeg,td-alloc,td-ui,td-compositor,td-test-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-alloc,td-ui,td-tpm,td-fido,td-test-compositor
 td-review-source td-review td-fs,td-alloc,td-ui,td-compositor

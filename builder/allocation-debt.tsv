@@ -3199,6 +3199,8 @@ td-pass/src/store.rs	allocation-macro	9
 td-pass/src/store.rs	unchecked-growth-or-clone	14
 td-pass/src/window.rs	allocating-conversion	2
 td-pass/src/window.rs	allocation-macro	2
+td-passkeys/src/worker.rs	allocating-conversion	2
+td-passkeys/src/worker.rs	unchecked-growth-or-clone	3
 td-photo/src/auto.rs	allocating-conversion	2
 td-photo/src/avif.rs	allocating-constructor	1
 td-photo/src/avif.rs	unchecked-growth-or-clone	4

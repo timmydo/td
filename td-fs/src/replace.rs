@@ -44,6 +44,18 @@ pub fn replace_with(
     mode: u32,
     prepare: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
+    replace_if(path, bytes, mode, prepare, || Ok(()))
+}
+
+/// Run the final authorization check after syncing the temporary and just
+/// before committing the rename. Refusal discards the temporary.
+pub fn replace_if(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    prepare: impl FnOnce(&File) -> io::Result<()>,
+    commit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let named =
@@ -82,6 +94,7 @@ pub fn replace_with(
     let placed = prepare(&file)
         .and_then(|()| file.write_all(bytes))
         .and_then(|()| file.sync_all())
+        .and_then(|()| commit())
         .and_then(|()| std::fs::rename(&temporary, path));
     if let Err(error) = placed {
         let _ = std::fs::remove_file(&temporary);

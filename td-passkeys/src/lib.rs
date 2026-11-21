@@ -2,8 +2,10 @@
 #![forbid(unsafe_code)]
 mod credential;
 pub mod hid;
+pub mod service;
 pub mod uhid;
 mod vault;
+pub mod worker;
 
 pub use credential::{Account, Approval};
 use std::io;
@@ -527,30 +529,29 @@ mod tests {
             .custom_flags(0o4000)
             .open("/dev/td-firefox-passkeys")
             .unwrap();
-        let mut exchange =
-            |reports: wire::Reports,
-             mut receive: Box<dyn FnMut(&hid::Report) -> Option<Vec<u8>>>| {
-                for r in reports.as_ref() {
-                    let mut frame = [0; 65];
-                    frame[1..].copy_from_slice(r);
-                    assert_eq!(node.write(&frame).unwrap(), 65);
-                }
-                loop {
-                    assert!(Instant::now() < end);
-                    let mut r = [0; 64];
-                    match node.read(&mut r) {
-                        Ok(64) => {
-                            if let Some(data) = receive(&r) {
-                                return data;
-                            }
+        type ReceiveReport = Box<dyn FnMut(&hid::Report) -> Option<Vec<u8>>>;
+        let mut exchange = |reports: wire::Reports, mut receive: ReceiveReport| {
+            for r in reports.as_ref() {
+                let mut frame = [0; 65];
+                frame[1..].copy_from_slice(r);
+                assert_eq!(node.write(&frame).unwrap(), 65);
+            }
+            loop {
+                assert!(Instant::now() < end);
+                let mut r = [0; 64];
+                match node.read(&mut r) {
+                    Ok(64) => {
+                        if let Some(data) = receive(&r) {
+                            return data;
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(2))
-                        }
-                        other => panic!("hidraw read {other:?}"),
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    other => panic!("hidraw read {other:?}"),
                 }
-            };
+            }
+        };
         let mut init = wire::Initialization::new(wire::BROADCAST, [52; 8]).unwrap();
         let cid = exchange(
             init.request().unwrap(),
@@ -576,6 +577,123 @@ mod tests {
         ctap(&probe(SITE, &digest(b""), &id));
         let hash = digest(b"fresh website challenge in the td guest");
         verify(&ctap(&get(SITE, &hash)), &pk, &hash);
+    }
+
+    #[cfg(feature = "guest-tests")]
+    #[test]
+    #[ignore = "requires disposable passkey guest with the packaged td-pass entry"]
+    fn guest_website_worker_and_workload() {
+        use std::{
+            fs,
+            os::{
+                fd::OwnedFd,
+                unix::{fs::PermissionsExt, net::UnixDatagram, process::CommandExt},
+            },
+            thread,
+        };
+        assert!(fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .split_whitespace()
+            .any(|s| s == "td.passkey-guest=1"));
+        assert!(!std::path::Path::new("/var/lib/td-passkeys/passkeys").exists());
+        let client = || Client::new(td_tpm::Device::open().unwrap());
+        let name = client().storage_primary(None).unwrap().1;
+        let lock = LockoutAuth::generate().unwrap();
+        client().take_lockout(&name, &lock).unwrap();
+        client()
+            .set_dictionary_attack(&name, &lock, DA_PARAMETERS)
+            .unwrap();
+        td_fs::private_dir(std::path::Path::new("/run/td-admit")).unwrap();
+        let anchor = "/run/td-admit/td-passkey-primary";
+        fs::write(anchor, &name).unwrap();
+        fs::set_permissions(anchor, fs::Permissions::from_mode(0o600)).unwrap();
+        let (root, worker) = UnixDatagram::pair().unwrap();
+        root.set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut worker = Process(
+            Command::new("/bin/td-pass")
+                .args(["website-authenticator", "65536"])
+                .stdin(Stdio::from(OwnedFd::from(worker)))
+                .spawn()
+                .unwrap(),
+        );
+        let end = Instant::now() + Duration::from_secs(55);
+        while !std::path::Path::new("/dev/td-firefox-passkeys").exists() {
+            assert!(Instant::now() < end && worker.0.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut browser = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::guest_workload_client",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .uid(65536)
+                .gid(65536)
+                .spawn()
+                .unwrap(),
+        );
+        let control = |bytes: &[u8]| {
+            assert_eq!(root.send(bytes).unwrap(), bytes.len());
+            let mut buf = [0; 2048];
+            let n = root.recv(&mut buf).unwrap();
+            buf[..n].to_vec()
+        };
+        let mut sequence = Vec::new();
+        loop {
+            assert!(Instant::now() < end);
+            if let Some(status) = browser.0.try_wait().unwrap() {
+                assert!(status.success());
+                assert_eq!(sequence, vec![1, 2]);
+                break;
+            }
+            let state = control(&[1]);
+            if state == [0] {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            assert_eq!(state[0], 0);
+            let ticket = &state[1..9];
+            let op = state[9];
+            if op == 8 {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            assert!(matches!(op, 1 | 2));
+            assert_eq!(state[10], 0); // no YubiKey in the guest
+            assert_eq!(state[11], if op == 1 { 1 } else { 2 });
+            let mut labels = &state[12..];
+            assert_eq!(super::field(&mut labels, 253).unwrap(), SITE.as_bytes());
+            let send = |n, body: &[u8]| {
+                let mut q = vec![n];
+                q.extend(ticket);
+                q.extend(body);
+                control(&q)
+            };
+            sequence.push(op);
+            assert_eq!(send(5, &[u8::from(op == 1)]), [0]);
+            assert_eq!(send(6, b"guest PIN"), [0]);
+            loop {
+                assert!(Instant::now() < end);
+                let next = control(&[1]);
+                assert_eq!(next.get(1..9), Some(ticket));
+                if next.get(9..) == Some(&[7]) {
+                    break;
+                }
+                assert_eq!(next.get(9..), Some([8].as_slice()));
+                thread::sleep(Duration::from_millis(5));
+            }
+            if op == 1 {
+                assert_eq!(send(8, &[]), [0]);
+            } else {
+                let row = send(7, &[0]);
+                assert_eq!(row[0], 0);
+                assert_eq!(send(8, &row[1..33]), [0]);
+            }
+        }
+        assert_eq!(control(&[2]), [0]);
     }
 
     struct Socket(UnixStream);

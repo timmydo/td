@@ -32,6 +32,7 @@ indexing_slicing = "deny"
 # protection are td-secret's notebook library, its `pass` module.
 [dependencies]
 td-ui = { path = "../td-ui" }
+td-passkeys = { path = "../td-passkeys" }
 td-secret = { path = "../td-secret" }
 
 [dev-dependencies]

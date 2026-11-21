@@ -121,6 +121,10 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn hidraw_index(self) -> u8 {
+        self.index
+    }
+
     /// Selection is repeated for each website transaction. The root worker
     /// subsequently pins the chosen attachment and takes the normal HID lock.
     pub fn website_devices() -> Result<Vec<Self>, String> {

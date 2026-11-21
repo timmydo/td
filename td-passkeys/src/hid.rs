@@ -22,10 +22,14 @@ const HEARTBEAT: Duration = Duration::from_millis(90);
 pub struct Command {
     ticket: u64,
     message: Message,
+    deadline: Instant,
 }
 impl Command {
     pub fn ticket(&self) -> u64 {
         self.ticket
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
     pub fn request(&self) -> Result<Request<'_>> {
         web_request::parse(self.message.as_ref()).map_err(|_| Error::Invalid)
@@ -264,15 +268,17 @@ impl Authenticator {
             }
             Ok(_) => {
                 self.serial = self.serial.checked_add(1).ok_or(Error::Full)?;
+                let deadline = now + APPROVAL_TIMEOUT;
                 self.waiting = Some(Waiting {
                     channel,
                     ticket: self.serial,
-                    end: now + APPROVAL_TIMEOUT,
+                    end: deadline,
                     heartbeat: now + HEARTBEAT,
                 });
                 return Ok(Some(Command {
                     ticket: self.serial,
                     message,
+                    deadline,
                 }));
             }
         }

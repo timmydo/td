@@ -33,6 +33,18 @@ fn main() -> ExitCode {
     else {
         return exit(Err("usage: td-pass".to_owned()));
     };
+    if let [verb, group] = args.as_slice() {
+        if verb == "website-authenticator" {
+            return exit(
+                group
+                    .parse()
+                    .map_err(|_| "invalid Firefox group")
+                    .and_then(|group| {
+                        td_passkeys::worker::run(group).map_err(|_| "website authenticator stopped")
+                    }),
+            );
+        }
+    }
     if let Some(result) = td_secret::pass::worker(&args) {
         return exit(result);
     }
@@ -55,7 +67,7 @@ fn main() -> ExitCode {
     }
     match mode::admit(os_release().as_deref()) {
         Ok(mode::Mode::Standalone) => exit(window::run_with(None)),
-        Ok(mode::Mode::TrustedRequired) => exit(Err("open td-pass from td’s launcher".into())),
+        Ok(mode::Mode::TrustedRequired) => exit(Err("open td-pass from td’s launcher")),
         Err(reason) => exit(Err(reason.to_owned())),
     }
 }
@@ -84,7 +96,7 @@ fn os_release() -> Option<String> {
     Some("ID=td-pass-test-vault\n".to_owned())
 }
 
-fn exit(result: Result<(), String>) -> ExitCode {
+fn exit(result: Result<(), impl std::fmt::Display>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {

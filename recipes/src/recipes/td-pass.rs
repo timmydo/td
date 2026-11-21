@@ -22,6 +22,13 @@ pub fn recipe() -> Recipe {
         .local_source("td-pass")
         .local_source_trees(&[
             "td-secret",
+            "td-passkeys",
+            "td-json",
+            "td-luks",
+            "td-primitives",
+            "td-protector",
+            "td-encoding",
+            "td-source-scan",
             "td-alloc",
             "td-ui",
             "td-compositor",
@@ -60,6 +67,13 @@ mod tests {
             Some(
                 [
                     "td-secret",
+                    "td-passkeys",
+                    "td-json",
+                    "td-luks",
+                    "td-primitives",
+                    "td-protector",
+                    "td-encoding",
+                    "td-source-scan",
                     "td-alloc",
                     "td-ui",
                     "td-compositor",
@@ -121,6 +135,7 @@ mod tests {
             paths,
             [
                 "td-ui = { path = \"../td-ui\" }",
+                "td-passkeys = { path = \"../td-passkeys\" }",
                 "td-secret = { path = \"../td-secret\" }",
                 "td-test-compositor = { path = \"../td-test-compositor\" }"
             ]

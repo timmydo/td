@@ -57,3 +57,23 @@ hierarchy. A hidraw client running under workload UID and GID 65536 performs reg
 sign-in through the kernel's UHID device, reopening the TPM vault between
 operations and verifying the signature independently. This protocol
 client supplies the test approvals.
+
+The worker distinguishes its private control endpoint from the HID
+interface. Control frames select a backend, approve one ticket, submit a
+protected PIN, select a site-matched account, cancel a request, or lock
+the vault. Only explicit acceptance at registration can enroll the
+TPM vault. A website assertion checks the accepted ticket again. The
+worker clears the input containing a PIN. A hardware operation pins its
+attachment from the revision of the hotplug list shown to the human, checks for cancellation and uses a separate HID worker under
+the system operation lock. The guest worker case drives the installed
+td-pass worker entry with test approvals and an unprivileged hidraw
+client.
+
+
+The worker services HID and control traffic while TPM work and durable
+writes are pending. The private controller polls for verification before
+selecting an account or committing an operation. A cancel, lock or the
+original HID deadline invalidates the job. Publication checks that event
+after syncing the temporary file, immediately before its rename. A
+cancellation after this commit point can suppress the reply to Firefox
+even when the credential is already durable.
