@@ -275,7 +275,8 @@ pub struct Session {
     next_channel: u64,
     client_index: u32,
     subscribed: u32,
-    /// Sink-input changes for the daemon to relay to every other subscriber.
+    /// Sink-input changes for the daemon to relay to the other connections'
+    /// subscribers that are controllers.
     global_events: Vec<(u32, u32)>,
     global_requests: Vec<GlobalRequest>,
     output_overflowed: bool,
@@ -352,8 +353,8 @@ impl Session {
         self.client_index
     }
 
-    /// Changes originated by this connection, for server-wide subscription
-    /// delivery. The originating session already received its local copy.
+    /// Changes originated by this connection, for the daemon to deliver to
+    /// controllers. The originating session already received its local copy.
     pub fn take_global_events(&mut self) -> Vec<(u32, u32)> {
         std::mem::take(&mut self.global_events)
     }

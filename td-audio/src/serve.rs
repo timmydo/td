@@ -87,9 +87,21 @@ const READ_CHUNK: usize = 64 * 1024;
 /// The one application whose account may connect.
 const BROWSER: &str = "firefox";
 
+/// What an admitted peer may reach beyond its own streams, fixed at accept
+/// from its kernel uid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The daemon's own uid and the seat user: every connection's streams
+    /// are visible and controllable, as for a same-user Pulse mixer.
+    Controller,
+    /// An application account: only its own streams. Another connection's
+    /// sink inputs are absent, never merely forbidden.
+    Player,
+}
+
 /// Who may connect.
 pub struct Policy {
-    /// Dedicated audio and the human seat.
+    /// Dedicated audio and the human seat, the controller uids.
     pub allowed_uids: Vec<u32>,
     /// The deployment's application policy, which names the browser's
     /// account. Asked on each admission, so an account the ledger gains
@@ -162,8 +174,18 @@ impl Policy {
         uids
     }
 
-    pub fn admits(&self, peer: &sys::Peer) -> bool {
-        self.allowed_uids.contains(&peer.uid) || self.browser() == Some(peer.uid)
+    /// The role an admitted peer gets, or `None` for a refused one.
+    ///
+    /// The browser account is a player even if a ledger row ever named a
+    /// controller uid for it: sharing an account must not promote an
+    /// application, so the ambiguous case fails toward less authority.
+    pub fn role(&self, peer: &sys::Peer) -> Option<Role> {
+        if self.browser() == Some(peer.uid) {
+            return Some(Role::Player);
+        }
+        self.allowed_uids
+            .contains(&peer.uid)
+            .then_some(Role::Controller)
     }
 
     /// Why a peer was refused, in words a log line can carry. §K.5 asks for a
@@ -210,6 +232,8 @@ struct Client {
     stream: UnixStream,
     session: Session,
     peer: sys::Peer,
+    /// What it may reach beyond its own streams.
+    role: Role,
     /// Bytes owed to the client that the socket would not take yet.
     pending: Vec<u8>,
     /// How far into `pending` the socket has got.
@@ -527,70 +551,78 @@ impl<S: AudioSink> Server<S> {
                     continue;
                 }
             };
-            if !self.policy.admits(&peer) {
-                // §K.5 asks for the decision to be "in code that can say why it
-                // refused", so it says so.
-                diagnostic(
-                    &mut self.diagnostics,
-                    format_args!("refused a connection: {}", self.policy.refusal(&peer)),
-                );
-                self.refused = self.refused.saturating_add(1);
-                continue;
-            }
-            if self
-                .clients
-                .iter()
-                .filter(|client| client.peer.pid == peer.pid)
-                .count()
-                >= MAX_CLIENTS_PER_PID
-            {
+            self.admit(stream, peer, &mut replaced_idle);
+        }
+    }
+
+    /// Give an accepted connection, whose kernel credentials have been read,
+    /// its role and a slot, or refuse it. The role is fixed here for the
+    /// connection's life.
+    fn admit(&mut self, stream: UnixStream, peer: sys::Peer, replaced_idle: &mut bool) {
+        let Some(role) = self.policy.role(&peer) else {
+            // §K.5 asks for the decision to be "in code that can say why it
+            // refused", so it says so.
+            diagnostic(
+                &mut self.diagnostics,
+                format_args!("refused a connection: {}", self.policy.refusal(&peer)),
+            );
+            self.refused = self.refused.saturating_add(1);
+            return;
+        };
+        if self
+            .clients
+            .iter()
+            .filter(|client| client.peer.pid == peer.pid)
+            .count()
+            >= MAX_CLIENTS_PER_PID
+        {
+            diagnostic(
+                &mut self.diagnostics,
+                format_args!(
+                    "refused uid {} pid {}: already serving its \
+                     {MAX_CLIENTS_PER_PID} client limit",
+                    peer.uid, peer.pid
+                ),
+            );
+            self.refused = self.refused.saturating_add(1);
+            return;
+        }
+        if self.clients.len() >= MAX_CLIENTS {
+            let idle = if *replaced_idle {
+                None
+            } else {
+                self.clients.iter().position(Client::evictable_idle)
+            };
+            if let Some(idle) = idle {
+                self.drop_clients(&[idle]);
+                *replaced_idle = true;
+            } else {
                 diagnostic(
                     &mut self.diagnostics,
                     format_args!(
-                        "refused uid {} pid {}: already serving its \
-                         {MAX_CLIENTS_PER_PID} client limit",
+                        "refused uid {} (pid {}): already serving {MAX_CLIENTS} active clients",
                         peer.uid, peer.pid
                     ),
                 );
                 self.refused = self.refused.saturating_add(1);
-                continue;
+                return;
             }
-            if self.clients.len() >= MAX_CLIENTS {
-                let idle = if replaced_idle {
-                    None
-                } else {
-                    self.clients.iter().position(Client::evictable_idle)
-                };
-                if let Some(idle) = idle {
-                    self.drop_clients(&[idle]);
-                    replaced_idle = true;
-                } else {
-                    diagnostic(
-                        &mut self.diagnostics,
-                        format_args!(
-                            "refused uid {} (pid {}): already serving {MAX_CLIENTS} active clients",
-                            peer.uid, peer.pid
-                        ),
-                    );
-                    self.refused = self.refused.saturating_add(1);
-                    continue;
-                }
-            }
-            let Some(index) = self.allocate_client_index() else {
-                self.refused = self.refused.saturating_add(1);
-                continue;
-            };
-            self.clients.push(Client {
-                stream,
-                session: Session::new(self.spec, index),
-                peer,
-                pending: Vec::new(),
-                pending_at: 0,
-                since: Instant::now(),
-                partial_since: None,
-                ready_input: false,
-            });
         }
+        let Some(index) = self.allocate_client_index() else {
+            self.refused = self.refused.saturating_add(1);
+            return;
+        };
+        self.clients.push(Client {
+            stream,
+            session: Session::new(self.spec, index),
+            peer,
+            role,
+            pending: Vec::new(),
+            pending_at: 0,
+            since: Instant::now(),
+            partial_since: None,
+            ready_input: false,
+        });
     }
 
     fn allocate_client_index(&mut self) -> Option<u32> {
@@ -613,10 +645,17 @@ impl<S: AudioSink> Server<S> {
             }
         }
         for (origin, event, index) in events {
-            for (recipient, client) in self.clients.iter_mut().enumerate() {
-                if recipient != origin {
-                    client.session.notify_global(event, index);
-                }
+            self.notify_controllers(Some(origin), event, index);
+        }
+    }
+
+    /// The one fan-out of another connection's sink-input event. Only
+    /// controllers hear it: a player learns of no stream but its own, whose
+    /// events its session already delivered locally.
+    fn notify_controllers(&mut self, origin: Option<usize>, event: u32, index: u32) {
+        for (recipient, client) in self.clients.iter_mut().enumerate() {
+            if Some(recipient) != origin && client.role == Role::Controller {
+                client.session.notify_global(event, index);
             }
         }
     }
@@ -635,9 +674,16 @@ impl<S: AudioSink> Server<S> {
                 | crate::session::GlobalRequest::Volume { index, .. }
                 | crate::session::GlobalRequest::Mute { index, .. } => *index,
             };
+            // A player's own streams never reach this router, so whatever it
+            // names here is another connection's or nobody's, and gets the
+            // same answer either way: an index that exists is not revealed.
+            let controller = clients
+                .get(requester)
+                .is_some_and(|client| client.role == Role::Controller);
             let owner = clients
                 .iter()
-                .position(|client| client.session.owns_sink_input(index));
+                .position(|client| client.session.owns_sink_input(index))
+                .filter(|_| controller);
             let Some(owner) = owner else {
                 if let Some(client) = clients.get_mut(requester) {
                     client.session.reject_global_request(request);
@@ -952,12 +998,11 @@ impl<S: AudioSink> Server<S> {
         // is a separate table, reconciled here against the sessions that remain.
         self.forget_orphaned_streams();
         for index in removed_sink_inputs {
-            for client in &mut self.clients {
-                client.session.notify_global(
-                    subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
-                    index,
-                );
-            }
+            self.notify_controllers(
+                None,
+                subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
+                index,
+            );
         }
     }
 
@@ -1060,6 +1105,10 @@ mod tests {
     use crate::sink::{AudioSink, MemorySink, Wait};
     use crate::tag;
     use crate::wire;
+
+    fn admits(policy: &Policy, peer: &sys::Peer) -> bool {
+        policy.role(peer).is_some()
+    }
 
     fn socket_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("td-audio-{}-{}", name, std::process::id()))
@@ -1740,6 +1789,296 @@ mod tests {
         server.shutdown();
     }
 
+    const BROWSER_UID: u32 = 65536;
+
+    /// A deployment policy whose browser account is `BROWSER_UID`, for a
+    /// daemon running as `own`.
+    fn browser_policy(own: u32) -> Policy {
+        Policy::deployment_policy(own, Ok(()), || {
+            crate::app_policy::Policy::from_tables(
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\n",
+                "td-accounts-v1\napplication\tfirefox\t65536\n",
+            )
+            .map_err(io::Error::other)
+        })
+        .unwrap()
+    }
+
+    /// A connection through the production admission path, with the
+    /// credentials the kernel would report for `uid` and `pid`: one test
+    /// process cannot be the browser's account itself.
+    fn admit_as(server: &mut Server<MemorySink>, uid: u32, pid: i32) -> UnixStream {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs.set_nonblocking(true).unwrap();
+        server.admit(theirs, sys::Peer { pid, uid, gid: uid }, &mut false);
+        ours
+    }
+
+    fn error_code(bytes: &[u8], expected_tag: u32) -> Option<u32> {
+        control_packets(bytes).into_iter().find_map(|packet| {
+            let mut reader = tag::Reader::new(&packet);
+            if reader.u32().ok()? != command::ERROR || reader.u32().ok()? != expected_tag {
+                return None;
+            }
+            reader.u32().ok()
+        })
+    }
+
+    /// An application account is a player. Another connection's stream is
+    /// absent to it: no subscription event, and inspection, volume and mute
+    /// all answer `NOENTITY` without touching the owner's stream. Its own
+    /// stream stays fully controllable, and a controller still reaches it.
+    #[test]
+    fn a_player_cannot_observe_or_change_another_connections_stream() {
+        let (mut server, path) = server("player-isolation");
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut owner = UnixStream::connect(&path).unwrap();
+        player.write_all(&auth_packet()).unwrap();
+        owner.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let roles: Vec<Role> = server.clients.iter().map(|client| client.role).collect();
+        assert_eq!(
+            roles,
+            [Role::Player, Role::Controller],
+            "admission derived both roles from the deployment policy"
+        );
+        let _ = drain_socket(&mut player);
+        let _ = drain_socket(&mut owner);
+
+        player
+            .write_all(&build(command::SUBSCRIBE, 10, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+
+        owner.write_all(&create_request(20, false)).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let foreign = created_sink_input(&drain_socket(&mut owner)).expect("owner's stream");
+        assert_eq!(
+            subscription_events(&drain_socket(&mut player)),
+            Vec::new(),
+            "a player is not told another connection created a stream"
+        );
+
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut probes = build(command::GET_SINK_INPUT_INFO, 30, |writer| {
+            writer.u32(foreign);
+        });
+        probes.extend(build(command::SET_SINK_INPUT_VOLUME, 31, |writer| {
+            writer.u32(foreign).cvolume(&[half, half]);
+        }));
+        probes.extend(build(command::SET_SINK_INPUT_MUTE, 32, |writer| {
+            writer.u32(foreign).boolean(true);
+        }));
+        player.write_all(&probes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut player);
+        for probe in [30, 31, 32] {
+            assert_eq!(
+                error_code(&answers, probe),
+                Some(crate::proto::error::NOENTITY),
+                "probe {probe} sees another connection's stream as absent"
+            );
+        }
+        assert_eq!(subscription_events(&answers), Vec::new());
+        // The same probes against an index nobody holds: the answers must be
+        // the same bytes, or the difference enumerates live streams.
+        let absent = foreign.wrapping_add(1000);
+        let mut probes = build(command::GET_SINK_INPUT_INFO, 30, |writer| {
+            writer.u32(absent);
+        });
+        probes.extend(build(command::SET_SINK_INPUT_VOLUME, 31, |writer| {
+            writer.u32(absent).cvolume(&[half, half]);
+        }));
+        probes.extend(build(command::SET_SINK_INPUT_MUTE, 32, |writer| {
+            writer.u32(absent).boolean(true);
+        }));
+        player.write_all(&probes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(drain_socket(&mut player), answers);
+
+        owner
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 40, |writer| {
+                writer.u32(foreign);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let state = sink_input_state(&drain_socket(&mut owner), 40).unwrap();
+        assert_eq!(
+            state.2,
+            vec![crate::mixer::VOLUME_NORM, crate::mixer::VOLUME_NORM]
+        );
+        assert!(!state.3, "the owner's stream was not muted");
+
+        player.write_all(&create_request(50, false)).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let own = created_sink_input(&drain_socket(&mut player)).expect("player's stream");
+        player
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 51, |writer| {
+                writer.u32(own).boolean(true);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let mine = drain_socket(&mut player);
+        assert_eq!(error_code(&mine, 51), None, "its own stream obeys it");
+        assert!(subscription_events(&mine).contains(&(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+            own
+        )));
+
+        owner
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 60, |writer| {
+                writer.u32(own).boolean(false);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            error_code(&drain_socket(&mut owner), 60),
+            None,
+            "a controller still reaches the player's stream"
+        );
+        assert!(
+            subscription_events(&drain_socket(&mut player)).contains(&(
+                subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+                own
+            )),
+            "and the player hears that its own stream changed"
+        );
+
+        drop(owner);
+        for _ in 0..3 {
+            server.pass().unwrap();
+        }
+        assert!(
+            !subscription_events(&drain_socket(&mut player))
+                .iter()
+                .any(|(_, index)| *index == foreign),
+            "nor is it told the stream went away"
+        );
+        server.shutdown();
+    }
+
+    /// Two application connections are each other's strangers, not only a
+    /// player and a controller.
+    #[test]
+    fn two_players_do_not_see_each_other() {
+        let (mut server, _path) = server("player-pair");
+        server.policy = browser_policy(own_uid());
+        let mut watcher = admit_as(&mut server, BROWSER_UID, 7);
+        let mut other = admit_as(&mut server, BROWSER_UID, 8);
+        watcher.write_all(&auth_packet()).unwrap();
+        other.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert!(server
+            .clients
+            .iter()
+            .all(|client| client.role == Role::Player));
+        let _ = drain_socket(&mut watcher);
+        let _ = drain_socket(&mut other);
+        watcher
+            .write_all(&build(command::SUBSCRIBE, 10, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut watcher);
+
+        other.write_all(&create_request(20, false)).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let index = created_sink_input(&drain_socket(&mut other)).expect("other's stream");
+        watcher
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 30, |writer| {
+                writer.u32(index).boolean(true);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let seen = drain_socket(&mut watcher);
+        assert_eq!(error_code(&seen, 30), Some(crate::proto::error::NOENTITY));
+        assert_eq!(subscription_events(&seen), Vec::new());
+        server.shutdown();
+    }
+
+    /// The role is decided once, at accept, from the policy then in force: a
+    /// later policy change neither promotes nor demotes a live connection.
+    #[test]
+    fn a_connections_role_is_fixed_at_accept() {
+        let (mut server, path) = server("role-at-accept");
+        let mut control = UnixStream::connect(&path).unwrap();
+        let mut playback = UnixStream::connect(&path).unwrap();
+        control.write_all(&auth_packet()).unwrap();
+        playback.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut control);
+        let _ = drain_socket(&mut playback);
+        playback.write_all(&create_request(20, false)).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let index = created_sink_input(&drain_socket(&mut playback)).expect("a stream");
+
+        // A policy that would refuse both connections now. A router that
+        // re-derived the role per request would refuse the controller too.
+        server.policy = Policy {
+            allowed_uids: Vec::new(),
+            applications: None,
+        };
+        let _late = UnixStream::connect(&path).unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            server.client_count(),
+            2,
+            "the new policy refuses a newcomer"
+        );
+        control
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 30, |writer| {
+                writer.u32(index).boolean(true);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let reply = drain_socket(&mut control);
+        assert_eq!(first_command(&reply), Some(command::REPLY));
+        assert_eq!(
+            error_code(&reply, 30),
+            None,
+            "the admitted controller still reaches another connection's stream"
+        );
+        server.shutdown();
+    }
+
+    /// A browser account that collides with a controller uid stays a player:
+    /// sharing an account never promotes an application.
+    #[test]
+    fn a_browser_account_on_a_controller_uid_is_a_player() {
+        let policy = browser_policy(BROWSER_UID);
+        assert_eq!(policy.permitted(), [BROWSER_UID, SEAT_UID], "listed once");
+        let role = |uid| {
+            policy.role(&sys::Peer {
+                pid: 1,
+                uid,
+                gid: uid,
+            })
+        };
+        assert_eq!(role(BROWSER_UID), Some(Role::Player));
+        assert_eq!(role(SEAT_UID), Some(Role::Controller));
+    }
+
     /// Sink-input identity is daemon-global, not merely a unique number in a
     /// create reply. A separate control connection can observe, inspect, and
     /// change another client's stream, then observes its removal.
@@ -1933,6 +2272,7 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
             },
+            role: Role::Controller,
             pending: vec![0; MAX_PENDING_STORAGE - 1],
             pending_at: MAX_PENDING,
             since: Instant::now(),
@@ -2118,19 +2458,37 @@ mod tests {
         };
         let policy = Policy::deployment_policy(994, Ok(()), installed).unwrap();
         assert_eq!(policy.permitted(), [994, 1000, 65536]);
-        for uid in [994, 1000, 65536] {
-            assert!(policy.admits(&sys::Peer {
+        let role = |uid| {
+            policy.role(&sys::Peer {
                 pid: 1,
                 uid,
-                gid: uid
-            }));
+                gid: uid,
+            })
+        };
+        assert_eq!(role(994), Some(Role::Controller), "the daemon's own uid");
+        assert_eq!(role(1000), Some(Role::Controller), "the seat user");
+        assert_eq!(role(65536), Some(Role::Player), "the browser account");
+        assert_eq!(role(65537), None, "an application without audio");
+        assert_eq!(role(993), None, "the compositor is not yet admitted");
+        for uid in [994, 1000, 65536] {
+            assert!(admits(
+                &policy,
+                &sys::Peer {
+                    pid: 1,
+                    uid,
+                    gid: uid
+                }
+            ));
         }
         for uid in [0, 991, 993, 1001, 65537, 65538, 65539] {
-            assert!(!policy.admits(&sys::Peer {
-                pid: 1,
-                uid,
-                gid: uid
-            }));
+            assert!(!admits(
+                &policy,
+                &sys::Peer {
+                    pid: 1,
+                    uid,
+                    gid: uid
+                }
+            ));
         }
         let fallback = Policy::deployment_policy(994, Err(io::ErrorKind::NotFound.into()), || {
             panic!("missing deployment must not call loader")
@@ -2156,11 +2514,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(no_browser.permitted(), [994, 1000]);
-        assert!(!no_browser.admits(&sys::Peer {
-            pid: 1,
-            uid: 65536,
-            gid: 65536
-        }));
+        assert!(!admits(
+            &no_browser,
+            &sys::Peer {
+                pid: 1,
+                uid: 65536,
+                gid: 65536
+            }
+        ));
         // A declared browser without a ledger account is admitted nowhere.
         let unallocated = Policy::deployment_policy(994, Ok(()), || {
             crate::app_policy::Policy::from_tables(
@@ -2184,11 +2545,11 @@ mod tests {
             uid,
             gid: uid,
         };
-        assert!(policy.admits(&peer(994)), "the daemon's own uid");
-        assert!(policy.admits(&peer(SEAT_UID)), "the seat user");
-        assert!(!policy.admits(&peer(0)), "root is not on the list");
-        assert!(!policy.admits(&peer(1001)), "another user");
-        assert!(!policy.admits(&peer(65534)), "nobody");
+        assert!(admits(&policy, &peer(994)), "the daemon's own uid");
+        assert!(admits(&policy, &peer(SEAT_UID)), "the seat user");
+        assert!(!admits(&policy, &peer(0)), "root is not on the list");
+        assert!(!admits(&policy, &peer(1001)), "another user");
+        assert!(!admits(&policy, &peer(65534)), "nobody");
         assert_eq!(policy.allowed_uids.len(), 2);
         // And a refusal says why, with the uid in it.
         let refusal = policy.refusal(&peer(1001));

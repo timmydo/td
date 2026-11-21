@@ -8751,8 +8751,8 @@ for a single-user machine is *nearly* fine and is exactly the kind of
 "nearly" this document refuses elsewhere. The specification: the
 **directory is traversable (0755, owned by `audio`) and the socket is
 0666**, with authorization done by the daemon on `SO_PEERCRED` — accept
-the human UID, the audio UID and the immutable assigned Firefox UID,
-refuse everything else — rather than by mode
+the human UID and the audio UID as controllers and the immutable assigned
+Firefox UID as a player, refuse everything else — rather than by mode
 bits. That puts the decision in code that can say why it refused, which
 is the same reason `td-busd` authenticates rather than relying on a 0700
 directory. And `td-seatd` **creates the directory only**; it cannot
@@ -8821,12 +8821,28 @@ values rather than wrapping onto stale identities. Timing and pending
 `UNDERFLOW` delivery share at most 1024 records per stream, so a stream that
 resumes across a peer's output gap does not claim its earlier device-buffered
 run has played or grow a second queue behind a stalled client.
-A single uid-1000 session is one Pulse authorization domain: any admitted
-client may enumerate another client's sink input and apply the supported
-volume or mute controls, just as an ordinary same-user Pulse control client
-may. The daemon never exposes another stream's samples and v1 exposes no
-capture source. Per-application playback-control isolation would require a
-different authenticated protocol boundary and is not claimed here.
+Admission gives each peer a role from its kernel uid. The daemon's own
+uid and the seat user are controllers, one ordinary same-user Pulse
+authorization domain: a controller may enumerate any connection's sink
+input and apply the supported volume or mute controls. An application
+account, today only the browser's ledger uid, is a player, and a browser
+account that ever named a controller uid is still a player. Another
+connection's sink input is absent to a player: inspecting it, setting its
+volume or muting it answers `NOENTITY`, as for an index nobody holds, and
+no server-wide subscription event reaches a player, a disconnect's removal
+included; its own streams' events arrive through its own session. The
+daemon never exposes another stream's samples and v1 exposes no capture
+source. A player can still tell that other connections and audio exist,
+among other ways from the shared sink's running state and its own stream's
+device latency, from gaps in the process-global sink-input and client
+numbering, and from the daemon-wide stream, queue-reservation and client
+limits it meets; none of these names a stream, its client or its content.
+Roles do not reserve capacity: players can fill the client table and the
+stream and queue budgets against a later controller, as any admitted peer
+could before roles existed. A controller's volume or mute lands in the
+same per-stream value the owning application sets, so the application can
+undo it. td-agent's unconfined workspace runs as the human (WORKLOADS.md)
+and is therefore a controller.
 A final readable AF_UNIX queue is consumed before a simultaneous hangup;
 device loss queues `PLAYBACK_STREAM_KILLED` for one nonblocking attempt and
 then closes, so a backpressured client may observe EOF instead of that
