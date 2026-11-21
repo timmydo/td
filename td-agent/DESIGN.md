@@ -4734,7 +4734,7 @@ row says `network sandbox profile`; the model prompt reports the network
 root returned, separately from web fetch.
 Concurrent conversations and commands naming one sandbox intentionally
 share its account and home, as commands in that sandbox do. They do not
-hold the CLI's exclusive interactive-session lock or own its stop socket.
+register for `td-sandbox stop`, which ends the profile's CLI sessions.
 
 Preparation rereads the profile and grants. A changed selection, runtime,
 account, network or grant list retires the cached file host and restarts

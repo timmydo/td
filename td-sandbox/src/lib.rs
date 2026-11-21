@@ -29,8 +29,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -53,7 +51,7 @@ const HELP: &str = "td-sandbox COMMAND\n\
   runtime NAME RUNTIME|native bind a declared Flathub runtime at /usr\n\
   shell NAME                  start an interactive shell\n\
   run NAME -- COMMAND [ARG...] run a command in the sandbox\n\
-  stop NAME                   terminate the active session\n\
+  stop NAME                   stop all CLI shells and commands for NAME\n\
   delete NAME                 delete an inactive sandbox, its grants and\n\
                               its home's contents; its account is kept\n\
   Sandboxes run only on td: every command but help, runtimes, runtime and stop asks\n\
@@ -282,26 +280,13 @@ fn inspect(profile: &state::Profile, grants: &intake::Grants) -> io::Result<Stri
     Ok(shown)
 }
 
-/// Runs a session: the record locked for its length, a stop socket beside
-/// it, root's answer, then the relay over the same connection.
+/// Each launch has its own intake channel and shares the profile's stop marker.
 fn session(profile: &state::Profile, name: &str, line: &str, terminal: bool) -> io::Result<u8> {
-    let control = profile.root.join("control");
-    if fs::symlink_metadata(&control).is_ok() {
-        fs::remove_file(&control)?;
-    }
-    let directory = fs::File::open(&profile.root)?;
-    let stop = UnixListener::bind(text(format_args!(
-        "/proc/self/fd/{}/control",
-        directory.as_raw_fd()
-    ))?)?;
-    stop.set_nonblocking(true)?;
-    let result = intake::Root::new()
+    let sessions = profile.join_sessions()?;
+    let channel = intake::Root::new()
         .launch(line)
-        .map_err(|e| failure(format_args!("sandbox {name}: {}", explain(name, e))))
-        .and_then(|channel| relay::outside(channel, &stop, terminal));
-    drop(stop);
-    let _ = fs::remove_file(&control);
-    result
+        .map_err(|e| failure(format_args!("sandbox {name}: {}", explain(name, e))))?;
+    relay::outside(channel, &sessions, terminal)
 }
 
 /// The compiled choices, not a claim that their payloads are installed.
@@ -365,12 +350,7 @@ fn run() -> io::Result<u8> {
     match command.as_str() {
         "stop" => {
             end(&mut args)?;
-            let profile = state::Profile::read(&profiles, &name)?;
-            let directory = fs::File::open(&profile.root)?;
-            let _ = UnixStream::connect(text(format_args!(
-                "/proc/self/fd/{}/control",
-                directory.as_raw_fd()
-            ))?)?;
+            state::Profile::open(&profiles, &name, state::Access::Session)?.stop_sessions()?;
         }
         "create" => {
             end(&mut args)?;
@@ -408,7 +388,7 @@ fn run() -> io::Result<u8> {
         "runtime" => {
             let choice = word(args.next())?;
             end(&mut args)?;
-            let mut profile = state::Profile::open(&profiles, &name)?;
+            let mut profile = state::Profile::open(&profiles, &name, state::Access::Change)?;
             profile.runtime = match choice.as_str() {
                 "native" => None,
                 runtime => Some(owned(state::runtime(runtime)?)?),
@@ -456,7 +436,7 @@ fn run() -> io::Result<u8> {
         }
         "shell" | "run" => {
             let terminal = relay::is_terminal();
-            let profile = state::Profile::open(&profiles, &name)?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
             let runtime = profile.runtime.as_deref();
             let term = if terminal {
                 std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())

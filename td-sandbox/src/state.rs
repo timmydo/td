@@ -5,6 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -13,10 +14,14 @@ const RECORD_FORMAT: &str = "td-sandbox-profile-v1";
 /// The most profiles listed or imported.
 pub const MAX_PROFILES: usize = 1024;
 
-/// One sandbox's record, locked while it is open: a session, or a change
-/// to it, holds the lock.
+pub enum Access {
+    Session,
+    Change,
+}
+
+/// One sandbox's record. Sessions share the lock and changes take it exclusively.
 pub struct Profile {
-    pub root: PathBuf,
+    root: PathBuf,
     /// A declared runtime's td name; none for a native sandbox. Only
     /// setting it asks whether it is declared: one a later system no
     /// longer declares still opens, shows and clears, and root refuses
@@ -68,11 +73,11 @@ pub fn text(path: &Path) -> io::Result<&str> {
         .ok_or_else(|| io::Error::other("path must be UTF-8 without line breaks"))
 }
 
-fn open_private(path: &Path) -> io::Result<File> {
+fn open_private(path: &Path, create: bool) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .mode(0o600)
         .custom_flags(0o400_000 | 0o4000)
         .open(path)?;
@@ -138,7 +143,7 @@ pub fn removal(profiles: &Path, name_: &str) -> io::Result<Option<Removal>> {
     }
     let root = profiles.join(name_);
     td_fs::check_private_dir(&root)?;
-    let lock = open_private(&root.join("lock"))?;
+    let lock = open_private(&root.join("lock"), true)?;
     lock.try_lock()
         .map_err(|e| crate::failure(format_args!("sandbox is active or being changed: {e}")))?;
     Ok(Some(Removal { root, _lock: lock }))
@@ -175,10 +180,10 @@ impl Profile {
             _lock: None,
         };
         let written = (|| {
-            let lock = open_private(&profile.root.join("lock"))?;
+            let lock = open_private(&profile.root.join("lock"), true)?;
             lock.try_lock()
                 .map_err(|e| crate::failure(format_args!("sandbox is being changed: {e}")))?;
-            let mut record = open_private(&profile.root.join("record"))?;
+            let mut record = open_private(&profile.root.join("record"), true)?;
             record.write_all(profile.render()?.as_bytes())?;
             record.sync_all()?;
             Ok(lock)
@@ -195,33 +200,48 @@ impl Profile {
         }
     }
 
-    /// The record of `name`, locked: refused while a session or another
-    /// change holds it.
-    pub fn open(profiles: &Path, name_: &str) -> io::Result<Self> {
-        let mut profile = Self::read(profiles, name_)?;
-        let lock = open_private(&profile.root.join("lock"))?;
-        lock.try_lock()
-            .map_err(|e| crate::failure(format_args!("sandbox is active or being changed: {e}")))?;
-        profile._lock = Some(lock);
-        Ok(profile)
+    pub fn open(profiles: &Path, name_: &str, access: Access) -> io::Result<Self> {
+        Self::load(profiles, name_, Some(access))
     }
 
     /// The record of `name`, unlocked, to show.
     pub fn read(profiles: &Path, name_: &str) -> io::Result<Self> {
+        Self::load(profiles, name_, None)
+    }
+
+    fn load(profiles: &Path, name_: &str, access: Option<Access>) -> io::Result<Self> {
         name(name_)?;
         let root = profiles.join(name_);
         td_fs::check_private_dir(&root).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => crate::failure(format_args!("no sandbox named {name_}")),
             _ => e,
         })?;
-        let record = td_fs::read_bounded_real_file(&root.join("record"), "sandbox record", 8192)?;
+        let record_path = root.join("record");
+        let lock = if let Some(access) = access {
+            // Creation takes the exclusive lock before publishing the record.
+            // An opener must not contend with it until the record exists.
+            fs::symlink_metadata(&record_path)?;
+            let lock = open_private(&root.join("lock"), false)?;
+            match access {
+                Access::Session => lock.try_lock_shared(),
+                Access::Change => lock.try_lock(),
+            }
+            .map_err(|e| crate::failure(format_args!("sandbox is active or being changed: {e}")))?;
+            if lock.metadata()?.nlink() == 0 {
+                return Err(io::Error::other("sandbox record was removed"));
+            }
+            Some(lock)
+        } else {
+            None
+        };
+        let record = td_fs::read_bounded_real_file(&record_path, "sandbox record", 8192)?;
         let record = String::from_utf8(record).map_err(io::Error::other)?;
         let (runtime, old_home) = parse(&record)?;
         Ok(Self {
             root,
             runtime,
             old_home,
-            _lock: None,
+            _lock: lock,
         })
     }
 
@@ -229,7 +249,35 @@ impl Profile {
         td_fs::replace(&self.root.join("record"), self.render()?.as_bytes(), 0o600)
     }
 
-    /// The record removed, with its lock and stop socket.
+    // Order joining the current group against unlinking it. The directory
+    // lock lasts only through registration or stop, never across a launch.
+    fn with_sessions<T>(&self, action: impl FnOnce(File, &Path) -> io::Result<T>) -> io::Result<T> {
+        let directory = File::open(&self.root)?;
+        directory.lock()?;
+        let address = crate::text(format_args!(
+            "/proc/self/fd/{}/sessions",
+            directory.as_raw_fd()
+        ))?;
+        let path = Path::new(&address);
+        action(open_private(path, true)?, path)
+    }
+
+    pub fn join_sessions(&self) -> io::Result<File> {
+        self.with_sessions(|sessions, _| {
+            sessions.lock_shared()?;
+            Ok(sessions)
+        })
+    }
+
+    pub fn stop_sessions(&self) -> io::Result<()> {
+        self.with_sessions(|sessions, path| match sessions.try_lock() {
+            Err(fs::TryLockError::WouldBlock) => fs::remove_file(path),
+            Ok(()) => Err(io::Error::other("no active sandbox shell or command")),
+            Err(fs::TryLockError::Error(e)) => Err(e),
+        })
+    }
+
+    /// The record removed, with its session state.
     pub fn remove(self) -> io::Result<()> {
         fs::remove_dir_all(&self.root)
     }
@@ -284,10 +332,10 @@ mod tests {
         let base = td_fs::TempDir::new("sandbox-record")?;
         let profiles = profiles(&base)?;
         let created = Profile::create(&profiles, "tools", None, None)?;
-        assert!(Profile::open(&profiles, "tools").is_err());
+        assert!(Profile::open(&profiles, "tools", Access::Change).is_err());
         assert!(Profile::create(&profiles, "tools", None, None).is_err());
         drop(created);
-        let mut profile = Profile::open(&profiles, "tools")?;
+        let mut profile = Profile::open(&profiles, "tools", Access::Change)?;
         assert_eq!(
             (profile.runtime.as_deref(), profile.old_home.as_deref()),
             (None, None)
@@ -300,7 +348,7 @@ mod tests {
             "td-sandbox-profile-v1\nruntime=freedesktop-sdk-25-08\n"
         );
         // Reading takes no lock: a session does not hide its record.
-        let session = Profile::open(&profiles, "tools")?;
+        let session = Profile::open(&profiles, "tools", Access::Session)?;
         assert_eq!(
             Profile::read(&profiles, "tools")?.runtime.as_deref(),
             Some("freedesktop-sdk-25-08")
@@ -320,10 +368,45 @@ mod tests {
         assert_eq!(list(&profiles)?, ["default", "tools"]);
         let again = Profile::create(&profiles, "default", None, None).err();
         assert!(again.is_some_and(|e| e.to_string().contains("already exists")));
-        Profile::open(&profiles, "tools")?.remove()?;
+        Profile::open(&profiles, "tools", Access::Change)?.remove()?;
         assert_eq!(list(&profiles)?, ["default"]);
         assert!(!exists(&profiles, "tools")?);
         assert!(Profile::read(&profiles, "tools").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_overlap_close_independently_and_stop_as_a_group() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-sessions")?;
+        let profiles = profiles(&base)?;
+        let created = Profile::create(&profiles, "default", None, None)?;
+        let open = || Profile::open(&profiles, "default", Access::Session);
+        assert!(open().is_err());
+        drop(created);
+
+        let first = open()?;
+        assert!(first.stop_sessions().is_err());
+        let first_marker = first.join_sessions()?;
+        let second = open()?;
+        let second_marker = second.join_sessions()?;
+        assert!(removal(&profiles, "default").is_err());
+        assert!(Profile::open(&profiles, "default", Access::Change).is_err());
+        drop((first_marker, first));
+        assert_eq!(second_marker.metadata()?.nlink(), 1);
+
+        let third = open()?;
+        let third_marker = third.join_sessions()?;
+        open()?.stop_sessions()?;
+        assert_eq!(second_marker.metadata()?.nlink(), 0);
+        assert_eq!(third_marker.metadata()?.nlink(), 0);
+        assert!(open()?.stop_sessions().is_err());
+        let next = open()?;
+        let next_marker = next.join_sessions()?;
+        drop((second_marker, second, third_marker, third));
+        assert_eq!(next_marker.metadata()?.nlink(), 1);
+        drop((next_marker, next));
+        assert!(open()?.stop_sessions().is_err());
+        assert!(removal(&profiles, "default")?.is_some());
         Ok(())
     }
 
@@ -359,7 +442,7 @@ mod tests {
             0o600,
         )?;
         assert!(runtime("freedesktop-platform-24-08").is_err());
-        let mut profile = Profile::open(&profiles, "tools")?;
+        let mut profile = Profile::open(&profiles, "tools", Access::Change)?;
         assert_eq!(
             profile.runtime.as_deref(),
             Some("freedesktop-platform-24-08")

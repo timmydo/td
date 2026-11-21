@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -34,11 +35,7 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
 /// sends empty once its command runs, means the command never started;
 /// one that ends later, that it ended without saying how. Root's log says
 /// why either way.
-pub fn outside(
-    mut channel: UnixStream,
-    stop: &std::os::unix::net::UnixListener,
-    terminal: bool,
-) -> io::Result<u8> {
+pub fn outside(mut channel: UnixStream, sessions: &File, terminal: bool) -> io::Result<u8> {
     let mut terminal = if terminal {
         Some(RelayTerminal::enter(File::from(
             io::stdin().as_fd().try_clone_to_owned()?,
@@ -114,7 +111,7 @@ pub fn outside(
     let mut exit = None;
     let mut started = false;
     loop {
-        if stop.accept().is_ok() {
+        if sessions.metadata()?.nlink() == 0 {
             return Ok(143);
         }
         for result in written_rx.try_iter() {

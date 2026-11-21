@@ -3518,7 +3518,7 @@ td-review/src/worktrees.rs	unchecked-growth-or-clone	5
 td-sandbox/src/client.rs	allocating-conversion	2
 td-sandbox/src/import.rs	allocating-conversion	6
 td-sandbox/src/import.rs	unchecked-growth-or-clone	1
-td-sandbox/src/lib.rs	allocating-conversion	8
+td-sandbox/src/lib.rs	allocating-conversion	7
 td-sandbox/src/relay.rs	allocating-conversion	7
 td-sandbox/src/relay.rs	allocation-macro	1
 td-sandbox/src/relay.rs	heap-owner	3

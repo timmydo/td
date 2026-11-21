@@ -46,13 +46,13 @@ account's home. td-sandbox keeps none of them: `inspect`, `list` and
 `adopt` ask root.
 
 The human keeps one record per sandbox under
-`~/.local/share/td-sandbox/.profiles/NAME`, private: `record`, `lock` and,
-while a session runs, `control`. The record is exact: the line
+`~/.local/share/td-sandbox/.profiles/NAME`, private: `record`, `lock` and a
+`sessions` file for stopping active CLI sessions. The record is exact: the line
 `td-sandbox-profile-v1`, an optional `runtime=RUNTIME`, then an optional
 `old-home=PATH` naming the home of the profile it was imported from. A
 name is the ledger's: 1–64 lowercase ASCII letters, digits, `.`, `_` or
-`-`, beginning with a letter. One session or change per name holds the
-record's kernel file lock.
+`-`, beginning with a letter. CLI sessions share the record's kernel file
+lock. Changing the runtime or removing the record takes it exclusively.
 
 A sandbox is **held** when its account's home holds files or the grant
 table holds a row of its name; root answers `status NAME` with `absent`
@@ -260,10 +260,27 @@ removed grants. On the first boot after sandbox accounts the import can
 take more than the unit's bound; a run it cuts short is completed on the
 next boot.
 
+To share a Git checkout with the launcher sandbox, run these commands in
+a regular td terminal, substituting the checkout's directory:
+
+```
+td-sandbox share default ~/src/project --write
+td-sandbox inspect default
+```
+
+Use `--read` for read-only access. Open a new `td-term (sandbox)` and
+change to the checkout's absolute path under the human's home. The
+sandbox has its own `~`. For a normal clone the grant includes its
+`.git` directory. A linked worktree whose `.git` file points outside
+the grant also needs access to the backing repository at its original
+path. To revoke the share, run `td-sandbox unshare default ~/src/project`
+in the regular terminal. Existing sessions retain their view until exit.
+
 The image compositor offers `td-term (sandbox)`. Its fixed authority request
 starts a human-owned td-term with literal command `/bin/td-sandbox shell
 default`, using the normal terminal readiness and process tracking. The
-terminal remains outside the jail; its shell is inside. The launcher never
+terminal remains outside the jail. Each launch opens its own shell and
+PTY in the same sandbox account, with the same home and current grants. The launcher never
 initializes or rewrites a record. Boot orders the compositor after default
 provisioning but does not require provisioning success, so a damaged record
 cannot prevent the desktop opening. A deleted default is seeded on the next
@@ -317,14 +334,15 @@ relay. SIGKILL cannot restore a terminal. Original attributes and signal mask
 are restored on ordinary return and errors. Reader threads end with the
 client process and are never joined on a blocking read.
 
-`stop` connects to the session's private `control` socket beside its
-record. Its filesystem address is opened through a retained directory
-descriptor's procfs alias to avoid sockaddr_un's pathname limit. The
-listener carries no general command protocol: an accepted connection ends
-this session's relay, which closes the connection; the entry inside sees
-its channel end and returns, and td-jail tears the namespace down. A
-client that dies closes the connection the same way. A stale `control` is
-replaced only while the record's lock is held.
+`stop NAME` stops all CLI shells and commands currently registered for
+that profile. Each holds a shared kernel lock on the same private
+`sessions` file. Registration and stop briefly lock the profile directory
+to order opening the file against its unlink. Stop reports an idle
+profile when it can exclusively lock the file. Otherwise it unlinks it,
+and each relay sees its descriptor's link count drop to zero and exits
+with status 143. A later launch opens a new file. Exiting one shell
+closes only its own connection, which lets td-jail tear down its PID
+namespace. Process exit releases its locks even after a crash.
 
 ## Other frontends
 
@@ -341,8 +359,7 @@ A td-agent template may name one of these profiles (td-agent/DESIGN.md,
 "Named sandboxes"). Its tool instances share the sandbox account, home,
 runtime and root-owned grants and network. They add no mounts or grants,
 allocate no account and never delete the sandbox. Each instance has its
-own connection; the CLI's interactive-session lock and stop socket are
-not taken, so multiple tool instances can run concurrently. Root still
+own connection; tool instances run concurrently and do not register for CLI `stop`. Root still
 orders deletion against every running instance. Profile and grant edits
 affect new launches; an existing jail retains its views.
 
