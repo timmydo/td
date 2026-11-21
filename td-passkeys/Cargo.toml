@@ -29,3 +29,6 @@ td-fs = { path = "../td-fs" }
 td-primitives = { path = "../td-primitives" }
 td-protector = { path = "../td-protector" }
 td-tpm = { path = "../td-tpm" }
+
+[features]
+guest-tests = []

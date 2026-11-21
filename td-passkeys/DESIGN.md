@@ -48,3 +48,12 @@ Only parsed website operations reach a worker. The transport handles
 initialization, echo and authenticator information locally. Its UHID
 descriptor lives with the root session owner. Only the kernel virtual
 device carrying its random identity can be published to Firefox.
+
+The guest-tests feature builds a separate ignored case,
+`tests::kernel_passkey_registration_and_sign_in`, for a disposable KVM
+guest with td's kernel, a fresh emulated TPM and the explicit
+`td.passkey-guest=1` boot option. It takes that test TPM's lockout
+hierarchy. A hidraw client running under workload UID and GID 65536 performs registration, a handle check and
+sign-in through the kernel's UHID device, reopening the TPM vault between
+operations and verifying the signature independently. This protocol
+client supplies the test approvals.

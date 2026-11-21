@@ -398,6 +398,186 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "guest-tests")]
+    #[test]
+    #[ignore = "requires the disposable passkey KVM guest and its fresh TPM"]
+    fn kernel_passkey_registration_and_sign_in() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+        use std::thread;
+        assert!(fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .split_whitespace()
+            .any(|v| v == "td.passkey-guest=1"));
+        assert!(fs::metadata("/proc/self").unwrap().uid() == 0);
+        let mut device = uhid::Device::create().unwrap();
+        let end = Instant::now() + Duration::from_secs(25);
+        while !std::path::Path::new("/sys/class/hidraw/hidraw0/device/report_descriptor").exists() {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let private = fs::metadata("/dev/hidraw0").unwrap();
+        assert_eq!((private.gid(), private.mode() & 0o7777), (0, 0o600));
+        assert!(td_fido::fido_device::Device::discover().unwrap().is_empty());
+        while !device.publish(65536).unwrap() {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(device.publish(65537).is_err());
+        assert!(td_fido::fido_device::Device::discover().unwrap().is_empty());
+        let dir = td_fs::TempDir::new("guest-vault").unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let dirfd = File::open(dir.path()).unwrap();
+        let client = || Client::new(td_tpm::Device::open().unwrap());
+        let name = client().storage_primary(None).unwrap().1;
+        let auth = LockoutAuth::generate().unwrap();
+        client().take_lockout(&name, &auth).unwrap();
+        client()
+            .set_dictionary_attack(&name, &auth, DA_PARAMETERS)
+            .unwrap();
+        let pin = Pin::parse(b"guest PIN").unwrap();
+        drop(
+            Vault::enroll(
+                &dirfd,
+                client(),
+                &name,
+                &pin,
+                Enrollment::AcceptLossOfOriginalTpm,
+            )
+            .unwrap(),
+        );
+        use std::os::unix::process::CommandExt;
+        let mut browser = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::guest_workload_client",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .uid(65536)
+                .gid(65536)
+                .spawn()
+                .unwrap(),
+        );
+        let mut transport = hid::Authenticator::default();
+        let mut completed = Vec::new();
+        loop {
+            if let Some(status) = browser.0.try_wait().unwrap() {
+                assert!(status.success());
+                assert_eq!(completed, ["register", "preflight", "sign"]);
+                break;
+            }
+            assert!(Instant::now() < end, "guest website transaction timed out");
+            if let Some(r) = device.output().unwrap() {
+                if let Some(cmd) = transport
+                    .receive(&r, Instant::now(), |r| device.input(r))
+                    .unwrap()
+                {
+                    let mut vault = Vault::unlock(&dirfd, client(), &name, &pin).unwrap();
+                    let body = match cmd.request().unwrap() {
+                        Request::Create(r) => {
+                            completed.push("register");
+                            vault.register(&r, Approval::Verified).unwrap()
+                        }
+                        Request::Get(r) if !r.presence() => {
+                            completed.push("preflight");
+                            vault.preflight(&r).unwrap()
+                        }
+                        Request::Get(r) => {
+                            completed.push("sign");
+                            let mut id = None;
+                            vault
+                                .list(|acct| {
+                                    id = Some(*acct.id);
+                                    Ok(())
+                                })
+                                .unwrap();
+                            vault.sign(&r, &id.unwrap(), Approval::Verified).unwrap()
+                        }
+                        _ => panic!("unexpected guest operation"),
+                    };
+                    transport
+                        .finish(cmd.ticket(), 0, &body, |r| device.input(r))
+                        .unwrap();
+                }
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[cfg(feature = "guest-tests")]
+    #[test]
+    #[ignore = "unprivileged protocol client for the passkey guest"]
+    fn guest_workload_client() {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::thread;
+        use td_fido::fido_hid as wire;
+        assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), 65536);
+        let end = Instant::now() + Duration::from_secs(25);
+        let mut node = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0o4000)
+            .open("/dev/td-firefox-passkeys")
+            .unwrap();
+        let mut exchange =
+            |reports: wire::Reports,
+             mut receive: Box<dyn FnMut(&hid::Report) -> Option<Vec<u8>>>| {
+                for r in reports.as_ref() {
+                    let mut frame = [0; 65];
+                    frame[1..].copy_from_slice(r);
+                    assert_eq!(node.write(&frame).unwrap(), 65);
+                }
+                loop {
+                    assert!(Instant::now() < end);
+                    let mut r = [0; 64];
+                    match node.read(&mut r) {
+                        Ok(64) => {
+                            if let Some(data) = receive(&r) {
+                                return data;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2))
+                        }
+                        other => panic!("hidraw read {other:?}"),
+                    }
+                }
+            };
+        let mut init = wire::Initialization::new(wire::BROADCAST, [52; 8]).unwrap();
+        let cid = exchange(
+            init.request().unwrap(),
+            Box::new(move |r| init.push(r).unwrap().map(|id| id.to_be_bytes().to_vec())),
+        );
+        let cid = u32::from_be_bytes(cid.try_into().unwrap());
+        let mut ctap = |packet: &[u8]| {
+            let mut d = wire::Decoder::cbor(cid).unwrap();
+            let response = exchange(
+                wire::cbor(cid, packet).unwrap(),
+                Box::new(move |r| {
+                    if let wire::Event::Complete(m) = d.push(r).unwrap() {
+                        Some(m.as_ref().to_vec())
+                    } else {
+                        None
+                    }
+                }),
+            );
+            assert_eq!(response[0], 0);
+            response[1..].to_vec()
+        };
+        let (id, pk) = key_from_registration(&ctap(&registration()));
+        ctap(&probe(SITE, &digest(b""), &id));
+        let hash = digest(b"fresh website challenge in the td guest");
+        verify(&ctap(&get(SITE, &hash)), &pk, &hash);
+    }
+
     struct Socket(UnixStream);
     impl Transport for Socket {
         fn exchange(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, String> {
