@@ -1871,6 +1871,9 @@ instances wait for the database route lease. A changed selection fences old
 operations, and a serving process notices within about 30 seconds and drains
 and reloads itself, with a brief listener gap. If it cannot serve the new
 configuration, or the database is unreachable just then, the process exits.
+For managed certificate renewal under the same selection, existing sessions
+and listeners stay open while fresh handshakes use the newly verified
+certificate generation (ACME.md).
 
 `queue-clock-status --runtime PATH` reports `held` during startup. A
 clean restart with matching clock evidence reports `confirmed` after the

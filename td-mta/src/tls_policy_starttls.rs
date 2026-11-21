@@ -59,7 +59,8 @@ impl<B: TlsWireStorage> ServerStartTls<B> {
             {
                 return Err(Error::Invalid);
             }
-            let policy = TlsPolicies::resolve(&owner.prepared.lease, owner.prepared.id)?;
+            let policy =
+                TlsPolicies::resolve(&owner.prepared.lease.configuration, owner.prepared.id)?;
             if !matches!(
                 policy.role()?,
                 PolicyRole::DirectSmtp | PolicyRole::GatewaySmtp

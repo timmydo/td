@@ -60,7 +60,7 @@ impl<'a, B: TlsWireStorage> RelayStartTls<'a, B> {
             if handshake_deadline.tick() > deadline.tick() {
                 return Err(Error::Invalid);
             }
-            let policy = TlsPolicies::resolve(&prepared.lease, prepared.id)?;
+            let policy = TlsPolicies::resolve(&prepared.lease.configuration, prepared.id)?;
             if !matches!(
                 policy.binding,
                 Binding::Relay {

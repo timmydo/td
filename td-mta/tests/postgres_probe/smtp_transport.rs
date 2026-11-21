@@ -252,6 +252,16 @@ pub(super) fn upgrade_with_lifetime(
     protocol: td_crypto::TlsProtocol,
     lifetime: Duration,
 ) -> (TlsDriver, i64) {
+    try_upgrade(stream, clock, ca, protocol, lifetime).unwrap()
+}
+
+fn try_upgrade(
+    stream: TcpStream,
+    clock: Arc<RuntimeClock>,
+    ca: &[u8],
+    protocol: td_crypto::TlsProtocol,
+    lifetime: Duration,
+) -> std::io::Result<(TlsDriver, i64)> {
     let trust = td_crypto::TrustStore::from_pem(ca).unwrap();
     let tls_clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(
         clock.clone(),
@@ -269,13 +279,13 @@ pub(super) fn upgrade_with_lifetime(
         Box::new([0; TLS_WIRE_BYTES]),
     )
     .unwrap();
-    let info = progress(|| io.handshake().map_err(io_error)).unwrap();
+    let info = progress(|| io.handshake().map_err(io_error))?;
     assert_eq!(info.peer, td_crypto::PeerEvidence::VerifiedServerName);
     let version = match info.version {
         td_crypto::TlsVersion::V12 => 1,
         td_crypto::TlsVersion::V13 => 2,
     };
-    (TlsDriver(io), version)
+    Ok((TlsDriver(io), version))
 }
 
 struct Stop<'a>(&'a Control);
@@ -308,6 +318,57 @@ fn envelope(stream: &mut BufReader<impl Read + Write>) {
     command(stream, b"MAIL FROM:<sender@example.test>\r\n", "250");
     command(stream, b"RCPT TO:<main@example.test>\r\n", "250");
     command(stream, b"DATA\r\n", "354");
+}
+
+/// Only the replacement leaf chains to this fixture CA. Each attempt uses a
+/// fresh TLS client configuration and goes through the production listener.
+pub(super) fn await_renewal(
+    address: std::net::SocketAddr,
+    ca: &[u8],
+    protocol: td_crypto::TlsProtocol,
+) -> BufReader<TlsDriver> {
+    let until = Instant::now() + Duration::from_secs(50);
+    loop {
+        let socket = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut peer = BufReader::new(socket);
+        if protocol == td_crypto::TlsProtocol::Smtp {
+            reply(&mut peer, "220");
+            command(&mut peer, b"EHLO sender.example.test\r\n", "250");
+            command(&mut peer, b"STARTTLS\r\n", "220");
+        }
+        assert!(peer.buffer().is_empty());
+        match try_upgrade(
+            peer.into_inner(),
+            Arc::new(RuntimeClock::new()),
+            ca,
+            protocol,
+            Duration::from_secs(120),
+        ) {
+            Ok((tls, _)) => return BufReader::new(tls),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                assert!(
+                    Instant::now() < until,
+                    "listener still presents the old certificate: {error}"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => panic!("renewal TLS probe: {error}"),
+        }
+    }
+}
+
+pub(super) fn deliver_after_renewal(address: std::net::SocketAddr, ca: &[u8]) {
+    let mut peer = await_renewal(address, ca, td_crypto::TlsProtocol::Smtp);
+    command(&mut peer, b"EHLO sender.example.test\r\n", "250");
+    envelope(&mut peer);
+    command(&mut peer, b"Subject: fresh STARTTLS after certificate renewal\r\n\r\nDelivered over the renewed connection.\r\n.\r\n", "250");
+    command(&mut peer, b"QUIT\r\n", "221");
 }
 
 fn connect(

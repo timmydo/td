@@ -75,17 +75,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     let key = Provider
         .load_p256_pem(state.certificate_key.as_bytes())
         .unwrap();
-    let mut raw = [0; td_crypto::P256_PKCS8_CAPACITY];
-    let n = Provider.generate_p256(&mut raw).unwrap();
-    let root = Provider.load_p256(&raw[..n]).unwrap();
-    let mut chain = certificate::pem(
-        "CERTIFICATE",
-        &certificate::certificate_names(&key, &root, false, 2, &["localhost"], false),
-    );
-    chain.extend(certificate::pem(
-        "CERTIFICATE",
-        &certificate::certificate_names(&root, &root, true, 1, &[], false),
-    ));
+    let (chain, _) = issue(&key);
     writer
         .save(&state, Some((&chain, state.certificate_key.as_bytes())))
         .unwrap();
@@ -150,6 +140,36 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     );
 }
 
+fn issue(key: &td_crypto::P256Key) -> (Vec<u8>, Vec<u8>) {
+    let mut raw = [0; td_crypto::P256_PKCS8_CAPACITY];
+    let n = Provider.generate_p256(&mut raw).unwrap();
+    let root = Provider.load_p256(&raw[..n]).unwrap();
+    let mut chain = certificate::pem(
+        "CERTIFICATE",
+        &certificate::certificate_names(key, &root, false, 2, &["localhost"], false),
+    );
+    let ca = certificate::pem(
+        "CERTIFICATE",
+        &certificate::certificate_names(&root, &root, true, 1, &[], false),
+    );
+    chain.extend_from_slice(&ca);
+    (chain, ca)
+}
+
+pub(super) fn renew_fixture_pair(fixture: &Fixture) -> Vec<u8> {
+    let mut raw = [0; td_crypto::P256_PKCS8_CAPACITY];
+    let size = Provider.generate_p256(&mut raw).unwrap();
+    let key = Provider.load_p256(&raw[..size]).unwrap();
+    let (chain, ca) = issue(&key);
+    publish_pair(
+        fixture,
+        fixture.request(),
+        &chain,
+        &certificate::pem("PRIVATE KEY", &raw[..size]),
+    );
+    ca
+}
+
 pub(super) fn publish_fixture_pair(fixture: &Fixture) {
     publish_fixture_pair_as(fixture, fixture.request());
 }
@@ -157,6 +177,17 @@ pub(super) fn publish_fixture_pair(fixture: &Fixture) {
 pub(super) fn publish_fixture_pair_as(
     fixture: &Fixture,
     request: td_mta::postgres_probe::Request<'_>,
+) {
+    let chain = std::fs::read(fixture.root.join("server.crt")).unwrap();
+    let key = std::fs::read(fixture.root.join("server.key")).unwrap();
+    publish_pair(fixture, request, &chain, &key);
+}
+
+fn publish_pair(
+    fixture: &Fixture,
+    request: td_mta::postgres_probe::Request<'_>,
+    chain: &[u8],
+    key: &[u8],
 ) {
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let epoch = postgres_schema::inspect(&request, &trust, deadline())
@@ -195,7 +226,5 @@ pub(super) fn publish_fixture_pair_as(
         revision: lease.revision,
         challenge: &current,
     };
-    let chain = std::fs::read(fixture.root.join("server.crt")).unwrap();
-    let key = std::fs::read(fixture.root.join("server.key")).unwrap();
-    writer.save(&lease.state, Some((&chain, &key))).unwrap();
+    writer.save(&lease.state, Some((chain, key))).unwrap();
 }

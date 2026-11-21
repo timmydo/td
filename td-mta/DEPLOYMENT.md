@@ -8,8 +8,8 @@ in [MIGRATION.md](MIGRATION.md).
 [POSTGRES.md](POSTGRES.md) owns database preparation and current support;
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
 Relay scheduling is active. A serving process checks about every 30 seconds
-for a newly selected configuration or a managed certificate change, then drains
-and reloads itself.
+for a newly selected configuration or a managed certificate change. A selection
+change drains and reloads the service. Managed certificates update in place.
 
 The live Azure host serving `mx.timmydouglas.com`, `mx.timmyd.info` and
 `mx.882015.xyz` has a separate [production runbook](PRODUCTION.md), including
@@ -450,9 +450,9 @@ device-revoke`, using the explicit database/account arguments in POSTGRES.md.
 
 General configuration changes require validated database versions and
 selection; serving processes then drain and reload, and a restart applies them
-sooner. Native managed certificate renewal is supervised
-separately; serving processes drain and reload when their managed certificate
-generation changes, as [ACME.md](ACME.md) specifies. The native executable fixture qualifies separate
+sooner. A separately supervised ACME worker renews managed certificates.
+Serving processes pick up the new generation on existing listeners, as
+[ACME.md](ACME.md) specifies. The native executable fixture qualifies separate
 receive/JMAP processes, durable SMTP delivery, verified HTTPS credential
 acceptance and revocation, control stop and signal-based restart cycles.
 It does not qualify a deployment host or supervisor.

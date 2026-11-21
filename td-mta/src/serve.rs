@@ -201,7 +201,14 @@ fn run_once(
                     if options.read_only {
                         return Err(config_failure("certificate", "replica-acme"));
                     }
-                    managed_names.push(certificate.name.to_owned());
+                    if policies
+                        .value()
+                        .coverage()
+                        .includes_server_identity(view, certificate.name)
+                        .map_err(|_| config_failure("certificate", "configuration"))?
+                    {
+                        managed_names.push(certificate.name.to_owned());
+                    }
                 }
             }
             certificate_revisions.retain(|(name, _)| managed_names.contains(name));
@@ -566,7 +573,9 @@ fn run_once(
                                     if selected != Some(binding.selection()) {
                                         return Some(true);
                                     }
-                                    if managed_names.is_empty() {
+                                    if managed_names.is_empty()
+                                        || (listeners.is_empty() && https_listeners.is_empty())
+                                    {
                                         return Some(false);
                                     }
                                     if let Ok(mut revisions) = td_mta::postgres_acme::generations(
@@ -576,7 +585,25 @@ fn run_once(
                                         binding.epoch(),
                                     ) {
                                         revisions.retain(|(name, _)| managed_names.contains(name));
-                                        return Some(revisions != certificate_revisions);
+                                        if revisions != certificate_revisions {
+                                            use td_mta::postgres_runtime_profile::Error;
+                                            match published.refresh_certificates(
+                                                &request,
+                                                &loaded.trust,
+                                                until,
+                                                &revisions,
+                                            ) {
+                                                Ok(()) => certificate_revisions = revisions,
+                                                Err(Error::TlsPolicy(td_mta::ports::Error::Busy)
+                                                    | Error::Superseded) => (),
+                                                Err(_) => control.log(
+                                                    td_mta::observability::Kind::CertificateRenewalFailed,
+                                                    None,
+                                                    None,
+                                                ),
+                                            }
+                                        }
+                                        return Some(false);
                                     }
                                 }
                                 None

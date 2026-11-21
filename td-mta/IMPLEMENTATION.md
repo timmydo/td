@@ -1936,7 +1936,7 @@ are implemented.
 `td-mta serve` (CONFIG.md, "Foreground PostgreSQL service") runs direct
 SMTP receiving with STARTTLS (M11), HTTPS (M13c) and relay over verified
 implicit TLS or required STARTTLS (M17) through them, and takes
-ACME-managed certificates by drain and reload (M18, ACME.md). Since F04
+ACME-managed certificates through live TLS policy updates (ACME.md). Since F04
 td-crypto's backend is td-primitives and td-tls-provider, and its heap
 goes through Rust's allocator, which the Rust probe counts; no
 libc-boundary allocator diagnostic remains. td-crypto/DESIGN.md,
@@ -2132,7 +2132,7 @@ Implement the remaining work as independently reviewable increments:
             strict client trust refusal and an old outbound session completing
             across publication of a complete table. Constructors alone never
             issue certificates; M18's ACME worker issues and renews them, and
-            serving instances take a new one by drain and reload (ACME.md).
+            serving instances publish the new pair on live listeners (ACME.md).
           - **Socket handoff:** implemented consuming TCP handoff with fixed
             deadlines, plaintext-tail refusal and exact buffer recovery. The
             bounded pump retains generation/count owners, publishes role-checked
@@ -3056,9 +3056,8 @@ DEPLOYMENT.md supplies systemd and high-port td-svc examples with their
 current readiness, orderly-stop and forced-termination limits. The
 PostgreSQL service has since activated HTTPS/JMAP, relay delivery,
 database service logging (OBSERVABILITY.md) and ACME through the separate
-`td-mta acme` worker; serving drains and reloads when its managed
-certificate generation changes (ACME.md), and a newly selected
-configuration takes the same drain and reload (CONFIG.md). It still refuses
+`td-mta acme` worker. Serving updates managed certificates in place
+(ACME.md) and drains and reloads a newly selected configuration (CONFIG.md). It still refuses
 a gateway SMTP listener at startup.
 
 Prepared Core Session metadata now covers configured-origin URL templates,

@@ -152,6 +152,40 @@ pub struct PublishedProfile {
     pub(crate) policies: GenerationLease<TlsPolicies>,
 }
 impl PublishedProfile {
+    /// Replace the serving certificates only within this selected configuration.
+    /// Every input pair must match the watcher's revision observation.
+    pub fn refresh_certificates(
+        &self,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        revisions: &[(String, i64)],
+    ) -> Result<(), Error> {
+        let epoch = self.binding.epoch();
+        let mut loader =
+            crate::postgres_profile_materials::Loader::new(request, trust, epoch, deadline);
+        let policies = self.policies.value();
+        let prepared = policies
+            .prepare_certificates(&self.configuration, |reference| {
+                loader
+                    .open_tls(reference)
+                    .map_err(|_| crate::ports::Error::Tls)
+            })
+            .map_err(Error::TlsPolicy)?;
+        if !loader.matches_certificates(revisions)
+            || selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
+                != Some(self.binding.selection())
+        {
+            return Err(Error::Superseded);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
+        policies
+            .publish_certificates(prepared)
+            .map_err(Error::TlsPolicy)
+    }
+
     pub fn configuration(&self) -> &ResolvedProfile {
         &self.configuration
     }

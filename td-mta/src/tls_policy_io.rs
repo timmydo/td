@@ -19,7 +19,7 @@ use td_crypto::{HandshakeInfo, PeerEvidence};
 pub struct TlsConnection<B: TlsWireStorage> {
     // Native teardown precedes material and count release on ordinary Drop.
     io: TlsIo<TcpTransport, B>,
-    lease: GenerationLease<TlsPolicies>,
+    lease: super::SessionPolicy,
     permit: Option<HandshakePermit>,
     id: TlsPolicyId,
     peer: IpAddr,
@@ -122,7 +122,7 @@ impl<B: TlsWireStorage> TlsConnection<B> {
         {
             return Err(Error::Tls);
         }
-        match &TlsPolicies::resolve(&self.lease, self.id)?.binding {
+        match &TlsPolicies::resolve(&self.lease.configuration, self.id)?.binding {
             super::Binding::Relay { transport, .. } => Ok(*transport),
             _ => Err(Error::Forbidden),
         }
@@ -137,7 +137,7 @@ impl<B: TlsWireStorage> TlsConnection<B> {
         self.verified_relay_transport()?;
         let supplied = super::relay_credentials_digest(username, password)?;
         let super::Binding::Relay { credentials, .. } =
-            &TlsPolicies::resolve(&self.lease, self.id)?.binding
+            &TlsPolicies::resolve(&self.lease.configuration, self.id)?.binding
         else {
             return Err(Error::Forbidden);
         };
@@ -169,7 +169,7 @@ impl<B: TlsWireStorage> TlsConnection<B> {
         current: &GenerationLease<TlsPolicies>,
     ) -> Result<(), Error> {
         self.live()?;
-        let result = TlsPolicies::gateway_unchanged(&self.lease, self.id, current)
+        let result = TlsPolicies::gateway_unchanged(&self.lease.configuration, self.id, current)
             .and_then(|same| if same { Ok(()) } else { Err(Error::Forbidden) });
         result.map_err(|error| self.fail(error))
     }
@@ -190,7 +190,7 @@ impl<B: TlsWireStorage> TlsConnection<B> {
     }
 
     fn authorize(&self, evidence: HandshakeInfo) -> Result<TlsInfo, Error> {
-        let policy = TlsPolicies::resolve(&self.lease, self.id)?;
+        let policy = TlsPolicies::resolve(&self.lease.configuration, self.id)?;
         let peer = match (policy.role()?, evidence.peer) {
             (PolicyRole::DirectSmtp | PolicyRole::Https, PeerEvidence::Unauthenticated) => {
                 PeerVerification::None

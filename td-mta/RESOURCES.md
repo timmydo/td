@@ -3112,6 +3112,19 @@ and allocator retention vary by host and run. Whole-service worst-case RSS,
 maximum concurrency, stack coverage and ledger qualification remain pending;
 these observations change no memory allowance or service activation rule.
 
+## Serving certificate generations
+
+Each running profile with inbound TLS owns one current table for direct
+SMTP and HTTPS. Renewal reserves the second slot before loading key material
+or constructing a candidate. A handshake pins its table when it reserves
+the TLS session and releases it when the session ends. A retired table can
+therefore defer a later renewal until its last session closes. Relay policy
+and the running profile's binding do not pin retired inbound certificates.
+The watcher performs database reads and provider validation before publication.
+It replaces the generation-set handle and then its second read handle, holding
+only one write lock at a time. Network validity checks and handshakes use
+nonblocking reads of the same published table through either handle.
+
 ## Sixteen-profile generation observations
 
 The `--tls-generations` mode in the counter executable and the unwrapped RSS

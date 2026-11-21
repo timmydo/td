@@ -237,11 +237,11 @@ pub(super) fn exercise(
         .lines()
         .filter(|line| !line.starts_with("---"))
         .collect::<String>();
-    let query = |address: std::net::SocketAddr| {
+    let query = |address: std::net::SocketAddr, ca: &[u8]| {
         let (mut tls, _) = super::smtp_transport::upgrade_protocol(
             TcpStream::connect(address).unwrap(),
             Arc::new(td_mta::clock::RuntimeClock::new()),
-            &fixture.ca,
+            ca,
             td_crypto::TlsProtocol::Http1,
         );
         write!(tls,"GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {encoded}\r\nConnection: close\r\n\r\n",address.port()).unwrap();
@@ -263,7 +263,7 @@ pub(super) fn exercise(
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
         result => panic!("expected the per-address refusal, got {result:?}"),
     }
-    let reply = query(https_v4_address);
+    let reply = query(https_v4_address, &fixture.ca);
     drop(pending);
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     assert!(reply.contains("urn:ietf:params:jmap:mail"), "{reply}");
@@ -899,41 +899,25 @@ pub(super) fn exercise(
         ),
         "2"
     );
-    super::acme::publish_fixture_pair(fixture);
-    let until = std::time::Instant::now() + Duration::from_secs(50);
-    loop {
-        for (profile, child) in [("cloud", &mut cloud), ("desktop", &mut desktop)] {
-            let status = child.0.try_wait().unwrap();
-            assert!(
-                status.is_none(),
-                "{profile} exited during certificate reload: {status:?}: {}",
-                fs::read_to_string(local.join(format!("{profile}-output"))).unwrap()
-            );
-        }
-        if ["cloud", "desktop"].iter().all(|profile| {
-            fs::read_to_string(local.join(format!("{profile}-output")))
-                .unwrap()
-                .matches("\"status\":\"ready\"")
-                .count()
-                >= 2
-        }) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < until,
-            "managed certificate reload did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(query(https_address).starts_with("HTTP/1.1 200"));
     let mut events = events::open(&session, https_address, &fixture.ca, &encoded, "no", None);
-    let _ = events::state(&mut events, account_wire);
+    let (event_id, email_state) = events::state(&mut events, account_wire);
+    let renewed_ca = super::acme::renew_fixture_pair(fixture);
+    drop(super::smtp_transport::await_renewal(
+        https_address,
+        &renewed_ca,
+        td_crypto::TlsProtocol::Http1,
+    ));
+    assert!(query(https_address, &renewed_ca).starts_with("HTTP/1.1 200"));
+    super::smtp_transport::deliver_after_renewal(smtp_address, &renewed_ca);
+    let (next_id, after_delivery) = events::state(&mut events, account_wire);
+    assert_ne!(next_id, event_id);
+    assert_ne!(after_delivery, email_state);
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();
     td_mta::postgres_devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke)
         .unwrap();
-    assert!(query(https_address).starts_with("HTTP/1.1 401"));
+    assert!(query(https_address, &renewed_ca).starts_with("HTTP/1.1 401"));
     let mut tail = Vec::new();
     if let Err(error) = events.read_to_end(&mut tail) {
         assert!(
@@ -962,7 +946,7 @@ pub(super) fn exercise(
         send(&child.0, signal).unwrap();
         super::wait_command(&mut child);
     }
-    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "10");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "11");
     let utc_ms = sql(
         fixture,
         "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",

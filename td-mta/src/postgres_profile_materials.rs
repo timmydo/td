@@ -83,6 +83,15 @@ impl<'a, 'r> Loader<'a, 'r> {
         }
     }
 
+    pub(crate) fn matches_certificates(&self, revisions: &[(String, i64)]) -> bool {
+        self.managed.len() == revisions.len()
+            && self.managed.iter().all(|(name, pair)| {
+                revisions.iter().any(|(expected, generation)| {
+                    name == expected && pair.generation == *generation
+                })
+            })
+    }
+
     pub fn open_input(&mut self, reference: inputs::Reference<'_>) -> Result<Reader, Error> {
         self.open(Some(reference.path()), input_kind(reference.target()))
     }

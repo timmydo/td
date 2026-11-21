@@ -2,12 +2,16 @@
 use crate::{
     config::{certificate, graph, inputs, listener, materialize::ResolvedText, outbound},
     gateway_policy::{GatewayFingerprint, GatewayPolicy},
-    generations::{GenerationConstruction, GenerationLease, PreparedGeneration},
+    generations::{GenerationConstruction, GenerationLease, GenerationSet, PreparedGeneration},
     ports::{Error, TlsPolicyId},
     tls_admission::{HandshakePermit, HandshakePool},
     tls_io::TlsWireStorage,
 };
-use std::{io::Read, net::SocketAddr, sync::Arc};
+use std::{
+    io::Read,
+    net::SocketAddr,
+    sync::{Arc, RwLock, TryLockError},
+};
 use td_crypto::{
     ClientConfig, ClockHandle, Crypto, Digest, IdentitySelection, Provider, ServerConfig,
     ServerIdentity, TlsProtocol, TlsSession, TlsStatus, TrustStore,
@@ -111,7 +115,7 @@ enum Binding {
 }
 
 enum Configuration {
-    Server(Arc<ServerConfig>),
+    Server,
     Gateway(Box<GatewayPolicy>),
     Client(Arc<ClientConfig>),
 }
@@ -123,7 +127,6 @@ struct HttpsIdentity<'a> {
 }
 
 struct Policy {
-    receiving_validity: Option<(u64, u64)>,
     binding: Binding,
     configuration: Configuration,
 }
@@ -142,10 +145,15 @@ impl Policy {
         }
     }
 
-    fn session(&self) -> Result<TlsSession, Error> {
+    fn session(
+        &self,
+        certificates: Option<&GenerationLease<ServerCertificates>>,
+        index: u16,
+    ) -> Result<TlsSession, Error> {
         match (&self.configuration, &self.binding) {
-            (Configuration::Server(config), Binding::Listener(_)) => {
-                TlsSession::server(config.clone()).map_err(|_| Error::Tls)
+            (Configuration::Server, Binding::Listener(_)) => {
+                let server = certificates.ok_or(Error::Invalid)?.value().get(index)?;
+                TlsSession::server(Arc::clone(&server.config)).map_err(|_| Error::Tls)
             }
             (Configuration::Gateway(policy), Binding::Listener(_)) => policy.new_session(),
             (
@@ -157,9 +165,27 @@ impl Policy {
     }
 }
 
-/// An immutable TLS table. Construct only inside a reserved generation.
+struct ServerCertificate {
+    config: Arc<ServerConfig>,
+    validity: (u64, u64),
+}
+pub(crate) struct ServerCertificates(Vec<ServerCertificate>);
+impl ServerCertificates {
+    fn get(&self, index: u16) -> Result<&ServerCertificate, Error> {
+        self.0.get(usize::from(index)).ok_or(Error::Invalid)
+    }
+}
+struct SessionPolicy {
+    configuration: GenerationLease<TlsPolicies>,
+    certificates: Option<GenerationLease<ServerCertificates>>,
+}
+/// Configuration bindings are immutable. Server certificates rotate together
+/// within that configuration, with at most two retained certificate tables.
 /// Counts/input caps are not a native allocation or aggregate byte qualification.
 pub struct TlsPolicies {
+    clock: Arc<ClockHandle>,
+    certificates: RwLock<GenerationSet<ServerCertificates>>,
+    published_certificates: RwLock<Option<GenerationLease<ServerCertificates>>>,
     policies: Vec<Policy>,
     coverage: PolicyCoverage,
 }
@@ -171,6 +197,20 @@ pub enum PolicyCoverage {
     RelayOnly,
     ClientsOnly,
     Complete,
+}
+
+impl PolicyCoverage {
+    pub fn includes_server_identity(
+        self,
+        graph: graph::View<'_, '_>,
+        name: &str,
+    ) -> Result<bool, Error> {
+        match self {
+            Self::Complete => Ok(true),
+            Self::ListenersOnly => graph.serves_certificate(name).map_err(|_| Error::Invalid),
+            Self::ClientsOnly | Self::RelayOnly => Ok(false),
+        }
+    }
 }
 
 impl std::fmt::Debug for TlsPolicies {
@@ -408,11 +448,76 @@ impl TlsPolicies {
         utc_ms: i64,
     ) -> Result<(), Error> {
         let policy = Self::resolve(lease, id)?;
-        let (first, last) = policy.receiving_validity.ok_or(Error::Invalid)?;
+        if !matches!(policy.configuration, Configuration::Server) {
+            return Err(Error::Invalid);
+        }
+        let certificates = lease.value().current_certificates()?;
+        let (first, last) = certificates.value().get(id.index)?.validity;
         let now = u64::try_from(utc_ms).map_err(|_| Error::Tls)? / 1000;
         if now < first || now > last {
             return Err(Error::Tls);
         }
+        Ok(())
+    }
+
+    fn current_certificates(&self) -> Result<GenerationLease<ServerCertificates>, Error> {
+        // Publication writes one handle at a time. If the writer is paused,
+        // the other handle still supplies a complete published generation.
+        // Retry only if publication advances between the two try-reads.
+        loop {
+            match self.certificates.try_read() {
+                Ok(set) => return set.current().ok_or(Error::Invalid),
+                Err(TryLockError::Poisoned(_)) => return Err(Error::Conflict),
+                Err(TryLockError::WouldBlock) => (),
+            }
+            match self.published_certificates.try_read() {
+                Ok(lease) => return lease.as_ref().cloned().ok_or(Error::Invalid),
+                Err(TryLockError::Poisoned(_)) => return Err(Error::Conflict),
+                Err(TryLockError::WouldBlock) => (),
+            }
+        }
+    }
+
+    pub(crate) fn prepare_certificates<R: Read>(
+        &self,
+        configuration: &crate::config::materialize::ResolvedProfile,
+        mut open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    ) -> Result<PreparedGeneration<ServerCertificates>, Error> {
+        let reserved = self
+            .certificates
+            .read()
+            .map_err(|_| Error::Conflict)?
+            .reserve()?;
+        reserved.construct(|| {
+            configuration
+                .candidate()
+                .with_graph(|records, text| {
+                    let graph = records.view(text).map_err(|_| Error::Invalid)?;
+                    let identities = load_identities(graph, &self.clock, &mut open, self.coverage)?;
+                    server_certificates(graph, &self.clock, &identities, |_| Ok(()))
+                })
+                .map_err(|_| Error::Invalid)?
+        })
+    }
+
+    pub(crate) fn publish_certificates(
+        &self,
+        prepared: PreparedGeneration<ServerCertificates>,
+    ) -> Result<(), Error> {
+        let (current, retired) = self
+            .certificates
+            .write()
+            .map_err(|_| Error::Conflict)?
+            .publish_retained(prepared)
+            .map_err(|refusal| refusal.error())?;
+        let previous = {
+            let mut published = self
+                .published_certificates
+                .write()
+                .map_err(|_| Error::Conflict)?;
+            Option::replace(&mut *published, current)
+        };
+        drop((previous, retired));
         Ok(())
     }
 
@@ -426,13 +531,21 @@ impl TlsPolicies {
         output: B,
     ) -> Result<SessionPreparation<B>, SessionRefusal<B>> {
         let result = (|| {
-            Self::resolve(&lease, id)?;
+            let policy = Self::resolve(&lease, id)?;
             let permit = pool.reserve()?;
-            Ok(permit)
+            let certificates = if matches!(policy.configuration, Configuration::Server) {
+                Some(lease.value().current_certificates()?)
+            } else {
+                None
+            };
+            Ok((permit, certificates))
         })();
         match result {
-            Ok(permit) => Ok(SessionPreparation {
-                lease,
+            Ok((permit, certificates)) => Ok(SessionPreparation {
+                lease: SessionPolicy {
+                    configuration: lease,
+                    certificates,
+                },
                 permit,
                 id,
                 input,
@@ -457,7 +570,7 @@ impl TlsPolicies {
 /// ```
 #[must_use = "construct on a TLS worker or recover the reserved buffers"]
 pub struct SessionPreparation<B: TlsWireStorage> {
-    lease: GenerationLease<TlsPolicies>,
+    lease: SessionPolicy,
     permit: HandshakePermit,
     id: TlsPolicyId,
     input: B,
@@ -465,7 +578,9 @@ pub struct SessionPreparation<B: TlsWireStorage> {
 }
 impl<B: TlsWireStorage> SessionPreparation<B> {
     pub fn construct(self) -> Result<SessionReservation<B>, SessionRefusal<B>> {
-        match TlsPolicies::resolve(&self.lease, self.id).and_then(Policy::session) {
+        match TlsPolicies::resolve(&self.lease.configuration, self.id)
+            .and_then(|p| p.session(self.lease.certificates.as_ref(), self.id.index))
+        {
             Ok(session) => Ok(SessionReservation {
                 session,
                 lease: self.lease,
@@ -504,7 +619,7 @@ impl<B: TlsWireStorage> std::fmt::Debug for SessionPreparation<B> {
 pub struct SessionReservation<B: TlsWireStorage> {
     // Drop order retires native state before material and handshake capacity.
     session: TlsSession,
-    lease: GenerationLease<TlsPolicies>,
+    lease: SessionPolicy,
     permit: HandshakePermit,
     id: TlsPolicyId,
     input: B,
@@ -518,7 +633,7 @@ impl<B: TlsWireStorage> SessionReservation<B> {
         self.session.status()
     }
     pub fn role(&self) -> Result<PolicyRole, Error> {
-        TlsPolicies::role(&self.lease, self.id)
+        TlsPolicies::role(&self.lease.configuration, self.id)
     }
     /// Abort native state before releasing its generation/permit; reuse buffers
     /// explicitly. Ordinary Drop frees owned arrays instead of pooling them.
@@ -681,6 +796,7 @@ fn build<R: Read>(
 ) -> Result<TlsPolicies, Error> {
     let profiles = graph.certificates().map_err(|_| Error::Invalid)?;
     let mut policies = Vec::new();
+    let mut certificates = GenerationSet::at_startup();
     let capacity = match coverage {
         PolicyCoverage::ClientsOnly | PolicyCoverage::RelayOnly => 2,
         PolicyCoverage::Complete | PolicyCoverage::ListenersOnly => MAX_POLICIES,
@@ -700,8 +816,106 @@ fn build<R: Read>(
             open,
             coverage == PolicyCoverage::ClientsOnly,
         )?;
-        return Ok(TlsPolicies { policies, coverage });
+        return Ok(TlsPolicies {
+            policies,
+            coverage,
+            clock,
+            published_certificates: RwLock::new(None),
+            certificates: RwLock::new(certificates),
+        });
     }
+    let identities = load_identities(graph, &clock, open, coverage)?;
+    let prepared = certificates.prepare(|| {
+        server_certificates(graph, &clock, &identities, |row| {
+            push(
+                &mut policies,
+                Policy {
+                    binding: listener_binding(row)?,
+                    configuration: Configuration::Server,
+                },
+            )
+        })
+    })?;
+    drop(certificates.publish(prepared).map_err(|r| r.error())?);
+    let listeners = graph.listeners().map_err(|_| Error::Invalid)?;
+    // One read per gateway: every listener in this generation uses the same CA bytes.
+    let gateways = graph.gateways().map_err(|_| Error::Invalid)?;
+    for i in 0..gateways.len() {
+        let gateway = gateways
+            .gateway(i)
+            .map_err(|_| Error::Invalid)?
+            .ok_or(Error::Invalid)?;
+        if coverage == PolicyCoverage::ListenersOnly
+            && !graph
+                .serves_gateway(gateway.name)
+                .map_err(|_| Error::Invalid)?
+        {
+            continue;
+        }
+        let ca = read(
+            MaterialRequest {
+                kind: MaterialKind::GatewayCa,
+                profile: Some(gateway.name),
+                path: Some(gateway.ca_file),
+                managed_settings: None,
+            },
+            inputs::MAX_CA_BYTES,
+            open,
+        )?;
+        let mut used = false;
+        for index in 0..listeners.len() {
+            let row = listeners
+                .listener(index)
+                .map_err(|_| Error::Invalid)?
+                .ok_or(Error::Invalid)?;
+            if row.kind != listener::Kind::GatewaySmtp || row.gateway != Some(gateway.name) {
+                continue;
+            }
+            let native = GatewayPolicy::new(
+                &gateway,
+                &ca.0,
+                Arc::new(
+                    identity(&identities, row.certificate.ok_or(Error::Invalid)?)?
+                        .restrict_names(&[row.server_name.ok_or(Error::Invalid)?])
+                        .map_err(|_| Error::Tls)?,
+                ),
+                clock.clone(),
+            )?;
+            push(
+                &mut policies,
+                Policy {
+                    binding: listener_binding(row)?,
+                    configuration: Configuration::Gateway(Box::new(native)),
+                },
+            )?;
+            used = true;
+        }
+        if !used {
+            TrustStore::from_pem(&ca.0).map_err(|_| Error::Tls)?;
+        }
+    }
+    if coverage == PolicyCoverage::Complete {
+        append_clients(&mut policies, configuration, profiles, &clock, open, true)?;
+    }
+    if policies.len() > MAX_POLICIES {
+        return Err(Error::Capacity);
+    }
+    Ok(TlsPolicies {
+        policies,
+        coverage,
+        clock,
+        published_certificates: RwLock::new(certificates.current()),
+        certificates: RwLock::new(certificates),
+    })
+}
+
+fn load_identities<'t, R: Read>(
+    graph: graph::View<'_, 't>,
+    clock: &ClockHandle,
+    open: &mut impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    coverage: PolicyCoverage,
+) -> Result<Vec<(&'t str, Arc<ServerIdentity>)>, Error> {
+    let profiles = graph.certificates().map_err(|_| Error::Invalid)?;
     let mut identities = Vec::new();
     identities
         .try_reserve_exact(profiles.len())
@@ -711,11 +925,7 @@ fn build<R: Read>(
             .profile(index)
             .map_err(|_| Error::Invalid)?
             .ok_or(Error::Invalid)?;
-        if coverage == PolicyCoverage::ListenersOnly
-            && !graph
-                .serves_certificate(profile.name)
-                .map_err(|_| Error::Invalid)?
-        {
+        if !coverage.includes_server_identity(graph, profile.name)? {
             continue;
         }
         let mut names = [""; graph::MAX_NAMES_PER_CERTIFICATE];
@@ -782,13 +992,27 @@ fn build<R: Read>(
         .map_err(|_| Error::Tls)?;
         identities.push((profile.name, Arc::new(identity)));
     }
-    let identity = |name: &str| {
-        identities
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, value)| value.clone())
-            .ok_or(Error::Invalid)
-    };
+    Ok(identities)
+}
+
+fn identity(
+    identities: &[(&str, Arc<ServerIdentity>)],
+    name: &str,
+) -> Result<Arc<ServerIdentity>, Error> {
+    identities
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, value)| value.clone())
+        .ok_or(Error::Invalid)
+}
+
+fn server_certificates(
+    graph: graph::View<'_, '_>,
+    clock: &Arc<ClockHandle>,
+    identities: &[(&str, Arc<ServerIdentity>)],
+    mut bind: impl FnMut(listener::Listener<'_>) -> Result<(), Error>,
+) -> Result<Box<ServerCertificates>, Error> {
+    let mut servers = Vec::new();
     // Within this graph a profile has only two HTTPS views: with/without JMAP.
     let mut https_identities: Vec<HttpsIdentity<'_>> = Vec::new();
     let https_capacity = certificate::MAX_PROFILES * 2;
@@ -810,19 +1034,16 @@ fn build<R: Read>(
         ) {
             continue;
         }
-        let primary = identity(row.certificate.ok_or(Error::Invalid)?)?;
-        let receiving_validity = Some(primary.validity());
+        let primary = identity(identities, row.certificate.ok_or(Error::Invalid)?)?;
+        let validity = primary.validity();
         let native = match row.kind {
-            listener::Kind::DirectSmtp => Configuration::Server(Arc::new(
-                ServerConfig::new(
-                    &[primary],
-                    TlsProtocol::Smtp,
-                    IdentitySelection::DefaultIdentity,
-                    None,
-                    clock.clone(),
-                )
-                .map_err(|_| Error::Tls)?,
-            )),
+            listener::Kind::DirectSmtp => ServerConfig::new(
+                &[primary],
+                TlsProtocol::Smtp,
+                IdentitySelection::DefaultIdentity,
+                None,
+                clock.clone(),
+            ),
             listener::Kind::Https => {
                 let mut selected = Vec::new();
                 selected
@@ -830,7 +1051,7 @@ fn build<R: Read>(
                     .map_err(|_| Error::Capacity)?;
                 let origins = graph.origins().map_err(|_| Error::Invalid)?;
                 let domains = graph.domains().map_err(|_| Error::Invalid)?;
-                for (profile, full) in &identities {
+                for (profile, full) in identities {
                     let owns_origin = Some(*profile) == row.certificate;
                     if let Some(cached) = https_identities.iter().find(|cached| {
                         cached.profile == *profile && cached.owns_origin == owns_origin
@@ -886,92 +1107,28 @@ fn build<R: Read>(
                         selected.push(identity);
                     }
                 }
-                Configuration::Server(Arc::new(
-                    ServerConfig::new(
-                        &selected,
-                        TlsProtocol::Http1,
-                        IdentitySelection::RequiredName,
-                        None,
-                        clock.clone(),
-                    )
-                    .map_err(|_| Error::Tls)?,
-                ))
+                ServerConfig::new(
+                    &selected,
+                    TlsProtocol::Http1,
+                    IdentitySelection::RequiredName,
+                    None,
+                    clock.clone(),
+                )
             }
             _ => return Err(Error::Invalid),
-        };
-        push(
-            &mut policies,
-            Policy {
-                receiving_validity,
-                binding: listener_binding(row)?,
-                configuration: native,
+        }
+        .map_err(|_| Error::Tls)?;
+        bind(row)?;
+        td_alloc::push(
+            &mut servers,
+            ServerCertificate {
+                config: Arc::new(native),
+                validity,
             },
-        )?;
+        )
+        .map_err(|_| Error::Capacity)?;
     }
-    // One read per gateway: every listener in this generation uses the same CA bytes.
-    let gateways = graph.gateways().map_err(|_| Error::Invalid)?;
-    for i in 0..gateways.len() {
-        let gateway = gateways
-            .gateway(i)
-            .map_err(|_| Error::Invalid)?
-            .ok_or(Error::Invalid)?;
-        if coverage == PolicyCoverage::ListenersOnly
-            && !graph
-                .serves_gateway(gateway.name)
-                .map_err(|_| Error::Invalid)?
-        {
-            continue;
-        }
-        let ca = read(
-            MaterialRequest {
-                kind: MaterialKind::GatewayCa,
-                profile: Some(gateway.name),
-                path: Some(gateway.ca_file),
-                managed_settings: None,
-            },
-            inputs::MAX_CA_BYTES,
-            open,
-        )?;
-        let mut used = false;
-        for index in 0..listeners.len() {
-            let row = listeners
-                .listener(index)
-                .map_err(|_| Error::Invalid)?
-                .ok_or(Error::Invalid)?;
-            if row.kind != listener::Kind::GatewaySmtp || row.gateway != Some(gateway.name) {
-                continue;
-            }
-            let native = GatewayPolicy::new(
-                &gateway,
-                &ca.0,
-                Arc::new(
-                    identity(row.certificate.ok_or(Error::Invalid)?)?
-                        .restrict_names(&[row.server_name.ok_or(Error::Invalid)?])
-                        .map_err(|_| Error::Tls)?,
-                ),
-                clock.clone(),
-            )?;
-            push(
-                &mut policies,
-                Policy {
-                    receiving_validity: None,
-                    binding: listener_binding(row)?,
-                    configuration: Configuration::Gateway(Box::new(native)),
-                },
-            )?;
-            used = true;
-        }
-        if !used {
-            TrustStore::from_pem(&ca.0).map_err(|_| Error::Tls)?;
-        }
-    }
-    if coverage == PolicyCoverage::Complete {
-        append_clients(&mut policies, configuration, profiles, &clock, open, true)?;
-    }
-    if policies.len() > MAX_POLICIES {
-        return Err(Error::Capacity);
-    }
-    Ok(TlsPolicies { policies, coverage })
+    Ok(Box::new(ServerCertificates(servers)))
 }
 
 fn relay_credentials_digest(username: &str, password: &str) -> Result<[u8; 32], Error> {
@@ -1015,7 +1172,6 @@ fn append_clients<R: Read>(
     push(
         policies,
         Policy {
-            receiving_validity: None,
             binding: Binding::Relay {
                 host: owned(relay.host)?,
                 port: relay.port,
@@ -1041,7 +1197,6 @@ fn append_clients<R: Read>(
         push(
             policies,
             Policy {
-                receiving_validity: None,
                 binding: Binding::Acme {
                     host: owned(acme.directory.host())?,
                     port: acme.directory.port(),

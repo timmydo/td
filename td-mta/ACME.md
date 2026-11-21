@@ -114,11 +114,21 @@ completed order is retired so a new order can proceed. Expired certificates do n
 protected mail service.
 
 Managed mail instances check their certificate revisions every thirty seconds.
-A change causes orderly drain, release of the old listeners and internal reload
-of the selected database profile. This first implementation has a brief listener
-gap; it does not claim uninterrupted hot swapping. An explicit stop wins over a
-reload. Existing external service supervision still handles actual process
-failures. A newly selected general configuration takes the same drain and reload.
+On a change, the watcher prepares the selected profile's inbound TLS policies
+with the same identity, key, validity and hostname checks as startup. All
+loaded managed pairs must match the observed revisions and the database
+selection must still match the running profile. A single publication makes
+the new certificates available to fresh HTTPS and SMTP STARTTLS handshakes.
+The listeners stay bound and established connections finish on their original
+TLS sessions. Device revocation checks continue on established JMAP streams.
+
+The profile has room for its current serving certificates and one candidate
+or retired generation. When a session still pins a retired generation, the
+watcher retries on the next observation. A failed refresh retains the
+current certificates subject to their original validity checks. A serving
+process emits `certificate_renewal_failed` when a changed revision fails
+activation. Capacity waits and superseded observations are retried quietly. A general
+configuration selection change still causes a bounded drain and reload.
 
 ## Qualification
 
@@ -130,6 +140,7 @@ HTTP-01 endpoint. Native PostgreSQL tests cover upgrade, ownership conflicts,
 stale revisions, lease takeover, invalid-pair refusal, asynchronous role defaults
 and the sixteen-row cap. Recovery fixtures cover uncertain publication, delayed
 authorization across multiple names and late retrieval of completed orders.
-Native mail process tests publish a new managed generation and verify both
-services reload internally and continue serving authenticated JMAP requests.
+Native mail process tests publish a new leaf and issuer, verify fresh HTTPS
+and SMTP STARTTLS connections against that issuer, then observe SMTP delivery
+and device revocation on the JMAP stream opened before publication.
 Live staging/public-CA acceptance is deployment validation, not part of the gate.

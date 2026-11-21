@@ -253,6 +253,22 @@ fn resolved_profile(bits: u8) -> materialize::ResolvedProfile {
     .unwrap()
 }
 
+fn published_profile(
+    material: &Material,
+    profile: &materialize::ResolvedProfile,
+) -> GenerationSet<TlsPolicies> {
+    let mut set = GenerationSet::at_startup();
+    let initial = TlsPolicies::prepare_profile(
+        set.reserve().unwrap(),
+        profile,
+        material.clock.clone(),
+        |r| material.open(r),
+    )
+    .unwrap();
+    drop(set.publish(initial).unwrap());
+    set
+}
+
 #[test]
 fn selected_profiles_compile_only_selected_inbound_tls_roles() {
     let _serial = serial();
@@ -260,15 +276,7 @@ fn selected_profiles_compile_only_selected_inbound_tls_roles() {
     for bits in 1..=7 {
         let profile = resolved_profile(bits);
         assert_eq!(profile.roles().bits(), bits);
-        let mut set = GenerationSet::at_startup();
-        let prepared = TlsPolicies::prepare_profile(
-            set.reserve().unwrap(),
-            &profile,
-            material.clock.clone(),
-            |request| material.open(request),
-        )
-        .unwrap();
-        drop(set.publish(prepared).unwrap());
+        let set = published_profile(&material, &profile);
         let lease = set.current().unwrap();
         assert_eq!(lease.value().coverage(), PolicyCoverage::Complete);
         assert_eq!(
@@ -320,6 +328,56 @@ fn selected_profile_provider_failure_does_not_publish_or_consume_a_generation_sl
     .unwrap();
     drop(set.publish(prepared).unwrap());
     assert_eq!(set.current().unwrap().value().len(), 2);
+}
+
+#[test]
+fn certificate_rotation_reuses_capacity_after_old_sessions_close() {
+    let _serial = serial();
+    let material = Material::new();
+    let profile = resolved_profile(7);
+    let set = published_profile(&material, &profile);
+    let lease = set.current().unwrap();
+    let policies = lease.value();
+    let pool = HandshakePool::new(2).unwrap();
+    let session = |name| {
+        let (input, output) = buffers();
+        let id = TlsPolicies::listener(&lease, name).unwrap();
+        TlsPolicies::reserve_session(set.current().unwrap(), id, &pool, input, output)
+            .unwrap()
+            .construct()
+            .unwrap()
+    };
+    let old = {
+        let _publishing = policies.certificates.write().unwrap();
+        let smtp = TlsPolicies::listener(&lease, "smtp").unwrap();
+        TlsPolicies::check_receiving_certificate(&lease, smtp, 1_800_000_000_000).unwrap();
+        assert_eq!(
+            TlsPolicies::check_receiving_certificate(&lease, smtp, 0),
+            Err(Error::Tls)
+        );
+        session("smtp")
+    };
+    let relay = TlsPolicies::relay(&lease).unwrap();
+    let replacement = Material::new();
+    let renew = || policies.prepare_certificates(&profile, |r| replacement.open(r));
+    policies.publish_certificates(renew().unwrap()).unwrap();
+    let current = {
+        let _publishing = policies.published_certificates.write().unwrap();
+        session("https")
+    };
+    assert_ne!(
+        old.lease.certificates.as_ref().unwrap().id(),
+        current.lease.certificates.as_ref().unwrap().id()
+    );
+    assert_eq!(renew().unwrap_err(), Error::Busy);
+    drop(old);
+    policies.publish_certificates(renew().unwrap()).unwrap();
+    assert_eq!(renew().unwrap_err(), Error::Busy);
+    drop(current);
+    for _ in 0..3 {
+        policies.publish_certificates(renew().unwrap()).unwrap();
+    }
+    assert_eq!(TlsPolicies::relay(&lease).unwrap(), relay);
 }
 
 #[test]
@@ -688,7 +746,10 @@ fn exchange(
         let (input, output) = buffers();
         TlsIo::new(
             TcpTransport::from_stream(stream).unwrap(),
-            TlsPolicies::resolve(lease, id).unwrap().session().unwrap(),
+            TlsPolicies::resolve(lease, id)
+                .unwrap()
+                .session(lease.value().current_certificates().ok().as_ref(), id.index)
+                .unwrap(),
             source.clone(),
             deadline,
             deadline,
@@ -827,11 +888,8 @@ certificate = "sts"
             ("https-sts-copy", 1, true),
         ] {
             let id = TlsPolicies::listener(&lease, listener).unwrap();
-            let Configuration::Server(config) =
-                &TlsPolicies::resolve(&lease, id).unwrap().configuration
-            else {
-                panic!("not HTTPS");
-            };
+            let certificates = lease.value().current_certificates().unwrap();
+            let config = &certificates.value().get(id.index).unwrap().config;
             assert_eq!(config.identity_count(), identities);
             assert_eq!(config.binding_count(), 2);
             assert_eq!(

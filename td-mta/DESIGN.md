@@ -1694,8 +1694,9 @@ contact Migadu or a CA. Configuration errors do not echo supplied secrets.
 
 Command-line paths, the runtime and scratch directories, require restart. A
 newly selected configuration, with its listeners, pool sizing, accounts, aliases
-and sending identities, takes the same bounded drain and reload as a managed
-certificate.
+and sending identities, requires a bounded drain and reload. A managed
+certificate renewal updates the running profile's inbound TLS policies in
+place as specified in ACME.md.
 Device revocations are observed from PostgreSQL. Revocation
 is rechecked before a mutation commits; a connection is not permanent authority.
 Reload has bounded coexistence memory and records the effective generation.
@@ -3092,9 +3093,9 @@ its supported CA subset, persistence bounds, renewal scheduling and operational
 commands. It starts independently of selected mail profiles, so initial issuance
 can run before a usable certificate exists. Mail profile import/activation still
 requires a valid certificate. The native worker owns the declared HTTP-01
-listener. Managed certificate changes currently cause bounded mail-service drain
-and internal reload with a brief listener gap; uninterrupted generation swapping
-remains outside this deployment profile. Explicit external certificate inputs
+listener. Mail services publish a verified managed certificate generation
+to their existing listeners. Established TLS sessions keep the generation
+they acquired. Explicit external certificate inputs
 remain supported. No Certbot subprocess or dependency is introduced.
 
 Cold profile preparation retains one bounded binding, private identity
@@ -3152,8 +3153,8 @@ activation. It never repairs mail or enables itself during serving.
 
 Local file-certificate profiles also observe the selected configuration
 generation in the existing 30-second certificate watcher. A definite change
-requests the same bounded drain and reload as a managed certificate change;
-a failed observation does not claim a change. This includes idle read-only
+requests a bounded drain and reload. A failed observation retains the current
+selection. This includes idle read-only
 replicas, so certificate activation does not depend on client traffic.
 
 SMTP receiving emits bounded refusal observations through the existing
