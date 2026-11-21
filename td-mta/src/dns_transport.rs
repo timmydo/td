@@ -2,7 +2,7 @@
 use crate::{
     clock::RuntimeClock,
     dns_reply::{self, Reply, MAX_ALIASES, MAX_RECORDS},
-    dns_wire::{Question, WireQuestion, MAX_PACKET_BYTES, MAX_QUERY_BYTES},
+    dns_wire::{Question, WireQuestion, EDNS_UDP_BYTES, MAX_PACKET_BYTES, MAX_QUERY_BYTES},
     ports::{Clock, Deadline, Error, Tick},
 };
 use std::{
@@ -14,7 +14,6 @@ use td_mime::work::{Charge, Meter, Stop};
 
 pub const PACKET_BYTES: usize = MAX_PACKET_BYTES;
 pub const MAX_DATAGRAMS: usize = 16;
-const UDP_BYTES: usize = 512;
 const IO_BYTES: usize = 16 * 1024;
 const IDLE: Duration = Duration::from_secs(1);
 
@@ -170,15 +169,20 @@ pub(crate) fn exchange_with<T>(
     if result.map_err(io)? != query.len() {
         return Err(Error::Dns);
     }
+    let udp_bytes = if question.edns {
+        usize::from(EDNS_UDP_BYTES)
+    } else {
+        512
+    };
     for _ in 0..MAX_DATAGRAMS {
         socket
             .set_read_timeout(Some(budget.while_current(current)?))
             .map_err(io)?;
-        budget.io(UDP_BYTES + 1)?;
-        let result = socket.recv(packet.get_mut(..UDP_BYTES + 1).ok_or(Error::Capacity)?);
+        budget.io(udp_bytes + 1)?;
+        let result = socket.recv(packet.get_mut(..udp_bytes + 1).ok_or(Error::Capacity)?);
         budget.while_current(current)?;
         let size = result.map_err(io)?;
-        if size > UDP_BYTES {
+        if size > udp_bytes {
             return Err(Error::Dns);
         }
         let data = packet.get(..size).ok_or(Error::Invalid)?;

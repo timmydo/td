@@ -72,56 +72,61 @@ impl<'a> Resolver<'a> {
             remaining_aliases: remaining,
         };
         for server in self.servers {
-            if !(self.current)() {
-                return Err(DnsError::Unavailable);
-            }
-            budget.check().map_err(|_| DnsError::Unavailable)?;
-            let mut id = [0; 2];
-            self.entropy
-                .fill(&mut id)
-                .map_err(|_| DnsError::Unavailable)?;
-            let question = WireQuestion {
-                name,
-                kind: code(kind),
-                id: u16::from_be_bytes(id),
-            };
-            let response = dns_transport::exchange_with(
-                *server,
-                question,
-                &mut budget,
-                self.packet,
-                self.current,
-                |packet| match decode(packet, question, kind, remaining) {
-                    Ok(Message::Truncated) => Ok(Packet::Truncated),
-                    Ok(reply) => Ok(Packet::Complete(reply)),
-                    Err(WireError::Invalid) => Ok(Packet::Invalid),
-                    Err(WireError::Capacity) => Err(Error::Capacity),
-                },
-            );
-            match response {
-                Ok(Message::Answer(answer)) => return Ok(answer),
-                Ok(Message::ResponseCode(3)) => return Ok(None),
-                // Retry only remote failures and per-server idle timeouts.
-                // Local resource failures must survive PTR error suppression.
-                Ok(_)
-                | Err(
-                    Error::Dns
-                    | Error::Deadline
-                    | Error::Io {
-                        kind:
-                            ErrorKind::ConnectionRefused
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::ConnectionAborted
-                            | ErrorKind::NotConnected
-                            | ErrorKind::BrokenPipe
-                            | ErrorKind::HostUnreachable
-                            | ErrorKind::NetworkUnreachable,
-                        ..
-                    },
-                ) => {
-                    budget.check().map_err(|_| DnsError::Unavailable)?;
+            for edns in [true, false] {
+                if !(self.current)() {
+                    return Err(DnsError::Unavailable);
                 }
-                Err(_) => return Err(DnsError::Unavailable),
+                budget.check().map_err(|_| DnsError::Unavailable)?;
+                let mut id = [0; 2];
+                self.entropy
+                    .fill(&mut id)
+                    .map_err(|_| DnsError::Unavailable)?;
+                let question = WireQuestion {
+                    name,
+                    kind: code(kind),
+                    id: u16::from_be_bytes(id),
+                    edns,
+                };
+                let response = dns_transport::exchange_with(
+                    *server,
+                    question,
+                    &mut budget,
+                    self.packet,
+                    self.current,
+                    |packet| match decode(packet, question, kind, remaining) {
+                        Ok(Message::Truncated) => Ok(Packet::Truncated),
+                        Ok(reply) => Ok(Packet::Complete(reply)),
+                        Err(WireError::Invalid) => Ok(Packet::Invalid),
+                        Err(WireError::Capacity) => Err(Error::Capacity),
+                    },
+                );
+                match response {
+                    Ok(Message::Answer(answer)) => return Ok(answer),
+                    Ok(Message::ResponseCode(3)) => return Ok(None),
+                    Ok(Message::LegacyResolver) if edns => continue,
+                    // Retry only remote failures and per-server idle timeouts.
+                    // Local resource failures must survive PTR error suppression.
+                    Ok(_)
+                    | Err(
+                        Error::Dns
+                        | Error::Deadline
+                        | Error::Io {
+                            kind:
+                                ErrorKind::ConnectionRefused
+                                | ErrorKind::ConnectionReset
+                                | ErrorKind::ConnectionAborted
+                                | ErrorKind::NotConnected
+                                | ErrorKind::BrokenPipe
+                                | ErrorKind::HostUnreachable
+                                | ErrorKind::NetworkUnreachable,
+                            ..
+                        },
+                    ) => {
+                        budget.check().map_err(|_| DnsError::Unavailable)?;
+                        break;
+                    }
+                    Err(_) => return Err(DnsError::Unavailable),
+                }
             }
         }
         Err(DnsError::Temporary)

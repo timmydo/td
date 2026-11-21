@@ -111,10 +111,6 @@ fn record(packet: &[u8], at: usize) -> Result<(Record, usize), Error> {
     let fixed = at.checked_add(used).ok_or(Error::Invalid)?;
     let data = fixed.checked_add(10).ok_or(Error::Invalid)?;
     let kind = word(packet, fixed)?;
-    // Our question has no EDNS; do not ignore an unsolicited extended RCODE.
-    if kind == 41 {
-        return Err(Error::Invalid);
-    }
     let class = word(packet, fixed + 2)?;
     let ttl = u32::from_be_bytes(
         packet
@@ -134,7 +130,7 @@ fn record(packet: &[u8], at: usize) -> Result<(Record, usize), Error> {
         class,
         data: u16::try_from(data).map_err(|_| Error::Invalid)?,
         length,
-        ttl: seconds(ttl),
+        ttl: if kind == 41 { ttl } else { seconds(ttl) },
     };
     if class == 1 {
         match kind {
@@ -164,14 +160,18 @@ pub fn read(packet: &[u8], question: &Question, remaining_aliases: usize) -> Res
         extract(packet, question, answers, authority, remaining_aliases)
     })? {
         Message::Truncated => Ok(Reply::Truncated),
-        Message::ResponseCode(code) => Ok(Reply::ResponseCode(code)),
+        Message::ResponseCode(code) => Ok(Reply::ResponseCode(
+            u8::try_from(code).map_err(|_| Error::Invalid)?,
+        )),
+        Message::LegacyResolver => Err(Error::Invalid),
         Message::Answer(reply) => Ok(reply),
     }
 }
 
 pub(crate) enum Message<T> {
     Truncated,
-    ResponseCode(u8),
+    LegacyResolver,
+    ResponseCode(u16),
     Answer(T),
 }
 
@@ -209,8 +209,29 @@ pub(crate) fn parse<T>(
         return Err(Error::Capacity);
     }
     let mut records = [Record::default(); MAX_RECORDS];
+    let mut extended = None;
+    let mut remaining_options = MAX_RECORDS - total;
     for index in 0..total {
         let (rr, end) = record(packet, position)?;
+        if rr.kind == 41 {
+            if !question.edns
+                || index < authority_end
+                || extended.is_some()
+                || packet.get(position) != Some(&0)
+            {
+                return Err(Error::Invalid);
+            }
+            // RFC 6891 sections 6.1.2-4. Ignore unknown options and flags
+            // after checking their framing. The response uses the requested
+            // format even if the resolver advertises a higher version.
+            let mut options = value(packet, rr)?;
+            while !options.is_empty() {
+                remaining_options = remaining_options.checked_sub(1).ok_or(Error::Capacity)?;
+                let len = usize::from(word(options, 2)?);
+                options = options.get(4 + len..).ok_or(Error::Invalid)?;
+            }
+            extended = Some((rr.ttl >> 24) as u16);
+        }
         if index < authority_end {
             *records.get_mut(index).ok_or(Error::Capacity)? = rr;
         }
@@ -219,8 +240,12 @@ pub(crate) fn parse<T>(
     if position != packet.len() {
         return Err(Error::Invalid);
     }
-    if flags & 0x000f != 0 {
-        return Ok(Message::ResponseCode((flags & 0x000f) as u8));
+    let rcode = (extended.unwrap_or(0) << 4) | (flags & 0x000f);
+    if question.edns && rcode == 1 && extended.is_none() {
+        return Ok(Message::LegacyResolver);
+    }
+    if rcode != 0 {
+        return Ok(Message::ResponseCode(rcode));
     }
     extract(
         records.get(..answers).ok_or(Error::Capacity)?,

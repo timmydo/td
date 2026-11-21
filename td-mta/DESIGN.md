@@ -1483,9 +1483,8 @@ reserved Z bit, transaction ID and complete single IN A/AAAA question before
 accepting even a truncated-response indication. A nontruncated packet must
 frame exactly, with at most 256 records across all sections. Known IN address
 and CNAME records are structurally checked even outside the answer section;
-unknown records remain opaque. An unsolicited OPT record is refused because
-the corresponding query advertises no EDNS, preventing an extended error code
-from being silently ignored. AD/CD bits grant no DNS authentication claim.
+unknown records remain opaque. The configured-host address lookup rejects
+unsolicited OPT records. AD/CD bits grant no DNS authentication claim.
 
 Only answer-section addresses reachable from the question through at most
 eight CNAME hops contribute a result. Each call accepts the original chain's
@@ -1506,9 +1505,9 @@ as usable only for the current lookup, without caching it.
 
 The prepared `dns_transport` exchange runs synchronously on the fixed
 resolver worker against a caller-admitted numeric server. A connected UDP
-socket filters the peer; at most 16 datagrams are considered. Queries omit
-EDNS, so a receive cell of 513 bytes detects and refuses oversized UDP
-responses. Only a response matching the full question may request TCP
+socket filters the peer; at most 16 datagrams are considered. The configured
+relay and ACME address lookups use classic DNS with a 512-byte UDP limit.
+Each UDP receive allows one extra byte to detect oversized responses. Only a response matching the full question may request TCP
 fallback. Drop UDP before opening one TCP connection to that same endpoint;
 write the length-prefixed query and read exactly one length-prefixed response,
 refusing early EOF, invalid framing and another truncation indication.
@@ -1593,7 +1592,13 @@ the SMTP envelope and published policy. DKIM queries TXT at the selector's
 `_dmarc` TXT records to discover policy and compare organizational domains.
 Both workers send DNS questions only to configured numeric
 resolvers, have no application-dial capability, and keep their per-message
-work separate from the configured relay/ACME cache.
+work separate from the configured relay/ACME cache. Sender-authentication
+questions advertise a 1232-byte EDNS(0) UDP payload with no options. A
+complete reply can contain one root-owned OPT in the additional section.
+The decoder validates option lengths and combines the extended and header
+response codes before using an answer. A matching FORMERR without OPT
+allows one classic query to the same resolver with a new ID. TCP fallback
+after a matching truncated reply retains the query and original deadline.
 
 The prepared `outbound_dial` helper runs only on the admitted outbound
 handshake worker while its caller retains the sole outbound slot and configured

@@ -3,7 +3,13 @@
 pub const MAX_PACKET_BYTES: usize = 65_535;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_POINTERS: usize = 32;
-pub const MAX_QUERY_BYTES: usize = 12 + MAX_NAME_BYTES + 4;
+pub(crate) const EDNS_UDP_BYTES: u16 = 1232;
+// Root owner, OPT, UDP payload size, zero extended RCODE/version/flags/RDLENGTH.
+const OPT: &[u8] = &{
+    let [hi, lo] = EDNS_UDP_BYTES.to_be_bytes();
+    [0, 0, 41, hi, lo, 0, 0, 0, 0, 0, 0]
+};
+pub const MAX_QUERY_BYTES: usize = 12 + MAX_NAME_BYTES + 4 + OPT.len();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -183,6 +189,7 @@ impl Question {
             name: &self.name,
             id: self.id,
             kind: self.kind.code(),
+            edns: false,
         }
     }
 
@@ -196,13 +203,15 @@ pub(crate) struct WireQuestion<'a> {
     pub(crate) name: &'a Name,
     pub(crate) kind: u16,
     pub(crate) id: u16,
+    pub(crate) edns: bool,
 }
 impl WireQuestion<'_> {
     /// Only the returned prefix is a query; bytes beyond it are unchanged.
-    /// Insufficient capacity writes nothing. No TCP length prefix or EDNS.
+    /// Insufficient capacity writes nothing. No TCP length prefix.
     pub fn write<'a>(&self, output: &'a mut [u8]) -> Result<&'a [u8], Error> {
         let end = 12 + self.name.wire().len();
-        let length = end + 4;
+        let opt = if self.edns { OPT } else { &[] };
+        let length = end + 4 + opt.len();
         let output = output.get_mut(..length).ok_or(Error::Capacity)?;
         output.fill(0);
         output
@@ -220,6 +229,11 @@ impl WireQuestion<'_> {
             .ok_or(Error::Capacity)?
             .copy_from_slice(&self.kind.to_be_bytes());
         *output.get_mut(end + 3).ok_or(Error::Capacity)? = 1; // IN
+        *output.get_mut(11).ok_or(Error::Capacity)? = u8::from(self.edns); // ARCOUNT
+        output
+            .get_mut(end + 4..)
+            .ok_or(Error::Capacity)?
+            .copy_from_slice(opt);
         Ok(output)
     }
 }

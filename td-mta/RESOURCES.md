@@ -3976,9 +3976,9 @@ Output accumulates across codec turns before one bounded TLS write; only
 a full cell or completed body drains it. Partial writes retain exact offsets.
 
 The prepared DNS wire helper keeps a canonical name in at most 258 bytes
-and an address question in at most 264 bytes. Query encoding borrows at most
-271 caller bytes and never changes bytes outside the returned query prefix;
-short capacity writes nothing. Name decoding allocates no heap storage and
+and an address question in at most 264 bytes. Classic queries use at most
+271 caller bytes. Sender-authentication queries with OPT use at most 282.
+Only the returned query prefix is written, and short capacity writes nothing. Name decoding allocates no heap storage and
 uses no recursion: at most 255 expanded name bytes and 32 backward pointer
 hops bound one call. Packet input is at most 65535 bytes. These values belong
 to the resolver's existing question/name/cursor partition, not one new
@@ -4002,10 +4002,13 @@ resolver owner. The decoder enforces the supplied remaining alias allowance
 cannot reset or grant that allowance.
 
 The prepared DNS transport borrows the existing 65535-byte packet cell,
-keeps a 271-byte query and at most a 273-byte TCP query frame, and uses the
+keeps a 282-byte query and at most a 284-byte TCP query frame, and uses the
 answer decoder's bounded arrays. It allocates no per-query heap storage and
-has at most one socket live: UDP closes before TCP fallback. A lookup attempts
-at most 16 UDP receives of 513 bytes; TCP reads use at most 16 KiB per call
+has at most one socket live: UDP closes before TCP fallback. Each exchange
+permits 16 UDP receives of at most 1233 bytes for sender-authentication EDNS
+or 513 bytes for classic DNS, including the oversize sentinel byte. Resource
+records and EDNS option headers share the 256-entry framing limit. TCP reads
+use at most 16 KiB per call
 under the original total deadline and work meter. Every socket I/O attempt
 precharges a record and its requested byte extent, including repeated partial
 operations; each query send also charges output bytes. Each parse reserves
