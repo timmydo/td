@@ -4485,6 +4485,8 @@ longer holds it to the screen's rate the way a synchronous one did:
   thread the runtime already wakes for layout. It takes the due callbacks
   under the lock and writes `done` and delete_id after it, following any
   configure, so no client write is made under the runtime lock.
+- A frame callback's `done` carries elapsed milliseconds from a shared
+  monotonic origin, modulo 2^32. Both delivery paths use that clock.
 - A client's callbacks stay in order. A newer one queues behind any held,
   and behind any the worker has taken and not yet written: those are in
   transit until it reports them sent.

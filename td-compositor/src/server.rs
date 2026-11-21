@@ -34,7 +34,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1485,8 +1485,10 @@ fn send_frame_done(
     pending_deletes: &PendingDeletes,
     callback: u32,
 ) -> Result<(), String> {
+    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
     let mut done = wire::Builder::new();
-    done.u32(next_serial());
+    // Wayland frame time wraps modulo 2^32 milliseconds.
+    done.u32(ORIGIN.elapsed().as_millis() as u32);
     let message = done.message(callback, WL_CALLBACK_DONE)?;
     outbound
         .lock()
@@ -16304,6 +16306,7 @@ mod tests {
         let reused = client.insert(50, Object::Callback).unwrap_err();
         assert!(reused.contains("reused before delete_id"), "{reused}");
 
+        let first_start = Instant::now();
         runtime
             .lock()
             .unwrap()
@@ -16313,6 +16316,8 @@ mod tests {
         let events = receive_messages(&mut peer, 2);
         assert_eq!((events[0].object, events[0].opcode), (50, WL_CALLBACK_DONE));
         assert_eq!((events[1].object, events[1].opcode), (1, 1));
+        let first_end = Instant::now();
+        let first_ms = wire::Cursor::new(&events[0].payload).u32().unwrap();
         // The worker reports them sent after writing, so a moment later.
         let deadline = Instant::now() + Duration::from_secs(2);
         while client.pending_frame_callbacks().unwrap() != 0 {
@@ -16327,7 +16332,10 @@ mod tests {
         // The client can keep asking on this same image. With no output
         // event to wake the worker, its deadline must deliver the callbacks.
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Give the wire clock a measurable interval on a quiet test host.
+        thread::sleep(Duration::from_millis(30));
         for callback in [51, 52, 53] {
+            let start = Instant::now();
             let mut frame = wire::Builder::new();
             frame.u32(callback);
             client
@@ -16345,6 +16353,14 @@ mod tests {
                 (callback, WL_CALLBACK_DONE)
             );
             assert_eq!((events[1].object, events[1].opcode), (1, 1));
+            let ms = wire::Cursor::new(&events[0].payload).u32().unwrap();
+            let elapsed = u128::from(ms.wrapping_sub(first_ms));
+            let lower = start.duration_since(first_end).as_millis();
+            let upper = first_start.elapsed().as_millis() + 1;
+            assert!(
+                (lower..=upper).contains(&elapsed),
+                "frame timestamp advanced {elapsed} ms, expected {lower}..={upper}"
+            );
         }
         assert!(runtime.lock().unwrap().frame_in_flight().is_none());
 
