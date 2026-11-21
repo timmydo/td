@@ -3,6 +3,11 @@ use std::path::Path;
 
 #[test]
 fn the_production_source_and_raw_boundary_are_closed() {
+    let website = include_str!("../src/website.rs");
+    assert_eq!(website.matches("Command::new(").count(), 1);
+    assert!(website.contains("Command::new(\"/bin/td-pass\")"));
+    assert!(website.contains("crate::application::admitted_uid(\"firefox\")"));
+    assert!(website.contains("UnixDatagram::pair()"));
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     assert!(manifest.contains("autotests = false"));
@@ -63,6 +68,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "suspend.rs",
             "sys.rs",
             "unlock.rs",
+            "website.rs",
             "workspace.rs"
         ]
     );
@@ -103,6 +109,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("revocation.rs", 0),
         ("storage.rs", 0),
         ("suspend.rs", 0),
+        ("website.rs", 0),
         ("workspace.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
@@ -142,6 +149,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "inspection.rs"
                     | "notebook.rs"
                     | "notebook_token.rs"
+                    | "website.rs"
                     | "stderr_tail.rs"
                     | "workspace.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
@@ -186,7 +194,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xc81434bc533bfa8f,
+        0xf3db5dc032ed743b,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -693,9 +701,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
     // A failed write is sticky: `1f` answers 02 while one stands.
     assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
-    assert_eq!(rename.matches("Command::new(").count(), 5);
-    assert!(rename.contains("Command::new(\"/bin/td-secret\")"));
-    assert!(rename.contains("crate::application::admitted_uid(\"firefox\")?"));
+    assert_eq!(rename.matches("Command::new(").count(), 4);
     assert!(rename.contains("command.args([\"accept-publisher\", fingerprint]);"));
     assert!(rename.contains("Command::new(\"/bin/td-admin\")"));
     assert!(rename.contains("command.args([\"accept-key\", blob]);"));
@@ -1861,10 +1867,10 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0xee8466da0204da7b;
-const MAIN_FINGERPRINT: u64 = 0x3175b506acfe09d1;
+const LAUNCH_FINGERPRINT: u64 = 0x8c225f6d6c3ed892;
+const MAIN_FINGERPRINT: u64 = 0xaca9c2323ccde7ee;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
-const SESSION_FINGERPRINT: u64 = 0x9991a82824bab5fd;
+const SESSION_FINGERPRINT: u64 = 0xe39d33ad743cf6bf;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0x755e883a75780a83;
@@ -1874,8 +1880,8 @@ const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const SHARED_MEMORY_FINGERPRINT: u64 = 0xe860c6bf21db03b0;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0x8debdaa6919034d5;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x17c8ebcb6faa1505;
+const ELEVATION_FINGERPRINT: u64 = 0x21e50efe028ca4b6;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x9c3353d7916f6012;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;

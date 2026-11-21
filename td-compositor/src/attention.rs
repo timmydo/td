@@ -35,7 +35,6 @@ pub(crate) enum Notice {
     HostnameSaved,
     TimeSaved,
     VolumeSaved,
-    WebsiteKeyAssigned,
     AdminKeySaved,
     PublisherSaved,
     /// A committed device-bound disk installation, before its recovery key:
@@ -182,6 +181,7 @@ impl Prepared {
                 && !matches!(
                     request.operation(),
                     crate::authority::consent::Operation::Notebook(_)
+                        | crate::authority::consent::Operation::Website(_)
                 ))
         {
             let scale = if doubled { 2 } else { 1 };
@@ -225,7 +225,13 @@ impl Prepared {
             .checked_div(cell_width)
             .filter(|value| *value >= 24)
             .ok_or("output cannot hold a complete trusted prompt")?;
-        let mut lines = request.lines();
+        let mut lines = Vec::new();
+        if !request.website_rows(|args| {
+            let line = crate::allocation::format(args).map_err(|_| String::new())?;
+            crate::allocation::push(&mut lines, line).map_err(|_| String::new())
+        })? {
+            lines = request.lines();
+        }
         let ceiling = request
             .ceiling()
             .map_or(OPERATION_SECONDS, |ceiling| ceiling.as_secs());
@@ -306,6 +312,11 @@ impl Prepared {
                 request.protector_step() == Some(crate::authority::consent::LoginStep::Choose);
             let (pin, touch) = if recovery {
                 (RECOVERY_PROMPT, CHECKING_PROMPT)
+            } else if matches!(
+                request.operation(),
+                crate::authority::consent::Operation::Website(_)
+            ) {
+                ("PIN", "CHECKING PIN")
             } else if choose {
                 (CHOOSE_PROMPT, CHOSEN_PROMPT)
             } else {
@@ -691,7 +702,6 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
-        Notice::WebsiteKeyAssigned => "YUBIKEY ASSIGNED - REOPEN FIREFOX",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::PublisherSaved => "UPDATE PUBLISHER TRUST REPLACED",

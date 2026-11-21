@@ -184,44 +184,6 @@ pub(crate) mod vm_tests {
             .collect()
     }
 
-    fn website_attachment_lifecycle() {
-        let attach = || Uhid::create_vendor("website key", FIDO_PRODUCT, FIDO_DESCRIPTOR, 0x1050);
-        let first = attach();
-        discover_one();
-        let (index, inode, device) = website_candidate().unwrap();
-        let second = attach();
-        desktop::wait("both website attachments", || {
-            Device::discover().unwrap().len() == 2
-        });
-        assert!(website_candidate().is_err());
-        assert!(assign_website_key(index, inode + 1, device, 65536).is_err());
-        assign_website_key(index, inode, device, 65536).unwrap();
-        let alias = "/dev/td-firefox-website-key";
-        let held = File::open(alias).unwrap();
-        let granted = held.metadata().unwrap();
-        assert_eq!(
-            (
-                granted.uid(),
-                granted.gid(),
-                granted.mode() & 0o7777,
-                granted.nlink()
-            ),
-            (0, 65536, 0o660, 1)
-        );
-        let (next, next_inode, next_device) = website_candidate().unwrap();
-        assert!(assign_website_key(next, next_inode, next_device, 65536).is_err());
-        drop(first);
-        desktop::wait("unplug invalidates the grant", || {
-            held.metadata().unwrap().nlink() == 0
-        });
-        assert_eq!(held.metadata().unwrap().mode() & 0o7777, 0);
-        assign_website_key(next, next_inode, next_device, 65536).unwrap();
-        assert_eq!(fs::metadata(alias).unwrap().ino(), next_inode);
-        assert_eq!(held.metadata().unwrap().nlink(), 0);
-        assert!(Device::discover().unwrap().is_empty());
-        drop(second);
-    }
-
     fn assertion_fixture() -> (Vec<u8>, crate::fido_ctap::Es256PublicKey, [u8; 32]) {
         // The independent OpenSSL fixture also used by the host TPM oracle.
         let mut cose = vec![0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20];
@@ -289,10 +251,8 @@ pub(crate) mod vm_tests {
         assert!(error.starts_with("TPM command 0x177 refused:"), "{error}");
         drop(session);
         assert!(!std::path::Path::new(&format!("/proc/{worker}")).exists());
-        assert!(website_candidate().is_err());
         assert_eq!(token.finish(), (2, 0));
         assert!(Device::discover().unwrap().is_empty());
-        website_attachment_lifecycle();
     }
 
     #[test]

@@ -596,29 +596,6 @@ fn the_client_refuses_a_malformed_name_before_connecting() {
 }
 
 #[test]
-fn failed_website_key_approval_returns_an_operation_receipt() {
-    let fixture = Fixture::new("td");
-    let mut change = drawn(&fixture);
-    change.request = Request::new(
-        [7; 32],
-        fixture.uid(),
-        Operation::AssignWebsiteKey {
-            requester: fixture.uid(),
-            key: WebsiteKey::parse("0 1 61440").unwrap(),
-        },
-    )
-    .unwrap();
-    // Force an admission failure without consulting host devices or apps.
-    fixture.scratch.write(b"td-authd-backoff-v1\n");
-    fs::create_dir(fixture.scratch.path.join("authd/backoff.new")).unwrap();
-    let request = change.request().clone();
-    change.presented(&request).unwrap();
-    change.commit(&request).unwrap();
-    assert!(matches!(change.poll().unwrap(), Event::Failed(_)));
-    assert!(change.commit(&request).is_err());
-}
-
-#[test]
 fn time_settings_bind_exact_values_and_cancellation_never_starts_the_helper() {
     for setting in [
         "set 2026-10-30T06:11:04Z",

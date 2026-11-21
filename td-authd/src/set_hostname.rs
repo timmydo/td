@@ -6,7 +6,7 @@
 use crate::backoff::{self, Backoff, Entry, Refused, Row, BACKING_OFF, REFUSED};
 use crate::consent::time_setting;
 use crate::consent::volume_setting;
-use crate::consent::{Operation, Request, WebsiteKey};
+use crate::consent::{Operation, Request};
 use crate::deployment::{bind_intake, unlink_intake};
 use crate::elevation::{self, Table};
 use crate::hostname::Hostname;
@@ -17,7 +17,7 @@ use crate::unlock::Event;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,8 +37,6 @@ impl Setting {
             }
         } else if let Some(value) = text.strip_prefix("time ") {
             time_setting::Change::decode(value)?;
-        } else if let Some(value) = text.strip_prefix("website-key ") {
-            WebsiteKey::parse(value).ok_or("invalid website key identity")?;
         } else if let Some(value) = text.strip_prefix("volume ") {
             volume_setting::Change::decode(value)?;
         } else {
@@ -56,8 +54,6 @@ impl Setting {
             elevation::Operation::EnrollAdminKey
         } else if self.0.starts_with("time ") {
             elevation::Operation::ManageTime
-        } else if self.0.starts_with("website-key ") {
-            elevation::Operation::AssignWebsiteKey
         } else if self.0.starts_with("volume ") {
             elevation::Operation::ManageVolumes
         } else {
@@ -605,13 +601,7 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
     stream
         .read_exact(&mut reply)
         .map_err(|e| format!("hostname change ended without a completion receipt: {e}"))?;
-    if reply == [1] && name.name().starts_with("website-key ") {
-        writeln!(
-            io::stdout(),
-            "YubiKey assigned. Fully quit and reopen Firefox with the key plugged in."
-        )
-        .map_err(|e| e.to_string())
-    } else if reply == [1] {
+    if reply == [1] {
         writeln!(
             io::stdout(),
             "Settings change completed: {}. Hostname changes require a restart.",
@@ -624,7 +614,6 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
 }
 
 pub(crate) struct Change {
-    _website_node: Option<File>,
     request: Request,
     saved: PathBuf,
     owner: u32,
@@ -654,7 +643,6 @@ impl Change {
         places: &Places,
         nonce: [u8; 32],
     ) -> Result<Self, String> {
-        let mut website_node = None;
         let request = Request::new(
             nonce,
             owner,
@@ -673,32 +661,6 @@ impl Change {
                     requester: ready.requester,
                     setting: setting.into(),
                 }
-            } else if let Some(value) = ready.name.name().strip_prefix("website-key ") {
-                let key = WebsiteKey::parse(value).ok_or("invalid website key")?;
-                let path = crate::text(format_args!("/dev/hidraw{}", key.index))?;
-                // O_PATH | O_NOFOLLOW holds the original inode across approval.
-                // Only td-secret's checked commit opens the HID transport.
-                let file = File::options()
-                    .read(true)
-                    .custom_flags(0o10000000 | 0o400000)
-                    .open(path)
-                    .map_err(|_| "website key disconnected")?;
-                let meta = file.metadata().map_err(|_| "stat website key")?;
-                if !meta.file_type().is_char_device()
-                    || meta.ino() != key.inode
-                    || meta.rdev() != key.device
-                    || meta.uid() != 0
-                    || meta.gid() != 0
-                    || meta.nlink() != 1
-                    || !matches!(meta.mode() & 0o7777, 0o600 | 0o660)
-                {
-                    return Err("website key changed before presentation".into());
-                }
-                website_node = Some(file);
-                Operation::AssignWebsiteKey {
-                    requester: ready.requester,
-                    key,
-                }
             } else if let Some(setting) = ready.name.name().strip_prefix("volume ") {
                 Operation::ManageVolumes {
                     requester: ready.requester,
@@ -713,7 +675,6 @@ impl Change {
             },
         )?;
         Ok(Self {
-            _website_node: website_node,
             request,
             saved: places.saved.clone(),
             owner: places.owner,
@@ -791,18 +752,6 @@ impl Change {
             self.result = None;
             return Ok(());
         }
-        if let Operation::AssignWebsiteKey { key, .. } = self.request.operation() {
-            self.committed = true;
-            self.result = Some(false);
-            match self.backoff.approved().and_then(|_| start_website_key(key)) {
-                Ok(helper) => {
-                    self.helper = Some(helper);
-                    self.result = None;
-                }
-                Err(why) => diagnose(&why),
-            }
-            return Ok(());
-        }
         if let Operation::ManageVolumes { setting, .. } = self.request.operation() {
             let change = volume_setting::Change::decode(setting)?;
             self.committed = true;
@@ -850,19 +799,6 @@ impl Change {
             None => Event::Present(self.request.clone()),
         })
     }
-}
-
-fn start_website_key(key: &WebsiteKey) -> Result<Inspection, String> {
-    let group = crate::application::admitted_uid("firefox")?;
-    let mut command = Command::new("/bin/td-secret");
-    command.args([
-        "assign-website-key",
-        &crate::text(format_args!("{}", key.index))?,
-        &crate::text(format_args!("{}", key.inode))?,
-        &crate::text(format_args!("{}", key.device))?,
-        &crate::text(format_args!("{}", group))?,
-    ]);
-    Inspection::printing(command, 128, Duration::from_secs(10))
 }
 
 fn save(path: &Path, owner: u32, backoff: &Backoff, old: &str, new: &str) -> Result<(), String> {

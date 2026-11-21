@@ -97,6 +97,7 @@ mod storage;
 mod suspend;
 mod sys;
 mod unlock;
+mod website;
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(dead_code, reason = "the application policy reads the ledger")]
 mod workload_accounts;
@@ -131,12 +132,6 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
      td-authd time ACTION VALUE | td-authd volume add|remove ...";
 
 fn run(arguments: &[String]) -> Result<(), String> {
-    if let [verb, identity] = arguments {
-        if verb == "request-website-key" {
-            consent::WebsiteKey::parse(identity).ok_or("invalid website key identity")?;
-            return set_hostname::request(&text(format_args!("website-key {identity}"))?);
-        }
-    }
     if let [verb, words @ ..] = arguments {
         if verb == "volume" {
             let words: Vec<&str> = words.iter().map(String::as_str).collect();

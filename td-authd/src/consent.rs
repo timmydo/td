@@ -20,41 +20,6 @@ pub fn admin_key(blob: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
-/// One kernel attachment, identified before the settings prompt opens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WebsiteKey {
-    pub index: u8,
-    pub inode: u64,
-    pub device: u64,
-}
-
-impl WebsiteKey {
-    pub fn parse(value: &str) -> Option<Self> {
-        let mut words = value.split(' ');
-        let number = |word: &str| {
-            if word.is_empty()
-                || (word.len() > 1 && word.starts_with('0'))
-                || !word.bytes().all(|b| b.is_ascii_digit())
-            {
-                return None;
-            }
-            word.parse::<u64>().ok()
-        };
-        let key = Self {
-            index: u8::try_from(number(words.next()?)?).ok()?,
-            inode: number(words.next()?)?,
-            device: number(words.next()?)?,
-        };
-        (key.valid() && words.next().is_none()).then_some(key)
-    }
-    fn valid(self) -> bool {
-        self.inode != 0
-            && self.device != 0
-            && (self.device & 0xff) == u64::from(self.index)
-            && self.device <= 0xfffff
-    }
-}
-
 const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -1069,8 +1034,86 @@ impl Notebook {
     }
 }
 
+/// Immutable website prompt painted by the physical seat. Browser-provided
+/// strings occupy their own rows and never contain control characters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Website {
+    pub ticket: u64,
+    pub stage: u8,
+    pub register: bool,
+    pub key: Option<u8>,
+    pub site: String,
+    pub account: String,
+    pub credential: Option<[u8; 32]>,
+}
+impl Website {
+    fn valid(&self) -> bool {
+        self.ticket != 0
+            && matches!(self.stage, 0..=4 | 7 | 8)
+            && (self.stage == 3) == self.credential.is_some()
+            && !self.site.is_empty()
+            && self.site.len() <= 253
+            && self
+                .site
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+            && self.account.len() <= 255
+            && self.account.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    }
+    fn rows<E>(
+        &self,
+        mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        row(format_args!(
+            "{}",
+            if self.register {
+                "CREATE A WEBSITE PASSKEY"
+            } else {
+                "SIGN IN TO WEBSITE"
+            }
+        ))?;
+        row(format_args!("SITE: {}", self.site))?;
+        if !self.account.is_empty() {
+            row(format_args!("ACCOUNT: {}", self.account))?;
+        }
+        if let Some(id) = &self.credential {
+            let (chunks, _) = id.as_chunks::<16>();
+            if let [a, b] = chunks {
+                row(format_args!(
+                    "CREDENTIAL: {:032X}{:032X}",
+                    u128::from_be_bytes(*a),
+                    u128::from_be_bytes(*b)
+                ))?;
+            }
+        }
+        match self.key {
+            Some(i) => row(format_args!("YUBIKEY (HIDRAW {i})"))?,
+            None => row(format_args!("TD-PASS ON THIS TPM"))?,
+        }
+        let instructions: &[&str] = match self.stage {
+            0 => &["TAB: CHANGE PROVIDER   ENTER: CONTINUE"],
+            1 => &[
+                "ENROLL A DEVICE-BOUND PASSKEY VAULT?",
+                "LOSING OR CLEARING THIS TPM PERMANENTLY LOSES THESE PASSKEYS.",
+                "ENTER: ACCEPT LOSS   ESC: CANCEL",
+            ],
+            2 if self.key.is_some() => &["ENTER YOUR YUBIKEY PIN"],
+            2 => &["ENTER YOUR TD-PASS VAULT PIN"],
+            3 => &["TAB: NEXT ACCOUNT   ENTER: SIGN IN"],
+            7 => &["CHOOSE A TD-PASS VAULT PIN (6 TO 63 CHARACTERS)"],
+            8 => &["RE-ENTER YOUR NEW VAULT PIN"],
+            _ => &["TOUCH YOUR YUBIKEY"],
+        };
+        for text in instructions {
+            row(format_args!("{text}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
+    Website(Website),
     Notebook(Notebook),
     /// `deploy-publish`: install a locally built deployment as current.
     Install {
@@ -1156,10 +1199,6 @@ pub enum Operation {
     ManageTime {
         requester: u32,
         setting: String,
-    },
-    AssignWebsiteKey {
-        requester: u32,
-        key: WebsiteKey,
     },
     /// Tag 42: one extra-volume change (td-disks/DESIGN.md).
     ManageVolumes {
@@ -1685,6 +1724,7 @@ impl Request {
             return Err("invalid consent protector operation".into());
         }
         match &operation {
+            Operation::Website(w) if !w.valid() => return Err("invalid website prompt".into()),
             Operation::Notebook(notebook) if !notebook.valid() => {
                 return Err("invalid consent notebook operation".into());
             }
@@ -1779,11 +1819,6 @@ impl Request {
             {
                 return Err("invalid consent time change".into());
             }
-            Operation::AssignWebsiteKey { requester, key }
-                if *requester != owner || !key.valid() =>
-            {
-                return Err("invalid website key assignment".into());
-            }
             Operation::ManageVolumes { requester, setting }
                 if *requester != owner || volume_setting::Change::decode(setting).is_err() =>
             {
@@ -1857,9 +1892,36 @@ impl Request {
         }
     }
 
+    pub fn website_successor(&self, next: &Self) -> bool {
+        let (Operation::Website(a), Operation::Website(b)) = (&self.operation, &next.operation)
+        else {
+            return false;
+        };
+        if self.owner != next.owner
+            || self.nonce != next.nonce
+            || a.ticket != b.ticket
+            || a.site != b.site
+            || a.register != b.register
+        {
+            return false;
+        }
+        if (a.stage, b.stage) == (0, 0) {
+            return a.account == b.account;
+        }
+        a.key == b.key
+            && match (a.stage, b.stage) {
+                (0, 1) | (1, 7) | (7, 8) => a.key.is_none() && a.register && a.account == b.account,
+                (0, 2) => a.key.is_none() && a.account == b.account,
+                (2, 3) | (3, 3) => a.key.is_none() && !a.register,
+                (0, 4) | (4, 2) | (2, 4) => a.key.is_some() && a.account == b.account,
+                _ => false,
+            }
+    }
+
     pub fn asks_pin(&self) -> bool {
         self.ceremony_step().is_some_and(LoginStep::asks_pin)
             || matches!(&self.operation, Operation::Notebook(n) if n.step != 0)
+            || matches!(&self.operation, Operation::Website(w) if matches!(w.stage, 2 | 7 | 8))
     }
 
     pub fn asks_recovery_key(&self) -> bool {
@@ -1984,12 +2046,12 @@ impl Request {
     /// identify step. Every other description and step does not.
     pub fn awaits_approval(&self) -> bool {
         match &self.operation {
+            Operation::Website(w) => matches!(w.stage, 0 | 1 | 3),
             Operation::Notebook(n) => n.step == 0,
             Operation::Install { .. }
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
-            | Operation::AssignWebsiteKey { .. }
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. }
@@ -2426,6 +2488,21 @@ impl Request {
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
+            Operation::Website(w) => {
+                bytes.extend_from_slice(&[
+                    45,
+                    w.stage,
+                    u8::from(w.register),
+                    u8::from(w.key.is_some()),
+                    w.key.unwrap_or(0),
+                ]);
+                bytes.extend_from_slice(&w.ticket.to_be_bytes());
+                put_text(&mut bytes, &w.site);
+                put_text(&mut bytes, &w.account);
+                if let Some(id) = w.credential {
+                    bytes.extend_from_slice(&id);
+                }
+            }
             Operation::Notebook(n) => {
                 bytes.extend_from_slice(&[41, n.method, n.action, n.purpose, n.role, n.step]);
                 bytes.extend_from_slice(&n.operation);
@@ -2569,13 +2646,6 @@ impl Request {
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, setting);
             }
-            Operation::AssignWebsiteKey { requester, key } => {
-                bytes.push(44);
-                bytes.extend_from_slice(&requester.to_be_bytes());
-                bytes.push(key.index);
-                bytes.extend_from_slice(&key.inode.to_be_bytes());
-                bytes.extend_from_slice(&key.device.to_be_bytes());
-            }
             Operation::ManageVolumes { requester, setting } => {
                 bytes.push(42);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -2674,7 +2744,7 @@ impl Request {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_BYTES {
+        if bytes.len() > MAX_BYTES && (bytes.get(44) != Some(&45) || bytes.len() > 600) {
             return Err("oversized consent request".into());
         }
         let mut input = Input(bytes);
@@ -2837,6 +2907,33 @@ impl Request {
                 requester: input.number()?,
                 blob: input.text()?,
             },
+            45 => {
+                let stage = input.byte()?;
+                let register = input.flag()?;
+                let physical = input.flag()?;
+                let index = input.byte()?;
+                if !physical && index != 0 {
+                    return Err("invalid website key choice".into());
+                }
+                Operation::Website(Website {
+                    ticket: input.wide()?,
+                    stage,
+                    register,
+                    key: physical.then_some(index),
+                    site: input.text()?,
+                    account: input.text()?,
+                    credential: if stage == 3 {
+                        Some(
+                            input
+                                .take(32)?
+                                .try_into()
+                                .map_err(|_| "invalid website credential")?,
+                        )
+                    } else {
+                        None
+                    },
+                })
+            }
             41 => Operation::Notebook(Notebook {
                 method: input.byte()?,
                 action: input.byte()?,
@@ -2855,14 +2952,6 @@ impl Request {
             39 => Operation::ManageTime {
                 requester: input.number()?,
                 setting: input.text()?,
-            },
-            44 => Operation::AssignWebsiteKey {
-                requester: input.number()?,
-                key: WebsiteKey {
-                    index: input.byte()?,
-                    inode: input.wide()?,
-                    device: input.wide()?,
-                },
             },
             42 => Operation::ManageVolumes {
                 requester: input.number()?,
@@ -2994,12 +3083,34 @@ impl Request {
     }
 
     /// Display human-relevant operation arguments; retain the nonce without displaying it.
+    pub fn website_rows<E>(
+        &self,
+        mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let Operation::Website(w) = &self.operation else {
+            return Ok(false);
+        };
+        row(format_args!("TD SECURE ATTENTION"))?;
+        row(format_args!("SESSION USER {}", self.owner))?;
+        w.rows(&mut row)?;
+        if !self.awaits_approval() {
+            row(format_args!("ESC TO CANCEL"))?;
+        }
+        Ok(true)
+    }
+
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![
             "TD SECURE ATTENTION".into(),
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
+            Operation::Website(w) => {
+                let _: Result<(), std::convert::Infallible> = w.rows(|row| {
+                    lines.push(row.to_string());
+                    Ok(())
+                });
+            }
             Operation::Notebook(n) => n.lines(&mut lines),
             Operation::Install { deployment, .. } => {
                 lines.push("INSTALL BUILT SYSTEM".into());
@@ -3188,17 +3299,6 @@ impl Request {
                 lines.push(format!("REQUEST: {setting}"));
                 lines.push("CLOCK AND HARDWARE CLOCK USE UTC".into());
                 lines.push("AUTOMATIC SYNC CAN ADJUST MANUAL TIME".into());
-                approval_lines(&mut lines);
-            }
-            Operation::AssignWebsiteKey { requester, key } => {
-                lines.push("GIVE FIREFOX DIRECT ACCESS TO THIS YUBIKEY".into());
-                lines.push(format!("REQUESTER UID {requester}"));
-                lines.push(format!(
-                    "FIDO INTERFACE hidraw{}  INODE {}  DEVICE {}",
-                    key.index, key.inode, key.device
-                ));
-                lines.push("USE A KEY DEDICATED TO WEBSITES".into());
-                lines.push("FIREFOX CAN SEND FIDO COMMANDS UNTIL UNPLUGGED".into());
                 approval_lines(&mut lines);
             }
             Operation::ManageVolumes { requester, setting } => {
@@ -3777,43 +3877,6 @@ pub(crate) fn deployment_id(value: &str) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
-
-    #[test]
-    fn website_key_binds_one_attachment_to_its_owner_and_presentation() {
-        let key = WebsiteKey::parse("5 123 61445").unwrap();
-        for invalid in [
-            "+5 123 61445",
-            "05 123 61445",
-            "5 0 61445",
-            "5 123 61446",
-            "5 123 61445 extra",
-            "256 123 61445",
-            "5 123 1048581",
-        ] {
-            assert!(WebsiteKey::parse(invalid).is_none(), "{invalid}");
-        }
-        let operation = Operation::AssignWebsiteKey {
-            requester: 1000,
-            key,
-        };
-        assert!(Request::new([1; 32], 1001, operation.clone()).is_err());
-        let request = Request::new([1; 32], 1000, operation).unwrap();
-        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
-        assert!(request
-            .lines()
-            .iter()
-            .any(|line| line.contains("hidraw5  INODE 123  DEVICE 61445")));
-        let other = Request::new(
-            [1; 32],
-            1000,
-            Operation::AssignWebsiteKey {
-                requester: 1000,
-                key: WebsiteKey { inode: 124, ..key },
-            },
-        )
-        .unwrap();
-        assert_ne!(request.encode(), other.encode());
-    }
 
     #[test]
     fn enrollment_progression_preserves_identity_and_stops_at_the_selected_final_proof() {

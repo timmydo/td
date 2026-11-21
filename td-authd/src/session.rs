@@ -50,6 +50,7 @@ const CLEANUP_TIME: Duration = Duration::from_secs(2);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
     Prepare,
+    Website(crate::website::Frame),
     NotebookOpen,
     NotebookBegin,
     NotebookState,
@@ -108,6 +109,7 @@ impl Request {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [0x10] => Ok(Self::Prepare),
+            [0x2d, rest @ ..] => Ok(Self::Website(crate::website::Frame::parse(rest)?)),
             [0x28] => Ok(Self::NotebookOpen),
             [0x29] => Ok(Self::NotebookBegin),
             [0x2a] => Ok(Self::NotebookState),
@@ -355,6 +357,7 @@ impl Drop for Cleanup {
 }
 
 pub(crate) struct Session {
+    website: crate::website::Authority,
     owner: u32,
     notebook: Option<crate::notebook::Bridge>,
     /// The last notebook bridge ended with a process's own failed exit,
@@ -399,6 +402,7 @@ impl Session {
         }
         Ok(Self {
             owner,
+            website: crate::website::Authority::default(),
             notebook: None,
             notebook_failed: false,
             notebook_mail: None,
@@ -472,6 +476,9 @@ impl Session {
         if self.suspending.is_some() && request.takes_slot() {
             return Err("a request for the slot while suspend is pending".into());
         }
+        if request.takes_slot() || request == Request::NotebookLock {
+            self.website.revoke();
+        }
         match request {
             Request::Prepare => {
                 if self.activated {
@@ -496,6 +503,19 @@ impl Session {
                     operation.cancel()?;
                 }
                 Ok(vec![0xab])
+            }
+            Request::Website(frame) => {
+                let allowed = self.prepared
+                    && self.setup.is_none()
+                    && self.cleanup.is_none()
+                    && self.operation.is_none()
+                    && self.inspection.is_none()
+                    && self.suspending.is_none()
+                    && !self
+                        .revocation
+                        .as_ref()
+                        .is_some_and(crate::revocation::Revocation::restarting);
+                self.website.answer(frame, allowed)
             }
             Request::NotebookOpen => {
                 // A window that just closed is seen before it is counted open.
@@ -1276,6 +1296,7 @@ impl Session {
     }
 
     fn close_with(&mut self, command: impl FnOnce(u32) -> Command) -> Result<(), String> {
+        self.website = crate::website::Authority::default();
         if !self.activated {
             self.abandon_revocation(true);
             return Ok(());

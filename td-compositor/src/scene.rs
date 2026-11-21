@@ -3490,6 +3490,14 @@ impl Scene {
                 {
                     previous.notebook_successor(&request)
                 }
+                Some(previous)
+                    if matches!(
+                        previous.operation(),
+                        crate::authority::consent::Operation::Website(_)
+                    ) =>
+                {
+                    previous.website_successor(&request)
+                }
                 Some(previous) if previous.is_login() => previous.login_successor(&request).is_ok(),
                 Some(previous) if previous.upgrade_step().is_some() => {
                     previous.upgrade_successor(&request).is_ok()

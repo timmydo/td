@@ -5194,15 +5194,14 @@ principal grant and pinned-source checks are unchanged; neither admission nor
 approval asserts that the requester built the image. The exact manifest digest
 and root helper's payload checks establish which bytes are approved.
 
-## Assign a website YubiKey to Firefox
+### Website authenticator
 
-The primary user's `assign-website-key` principal grant admits a typed
-settings request. Selection at secure attention H opens the fixed
-`/dev/hidrawN` with O_PATH and O_NOFOLLOW. The authority pins its inode
-through approval and helper completion. Tag 44 binds requester, index,
-inode and device number to the displayed request. On approval the
-authority resolves the installed Firefox workload and invokes
-`/bin/td-secret assign-website-key INDEX INODE DEVICE GROUP`. The helper
-validates the live USB FIDO collection under the trusted token lock.
-Publication ends when the device disconnects. APPLICATIONS.md describes
-the jail view and the browser's authority over that attachment.
+The paired compositor's request 2d polls the virtual authenticator or
+answers a transaction. Root obtains the current Firefox workload group
+from the application ledger and starts the fixed td-pass worker with an
+unnamed socketpair. The 32-byte worker generation and the individual
+ticket bind commands to that process and that ceremony. Root revokes
+website operations before local secret operations, session lock or
+suspend. Losing the generation closes the worker. A worker failure is
+reported as unavailable on this channel. The worker, its private storage
+and the TPM admission record are documented in td-passkeys/DESIGN.md.

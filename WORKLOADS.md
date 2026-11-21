@@ -522,9 +522,9 @@ own account.
 - Whether a workload's request for a directory grant is answered by
   td-portal's dialog alone or also recorded as a standing grant.
 
-## Firefox website key
+### Firefox website authenticator
 
-A physical settings approval assigns the current YubiKey FIDO attachment
-to the installed Firefox workload group. A launch of the installed
-Firefox entry can bind that device and its discovery metadata. The
-assignment ends on unplug. APPLICATIONS.md describes setup and scope.
+The root session's virtual FIDO hidraw device is readable and writable
+by the admitted Firefox workload group. Physical FIDO nodes stay under
+root ownership and mode 0600. td-jail verifies and pins the virtual
+node, its sysfs identity and its attachment for the Firefox instance.

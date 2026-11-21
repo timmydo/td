@@ -6427,7 +6427,7 @@ device's arrival or departure: the compositor's sysfs reads can only
 exclude a device from secure attention, and token workers find tokens
 through their own root-only hidraw path (`td-secret/DESIGN.md`, "USB
 token transport"). Only `/dev/input/event*` nodes are assigned late.
-trusted hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
+hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
 assignment stay boot snapshots, playback nodes keep their own
 reassignment at each audio start (`APPLICATIONS.md` §K.5), and no node
 moves between accounts: section 1's absent live seat reassignment stays
@@ -8198,11 +8198,6 @@ retry. QEMU exit and successful filesystem teardown are separate observations.
 
 ### Initial remote administrator key
 
-H can select a queued Firefox website-key assignment. The compositor
-presents the attachment identity, direct FIDO authority and unplug lifetime
-before enabling Enter. A success receipt tells the operator to reopen
-Firefox. Subsequent website requests use Firefox's own WebAuthn UI.
-
 H also selects the settings intake's initial remote-admin key enrollment
 (tag 40). The prompt displays the full Ed25519 key and the grant to install
 configured signed releases or build trusted main, and reboot without further
@@ -8237,3 +8232,16 @@ publisher policy. `td-update/ADMIN.md` owns both recovery operations.
 The shared td-authd channel module also contains the root workspace
 intake's fixed `POLLRDHUP` lifetime check (UNSAFE.md §16). The compositor
 never calls it; its own authority-channel operations are unchanged.
+
+### Firefox website passkeys
+
+A pending website request displays a compositor notification. Ctrl+Alt+P
+on the physical seat opens that ticket while the session is unlocked.
+Ctrl+Alt+Esc still opens the system menu. The prompt shows the exact RP,
+the account when supplied, and the selected provider. Enter confirms a
+presented choice. Tab cycles through td-pass and each attached YubiKey.
+A new registration selects td-pass first when this boot admitted its
+TPM. Creating the vault requires separate acceptance that losing or
+clearing the original TPM loses its passkeys. PINs use the protected
+field. Escape, session lock and a changed worker generation revoke the
+operation. A YubiKey remains available for td authentication.

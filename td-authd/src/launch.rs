@@ -917,7 +917,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b, ..] => {
+        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b | 0x2d, ..] => {
             Ok(Request::Secret(crate::session::Request::decode(bytes)?))
         }
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
@@ -1161,6 +1161,11 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
                 Request::Secret(request) => secrets.answer(request)?,
                 request => {
                     secrets.tick()?;
+                    if matches!(&request, Request::Supervised(unit) if unit.name()=="firefox") {
+                        let _ = secrets.answer(crate::session::Request::Website(
+                            crate::website::Frame::parse(&[1])?,
+                        ))?;
+                    }
                     launches.answer(&config, request)?
                 }
             };

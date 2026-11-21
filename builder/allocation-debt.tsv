@@ -1118,10 +1118,10 @@ td-authd/src/backoff.rs	allocation-macro	10
 td-authd/src/backoff.rs	unchecked-growth-or-clone	1
 td-authd/src/channel.rs	allocation-macro	1
 td-authd/src/consent.rs	allocating-constructor	5
-td-authd/src/consent.rs	allocating-conversion	12
-td-authd/src/consent.rs	allocation-macro	53
+td-authd/src/consent.rs	allocating-conversion	13
+td-authd/src/consent.rs	allocation-macro	51
 td-authd/src/consent.rs	heap-owner	2
-td-authd/src/consent.rs	unchecked-growth-or-clone	234
+td-authd/src/consent.rs	unchecked-growth-or-clone	228
 td-authd/src/deployment.rs	allocating-constructor	2
 td-authd/src/deployment.rs	allocating-conversion	21
 td-authd/src/deployment.rs	allocation-macro	7
@@ -1199,7 +1199,7 @@ td-authd/src/session.rs	allocation-macro	59
 td-authd/src/session.rs	heap-owner	10
 td-authd/src/session.rs	unchecked-growth-or-clone	20
 td-authd/src/set_hostname.rs	allocating-constructor	2
-td-authd/src/set_hostname.rs	allocating-conversion	12
+td-authd/src/set_hostname.rs	allocating-conversion	11
 td-authd/src/set_hostname.rs	allocation-macro	8
 td-authd/src/set_hostname.rs	unchecked-growth-or-clone	9
 td-authd/src/software.rs	allocating-conversion	12
@@ -3549,7 +3549,7 @@ td-secret/src/frames.rs	allocating-constructor	1
 td-secret/src/frames.rs	allocating-conversion	4
 td-secret/src/frames.rs	allocation-macro	3
 td-secret/src/frames.rs	unchecked-growth-or-clone	5
-td-secret/src/lib.rs	allocating-conversion	12
+td-secret/src/lib.rs	allocating-conversion	11
 td-secret/src/lib.rs	allocation-macro	2
 td-secret/src/login_operation.rs	allocating-constructor	1
 td-secret/src/login_operation.rs	allocating-conversion	10

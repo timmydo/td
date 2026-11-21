@@ -1851,15 +1851,6 @@ instead — `/proc/<pid>/fd/N`, which the command OPENS rather than
 inherits. That needs no flag, leaks no descriptor into any child, reads
 the same in both directions, and costs only the text of the word.
 
-The Firefox website-key settings intake uses std OpenOptions with the
-fixed O_PATH and O_NOFOLLOW flags on the numerically selected hidraw
-path. The root helper uses std file permissions and fd-based fchown.
-Stage 1 binds the devtmpfs node read-only/nosuid/noexec and the hidraw
-sysfs leaf read-only/nosuid/nodev/noexec by path in the new mount
-namespace. It checks each mounted target's device and inode against its
-open descriptor before starting stage 2. Stage 2 checks both mount types
-and flags before entry.
-
 ## 9. `td-jail` — the application sandbox
 
 The landed `td-jail` surface carries exactly FOURTEEN syscalls on x86-64
@@ -4228,3 +4219,10 @@ The notebook mail intake is another safe caller of td-authd's existing
 socket's peer UID to the fixed portal UID 991 before reading a frame. It
 adds no raw syscall or unsafe block. AppId authentication remains in the
 portal's broker query; peer UID is not treated as the mail application ID.
+
+The Firefox instance can bind the verified virtual FIDO hidraw node and
+its sysfs leaf using the existing td-jail mount boundary. Its root
+selector, identity, inode, group and access mode are verified before
+publication. Only the selected bind and restricted sysfs scaffold are
+admitted in the second stage. Physical YubiKeys are opened by the
+existing td-fido worker under the system operation lock.

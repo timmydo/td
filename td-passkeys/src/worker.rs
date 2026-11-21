@@ -224,9 +224,11 @@ impl Worker {
             return Ok(());
         }
         if let Some(h) = &self.hardware {
-            let Some(n) = h.retries else { return Ok(()) };
             td_alloc::extend_from_slice(reply, &h.ticket.to_be_bytes())?;
-            td_alloc::extend_from_slice(reply, &[6, n])?;
+            match h.retries {
+                Some(n) => td_alloc::extend_from_slice(reply, &[6, n])?,
+                None => td_alloc::push(reply, 10)?,
+            }
             return Ok(());
         }
         let Some((ticket, action)) = self.session.describe() else {

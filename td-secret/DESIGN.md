@@ -386,12 +386,8 @@ The prompted parents are explicitly enabled after
 allnoconfig; derived USB_XHCI_PCI is checked after olddefconfig without
 a fictitious direct pin. Besides EHCI, built in for the ThinkPad T430s's
 USB 2.0 port, the profile adds no legacy USB host controller drivers.
-Trusted token nodes stay root-only. The separate `td-secret website-key`
-command requests a physical settings approval for a website-dedicated
-YubiKey. td-authd pins the kernel attachment and supplies the installed
-Firefox group to the root assignment helper. A granted attachment
-leaves trusted token admission until unplugged. See APPLICATIONS.md,
-“Using a YubiKey for websites in Firefox”, for the operating procedure. Separate USB keyboard/pointer
+Raw token nodes stay root-only and never enter an application jail or the
+compositor's input-device delegation. Separate USB keyboard/pointer
 interfaces do enter the compositor's seat-assigned evdev roster, at
 startup and through hotplug; its trusted-device boundary is specified in
 `td-compositor/DESIGN.md` under Physical secure attention.

@@ -1120,13 +1120,14 @@ while the notebook is unlocked. The adapter exposes neither notes nor vault
 keys and cannot unlock the service. Closing or locking the notebook cancels
 outstanding requests, but cannot revoke plaintext already released to mail.
 
-## Website security keys
+### Website passkeys
 
-A TPM-only installation can dedicate its USB YubiKey to Firefox through
-the physical settings operation in APPLICATIONS.md. Trusted FIDO workers
-serialize with assignment and reject the resulting Firefox-owned group
-and mode. A browser with direct FIDO access is trusted for website origin
-binding and can issue any commands the key accepts. Use a website key
-separate from keys enrolled for td login, disk unlock or credential
-release. Device metadata identifies an attachment, not the credentials
-stored on it.
+Confined Firefox can submit website CTAP requests to a td-owned virtual
+authenticator. Its trusted confirmation and protected PIN entry use the
+physical seat. Site and account labels come from the request; a
+compromised browser can misstate the intended website. The worker
+admits website RP identifiers only, omits local credential-management
+commands and reserves the selected root-owned YubiKey through the same
+operation lock used by td login. A hardware passkey stays on that key.
+Device-bound software passkeys use the independently established TPM
+primary and their vault PIN, with explicit enrollment consent.

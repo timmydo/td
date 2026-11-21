@@ -2400,7 +2400,21 @@ impl WebsiteKey {
         if plan.host_mode || plan.name != "firefox" || plan.entry != "/app/bin/firefox" {
             return Ok(None);
         }
-        const SELECTOR: &str = "/dev/td-firefox-website-key";
+        // First launch can race the kernel publishing the session's UHID
+        // device. Wait here rather than blocking the paired authority.
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(key) = Self::published(plan)? {
+                return Ok(Some(key));
+            }
+            if start.elapsed() >= std::time::Duration::from_secs(6) {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+    fn published(plan: &LaunchPlan) -> io::Result<Option<Self>> {
+        const SELECTOR: &str = "/dev/td-firefox-passkeys";
         let published = match fs::symlink_metadata(SELECTOR) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2463,7 +2477,7 @@ impl WebsiteKey {
         let Ok(syspath) = fs::canonicalize(path) else {
             return Ok(None);
         };
-        if !syspath.starts_with("/sys/devices")
+        if !syspath.starts_with("/sys/devices/virtual")
             || syspath.file_name() != Some(OsStr::new(name))
             || syspath.parent().and_then(Path::file_name) != Some(OsStr::new("hidraw"))
         {
@@ -2474,6 +2488,35 @@ impl WebsiteKey {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        let event = crate::text(format_args!(
+            "/proc/self/fd/{}/device/uevent",
+            std::os::fd::AsRawFd::as_raw_fd(&sysfs)
+        ))?;
+        let mut bytes = [0; 4097];
+        let mut input = fs::File::open(event)?;
+        let mut used = 0;
+        while let Some(space) = bytes.get_mut(used..).filter(|left| !left.is_empty()) {
+            let n = input.read(space)?;
+            if n == 0 {
+                break;
+            }
+            used += n;
+        }
+        let event = bytes
+            .get(..used)
+            .filter(|s| s.len() < 4097)
+            .and_then(|s| std::str::from_utf8(s).ok());
+        if !event.is_some_and(|s| {
+            s.lines().any(|l| l == "HID_ID=0003:00001209:00007464")
+                && s.lines().any(|l| l == "HID_PHYS=td/firefox-passkeys")
+                && s.lines().any(|l| {
+                    l.strip_prefix("HID_UNIQ=td-").is_some_and(|id| {
+                        id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit())
+                    })
+                })
+        }) {
+            return Ok(None);
+        }
         Ok(Some(Self {
             index,
             node,
@@ -3905,7 +3948,7 @@ fn require_mount_plan(
             &["rw", "nodev"],
         )?;
         let leaf = fs::read_link(crate::text(format_args!("/sys/class/hidraw/{name}"))?)?;
-        if !leaf.starts_with("/sys/devices") {
+        if !leaf.starts_with("/sys/devices/virtual") {
             return Err(io::Error::other("invalid website key sysfs leaf"));
         }
         require_mount(

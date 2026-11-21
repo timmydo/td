@@ -143,18 +143,10 @@ verification. The decoder has no authority to operate a device.
 
 ### Website key attachment
 
-`website_candidate` inspects the fixed hidraw names without opening them.
-A candidate must pass the existing single unnumbered FIDO collection
-check and report USB vendor 1050. td-secret rejects ambiguous selection.
-The root assignment helper takes the trusted worker's operation lock,
-opens the approved inode, rechecks its identity and descriptor, and
-publishes a relative selector symlink at `/dev/td-firefox-website-key`. The attachment
-becomes root-owned mode 0660 with Firefox's application group. Trusted
-root workers require root-group mode 0600. The assignment admits a retry
-of its partially prepared selection. Linux devtmpfs owns the only host
-link to the inode and removes it on unplug. A subsequent assignment can
-replace the selector. A replacement device starts with root-only access. The browser launcher holds the open hardware file
-while serving the instance so Linux cannot reuse that hidraw minor in it.
+The website worker enumerates root-owned USB YubiKey FIDO collections.
+A selected device retains its kernel identity and participates in the
+same operation lock as login and recovery. The virtual Firefox device
+is excluded from system token discovery.
 
 ## Consumers
 
