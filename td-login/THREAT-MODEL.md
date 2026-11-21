@@ -1119,3 +1119,14 @@ insufficient. The tuple selects only a previously approved entry password,
 while the notebook is unlocked. The adapter exposes neither notes nor vault
 keys and cannot unlock the service. Closing or locking the notebook cancels
 outstanding requests, but cannot revoke plaintext already released to mail.
+
+## Website security keys
+
+A TPM-only installation can dedicate its USB YubiKey to Firefox through
+the physical settings operation in APPLICATIONS.md. Trusted FIDO workers
+serialize with assignment and reject the resulting Firefox-owned group
+and mode. A browser with direct FIDO access is trusted for website origin
+binding and can issue any commands the key accepts. Use a website key
+separate from keys enrolled for td login, disk unlock or credential
+release. Device metadata identifies an attachment, not the credentials
+stored on it.

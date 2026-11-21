@@ -129,6 +129,21 @@ so:
   consumer serves the role from its own command line
   (td-secret/DESIGN.md names td-secret's).
 
+### Website key attachment
+
+`website_candidate` inspects the fixed hidraw names without opening them.
+A candidate must pass the existing single unnumbered FIDO collection
+check and report USB vendor 1050. td-secret rejects ambiguous selection.
+The root assignment helper takes the trusted worker's operation lock,
+opens the approved inode, rechecks its identity and descriptor, and
+publishes a relative selector symlink at `/dev/td-firefox-website-key`. The attachment
+becomes root-owned mode 0660 with Firefox's application group. Trusted
+root workers require root-group mode 0600. The assignment admits a retry
+of its partially prepared selection. Linux devtmpfs owns the only host
+link to the inode and removes it on unplug. A subsequent assignment can
+replace the selector. A replacement device starts with root-only access. The browser launcher holds the open hardware file
+while serving the instance so Linux cannot reuse that hidraw minor in it.
+
 ## Consumers
 
 td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"

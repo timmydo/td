@@ -35,6 +35,7 @@ pub(crate) enum Notice {
     HostnameSaved,
     TimeSaved,
     VolumeSaved,
+    WebsiteKeyAssigned,
     AdminKeySaved,
     PublisherSaved,
     /// A committed device-bound disk installation, before its recovery key:
@@ -690,6 +691,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
+        Notice::WebsiteKeyAssigned => "YUBIKEY ASSIGNED - REOPEN FIREFOX",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::PublisherSaved => "UPDATE PUBLISHER TRUST REPLACED",

@@ -139,6 +139,32 @@ pub fn run(args: &[String]) -> Result<(), String> {
         [command, flag, uid] if command == "lock-session" && flag == "--uid" => {
             store::lock_session(parse_uid(uid)?)
         }
+        [command] if command == "website-key" => {
+            let (index, inode, device) = fido_device::website_candidate()?;
+            use std::io::Write;
+            use std::os::unix::process::CommandExt;
+            // Three decimal identities, at most 3 + 20 + 20 digits and two spaces.
+            let mut storage = [0u8; 45];
+            let mut cursor = std::io::Cursor::new(storage.as_mut_slice());
+            write!(cursor, "{index} {inode} {device}").map_err(|_| "format website key")?;
+            let used = cursor.position() as usize;
+            let identity = storage
+                .get(..used)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .ok_or("invalid website key identity")?;
+            let error = std::process::Command::new("/bin/td-authd")
+                .args(["request-website-key", identity])
+                .exec();
+            Err(error.kind().to_string())
+        }
+        [command, index, inode, device, group] if command == "assign-website-key" => {
+            fido_device::assign_website_key(
+                index.parse().map_err(|_| "invalid website key index")?,
+                inode.parse().map_err(|_| "invalid website key inode")?,
+                device.parse().map_err(|_| "invalid website key device")?,
+                group.parse().map_err(|_| "invalid Firefox group")?,
+            )
+        }
         [command, index, inode, rdev] if command == "hid-worker" => {
             fido_device::worker(index, inode, rdev)
         }
@@ -155,6 +181,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         _ => Err(concat!(
             "usage: td-secret set [--recovery] APPLICATION/NAME < credential-input; ",
+            "td-secret website-key assigns a plugged-in YubiKey to Firefox; ",
             "use physical secure attention to enroll or unlock the store; ",
             "manual hardware diagnostic: td-secret check-portable-token --create-test-credential"
         )
@@ -409,7 +436,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x5e3fb383c97e2405
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x15cb18f54f2439bd, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xc81434bc533bfa8f, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

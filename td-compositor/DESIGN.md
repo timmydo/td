@@ -6414,7 +6414,7 @@ device's arrival or departure: the compositor's sysfs reads can only
 exclude a device from secure attention, and token workers find tokens
 through their own root-only hidraw path (`td-secret/DESIGN.md`, "USB
 token transport"). Only `/dev/input/event*` nodes are assigned late.
-hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
+trusted hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
 assignment stay boot snapshots, playback nodes keep their own
 reassignment at each audio start (`APPLICATIONS.md` §K.5), and no node
 moves between accounts: section 1's absent live seat reassignment stays
@@ -8184,6 +8184,11 @@ arbitrary service operation. Repeating Stop replaces the inode for explicit
 retry. QEMU exit and successful filesystem teardown are separate observations.
 
 ### Initial remote administrator key
+
+H can select a queued Firefox website-key assignment. The compositor
+presents the attachment identity, direct FIDO authority and unplug lifetime
+before enabling Enter. A success receipt tells the operator to reopen
+Firefox. Subsequent website requests use Firefox's own WebAuthn UI.
 
 H also selects the settings intake's initial remote-admin key enrollment
 (tag 40). The prompt displays the full Ed25519 key and the grant to install

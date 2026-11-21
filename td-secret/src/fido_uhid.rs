@@ -79,6 +79,10 @@ impl Uhid {
     /// A USB-bus device under the pid.codes test vendor, after checking that
     /// `/dev/uhid` is a root-owned, root-group mode-0600 character device.
     pub(crate) fn create(name: &str, product: u32, descriptor: &[u8]) -> Self {
+        Self::create_vendor(name, product, descriptor, VENDOR)
+    }
+
+    pub(crate) fn create_vendor(name: &str, product: u32, descriptor: &[u8], vendor: u32) -> Self {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,7 +101,7 @@ impl Uhid {
         event[4..4 + name.len()].copy_from_slice(name.as_bytes());
         event[260..262].copy_from_slice(&(descriptor.len() as u16).to_ne_bytes());
         event[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
-        event[264..268].copy_from_slice(&VENDOR.to_ne_bytes());
+        event[264..268].copy_from_slice(&vendor.to_ne_bytes());
         event[268..272].copy_from_slice(&product.to_ne_bytes());
         event[CREATE2_DESCRIPTOR..CREATE2_DESCRIPTOR + descriptor.len()]
             .copy_from_slice(descriptor);

@@ -1851,6 +1851,15 @@ instead — `/proc/<pid>/fd/N`, which the command OPENS rather than
 inherits. That needs no flag, leaks no descriptor into any child, reads
 the same in both directions, and costs only the text of the word.
 
+The Firefox website-key settings intake uses std OpenOptions with the
+fixed O_PATH and O_NOFOLLOW flags on the numerically selected hidraw
+path. The root helper uses std file permissions and fd-based fchown.
+Stage 1 binds the devtmpfs node read-only/nosuid/noexec and the hidraw
+sysfs leaf read-only/nosuid/nodev/noexec by path in the new mount
+namespace. It checks each mounted target's device and inode against its
+open descriptor before starting stage 2. Stage 2 checks both mount types
+and flags before entry.
+
 ## 9. `td-jail` — the application sandbox
 
 The landed `td-jail` surface carries exactly FOURTEEN syscalls on x86-64

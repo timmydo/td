@@ -1125,9 +1125,9 @@ td-authd/src/backoff.rs	unchecked-growth-or-clone	1
 td-authd/src/channel.rs	allocation-macro	1
 td-authd/src/consent.rs	allocating-constructor	5
 td-authd/src/consent.rs	allocating-conversion	12
-td-authd/src/consent.rs	allocation-macro	51
+td-authd/src/consent.rs	allocation-macro	53
 td-authd/src/consent.rs	heap-owner	2
-td-authd/src/consent.rs	unchecked-growth-or-clone	224
+td-authd/src/consent.rs	unchecked-growth-or-clone	234
 td-authd/src/deployment.rs	allocating-constructor	2
 td-authd/src/deployment.rs	allocating-conversion	21
 td-authd/src/deployment.rs	allocation-macro	7
@@ -1205,7 +1205,7 @@ td-authd/src/session.rs	allocation-macro	59
 td-authd/src/session.rs	heap-owner	10
 td-authd/src/session.rs	unchecked-growth-or-clone	20
 td-authd/src/set_hostname.rs	allocating-constructor	2
-td-authd/src/set_hostname.rs	allocating-conversion	11
+td-authd/src/set_hostname.rs	allocating-conversion	12
 td-authd/src/set_hostname.rs	allocation-macro	8
 td-authd/src/set_hostname.rs	unchecked-growth-or-clone	9
 td-authd/src/software.rs	allocating-conversion	12
@@ -1759,7 +1759,7 @@ td-fido/src/fido_ctap.rs	allocation-macro	2
 td-fido/src/fido_ctap.rs	unchecked-growth-or-clone	11
 td-fido/src/fido_device.rs	allocating-constructor	1
 td-fido/src/fido_device.rs	allocating-conversion	11
-td-fido/src/fido_device.rs	allocation-macro	17
+td-fido/src/fido_device.rs	allocation-macro	15
 td-fido/src/fido_device.rs	heap-owner	1
 td-fido/src/fido_device.rs	unchecked-growth-or-clone	5
 td-fido/src/fido_disk.rs	allocating-constructor	1
@@ -2034,10 +2034,10 @@ td-jail/src/seccomp.rs	allocation-macro	13
 td-jail/src/seccomp.rs	unchecked-growth-or-clone	5
 td-jail/src/sys.rs	allocation-macro	4
 td-jail/src/transition.rs	allocating-constructor	10
-td-jail/src/transition.rs	allocating-conversion	114
+td-jail/src/transition.rs	allocating-conversion	115
 td-jail/src/transition.rs	allocation-macro	374
 td-jail/src/transition.rs	heap-owner	3
-td-jail/src/transition.rs	unchecked-growth-or-clone	122
+td-jail/src/transition.rs	unchecked-growth-or-clone	125
 td-jail/src/workspace.rs	allocating-conversion	18
 td-jail/src/workspace.rs	allocation-macro	42
 td-jail/src/workspace.rs	unchecked-growth-or-clone	36
@@ -3548,7 +3548,7 @@ td-secret/src/frames.rs	allocating-constructor	1
 td-secret/src/frames.rs	allocating-conversion	4
 td-secret/src/frames.rs	allocation-macro	3
 td-secret/src/frames.rs	unchecked-growth-or-clone	5
-td-secret/src/lib.rs	allocating-conversion	11
+td-secret/src/lib.rs	allocating-conversion	12
 td-secret/src/lib.rs	allocation-macro	2
 td-secret/src/login_operation.rs	allocating-constructor	1
 td-secret/src/login_operation.rs	allocating-conversion	10

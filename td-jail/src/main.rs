@@ -1073,7 +1073,7 @@ mod confinement {
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
         assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor.as_slice())?;"));
         assert!(TRANSITION.contains(
-            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptors)\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
+            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptors)\n            .chain(\n                website_key\n                    .iter()\n                    .flat_map(|key| [key.node.as_raw_fd() as u32, key.sysfs.as_raw_fd() as u32]),\n            )\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
         ));
         assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));
         assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));

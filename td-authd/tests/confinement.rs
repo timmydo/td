@@ -186,7 +186,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x15cb18f54f2439bd,
+        0xc81434bc533bfa8f,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -693,7 +693,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
     // A failed write is sticky: `1f` answers 02 while one stands.
     assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
-    assert_eq!(rename.matches("Command::new(").count(), 4);
+    assert_eq!(rename.matches("Command::new(").count(), 5);
+    assert!(rename.contains("Command::new(\"/bin/td-secret\")"));
+    assert!(rename.contains("crate::application::admitted_uid(\"firefox\")?"));
     assert!(rename.contains("command.args([\"accept-publisher\", fingerprint]);"));
     assert!(rename.contains("Command::new(\"/bin/td-admin\")"));
     assert!(rename.contains("command.args([\"accept-key\", blob]);"));
@@ -1860,7 +1862,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
 const LAUNCH_FINGERPRINT: u64 = 0xee8466da0204da7b;
-const MAIN_FINGERPRINT: u64 = 0xed3640ea05832242;
+const MAIN_FINGERPRINT: u64 = 0x3175b506acfe09d1;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0x9991a82824bab5fd;
 
@@ -1872,8 +1874,8 @@ const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const SHARED_MEMORY_FINGERPRINT: u64 = 0xe860c6bf21db03b0;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0x21e50efe028ca4b6;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x9c3353d7916f6012;
+const ELEVATION_FINGERPRINT: u64 = 0x8debdaa6919034d5;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x17c8ebcb6faa1505;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;

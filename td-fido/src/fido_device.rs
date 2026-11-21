@@ -113,6 +113,7 @@ fn desktop_identity(status: &str) -> Result<(u32, u32), String> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Device {
+    yubikey: bool,
     index: u8,
     inode: u64,
     rdev: u64,
@@ -127,7 +128,7 @@ impl Device {
         // This avoids an
         // unbounded directory walk and accepts no caller-selected path.
         for index in 0..=u8::MAX {
-            if let Ok(meta) = fs::symlink_metadata(format!("/dev/hidraw{index}")) {
+            if let Ok(meta) = fs::symlink_metadata(node_path(index)) {
                 if let Ok(device) = Self::inspect(index, &meta, Admission::Root) {
                     found.push(device);
                 }
@@ -143,7 +144,7 @@ impl Device {
         Admission::Desktop.require()?;
         let mut found = Vec::new();
         for index in 0..=u8::MAX {
-            if let Ok(meta) = fs::symlink_metadata(format!("/dev/hidraw{index}")) {
+            if let Ok(meta) = fs::symlink_metadata(node_path(index)) {
                 if let Ok(device) = Self::inspect(index, &meta, Admission::Desktop) {
                     found.push(device);
                 }
@@ -153,12 +154,7 @@ impl Device {
     }
 
     fn open(index: u8, admission: Admission) -> Result<(Self, File), String> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(NOFOLLOW | NOCTTY)
-            .open(format!("/dev/hidraw{index}"))
-            .map_err(|error| open_failure(admission, error.kind()))?;
+        let file = open_node(index).map_err(|error| open_failure(admission, error.kind()))?;
         let meta = file.metadata().map_err(|_| "read token device metadata")?;
         Ok((Self::inspect(index, &meta, admission)?, file))
     }
@@ -173,6 +169,10 @@ impl Device {
             }
             .into());
         }
+        Self::profile(index, meta, admission)
+    }
+
+    fn profile(index: u8, meta: &fs::Metadata, admission: Admission) -> Result<Self, String> {
         let (event_path, descriptor_path) = metadata_paths(meta.rdev());
         let event = bounded_file(&event_path, 4096)?;
         let event = std::str::from_utf8(&event).map_err(|_| "invalid token bus metadata")?;
@@ -185,12 +185,138 @@ impl Device {
         }
         descriptor(&bounded_file(&descriptor_path, MAX_DESCRIPTOR)?)?;
         Ok(Self {
+            yubikey: id.starts_with("0003:00001050:"),
             index,
             inode: meta.ino(),
             rdev: meta.rdev(),
             admission,
         })
     }
+}
+
+const WEBSITE_NODE: &str = "/dev/td-firefox-website-key";
+
+fn open_node(index: u8) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(NOFOLLOW | NOCTTY)
+        .open(node_path(index))
+}
+
+fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+fn website_profile(index: u8, meta: &fs::Metadata) -> Option<Device> {
+    // A crash after publishing or preparing the group mode can be retried on
+    // the same inode. Only the final fchown grants another account access.
+    if !meta.file_type().is_char_device() || meta.uid() != 0 || meta.gid() != 0 {
+        return None;
+    }
+    let mode = meta.mode() & 0o7777;
+    match (meta.nlink(), mode) {
+        (1, 0o600) => (),
+        (1, 0o660) if fs::metadata(WEBSITE_NODE).is_ok_and(|alias| same_inode(meta, &alias)) => (),
+        _ => return None,
+    }
+    Device::profile(index, meta, Admission::Root)
+        .ok()
+        .filter(|device| device.yubikey)
+}
+
+/// Public sysfs inspection for the human's command. No device is opened.
+pub fn website_candidate() -> Result<(u8, u64, u64), String> {
+    let mut selected = None;
+    for index in 0..=u8::MAX {
+        let Ok(meta) = fs::symlink_metadata(node_path(index)) else {
+            continue;
+        };
+        if let Some(key) = website_profile(index, &meta) {
+            if selected.is_some() {
+                return Err("plug in only the YubiKey to assign to Firefox".into());
+            }
+            selected = Some((index, key.inode, key.rdev));
+        }
+    }
+    selected.ok_or_else(|| "no unassigned USB YubiKey FIDO interface found".into())
+}
+
+/// Commit the attachment named in a physical settings approval. The
+/// authority holds its inode from presentation through the helper's exit.
+pub fn assign_website_key(index: u8, inode: u64, rdev: u64, group: u32) -> Result<(), String> {
+    require_root()?;
+    if !(65536..98304).contains(&group) {
+        return Err("invalid website key group".into());
+    }
+    let _operation = operation_lock(Admission::Root, None)?;
+    let path = node_path(index);
+    let meta = fs::symlink_metadata(&path).map_err(|_| "website key disconnected")?;
+    if meta.ino() != inode || meta.rdev() != rdev || website_profile(index, &meta).is_none() {
+        return Err("approved USB YubiKey FIDO interface is unavailable".into());
+    }
+    let file = open_node(index).map_err(|_| "open approved website key")?;
+    let pinned = file
+        .metadata()
+        .map_err(|_| "inspect approved website key")?;
+    if !same_inode(&meta, &pinned) || website_profile(index, &pinned).is_none() {
+        return Err("website key changed before assignment".into());
+    }
+
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .ok_or("invalid hidraw name")?;
+    let publish = match fs::symlink_metadata(WEBSITE_NODE) {
+        Ok(link) if link.file_type().is_symlink() && link.uid() == 0 => {
+            match fs::metadata(WEBSITE_NODE) {
+                Ok(old) if same_inode(&old, &pinned) => false,
+                Ok(old)
+                    if old.mode() & 0o7777 == 0o660 && (old.gid() == group || old.gid() == 0) =>
+                {
+                    return Err("unplug the previously assigned website key first".into());
+                }
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    return Err("inspect prior website key".into());
+                }
+                _ => {
+                    fs::remove_file(WEBSITE_NODE)
+                        .map_err(|_| "retire prior website key selection")?;
+                    true
+                }
+            }
+        }
+        Ok(_) => return Err("invalid website key publication".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => return Err("inspect website key publication".into()),
+    };
+    // Leave devtmpfs the only link to the inode. Even if its permission
+    // reset races our chmod on unplug, its unlink retires the host name.
+    if publish {
+        std::os::unix::fs::symlink(name, WEBSITE_NODE)
+            .map_err(|_| "publish website key selection")?;
+    }
+    let linked = fs::metadata(WEBSITE_NODE).map_err(|_| "stat selected website key")?;
+    if !same_inode(&linked, &pinned) || linked.nlink() != 1 {
+        return Err("website key disconnected during publication".into());
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o660))
+        .map_err(|_| "prepare website key access")?;
+    if file.metadata().map_err(|_| "recheck website key")?.nlink() != 1 {
+        file.set_permissions(fs::Permissions::from_mode(0o000))
+            .map_err(|_| "retire website key")?;
+        return Err("website key disconnected during publication".into());
+    }
+    std::os::unix::fs::fchown(&file, None, Some(group))
+        .map_err(|_| "grant website key to Firefox")?;
+    let granted = file.metadata().map_err(|_| "check assigned website key")?;
+    if granted.gid() != group || granted.mode() & 0o7777 != 0o660 || granted.nlink() != 1 {
+        return Err("website key disconnected during assignment".into());
+    }
+    Ok(())
+}
+
+fn node_path(index: u8) -> String {
+    format!("/dev/hidraw{index}")
 }
 
 const DENIED: &str = "this account may not open the token device";
@@ -1132,6 +1258,7 @@ pub(crate) mod tests {
         cancellation.cancel();
         cancellation.cancel();
         let device = Device {
+            yubikey: false,
             index: 0,
             inode: 0,
             rdev: 0,
@@ -1416,6 +1543,7 @@ pub(crate) mod tests {
     #[test]
     fn desktop_workers_receive_the_runtime_directory_and_root_workers_do_not() {
         let device = |admission| Device {
+            yubikey: false,
             index: 3,
             inode: 7,
             rdev: 9,
@@ -1530,12 +1658,17 @@ pub(crate) mod tests {
         assert_eq!(worker.matches("_operation").count(), 1);
         assert!(worker.starts_with("\n    admission: Admission,"));
         assert!(worker.contains(") -> Result<(), String> {\n    admission.require()?;"));
-        // Production opens a device only in the worker, through the one
-        // opener of a hidraw path; discovery reads metadata alone.
-        assert_eq!(source.matches(".open(format!(\"/dev/hidraw").count(), 1);
-        // Two metadata reads and that opener name a hidraw path at all.
-        assert_eq!(source.matches("\"/dev/hidraw").count(), 3);
-        assert_eq!(source.matches("open(index,").count(), 1);
+        // A single opener serves the private HID worker and the physically
+        // approved assignment. Both serialize before opening the transport.
+        assert_eq!(source.matches(".open(node_path(index))").count(), 1);
+        assert_eq!(source.matches("open_node(index)").count(), 2);
+        let grant = source.split_once("pub fn assign_website_key(").unwrap().1;
+        assert!(
+            grant
+                .find("operation_lock(Admission::Root, None)?")
+                .unwrap()
+                < grant.find("open_node(index)").unwrap()
+        );
         assert_eq!(
             source
                 .matches("match Device::open(index, admission)")

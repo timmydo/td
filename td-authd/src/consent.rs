@@ -20,6 +20,41 @@ pub fn admin_key(blob: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
+/// One kernel attachment, identified before the settings prompt opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebsiteKey {
+    pub index: u8,
+    pub inode: u64,
+    pub device: u64,
+}
+
+impl WebsiteKey {
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut words = value.split(' ');
+        let number = |word: &str| {
+            if word.is_empty()
+                || (word.len() > 1 && word.starts_with('0'))
+                || !word.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            word.parse::<u64>().ok()
+        };
+        let key = Self {
+            index: u8::try_from(number(words.next()?)?).ok()?,
+            inode: number(words.next()?)?,
+            device: number(words.next()?)?,
+        };
+        (key.valid() && words.next().is_none()).then_some(key)
+    }
+    fn valid(self) -> bool {
+        self.inode != 0
+            && self.device != 0
+            && (self.device & 0xff) == u64::from(self.index)
+            && self.device <= 0xfffff
+    }
+}
+
 const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -1122,6 +1157,10 @@ pub enum Operation {
         requester: u32,
         setting: String,
     },
+    AssignWebsiteKey {
+        requester: u32,
+        key: WebsiteKey,
+    },
     /// Tag 42: one extra-volume change (td-disks/DESIGN.md).
     ManageVolumes {
         requester: u32,
@@ -1740,6 +1779,11 @@ impl Request {
             {
                 return Err("invalid consent time change".into());
             }
+            Operation::AssignWebsiteKey { requester, key }
+                if *requester != owner || !key.valid() =>
+            {
+                return Err("invalid website key assignment".into());
+            }
             Operation::ManageVolumes { requester, setting }
                 if *requester != owner || volume_setting::Change::decode(setting).is_err() =>
             {
@@ -1945,6 +1989,7 @@ impl Request {
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::AssignWebsiteKey { .. }
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. }
@@ -2524,6 +2569,13 @@ impl Request {
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, setting);
             }
+            Operation::AssignWebsiteKey { requester, key } => {
+                bytes.push(44);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                bytes.push(key.index);
+                bytes.extend_from_slice(&key.inode.to_be_bytes());
+                bytes.extend_from_slice(&key.device.to_be_bytes());
+            }
             Operation::ManageVolumes { requester, setting } => {
                 bytes.push(42);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -2803,6 +2855,14 @@ impl Request {
             39 => Operation::ManageTime {
                 requester: input.number()?,
                 setting: input.text()?,
+            },
+            44 => Operation::AssignWebsiteKey {
+                requester: input.number()?,
+                key: WebsiteKey {
+                    index: input.byte()?,
+                    inode: input.wide()?,
+                    device: input.wide()?,
+                },
             },
             42 => Operation::ManageVolumes {
                 requester: input.number()?,
@@ -3128,6 +3188,17 @@ impl Request {
                 lines.push(format!("REQUEST: {setting}"));
                 lines.push("CLOCK AND HARDWARE CLOCK USE UTC".into());
                 lines.push("AUTOMATIC SYNC CAN ADJUST MANUAL TIME".into());
+                approval_lines(&mut lines);
+            }
+            Operation::AssignWebsiteKey { requester, key } => {
+                lines.push("GIVE FIREFOX DIRECT ACCESS TO THIS YUBIKEY".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                lines.push(format!(
+                    "FIDO INTERFACE hidraw{}  INODE {}  DEVICE {}",
+                    key.index, key.inode, key.device
+                ));
+                lines.push("USE A KEY DEDICATED TO WEBSITES".into());
+                lines.push("FIREFOX CAN SEND FIDO COMMANDS UNTIL UNPLUGGED".into());
                 approval_lines(&mut lines);
             }
             Operation::ManageVolumes { requester, setting } => {
@@ -3706,6 +3777,43 @@ pub(crate) fn deployment_id(value: &str) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn website_key_binds_one_attachment_to_its_owner_and_presentation() {
+        let key = WebsiteKey::parse("5 123 61445").unwrap();
+        for invalid in [
+            "+5 123 61445",
+            "05 123 61445",
+            "5 0 61445",
+            "5 123 61446",
+            "5 123 61445 extra",
+            "256 123 61445",
+            "5 123 1048581",
+        ] {
+            assert!(WebsiteKey::parse(invalid).is_none(), "{invalid}");
+        }
+        let operation = Operation::AssignWebsiteKey {
+            requester: 1000,
+            key,
+        };
+        assert!(Request::new([1; 32], 1001, operation.clone()).is_err());
+        let request = Request::new([1; 32], 1000, operation).unwrap();
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert!(request
+            .lines()
+            .iter()
+            .any(|line| line.contains("hidraw5  INODE 123  DEVICE 61445")));
+        let other = Request::new(
+            [1; 32],
+            1000,
+            Operation::AssignWebsiteKey {
+                requester: 1000,
+                key: WebsiteKey { inode: 124, ..key },
+            },
+        )
+        .unwrap();
+        assert_ne!(request.encode(), other.encode());
+    }
 
     #[test]
     fn enrollment_progression_preserves_identity_and_stops_at_the_selected_final_proof() {

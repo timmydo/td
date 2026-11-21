@@ -413,6 +413,7 @@ pub enum Mode {
 /// indirection costs a pointer hop on a path that runs a single time.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Launch {
+    website_key: Option<u8>,
     entry: String,
     resolv_conf: bool,
     machine_id: String,
@@ -532,6 +533,7 @@ struct EtcBinding<'a> {
 
 #[derive(Clone, Copy)]
 struct Stage2MountBinding<'a> {
+    website_key: Option<u8>,
     filesystems: &'a [FilesystemGrant],
     resolv_conf: bool,
     machine_id: &'a str,
@@ -1033,10 +1035,32 @@ where
         if cgroup_membership != NO_CGROUP_MEMBERSHIP {
             cgroup::validate_expected_membership(&cgroup_membership)?;
         }
-        if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
+        let next = args.next();
+        let (website_key, delimiter) = if next.as_deref() == Some(OsStr::new("--website-key")) {
+            if entry != "/app/bin/firefox" || cgroup_membership == NO_CGROUP_MEMBERSHIP {
+                return Err(usage_error());
+            }
+            let index = args
+                .next()
+                .and_then(|arg| {
+                    let word = arg.to_str()?;
+                    if !word.bytes().all(|b| b.is_ascii_digit())
+                        || (word.len() > 1 && word.starts_with('0'))
+                    {
+                        return None;
+                    }
+                    word.parse::<u8>().ok()
+                })
+                .ok_or_else(usage_error)?;
+            (Some(index), args.next())
+        } else {
+            (None, next)
+        };
+        if delimiter.as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
         return Ok(Stage2Action::Launch(Box::new(Stage2Launch {
+            website_key,
             entry,
             resolv_conf,
             machine_id,
@@ -1217,6 +1241,12 @@ fn stage2_launch_arguments(
         OsString::from(resources.limits.cpu_period_usec.to_string()),
         OsString::from(resources.membership),
     ]);
+    if let Some(index) = mounts.website_key {
+        stage2.extend([
+            OsString::from("--website-key"),
+            OsString::from(index.to_string()),
+        ]);
+    }
     stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
     stage2.extend(arguments.iter().cloned());
     stage2
@@ -2356,10 +2386,139 @@ fn prepare_base_mounts(
     Ok(dev)
 }
 
+// Only root can publish this selector symlink in devtmpfs. Hold the actual
+// hidraw file and its sysfs leaf while the instance lives.
+struct WebsiteKey {
+    index: u8,
+    node: fs::File,
+    sysfs: fs::File,
+    syspath: PathBuf,
+}
+
+impl WebsiteKey {
+    fn acquire(plan: &LaunchPlan) -> io::Result<Option<Self>> {
+        if plan.host_mode || plan.name != "firefox" || plan.entry != "/app/bin/firefox" {
+            return Ok(None);
+        }
+        const SELECTOR: &str = "/dev/td-firefox-website-key";
+        let published = match fs::symlink_metadata(SELECTOR) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !published.file_type().is_symlink() || published.uid() != 0 {
+            return Ok(None);
+        }
+        let published = match fs::metadata(SELECTOR) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !published.file_type().is_char_device()
+            || published.uid() != 0
+            || published.gid() != plan.outside_gid
+            || published.mode() & 0o7777 != 0o660
+            || published.nlink() != 1
+        {
+            return Ok(None);
+        }
+        let (major, minor) = device_numbers(published.rdev());
+        let Ok(index) = u8::try_from(minor) else {
+            return Ok(None);
+        };
+        let name = crate::text(format_args!("hidraw{index}"))?;
+        if fs::read_link(SELECTOR).ok().as_deref() != Some(Path::new(&name)) {
+            return Ok(None);
+        }
+        Self::open(index, major, &name, &published)
+    }
+
+    fn open(
+        index: u8,
+        major: u64,
+        name: &str,
+        published: &fs::Metadata,
+    ) -> io::Result<Option<Self>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let node = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0o400000 | 0o400 | 0o4000)
+            .open(crate::text(format_args!("/dev/{name}"))?)
+        {
+            Ok(node) => node,
+            Err(_) => return Ok(None),
+        };
+        let meta = node.metadata()?;
+        if meta.dev() != published.dev()
+            || meta.ino() != published.ino()
+            || meta.rdev() != published.rdev()
+            || meta.nlink() != 1
+            || meta.gid() != published.gid()
+            || meta.mode() & 0o7777 != 0o660
+        {
+            return Ok(None);
+        }
+        let path = crate::text(format_args!("/sys/dev/char/{major}:{index}"))?;
+        let Ok(syspath) = fs::canonicalize(path) else {
+            return Ok(None);
+        };
+        if !syspath.starts_with("/sys/devices")
+            || syspath.file_name() != Some(OsStr::new(name))
+            || syspath.parent().and_then(Path::file_name) != Some(OsStr::new("hidraw"))
+        {
+            return Ok(None);
+        }
+        let sysfs = match fs::File::open(&syspath) {
+            Ok(leaf) => leaf,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        Ok(Some(Self {
+            index,
+            node,
+            sysfs,
+            syspath,
+        }))
+    }
+
+    fn mount(&self) -> io::Result<()> {
+        let name = crate::text(format_args!("hidraw{}", self.index))?;
+        let node = crate::text(format_args!("{NEW_ROOT}/dev/{name}"))?;
+        fs::File::create_new(&node)?;
+        // Bind through this namespace's devtmpfs and sysfs mounts. A proc
+        // descriptor link may still refer to the original mount namespace.
+        mount_bind_read_only(&crate::text(format_args!("/dev/{name}"))?, &node)?;
+        Self::require_pinned_bind(&self.node, &node)?;
+        let syspath = self
+            .syspath
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid HID sysfs path"))?;
+        let leaf = crate::text(format_args!("{NEW_ROOT}{syspath}"))?;
+        fs::create_dir_all(&leaf)?;
+        let class = crate::text(format_args!("{NEW_ROOT}/sys/class/hidraw"))?;
+        fs::create_dir_all(&class)?;
+        fs::create_dir(crate::text(format_args!("{NEW_ROOT}/sys/bus"))?)?;
+        symlink(syspath, crate::text(format_args!("{class}/{name}"))?)?;
+        mount_private_bind(&self.syspath, &leaf, true)?;
+        Self::require_pinned_bind(&self.sysfs, &leaf)
+    }
+
+    fn require_pinned_bind(pinned: &fs::File, target: &str) -> io::Result<()> {
+        let expected = pinned.metadata()?;
+        let actual = fs::symlink_metadata(target)?;
+        if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+            return Err(io::Error::other("website key bind changed identity"));
+        }
+        Ok(())
+    }
+}
+
 fn prepare_mount_plan(
     identity: Identity,
     executable: &Path,
     application: Option<&LaunchPlan>,
+    website_key: Option<&WebsiteKey>,
 ) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
@@ -2398,6 +2557,9 @@ fn prepare_mount_plan(
 
     let terminal = application.is_some_and(|plan| plan.terminal);
     let dev = prepare_base_mounts(identity, terminal, false, false)?;
+    if let Some(key) = website_key {
+        key.mount()?;
+    }
     if let Some(application) = application {
         if let Some(probe) = &application.firefox_seccomp_probe {
             create_dir(&format!("{NEW_ROOT}/opt"), 0o555)?;
@@ -2894,13 +3056,19 @@ fn device_nodes(terminal: bool) -> impl Iterator<Item = (&'static str, u64, u64)
         .chain(terminal.then_some(TERMINAL_NODE))
 }
 
-fn require_devices(terminal: bool) -> io::Result<()> {
+fn require_devices(terminal: bool, website_key: Option<u8>) -> io::Result<()> {
     let mut names = vec![
         "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
         "urandom", "zero",
     ];
     if terminal {
         names.push(TERMINAL_NODE.0);
+    }
+    let key_name = website_key
+        .map(|index| crate::text(format_args!("hidraw{index}")))
+        .transpose()?;
+    if let Some(name) = &key_name {
+        names.push(name);
     }
     require_names("/dev", &names)?;
     for (name, expected_major, expected_minor) in device_nodes(terminal) {
@@ -3553,6 +3721,7 @@ fn require_runtime_etc_binds(mountinfo: &str, runtime_etc: &[RuntimeEtcEntry]) -
 }
 
 struct Stage2MountExpectation<'a> {
+    website_key: Option<u8>,
     filesystems: Option<&'a [Stage2Filesystem]>,
     etc: EtcBinding<'a>,
     runtime_aliases: bool,
@@ -3567,6 +3736,7 @@ struct Stage2MountExpectation<'a> {
 /// the read-only root, `/dev` and its nodes, the fresh procfs holding only
 /// PID 1, and the writable scratch trees; returns the mountinfo it read.
 fn require_base_plan(
+    website_key: Option<u8>,
     token: &[u8; TOKEN_LEN],
     terminal: bool,
     executable_scratch: bool,
@@ -3577,7 +3747,7 @@ fn require_base_plan(
     require_mode("/dev/shm", 0o1777)?;
     require_mode("/tmp", 0o1777)?;
     require_mode("/var/tmp", 0o1777)?;
-    require_devices(terminal)?;
+    require_devices(terminal, website_key)?;
 
     let numeric = read_dir_names("/proc")?
         .into_iter()
@@ -3678,6 +3848,7 @@ fn require_mount_plan(
     identity: Identity,
 ) -> io::Result<()> {
     let Stage2MountExpectation {
+        website_key,
         filesystems,
         etc,
         runtime_aliases,
@@ -3695,12 +3866,15 @@ fn require_mount_plan(
             "detached host root remains reachable in the fresh root",
         ));
     }
-    for (path, expected) in grant_scaffold_names(
+    for (path, mut expected) in grant_scaffold_names(
         application,
         runtime_aliases,
         firefox_seccomp_probe,
         filesystems.unwrap_or_default(),
     )? {
+        if website_key.is_some() && path == Path::new("/") {
+            expected.insert(crate::text(format_args!("sys"))?);
+        }
         let path_text = path
             .to_str()
             .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
@@ -3711,7 +3885,38 @@ fn require_mount_plan(
             )));
         }
     }
-    let mountinfo = require_base_plan(token, terminal, false, false)?;
+    let mountinfo = require_base_plan(website_key, token, terminal, false, false)?;
+    if let Some(index) = website_key {
+        let name = crate::text(format_args!("hidraw{index}"))?;
+        require_names("/sys", &["bus", "class", "devices"])?;
+        require_names("/sys/bus", &[])?;
+        require_names("/sys/class", &["hidraw"])?;
+        require_names("/sys/class/hidraw", &[&name])?;
+        let path = crate::text(format_args!("/dev/{name}"))?;
+        let meta = fs::symlink_metadata(&path)?;
+        if !meta.file_type().is_char_device() || device_numbers(meta.rdev()).1 != u64::from(index) {
+            return Err(io::Error::other("website key device mismatch"));
+        }
+        require_mount(
+            &mountinfo,
+            &path,
+            Some("devtmpfs"),
+            &["ro", "nosuid", "noexec"],
+            &["rw", "nodev"],
+        )?;
+        let leaf = fs::read_link(crate::text(format_args!("/sys/class/hidraw/{name}"))?)?;
+        if !leaf.starts_with("/sys/devices") {
+            return Err(io::Error::other("invalid website key sysfs leaf"));
+        }
+        require_mount(
+            &mountinfo,
+            leaf.to_str()
+                .ok_or_else(|| io::Error::other("invalid HID sysfs path"))?,
+            Some("sysfs"),
+            &["ro", "nosuid", "nodev", "noexec"],
+            &["rw"],
+        )?;
+    }
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
@@ -4327,7 +4532,7 @@ fn start_probe_instance(
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
-    prepare_mount_plan(identity, &executable, None)?;
+    prepare_mount_plan(identity, &executable, None, None)?;
     prepare_capability_bridge()?;
 
     let (proof_reader, mut proof_writer) = io::pipe()?;
@@ -5510,6 +5715,10 @@ pub fn run_stage2(
         };
     require_mount_plan(
         Stage2MountExpectation {
+            website_key: match &action {
+                Stage2Action::Launch(launch) => launch.website_key,
+                _ => None,
+            },
             filesystems,
             etc,
             runtime_aliases,
@@ -5552,6 +5761,7 @@ pub fn run_stage2(
             // mistake this very commit had to be threaded through twice to
             // avoid making.
             let Stage2Launch {
+                website_key: _,
                 entry,
                 resolv_conf: _,
                 machine_id: _,
@@ -6297,6 +6507,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         };
         crate::bus::require_accepting_endpoint(socket, FETCH_CONNECT_TIMEOUT, what)?;
     }
+    let website_key = WebsiteKey::acquire(&application)?;
     let inside_identity = Identity {
         uid: application.inside_uid,
         gid: application.inside_gid,
@@ -6400,9 +6611,19 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         let preserved: Vec<u32> = cleanup_descriptor
             .into_iter()
             .chain(generation_descriptors)
+            .chain(
+                website_key
+                    .iter()
+                    .flat_map(|key| [key.node.as_raw_fd() as u32, key.sysfs.as_raw_fd() as u32]),
+            )
             .collect();
         close_inherited_descriptors(&preserved)?;
-        prepare_mount_plan(inside_identity, &executable, Some(&application))?;
+        prepare_mount_plan(
+            inside_identity,
+            &executable,
+            Some(&application),
+            website_key.as_ref(),
+        )?;
         prepare_capability_bridge()?;
 
         let (proof_reader, mut proof_writer) = io::pipe()?;
@@ -6416,6 +6637,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             &application.entry,
             &application.environment,
             Stage2MountBinding {
+                website_key: website_key.as_ref().map(|key| key.index),
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
@@ -7478,7 +7700,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let mountinfo = require_base_plan(token, plan.development, true, plan.persistent)?;
+    let mountinfo = require_base_plan(None, token, plan.development, true, plan.persistent)?;
     // The root holds the fixed trees, the host's system trees and the
     // first component of each admitted directory, and nothing else.
     let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
@@ -8057,6 +8279,18 @@ mod tests {
             ));
             assert!(!opted_in(&of(&["--marionette-extra"]), true, probe));
         }
+    }
+
+    #[test]
+    fn website_key_bind_refuses_a_replacement_at_the_same_name() {
+        let dir = td_fs::TempDir::new("website-key-bind").unwrap();
+        let target = dir.path().join("hidraw0");
+        let pinned = fs::File::create_new(&target).unwrap();
+        let name = target.to_str().unwrap();
+        WebsiteKey::require_pinned_bind(&pinned, name).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::File::create_new(&target).unwrap();
+        assert!(WebsiteKey::require_pinned_bind(&pinned, name).is_err());
     }
 
     #[test]
@@ -9050,6 +9284,7 @@ mod tests {
                 action: Stage2Action::Launch(launch),
                 ..
             } if *launch == Stage2Launch {
+                website_key: None,
                 entry: "/app/bin/app".into(),
                 resolv_conf: true,
                 machine_id: machine_id.into(),
@@ -9382,6 +9617,7 @@ mod tests {
                 "/app/bin/app",
                 &environment,
                 Stage2MountBinding {
+                    website_key: None,
                     filesystems: &filesystems,
                     resolv_conf: false,
                     machine_id,
@@ -9418,6 +9654,29 @@ mod tests {
             ));
         }
         let emitted = emit(true, authority::ApplicationFilter::Standard);
+        let with_key = |entry: &str, index: &str| {
+            let mut wire = emitted.clone();
+            let app = wire.iter().position(|arg| arg == "/app/bin/app").unwrap();
+            wire[app] = entry.into();
+            let delimiter = wire
+                .iter()
+                .position(|arg| arg == STAGE2_ARGUMENTS_ARG)
+                .unwrap();
+            wire.splice(
+                delimiter..delimiter,
+                [OsString::from("--website-key"), index.into()],
+            );
+            parse_mode(wire.into_iter())
+        };
+        assert!(
+            matches!(with_key("/app/bin/firefox", "0"), Ok(Mode::Stage2 {
+            action: Stage2Action::Launch(launch), ..
+        }) if launch.website_key == Some(0))
+        );
+        assert!(with_key("/app/bin/app", "0").is_err());
+        for invalid in ["01", "+1", "-1", "256", "../1"] {
+            assert!(with_key("/app/bin/firefox", invalid).is_err());
+        }
         // The sentinel is the value EVERY launch emits until a writer for
         // `/etc/timezone` exists, so it needs a POSITIVE assertion: every
         // other `NO_TIMEZONE` in these tests sits in a case that is refused
@@ -9481,6 +9740,7 @@ mod tests {
             "/app/bin/app",
             &environment,
             Stage2MountBinding {
+                website_key: None,
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
@@ -9623,6 +9883,7 @@ mod tests {
             "/app/bin/app",
             &environment,
             Stage2MountBinding {
+                website_key: None,
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
@@ -9651,6 +9912,7 @@ mod tests {
                 identity,
                 outside_identity,
                 action: Stage2Action::Launch(Box::new(Stage2Launch {
+                    website_key: None,
                     entry: "/app/bin/app".into(),
                     resolv_conf: false,
                     machine_id: machine_id.into(),

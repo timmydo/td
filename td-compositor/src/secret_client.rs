@@ -419,6 +419,7 @@ impl Elevation {
             Operation::DeployRollback { .. } => Some(Self::Rollback),
             Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::AssignWebsiteKey { .. }
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. } => Some(Self::Hostname),
@@ -2241,6 +2242,11 @@ impl Client {
                             Operation::ManageVolumes { .. }
                         ) {
                             crate::attention::Notice::VolumeSaved
+                        } else if matches!(
+                            pending.request.operation(),
+                            Operation::AssignWebsiteKey { .. }
+                        ) {
+                            crate::attention::Notice::WebsiteKeyAssigned
                         } else {
                             crate::attention::Notice::HostnameSaved
                         }

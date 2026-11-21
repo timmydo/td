@@ -5193,3 +5193,16 @@ deployment through `td-update trust-image DIRECTORY SHA256`. Its tag 5,
 principal grant and pinned-source checks are unchanged; neither admission nor
 approval asserts that the requester built the image. The exact manifest digest
 and root helper's payload checks establish which bytes are approved.
+
+## Assign a website YubiKey to Firefox
+
+The primary user's `assign-website-key` principal grant admits a typed
+settings request. Selection at secure attention H opens the fixed
+`/dev/hidrawN` with O_PATH and O_NOFOLLOW. The authority pins its inode
+through approval and helper completion. Tag 44 binds requester, index,
+inode and device number to the displayed request. On approval the
+authority resolves the installed Firefox workload and invokes
+`/bin/td-secret assign-website-key INDEX INODE DEVICE GROUP`. The helper
+validates the live USB FIDO collection under the trusted token lock.
+Publication ends when the device disconnects. APPLICATIONS.md describes
+the jail view and the browser's authority over that attachment.

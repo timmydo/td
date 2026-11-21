@@ -521,3 +521,10 @@ own account.
   git credential helpers), and whether any may be.
 - Whether a workload's request for a directory grant is answered by
   td-portal's dialog alone or also recorded as a standing grant.
+
+## Firefox website key
+
+A physical settings approval assigns the current YubiKey FIDO attachment
+to the installed Firefox workload group. A launch of the installed
+Firefox entry can bind that device and its discovery metadata. The
+assignment ends on unplug. APPLICATIONS.md describes setup and scope.

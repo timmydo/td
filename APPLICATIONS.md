@@ -9312,13 +9312,31 @@ holds the key may elevate*, consistent with physical access being out of
 scope. If a token is used, **CTAP access must be exclusively mediated**:
 a key is `/dev/hidraw`, not evdev, so the compositor's input path does
 not cover it, and a rogue process holding hidraw can solicit an assertion
-timed with the prompt and consume the operator's touch. No jail binds
-hidraw; the USB transport requires root-owned mode-0600 token nodes.
-This blocks unprivileged direct access. The td-owned HID workers serialize
+timed with the prompt and consume the operator's touch. td's USB
+transport requires root-owned, root-group mode-0600 token nodes.
+An attachment assigned to Firefox loses that eligibility before the
+browser can open it. The td-owned HID workers serialize
 through one root-private runtime lock held until the worker actually exits.
 Hidraw itself permits concurrent opens, and a different trusted root program
 can ignore that advisory lock. Complete presented-operation mediation remains
-required before enabling consent or a WebAuthn grant.
+required for a token shared between td authentication and websites.
+
+**Using a YubiKey for websites in Firefox.** On a TPM-only installation,
+plug in the YubiKey dedicated to websites and run `td-secret website-key`
+from a td terminal. Leave just the intended unassigned YubiKey connected.
+Press Ctrl+Alt+Escape, then H, review the attachment and press Enter.
+Fully quit and reopen Firefox. Select the site's security-key sign-in or
+registration option and follow Firefox's PIN and touch prompts.
+Unplugging expires the assignment. Repeat setup and relaunch after
+reconnecting. Existing website credentials stay on the key.
+
+The installed Firefox workload receives the single FIDO character device
+and its read-only hidraw sysfs leaf for discovery. The jail creates empty
+ancestor directories and one class link. The device grant gives Firefox
+direct FIDO command access for the entire attachment, including commands
+the authenticator permits beyond signing. Firefox binds WebAuthn requests
+to the website origin. The key enforces its own PIN and touch policy.
+td's grant covers neither other USB interfaces nor other hidraw devices.
 
 **Current credential consent is specified in §W.4.** Physical selection,
 immutable presentation and a token assertion now mediate credential writes,
