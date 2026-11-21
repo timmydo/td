@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::fs::File;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -21,6 +22,9 @@ use td_alloc::BudgetShared;
 use td_html::document::NodeId;
 use td_ui::chrome::{Status, TextEntry, ROW};
 use td_ui::clipboard::{OwnedText, TextError};
+use td_ui::control_socket::Socket;
+use td_ui::control_worker::Worker as Control;
+use td_ui::driven::{self, Payload};
 use td_ui::entry_model::{Action, EntryModel};
 use td_ui::keys::Section;
 use td_ui::picture::Fitted;
@@ -45,6 +49,8 @@ use crate::text::{self, Move, Place};
 use crate::tree::Source;
 use crate::view::{self, Anchor, Pane, Selection, View};
 
+pub mod control;
+
 const MAX_ADDRESS: usize = 4096;
 const MAX_QUERY: usize = crate::search::MAX_QUERY;
 /// The most pages each of back and forward keeps.
@@ -54,6 +60,8 @@ pub const MAX_WORKERS: usize = 4;
 /// Cells a `Left` or `Right` press, or a wheel's column, scrolls across.
 const ACROSS: i64 = 4;
 const LOADING_WAIT_MS: u64 = 50;
+/// The most of the control socket's requests one turn answers.
+const CONTROL_PER_TURN: usize = 4;
 const IDLE_WAIT_MS: u64 = 1000;
 /// The least viewport, in ems of td-ui's prose size: a narrower pane
 /// shows the page's left and scrolls across it.
@@ -434,6 +442,12 @@ pub struct App {
     clock: Clock,
     drag_scrolled: Option<u64>,
     scratch: Scratch,
+    /// The seam served on a control socket (`control`), when started
+    /// with one.
+    control: Option<Control<Payload>>,
+    /// A press the seam delivered and has not released: its moves are
+    /// the drag's, as the window's are while its button is held.
+    driven_press: bool,
 }
 
 impl Drop for App {
@@ -651,6 +665,8 @@ impl App {
             clock: Clock::new(),
             drag_scrolled: None,
             scratch,
+            control: None,
+            driven_press: false,
         })
     }
 
@@ -2680,6 +2696,7 @@ impl Handler for App {
             self.settle_relayout();
         }
         self.drag_scroll(now);
+        self.serve_control();
         self.flow()
     }
 
@@ -2691,6 +2708,7 @@ impl Handler for App {
             || self.current.relayout.is_some()
             || self.current.again
             || self.current.pictures.as_ref().is_some_and(Pictures::busy)
+            || self.control.is_some()
         {
             LOADING_WAIT_MS
         } else {
@@ -2703,14 +2721,65 @@ impl Handler for App {
     }
 
     fn paint(&mut self, raster: &mut Raster<'_, '_>, surface: Surface) -> Result<(), String> {
+        self.frame(surface, raster);
+        self.redraw = false;
+        Ok(())
+    }
+
+    fn motion(&mut self, at: Option<(i64, i64)>) {
+        self.pointer = at;
+        let hover = (self.hover, self.hover_image);
+        self.refresh_hover();
+        if hover != (self.hover, self.hover_image) {
+            self.redraw = true;
+        }
+    }
+
+    fn keys(&self) -> Vec<Section> {
+        vec![
+            Section::new("Page", PAGE_KEYS),
+            Section::new("Browser", BROWSER_KEYS),
+        ]
+    }
+
+    fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
+    }
+}
+
+/// What a frame is drawn on: the window's raster, or the seam's
+/// recording of it (`control`), so the two draw one stream.
+trait Canvas {
+    fn draw(&mut self, draw: Draw);
+    /// The fitted picture `id` names, its top left at `rect`'s, within
+    /// `clip`, each of its pixels `factor` device pixels across.
+    fn image(&mut self, clip: Rect, rect: Rect, id: u64, fitted: &Fitted, factor: usize);
+}
+
+impl Canvas for Raster<'_, '_> {
+    fn draw(&mut self, draw: Draw) {
+        Raster::draw(self, draw);
+    }
+    fn image(&mut self, clip: Rect, rect: Rect, _: u64, fitted: &Fitted, factor: usize) {
+        self.image_scaled(clip, rect, fitted, factor);
+    }
+}
+
+/// The id a picture shown as the page is drawn by, which no layout's
+/// inline picture takes.
+const PAGE_PICTURE: u64 = u64::MAX;
+
+impl App {
+    /// The window at `surface` drawn on `canvas`: the address row, the
+    /// page and the status row.
+    fn frame(&mut self, surface: Surface, canvas: &mut dyn Canvas) {
         if surface != self.surface {
             self.surface = surface;
             self.current.fitted = PictureFit::Empty;
             self.relayout();
         }
         let bounds = surface.bounds();
-        let mut sink = |draw| raster.draw(draw);
-        fill(bounds, CHROME, bounds, &mut sink);
+        fill(bounds, CHROME, bounds, &mut |draw| canvas.draw(draw));
         let address = self.address_rect();
         if let Some(entry) = TextEntry::new(surface, address) {
             self.address.reveal(entry);
@@ -2718,12 +2787,12 @@ impl Handler for App {
             let field = self
                 .address
                 .field("an address, or Ctrl+L", focused, focused);
-            entry.emit(field, bounds, &mut sink);
+            entry.emit(field, bounds, &mut |draw| canvas.draw(draw));
         }
         let page = self.page_rect();
         match &self.current.doc.body {
             Body::Picture(picture) => {
-                fill(page, PAPER, bounds, &mut sink);
+                fill(page, PAPER, bounds, &mut |draw| canvas.draw(draw));
                 let (width, height) = picture.fit_size(page.width as usize, page.height as usize);
                 let doc = &self.current.doc;
                 let fitted = self
@@ -2731,14 +2800,16 @@ impl Handler for App {
                     .fitted
                     .get_or_fit(|| doc.fit_picture(width, height));
                 if let Some(fitted) = fitted {
-                    raster.image(page, page, fitted);
+                    canvas.image(page, page, PAGE_PICTURE, fitted, 1);
                 } else {
-                    notice(surface, page, bounds, &mut sink);
+                    notice(surface, page, bounds, &mut |draw| canvas.draw(draw));
                 }
             }
-            Body::Resources => notice(surface, page, bounds, &mut sink),
-            Body::Blank => fill(page, PAPER, bounds, &mut sink),
-            Body::Page(shown) if shown.laid.is_none() => fill(page, PAPER, bounds, &mut sink),
+            Body::Resources => notice(surface, page, bounds, &mut |draw| canvas.draw(draw)),
+            Body::Blank => fill(page, PAPER, bounds, &mut |draw| canvas.draw(draw)),
+            Body::Page(shown) if shown.laid.is_none() => {
+                fill(page, PAPER, bounds, &mut |draw| canvas.draw(draw));
+            }
             Body::Page(_) => {
                 let pane = self.pane();
                 let hover = self.hover.or(self.current.view.focus);
@@ -2768,10 +2839,10 @@ impl Handler for App {
                             let mut sink = |draw: Draw| match draw.primitive {
                                 Primitive::Image { id, rect } => {
                                     if let Some((fitted, factor)) = laid.fitted_by(id) {
-                                        raster.image_scaled(draw.clip, rect, fitted, factor);
+                                        canvas.image(draw.clip, rect, id, fitted, factor);
                                     }
                                 }
-                                _ => raster.draw(draw),
+                                _ => canvas.draw(draw),
                             };
                             paint::paint(
                                 &laid,
@@ -2791,42 +2862,19 @@ impl Handler for App {
             }
         }
         let status = self.status();
-        let mut sink = |draw| raster.draw(draw);
         if self.focus == Focus::Find && self.message.is_none() {
             if let Some(entry) = TextEntry::new(surface, status.rect()) {
                 self.query.reveal(entry);
                 let field = self.query.field("find in the page", true, true);
-                entry.emit(field, bounds, &mut sink);
+                entry.emit(field, bounds, &mut |draw| canvas.draw(draw));
             }
         } else {
-            status.emit(self.status_text().chars(), bounds, &mut sink);
-        }
-        self.redraw = false;
-        Ok(())
-    }
-
-    fn motion(&mut self, at: Option<(i64, i64)>) {
-        self.pointer = at;
-        let hover = (self.hover, self.hover_image);
-        self.refresh_hover();
-        if hover != (self.hover, self.hover_image) {
-            self.redraw = true;
+            status.emit(self.status_text().chars(), bounds, &mut |draw| {
+                canvas.draw(draw)
+            });
         }
     }
 
-    fn keys(&self) -> Vec<Section> {
-        vec![
-            Section::new("Page", PAGE_KEYS),
-            Section::new("Browser", BROWSER_KEYS),
-        ]
-    }
-
-    fn take_show_keys(&mut self) -> bool {
-        std::mem::take(&mut self.show_keys)
-    }
-}
-
-impl App {
     fn flow(&self) -> Flow {
         if self.quit {
             Flow::Quit
@@ -2834,9 +2882,54 @@ impl App {
             Flow::Continue
         }
     }
+
+    /// Answers at most `CONTROL_PER_TURN` of what the control socket
+    /// asked, through the paths the window's own inputs take; a worker
+    /// that stopped is said once and let go.
+    fn serve_control(&mut self) {
+        let Some(worker) = self.control.take() else {
+            return;
+        };
+        for _ in 0..CONTROL_PER_TURN {
+            match worker.try_request() {
+                Ok(Some(job)) => {
+                    let mut remote = control::Remote::new(self);
+                    if let Err(why) =
+                        job.respond_with(|payload| driven::request(&mut remote, payload.bytes()))
+                    {
+                        let _ =
+                            writeln!(std::io::stderr().lock(), "td-web: a control reply: {why}");
+                    }
+                }
+                Ok(None) => break,
+                Err(why) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "td-web: the control socket stopped: {why}"
+                    );
+                    return;
+                }
+            }
+        }
+        self.control = Some(worker);
+    }
 }
 
-pub fn run(start: Option<String>) -> Result<(), String> {
+/// The window on the display, on `start` if given, serving td-ui's seam on
+/// a private socket at `control` if given. The socket is bound before the
+/// display is connected, so a bad path fails before a window appears.
+pub fn run(start: Option<String>, control: Option<PathBuf>) -> Result<(), String> {
+    let control = match control {
+        Some(path) => Some(
+            Socket::bind(&path)
+                .and_then(Control::start)
+                .map_err(|why| {
+                    td_alloc::format(format_args!("control socket {}: {why}", path.display()))
+                        .unwrap_or_default()
+                })?,
+        ),
+        None => None,
+    };
     let endpoint = td_ui::wayland::endpoint(
         std::env::var_os("WAYLAND_SOCKET"),
         std::env::var_os("WAYLAND_DISPLAY"),
@@ -2852,6 +2945,7 @@ pub fn run(start: Option<String>) -> Result<(), String> {
     let prose = td_ui::pinned_face::prose_or_note("td-web", setting.as_deref(), typeface.as_ref());
     let mut app = App::new(Arc::new(fetch::Service), surface, prose.clone())?;
     app.home = std::env::var_os("HOME").map(PathBuf::from);
+    app.control = control;
     if let Some(start) = start {
         app.open(&start);
     }
@@ -2958,14 +3052,14 @@ mod tests {
         app
     }
 
-    fn app(table: Table) -> App {
+    pub(super) fn app(table: Table) -> App {
         app_over(Arc::new(table))
     }
 
     /// Waits for the fetch out to answer and takes it: a deadline rather
     /// than a count, since a large page made in a debug build under a
     /// loaded host's checks takes seconds.
-    fn settle(app: &mut App) {
+    pub(super) fn settle(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             app.poll(0);
@@ -2978,7 +3072,7 @@ mod tests {
     }
 
     /// Waits for the relayouts asked to come and takes them.
-    fn relaid(app: &mut App) {
+    pub(super) fn relaid(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             app.poll(0);
@@ -3027,12 +3121,12 @@ mod tests {
         key(app, "Return");
     }
 
-    fn typed(app: &mut App, text: &str) {
+    pub(super) fn typed(app: &mut App, text: &str) {
         type_address(app, text);
         settle(app);
     }
 
-    fn site() -> Table {
+    pub(super) fn site() -> Table {
         Table::default()
             .page(
                 "https://example.org/",
@@ -4912,11 +5006,12 @@ mod tests {
         glyphs
     }
 
-    /// The glyphs the page paints on the selection's ground.
+    /// The glyphs the page paints on the selection's ground that ink,
+    /// spaces passed over.
     fn painted_selection(app: &mut App) -> String {
         painted(app)
             .into_iter()
-            .filter(|&(_, _, selected)| selected)
+            .filter(|&(_, scalar, selected)| selected && scalar != ' ')
             .map(|(_, scalar, _)| scalar)
             .collect()
     }
@@ -6844,7 +6939,7 @@ mod tests {
     }
 
     /// A PNG of `width` by `height` pixels, each `rgb`.
-    fn png(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
+    pub(super) fn png(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
         td_png::encode_rgb8(width, height, &rgb.repeat(width * height)).unwrap()
     }
 
@@ -6860,7 +6955,7 @@ mod tests {
     }
 
     /// Waits for the page's pictures to come and be laid.
-    fn pictured(app: &mut App) {
+    pub(super) fn pictured(app: &mut App) {
         until(app, "the pictures did not come", |app| {
             !app.current.pictures.as_ref().is_some_and(Pictures::busy)
                 && app.current.relayout.is_none()
@@ -6887,9 +6982,14 @@ mod tests {
         app.current.pictures.as_ref().unwrap().refused(at)
     }
 
-    /// The glyphs a paint of the page draws, in order.
+    /// The glyphs a paint of the page draws that ink, in order, spaces
+    /// passed over.
     fn glyph_text(app: &mut App) -> String {
-        painted(app).iter().map(|&(_, c, _)| c).collect()
+        painted(app)
+            .iter()
+            .map(|&(_, c, _)| c)
+            .filter(|&c| c != ' ')
+            .collect()
     }
 
     /// The pictures a paint of the page draws: each one's id and box.
@@ -8220,7 +8320,7 @@ mod tests {
         }
     }
 
-    fn base64(bytes: &[u8]) -> String {
+    pub(super) fn base64(bytes: &[u8]) -> String {
         const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {

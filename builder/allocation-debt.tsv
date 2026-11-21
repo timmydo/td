@@ -4346,7 +4346,6 @@ td-web/src/document.rs	unchecked-growth-or-clone	3
 td-web/src/fetch.rs	allocating-conversion	1
 td-web/src/fetch.rs	allocation-macro	3
 td-web/src/main.rs	allocating-conversion	1
-td-web/src/main.rs	unchecked-growth-or-clone	1
 td-web/src/picture.rs	unchecked-growth-or-clone	2
 td-webp/src/lib.rs	unchecked-growth-or-clone	4
 td-webp/src/lossless.rs	unchecked-growth-or-clone	7

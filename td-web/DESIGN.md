@@ -26,8 +26,10 @@ executable memory and never carries a JIT (§2).
 
 What td-web does not do, so a reader can say so: it runs no script,
 plugin or WebAssembly; it does not speak to the bus, the portal or the
-audio service; it keeps no cookie, cache or history on disk in its
-first increments (§6), and writes no file but one the person saves into
+audio service; it listens on no socket but td-ui's control socket, and
+that only when run on a host with one (§8, "Driving"); it keeps no
+cookie, cache or history on disk in its first increments (§6), and
+writes no file but one the person saves into
 a Downloads the human granted it (§5, "Saving"); it has no GPU path
 (td-ui renders in software, td-ui/DESIGN.md "The GPU path"); and it is
 not registered as `BROWSER` or as the OpenURI target.
@@ -292,9 +294,11 @@ td static application shares, without td-kv's `fdatasync`, which mail
 and news add and td-web does not link. What is off it answers `ENOSYS`;
 `socket` is `AF_UNIX` alone and `ioctl` `FIONBIO` alone. A change that
 reaches for another operating-system facility, in td-web or a crate it
-links, derives the list again, or that path fails in the jail. Saving
-(§5) is held to that list: it reads its mount table and creates,
-writes, syncs, empties and unlinks a file (`openat`, `read`, `write`,
+links, derives the list again, or that path fails in the jail. The
+control socket (§8, "Driving") is such a path: its `bind`, `listen`
+and `accept4` are off the list, and the jail never starts td-web with
+one. Saving (§5) is held to that list: it reads its mount table and
+creates, writes, syncs, empties and unlinks a file (`openat`, `read`, `write`,
 `fsync`, `ftruncate`, `statx`, `unlink`), calls td-ui's shared-memory
 buffers and theme file already make, and renames and links nothing,
 which would want `renameat2` or `linkat`.
@@ -573,8 +577,9 @@ never in the login user's.
 Firefox remains `BROWSER` for td's applications and the OpenURI target
 (`td-portal/src/open_uri.rs`). td-web is started from its launcher card,
 as every service-account application is (it has no `/bin` name); the
-program takes an optional URL argument, `td-web [URL]`, which hosts
-and tests use. Making td-web a handler for links, or offering a choice
+program takes an optional URL argument, `td-web [--control-socket
+PATH] [URL]`, which hosts and tests use (the socket is §8's
+"Driving"). Making td-web a handler for links, or offering a choice
 of handler, is a later decision and an amendment to td-portal's design.
 
 ## 8. Window and keys
@@ -722,6 +727,75 @@ relayout that keeps the page's tree, as the place at the top is.
   selection for no handler and delivers no middle button (td-ui/DESIGN.md,
   "Widget window"), so that is td-ui's increment before it is td-web's
   (§11).
+
+**Driving.** td-web takes td-ui's driven seam (td-ui/DESIGN.md,
+"Driving" and "The semantic seam"), so a test or an agent operates the
+window through the verbs td-ui's other programs take. `td-web
+--control-socket PATH` serves it on a private socket td-ui's binder
+admits, bound before the display is connected; each turn answers at
+most `CONTROL_PER_TURN` (4) requests and, while the socket is served,
+waits at most `LOADING_WAIT_MS` (50 ms). `td-web --help actions`
+prints the action table.
+
+- **Actions.** `open HEX_ADDRESS` goes to an address as the address
+  row's `Return` takes it. Every other action is one chord of the keys
+  above, delivered through the key path, so it means what that key
+  means where the focus is: `address`, `back`, `forward`, `reload`,
+  `stop`, `next-link`, `previous-link`, `follow`, `find`, `page-down`,
+  `page-up`, `top`, `bottom`, `select-all`, `copy`, `save`,
+  `body-face`, `page-styles` and `close`. The seam's inputs reach no
+  clipboard, so a copy through it is refused and the status row says
+  so; a paste is not one of its inputs.
+- **Inputs.** A key, a press and a release go through the window's own
+  paths, as td-ui's window delivers them: a press holds the button and
+  tells the window the pointer no longer hovers, a move while it is
+  held is the drag's and otherwise says where the pointer is, and a
+  release lets the button go and says where it is. The key list opens
+  from the person's keyboard and pointer only (td-ui/DESIGN.md, "Key
+  list"), so a `?` through the seam leaves it closed. A press carries
+  no Shift, `focus` changes nothing, the roles `held` name nothing, and
+  `tick MS` is the window's poll at that time on the window's own
+  clock, taking what has come. An input answers `quit` once the window
+  closes and `changed` when it must paint again, which every key,
+  press, release, wheel turn and resize the window takes asks, whether
+  or not it moved anything; a move with no button held answers
+  `changed` only when the hover moved, and `focus`, `held` and a tick
+  that took nothing `ignored`; a press while one is held and a release
+  with none are dropped, `ignored`, as the window drops them. On the
+  live window the display sets the surface, so its next paint undoes a
+  `resize`.
+- **State.** `KEY=VALUE` fields, a value's controls each a space: `url`;
+  `title`, the window's; `focus`, `address`, `page` or `find`;
+  `address`, the row's text; `loading`, `none`, `page`, `styles` or
+  `pictures`; `body`, `blank`, `page`, `picture` or `refused`;
+  `status`, the response's; `back` and `forward`, the history's
+  counts; `link`, the focused link's address, and `hover`, the one
+  under the pointer; `selection`, `some` or `none`; `query` and
+  `matches`, find's; `styles`, `page` or `none`; `face`, `sans` or
+  `serif`; `saving`, `1` while a save runs, else `0`; and `line`, the
+  status row's text, which find's row replaces while find has the
+  focus and no message is shown (its text is then `query`).
+- **What it shows.** `text`, `frame` and `frame-page` read one paint of
+  the window, the one its raster takes, recorded in order into storage
+  charged to §3's root, at most `MAX_RECORDED` draws (the page's
+  `MAX_PAINT` and 65,536 for the two rows), and replayed; a recording
+  refused answers `limit`. The page's glyphs come after its fills and
+  its spaces are drawn (§10, "Painting"), as the seam's read-back of
+  prose assumes. td-ui paints the seam's frame with its pinned cell
+  face alone and its default theme, so with the prose faces loaded the
+  page's text is drawn there in the bitmap face at the pens the prose
+  laid, and in that theme; the draws are the window's. The key list
+  td-ui's window draws over the page is not in it, and td-ui draws a
+  composition's picture at its fitted size, so a picture the window
+  draws at a factor (at scale two, one at its own size, §10,
+  "Subresources") is drawn smaller in `frame`; `text` reads no picture.
+- **On a host only.** td-jail's `web` allowlist admits no `bind`,
+  `listen` or `accept4`, which answer `ENOSYS` there, so a socket asked
+  for in the jail fails before a window appears, and the application's
+  entry asks for none: a jailed td-web is never driven (§3). The seam
+  serves td-web run on a host (`./install-apps`), its socket in a
+  directory the person keeps private (mode 0700), with the person's
+  authority over the window.
 
 ## 9. Increments
 
@@ -1005,7 +1079,11 @@ handle, each relayout's cancel flag and answer slot, the paint order's
 scratch (4.5 MiB taken at the first paint, grown to at most 18 MiB by
 a paint that fills it, "Painting" below) and the window's measure
 caches, a few MiB in all and about 20 once that scratch is grown,
-which come out of `PAGES`. The sheets child bounds simultaneously live compilation layouts,
+which come out of `PAGES`; and, only while td-ui's seam reads the
+window on a host (§8, "Driving"), its recording of one paint, 64
+bytes a draw, at most 20 MiB and 36 MiB while it doubles the last
+time, so a page made meanwhile can be refused for it. The sheets child
+bounds simultaneously live compilation layouts,
 including scratch and replacement overlap. Source-size limits alone do
 not guarantee admission: a sufficiently complex sheet can exhaust 48 MiB
 before compilation finishes, and the page follows "Cuts" below. A
@@ -1841,7 +1919,10 @@ order, then every glyph.
    in a line, across the fragments td-layout splits a run into;
    an `alt` text's, its first `MAX_ALT_SCALARS` scalars; and the list
    markers', their text in their item's colour, face and size at their
-   baseline, those without a line with their item's box. They are drawn
+   baseline, those without a line with their item's box. Each scalar
+   is drawn, white space (a preserved tab and a no-break space among
+   it) as a space, which every face draws blank, so td-ui's seam reads
+   a page's words apart (§8, "Driving"). They are drawn
    ordered by family, then size, then the order they came in, so a
    later box's background never covers an earlier box's glyphs.
 
@@ -1881,7 +1962,8 @@ A paint is bounded three times on the window thread. It takes at most
 marker meeting the damage counting one, so that ones laid on one
 another end it though they draw nothing; it charges at most `PANES`
 (8) times the pane's area in pixels: a fill what it covers within its
-clip, a glyph its em square within its clip; and it takes at most
+clip, a glyph its em square within its clip, a space nothing, as it
+inks nothing; and it takes at most
 `MAX_PAINT_WORK` (1,048,576) steps of other work: each entry of the
 index passed by, each fragment and replaced box looked at, each scalar
 replayed or measured, a tabbed fragment's bytes, which td-layout scans
@@ -1931,7 +2013,9 @@ glyph, so each of those could remake a page, about 65,500 × 47 µs, 3.1
 s, at worst.
 
 On the cell (above, "Relayout") a paint of a whole 1920x1200 pane of a
-corpus page takes 66 to 157 µs and at most 1,651 draws. Over the pinned
+corpus page takes 66 to 157 µs and at most 1,651 draws, measured
+before each space was drawn as a glyph, which adds a draw a space and
+no pixel charge. Over the pinned
 faces, the whole window (its rows included) is drawn into its buffer,
 the pinned faces rasterised by td-ui's `Raster`, at 1920x1200 in 2.1 to
 5.7 ms once its glyphs are in the atlas and 2.8 to 9.2 ms at the first
@@ -2316,14 +2400,13 @@ order; each is its own design amendment when it starts:
   status row naming the grant. Nothing yet exercises the jail's branch
   (the mount table, the view) or the realized static binary under its
   allowlist: §5's tests run on the host and fake the mount table.
-- **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
-  agent can operate td-web through the verbs td-ui's other programs
-  take, and an oracle can boot it in the image. td-ui's seam reads
-  prose back as its text (td-ui/DESIGN.md, "The semantic seam") only
-  from a glyph per scalar, spaces included, and paint drawn after the
-  text it covers: the painter skips whitespace and emits every glyph
-  after its fills, so a page reads its words together until it draws
-  them in order.
+- **Driving in the image.** td-web takes td-ui's seam on a host (§8,
+  "Driving"); an oracle booting it driven needs td-jail to bind a
+  private socket directory into the `web` jail and `bind`, `listen` and
+  `accept4` in its allowlist (APPLICATIONS.md, "Per-application
+  allowlists"; UNSAFE.md §9), with the probe's witness. td-ui's
+  composition naming a picture's factor would let the seam's `frame`
+  draw one as the window does.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

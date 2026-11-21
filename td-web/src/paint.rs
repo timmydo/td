@@ -452,7 +452,12 @@ impl<'s, 'k> Painter<'s, 'k> {
             width: em,
             height: em,
         };
-        let pixels = square.intersection(clip).map_or(0, area);
+        // A space inks nothing, so it costs no fill.
+        let pixels = if scalar == ' ' {
+            0
+        } else {
+            square.intersection(clip).map_or(0, area)
+        };
         if !self.charge(pixels, 0) {
             return;
         }
@@ -1062,9 +1067,9 @@ fn paint_text(
                 run = Some((x, end, mark));
             }
         }
-        if !e.shown.is_whitespace() && stack.admits(x) {
+        if stack.admits(x) {
             if let Some(slot) = glyphs.get_mut(pending) {
-                *slot = (x, e.shown, mark);
+                *slot = (x, shown(e.shown), mark);
                 pending += 1;
             }
         }
@@ -1097,6 +1102,17 @@ fn paint_text(
     }
 }
 
+/// The scalar drawn for `c`: white space, a preserved tab among it, as a
+/// space, which every face draws blank, so td-ui's seam reads words
+/// apart (td-ui/DESIGN.md, "The semantic seam").
+fn shown(c: char) -> char {
+    if c.is_whitespace() {
+        ' '
+    } else {
+        c
+    }
+}
+
 /// Text drawn in `font` from `x` on a baseline, clipped, at most
 /// `MAX_STACKED` glyphs at one pen and `MAX_ALT_SCALARS` scalars; for alt
 /// text and markers, whose advances td-web measures itself.
@@ -1124,8 +1140,8 @@ fn paint_run(
             continue;
         }
         let at = frame.x(pen);
-        if !c.is_whitespace() && stack.admits(at) {
-            p.glyph(at, top, c, font.glyph(ink, ground), clip);
+        if stack.admits(at) {
+            p.glyph(at, top, shown(c), font.glyph(ink, ground), clip);
         }
         pen += crate::page::px(measure.advance_in(font, c));
         if frame.x(pen) > clip.x + i64::from(clip.width) {
@@ -1450,6 +1466,20 @@ mod tests {
 
     fn draws(markup: &str, marks: Marks) -> (Vec<Draw>, Painted) {
         draws_in(markup, marks, true)
+    }
+
+    /// White space is drawn as a space at its pen, a preserved tab and a
+    /// no-break space among it, so td-ui's seam reads words apart; a
+    /// space inks nothing and is charged no pixels.
+    #[test]
+    fn white_space_is_drawn_as_spaces_charged_nothing() {
+        let (spaced, with) = draws("<pre style=margin:0>a\tb c\u{a0}d</pre>", Marks::default());
+        let text = glyphs(&spaced);
+        assert_eq!(text.replace(' ', ""), "abcd");
+        assert_eq!(text.matches(' ').count(), 3, "{text:?}");
+        let (_, without) = draws("<pre style=margin:0>abcd</pre>", Marks::default());
+        // The canvas and the four letters alike.
+        assert_eq!(with.pixels, without.pixels);
     }
 
     /// `draws`, the glyphs in order only when `ordered`.
@@ -2113,7 +2143,11 @@ mod tests {
             }
         }
         let bullets: Vec<i64> = tops.iter().filter(|g| g.0 == '•').map(|g| g.1).collect();
-        let letters: Vec<i64> = tops.iter().filter(|g| g.0 != '•').map(|g| g.1).collect();
+        let letters: Vec<i64> = tops
+            .iter()
+            .filter(|g| g.0 != '•' && g.0 != ' ')
+            .map(|g| g.1)
+            .collect();
         assert_eq!(bullets.len(), 10);
         assert_eq!(bullets, letters);
     }
@@ -2231,7 +2265,7 @@ mod tests {
         );
         let (painted, drawn) = paint_right(&stacked);
         assert!(painted.cut);
-        assert!(drawn.len() < MAX_PAINT_WORK / most);
+        assert!(drawn.matches('z').count() < MAX_PAINT_WORK / most);
     }
 
     /// Grounds asked for in any order are the nearest opaque ancestor's,
