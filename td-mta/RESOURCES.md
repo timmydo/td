@@ -3347,9 +3347,9 @@ origin/rate checks and hands credential lookup to the fixed authentication
 worker. The current local backend tries its registry mutex there and performs
 no credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
 a retired slot can retain its old peer charge until the next scan. The
-per-address limit leaves at least one slot for another peer in a pool of
-two or more. At the default size, one network
-address can use seven of the eight slots.
+per-peer limit leaves at least one slot for another peer in a pool of
+two or more. At the default size, one IPv4 address or IPv6 /64 can use
+seven of the eight slots. Mapped IPv4 shares its IPv4 allowance.
 Transient accept resource failures back off for five seconds. Session slots
 are the completion storage; no unbounded work queue or per-client thread exists.
 An HTTP connection admits at most 32 requests under its original absolute
@@ -3365,7 +3365,8 @@ Control publishes credentials on its existing fixed worker while holding the
 registry mutex. The snapshot has a 64 KiB file cap and at most 256 records;
 control request/reply buffers have 256-byte/12-KiB caps. Successful publication
 precedes password output. Authentication attempts use a fixed 64-entry table,
-64 attempts globally and eight per IP per one-second monotonic window. Native
+64 attempts per profile and eight pending or failed attempts per peer key
+per one-second monotonic window. Native
 work already executing is joined on shutdown, not forcibly canceled. The
 current HTTPS profile uses at most three fixed body workers for uploads, raw
 downloads and retained Core API responses. Worker count is the smaller of

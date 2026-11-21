@@ -16,6 +16,21 @@ impl From<IpAddr> for PeerAddress {
     }
 }
 
+/// Admission groups TCP peers by the same IPv4 address or IPv6 /64 as SMTP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionPeer {
+    Network(crate::smtp_rate::PeerKey),
+    Local,
+}
+impl PeerAddress {
+    pub(crate) fn admission_peer(self) -> AdmissionPeer {
+        match self {
+            Self::Network(ip) => AdmissionPeer::Network(ip.into()),
+            Self::Local => AdmissionPeer::Local,
+        }
+    }
+}
+
 const DECODED: usize = 254 + 1 + 97;
 struct Credentials([u8; DECODED]);
 impl Drop for Credentials {
@@ -186,13 +201,13 @@ const GLOBAL_ATTEMPTS: u16 = 64;
 const PEER_ATTEMPTS: u16 = 8;
 #[derive(Clone, Copy)]
 struct Peer {
-    address: PeerAddress,
+    key: AdmissionPeer,
     attempts: u16,
 }
 /// One charged attempt; only a successful authentication returns its peer charge.
 /// Not Clone or Copy: completion cannot refund the same reservation twice.
 pub(crate) struct Attempt {
-    address: PeerAddress,
+    key: AdmissionPeer,
     second: u64,
 }
 /// Fixed one-second windows. Never evict an unexpired peer to admit a new one.
@@ -216,9 +231,9 @@ impl Attempts {
         address: impl Into<PeerAddress>,
         monotonic_ms: u64,
     ) -> Option<Attempt> {
-        let address = address.into();
-        self.admit(address, monotonic_ms).then_some(Attempt {
-            address,
+        let key = address.into().admission_peer();
+        self.admit_key(key, monotonic_ms).then_some(Attempt {
+            key,
             second: monotonic_ms / 1000,
         })
     }
@@ -230,14 +245,16 @@ impl Attempts {
             .peers
             .iter_mut()
             .flatten()
-            .find(|peer| peer.address == attempt.address)
+            .find(|peer| peer.key == attempt.key)
         {
             peer.attempts = peer.attempts.saturating_sub(1);
         }
     }
     pub fn admit(&mut self, address: impl Into<PeerAddress>, monotonic_ms: u64) -> bool {
-        let address = address.into();
-        let admitted = self.try_admit(address, monotonic_ms);
+        self.admit_key(address.into().admission_peer(), monotonic_ms)
+    }
+    fn admit_key(&mut self, key: AdmissionPeer, monotonic_ms: u64) -> bool {
+        let admitted = self.try_admit(key, monotonic_ms);
         if !admitted {
             crate::performance::record(
                 crate::performance::Phase::HttpAuthRefused,
@@ -247,7 +264,7 @@ impl Attempts {
         }
         admitted
     }
-    fn try_admit(&mut self, address: PeerAddress, monotonic_ms: u64) -> bool {
+    fn try_admit(&mut self, key: AdmissionPeer, monotonic_ms: u64) -> bool {
         let second = monotonic_ms / 1000;
         if second < self.second {
             return false;
@@ -263,17 +280,14 @@ impl Attempts {
         let existing = self
             .peers
             .iter()
-            .position(|peer| peer.is_some_and(|peer| peer.address == address));
+            .position(|peer| peer.is_some_and(|peer| peer.key == key));
         let Some(index) = existing.or_else(|| self.peers.iter().position(Option::is_none)) else {
             return false;
         };
         let Some(slot) = self.peers.get_mut(index) else {
             return false;
         };
-        let peer = slot.get_or_insert(Peer {
-            address,
-            attempts: 0,
-        });
+        let peer = slot.get_or_insert(Peer { key, attempts: 0 });
         if peer.attempts >= PEER_ATTEMPTS {
             return false;
         }
@@ -363,6 +377,27 @@ mod tests {
         assert_eq!(after.busy - before.busy, after.calls - before.calls);
         assert_eq!(after.total_us, 0);
     }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn authentication_charges_share_the_network_prefix() {
+        let _serial = crate::generations::TEST_CONSTRUCTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = "2001:db8:1::1".parse::<IpAddr>().unwrap();
+        let sibling = "2001:db8:1::2".parse::<IpAddr>().unwrap();
+        let other = "2001:db8:1:1::1".parse::<IpAddr>().unwrap();
+        let mut attempts = Attempts::default();
+        let pending = attempts.reserve(first, 10).unwrap();
+        for _ in 1..PEER_ATTEMPTS {
+            assert!(attempts.admit(sibling, 10));
+        }
+        assert!(!attempts.admit(first, 10));
+        assert!(attempts.admit(other, 10));
+        attempts.authenticated(pending);
+        assert!(attempts.admit(sibling, 10));
+        assert!(!attempts.admit(first, 10));
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn successful_authentication_releases_only_its_peer_charge() {

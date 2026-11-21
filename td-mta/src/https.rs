@@ -6,7 +6,7 @@ use crate::{
         listener::{Bind, Kind, Listener},
     },
     generations::GenerationLease,
-    http_auth::{self, Attempts, PeerAddress},
+    http_auth::{self, AdmissionPeer, Attempts, PeerAddress},
     http_request::{self, HeadReader, HEAD_BYTES, QUANTUM},
     https_upload,
     limits::ResourcePlan,
@@ -43,6 +43,11 @@ fn peer_limit(peer: PeerAddress, slots: usize) -> usize {
         PeerAddress::Network(_) => slots.saturating_sub(1).clamp(1, MAX_PER_PEER),
         PeerAddress::Local => slots.min(MAX_PER_PEER),
     }
+}
+
+fn has_peer_capacity(peer: PeerAddress, occupied: &[Option<AdmissionPeer>]) -> bool {
+    let key = peer.admission_peer();
+    occupied.iter().filter(|entry| **entry == Some(key)).count() < peer_limit(peer, occupied.len())
 }
 
 pub struct BoundListener {
@@ -994,6 +999,7 @@ impl Https<'_> {
         self.ready.store(true, Ordering::Release);
         let mut attempts = Attempts::default();
         let mut peers = [None; crate::limits::MAX_HTTPS_CONNECTIONS];
+        let peers = peers.get_mut(..slots.len()).ok_or(Error::Invalid)?;
         let mut listener_cursor = 0;
         let mut cursor = 0;
         let mut accept_after = Tick(0);
@@ -1154,12 +1160,7 @@ impl Https<'_> {
                     Err(error) => return Err(error.into()),
                 };
                 *peers.get_mut(index).ok_or(Error::Invalid)? = None;
-                if peers
-                    .iter()
-                    .filter(|existing| **existing == Some(peer))
-                    .count()
-                    >= peer_limit(peer, slots.len())
-                {
+                if !has_peer_capacity(peer, peers) {
                     control.log(
                         crate::observability::Kind::AdmissionRefused {
                             reason: crate::observability::Refusal::Capacity,
@@ -1255,7 +1256,7 @@ impl Https<'_> {
                     phase_deadline,
                     idle,
                 };
-                *peers.get_mut(index).ok_or(Error::Invalid)? = Some(peer);
+                *peers.get_mut(index).ok_or(Error::Invalid)? = Some(peer.admission_peer());
                 *slot = Some(client);
             }
             listener_cursor = (listener_cursor + 1) % self.listeners.len();
@@ -2237,6 +2238,22 @@ mod tests {
             assert_eq!(peer_limit(network, slots), network_limit);
             assert_eq!(peer_limit(PeerAddress::Local, slots), local_limit);
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn connection_capacity_groups_network_addresses_like_smtp() {
+        let address = |ip: &str| PeerAddress::from(ip.parse::<std::net::IpAddr>().unwrap());
+        let peer = address("2001:db8:1::1");
+        let mut slots = [None; 8];
+        for slot in slots.iter_mut().take(7) {
+            *slot = Some(peer.admission_peer());
+        }
+        assert!(!has_peer_capacity(address("2001:db8:1::abcd"), &slots));
+        assert!(has_peer_capacity(address("2001:db8:1:1::1"), &slots));
+        let slots = [Some(address("::ffff:192.0.2.1").admission_peer()), None];
+        assert!(!has_peer_capacity(address("192.0.2.1"), &slots));
+        assert!(has_peer_capacity(address("192.0.2.2"), &slots));
     }
 
     #[test]

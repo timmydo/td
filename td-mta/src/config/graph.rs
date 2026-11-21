@@ -1111,6 +1111,26 @@ mod tests {
         );
     }
     #[test]
+    fn public_and_private_jmap_require_separate_profiles() {
+        let _lock = lock();
+        for (origin, offending_line) in [(ORIGIN, 3), ("http://localhost", 2)] {
+            let mut c = Config::base();
+            c.listeners.push((
+                "private",
+                listener::Input {
+                    kind: listener::Kind::LocalJmap,
+                    certificate: None,
+                    ..https("/private/jmap/socket")
+                },
+            ));
+            assert_eq!(
+                run(c, origin).unwrap_err(),
+                conflict(Code::OriginPort, at(offending_line), at(901))
+            );
+        }
+    }
+
+    #[test]
     fn origin_ports_and_acme_http01_are_mandatory() {
         let _lock = lock();
         assert_eq!(

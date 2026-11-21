@@ -1411,7 +1411,7 @@ Initial default ceilings (validated together at startup):
 | --- | --- |
 | Simultaneous inbound SMTP sessions | 8, at most 2 per SMTP peer key |
 | Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
-| Active HTTPS connections | 8, at most 7 per network address, with a separate cap of 2 TLS handshakes |
+| Active HTTPS connections | 8, at most 7 per IPv4 address or IPv6 /64, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 3 |
@@ -2309,17 +2309,18 @@ Upload publication acquires a fresh commit-time authorization guard; future
 mutations must do the same.
 
 A profile's HTTPS listeners share its configured connection pool. When it has at
-least two slots, each network address can occupy at most the smaller of
+least two slots, each network peer can occupy at most the smaller of
 sixteen and the pool size minus one. A one-slot pool admits one connection.
-Clients sharing a public address share its allowance. In a private Unix-socket
+Connections and authentication attempts use the same peer key as SMTP:
+the IPv4 address (including mapped IPv4), or the IPv6 /64 prefix. In a private Unix-socket
 profile, all clients share up to sixteen slots, subject to the configured
-pool size. Per-IP connection refusals emit the bounded, rate-limited
+pool size. Per-peer connection refusals emit the bounded, rate-limited
 admission-refused event before closing the unauthenticated socket. No peer
 address or credential is retained in that event. Authentication uses fixed
 one-second monotonic windows: 64
-attempts globally and eight failed or still-pending attempts per IP, with a
+attempts per profile and eight failed or still-pending attempts per peer, with a
 64-entry peer table that never evicts an unexpired entry. A successful fresh
-authentication releases only its own per-IP charge, never the global work
+authentication releases only its own per-peer charge, never the global work
 charge or a prior failure. Completion from an older window cannot refund a
 new window. Invalid credential syntax consumes an attempt too;
 wrong authority or cross-origin requests are refused before verification.
