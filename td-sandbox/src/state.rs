@@ -5,7 +5,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -73,7 +72,7 @@ pub fn text(path: &Path) -> io::Result<&str> {
         .ok_or_else(|| io::Error::other("path must be UTF-8 without line breaks"))
 }
 
-fn open_private(path: &Path, create: bool) -> io::Result<File> {
+pub(super) fn open_private(path: &Path, create: bool) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -249,32 +248,8 @@ impl Profile {
         td_fs::replace(&self.root.join("record"), self.render()?.as_bytes(), 0o600)
     }
 
-    // Order joining the current group against unlinking it. The directory
-    // lock lasts only through registration or stop, never across a launch.
-    fn with_sessions<T>(&self, action: impl FnOnce(File, &Path) -> io::Result<T>) -> io::Result<T> {
-        let directory = File::open(&self.root)?;
-        directory.lock()?;
-        let address = crate::text(format_args!(
-            "/proc/self/fd/{}/sessions",
-            directory.as_raw_fd()
-        ))?;
-        let path = Path::new(&address);
-        action(open_private(path, true)?, path)
-    }
-
-    pub fn join_sessions(&self) -> io::Result<File> {
-        self.with_sessions(|sessions, _| {
-            sessions.lock_shared()?;
-            Ok(sessions)
-        })
-    }
-
-    pub fn stop_sessions(&self) -> io::Result<()> {
-        self.with_sessions(|sessions, path| match sessions.try_lock() {
-            Err(fs::TryLockError::WouldBlock) => fs::remove_file(path),
-            Ok(()) => Err(io::Error::other("no active sandbox shell or command")),
-            Err(fs::TryLockError::Error(e)) => Err(e),
-        })
+    pub fn sessions(&self) -> io::Result<crate::sessions::Registry> {
+        crate::sessions::Registry::open(&self.root)
     }
 
     /// The record removed, with its session state.
@@ -372,41 +347,6 @@ mod tests {
         assert_eq!(list(&profiles)?, ["default"]);
         assert!(!exists(&profiles, "tools")?);
         assert!(Profile::read(&profiles, "tools").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn sessions_overlap_close_independently_and_stop_as_a_group() -> io::Result<()> {
-        let base = td_fs::TempDir::new("sandbox-sessions")?;
-        let profiles = profiles(&base)?;
-        let created = Profile::create(&profiles, "default", None, None)?;
-        let open = || Profile::open(&profiles, "default", Access::Session);
-        assert!(open().is_err());
-        drop(created);
-
-        let first = open()?;
-        assert!(first.stop_sessions().is_err());
-        let first_marker = first.join_sessions()?;
-        let second = open()?;
-        let second_marker = second.join_sessions()?;
-        assert!(removal(&profiles, "default").is_err());
-        assert!(Profile::open(&profiles, "default", Access::Change).is_err());
-        drop((first_marker, first));
-        assert_eq!(second_marker.metadata()?.nlink(), 1);
-
-        let third = open()?;
-        let third_marker = third.join_sessions()?;
-        open()?.stop_sessions()?;
-        assert_eq!(second_marker.metadata()?.nlink(), 0);
-        assert_eq!(third_marker.metadata()?.nlink(), 0);
-        assert!(open()?.stop_sessions().is_err());
-        let next = open()?;
-        let next_marker = next.join_sessions()?;
-        drop((second_marker, second, third_marker, third));
-        assert_eq!(next_marker.metadata()?.nlink(), 1);
-        drop((next_marker, next));
-        assert!(open()?.stop_sessions().is_err());
-        assert!(removal(&profiles, "default")?.is_some());
         Ok(())
     }
 

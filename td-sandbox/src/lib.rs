@@ -14,6 +14,7 @@ mod flathub_app;
 mod import;
 mod intake;
 mod relay;
+mod sessions;
 mod state;
 mod wire;
 #[path = "../../engine/src/workspace_intake.rs"]
@@ -28,7 +29,7 @@ use intake::Intake;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -51,10 +52,11 @@ const HELP: &str = "td-sandbox COMMAND\n\
   runtime NAME RUNTIME|native bind a declared Flathub runtime at /usr\n\
   shell NAME                  start an interactive shell\n\
   run NAME -- COMMAND [ARG...] run a command in the sandbox\n\
-  stop NAME                   stop all CLI shells and commands for NAME\n\
+  sessions NAME               list active CLI session IDs\n\
+  stop NAME [ID]              stop one session (ID required when several run)\n\
   delete NAME                 delete an inactive sandbox, its grants and\n\
                               its home's contents; its account is kept\n\
-  Sandboxes run only on td: every command but help, runtimes, runtime and stop asks\n\
+  Sandboxes run only on td: every command but help, runtimes, runtime, sessions and stop asks\n\
   root's workspace intake.\n";
 
 /// How long `init-default` waits for root's intake at boot.
@@ -280,13 +282,33 @@ fn inspect(profile: &state::Profile, grants: &intake::Grants) -> io::Result<Stri
     Ok(shown)
 }
 
-/// Each launch has its own intake channel and shares the profile's stop marker.
-fn session(profile: &state::Profile, name: &str, line: &str, terminal: bool) -> io::Result<u8> {
-    let sessions = profile.join_sessions()?;
+/// Each CLI launch holds its own stop marker and intake connection.
+fn session(
+    profile: &state::Profile,
+    name: &str,
+    line: &str,
+    terminal: bool,
+    shell: bool,
+) -> io::Result<u8> {
+    let session = sessions::Session::register(profile)?;
     let channel = intake::Root::new()
         .launch(line)
         .map_err(|e| failure(format_args!("sandbox {name}: {}", explain(name, e))))?;
-    relay::outside(channel, &sessions, terminal)
+    let banner = if shell {
+        // The terminal relay disables output newline translation.
+        let eol = if io::stderr().is_terminal() {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        Some(text(format_args!(
+            "Sandbox {name}, session {:016x}{eol}",
+            session.id
+        ))?)
+    } else {
+        None
+    };
+    relay::outside(channel, &session.marker, terminal, banner)
 }
 
 /// The compiled choices, not a claim that their payloads are installed.
@@ -348,9 +370,20 @@ fn run() -> io::Result<u8> {
     let name = word(args.next())?;
     state::name(&name)?;
     match command.as_str() {
-        "stop" => {
+        "sessions" => {
             end(&mut args)?;
-            state::Profile::open(&profiles, &name, state::Access::Session)?.stop_sessions()?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
+            let ids = profile.sessions()?.active()?;
+            let mut out = io::stdout().lock();
+            for id in ids {
+                writeln!(out, "{id:016x}")?;
+            }
+        }
+        "stop" => {
+            let id = args.next().map(|value| word(Some(value))).transpose()?;
+            end(&mut args)?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
+            profile.sessions()?.stop(&name, id.as_deref())?;
         }
         "create" => {
             end(&mut args)?;
@@ -466,7 +499,7 @@ fn run() -> io::Result<u8> {
                 }
                 intake::run(&name, runtime, terminal, &term, &argv)?
             };
-            return session(&profile, &name, &line, terminal);
+            return session(&profile, &name, &line, terminal, command == "shell");
         }
         _ => return Err(error(HELP)),
     }
@@ -720,6 +753,7 @@ mod tests {
             ("intake.rs", include_str!("intake.rs")),
             ("import.rs", include_str!("import.rs")),
             ("state.rs", include_str!("state.rs")),
+            ("sessions.rs", include_str!("sessions.rs")),
         ] {
             let production = source.split("#[cfg(test)]").next().unwrap_or_default();
             for absent in [

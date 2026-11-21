@@ -35,7 +35,12 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
 /// sends empty once its command runs, means the command never started;
 /// one that ends later, that it ended without saying how. Root's log says
 /// why either way.
-pub fn outside(mut channel: UnixStream, sessions: &File, terminal: bool) -> io::Result<u8> {
+pub fn outside(
+    mut channel: UnixStream,
+    marker: &File,
+    terminal: bool,
+    banner: Option<String>,
+) -> io::Result<u8> {
     let mut terminal = if terminal {
         Some(RelayTerminal::enter(File::from(
             io::stdin().as_fd().try_clone_to_owned()?,
@@ -106,12 +111,12 @@ pub fn outside(mut channel: UnixStream, sessions: &File, terminal: bool) -> io::
     let mut size = None;
     let mut bytes = [0; wire::LIMIT];
     let mut pending_input = None;
-    let mut pending_output = None;
+    let mut pending_output = banner.map(|line| (wire::ERROR, line.into_bytes()));
     let mut outstanding = 0usize;
     let mut exit = None;
     let mut started = false;
     loop {
-        if sessions.metadata()?.nlink() == 0 {
+        if marker.metadata()?.nlink() == 0 {
             return Ok(143);
         }
         for result in written_rx.try_iter() {

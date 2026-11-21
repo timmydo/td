@@ -19,7 +19,7 @@ immutable entry; the target recipe stages engine's Flathub declarations
 (`flathub_app.rs`) and the ledger's names (`workload_accounts.rs`) too.
 
 Sandboxes run only on td, where the intake runs: on any other host every
-command but `help`, `runtimes`, `runtime` and `stop`, which need no intake, fails naming the missing intake. `./install-apps` no longer
+command but `help`, `runtimes`, `runtime`, `sessions` and `stop`, which need no intake, fails naming the missing intake. `./install-apps` no longer
 installs td-sandbox and has no way to retire a program: a
 `~/.local/bin/td-sandbox` an earlier `./install-apps` left on a development
 host is stale, no longer updated, and should be removed by hand.
@@ -31,7 +31,8 @@ td-sandbox network tools host
 td-sandbox runtime tools freedesktop-platform-25-08
 td-sandbox shell tools
 td-sandbox run tools -- command argument
-td-sandbox stop tools
+td-sandbox sessions tools
+td-sandbox stop tools [ID]
 td-sandbox adopt tools
 td-sandbox delete tools
 ```
@@ -47,7 +48,7 @@ account's home. td-sandbox keeps none of them: `inspect`, `list` and
 
 The human keeps one record per sandbox under
 `~/.local/share/td-sandbox/.profiles/NAME`, private: `record`, `lock` and a
-`sessions` file for stopping active CLI sessions. The record is exact: the line
+`session-ID` file per active CLI shell or command. The record is exact: the line
 `td-sandbox-profile-v1`, an optional `runtime=RUNTIME`, then an optional
 `old-home=PATH` naming the home of the profile it was imported from. A
 name is the ledger's: 1–64 lowercase ASCII letters, digits, `.`, `_` or
@@ -334,15 +335,20 @@ relay. SIGKILL cannot restore a terminal. Original attributes and signal mask
 are restored on ordinary return and errors. Reader threads end with the
 client process and are never joined on a blocking read.
 
-`stop NAME` stops all CLI shells and commands currently registered for
-that profile. Each holds a shared kernel lock on the same private
-`sessions` file. Registration and stop briefly lock the profile directory
-to order opening the file against its unlink. Stop reports an idle
-profile when it can exclusively lock the file. Otherwise it unlinks it,
-and each relay sees its descriptor's link count drop to zero and exits
-with status 143. A later launch opens a new file. Exiting one shell
-closes only its own connection, which lets td-jail tear down its PID
-namespace. Process exit releases its locks even after a crash.
+`sessions NAME` lists active CLI session IDs, one per line. An interactive
+shell prints its ID on stderr. Each ID is 16 lowercase hex digits from
+eight random bytes. Each session exclusively creates and locks a private
+`session-ID` file before asking root to launch. Registration, listing,
+stop and cleanup briefly lock the profile directory to order selection
+against arrivals and exits. They scan at most 1024 profile entries.
+
+`stop NAME ID` selects that session. With one session, `stop NAME` selects
+it. With several, it reports their IDs and asks for an explicit choice.
+Stop unlinks the selected marker. The relay observes its descriptor's
+link count drop to zero and exits with status 143. Exiting a shell closes
+its own connection, which lets the jail tear down that PID namespace.
+Normal exit removes the marker. Process death releases its lock, and the
+next registration, listing or stop removes unlocked markers.
 
 ## Other frontends
 
