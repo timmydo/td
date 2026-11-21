@@ -4477,11 +4477,10 @@ longer holds it to the screen's rate the way a synchronous one did:
   for delete_id, and at the end of the transaction are handed to the
   runtime with the epoch of the paint that shows the commit
   (`current_epoch()`).
-- Where that paint is already on glass, they are answered at once by the
-  client's own thread after the runtime lock, as before. Under fbdev that is
-  every commit except one made while a paint is owed -- between an input
-  batch's deferral and its flush, say -- whose callbacks the owed paint
-  answers. Otherwise the runtime holds them per client.
+- Once the paint is on glass, the client thread may answer immediately
+  when a page flip has completed since the client's previous batch or
+  at least one advertised refresh interval has elapsed. Otherwise the runtime
+  holds the callbacks for its configure worker.
 - The paint landing wakes that client's configure worker, the per-client
   thread the runtime already wakes for layout. It takes the due callbacks
   under the lock and writes `done` and delete_id after it, following any
@@ -4492,12 +4491,13 @@ longer holds it to the screen's rate the way a synchronous one did:
 - Held and in-transit callbacks count against the client's 256 pending
   callbacks, so a screen that never completes bounds them. A departing
   client's are dropped with its layout subscription.
-- A commit that changes nothing on screen is answered as soon as the scene
-  it leaves is on glass, which with nothing in flight is at once. A client
-  re-committing identical frames on `done` is therefore not slowed by it,
-  under either backend; pacing it would need a timer, which td does not
-  keep. Under fbdev a paint owed by a failure holds such commits until the
-  next paint, since nothing retries it without the KMS watchdog.
+- Between completed flips, callback batches follow the advertised 60 Hz.
+  This includes callback-only commits, identical KMS frames that skip the
+  flip, and synchronous fbdev paints. The configure worker waits on its existing wake channel
+  with a deadline only while such callbacks are due. Layout changes, new
+  presentations and shutdown can interrupt the wait. A callback alone
+  schedules no repaint. A callback awaiting an unpresented paint still
+  needs that paint to land, even after a refresh interval has elapsed.
 - The epoch is read after the transaction's lock is released, so a paint
   queued in between can lengthen the wait by a frame, never shorten it.
 

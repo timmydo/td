@@ -13,6 +13,8 @@
 
 use crate::scene::{Scene, SurfaceKey};
 
+pub(crate) const REFRESH_HZ: u16 = 60;
+
 /// A format a backend can put on glass, as a DRM fourcc.
 ///
 /// Deliberately NOT `wl_shm`'s enumerant namespace, where XRGB8888 is 1 and

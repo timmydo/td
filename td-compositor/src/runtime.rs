@@ -258,6 +258,11 @@ impl NoticePresentation {
     }
 }
 
+struct LayoutSubscriber {
+    wake: SyncSender<()>,
+    last_callback_batch: Option<(u64, Instant)>,
+}
+
 #[derive(Clone)]
 pub struct SubscriptionStop {
     wake: SyncSender<()>,
@@ -675,6 +680,9 @@ pub struct Runtime {
     /// The newest paint known to be on glass. `presented` is the same number
     /// for waiters that cannot take this runtime's lock.
     on_glass: u64,
+    /// Epoch of the last completed page flip. A synchronous paint can
+    /// advance on_glass without waiting for a display refresh.
+    last_flip_epoch: u64,
     presented: Arc<PresentationClock>,
     /// Frame callbacks held until the paint showing their commit is on
     /// glass: per client, oldest first, each with that paint's epoch.
@@ -692,7 +700,7 @@ pub struct Runtime {
     /// Only live headless clients, with no retained event journal.
     headless_commits: BTreeMap<u64, ClientCommit>,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
-    subscribers: BTreeMap<u64, SyncSender<()>>,
+    subscribers: BTreeMap<u64, LayoutSubscriber>,
     /// Each connected client's popup registrations, by client.
     ///
     /// The compositor now takes menus down on its own initiative, and the two
@@ -936,6 +944,7 @@ impl Runtime {
             owed_paint_failing: false,
             paints: 0,
             on_glass: 0,
+            last_flip_epoch: 0,
             presented: Arc::new(PresentationClock::default()),
             paced_callbacks: BTreeMap::new(),
             paced_in_transit: BTreeMap::new(),
@@ -1582,41 +1591,67 @@ impl Runtime {
         self.wake_paced_callbacks();
     }
 
-    /// Hold a commit's frame callbacks until the paint that shows the commit
-    /// is on glass, and answer those that may be sent now. That paint is
-    /// `current_epoch()`, so a client drawing on `done` draws once per frame
-    /// SHOWN rather than once per frame submitted, which under a flip in
-    /// flight is as often as it can commit. Where the paint is already on
-    /// glass -- under fbdev, unless a paint is owed -- they are answered at
-    /// once, unless older ones of the client's are still held or
-    /// being written by its worker, which keeps its callbacks in order.
-    pub fn pace_frame_callbacks(&mut self, client: u64, callbacks: Vec<u32>) -> Vec<u32> {
-        let due = self.current_epoch();
-        let holding = self.paced_callbacks.contains_key(&client)
-            || self.paced_in_transit.contains_key(&client);
-        if due <= self.on_glass && !holding {
+    /// A completed flip supplies its own pacing. Between flips, use the
+    /// advertised rate even if identical pixels were submitted again.
+    fn callback_deadline(&self, client: u64, now: Instant) -> Option<Instant> {
+        let (epoch, last) = self.subscribers.get(&client)?.last_callback_batch?;
+        let interval = Duration::from_nanos(1_000_000_000 / u64::from(crate::output::REFRESH_HZ));
+        let deadline = last + interval;
+        (epoch == self.last_flip_epoch && now < deadline).then_some(deadline)
+    }
+
+    fn record_callback_batch(&mut self, client: u64, now: Instant) {
+        if let Some(subscriber) = self.subscribers.get_mut(&client) {
+            subscriber.last_callback_batch = Some((self.last_flip_epoch, now));
+        }
+    }
+
+    /// Answer callbacks once their paint is on glass and the client can
+    /// start its next frame. Older queued or in-transit batches go first.
+    pub fn pace_frame_callbacks(
+        &mut self,
+        client: u64,
+        callbacks: Vec<u32>,
+        now: Instant,
+    ) -> Vec<u32> {
+        if callbacks.is_empty() {
             return callbacks;
         }
-        if !callbacks.is_empty() {
-            self.paced_callbacks
-                .entry(client)
-                .or_default()
-                .extend(callbacks.into_iter().map(|callback| (due, callback)));
+        let due = self.current_epoch();
+        let queued = self.paced_callbacks.contains_key(&client);
+        if due <= self.on_glass
+            && !queued
+            && !self.paced_in_transit.contains_key(&client)
+            && self.callback_deadline(client, now).is_none()
+        {
+            self.record_callback_batch(client, now);
+            return callbacks;
         }
-        if due <= self.on_glass {
+        self.paced_callbacks
+            .entry(client)
+            .or_default()
+            .extend(callbacks.into_iter().map(|callback| (due, callback)));
+        if due <= self.on_glass && !queued {
             self.wake_layout(client);
         }
         Vec::new()
     }
 
-    /// The client's held callbacks whose paint is now on glass, taken for
-    /// its configure worker to send once this lock is released. They are in
-    /// transit until `presented_callbacks_sent`.
-    pub fn take_presented_callbacks(&mut self, client: u64) -> Vec<u32> {
+    /// Take a batch for the configure worker to write outside the lock.
+    /// Only a presented batch waiting on the clock needs a timed wake.
+    pub fn take_presented_callbacks(
+        &mut self,
+        client: u64,
+        now: Instant,
+    ) -> (Vec<u32>, Option<Instant>) {
         let on_glass = self.on_glass;
+        let deadline = self.callback_deadline(client, now);
         let Some(held) = self.paced_callbacks.get_mut(&client) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
+        if deadline.is_some() && held.front().is_some_and(|(due, _)| *due <= on_glass) {
+            return (Vec::new(), deadline);
+        }
         let mut shown = Vec::new();
         while let Some(&(due, callback)) = held.front() {
             if due > on_glass {
@@ -1631,8 +1666,9 @@ impl Runtime {
         if !shown.is_empty() {
             let transit = self.paced_in_transit.entry(client).or_default();
             *transit = transit.saturating_add(shown.len());
+            self.record_callback_batch(client, now);
         }
-        shown
+        (shown, None)
     }
 
     /// The worker wrote `count` callbacks it took.
@@ -1659,8 +1695,8 @@ impl Runtime {
     fn wake_paced_callbacks(&self) {
         for (client, held) in &self.paced_callbacks {
             if held.front().is_some_and(|(due, _)| *due <= self.on_glass) {
-                if let Some(wake) = self.subscribers.get(client) {
-                    let _ = wake.try_send(());
+                if let Some(subscriber) = self.subscribers.get(client) {
+                    let _ = subscriber.wake.try_send(());
                 }
             }
         }
@@ -1800,6 +1836,7 @@ impl Runtime {
         }
         // Before the owed paint is taken: that queues the next flip, and
         // evidence is judged against a glass whose contents are known.
+        self.last_flip_epoch = shown.epoch;
         self.mark_on_glass(shown.epoch);
         if let Err(error) = self.flush_paint() {
             eprintln!(
@@ -4664,7 +4701,13 @@ impl Runtime {
         let (wake, receiver) = mpsc::sync_channel(1);
         wake.try_send(())
             .map_err(|_| "new layout subscription could not be primed".to_string())?;
-        self.subscribers.insert(id, wake.clone());
+        self.subscribers.insert(
+            id,
+            LayoutSubscriber {
+                wake: wake.clone(),
+                last_callback_batch: None,
+            },
+        );
         Ok(LayoutSubscription {
             receiver,
             stop: SubscriptionStop {
@@ -5915,10 +5958,12 @@ impl Runtime {
     }
 
     pub fn wake_layout(&mut self, id: u64) {
-        let disconnected = self
-            .subscribers
-            .get(&id)
-            .is_some_and(|wake| matches!(wake.try_send(()), Err(TrySendError::Disconnected(()))));
+        let disconnected = self.subscribers.get(&id).is_some_and(|subscriber| {
+            matches!(
+                subscriber.wake.try_send(()),
+                Err(TrySendError::Disconnected(()))
+            )
+        });
         if disconnected {
             self.subscribers.remove(&id);
         }
@@ -5945,10 +5990,11 @@ impl Runtime {
     }
 
     fn publish_layout(&mut self) {
-        self.subscribers.retain(|_, wake| match wake.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => true,
-            Err(TrySendError::Disconnected(())) => false,
-        });
+        self.subscribers
+            .retain(|_, subscriber| match subscriber.wake.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => true,
+                Err(TrySendError::Disconnected(())) => false,
+            });
     }
 
     fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) -> Result<(), String> {
@@ -8170,29 +8216,41 @@ mod tests {
         let mut runtime = Runtime::new(chain);
         let (wake, _stop) = runtime.subscribe(3).unwrap().split();
         assert!(wake.try_recv().is_ok(), "the subscription is primed");
-        assert_eq!(runtime.pace_frame_callbacks(3, vec![40]), [40]);
+        let now = Instant::now();
+        assert_eq!(runtime.pace_frame_callbacks(3, vec![40], now), [40]);
 
         runtime
             .pointer_frame(1, 10, 10, &[], PointerScroll::default())
             .unwrap();
         runtime.flush_paint().unwrap();
         let shown = runtime.frame_in_flight().unwrap();
-        assert!(runtime.pace_frame_callbacks(3, vec![50, 51]).is_empty());
+        assert!(runtime
+            .pace_frame_callbacks(3, vec![50, 51], now)
+            .is_empty());
         assert_eq!(runtime.paced_frame_callbacks(3), 2);
-        assert!(runtime.take_presented_callbacks(3).is_empty());
+        assert_eq!(
+            runtime.take_presented_callbacks(3, now + Duration::from_secs(1)),
+            (vec![], None),
+            "only presentation can release callbacks for an in-flight paint"
+        );
         while wake.try_recv().is_ok() {}
 
         runtime.output_event(OutputEvent::Presented(shown)).unwrap();
         assert!(wake.try_recv().is_ok(), "the landing woke the worker");
         // Due now, but behind held ones: queued, so they stay in order.
-        assert!(runtime.pace_frame_callbacks(3, vec![52]).is_empty());
-        assert_eq!(runtime.take_presented_callbacks(3), [50, 51, 52]);
+        assert!(runtime.pace_frame_callbacks(3, vec![52], now).is_empty());
+        assert_eq!(runtime.take_presented_callbacks(3, now).0, [50, 51, 52]);
         // Taken but not yet written: still counted, and not overtaken.
         assert_eq!(runtime.paced_frame_callbacks(3), 3);
-        assert!(runtime.pace_frame_callbacks(3, vec![54]).is_empty());
+        assert!(runtime.pace_frame_callbacks(3, vec![54], now).is_empty());
         runtime.presented_callbacks_sent(3, 3);
         assert_eq!(runtime.paced_frame_callbacks(3), 1);
-        assert_eq!(runtime.take_presented_callbacks(3), [54]);
+        let (shown, deadline) = runtime.take_presented_callbacks(3, now);
+        assert!(shown.is_empty());
+        assert_eq!(
+            runtime.take_presented_callbacks(3, deadline.unwrap()).0,
+            [54]
+        );
         runtime.presented_callbacks_sent(3, 1);
         assert_eq!(runtime.paced_frame_callbacks(3), 0);
 
@@ -8200,11 +8258,56 @@ mod tests {
             .pointer_frame(1, -10, -10, &[], PointerScroll::default())
             .unwrap();
         runtime.flush_paint().unwrap();
-        assert!(runtime.pace_frame_callbacks(3, vec![53]).is_empty());
+        assert!(runtime.pace_frame_callbacks(3, vec![53], now).is_empty());
         assert_eq!(runtime.paced_frame_callbacks(3), 1);
 
         runtime.unsubscribe(3);
         assert_eq!(runtime.paced_frame_callbacks(3), 0);
+    }
+
+    #[test]
+    fn repeated_callbacks_on_an_idle_output_wait_without_painting() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        let (_wake, _stop) = runtime.subscribe(3).unwrap().split();
+        let now = Instant::now();
+        assert_eq!(runtime.pace_frame_callbacks(3, vec![40], now), [40]);
+        assert!(runtime.pace_frame_callbacks(3, vec![41], now).is_empty());
+        assert!(runtime.pace_frame_callbacks(3, vec![42], now).is_empty());
+        let (early, deadline) = runtime.take_presented_callbacks(3, now);
+        assert!(early.is_empty());
+        let deadline = deadline.unwrap();
+        assert_eq!(deadline - now, Duration::from_nanos(16_666_666));
+        let (_, still_waiting) =
+            runtime.take_presented_callbacks(3, deadline - Duration::from_nanos(1));
+        assert_eq!(still_waiting, Some(deadline));
+        assert_eq!(
+            runtime.take_presented_callbacks(3, deadline),
+            (vec![41, 42], None)
+        );
+        runtime.presented_callbacks_sent(3, 2);
+        assert_eq!(
+            runtime.take_presented_callbacks(3, deadline),
+            (vec![], None)
+        );
+        assert!(runtime.frame_in_flight().is_none());
+        assert_eq!(runtime.paints, 0);
+    }
+
+    #[test]
+    fn identical_repaints_do_not_supply_a_refresh_tick() {
+        let (chain, _log) = crate::drm::testing::chain(120, 80);
+        let mut runtime = Runtime::new(chain);
+        let (_wake, _stop) = runtime.subscribe(3).unwrap().split();
+        let now = Instant::now();
+        runtime.repaint().unwrap();
+        let frame = runtime.frame_in_flight().unwrap();
+        runtime.output_event(OutputEvent::Presented(frame)).unwrap();
+        assert_eq!(runtime.pace_frame_callbacks(3, vec![40], now), [40]);
+        runtime.repaint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+        assert!(runtime.frame_in_flight().is_none());
+        assert!(runtime.pace_frame_callbacks(3, vec![41], now).is_empty());
     }
 
     /// The wait is made without the runtime lock: a completion delivered

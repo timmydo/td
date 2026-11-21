@@ -1060,20 +1060,29 @@ fn configure_worker(
     client: u64,
     pending_deletes: PendingDeletes,
 ) -> Result<(), String> {
-    while receiver.recv().is_ok() {
-        if stop.is_stopped() {
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let disconnected = match deadline {
+            Some(at) => matches!(
+                receiver.recv_timeout(at.saturating_duration_since(Instant::now())),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            None => receiver.recv().is_err(),
+        };
+        if disconnected || stop.is_stopped() {
             return Ok(());
         }
-        let (snapshot, shown, closing) = {
+        let (snapshot, (shown, next_deadline), closing) = {
             let mut runtime = runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?;
             (
                 runtime.layout_snapshot(),
-                runtime.take_presented_callbacks(client),
+                runtime.take_presented_callbacks(client, Instant::now()),
                 runtime.close_requested(client),
             )
         };
+        deadline = next_deadline;
         let configurations = configurations
             .lock()
             .map_err(|_| "configure registration lock poisoned".to_string())?;
@@ -1123,7 +1132,6 @@ fn configure_worker(
             return Ok(());
         }
     }
-    Ok(())
 }
 
 fn keymap_file(directory: &Path) -> Result<KeymapFile, String> {
@@ -2643,7 +2651,7 @@ impl Client {
             .runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
-            .pace_frame_callbacks(self.id, callbacks);
+            .pace_frame_callbacks(self.id, callbacks, Instant::now());
         for callback in shown {
             send_frame_done(&self.outbound, &self.pending_deletes, callback)?;
         }
@@ -4110,7 +4118,7 @@ impl Client {
         mode.u32(3);
         mode.i32(width);
         mode.i32(height);
-        mode.i32(60_000);
+        mode.i32(i32::from(crate::output::REFRESH_HZ) * 1000);
         self.send(id, 1, mode)?;
 
         if version >= 2 {
@@ -16315,6 +16323,30 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         client.insert(50, Object::Callback).unwrap();
+
+        // The client can keep asking on this same image. With no output
+        // event to wake the worker, its deadline must deliver the callbacks.
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        for callback in [51, 52, 53] {
+            let mut frame = wire::Builder::new();
+            frame.u32(callback);
+            client
+                .dispatch(request(5, 3, frame).unwrap(), &mut VecDeque::new())
+                .unwrap();
+            client
+                .dispatch(
+                    request(5, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+            let events = receive_messages(&mut peer, 2);
+            assert_eq!(
+                (events[0].object, events[0].opcode),
+                (callback, WL_CALLBACK_DONE)
+            );
+            assert_eq!((events[1].object, events[1].opcode), (1, 1));
+        }
+        assert!(runtime.lock().unwrap().frame_in_flight().is_none());
 
         stop.stop();
         worker.join().unwrap().unwrap();
