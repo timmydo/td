@@ -32,10 +32,11 @@ use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// The output every harness session runs at.
+/// The output a harness session runs at unless it names another
+/// (`Compositor::start_sized`).
 pub const OUTPUT_WIDTH: usize = 800;
 pub const OUTPUT_HEIGHT: usize = 600;
-/// One captured output as RGB rows.
+/// One captured output of that size as RGB rows.
 pub const FRAME_BYTES: usize = OUTPUT_WIDTH * OUTPUT_HEIGHT * 3;
 
 /// The bound on each harness wait. Every wait polls and returns once its
@@ -182,9 +183,19 @@ pub fn observation(reply: &[u8], session: &str, window: &str) -> Result<Observat
 }
 
 /// Parses one `capture` reply in `session`: the output counter and the
-/// frame's RGB rows.
+/// frame's RGB rows, at the harness's default output.
 pub fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
-    if reply.len() > FRAME_BYTES + 128 {
+    ppm_sized(reply, session, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+}
+
+/// `ppm` for an output of `width` by `height`.
+pub fn ppm_sized<'a>(
+    reply: &'a [u8],
+    session: &str,
+    width: usize,
+    height: usize,
+) -> Result<(u64, &'a [u8])> {
+    if reply.len() > width * height * 3 + 128 {
         return Err("compositor capture limit".into());
     }
     let prefix = format!("ok\nP6\n# td-output-v1 session={session} output=");
@@ -197,13 +208,37 @@ pub fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
         .ok_or("capture output line")?;
     let output =
         number(std::str::from_utf8(&body[..newline]).map_err(|_| "capture counter UTF-8")?)?;
-    let pixels = body[newline + 1..]
-        .strip_prefix(b"800 600\n255\n")
-        .ok_or("capture geometry")?;
-    if output == 0 || pixels.len() != FRAME_BYTES {
+    let pixels = geometry(&body[newline + 1..], width, height).ok_or("capture geometry")?;
+    if output == 0 || pixels.len() != width * height * 3 {
         return Err("capture size or counter".into());
     }
     Ok((output, pixels))
+}
+
+/// The rows after a capture's `WIDTH HEIGHT\n255\n` header, when it
+/// names `width` by `height`.
+fn geometry(body: &[u8], width: usize, height: usize) -> Option<&[u8]> {
+    let mut parts = body.splitn(3, |byte| *byte == b'\n');
+    let size = std::str::from_utf8(parts.next()?).ok()?;
+    let (wide, high) = size.split_once(' ')?;
+    let sized = number(wide).ok()? == width as u64 && number(high).ok()? == height as u64;
+    (sized && parts.next()? == b"255").then_some(())?;
+    parts.next()
+}
+
+/// `n` in decimal in `buffer`, as an argument, with no allocation.
+fn decimal(mut n: usize, buffer: &mut [u8; 20]) -> &std::ffi::OsStr {
+    use std::os::unix::ffi::OsStrExt;
+    let mut start = buffer.len();
+    loop {
+        start -= 1;
+        buffer[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::ffi::OsStr::from_bytes(&buffer[start..])
 }
 
 /// A mapped toplevel and where the compositor composites it into the output,
@@ -234,6 +269,8 @@ pub struct Compositor {
     /// Input receipts counted so far; each injection expects the next.
     action: u64,
     output: Option<JoinHandle<()>>,
+    width: usize,
+    height: usize,
 }
 
 impl Compositor {
@@ -241,6 +278,12 @@ impl Compositor {
     /// and `controls`, its session under `directory`, its stderr in
     /// `directory/compositor.log`, and waits for its readiness line.
     pub fn start(directory: &Path, controls: Controls) -> Self {
+        Self::start_sized(directory, controls, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+    }
+
+    /// `start` at an output of `width` by `height`, at scale one, which
+    /// is the headless compositor's only scale.
+    pub fn start_sized(directory: &Path, controls: Controls, width: usize, height: usize) -> Self {
         let binary = PathBuf::from(
             std::env::var_os("TD_TEST_COMPOSITOR")
                 .expect("set TD_TEST_COMPOSITOR to an explicitly built td-compositor"),
@@ -255,14 +298,11 @@ impl Compositor {
             .arg("headless")
             .arg("--session-dir")
             .arg(&session_dir)
-            .args([
-                "--width",
-                "800",
-                "--height",
-                "600",
-                "--input-control",
-                "enabled",
-            ]);
+            .arg("--width")
+            .arg(decimal(width, &mut [0; 20]))
+            .arg("--height")
+            .arg(decimal(height, &mut [0; 20]))
+            .args(["--input-control", "enabled"]);
         if controls.capture {
             command.args(["--capture-control", "enabled"]);
         }
@@ -283,6 +323,8 @@ impl Compositor {
             session: String::new(),
             action: 0,
             output: None,
+            width,
+            height,
         };
         let stdout = compositor.child.stdout.take().unwrap();
         let (send, receive) = mpsc::sync_channel(1);
@@ -304,11 +346,28 @@ impl Compositor {
             .expect("compositor readiness deadline");
         let session = ready
             .strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=")
-            .and_then(|line| line.strip_suffix(" width=800 height=600 scale=1\n"))
+            .and_then(|line| line.strip_suffix(" scale=1\n"))
+            .and_then(|line| {
+                let (line, high) = line.rsplit_once(" height=")?;
+                let (line, wide) = line.rsplit_once(" width=")?;
+                let sized =
+                    number(wide).ok()? == width as u64 && number(high).ok()? == height as u64;
+                sized.then_some(line)
+            })
             .expect("compositor readiness grammar");
         assert!(identity(session));
         compositor.session = session.to_string();
         compositor
+    }
+
+    /// The output's width and height.
+    pub fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// One captured output as RGB rows.
+    fn frame_bytes(&self) -> usize {
+        self.width * self.height * 3
     }
 
     /// The session's identity.
@@ -498,8 +557,8 @@ impl Compositor {
 
     /// The output now as RGB rows, with the output counter of the frame.
     pub fn capture(&self) -> (u64, Vec<u8>) {
-        let capture = self.request("capture", FRAME_BYTES + 128);
-        let (output, pixels) = ppm(&capture, &self.session).unwrap();
+        let capture = self.request("capture", self.frame_bytes() + 128);
+        let (output, pixels) = ppm_sized(&capture, &self.session, self.width, self.height).unwrap();
         (output, pixels.to_vec())
     }
 
@@ -507,18 +566,31 @@ impl Compositor {
     /// capture, observe rule: the frame is the same one before and after
     /// the capture, and the capture's output number lies after the first
     /// observation's and not after the second's, or the capture is retried.
-    /// Returns the tile's RGB rows.
+    /// A capture cut short is retried too. Returns the tile's RGB rows.
     pub fn tile(&self, place: &Placement) -> Vec<u8> {
         let deadline = Instant::now() + TIMEOUT;
+        let mut refused = None;
         loop {
-            assert!(Instant::now() < deadline, "no settled frame to capture");
+            assert!(
+                Instant::now() < deadline,
+                "no settled frame to capture; the last capture refused: {refused:?}"
+            );
             std::thread::sleep(Duration::from_millis(2));
             let first = self.observe(&place.window);
             if !first.current {
                 continue;
             }
-            let capture = self.request("capture", FRAME_BYTES + 128);
-            let (output, pixels) = ppm(&capture, &self.session).unwrap();
+            let capture = self.request("capture", self.frame_bytes() + 128);
+            // A capture the compositor cut off at its exchange deadline,
+            // as a large output's can be on a loaded host, is asked again.
+            let (output, pixels) = match ppm_sized(&capture, &self.session, self.width, self.height)
+            {
+                Ok(parsed) => parsed,
+                Err(why) => {
+                    refused = Some(why);
+                    continue;
+                }
+            };
             let second = self.observe(&place.window);
             if !second.current || second.commit != first.commit {
                 continue;
@@ -527,7 +599,7 @@ impl Compositor {
             assert!(output > first.output && output <= second.output);
             let mut tile = Vec::with_capacity(place.width * place.height * 3);
             for y in 0..place.height {
-                let start = ((place.y + y) * OUTPUT_WIDTH + place.x) * 3;
+                let start = ((place.y + y) * self.width + place.x) * 3;
                 tile.extend_from_slice(&pixels[start..start + place.width * 3]);
             }
             return tile;
@@ -616,5 +688,45 @@ mod tests {
         assert!(ppm(&capture, "00000000000000000000000000000008").is_err());
         capture.push(7);
         assert!(ppm(&capture, session).is_err());
+        // Another output's capture: its own geometry and size, which the
+        // default output's parse refuses.
+        let mut sized =
+            format!("ok\nP6\n# td-output-v1 session={session} output=5\n32 16\n255\n").into_bytes();
+        let header = sized.len();
+        sized.resize(header + 32 * 16 * 3, 7);
+        assert_eq!(ppm_sized(&sized, session, 32, 16).unwrap().0, 5);
+        assert_eq!(
+            ppm_sized(&sized, session, 32, 16).unwrap().1.len(),
+            32 * 16 * 3
+        );
+        assert!(ppm_sized(&sized, session, 16, 32).is_err());
+        assert!(ppm_sized(&sized[..sized.len() - 1], session, 32, 16).is_err());
+        assert!(ppm(&sized, session).is_err());
+    }
+
+    #[test]
+    fn sizes_are_written_and_read_as_canonical_decimals() {
+        for (n, text) in [
+            (0, "0"),
+            (7, "7"),
+            (3840, "3840"),
+            (usize::MAX, "18446744073709551615"),
+        ] {
+            assert_eq!(decimal(n, &mut [0; 20]), text);
+        }
+        let rows = b"32 16\n255\nrows";
+        assert_eq!(geometry(rows, 32, 16), Some(&b"rows"[..]));
+        assert_eq!(geometry(b"32 16\n255\n", 32, 16), Some(&b""[..]));
+        for refused in [
+            &b"032 16\n255\nrows"[..],
+            b"32  16\n255\nrows",
+            b"32 16 \n255\nrows",
+            b"+32 16\n255\nrows",
+            b"32 16\n254\nrows",
+            b"32 16\n255",
+            b"16 32\n255\nrows",
+        ] {
+            assert_eq!(geometry(refused, 32, 16), None, "{refused:?}");
+        }
     }
 }
