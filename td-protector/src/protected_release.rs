@@ -242,6 +242,7 @@ pub struct Released {
     pub key: Key,
     pub method: Method,
     opened: Opened,
+    releasing_primary: Option<[u8; PRIMARY_NAME_LEN]>,
     /// The confirmed reseal's protector, or a PIN change's (`new_pin`).
     reseal: Option<NewPin>,
     /// A selector update's pre-seal: the PIN's released secret sealed under
@@ -557,6 +558,9 @@ fn released<T: Tpm, C: Runner, F: Fido>(
         keyslot,
         key,
         method: method(header, opened),
+        releasing_primary: chain.passed.and_then(|(number, pin)| {
+            (opened == Opened::TpmPin { token: number }).then_some(pin.primary)
+        }),
         opened,
         reseal,
         predicted,
@@ -575,6 +579,9 @@ pub struct Finished {
     /// This boot took or proved the TPM's lockout authorization, a
     /// TPM2_Clear after it included.
     pub lockout: bool,
+    /// Storage primary whose lockout hierarchy td proved this boot. A
+    /// clear attempt invalidates the proof even when its response was lost.
+    pub passkey_primary: Option<[u8; PRIMARY_NAME_LEN]>,
     /// A selector update's predicted protector, naming the keyslot that
     /// released, for the commit to import; none once this boot refused
     /// any header change, or without a lockout this boot took or proved
@@ -618,6 +625,7 @@ pub fn finish<T: Tpm, C: Runner>(
         predicted,
         capped,
         primary: chain_primary,
+        releasing_primary,
         new_pin,
     } = released;
     let mut reseal = reseal;
@@ -944,6 +952,9 @@ pub fn finish<T: Tpm, C: Runner>(
     }
     if let (Some((auth, primary)), Some(tpm)) = (&lockout, tpm) {
         finished.lockout = true;
+        if !clear_sent {
+            finished.passkey_primary = releasing_primary.filter(|name| name == primary.as_slice());
+        }
         // Not after a TPM2_Clear sent, refused or not: a refusal can be
         // forged over a clear done, and a reset under the old `L` would
         // spend the cleared TPM's lockout attempt, the next boot's take
@@ -3009,6 +3020,10 @@ pub(crate) mod tests {
         /// the reader returns it, and `finish` after a release. Every
         /// secret is gone once it returns and the script is used up.
         fn boot(&mut self, script: Vec<Say>) -> Run {
+            self.boot_with(script, |_| {})
+        }
+
+        fn boot_with(&mut self, script: Vec<Say>, after_release: impl FnOnce(&mut Model)) -> Run {
             self.model.reboot();
             if self.precapped {
                 self.model.wire.0.borrow_mut().pcrs[usize::from(CAP_PCR)] = capped();
@@ -3048,6 +3063,7 @@ pub(crate) mod tests {
             let mut run = Run::default();
             match outcome {
                 Outcome::Released(released) => {
+                    after_release(&mut self.model);
                     note(&self.log, format!("released {}", released.keyslot));
                     run.released = Some((released.keyslot, released.method));
                     run.finished = Some(finish(
@@ -3159,6 +3175,7 @@ pub(crate) mod tests {
             Some(Finished {
                 resealed: None,
                 lockout: true,
+                passkey_primary: Some(world.model.state.borrow().primary),
                 predicted: None,
             })
         );
@@ -3185,6 +3202,20 @@ pub(crate) mod tests {
         assert!(!world.has("tpm lockout Reset") && !world.has("tpm lockout Take"));
         assert!(world.has("say td proved the TPM's lockout authorization"));
         assert!(!world.wrote());
+    }
+
+    #[test]
+    fn post_cap_take_on_a_different_tpm_keeps_admission_without_a_passkey_anchor() {
+        let mut world = World::tpm_shape();
+        let run = world.boot_with(vec![say(PIN)], |model| {
+            model.wire.0.borrow_mut().seed += 1;
+            let (_, name) = model.wire.client().storage_primary(None).unwrap();
+            model.state.borrow_mut().primary = name.try_into().unwrap();
+        });
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        let finished = run.finished.unwrap();
+        assert!(finished.lockout);
+        assert_eq!(finished.passkey_primary, None);
     }
 
     #[test]

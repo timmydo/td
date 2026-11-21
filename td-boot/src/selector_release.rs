@@ -103,6 +103,7 @@ pub(crate) enum Unlock {
         /// keyslot that released, for the commit (ENCRYPTION.md "Selector
         /// update"); only a protected TPM PIN release carries one.
         predicted: Option<TpmPin>,
+        passkey_primary: Option<[u8; 34]>,
     },
     /// Refuse boot and halt, naming the reason. Nothing secret is held.
     Halt(String),
@@ -427,6 +428,7 @@ fn upgraded(outcome: upgrade_boot::Outcome<VolumeKey>) -> Upgrading {
             key,
             admission: Some(admission::Method::None),
             predicted: None,
+            passkey_primary: None,
         }),
         upgrade_boot::Outcome::Cancel => Upgrading::DeviceBound { cancel: true },
         upgrade_boot::Outcome::NoMains => Upgrading::DeviceBound { cancel: false },
@@ -674,24 +676,26 @@ fn open_released<T: Tpm, C: Runner>(
             again.as_ref()
         }
     };
-    let predicted = header.and_then(|header| {
-        protected::finish(
-            released,
-            header,
-            partition,
-            key.expose(),
-            tpm,
-            cryptsetup,
-            prompt,
-            console,
-        )
-        .predicted
-    });
+    let finished = header
+        .map(|header| {
+            protected::finish(
+                released,
+                header,
+                partition,
+                key.expose(),
+                tpm,
+                cryptsetup,
+                prompt,
+                console,
+            )
+        })
+        .unwrap_or_default();
     Unlock::Boot {
         keyslot,
         key,
         admission,
-        predicted,
+        predicted: finished.predicted,
+        passkey_primary: finished.passkey_primary,
     }
 }
 
@@ -1078,6 +1082,7 @@ fn open<C: Runner>(
             key: volume,
             admission: None,
             predicted: None,
+            passkey_primary: None,
         },
         Err(error) => Unlock::Failed(error),
     }

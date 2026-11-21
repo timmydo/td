@@ -2044,8 +2044,7 @@ td-json/src/lib.rs	allocating-conversion	23
 td-json/src/lib.rs	allocation-macro	7
 td-json/src/lib.rs	unchecked-growth-or-clone	29
 td-kexec/src/main.rs	allocating-conversion	4
-td-kexec/src/main.rs	allocation-macro	17
-td-kexec/src/main.rs	unchecked-growth-or-clone	1
+td-kexec/src/main.rs	allocation-macro	16
 td-kv/src/lib.rs	allocating-conversion	10
 td-kv/src/lib.rs	allocation-macro	9
 td-kv/src/lib.rs	heap-owner	6

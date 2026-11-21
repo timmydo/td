@@ -1755,3 +1755,10 @@ cargo test --release --manifest-path td-protector/Cargo.toml --test header_fit -
 ```
 
 These tests need no AF_ALG, device mapper, loop device or privilege.
+
+A protected TPM-primary release returns the storage primary Name in
+`Finished::passkey_primary` only after this boot took or proved lockout
+ownership and set the DA policy. Once a clear has been sent, its outcome
+can be uncertain and the result carries no Name. td-boot can hand this
+public value to the running session under the passkey storage primary
+contract in td-install/ENCRYPTION.md.

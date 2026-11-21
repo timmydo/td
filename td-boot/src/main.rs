@@ -2462,6 +2462,7 @@ fn read_only_recovery(
 struct Handoff<'a> {
     key: &'a unlock::VolumeKey,
     admission: Option<admission::Method>,
+    passkey_primary: Option<[u8; protocol::PASSKEY_PRIMARY_BYTES]>,
 }
 
 /// The admission record for the selected deployment `id`: the primary
@@ -2571,7 +2572,23 @@ fn kexec_boot_decision(
     let key_pipe = handoff
         .map(|handoff| KeyFile::new(handoff.key.expose()))
         .transpose()?;
-    let record_pipe = record.map(|record| KeyFile::new(&record)).transpose()?;
+    let record_pipe = record
+        .map(|record| {
+            let primary = handoff.and_then(|h| h.passkey_primary);
+            if let Some(name) = primary.filter(|_| {
+                admission::Record::decode(&record)
+                    .is_ok_and(|r| r.method == admission::Method::TpmPin)
+            }) {
+                let mut both = [0; admission::RECORD_BYTES + protocol::PASSKEY_PRIMARY_BYTES];
+                let (admit, anchor) = both.split_at_mut(admission::RECORD_BYTES);
+                admit.copy_from_slice(&record);
+                anchor.copy_from_slice(&name);
+                KeyFile::new(&both)
+            } else {
+                KeyFile::new(&record)
+            }
+        })
+        .transpose()?;
     let mut command = match (&key_pipe, &record_pipe) {
         (None, _) => kexec_command(kernel, initramfs, cmdline.as_os_str()),
         (Some(pipe), None) => key_kexec_command(
@@ -3718,7 +3735,7 @@ fn boot_encrypted(
         on_mains: &mut on_mains,
         resilience: &mut resilience,
     };
-    let (keyslot, key, admission, mut predicted) = match selector_release::unlock(
+    let (keyslot, key, admission, mut predicted, passkey_primary) = match selector_release::unlock(
         &header,
         &partition.path(),
         tpm.as_mut(),
@@ -3738,7 +3755,8 @@ fn boot_encrypted(
             key,
             admission,
             predicted,
-        } => (keyslot, key, admission, predicted),
+            passkey_primary,
+        } => (keyslot, key, admission, predicted, passkey_primary),
         selector_release::Unlock::Halt(reason) => halt(&reason),
         selector_release::Unlock::Failed(error) => return Err(error),
     };
@@ -3785,6 +3803,7 @@ fn boot_encrypted(
         Some(Handoff {
             key: &key,
             admission,
+            passkey_primary,
         }),
         Some(&mut commit),
     )
@@ -6432,7 +6451,7 @@ mod tests {
         // The key and the record are written to their pipes only after the
         // measurement, and the pipes live until td-kexec returns.
         let piped = position(".map(|handoff| KeyFile::new(handoff.key.expose()))");
-        let record_piped = position("let record_pipe = record.map(|record| KeyFile::new(&record))");
+        let record_piped = position("let record_pipe = record");
         let plain = position("(None, _) => kexec_command(kernel, initramfs, cmdline.as_os_str()),");
         let keyed = position("(Some(pipe), None) => key_kexec_command(");
         let admitting = position("(Some(pipe), Some(record)) => key_kexec_command(");
@@ -7900,7 +7919,7 @@ mod tests {
         );
         let keys = position("let mut keys = selector_release::SecurityKeys::root();");
         let released = position(
-            "let (keyslot, key, admission, mut predicted) = match selector_release::unlock(",
+            "let (keyslot, key, admission, mut predicted, passkey_primary) = match selector_release::unlock(",
         );
         assert!(position("&mut line,") > released);
         assert!(applet < keys && keys < released && position("&mut keys,") > released);
@@ -7912,7 +7931,7 @@ mod tests {
         );
         // The release's own admission, and nothing else, reaches the handoff.
         let boot = "run_boot(\n        &mapping.path(),\n        mountpoint,\n        cmdline,\n        \
-                    Some(Handoff {\n            key: &key,\n            admission,\n        }),\n        \
+                    Some(Handoff {\n            key: &key,\n            admission,\n            passkey_primary,\n        }),\n        \
                     Some(&mut commit),\n    )";
         let booted = position(boot);
         assert!(pre_active < header && header < waited);

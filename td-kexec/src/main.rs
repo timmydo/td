@@ -414,12 +414,48 @@ impl VolumeKey {
     }
 }
 
-/// The admission record: exactly `ADMIT_RECORD_BYTES` and then end of file.
+/// The admission record plus an optional fixed-width storage primary Name.
 /// td-boot writes and judges its fields; td-kexec only carries its bytes.
-fn read_record(source: &mut dyn Read) -> std::io::Result<[u8; protocol::ADMIT_RECORD_BYTES]> {
-    let mut record = [0u8; protocol::ADMIT_RECORD_BYTES];
-    read_exactly(source, &mut record, "admission record")?;
-    Ok(record)
+struct Record {
+    admission: [u8; protocol::ADMIT_RECORD_BYTES],
+    primary: Option<[u8; protocol::PASSKEY_PRIMARY_BYTES]>,
+}
+
+fn read_record(source: &mut dyn Read) -> std::io::Result<Record> {
+    // Two exact lengths are admitted, with both pipe writers closed.
+    let mut bytes = [0; protocol::ADMIT_RECORD_BYTES + protocol::PASSKEY_PRIMARY_BYTES + 1];
+    let mut count = 0;
+    while let Some(left) = bytes.get_mut(count..).filter(|s| !s.is_empty()) {
+        match source.read(left) {
+            Ok(0) => break,
+            Ok(n) => count += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::Error::other(
+                    "admission record pipe still has a write end open",
+                ))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let input = bytes
+        .get(..count)
+        .ok_or_else(|| std::io::Error::other("invalid admission record"))?;
+    let (admission, rest) = input
+        .split_first_chunk()
+        .ok_or_else(|| std::io::Error::other("short admission record"))?;
+    let primary = if rest.is_empty() {
+        None
+    } else {
+        Some(
+            rest.try_into()
+                .map_err(|_| std::io::Error::other("invalid admission record length"))?,
+        )
+    };
+    Ok(Record {
+        admission: *admission,
+        primary,
+    })
 }
 
 impl Drop for VolumeKey {
@@ -432,23 +468,36 @@ impl Drop for VolumeKey {
 /// key member, then `record`'s member when there is one, then the trailer.
 /// The key itself never enters this buffer: it is written to the memfd
 /// straight from `VolumeKey` between the archive's two halves.
-fn key_archive(
-    record: Option<&[u8; protocol::ADMIT_RECORD_BYTES]>,
-) -> std::io::Result<(Vec<u8>, usize)> {
+fn key_archive(record: Option<&Record>) -> std::io::Result<(Vec<u8>, usize)> {
     let placeholder = [0u8; protocol::VOLUME_KEY_BYTES];
-    let mut entries = vec![cpio::Entry {
+    let key = cpio::Entry {
         name: protocol::VOLUME_KEY_MEMBER,
         mode: VOLUME_KEY_MODE,
         kind: cpio::Kind::File(&placeholder),
-    }];
-    if let Some(record) = record {
-        entries.push(cpio::Entry {
-            name: protocol::ADMIT_MEMBER,
-            mode: ADMIT_RECORD_MODE,
-            kind: cpio::Kind::File(record),
-        });
+    };
+    let archive = match record {
+        None => cpio::build(&[key]),
+        Some(record) => {
+            let admit = cpio::Entry {
+                name: protocol::ADMIT_MEMBER,
+                mode: ADMIT_RECORD_MODE,
+                kind: cpio::Kind::File(&record.admission),
+            };
+            match &record.primary {
+                Some(primary) => cpio::build(&[
+                    key,
+                    admit,
+                    cpio::Entry {
+                        name: protocol::PASSKEY_PRIMARY_MEMBER,
+                        mode: ADMIT_RECORD_MODE,
+                        kind: cpio::Kind::File(primary),
+                    },
+                ]),
+                None => cpio::build(&[key, admit]),
+            }
+        }
     }
-    let archive = cpio::build(&entries).map_err(invalid)?;
+    .map_err(invalid)?;
     // newc: the header, the name and its NUL padded to 4, then the data.
     let named = CPIO_HEADER_BYTES
         .saturating_add(protocol::VOLUME_KEY_MEMBER.len())
@@ -967,7 +1016,7 @@ mod tests {
         if what == "volume key" {
             VolumeKey::read(pipe).map(|key| key.0.to_vec())
         } else {
-            read_record(pipe).map(|record| record.to_vec())
+            read_record(pipe).map(|record| record.admission.to_vec())
         }
     }
 
@@ -1181,9 +1230,42 @@ mod tests {
 
     /// The record follows the key; the key's place does not move.
     #[test]
+    fn optional_primary_is_a_separate_member_and_requires_the_whole_name() {
+        let admission = [0x51; protocol::ADMIT_RECORD_BYTES];
+        let name = [0x73; protocol::PASSKEY_PRIMARY_BYTES];
+        let mut wire = admission.to_vec();
+        wire.extend(name);
+        let record = read_record(&mut wire.as_slice()).unwrap();
+        assert_eq!(record.admission, admission);
+        assert_eq!(record.primary, Some(name));
+        let (archive, _) = key_archive(Some(&record)).unwrap();
+        assert_eq!(
+            archive.windows(name.len()).filter(|b| *b == name).count(),
+            1
+        );
+        let member = protocol::PASSKEY_PRIMARY_MEMBER.as_bytes();
+        assert_eq!(
+            archive
+                .windows(member.len())
+                .filter(|b| *b == member)
+                .count(),
+            1
+        );
+        for len in 1..name.len() {
+            assert!(read_record(&mut &wire[..admission.len() + len]).is_err());
+        }
+        wire.push(1);
+        assert!(read_record(&mut wire.as_slice()).is_err());
+    }
+
+    #[test]
     fn the_admitting_archive_puts_the_record_after_the_key() {
         let record = record_bytes();
-        let (archive, data_end) = key_archive(Some(&record)).unwrap();
+        let (archive, data_end) = key_archive(Some(&Record {
+            admission: record,
+            primary: None,
+        }))
+        .unwrap();
         assert_eq!(data_end, 192);
         assert_admit_archive(&archive, &[0u8; 64], &record);
     }

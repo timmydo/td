@@ -217,6 +217,10 @@ pub const VOLUME_KEY_BYTES: usize = 64;
 #[allow(dead_code)]
 pub const ADMIT_MEMBER: &str = "td-admit-v1";
 #[allow(dead_code)]
+pub const PASSKEY_PRIMARY_MEMBER: &str = "td-passkey-primary";
+#[allow(dead_code)]
+pub const PASSKEY_PRIMARY_BYTES: usize = 34;
+#[allow(dead_code)]
 pub const ADMIT_RECORD_BYTES: usize = 46;
 // The device-mapper name the deployment initramfs opens a td LUKS2 volume
 // under, so its dm uuid is `CRYPT-LUKS2-<hex UUID>-td-system`. The selector's

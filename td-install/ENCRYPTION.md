@@ -2085,6 +2085,21 @@ seal and no installation, and an older selector is refused.
 Between the import and the next boot the old chain's object stays
 valid, which lets that genuine chain boot once more.
 
+### Passkey storage primary
+
+A measured TPM-PIN release may also hand the deployment the 34-byte
+storage primary Name for a device-bound passkey vault. The selector
+obtains it only after proving or taking the lockout hierarchy and setting
+its dictionary-attack policy on this boot. The proven Name must match
+the object whose PIN unsealed the key that opened the volume. Any attempt to clear the TPM
+suppresses the Name. The closed admission pipe may append this fixed-width
+Name. td-kexec carries it in a separate mode-0400 archive member,
+`td-passkey-primary`, preserving the admission record for older
+deployments. During `admit`, a matching primary TPM admission allows the
+deployment to publish the Name in root's private /run/td-admit directory.
+The optional member carries no key, PIN or lockout authorization. Its
+absence affects only the availability of the TPM passkey vault.
+
 ### Verified account handoff
 
 One primary authentication unlocks storage and admits its account to one

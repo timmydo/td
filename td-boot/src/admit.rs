@@ -8,6 +8,7 @@
 //! empty, where it can: the login predicate enforces while it exists.
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -48,7 +49,7 @@ fn named(path: &Path, what: &str, error: io::Error) -> io::Error {
 
 /// The member at `path`: a regular file, not a symlink, of mode 0400 owned
 /// by `owner`'s UID, holding exactly the record's bytes. Absent is `None`.
-fn read_member(path: &Path, owner: Owner) -> io::Result<Option<[u8; admission::RECORD_BYTES]>> {
+fn read_member<const N: usize>(path: &Path, owner: Owner) -> io::Result<Option<[u8; N]>> {
     let before = match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         other => other.map_err(|error| named(path, "inspect admission record", error))?,
@@ -76,13 +77,10 @@ fn read_member(path: &Path, owner: Owner) -> io::Result<Option<[u8; admission::R
     if meta.uid() != owner.uid {
         return Err(refused(path, &format!("owned by uid {}", meta.uid())));
     }
-    if meta.len() != protocol::ADMIT_RECORD_BYTES as u64 {
-        return Err(refused(
-            path,
-            &format!("{} bytes, not {}", meta.len(), protocol::ADMIT_RECORD_BYTES),
-        ));
+    if meta.len() != N as u64 {
+        return Err(refused(path, &format!("{} bytes, not {}", meta.len(), N)));
     }
-    let mut record = [0u8; admission::RECORD_BYTES];
+    let mut record = [0u8; N];
     let mut reader = &file;
     reader
         .read_exact(&mut record)
@@ -113,37 +111,70 @@ fn write_record(run: &Path, owner: Owner, record: &[u8]) -> io::Result<()> {
         if !meta.is_dir() || meta.mode() & 0o7777 != DIRECTORY_MODE || !owner.owns(&meta) {
             return Err(refused(&directory, "the directory is not root's mode 0700"));
         }
-        let path = directory.join(admission::RECORD);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(RECORD_MODE)
-            .custom_flags(NOFOLLOW)
-            .open(&path)
-            .map_err(|error| named(&path, "create admission record", error))?;
-        let result = (|| {
-            let mut writer: &File = &file;
-            writer.write_all(record)?;
-            let meta = file.metadata()?;
-            if !meta.is_file()
-                || meta.nlink() != 1
-                || meta.mode() & 0o7777 != RECORD_MODE
-                || !owner.owns(&meta)
-                || meta.len() != record.len() as u64
-            {
-                return Err(refused(&path, "not a single-link root file of mode 0600"));
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&path);
-        }
-        result
+        write_private(&directory.join(admission::RECORD), owner, record)
     })();
     if written.is_err() {
         let _ = fs::remove_dir(&directory);
     }
     written
+}
+
+fn write_private(path: &Path, owner: Owner, record: &[u8]) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(RECORD_MODE)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .map_err(|error| named(path, "create admission record", error))?;
+    let result = (|| {
+        let mut writer: &File = &file;
+        writer.write_all(record)?;
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.mode() & 0o7777 != RECORD_MODE
+            || !owner.owns(&meta)
+            || meta.len() != record.len() as u64
+        {
+            return Err(refused(path, "not a single-link root file of mode 0600"));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+/// The two anchor paths consist of the caller's root and fixed relative
+/// components. Linux rejects any pathname that exceeds this extent.
+fn anchor_path<'a>(base: &Path, system: bool, buf: &'a mut [u8; 4096]) -> io::Result<&'a Path> {
+    let size = buf.len();
+    let mut left = buf.as_mut_slice();
+    left.write_all(base.as_os_str().as_bytes())?;
+    if system {
+        left.write_all(b"/td-admit")?;
+    }
+    left.write_all(b"/")?;
+    left.write_all(protocol::PASSKEY_PRIMARY_MEMBER.as_bytes())?;
+    let len = size - left.len();
+    Ok(Path::new(std::ffi::OsStr::from_bytes(
+        buf.get(..len).ok_or(io::ErrorKind::InvalidInput)?,
+    )))
+}
+
+fn take_primary(
+    root: &Path,
+    owner: Owner,
+) -> io::Result<Option<[u8; protocol::PASSKEY_PRIMARY_BYTES]>> {
+    let mut buf = [0; 4096];
+    let path = anchor_path(root, false, &mut buf)?;
+    let result = read_member(path, owner);
+    if !matches!(result, Ok(None)) {
+        fs::remove_file(path)?;
+    }
+    result
 }
 
 /// Takes the member from the initramfs root `root` and writes it under the
@@ -154,7 +185,8 @@ fn write_record(run: &Path, owner: Owner, record: &[u8]) -> io::Result<()> {
 /// there, it leaves `run/td-admit` itself, empty, if it can.
 pub(crate) fn admit(root: &Path, run: &Path, owner: Owner) -> io::Result<bool> {
     let member = root.join(protocol::ADMIT_MEMBER);
-    let record = read_member(&member, owner);
+    let record = read_member::<{ admission::RECORD_BYTES }>(&member, owner);
+    let primary = take_primary(root, owner);
     let removed = match fs::remove_file(&member) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other.map_err(|error| named(&member, "remove", error)),
@@ -164,7 +196,24 @@ pub(crate) fn admit(root: &Path, run: &Path, owner: Owner) -> io::Result<bool> {
         removed?;
         match record {
             None => Ok(false),
-            Some(record) => write_record(run, owner, &record).map(|()| true),
+            Some(record) => {
+                write_record(run, owner, &record)?;
+                if let (Ok(record), Ok(Some(name))) = (admission::Record::decode(&record), primary)
+                {
+                    if record.uid == admission::PRIMARY_UID
+                        && record.method == admission::Method::TpmPin
+                        && name.starts_with(&[0, 11])
+                    {
+                        let mut buf = [0; 4096];
+                        let published = anchor_path(run, true, &mut buf)
+                            .and_then(|path| write_private(path, owner, &name));
+                        if let Err(error) = published {
+                            eprintln!("td-boot: passkey TPM handoff failed: {error}");
+                        }
+                    }
+                }
+                Ok(true)
+            }
         }
     });
     if written.is_err() && present {
@@ -254,6 +303,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::set_permissions(self.run(), fs::Permissions::from_mode(0o755));
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn public_primary_is_only_carried_by_a_primary_tpm_admission() {
+        for method in [
+            admission::Method::None,
+            admission::Method::Fido2Primary,
+            admission::Method::TpmPin,
+        ] {
+            let tmp = crate::test_temp::TempDir::new("passkey-admit").unwrap();
+            let root = tmp.join("root");
+            let run = tmp.join("run");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&run).unwrap();
+            let meta = fs::metadata(&root).unwrap();
+            let owner = Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            };
+            let record = admission::Record {
+                uid: admission::PRIMARY_UID,
+                method,
+                manifest: [2; 32],
+            }
+            .encode();
+            let mut name = [0x29; 34];
+            name[..2].copy_from_slice(&[0, 11]);
+            for (member, bytes) in [
+                (protocol::ADMIT_MEMBER, record.as_slice()),
+                (protocol::PASSKEY_PRIMARY_MEMBER, name.as_slice()),
+            ] {
+                let path = root.join(member);
+                fs::write(&path, bytes).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            assert!(admit(&root, &run, owner).unwrap());
+            assert!(!root.join(protocol::PASSKEY_PRIMARY_MEMBER).exists());
+            let published = run
+                .join(admission::DIRECTORY)
+                .join(protocol::PASSKEY_PRIMARY_MEMBER);
+            if method == admission::Method::TpmPin {
+                assert_eq!(fs::read(published).unwrap(), name);
+            } else {
+                assert!(!published.exists());
+            }
         }
     }
 
