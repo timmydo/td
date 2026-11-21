@@ -207,10 +207,11 @@ impl Relay {
                     continue;
                 }
                 connections += 1;
-                if !multi && connections == 2 {
-                    assert!(mail
+                if !multi && connections <= 2 {
+                    let eight_bit = mail
                         .windows(b"BODY=8BITMIME".len())
-                        .any(|w| w == b"BODY=8BITMIME"));
+                        .any(|w| w == b"BODY=8BITMIME");
+                    assert_eq!(eight_bit, connections == 2);
                 }
                 if !multi && connections == 4 {
                     interrupt.store(true, Ordering::Release);

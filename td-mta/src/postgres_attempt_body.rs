@@ -36,6 +36,51 @@ pub fn with_body<T>(
     maximum: u64,
     read: impl FnOnce(BodyMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
 ) -> Result<T, ReadError> {
+    with_active_body(
+        request,
+        trust,
+        deadline,
+        value,
+        maximum,
+        None,
+        |meta, body, _| read(meta, body),
+    )
+}
+
+pub(crate) fn body_mode(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    maximum: u64,
+    mut charge: impl FnMut(u64) -> Result<(), ports::Error>,
+) -> Result<crate::smtp_data_encode::Body, ReadError> {
+    with_active_body(
+        request,
+        trust,
+        deadline,
+        value,
+        maximum,
+        Some(&mut charge),
+        |_, _, high_bit| {
+            Ok(if high_bit {
+                crate::smtp_data_encode::Body::EightBit
+            } else {
+                crate::smtp_data_encode::Body::SevenBit
+            })
+        },
+    )
+}
+
+fn with_active_body<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    maximum: u64,
+    charge_classification: Option<&mut dyn FnMut(u64) -> Result<(), ports::Error>>,
+    read: impl FnOnce(BodyMetadata, &mut dyn BlobReader, bool) -> Result<T, ports::Error>,
+) -> Result<T, ReadError> {
     if maximum > postgres_body::MAX_BODY_BYTES {
         return Err(ReadError::Body(postgres_body::Error::Capacity));
     }
@@ -45,11 +90,17 @@ pub fn with_body<T>(
         let metadata = worker
             .run(|client| Box::pin(snapshot(client, selected, maximum)))
             .map_err(|error| ReadError::Attempt(Error::Connection(error)))??;
-        postgres_body::with_verified_pin(worker, metadata.blob, deadline, |body| {
+        let checks = if let Some(charge) = charge_classification {
+            charge(metadata.blob.body.length).map_err(ReadError::Output)?;
+            postgres_body::PinChecks::ClassifyAscii
+        } else {
+            postgres_body::PinChecks::Full
+        };
+        postgres_body::with_pin_checks(worker, metadata.blob, deadline, checks, |body, high_bit| {
             Ok(replay(
                 body,
                 || admit(request, trust, deadline, value).map_err(ReadError::Attempt),
-                |body| read(metadata, body),
+                |body| read(metadata, body, high_bit),
             ))
         })
         .map_err(ReadError::Body)?

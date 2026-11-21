@@ -4506,7 +4506,9 @@ The prepared attempt API can admit its immutable transmitted body through a
 bounded read-only repeatable-read snapshot. The opaque Dispatch binds the
 account, route, destination, owner, generation, attempt and request digest.
 Fresh primary admission checks current policy, unexpired route ownership and
-that exact active attempt before snapshot work. The snapshot binds the live
+that exact active attempt before snapshot work. Pre-MAIL classification
+(section 212) and post-354 DATA each open and verify a separate snapshot.
+Each snapshot binds the live
 submission and blob manifest; the shared blob reader verifies contiguous
 chunks, total length and SHA-256 before exposing any bytes to the callback.
 
@@ -6990,11 +6992,13 @@ which stops it. Other errors still stop it at once.
 After selecting a repaired configuration and restarting, an explicit private
 `queue-route-repair` request releases the configuration-bound pause only if
 the database confirms a newer selected generation. Mere restart never repairs.
-The worker scans the verified immutable transmitted source under its original
-Prepared cap to select SevenBit or EightBit before MAIL; DATA requires the
-matching EHLO capability. This scan uses fixed 4096-byte scratch and prepays
-three maximum-body extents plus database validation overhead, with charged
-records per read. There is no complete-message allocation.
+Under the original Prepared cap, the worker inspects each transmitted chunk
+for non-ASCII octets while computing its digest. It selects SevenBit or
+EightBit before MAIL only after full verification and fresh attempt admission.
+EightBit requires the matching EHLO capability. The worker prepays three
+maximum-body extents plus database validation overhead and reserves one record
+per 4096 bytes of actual body length, rounded up, before scanning. Classification
+uses the existing verification batch.
 
 
 ## 213. Local terminal-delivery notices

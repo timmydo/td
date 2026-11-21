@@ -406,7 +406,9 @@ pub(crate) fn with_verified_pin<T>(
     deadline: Instant,
     read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
-    with_pin_checks(worker, metadata, deadline, false, read)
+    with_pin_checks(worker, metadata, deadline, PinChecks::Full, |pin, _| {
+        read(pin)
+    })
 }
 
 pub(crate) fn with_interpreted_pin<T>(
@@ -415,15 +417,27 @@ pub(crate) fn with_interpreted_pin<T>(
     deadline: Instant,
     read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
-    with_pin_checks(worker, metadata, deadline, true, read)
+    with_pin_checks(
+        worker,
+        metadata,
+        deadline,
+        PinChecks::Interpreted,
+        |pin, _| read(pin),
+    )
 }
 
-fn with_pin_checks<T>(
+pub(crate) enum PinChecks {
+    Full,
+    Interpreted,
+    ClassifyAscii,
+}
+
+pub(crate) fn with_pin_checks<T>(
     worker: &mut Worker,
     metadata: BlobMetadata,
     deadline: Instant,
-    interpreted: bool,
-    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+    checks: PinChecks,
+    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>, bool) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
     let mut body = Body {
         worker,
@@ -432,14 +446,16 @@ fn with_pin_checks<T>(
         failed: None,
         cache: Vec::new(),
         cache_start: 0,
-        checks_left: interpreted.then_some(0),
+        checks_left: matches!(checks, PinChecks::Interpreted).then_some(0),
         chunks: None,
     };
-    body.verify().map_err(Error::Read)?;
+    let has_non_ascii = body
+        .verify(matches!(checks, PinChecks::ClassifyAscii))
+        .map_err(Error::Read)?;
     let mut pin =
         crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
             .map_err(Error::Read)?;
-    let result = read(&mut pin);
+    let result = read(&mut pin, has_non_ascii);
     pin.check_deadline().map_err(Error::Read)?;
     drop(pin);
     body.check().map_err(Error::Read)?;
@@ -468,7 +484,7 @@ pub(crate) fn with_chunk_verified_pin<T>(
     };
     body.check().map_err(Error::Read)?;
     if metadata.body.length == 0 {
-        body.verify().map_err(Error::Read)?;
+        body.verify(false).map_err(Error::Read)?;
     }
     let mut pin =
         crate::store_fs::PinnedBlob::from_verified_chunks(&mut body, metadata.blob, metadata.body)
@@ -591,7 +607,7 @@ fn with_pinned_blob_inner<T>(
             checks_left: None,
             chunks: None,
         };
-        body.verify().map_err(Error::Read)?;
+        body.verify(false).map_err(Error::Read)?;
         // A new primary transaction sees revocations after the body snapshot.
         let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
         let binding = binding.clone();
@@ -953,7 +969,8 @@ impl Body<'_, '_> {
         Ok(rows)
     }
 
-    fn verify(&mut self) -> Result<(), ports::Error> {
+    fn verify(&mut self, classify_ascii: bool) -> Result<bool, ports::Error> {
+        let mut has_non_ascii = false;
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::BodyVerify);
         let mut digest = td_crypto::BulkSha256::try_new()?;
         let chunks = self.len().div_ceil(CHUNK);
@@ -966,6 +983,9 @@ impl Body<'_, '_> {
             for row in &self.cache {
                 let bytes: &[u8] = row.try_get(1).map_err(|_| ports::Error::Corrupt)?;
                 digest.update(bytes)?;
+                if classify_ascii && !has_non_ascii {
+                    has_non_ascii = !bytes.is_ascii();
+                }
             }
             start = end;
         }
@@ -974,7 +994,7 @@ impl Body<'_, '_> {
         }
         self.check()?;
         timing.succeeded();
-        Ok(())
+        Ok(has_non_ascii)
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, ports::Error> {

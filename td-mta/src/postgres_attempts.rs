@@ -18,6 +18,7 @@ use tokio_postgres::Client;
 
 #[path = "postgres_attempt_body.rs"]
 mod body;
+pub(crate) use body::body_mode;
 pub use body::{with_body, BodyMetadata, ReadError};
 
 #[path = "postgres_attempt_envelope.rs"]

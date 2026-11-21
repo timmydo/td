@@ -674,46 +674,28 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        match attempts::with_body(
+        match attempts::body_mode(
             self.worker.connection.request,
             self.worker.connection.trust,
             limit,
             &self.published.dispatch,
             maximum,
-            |_, body| {
-                let mut scratch = [0; 4096];
-                let mut offset = 0;
-                let mut mode = crate::smtp_data_encode::Body::SevenBit;
-                while offset < body.len() {
-                    if Instant::now() >= limit {
-                        return Err(ports::Error::Deadline);
-                    }
-                    meter
-                        .charge(
-                            self.worker.connection.clock.sample()?.monotonic,
-                            Charge {
-                                records: 1,
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(|stop| match stop {
-                            Stop::Deadline => ports::Error::Deadline,
-                            _ => ports::Error::Capacity,
-                        })?;
-                    let n = body.read_at(offset, &mut scratch)?;
-                    let bytes = scratch
-                        .get(..n)
-                        .filter(|_| n > 0)
-                        .ok_or(ports::Error::Corrupt)?;
-                    if bytes.iter().any(|byte| !byte.is_ascii()) {
-                        mode = crate::smtp_data_encode::Body::EightBit;
-                    }
-                    offset = offset.checked_add(n as u64).ok_or(ports::Error::Capacity)?;
-                }
+            |length| {
                 if Instant::now() >= limit {
                     return Err(ports::Error::Deadline);
                 }
-                Ok(mode)
+                meter
+                    .charge(
+                        self.worker.connection.clock.sample()?.monotonic,
+                        Charge {
+                            records: length.div_ceil(4096),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|stop| match stop {
+                        Stop::Deadline => ports::Error::Deadline,
+                        _ => ports::Error::Capacity,
+                    })
             },
         ) {
             Ok(mode) => Ok(Some(mode)),
