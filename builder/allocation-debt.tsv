@@ -331,10 +331,10 @@ net/src/egress.rs	allocation-macro	29
 net/src/egress.rs	heap-owner	2
 net/src/egress.rs	unchecked-growth-or-clone	15
 net/src/feed.rs	allocating-constructor	2
-net/src/feed.rs	allocating-conversion	146
+net/src/feed.rs	allocating-conversion	145
 net/src/feed.rs	allocation-macro	189
 net/src/feed.rs	heap-owner	6
-net/src/feed.rs	unchecked-growth-or-clone	36
+net/src/feed.rs	unchecked-growth-or-clone	33
 net/src/feed/debian.rs	allocating-conversion	35
 net/src/feed/debian.rs	allocation-macro	52
 net/src/feed/debian.rs	unchecked-growth-or-clone	38
@@ -423,6 +423,7 @@ net/src/s3/inventory.rs	unchecked-growth-or-clone	9
 net/src/s3/mod.rs	allocating-conversion	14
 net/src/s3/mod.rs	allocation-macro	18
 net/src/s3/mod.rs	unchecked-growth-or-clone	9
+net/src/s3/sources.rs	allocating-conversion	1
 net/src/s3/tests.rs	allocating-conversion	33
 net/src/s3/tests.rs	allocation-macro	12
 net/src/s3/tests.rs	heap-owner	2
@@ -567,10 +568,10 @@ recipes/src/bin/td_recipe_eval/gc_roots.rs	unchecked-growth-or-clone	21
 recipes/src/bin/td_recipe_eval/iso_image.rs	allocating-conversion	13
 recipes/src/bin/td_recipe_eval/iso_image.rs	allocation-macro	24
 recipes/src/bin/td_recipe_eval/iso_image.rs	unchecked-growth-or-clone	4
-recipes/src/bin/td_recipe_eval/publish.rs	allocating-conversion	68
-recipes/src/bin/td_recipe_eval/publish.rs	allocation-macro	30
+recipes/src/bin/td_recipe_eval/publish.rs	allocating-conversion	66
+recipes/src/bin/td_recipe_eval/publish.rs	allocation-macro	31
 recipes/src/bin/td_recipe_eval/publish.rs	heap-owner	1
-recipes/src/bin/td_recipe_eval/publish.rs	unchecked-growth-or-clone	26
+recipes/src/bin/td_recipe_eval/publish.rs	unchecked-growth-or-clone	27
 recipes/src/bin/td_recipe_eval/seed_digests.rs	allocating-conversion	4
 recipes/src/bin/td_recipe_eval/seed_digests.rs	allocation-macro	5
 recipes/src/bin/td_recipe_eval/seed_digests.rs	unchecked-growth-or-clone	6

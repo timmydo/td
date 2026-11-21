@@ -26,8 +26,11 @@ reset, or select a Git branch: update your checkout to the intended reviewed
 main revision first. The launcher rebuilds the host builder and evaluator,
 and the Rust command resolves a freshly built td-net through the existing
 provisioned host toolchain, warms pinned inputs, builds the ISO and
-retains the exact deployment it carries, signs both, promotes the update,
-uploads it, and publishes the complete ISO listing. All three host tools come
+retains the exact deployment it carries, warms every source and
+build-root pin and uploads them to the [source mirror](MIRROR.md), signs
+the image and ISO, promotes and uploads the update, and publishes the
+complete ISO listing. A pin it cannot warm stops the run, naming it,
+before anything is signed or promoted; rerun once its upstream serves it. All three host tools come
 from that checkout; target builds retain their normal pinned input rules.
 Only the desktop `system-x86-64` profile is supported by this convenience
 command. The lower-level [release commands](RELEASES.md#local-operator-workflow)

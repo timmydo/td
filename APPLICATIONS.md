@@ -12627,7 +12627,9 @@ A constraint rather than a design, stated because several decisions above
 turn on it and one earlier draft violated it without noticing.
 
 **td must not require its maintainer to run any service.** Not a package
-repository, not a binary cache, not an update server, not a mirror.
+repository, not a binary cache, not an update server, not a mirror. td may
+host, as `AGENTS.md` principle 5 states, but every build and every
+installed system must keep working when td's hosting is gone.
 
 What this permits, and it is enough:
 
@@ -12635,6 +12637,7 @@ What this permits, and it is enough:
 |---|---|---|
 | recipes, pins, versions | a git checkout of `td`, pulled (§W) | a git forge — GitHub and sr.ht already mirror `origin` |
 | sources and seeds | pinned URL + `sha256` at **upstream's own** location | upstream |
+| relief from a throttled upstream | the optional digest-keyed source mirror on `releases.tdlinux.org`, asked before the pin's URL (`net/MIRROR.md`) | td, optionally; a build without it fetches upstream |
 | local download reuse | `td-feed`, a shared host-side cache across worktrees | nobody — it is a dev-host daemon, not a public service |
 | built artifacts | built locally from the recipe graph | nobody |
 
@@ -12656,13 +12659,16 @@ Three consequences that are easy to violate by accident:
    source, or §W.9's run-time fetch of upstream-hosted objects under
    signature and admission rules (§B.3.1's exact-commit import rotted
    when Flathub pruned the commit). Never host a repackaged copy.
-3. **Optional system-image delivery is the explicit exception.**
-   `net/RELEASES.md` specifies a static signed release repository and chunk
-   reuse. The desktop image bundles the official public publisher root and
-   `https://releases.tdlinux.org`; td-admin initializes that policy only when
-   none exists (`td-update/ADMIN.md`). No periodic publisher activity is
-   required to keep existing signatures valid. Source builds remain
-   independent, and source recipes do not pin or consume release artifacts.
+3. **td's static release site serves two optional things.** Signed system
+   images: `net/RELEASES.md` specifies a static signed release repository
+   and chunk reuse. The desktop image bundles the official public publisher
+   root and `https://releases.tdlinux.org`; td-admin initializes that policy
+   only when none exists (`td-update/ADMIN.md`). No periodic publisher
+   activity is required to keep existing signatures valid. And a mirror of
+   pinned upstream bytes, unmodified and keyed by SHA-256, which source
+   fetches try before each pin's own URL (`net/MIRROR.md`). Source builds
+   remain independent of both: source recipes do not pin or consume release
+   artifacts, and no pin names the mirror.
 
 The scale at which this stops being sufficient is worth naming so the
 decision is revisited deliberately rather than suffered: **a second

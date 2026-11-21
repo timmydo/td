@@ -113,14 +113,15 @@ keeps these invariants:
    precedent for new control-plane or target logic.
 4. **Migrations are atomic.** Cut over completely and delete the old mechanism
    in the same landing. Git history carries dates and change narratives.
-5. **No required maintainer-run server infrastructure.** Recipes travel in git;
-   pins use upstream-owned URLs plus SHA-256; the graph can build locally.
-   Optional signed whole-system releases may travel through a static repository
-   under `net/RELEASES.md`. This is the explicit image-delivery exception,
-   initially a local repository; it adds no package service or target input.
+5. **td may host, but nothing may require it.** Recipes travel in git; pins
+   use upstream-owned URLs plus SHA-256, and the graph must build from those
+   URLs alone. td's static release site (`releases.tdlinux.org`) may serve
+   two things, both optional and neither a package service nor target input:
+   signed whole-system images (`net/RELEASES.md`), and a mirror of pinned
+   upstream bytes by digest that fetches try before each pin's URL, so a
+   throttled or unreachable upstream does not stop a build (`net/MIRROR.md`).
    `td-feed` is a host cache, and `td-subst` is a consumer for a cache nobody
-   is required to operate. Never pin a td-produced artifact that would require
-   td to publish or host it.
+   is required to operate. Never pin a td-produced artifact or a td-hosted URL.
 6. **The recipe graph is the distribution.** Source updates travel in git;
    optional signed image delivery materializes a complete deployment from that
    graph, without changing its target trust roots. System deployments retain

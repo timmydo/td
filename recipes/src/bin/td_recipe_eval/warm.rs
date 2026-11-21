@@ -392,7 +392,7 @@ pub(crate) fn export_flathub(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// recipe-owned pins by BUILDING an evaluator through tests/recipe-eval-tool.sh,
 /// which hard-requires TD_BUILDER_SELF — without it the warm dies on the unset
 /// variable before fetching anything.
-fn run_warm(td_net: &Path, root: &Path, builder: &Path, args: &[String]) -> bool {
+pub(crate) fn run_warm(td_net: &Path, root: &Path, builder: &Path, args: &[String]) -> bool {
     let mut cmd = Command::new(td_net);
     cmd.arg("feed");
     for arg in args {

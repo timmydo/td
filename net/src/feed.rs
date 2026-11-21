@@ -55,6 +55,12 @@ const SOURCE_CONSUMER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
+/// The td-operated mirror of pinned source bytes (net/MIRROR.md). Optional:
+/// a miss, an error or a digest mismatch falls back to the pin's upstream URL.
+const SOURCE_MIRROR: &str = "https://releases.tdlinux.org";
+const SOURCE_MIRROR_ENV: &str = "TD_SOURCE_MIRROR";
+/// A mirrored pin's object key is this prefix and its SHA-256.
+pub(crate) const SOURCE_MIRROR_PREFIX: &str = "sources/";
 // Linux UAPI on td's x86/ARM targets: refuse final symlinks and avoid blocking
 // on a substituted FIFO before fstat can reject its file type.
 pub(crate) const OPEN_REGULAR_NOFOLLOW: i32 = 0x20000 | 0x800;
@@ -67,11 +73,11 @@ struct Entry {
 }
 
 #[derive(Clone)]
-struct SourcePin {
-    key: String,
-    url: String,
-    sha256: String,
-    file: String,
+pub(crate) struct SourcePin {
+    pub(crate) key: String,
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    pub(crate) file: String,
 }
 
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
@@ -603,25 +609,44 @@ fn acquire_verified(
 /// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already
 /// warm + verified. Never egresses for an entry already present + matching.
 fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
-    if !source_feed_path_is_safe(&e.path) {
-        return Err(format!("unsafe feed artifact path {:?}", e.path));
+    warm_artifact(&e.path, &e.sha256, &e.url, store, None)
+}
+
+/// `warm_one` over borrowed fields: fetch `url` into `store/path` unless a
+/// verified copy is already there. A `deadline` makes it a mirror attempt:
+/// bounded, without redirects, and abandoned when the peer goes silent.
+fn warm_artifact(
+    path: &str,
+    sha256: &str,
+    url: &str,
+    store: &Path,
+    deadline: Option<Instant>,
+) -> Result<bool, String> {
+    if !source_feed_path_is_safe(path) {
+        return Err(format!("unsafe feed artifact path {path:?}"));
     }
-    let dst = store.join(&e.path);
+    let dst = store.join(path);
     let mut fetched = false;
     acquire_verified(
         &dst,
-        &e.sha256,
-        &e.url,
+        sha256,
+        url,
         None,
         |temp| {
-            crate::http::get_to_file(&e.url, temp, MAX_ARTIFACT_BYTES)?;
+            match deadline {
+                Some(deadline) => {
+                    crate::http::get_to_file_mirror_before(url, temp, MAX_ARTIFACT_BYTES, deadline)
+                        .map(|_| ())?
+                }
+                None => crate::http::get_to_file(url, temp, MAX_ARTIFACT_BYTES)?,
+            }
             fetched = true;
             Ok(())
         },
         || {
             let side = sidecar_path(&dst);
-            if read_digest_sidecar(&side).ok().as_deref() != Some(&e.sha256) {
-                write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
+            if read_digest_sidecar(&side).ok().as_deref() != Some(sha256) {
+                write_atomic(&side, format!("{sha256}\n").as_bytes())?;
             }
             Ok(())
         },
@@ -1477,7 +1502,7 @@ fn cargo_proxy_selftest() {
 // Paths resolve relative to the repo root (the prelude's CWD); TD_ROOT overrides it.
 
 /// The repo root: $TD_ROOT, else the current directory.
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     std::env::var_os("TD_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -2526,7 +2551,7 @@ fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
 }
 
 /// `verb` is `source-pins` or `build-root-pins`; both print the same rows.
-fn recipe_pins_result(root: &Path, verb: &str) -> Result<Vec<SourcePin>, String> {
+pub(crate) fn recipe_pins_result(root: &Path, verb: &str) -> Result<Vec<SourcePin>, String> {
     if !root.join("recipes/Cargo.toml").is_file() {
         return Err(format!(
             "no recipes/Cargo.toml under {} to resolve recipe source pins",
@@ -2771,11 +2796,24 @@ fn export_source_pins(pins: &[SourcePin], sources: &Path, store: &Path) -> Resul
 
 /// Validate the endpoint shared by every source-pin request.
 pub(crate) fn consumer_feed_base(base: &str) -> Result<&str, String> {
+    Ok(endpoint_origin(
+        base,
+        "TD_FEED_BASE must be an http:// or https:// endpoint",
+        "TD_FEED_BASE must name one server without a path, query or credentials",
+    )?)
+}
+
+/// `base` without trailing slashes, if it is one http(s) origin.
+fn endpoint_origin<'a>(
+    base: &'a str,
+    not_http: &'static str,
+    not_origin: &'static str,
+) -> Result<&'a str, &'static str> {
     let base = base.trim_end_matches('/');
     let authority = base
         .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))
-        .ok_or("TD_FEED_BASE must be an http:// or https:// endpoint")?;
+        .ok_or(not_http)?;
     if authority.is_empty()
         || authority.bytes().any(|b| {
             b.is_ascii_whitespace()
@@ -2783,9 +2821,7 @@ pub(crate) fn consumer_feed_base(base: &str) -> Result<&str, String> {
                 || matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\')
         })
     {
-        return Err(
-            "TD_FEED_BASE must name one server without a path, query or credentials".into(),
-        );
+        return Err(not_origin);
     }
     Ok(base)
 }
@@ -2963,6 +2999,8 @@ fn warm_build_root(root: &Path) -> Result<(), String> {
 /// Warm each pin into `dest`, through the shared feed when one is running.
 /// Best-effort per pin: a miss is reported, and its consumer's gate reds.
 fn warm_pins(label: &str, pins: &[SourcePin], dest: &Path) -> Result<(), String> {
+    let mirror = std::env::var_os(SOURCE_MIRROR_ENV);
+    let mirror = source_mirror(mirror.as_deref())?.map(Mirror::new);
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
 
     let feed = shared_feed();
@@ -2972,45 +3010,185 @@ fn warm_pins(label: &str, pins: &[SourcePin], dest: &Path) -> Result<(), String>
             store.display()
         );
     }
-
+    match &mirror {
+        Some(mirror) => eprintln!(
+            ">> td-feed warm {label}: trying the source mirror {} first",
+            mirror.base
+        ),
+        None => eprintln!(">> td-feed warm {label}: source mirror disabled"),
+    }
     for pin in pins {
-        let out = dest.join(&pin.file);
-        if let Ok(have) = file_sha256(&out) {
-            if have == pin.sha256 {
-                continue; // already warm + verified
-            }
-        }
-
-        let mut via: Option<String> = None;
-        // Preferred: through the SHARED feed. Populate it (warm_one egresses only if the
-        // shared store is cold — another worktree may already hold it), then GET it back from
-        // the feed (offline once warm). So the egress happens ONCE across all worktrees.
-        if let Some((addr, store)) = &feed {
-            let path = strip_scheme(&pin.url);
-            let e = Entry {
-                path: path.clone(),
-                url: pin.url.clone(),
-                sha256: pin.sha256.clone(),
-            };
-            let _ = warm_one(&e, store);
-            if download_verified(&format!("http://{addr}/{path}"), &out, &pin.sha256).is_ok() {
-                via = Some(format!("the shared feed (http://{addr})"));
-            }
-        }
-        // Fallback: a direct GET (feed unavailable, or a cold-feed miss).
-        if via.is_none() && download_verified(&pin.url, &out, &pin.sha256).is_ok() {
-            via = Some("a direct fetch".to_string());
-        }
-        match via {
-            Some(v) => eprintln!(">> td-feed warm {label}: warmed {} via {v} (sha256 verified)", out.display()),
-            None => eprintln!(
-                ">> td-feed warm {label}: could not warm {} ({}) (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)",
-                pin.file,
-                pin.key
-            ),
-        }
+        warm_pin(label, pin, dest, feed.as_ref(), mirror.as_ref());
     }
     Ok(())
+}
+
+/// `TD_SOURCE_MIRROR`: unset selects td's mirror, empty or `off` none, and
+/// anything else must name one server, as `TD_FEED_BASE` does.
+fn source_mirror(value: Option<&std::ffi::OsStr>) -> Result<Option<&str>, String> {
+    let Some(value) = value else {
+        return Ok(Some(SOURCE_MIRROR));
+    };
+    let value = value.to_str().ok_or("TD_SOURCE_MIRROR is not UTF-8")?;
+    if value.is_empty() || value == "off" {
+        return Ok(None);
+    }
+    Ok(Some(endpoint_origin(
+        value,
+        "TD_SOURCE_MIRROR must be an http:// or https:// endpoint, empty or off",
+        "TD_SOURCE_MIRROR must name one server without a path, query or credentials",
+    )?))
+}
+
+pub(crate) fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// One mirror attempt's absolute deadline, against a trickle; a silent peer
+/// is dropped sooner, by the HTTP read timeout.
+const MIRROR_PIN_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+/// Time one warm may lose to failed mirror attempts before it stops asking
+/// the mirror. Never refunded by a success, so no failure pattern escapes
+/// it; a miss (404, digest mismatch) answers in milliseconds.
+const MIRROR_FAILURE_BUDGET: Duration = Duration::from_secs(2 * 60);
+
+/// The source mirror for one warm, with its breaker.
+struct Mirror<'a> {
+    base: &'a str,
+    budget: Duration,
+    lost: std::cell::Cell<Duration>,
+}
+
+impl<'a> Mirror<'a> {
+    fn new(base: &'a str) -> Self {
+        Self::with_budget(base, MIRROR_FAILURE_BUDGET)
+    }
+
+    fn with_budget(base: &'a str, budget: Duration) -> Self {
+        Self {
+            base,
+            budget,
+            lost: std::cell::Cell::new(Duration::ZERO),
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.lost.get() < self.budget
+    }
+
+    fn failed(&self, took: Duration) {
+        let was_live = self.live();
+        self.lost.set(self.lost.get().saturating_add(took));
+        if was_live && !self.live() {
+            eprintln!(
+                ">> td-feed: the source mirror {} cost {}s in failures; using upstream for the rest of this warm",
+                self.base,
+                self.lost.get().as_secs()
+            );
+        }
+    }
+}
+
+/// Get one pin's bytes with `get`, from the mirror and then upstream, naming
+/// the origin that answered. `get` verifies the digest, so a mirror object
+/// that fails it is a miss like any other. A mirror attempt carries a
+/// deadline, which also refuses redirects; an upstream attempt does not.
+fn from_origins(
+    mirror: Option<&Mirror<'_>>,
+    pin: &SourcePin,
+    mut get: impl FnMut(&str, Option<Instant>) -> Result<bool, String>,
+) -> Option<&'static str> {
+    if let Some(mirror) = mirror.filter(|m| m.live() && is_sha256_hex(&pin.sha256)) {
+        let url = format!("{}/{SOURCE_MIRROR_PREFIX}{}", mirror.base, pin.sha256);
+        let started = Instant::now();
+        match get(&url, Some(started + MIRROR_PIN_DEADLINE)) {
+            Ok(fetched) => {
+                return Some(if fetched {
+                    "the source mirror"
+                } else {
+                    "the shared feed's store"
+                });
+            }
+            Err(e) => {
+                mirror.failed(started.elapsed());
+                eprintln!(">> td-feed: {} not from the source mirror: {e}", pin.file);
+            }
+        }
+    }
+    match get(&pin.url, None) {
+        Ok(true) => Some("upstream"),
+        Ok(false) => Some("the shared feed's store"),
+        Err(e) => {
+            eprintln!(">> td-feed: {} not from {}: {e}", pin.file, pin.url);
+            None
+        }
+    }
+}
+
+fn warm_pin(
+    label: &str,
+    pin: &SourcePin,
+    dest: &Path,
+    feed: Option<&(String, PathBuf)>,
+    mirror: Option<&Mirror<'_>>,
+) {
+    let out = dest.join(&pin.file);
+    if let Ok(have) = file_sha256(&out) {
+        if have == pin.sha256 {
+            return; // already warm + verified
+        }
+    }
+    // Preferred: through the SHARED feed. Populate it (egressing only if the
+    // shared store is cold — another worktree may already hold it), then GET
+    // it back from the feed (offline once warm). So the egress happens ONCE
+    // across all worktrees. An explicit TD_FEED_BASE may serve a store this
+    // host could not fill, so the feed is asked whatever the fill did.
+    if let Some((addr, store)) = feed {
+        let path = strip_scheme(&pin.url);
+        let origin = from_origins(mirror, pin, |url, deadline| {
+            warm_artifact(&path, &pin.sha256, url, store, deadline)
+        });
+        if download_verified(&format!("http://{addr}/{path}"), &out, &pin.sha256).is_ok() {
+            eprintln!(
+                ">> td-feed warm {label}: warmed {} via the shared feed (http://{addr}) from {} (sha256 verified)",
+                out.display(),
+                origin.unwrap_or("the feed's own store")
+            );
+            return;
+        }
+    }
+    // Fallback: a direct GET (feed unavailable, or a cold-feed miss).
+    let origin = from_origins(mirror, pin, |url, deadline| {
+        match deadline {
+            Some(deadline) => acquire_verified(
+                &out,
+                &pin.sha256,
+                url,
+                None,
+                |temp| {
+                    crate::http::get_to_file_mirror_before(url, temp, MAX_ARTIFACT_BYTES, deadline)
+                        .map(|_| ())
+                },
+                || Ok(()),
+            ),
+            None => download_verified(url, &out, &pin.sha256),
+        }
+        .map(|()| true)
+    });
+    match origin {
+        Some(origin) => eprintln!(
+            ">> td-feed warm {label}: warmed {} via a direct fetch from {origin} (sha256 verified)",
+            out.display()
+        ),
+        None => eprintln!(
+            ">> td-feed warm {label}: could not warm {} ({}) (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)",
+            pin.file,
+            pin.key
+        ),
+    }
 }
 
 /// Hermetic OFFLINE selftest of the warm orchestration's pure + in-process legs (the parts
@@ -4942,5 +5120,259 @@ pub(crate) mod tests {
             !super::feed_addr_reachable("not-an-address"),
             "an unparseable addr is unreachable, not a panic"
         );
+    }
+
+    /// A loopback origin serving `routes` by request path (404 otherwise),
+    /// recording every path asked for, until dropped.
+    struct Origin {
+        base: String,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Origin {
+        fn new(routes: Vec<(String, Vec<u8>)>) -> Self {
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (seen, quit) = (asked.clone(), stop.clone());
+            let worker = std::thread::spawn(move || {
+                while !quit.load(Ordering::Relaxed) {
+                    let mut conn = match listener.accept() {
+                        Ok((conn, _)) => conn,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    conn.set_nonblocking(false).unwrap();
+                    let head = super::read_request_head(&mut conn).unwrap();
+                    let line = String::from_utf8_lossy(&head).into_owned();
+                    let path = line.split_whitespace().nth(1).unwrap().to_string();
+                    seen.lock().unwrap().push(path.clone());
+                    match routes.iter().find(|(p, _)| *p == path) {
+                        Some((_, body)) => super::respond(&mut conn, 200, "OK", body).unwrap(),
+                        None => super::respond(&mut conn, 404, "Not Found", b"").unwrap(),
+                    }
+                }
+            });
+            Self {
+                base,
+                asked,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Origin {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let result = worker.join();
+                if !std::thread::panicking() {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+
+    fn mirrored_pin(upstream: &Origin, bytes: &[u8]) -> super::SourcePin {
+        super::SourcePin {
+            key: "fixture-source".into(),
+            url: format!("{}/upstream/fixture.bin", upstream.base),
+            sha256: super::hex_sha256(bytes),
+            file: "fixture.bin".into(),
+        }
+    }
+
+    #[test]
+    fn source_mirror_defaults_to_td_and_can_be_disabled_or_redirected() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            super::source_mirror(None).unwrap(),
+            Some("https://releases.tdlinux.org")
+        );
+        assert_eq!(super::source_mirror(Some(OsStr::new(""))).unwrap(), None);
+        assert_eq!(super::source_mirror(Some(OsStr::new("off"))).unwrap(), None);
+        assert_eq!(
+            super::source_mirror(Some(OsStr::new("https://mirror.example/"))).unwrap(),
+            Some("https://mirror.example")
+        );
+        for refused in [
+            "mirror.example",
+            "ftp://mirror.example",
+            "https://mirror.example/sources",
+            "https://user@mirror.example",
+            "https://mirror.example?x",
+        ] {
+            assert!(
+                super::source_mirror(Some(OsStr::new(refused))).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mirrored_pin_is_taken_from_the_mirror_by_digest() {
+        let bytes = b"mirrored firmware bytes";
+        let sha = super::hex_sha256(bytes);
+        let mirror = Origin::new(vec![(format!("/sources/{sha}"), bytes.to_vec())]);
+        let upstream = Origin::new(Vec::new());
+        let pin = mirrored_pin(&upstream, bytes);
+        let dir = crate::test_temp::TempDir::new("mirror-hit").unwrap();
+
+        super::warm_pin(
+            "sources",
+            &pin,
+            &dir,
+            None,
+            Some(&super::Mirror::new(&mirror.base)),
+        );
+
+        assert_eq!(std::fs::read(dir.join("fixture.bin")).unwrap(), bytes);
+        assert_eq!(mirror.asked(), vec![format!("/sources/{sha}")]);
+        assert!(upstream.asked().is_empty());
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_mirror_object_falls_back_to_upstream() {
+        let bytes = b"upstream firmware bytes";
+        let sha = super::hex_sha256(bytes);
+        let upstream = Origin::new(vec![("/upstream/fixture.bin".into(), bytes.to_vec())]);
+        let pin = mirrored_pin(&upstream, bytes);
+        for served in [None, Some(b"tampered".to_vec())] {
+            let routes = served
+                .into_iter()
+                .map(|body| (format!("/sources/{sha}"), body))
+                .collect();
+            let mirror = Origin::new(routes);
+            let dir = crate::test_temp::TempDir::new("mirror-fallback").unwrap();
+
+            super::warm_pin(
+                "sources",
+                &pin,
+                &dir,
+                None,
+                Some(&super::Mirror::new(&mirror.base)),
+            );
+
+            assert_eq!(std::fs::read(dir.join("fixture.bin")).unwrap(), bytes);
+            assert_eq!(mirror.asked(), vec![format!("/sources/{sha}")]);
+        }
+        assert_eq!(upstream.asked().len(), 2);
+    }
+
+    #[test]
+    fn a_disabled_mirror_is_never_asked() {
+        let bytes = b"upstream only";
+        let upstream = Origin::new(vec![("/upstream/fixture.bin".into(), bytes.to_vec())]);
+        let pin = mirrored_pin(&upstream, bytes);
+        let dir = crate::test_temp::TempDir::new("mirror-off").unwrap();
+
+        super::warm_pin("sources", &pin, &dir, None, None);
+
+        assert_eq!(std::fs::read(dir.join("fixture.bin")).unwrap(), bytes);
+        assert_eq!(upstream.asked(), vec!["/upstream/fixture.bin".to_string()]);
+    }
+
+    #[test]
+    fn the_shared_feed_store_fills_from_the_mirror_at_the_upstream_path() {
+        let bytes = b"feed-stored bytes";
+        let sha = super::hex_sha256(bytes);
+        let mirror = Origin::new(vec![(format!("/sources/{sha}"), bytes.to_vec())]);
+        let upstream = Origin::new(Vec::new());
+        let pin = mirrored_pin(&upstream, bytes);
+        let store = crate::test_temp::TempDir::new("mirror-feed-store").unwrap();
+        let path = super::strip_scheme(&pin.url);
+        let fill =
+            |url: &str, deadline| super::warm_artifact(&path, &pin.sha256, url, &store, deadline);
+        let source = super::Mirror::new(&mirror.base);
+
+        assert_eq!(
+            super::from_origins(Some(&source), &pin, fill),
+            Some("the source mirror")
+        );
+        assert_eq!(std::fs::read(store.join(&path)).unwrap(), bytes);
+        assert_eq!(
+            super::from_origins(Some(&source), &pin, fill),
+            Some("the shared feed's store")
+        );
+        assert_eq!(mirror.asked().len(), 1);
+        assert!(upstream.asked().is_empty());
+    }
+
+    #[test]
+    fn a_mirror_that_spends_its_failure_budget_is_no_longer_asked() {
+        let upstream = Origin::new(
+            ["one", "two", "three"]
+                .iter()
+                .map(|name| (format!("/upstream/{name}.bin"), name.as_bytes().to_vec()))
+                .collect(),
+        );
+        let mirror = Origin::new(Vec::new());
+        // A one-nanosecond budget: the first miss exhausts it.
+        let source = super::Mirror::with_budget(&mirror.base, std::time::Duration::from_nanos(1));
+        let dir = crate::test_temp::TempDir::new("mirror-breaker").unwrap();
+        for name in ["one", "two", "three"] {
+            let pin = super::SourcePin {
+                key: format!("{name}-source"),
+                url: format!("{}/upstream/{name}.bin", upstream.base),
+                sha256: super::hex_sha256(name.as_bytes()),
+                file: format!("{name}.bin"),
+            };
+            super::warm_pin("sources", &pin, &dir, None, Some(&source));
+            assert_eq!(std::fs::read(dir.join(&pin.file)).unwrap(), name.as_bytes());
+        }
+        assert_eq!(mirror.asked().len(), 1);
+        assert_eq!(upstream.asked().len(), 3);
+
+        // Fast misses (objects not mirrored yet) barely spend the budget,
+        // while failures that each stay under any per-attempt threshold
+        // still add up to it.
+        let budget = super::Mirror::new(&mirror.base);
+        for _ in 0..1000 {
+            budget.failed(std::time::Duration::from_millis(1));
+        }
+        assert!(budget.live());
+        for _ in 0..30 {
+            budget.failed(std::time::Duration::from_secs(4));
+        }
+        assert!(!budget.live());
+    }
+
+    #[test]
+    fn an_explicit_feed_is_asked_even_when_this_host_cannot_fill_its_store() {
+        let bytes = b"served by another host's feed";
+        // Nothing listens upstream or on the mirror; only the feed answers.
+        let dead = Origin::new(Vec::new());
+        let mut pin = mirrored_pin(&dead, bytes);
+        pin.url = "http://127.0.0.1:0/upstream/fixture.bin".into();
+        let path = super::strip_scheme(&pin.url);
+        let feed = Origin::new(vec![(format!("/{path}"), bytes.to_vec())]);
+        let store = crate::test_temp::TempDir::new("mirror-explicit-feed").unwrap();
+        let dir = crate::test_temp::TempDir::new("mirror-explicit-dest").unwrap();
+        let addr = feed.base.strip_prefix("http://").unwrap().to_string();
+        let source = super::Mirror::new(&dead.base);
+
+        super::warm_pin(
+            "sources",
+            &pin,
+            &dir,
+            Some(&(addr, store.to_path_buf())),
+            Some(&source),
+        );
+
+        assert_eq!(std::fs::read(dir.join("fixture.bin")).unwrap(), bytes);
+        assert_eq!(feed.asked(), vec![format!("/{path}")]);
     }
 }

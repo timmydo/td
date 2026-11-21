@@ -2001,7 +2001,7 @@ fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
 /// source archives from. Shared across ALL worktrees with NO env override; keep identical to
 /// the feed/builder copies (`home` comes from `var_os`, so a non-UTF-8 HOME resolves the
 /// same in all three). Deliberately NOT under `~/.td/build-daemon` (bound RW into sandboxes).
-fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
+pub(crate) fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
     home.map(|h| h.join(".td/sources"))
         .unwrap_or_else(|| PathBuf::from(".td/sources"))
 }

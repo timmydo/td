@@ -477,6 +477,8 @@ fn single_file_dry_run_sends_nothing_and_reserved_names_refuse() {
     let mut reserved = args;
     reserved[3] = "heads/system-x86-64".into();
     assert!(command(&reserved).is_err());
+    reserved[3] = "sources/fixture".into();
+    assert!(command(&reserved).is_err());
     for endpoint in [
         "http://example.org",
         "https://user@example.org",

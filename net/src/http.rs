@@ -134,6 +134,21 @@ pub(crate) fn agent_before(
     ))
 }
 
+/// `agent_before` that also gives up on a peer silent for READ_TIMEOUT.
+fn agent_before_reading(deadline: Instant, allow_redirects: bool) -> Result<ureq::Agent, String> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("HTTP request exceeded its absolute deadline")?;
+    Ok(ureq::Agent::new_with_config(
+        config(allow_redirects)
+            .timeout_global(Some(remaining))
+            .timeout_connect(Some(CONNECT_TIMEOUT.min(remaining)))
+            .timeout_per_read(Some(READ_TIMEOUT.min(remaining)))
+            .timeout_per_write(Some(WRITE_TIMEOUT.min(remaining)))
+            .build(),
+    ))
+}
+
 type Response = ureq::http::Response<ureq::Body>;
 
 /// The response if its status is one the caller reads, else the attempt's
@@ -669,6 +684,44 @@ pub(crate) fn get_to_file_accounted_no_redirects_before(
     )
 }
 
+/// The source mirror's fetch (net/MIRROR.md): an absolute deadline, no
+/// redirects, and a silent peer abandoned after READ_TIMEOUT rather than at
+/// the deadline, so a stalled mirror fails in minutes.
+pub(crate) fn get_to_file_mirror_before(
+    url: &str,
+    path: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<u64, String> {
+    get_to_file_with_policy(
+        url,
+        None,
+        path,
+        max_bytes,
+        Limit::BeforeReading(deadline),
+        None,
+        false,
+    )
+}
+
+/// How long a transfer may take: unbounded but read-timed (the idle
+/// agents), bounded by a deadline, or bounded and read-timed as well.
+#[derive(Clone, Copy)]
+enum Limit {
+    Idle,
+    Before(Instant),
+    BeforeReading(Instant),
+}
+
+impl Limit {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Limit::Idle => None,
+            Limit::Before(deadline) | Limit::BeforeReading(deadline) => Some(deadline),
+        }
+    }
+}
+
 fn get_to_file_with_deadline(
     url: &str,
     path: &Path,
@@ -682,7 +735,7 @@ fn get_to_file_with_deadline(
         registry_blob(url),
         path,
         max_bytes,
-        deadline,
+        deadline.map_or(Limit::Idle, Limit::Before),
         aggregate,
         allow_redirects,
     )
@@ -693,10 +746,11 @@ fn get_to_file_with_policy(
     blob: Option<RegistryBlob>,
     path: &Path,
     max_bytes: u64,
-    deadline: Option<Instant>,
+    limit: Limit,
     aggregate: Option<(&AtomicU64, u64)>,
     allow_redirects: bool,
 ) -> Result<u64, String> {
+    let deadline = limit.deadline();
     if blob.is_some() && !allow_redirects {
         return Err(format!(
             "{url}: a registry blob is served through a redirect, which this transfer refuses"
@@ -705,10 +759,11 @@ fn get_to_file_with_policy(
     let follow = follows_redirects(allow_redirects, blob.as_ref());
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
-        let request_agent = match deadline {
-            Some(deadline) => agent_before(deadline, follow)?,
-            None if follow => agent(),
-            None => agent_no_redirects(),
+        let request_agent = match limit {
+            Limit::BeforeReading(deadline) => agent_before_reading(deadline, follow)?,
+            Limit::Before(deadline) => agent_before(deadline, follow)?,
+            Limit::Idle if follow => agent(),
+            Limit::Idle => agent_no_redirects(),
         };
         let result = match &blob {
             Some(blob) => registry_blob_to_file_once(
@@ -836,7 +891,18 @@ mod tests {
         let _ = server.join();
     }
 
-    /// The test above proves ureq HONOURS a read timeout; this proves the applets'
+    /// The source mirror's deadline agent also drops a silent peer, which the
+    /// ordinary deadline agent waits out until its deadline.
+    #[test]
+    fn the_mirror_agent_abandons_a_silent_peer_before_its_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let mirror = agent_before_reading(deadline, false).unwrap();
+        assert_eq!(mirror.config().timeout_per_read(), Some(READ_TIMEOUT));
+        let plain = agent_before(deadline, false).unwrap();
+        assert_eq!(plain.config().timeout_per_read(), None);
+    }
+
+    /// A ureq test above proves ureq HONOURS a read timeout; this proves the applets'
     /// own agent carries one. Both halves are needed — ureq's default
     /// `timeout_per_read` is None (config.rs), and that default is the hang, so the
     /// assertion on the default is what keeps this test meaningful rather than vacuous.
@@ -1170,7 +1236,7 @@ mod tests {
             Some(blob),
             &path,
             1024,
-            deadline.map(|d| Instant::now() + d),
+            deadline.map_or(Limit::Idle, |d| Limit::Before(Instant::now() + d)),
             None,
             true,
         )

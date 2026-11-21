@@ -482,7 +482,8 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         }
     );
     // Share the builder's isolated compiler/target selection with source warming.
-    let net = crate::warm::resolve_td_net(&repo.join("target/release/td-builder"))?;
+    let builder = repo.join("target/release/td-builder");
+    let net = crate::warm::resolve_td_net(&builder)?;
     let net = fs::canonicalize(net).map_err(|e| e.to_string())?;
     let target = fs::canonicalize(repo.join("net/target")).map_err(|e| e.to_string())?;
     if !net.starts_with(&target) {
@@ -499,7 +500,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
             ));
         }
         crate::check_runner::warm_cli(&[PROFILE.into()])?;
-        build_image(&repo.join("target/release/td-builder"), &iso, &deployment)?;
+        build_image(&builder, &iso, &deployment)?;
         boot_info_source::finish(&repo, &source)?;
         atomic(&built, &fingerprint(&dir, &iso)?)?;
     }
@@ -514,7 +515,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         return Err("retained deployment has the wrong source identity".into());
     }
     if options.test {
-        run(&repo.join("target/release/td-builder"), &["check".into()])?;
+        run(&builder, &["check".into()])?;
         crate::check_runner::qemu_admin_update_cli(&[])?;
         atomic(
             &dir.join("tests-passed"),
@@ -522,6 +523,20 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         )?;
     }
     boot_info_source::finish(&repo, &source)?;
+    // Mirror every pin of this commit before anything is signed or promoted,
+    // so a published release never leaves a source build of it to upstream
+    // alone (net/MIRROR.md). The image's warm covers only its closure; these
+    // two cover every roster `s3 sources` reads, on every run.
+    for roster in ["sources", "build-root"] {
+        crate::warm::run_warm(&net, &repo, &builder, &["warm".into(), roster.into()]);
+    }
+    let mut sources = vec![
+        "s3".into(),
+        "sources".into(),
+        path_text(&crate::check_runner::shared_sources_dir(Some(&home))),
+    ];
+    sources.extend(config.upload_args());
+    run(&net, &sources)?;
     let common = vec![
         path_text(&config.repository),
         path_text(&config.root),

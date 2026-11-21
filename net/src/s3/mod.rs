@@ -10,6 +10,7 @@
 )]
 
 mod inventory;
+mod sources;
 #[cfg(test)]
 pub(crate) mod tests;
 mod website;
@@ -622,7 +623,7 @@ pub(crate) fn file_hash_until(file: &mut File, size: u64, deadline: Instant) -> 
     Ok(sig::to_hex(&digest.finalize()))
 }
 
-const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 website DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]";
+const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 website DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 sources DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]";
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
     let (words, dry) = if words.last() == Some(&"--dry-run") {
@@ -639,6 +640,16 @@ fn command(args: &[String]) -> Result<()> {
             dry,
         );
     }
+    if let ["sources", directory, endpoint, region, bucket, credentials, profile] = words {
+        let bucket = sources::Bucket {
+            endpoint,
+            region,
+            bucket,
+            credentials: Path::new(credentials),
+            profile,
+        };
+        return sources::command(Path::new(directory), &bucket, dry);
+    }
     let ["put", path, key, endpoint, region, bucket, credentials, profile] = words else {
         return Err(HELP.into());
     };
@@ -647,6 +658,9 @@ fn command(args: &[String]) -> Result<()> {
         Some("heads" | "roots" | "releases" | "objects")
     ) {
         return Err("use release upload-s3 for reserved release keys".into());
+    }
+    if key.split('/').next() == Some("sources") {
+        return Err("use s3 sources for the source mirror's keys".into());
     }
     key_path(bucket, key)?;
     let mut client = Client::new(endpoint, region, bucket, Path::new(credentials), profile)?;

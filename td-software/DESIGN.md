@@ -82,7 +82,8 @@ account ledger").
 
 These stay out because principle 5, §B.6 and §Z refuse them:
 
-- No repository, catalogue server, mirror or index that td hosts.
+- No application repository, catalogue server, mirror or index that td
+  hosts.
   td-software does not browse Flathub and does not take arbitrary refs.
 - No authority of its own. It never runs a payload, never writes a cache
   or table, and never runs an upstream `Exec=` line.

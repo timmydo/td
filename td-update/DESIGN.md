@@ -146,8 +146,10 @@ then invokes `build-run` through the existing sandbox and recipe
 graph. It receives the exact builder just compiled through
 `TD_BUILDER_SELF`. No host cache is imported, no application payload becomes
 a compilation input, and the logical target prefix remains `/td/store`.
-The first build therefore needs the graph's local build space and upstream
-source downloads. No command pulls Git implicitly. `build` does not activate
+The first build therefore needs the graph's local build space and source
+downloads, each from td's source mirror where it holds the pin's bytes and
+otherwise from the pin's upstream URL (`net/MIRROR.md`). No command pulls
+Git implicitly. `build` does not activate
 the result. The evaluator's successful build must emit a complete bounded
 `TD_RECIPE_RUN_OUT system-x86-64` receipt with an absolute output path;
 logs stream to the terminal with a 64 KiB line ceiling. Missing or malformed
