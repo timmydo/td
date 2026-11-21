@@ -265,6 +265,19 @@ impl<'a> Network<'a> {
             .map_or(self.session_deadline, |d| d.min(self.session_deadline))
     }
 
+    /// Timing and direction for an already blocked, network-owned transport turn.
+    pub(super) fn blocked(&self) -> (Deadline, bool) {
+        match self.closing {
+            Closing::Reply { deadline } | Closing::Shutdown { deadline } => (deadline, false),
+            Closing::Drain { deadline, .. } => (deadline, true),
+            _ => (
+                self.reply_grace
+                    .unwrap_or(self.idle_deadline.min(self.deadline())),
+                matches!(self.session.pending(), Pending::Input),
+            ),
+        }
+    }
+
     pub fn advance(
         &mut self,
         transport: &mut impl Transport,

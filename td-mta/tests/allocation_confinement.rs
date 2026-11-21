@@ -37,12 +37,42 @@ fn readiness_users(relative: &str, source: &str) {
             assert!(compact.contains("readiness_sys::wait(Connected::Tcp(self.connected()?),Interest{read:true,write:false,},None,until,)"));
             2
         }
-        "td-mta/src/https/wait.rs" => {
+        "td-mta/src/network_wake.rs" => {
             let compact: String = source.split_whitespace().collect();
             for expected in [
                 "let(tx,socket)=UnixStream::pair()?;",
                 "*sender=Some(tx);",
                 "Ok(Receiver{owner:self,socket,})",
+            ] {
+                assert!(compact.contains(expected), "{relative}: {expected}");
+            }
+            0
+        }
+        "td-mta/src/smtp_receiving/wait.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            for expected in [
+                "PollSet::new(&receiver.socket)",
+                "Some(Connection::Plain(_,tcp))=>tcp.connected()?",
+                "Some(Connection::Tls(_,tls))=>tls.socket()?",
+                "poll.add_connected(Connected::Tcp(socket),",
+                "poll.add_tcp_listener(&listener.socket)",
+            ] {
+                assert!(compact.contains(expected), "{relative}: {expected}");
+            }
+            for (token, count) in [
+                ("PollSet", 2),
+                ("Connected", 2),
+                ("add_connected", 1),
+                ("add_tcp_listener", 1),
+                ("add_unix_listener", 0),
+            ] {
+                assert_eq!(words(source, token), count, "{relative}: {token}");
+            }
+            1
+        }
+        "td-mta/src/https/wait.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            for expected in [
                 "PollSet::new(&receiver.socket)",
                 "(Some(Connection::Local(c)),None)=>Connected::Unix(c.connected()?)",
                 "(Some(Connection::Tls(c)),None)=>Connected::Tcp(c.socket()?)",

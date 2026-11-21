@@ -3687,10 +3687,11 @@ amends this section and `td-install/DESIGN.md`.
 The library denies `unsafe_code`. Its single function-scoped exception,
 `readiness_sys::ppoll`, invokes Linux `ppoll` (271 on x86-64, 73 on
 aarch64). Each eight-byte C-layout pollfd holds a transparent
-`BorrowedFd` and two 16-bit event fields. HTTPS admits at most 49 entries:
-one private Unix wake receiver, up to 16 TCP or Unix listeners and up
-to 32 connected TCP or Unix sockets. Only connected sockets can request
-writable readiness. PostgreSQL and single-socket transport waits pass
+`BorrowedFd` and two 16-bit event fields. HTTPS and direct SMTP each admit
+at most 49 entries: one private Unix wake receiver, up to 16 listeners
+and up to 32 connected sockets. SMTP borrows TCP sockets. HTTPS also
+admits Unix sockets. Only connected sockets can request writable
+readiness. PostgreSQL and single-socket transport waits pass
 one connected socket and optionally a private Unix wake receiver.
 All descriptors remain borrowed through the call. The syscall receives
 the length of the initialized slice and a mutable two-i64 timespec. Its

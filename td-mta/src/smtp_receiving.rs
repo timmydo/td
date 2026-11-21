@@ -27,7 +27,7 @@ use std::{
     net::{IpAddr, TcpListener},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc, Mutex, TryLockError,
+        Arc, OnceLock, TryLockError,
     },
     time::Duration,
 };
@@ -43,7 +43,9 @@ impl<B: smtp_storage::Storage> Drop for StorageClose<'_, B> {
 }
 
 mod dkim_worker;
+mod wait;
 pub(crate) use dkim_worker::STACK_BYTES as DKIM_STACK_BYTES;
+use wait::{Blocked, Cell, Owner};
 
 const SCAN: Duration = Duration::from_millis(5);
 const NETWORK_TURNS: usize = 16;
@@ -90,7 +92,9 @@ pub enum State {
 }
 
 pub struct Control {
-    pub(crate) https_wake: crate::https::wait::Notifications,
+    pub(crate) https_wake: crate::network_wake::Notifications,
+    smtp_wake: crate::network_wake::Notifications,
+    smtp_drain: OnceLock<Deadline>,
     stop: AtomicBool,
     user_stopped: AtomicBool,
     state: AtomicU8,
@@ -102,6 +106,8 @@ impl Default for Control {
             stop: AtomicBool::new(false),
             user_stopped: AtomicBool::new(false),
             https_wake: Default::default(),
+            smtp_wake: Default::default(),
+            smtp_drain: OnceLock::new(),
             state: AtomicU8::new(0),
             logging: None,
         }
@@ -131,6 +137,22 @@ impl Control {
         self.logging.as_ref().map(|logging| logging.status())
     }
 
+    fn can_claim_smtp_work(&self, clock: &dyn Clock) -> bool {
+        if self.state() == State::Failed {
+            return false;
+        }
+        let Some(deadline) = self.smtp_drain.get() else {
+            return true;
+        };
+        match clock.monotonic() {
+            Ok(now) => !deadline.expired(now),
+            Err(_) => {
+                self.fail();
+                false
+            }
+        }
+    }
+
     pub fn user_stop(&self) {
         self.user_stopped.store(true, Ordering::Release);
         self.stop();
@@ -141,6 +163,7 @@ impl Control {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         self.https_wake.notify();
+        self.smtp_wake.notify();
     }
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
@@ -245,10 +268,31 @@ impl<'a> Connection<'a> {
             _ => Err(Error::Conflict),
         }
     }
-    fn advance(&mut self, clock: &dyn Clock) -> Result<Progress, Error> {
+    fn advance(&mut self, clock: &dyn Clock, blocked: &mut Blocked) -> Result<Progress, Error> {
         match self {
-            Self::Plain(n, t) => n.advance(t, clock),
-            Self::Tls(n, t) => n.advance(t, clock),
+            Self::Plain(n, t) => {
+                let progress = n.advance(t, clock)?;
+                if progress == Progress::Pending {
+                    let (_, read) = n.blocked();
+                    *blocked = Blocked { read, write: !read };
+                }
+                Ok(progress)
+            }
+            Self::Tls(n, t) => {
+                let before = t.begin_turn();
+                let progress = n.advance(t, clock)?;
+                if progress == Progress::Pending {
+                    let turn = t.wire_turn(before);
+                    if turn.moved {
+                        return Ok(Progress::Advanced);
+                    }
+                    *blocked = Blocked {
+                        read: turn.read_blocked,
+                        write: turn.write_blocked,
+                    };
+                }
+                Ok(progress)
+            }
             _ => Err(Error::Conflict),
         }
     }
@@ -300,6 +344,7 @@ struct Slot<'s, 'cfg, 'spf, B: Storage + 's> {
     listener: usize,
     peer: IpAddr,
     final_reply: bool,
+    blocked: Blocked,
     spf_ticket: Option<crate::smtp_spf::Ticket<'spf>>,
     spf_result: Option<crate::spf::Outcome>,
     authentication: Option<dkim_worker::MessageAuthentication>,
@@ -426,10 +471,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             .state
             .compare_exchange(0, 5, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Conflict)?;
-        let result =
-            crate::smtp_spf::with_worker(self.resources.limits().smtp_sessions, resolvers, |spf| {
-                self.run_inner(control, ready, spf, resolvers)
-            });
+        let result = crate::smtp_spf::with_worker(
+            self.resources.limits().smtp_sessions,
+            resolvers,
+            &control.smtp_wake,
+            |spf| self.run_inner(control, ready, spf, resolvers),
+        );
         if result.is_err() {
             control.fail();
             return result;
@@ -511,6 +558,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 return Ok(());
             }
         }
+        let receiver = control.smtp_wake.attach()?;
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(total)
@@ -520,13 +568,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             .try_reserve_exact(total)
             .map_err(|_| Error::Capacity)?;
         for _ in 0..total {
-            slots.push(Mutex::new(Slot {
+            slots.push(Cell::new(Slot {
                 phase: Phase::Empty,
                 connection: None,
                 delivery: None,
                 listener: 0,
                 peer: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 final_reply: false,
+                blocked: Blocked::default(),
                 spf_ticket: None,
                 spf_result: None,
                 authentication: None,
@@ -565,7 +614,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     .name(name)
                     .stack_size(dkim_worker::STACK_BYTES)
                     .spawn_scoped(scope, || {
-                        self.verify_message(&slots, &finished, &main, control, resolvers)
+                        self.verify_message(&slots, &finished, control, resolvers)
                     })
                     .ok()
             });
@@ -601,20 +650,23 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 let mut accept_after = Tick(0);
                 let mut certificate_failed = false;
                 loop {
+                    receiver.consume()?;
                     if storage.is_finished() || tls.is_finished() {
                         control.fail();
                         break Err(Error::WriterStopped);
                     }
                     let now = match self.clock.sample() {
                         Ok(time) => {
-                            if self.listeners.iter().any(|listener| {
-                                TlsPolicies::check_receiving_certificate(
-                                    self.policies,
-                                    listener.policy,
-                                    time.utc_ms,
-                                )
-                                .is_err()
-                            }) {
+                            if !certificate_failed
+                                && self.listeners.iter().any(|listener| {
+                                    TlsPolicies::check_receiving_certificate(
+                                        self.policies,
+                                        listener.policy,
+                                        time.utc_ms,
+                                    )
+                                    .is_err()
+                                })
+                            {
                                 // Fail closed: workers discard queued, uncommitted work.
                                 certificate_failed = true;
                                 control.fail();
@@ -627,10 +679,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         }
                     };
                     if control.stop.load(Ordering::Acquire) && stopping.is_none() {
+                        let deadline = after(now, 5)?;
+                        control
+                            .smtp_drain
+                            .set(deadline)
+                            .map_err(|_| Error::Conflict)?;
+                        stopping = Some(deadline);
                         if control.state() != State::Failed {
                             control.transition(2);
                         }
-                        stopping = Some(after(now, 5)?);
                     }
                     let mut progress = false;
                     let mut wake_storage = false;
@@ -641,7 +698,10 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         let Some(cell) = slots.get(index) else {
                             break;
                         };
-                        let mut slot = match cell.try_lock() {
+                        if !cell.owned(Owner::Network) && !cell.owned(Owner::Dkim) {
+                            continue;
+                        }
+                        let mut slot = match cell.slot.try_lock() {
                             Ok(slot) => slot,
                             Err(TryLockError::WouldBlock) => continue,
                             Err(TryLockError::Poisoned(_)) => {
@@ -678,6 +738,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             slot.spf_result = result;
                             if now < until && stopping.is_none() {
                                 if slot.authentication.is_none() && dkim_thread.is_some() {
+                                    cell.assign(Owner::Dkim);
                                     wake_dkim = true;
                                     continue;
                                 }
@@ -742,10 +803,13 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                             .network_mut()?
                                             .service_unavailable(self.clock.as_ref());
                                     }
-                                    let progress = connection.advance(self.clock.as_ref())?;
+                                    let mut blocked = Blocked::default();
+                                    let progress =
+                                        connection.advance(self.clock.as_ref(), &mut blocked)?;
                                     if connection.network()?.session().envelope().is_none() {
                                         slot.spf_ticket = None;
                                     }
+                                    slot.blocked = blocked;
                                     Ok(progress)
                                 })();
                                 match turn {
@@ -782,13 +846,16 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 }
                             }
                         }
-                        match slot.phase {
-                            Phase::Queued {
-                                work: Work::Tls, ..
-                            } => wake_tls = true,
-                            Phase::Queued { .. } | Phase::Retire => wake_storage = true,
-                            Phase::AwaitAuthentication { .. } => wake_dkim = true,
-                            _ => (),
+                        let owner = wait::owner(
+                            slot.phase,
+                            dkim_thread.is_some() && slot.authentication.is_none(),
+                        );
+                        cell.assign(owner);
+                        match owner {
+                            Owner::Tls => wake_tls = true,
+                            Owner::Storage => wake_storage = true,
+                            Owner::Dkim => wake_dkim = true,
+                            Owner::Network => (),
                         }
                     }
                     cursor = (cursor + 1) % total;
@@ -865,7 +932,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                         .filter(|(_, entry)| entry.is_none())
                                         .find_map(|(index, _)| {
                                             slots.get(index).and_then(|cell| {
-                                                cell.try_lock().ok().map(|slot| (index, slot))
+                                                cell.slot.try_lock().ok().map(|slot| (index, slot))
                                             })
                                         });
                                     let Some((free, mut slot)) = free else {
@@ -906,7 +973,15 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         }
                     }
                     if !progress {
-                        std::thread::park_timeout(SCAN);
+                        wait::wait(
+                            &receiver,
+                            &slots,
+                            self.listeners,
+                            accept_after,
+                            stopping,
+                            now,
+                            self.clock.as_ref(),
+                        )?;
                     }
                 }
             })();
@@ -922,7 +997,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }
             // Terminal teardown is outside the event loop; never resume a poisoned job.
             for cell in &slots {
-                match cell.lock() {
+                match cell.slot.lock() {
                     Ok(mut slot) => slot.retire(),
                     Err(poisoned) => poisoned.into_inner().retire(),
                 }
@@ -999,13 +1074,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
 
     fn worker(
         &self,
-        slots: &[Mutex<Slot<'s, 'cfg, '_, B>>],
+        slots: &[Cell<Slot<'s, 'cfg, '_, B>>],
         tls: bool,
         finished: &AtomicBool,
         started: &AtomicU8,
         main: &std::thread::Thread,
         control: &Control,
     ) {
+        let owner = if tls { Owner::Tls } else { Owner::Storage };
         let _close = (!tls).then(|| StorageClose(self.storage, control));
         let mut random = if tls {
             None
@@ -1033,9 +1109,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             }
             let mut progress = false;
             for cell in slots {
-                let mut slot = match cell.try_lock() {
-                    Ok(slot) => slot,
-                    Err(_) => continue,
+                if !cell.owned(owner) {
+                    continue;
+                }
+                let Ok(mut slot) = cell.slot.lock() else {
+                    control.fail();
+                    return;
                 };
                 match slot.phase {
                     Phase::Retire if !tls => {
@@ -1046,41 +1125,45 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         progress = true;
                     }
                     Phase::Queued { work, deadline } if matches!(work, Work::Tls) == tls => {
-                        if control.state() == State::Failed {
+                        if !control.can_claim_smtp_work(self.clock.as_ref()) {
                             slot.queue_retirement();
-                            progress = true;
-                            continue;
-                        }
-                        let result = if tls {
-                            self.tls(&mut slot, deadline)
                         } else {
-                            match random.as_mut() {
-                                Some(random) => {
-                                    self.storage(&mut slot, work, deadline, random, control)
+                            let result = if tls {
+                                self.tls(&mut slot, deadline)
+                            } else {
+                                match random.as_mut() {
+                                    Some(random) => {
+                                        self.storage(&mut slot, work, deadline, random, control)
+                                    }
+                                    None => Err(Error::Conflict),
                                 }
-                                None => Err(Error::Conflict),
-                            }
-                        };
-                        if result.is_err() {
-                            slot.retire();
-                            if !tls && self.storage.stopped() {
-                                control.fail();
+                            };
+                            if result.is_err() {
+                                slot.retire();
+                                if !tls && self.storage.stopped() {
+                                    control.fail();
+                                }
                             }
                         }
                         progress = true;
                     }
                     _ => (),
                 }
+                cell.assign(Owner::Network);
+                drop(slot);
+                control.smtp_wake.notify();
             }
-            if progress {
-                main.unpark();
-            } else {
-                std::thread::park_timeout(SCAN);
+            if !progress && !finished.load(Ordering::Acquire) {
+                if tls {
+                    std::thread::park();
+                } else {
+                    std::thread::park_timeout(Duration::from_secs(1));
+                }
             }
         }
         if !tls {
             for cell in slots {
-                if let Ok(mut slot) = cell.lock() {
+                if let Ok(mut slot) = cell.slot.lock() {
                     slot.retire();
                 }
             }

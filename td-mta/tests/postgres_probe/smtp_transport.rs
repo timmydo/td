@@ -27,6 +27,7 @@ use td_mta::{
 struct CopyState {
     entered: bool,
     observed: bool,
+    copying_dot: bool,
     released: bool,
 }
 #[derive(Default)]
@@ -36,7 +37,7 @@ struct CopyProbe {
 }
 impl CopyProbe {
     fn wait(&self, condition: impl Fn(&CopyState) -> bool) -> bool {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(15);
         let mut state = self.state.lock().unwrap();
         while !condition(&state) {
             let Some(remaining) = until.checked_duration_since(Instant::now()) else {
@@ -67,6 +68,7 @@ struct ObservedJob<J> {
     inner: J,
     probe: Arc<CopyProbe>,
     gated: bool,
+    copying: bool,
 }
 impl<B: Storage> Storage for ObservedStorage<'_, B> {
     fn maintain(&self) -> Result<(), td_mta::ports::Error> {
@@ -102,6 +104,7 @@ impl<B: Storage> Storage for ObservedStorage<'_, B> {
             inner: self.inner.begin(input, random)?,
             probe: self.probe.clone(),
             gated: false,
+            copying: false,
         })
     }
 }
@@ -112,12 +115,17 @@ impl<J: Job> Job for ObservedJob<J> {
             self.gated = true;
         }
         if bytes == b"Subject: independent DATA copy\r\n" {
+            self.copying = true;
             self.probe.state.lock().unwrap().observed = true;
             self.probe.changed.notify_all();
         }
         Ok(())
     }
     fn dkim_input(&self) -> Option<&[u8]> {
+        if self.copying {
+            self.probe.state.lock().unwrap().copying_dot = true;
+            self.probe.changed.notify_all();
+        }
         self.inner.dkim_input()
     }
     fn prepare(&mut self, deadline: Deadline) -> Result<(), smtp_storage::Failure> {
@@ -161,8 +169,8 @@ impl<J: Job> Job for ObservedJob<J> {
     }
 }
 
-trait Duplex: Read + Write {}
-impl<T: Read + Write> Duplex for T {}
+trait Duplex: Read + Write + Send {}
+impl<T: Read + Write + Send> Duplex for T {}
 pub(super) struct TlsDriver(TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>);
 fn io_error(error: td_mta::ports::Error) -> std::io::Error {
     let kind = match error {
@@ -411,8 +419,20 @@ fn copy_during_publication(
         sql(fixture, "SELECT count(*) FROM td_mta.emails"),
         initial.to_string()
     );
-    drop(release);
-    reply(&mut held, "250");
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let held = &mut held;
+        scope.spawn(move || {
+            reply(held, "250");
+            tx.send(()).unwrap();
+        });
+        // The network already progressed on the second peer while publication
+        // was suspended. Only the confirmed database outcome may unblock this reply.
+        let early = rx.recv_timeout(Duration::from_millis(100));
+        drop(release);
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
     command(&mut copying, b".\r\n", "250");
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.emails"),
@@ -422,10 +442,65 @@ fn copy_during_publication(
     command(&mut copying, b"QUIT\r\n", "221");
 }
 
+fn stop_before_second_commit(
+    fixture: &Fixture,
+    address: std::net::SocketAddr,
+    clock: Arc<RuntimeClock>,
+    probe: Arc<CopyProbe>,
+    control: &Control,
+) {
+    let release = ReleaseCopy(probe.clone());
+    let before: usize = sql(fixture, "SELECT count(*) FROM td_mta.emails")
+        .parse()
+        .unwrap();
+    let mut held = connect(fixture, address, false, clock.clone());
+    let mut queued = connect(fixture, address, false, clock);
+    envelope(&mut held);
+    envelope(&mut queued);
+    held.get_mut()
+        .write_all(b"Subject: held publication\r\n\r\nfirst\r\n.\r\n")
+        .unwrap();
+    held.get_mut().flush().unwrap();
+    assert!(probe.wait(|state| state.entered));
+    queued
+        .get_mut()
+        .write_all(b"Subject: independent DATA copy\r\n\r\nsecond\r\n.\r\n")
+        .unwrap();
+    queued.get_mut().flush().unwrap();
+    assert!(probe.wait(|state| state.copying_dot));
+    control.stop();
+    let until = Instant::now() + Duration::from_secs(2);
+    while control.state() != State::Stopping {
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+    // The first claim predated shutdown. The second has waited behind it
+    // through the complete graceful drain, and must never publish.
+    std::thread::sleep(Duration::from_millis(5050));
+    drop(release);
+    reply(&mut held, "250");
+    let mut response = Vec::new();
+    match queued.read_to_end(&mut response) {
+        Ok(_) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => (),
+        other => panic!("queued peer did not close: {other:?}"),
+    }
+    assert!(
+        response.is_empty(),
+        "queued peer received {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.emails"),
+        (before + 1).to_string()
+    );
+}
+
 /// What follows the first accepted message.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Ending {
     Drain,
+    QueuedStop,
     Rate,
 }
 
@@ -515,6 +590,11 @@ pub(super) fn exercise(
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(control.state(), State::Ready);
+            if ending == Ending::QueuedStop {
+                stop_before_second_commit(fixture, address, clock.clone(), probe.clone(), &control);
+                server.join().unwrap().unwrap();
+                return;
+            }
             let stream = TcpStream::connect(address).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
             stream.set_write_timeout(Some(Duration::from_secs(15))).unwrap();

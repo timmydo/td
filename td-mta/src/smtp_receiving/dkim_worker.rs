@@ -1,5 +1,5 @@
 //! DKIM and DMARC share one worker, DNS meter and borrow of the admitted DATA.
-use super::{Control, Phase, Receiving, Slot};
+use super::{Cell, Control, Owner, Phase, Receiving, Slot};
 use crate::{
     clock::RuntimeClock,
     dkim, dmarc,
@@ -10,10 +10,7 @@ use crate::{
 };
 use std::{
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex, TryLockError,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 
@@ -76,9 +73,8 @@ fn evaluate_message(
 impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
     pub(super) fn verify_message(
         &self,
-        slots: &[Mutex<Slot<'s, 'cfg, '_, B>>],
+        slots: &[Cell<Slot<'s, 'cfg, '_, B>>],
         finished: &AtomicBool,
-        main: &thread::Thread,
         control: &Control,
         servers: &[SocketAddr],
     ) {
@@ -87,16 +83,26 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             td_alloc::filled(crate::dns_transport::PACKET_BYTES, 0u8).unwrap_or_default();
         let mut entropy = td_crypto::SystemEntropy::try_new().ok();
         while !finished.load(Ordering::Acquire) {
+            let mut worked = false;
             let mut contended = false;
             for cell in slots {
-                let mut slot = match cell.try_lock() {
-                    Ok(guard) => guard,
-                    Err(TryLockError::WouldBlock) => {
+                if !cell.owned(Owner::Dkim) {
+                    continue;
+                }
+                let mut slot = match cell.slot.try_lock() {
+                    Ok(slot) => slot,
+                    Err(std::sync::TryLockError::WouldBlock) => {
                         contended = true;
                         continue;
                     }
-                    Err(TryLockError::Poisoned(_)) => continue,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        control.fail();
+                        return;
+                    }
                 };
+                if !cell.owned(Owner::Dkim) {
+                    continue;
+                }
                 let Phase::AwaitAuthentication { until } = slot.phase else {
                     continue;
                 };
@@ -148,10 +154,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     .flatten()
                     .unwrap_or_else(MessageAuthentication::unavailable);
                 slot.authentication = Some(report);
+                cell.assign(Owner::Network);
                 drop(slot);
-                main.unpark();
+                worked = true;
+                control.smtp_wake.notify();
             }
-            if !finished.load(Ordering::Acquire) {
+            if !worked && !finished.load(Ordering::Acquire) {
                 if contended {
                     thread::park_timeout(super::SCAN);
                 } else {

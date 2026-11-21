@@ -123,6 +123,7 @@ pub mod mime_response;
 pub use td_mime::nfc;
 pub use td_mime::parameter_value as mime_value;
 pub use td_mime::unfold as mime_unfold;
+mod network_wake;
 pub mod observability;
 pub mod operator_files;
 pub mod outbound_dial;

@@ -1,6 +1,7 @@
 //! Checked startup reservations, not allocation or measured RSS guarantees.
 use std::fmt;
 
+pub(crate) const MAX_SMTP_SESSIONS: usize = 32;
 pub(crate) const MAX_HTTPS_CONNECTIONS: usize = 32;
 
 pub const KIB: usize = 1024;
@@ -151,7 +152,7 @@ macro_rules! limits {
 
 limits! {
     configurable {
-        smtp_sessions: 8, 1, 32;
+        smtp_sessions: 8, 1, MAX_SMTP_SESSIONS;
         smtp_per_peer: 2, 1, 32;
         https_connections: 8, 1, MAX_HTTPS_CONNECTIONS;
         tls_handshakes: 2, 1, 8;

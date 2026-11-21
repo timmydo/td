@@ -1030,8 +1030,8 @@ td-crypto still has an external TLS implementation.
 The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
-through each deadline-bounded wait. HTTPS can wait on a fixed set sized
-for its private wake receiver, 16 listeners and 32 client slots. PostgreSQL
+through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
+fixed set sized for a private wake receiver, 16 listeners and 32 client slots. PostgreSQL
 and single-connection transport waits use one or two entries. UNSAFE.md
 section 22 pins the syscall ABI.
 The binary denies unsafe code
@@ -1387,12 +1387,10 @@ live work and preserve foreground progress.
 Event-source streams hold connection slots but no storage read view between
 events. RESOURCES.md proposes nonblocking main-thread scheduling and
 planned stacks for nine fixed roles plus `tls_handshakes` HTTPS workers; event peers cannot occupy request/commit/control
-workers. Use safe std with a bounded round-robin socket scan and a wait
-based on deadlines, using the current proposed five-millisecond quantum.
-Established TLS record work is bounded per slot; disk, dial, handshake and DNS jobs use
-fixed workers. Safe std exposes no poll/epoll; adding an OS readiness
-adapter would require the explicit unsafe review from section 3 and a design
-amendment. Read slots are acquired per store operation with a bounded fair
+workers. HTTPS and direct SMTP visit a bounded set of slots in round-robin
+order and wait for socket readiness, worker completion or the next deadline
+through the adapter in section 3. Established TLS record work is bounded per
+slot. Disk, dial, handshake and DNS jobs use fixed workers. Read slots are acquired per store operation with a bounded fair
 wait queue; exhaustion returns a retryable HTTP 503 before response headers
 or the mapped JMAP method error. A streaming response that has begun cannot
 fabricate an error object inside its body: finish from its admitted view or
@@ -1868,7 +1866,12 @@ plaintext SMTP, which would otherwise never construct a TLS session.
 One network loop visits bounded connection slots in rotating order, with
 at most 16 nonblocking protocol turns per visit. A would-block result or
 queued worker operation ends the visit; each turn retains its deadline
-checks. One
+checks. The loop waits for listening sockets, the connected socket
+directions blocked beneath plaintext or TLS, worker completion, stop, or the
+next absolute deadline. Checks of wall-clock certificate validity are bounded
+by its one-second precision. Even at capacity, listeners remain observable
+for the existing 421 refusal. TLS and DKIM workers sleep until dispatched;
+storage wakes at least once a second for idle connection retirement. One
 fixed storage worker performs admission and publication; one fixed TLS
 worker constructs sessions and advances handshakes. The network loop copies
 one decoded DATA chunk of at most 1000 bytes per connection turn into its

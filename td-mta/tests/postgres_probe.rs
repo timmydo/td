@@ -4023,18 +4023,32 @@ per_peer_limit = 1
                     | ConfigurationExercise::ReceivingRate
             )
         {
+            let socket = smtp_socket.take().unwrap();
+            let drain = matches!(exercise, ConfigurationExercise::ReceivingTransport)
+                .then(|| socket.try_clone().unwrap());
             smtp_transport::exercise(
                 &fixture,
                 &binding,
                 &configuration,
                 &active,
-                smtp_socket.take().unwrap(),
+                socket,
                 matches!(exercise, ConfigurationExercise::ReceivingTls),
                 match exercise {
                     ConfigurationExercise::ReceivingRate => smtp_transport::Ending::Rate,
                     _ => smtp_transport::Ending::Drain,
                 },
             );
+            if let Some(socket) = drain {
+                smtp_transport::exercise(
+                    &fixture,
+                    &binding,
+                    &configuration,
+                    &active,
+                    socket,
+                    false,
+                    smtp_transport::Ending::QueuedStop,
+                );
+            }
             return;
         }
         let https = TlsPolicies::listener(&active, "https").unwrap();

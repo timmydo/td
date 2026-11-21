@@ -159,6 +159,7 @@ fn evaluate(
 fn consume(
     cells: &[Mailbox],
     stopped: &AtomicBool,
+    completed: impl Fn(),
     mut run: impl FnMut(&Query, &dyn Fn() -> bool) -> Outcome,
 ) {
     loop {
@@ -187,6 +188,7 @@ fn consume(
                         cell.result = Some(result);
                     }
                 }
+                completed();
             }
         }
         if !worked {
@@ -206,6 +208,7 @@ impl Drop for Stop<'_> {
 pub(super) fn with_worker<T>(
     slots: usize,
     servers: &[SocketAddr],
+    wake: &crate::network_wake::Notifications,
     run: impl FnOnce(Option<&Service<'_>>) -> T,
 ) -> T {
     if servers.is_empty() || slots == 0 {
@@ -232,9 +235,12 @@ pub(super) fn with_worker<T>(
             .name(name)
             .stack_size(STACK_BYTES)
             .spawn_scoped(scope, || {
-                consume(&cells, &stopped, |query, current| {
-                    evaluate(query, servers, &clock, &mut packet, current)
-                })
+                consume(
+                    &cells,
+                    &stopped,
+                    || wake.notify(),
+                    |query, current| evaluate(query, servers, &clock, &mut packet, current),
+                )
             });
         let Ok(handle) = handle else { return run(None) };
         let stop = Stop(&stopped, handle.thread());
@@ -279,7 +285,7 @@ mod tests {
         let cap = Duration::from_secs(3);
         thread::scope(|scope| {
             let h = scope.spawn(|| {
-                consume(&cells, &stopped, {
+                consume(&cells, &stopped, || (), {
                     move |q, current| {
                         if q.sender == "first@example.test" {
                             entered.send(()).unwrap();
@@ -343,13 +349,18 @@ mod tests {
             .unwrap();
         drop(stale);
         let mut calls = 0;
-        consume(&cells, &stopped, |query, current| {
-            calls += 1;
-            assert_eq!(query.sender, "live@example.test");
-            assert!(current());
-            stopped.store(true, Ordering::Release);
-            Outcome::Pass
-        });
+        consume(
+            &cells,
+            &stopped,
+            || (),
+            |query, current| {
+                calls += 1;
+                assert_eq!(query.sender, "live@example.test");
+                assert!(current());
+                stopped.store(true, Ordering::Release);
+                Outcome::Pass
+            },
+        );
         assert_eq!(calls, 1);
         drop(next);
     }

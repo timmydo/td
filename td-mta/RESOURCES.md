@@ -21,9 +21,9 @@ format. Local IDs are distinct 16-byte types with canonical lowercase hex;
 they convey no authorization. Derived MIME-part wire IDs belong to M02.
 
 
-An HTTPS network owner has one private Unix stream pair for worker completion
-and stop notifications. Its bounded poll array holds the read end, up to 16
-listeners and 32 connections. Polling borrows the original sockets, and
+Each HTTPS or direct SMTP network owner has its own private Unix stream pair
+for worker completion and stop notifications. Each bounded poll array holds
+the read end, up to 16 listeners and 32 connections. Polling borrows the original sockets, and
 worker-owned connections stay outside the wait. The array uses 400 bytes on
 the supported 64-bit targets.
 
@@ -475,10 +475,12 @@ There are no queued references that can outlive this phase, so these slots
 need neither scalar reuse tokens nor a separate completion-credit ledger.
 The retained slot is the completion reservation before every effect.
 
-Main uses nonblocking slot locks and a round-robin socket scan. It wakes
-workers after releasing slot locks. The network, TLS and storage loops park
-for at most five milliseconds. The DKIM worker retries a contended scan
-within five milliseconds and sleeps until signaled after an idle scan. Pending TLS turns
+Main visits the slots in round-robin order and wakes workers after
+releasing slot locks. The network owner waits for sockets, worker results,
+stop and deadlines. Its wait holds only network-owned socket slots. TLS
+parks until dispatched. Storage checks idle session retirement at least
+once per second. DKIM retries a contended assignment within five
+milliseconds and otherwise sleeps until signaled. Pending TLS turns
 are rescheduled no sooner than ten milliseconds after completion and keep
 the original handshake deadline. Storage coordination retries retain the
 captured operation deadline and wait at least five milliseconds after a

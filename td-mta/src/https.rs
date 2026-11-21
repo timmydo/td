@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) mod wait;
+mod wait;
 use wait::{Owner, Slot, Wait};
 
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
