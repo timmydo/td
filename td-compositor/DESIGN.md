@@ -8245,3 +8245,9 @@ TPM. Creating the vault requires separate acceptance that losing or
 clearing the original TPM loses its passkeys. PINs use the protected
 field. Escape, session lock and a changed worker generation revoke the
 operation. A YubiKey remains available for td authentication.
+
+Ctrl+Alt+K from an eligible physical keyboard on the unlocked seat
+opens td-pass website passkey management. A fresh protected vault PIN
+opens the list. Tab changes the selected credential, Page Down skips up to sixteen, and each review
+and removal requires a separate presented screen and physical Enter.
+The review binds the site, account, credential ID and private ticket.

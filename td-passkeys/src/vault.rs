@@ -369,7 +369,14 @@ impl Vault {
         Ok(std::mem::take(&mut out.0))
     }
     pub fn delete(&mut self, id: &[u8; 32]) -> Result<()> {
+        self.delete_if(id, || true)
+    }
+    pub(crate) fn delete_if(
+        &mut self,
+        id: &[u8; 32],
+        current: impl FnOnce() -> bool,
+    ) -> Result<()> {
         self.entries = Plain(self.without(Some(id))?);
-        self.persist(|| true)
+        self.persist(current)
     }
 }

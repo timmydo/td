@@ -342,7 +342,7 @@ fn asks_pin(request: &Request) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Selection {
-    Website(crate::website_prompt::Ticket),
+    Website(Option<crate::website_prompt::Ticket>),
     Unlock(Role),
     Enroll(Recovery),
     Write,
@@ -444,6 +444,7 @@ impl Elevation {
 /// other key, which ends the request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApprovalPress {
+    Page,
     Next,
     Enter,
     Other,
@@ -1045,7 +1046,7 @@ pub(crate) struct Attempt {
     selection: Selection,
     state: AtomicU8,
     deadline: Option<Instant>,
-    website_next: AtomicBool,
+    website_next: AtomicU8,
     website_pin: Mutex<PinBuffer>,
     presentation: Mutex<Option<Presented>>,
     confirmed: AtomicBool,
@@ -1081,13 +1082,18 @@ impl Attempt {
             deadline: Instant::now().checked_add(selection.lifetime()),
             selection,
             state: AtomicU8::new(ACTIVE),
-            website_next: AtomicBool::new(false),
+            website_next: AtomicU8::new(0),
             website_pin: Mutex::default(),
             presentation: Mutex::new(None),
             confirmed: AtomicBool::new(false),
             field: Mutex::new(PinField::default()),
             seat,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_now(&mut self) {
+        self.deadline = Some(Instant::now());
     }
 
     #[cfg(test)]
@@ -1170,8 +1176,8 @@ impl Attempt {
         Ok(())
     }
 
-    pub(crate) fn take_website_next(&self) -> bool {
-        self.website_next.swap(false, Ordering::SeqCst)
+    pub(crate) fn take_website_next(&self) -> u8 {
+        self.website_next.swap(0, Ordering::SeqCst)
     }
     pub(crate) fn claim_website_send(&self) -> Result<(), String> {
         if !self.is_website()
@@ -1191,10 +1197,8 @@ impl Attempt {
     }
     pub(crate) fn close_website(&self) -> Result<(), String> {
         self.close_field();
-        if self.active() {
-            if let Some(seat) = &self.seat {
-                return seat.release(self);
-            }
+        if let Some(seat) = &self.seat {
+            return seat.release(self);
         }
         Ok(())
     }
@@ -1527,13 +1531,21 @@ impl Attempt {
             }) else {
                 return Ok(false);
             };
-            if press == ApprovalPress::Next
-                && !presented.decided
-                && matches!(presented.request.operation(), Operation::Website(w) if matches!(w.stage,0|3))
-            {
-                presented.decided = true;
-                self.website_next.store(true, Ordering::SeqCst);
-                return Ok(false);
+            if !presented.decided {
+                let step = match (press, presented.request.operation()) {
+                    (ApprovalPress::Next, Operation::Website(w))
+                        if matches!(w.stage, 0 | 3 | 10) =>
+                    {
+                        1
+                    }
+                    (ApprovalPress::Page, Operation::Website(w)) if w.stage == 10 => 16,
+                    _ => 0,
+                };
+                if step != 0 {
+                    presented.decided = true;
+                    self.website_next.store(step, Ordering::SeqCst);
+                    return Ok(false);
+                }
             }
             if presented.decided {
                 let earlier = press != ApprovalPress::Enter
@@ -1749,7 +1761,10 @@ impl Client {
             return attempt.notice(Notice::Busy);
         }
         if let Selection::Website(ticket) = attempt.selection {
-            return self.website.start(ticket, attempt);
+            return match ticket {
+                Some(ticket) => self.website.start(ticket, attempt),
+                None => self.website.manage(wire, attempt),
+            };
         }
         if matches!(attempt.selection, Selection::Enroll(_)) {
             return self.inspect(wire, attempt, true);
@@ -3050,7 +3065,7 @@ mod tests {
         .concat();
         for (physical, mismatch) in [(false, false), (false, true), (true, false)] {
             let mut screen = Screen::sized(1024, 768);
-            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Website(ticket);
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Website(Some(ticket));
             let login = crate::authority::Login::default();
             let mut client = Client::trusting_memory();
             let mut wire = wire(Vec::new());
@@ -3150,6 +3165,105 @@ mod tests {
                 assert!(screen.attempt.claim_website_send().is_err());
             }
         }
+    }
+
+    #[test]
+    fn passkey_management_shows_the_selected_site_before_removing_a_credential() {
+        let mut screen = Screen::sized(1024, 768);
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Website(None);
+        let ticket = crate::website_prompt::Ticket {
+            epoch: [4; 32],
+            id: 9,
+        };
+        let prefix = [vec![0xad], ticket.epoch.to_vec(), vec![0]].concat();
+        let state = |op| [prefix.clone(), ticket.id.to_be_bytes().to_vec(), vec![op]].concat();
+        let login = crate::authority::Login::default();
+        let mut client = Client::trusting_memory();
+        let mut wire = wire(vec![state(11)]);
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        let follow = |wire: &mut Wire, client: &mut Client, replies: Vec<Vec<u8>>| {
+            wire.replies.extend(replies);
+            client.follow_website(wire, &login).unwrap();
+        };
+        follow(&mut wire, &mut client, vec![state(11)]);
+        type_pin(&screen.attempt, b"sample PIN");
+        follow(&mut wire, &mut client, vec![state(11), prefix.clone()]);
+        let row = |id, site: &str| {
+            [
+                prefix.clone(),
+                vec![id; 32],
+                (site.len() as u16).to_be_bytes().to_vec(),
+                site.as_bytes().to_vec(),
+                vec![0, 5],
+                b"Alice".to_vec(),
+                vec![255],
+            ]
+            .concat()
+        };
+        let shown = || {
+            let receipt = screen.attempt.presentation.lock().unwrap();
+            let presented = receipt.as_ref().unwrap();
+            let Operation::Website(w) = presented.request.operation() else {
+                panic!()
+            };
+            (
+                presented.after + APPROVAL_SETTLE + 1,
+                w.stage,
+                w.site.clone(),
+                w.credential,
+            )
+        };
+        follow(
+            &mut wire,
+            &mut client,
+            vec![state(13), row(1, "one.example")],
+        );
+        let (_, stage, site, id) = shown();
+        assert_eq!(
+            (stage, site.as_str(), id),
+            (10, "one.example", Some([1; 32]))
+        );
+        for n in 1..=16u16 {
+            let index = (n * 16).min(255) as u8;
+            let at = shown().0;
+            assert!(!press(&screen, ApprovalPress::Page, at));
+            follow(
+                &mut wire,
+                &mut client,
+                vec![state(13), row(index, "two.example")],
+            );
+            assert_eq!(wire.calls.last().unwrap().last(), Some(&index));
+            assert_eq!(shown().3, Some([index; 32]));
+        }
+        let (at, stage, site, id) = shown();
+        assert_eq!(
+            (stage, site.as_str(), id),
+            (10, "two.example", Some([255; 32]))
+        );
+        assert!(!press(&screen, ApprovalPress::Enter, at));
+        follow(&mut wire, &mut client, vec![state(13)]);
+        follow(&mut wire, &mut client, vec![state(13)]);
+        let (at, stage, site, id) = shown();
+        assert_eq!(
+            (stage, site.as_str(), id),
+            (11, "two.example", Some([255; 32]))
+        );
+        assert!(wire.calls.iter().all(|q| q.get(34) != Some(&14)));
+        assert!(!press(&screen, ApprovalPress::Enter, at));
+        follow(&mut wire, &mut client, vec![state(13), prefix.clone()]);
+        let remove = [
+            vec![0x2d, 2],
+            ticket.epoch.to_vec(),
+            vec![14],
+            ticket.id.to_be_bytes().to_vec(),
+            vec![255; 32],
+        ]
+        .concat();
+        assert_eq!(wire.calls.last(), Some(&remove));
+        follow(&mut wire, &mut client, vec![state(15)]);
+        assert!(!screen.attempt.field.lock().unwrap().is_open());
     }
 
     /// Root's `a9 03` and `a9 00` show their fixed notices and start no
@@ -4919,7 +5033,7 @@ mod tests {
             let mut screen = Self::login(selection.clone());
             let deadline = Instant::now() + after;
             screen.attempt = Arc::new(Attempt {
-                website_next: AtomicBool::new(false),
+                website_next: AtomicU8::new(0),
                 website_pin: Mutex::default(),
                 origin: crate::input::test_origin(),
                 runtime: Arc::clone(&screen.attempt.runtime),

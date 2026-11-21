@@ -12702,3 +12702,8 @@ Only Firefox receives the kernel's virtual authentication device and
 its pinned hidraw sysfs leaf. The browser speaks standard WebAuthn.
 td-pass owns the CTAP operation, permission checks and storage. The
 third-party Firefox and runtime continue to execute inside its jail.
+
+To manage saved td-pass passkeys, press Ctrl+Alt+K on the unlocked
+desktop and enter the vault PIN. Tab moves one entry and Page Down advances up to sixteen. Enter
+reviews the selected site's passkey and a second Enter removes it.
+Escape closes the vault.

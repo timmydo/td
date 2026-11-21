@@ -1049,9 +1049,11 @@ pub struct Website {
 impl Website {
     fn valid(&self) -> bool {
         self.ticket != 0
-            && matches!(self.stage, 0..=4 | 7 | 8)
-            && (self.stage == 3) == self.credential.is_some()
-            && !self.site.is_empty()
+            && matches!(self.stage, 0..=4 | 7..=13)
+            && matches!(self.stage, 3 | 10 | 11) == self.credential.is_some()
+            && (self.stage < 9 || (!self.register && self.key.is_none()))
+            && self.site.is_empty() == matches!(self.stage, 9 | 12 | 13)
+            && (!self.site.is_empty() || self.account.is_empty())
             && self.site.len() <= 253
             && self
                 .site
@@ -1066,13 +1068,17 @@ impl Website {
     ) -> Result<(), E> {
         row(format_args!(
             "{}",
-            if self.register {
+            if self.stage >= 9 {
+                "MANAGE TD-PASS WEBSITE PASSKEYS"
+            } else if self.register {
                 "CREATE A WEBSITE PASSKEY"
             } else {
                 "SIGN IN TO WEBSITE"
             }
         ))?;
-        row(format_args!("SITE: {}", self.site))?;
+        if !self.site.is_empty() {
+            row(format_args!("SITE: {}", self.site))?;
+        }
         if !self.account.is_empty() {
             row(format_args!("ACCOUNT: {}", self.account))?;
         }
@@ -1098,7 +1104,21 @@ impl Website {
                 "ENTER: ACCEPT LOSS   ESC: CANCEL",
             ],
             2 if self.key.is_some() => &["ENTER YOUR YUBIKEY PIN"],
-            2 => &["ENTER YOUR TD-PASS VAULT PIN"],
+            2 | 9 => &["ENTER YOUR TD-PASS VAULT PIN"],
+            10 => &[
+                "TAB: NEXT PASSKEY   PAGE DOWN: SKIP 16",
+                "ENTER: REVIEW REMOVAL   ESC: CLOSE",
+            ],
+            11 => &[
+                "REMOVE THIS PASSKEY FROM TD-PASS?",
+                "THIS WEBSITE SIGN-IN WILL BE LOST.",
+                "ENTER: REMOVE   ESC: CANCEL",
+            ],
+            12 => &[
+                "NO WEBSITE PASSKEYS SAVED.",
+                "CREATE A PASSKEY FROM FIREFOX TO SAVE IT HERE.",
+            ],
+            13 => &["PASSKEY REMOVED FROM TD-PASS."],
             3 => &["TAB: NEXT ACCOUNT   ENTER: SIGN IN"],
             7 => &["CHOOSE A TD-PASS VAULT PIN (6 TO 63 CHARACTERS)"],
             8 => &["RE-ENTER YOUR NEW VAULT PIN"],
@@ -1900,9 +1920,20 @@ impl Request {
         if self.owner != next.owner
             || self.nonce != next.nonce
             || a.ticket != b.ticket
-            || a.site != b.site
             || a.register != b.register
         {
+            return false;
+        }
+        if a.stage >= 9 || b.stage >= 9 {
+            return match (a.stage, b.stage) {
+                (9, 10 | 12) | (10, 10) | (11, 13) => true,
+                (10, 11) => {
+                    a.credential == b.credential && a.site == b.site && a.account == b.account
+                }
+                _ => false,
+            };
+        }
+        if a.site != b.site {
             return false;
         }
         if (a.stage, b.stage) == (0, 0) {
@@ -1921,7 +1952,7 @@ impl Request {
     pub fn asks_pin(&self) -> bool {
         self.ceremony_step().is_some_and(LoginStep::asks_pin)
             || matches!(&self.operation, Operation::Notebook(n) if n.step != 0)
-            || matches!(&self.operation, Operation::Website(w) if matches!(w.stage, 2 | 7 | 8))
+            || matches!(&self.operation, Operation::Website(w) if matches!(w.stage, 2 | 7 | 8 | 9))
     }
 
     pub fn asks_recovery_key(&self) -> bool {
@@ -2046,7 +2077,7 @@ impl Request {
     /// identify step. Every other description and step does not.
     pub fn awaits_approval(&self) -> bool {
         match &self.operation {
-            Operation::Website(w) => matches!(w.stage, 0 | 1 | 3),
+            Operation::Website(w) => matches!(w.stage, 0 | 1 | 3 | 10 | 11),
             Operation::Notebook(n) => n.step == 0,
             Operation::Install { .. }
             | Operation::DeployRollback { .. }
@@ -2922,7 +2953,7 @@ impl Request {
                     key: physical.then_some(index),
                     site: input.text()?,
                     account: input.text()?,
-                    credential: if stage == 3 {
+                    credential: if matches!(stage, 3 | 10 | 11) {
                         Some(
                             input
                                 .take(32)?

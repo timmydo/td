@@ -77,3 +77,11 @@ original HID deadline invalidates the job. Publication checks that event
 after syncing the temporary file, immediately before its rename. A
 cancellation after this commit point can suppress the reply to Firefox
 even when the credential is already durable.
+
+The physical seat can start a two-minute vault management session on the
+private worker socket. The worker releases its browser probe cache. The
+vault requires a fresh TPM PIN and verifies that the credential ID in a
+removal matches the last metadata row it returned. The browser gets no
+management commands through HID. Lock, closing the screen, generation
+loss and expiry revoke management. Deletion checks its cancellation
+after syncing the temporary file and before publication.

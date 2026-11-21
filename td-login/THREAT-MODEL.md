@@ -1126,8 +1126,12 @@ Confined Firefox can submit website CTAP requests to a td-owned virtual
 authenticator. Its trusted confirmation and protected PIN entry use the
 physical seat. Site and account labels come from the request; a
 compromised browser can misstate the intended website. The worker
-admits website RP identifiers only, omits local credential-management
-commands and reserves the selected root-owned YubiKey through the same
+admits website RP identifiers on its HID interface and reserves the
+selected root-owned YubiKey through the same
 operation lock used by td login. A hardware passkey stays on that key.
 Device-bound software passkeys use the independently established TPM
 primary and their vault PIN, with explicit enrollment consent.
+Only the trusted physical seat can request local vault management on
+the private worker channel. A fresh vault PIN opens its list. Removal
+binds a separate confirmation to the selected credential. Session lock,
+expiry or closing the trusted screen ends that authority.

@@ -1387,7 +1387,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xf3db5dc032ed743b,
+            0xa7120dd4dfca6446,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3603,7 +3603,7 @@ pub struct MappedRegion {
              || held(KEY_LEFTALT, KEY_RIGHTALT)\n            \
              || held(KEY_LEFTMETA, KEY_RIGHTMETA);\n        \
              Some(if code == KEY_ENTER && !modified {\n            \
-             ApprovalPress::Enter\n        } else if code == KEY_TAB && !modified {\n            ApprovalPress::Next\n        } else {\n            \
+             ApprovalPress::Enter\n        } else if code == KEY_TAB && !modified {\n            ApprovalPress::Next\n        } else if code == KEY_PAGEDOWN && !modified {\n            ApprovalPress::Page\n        } else {\n            \
              ApprovalPress::Other\n        })"
         ));
         assert!(!press.contains("KEY_KP"));

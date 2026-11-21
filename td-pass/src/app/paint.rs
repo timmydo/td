@@ -148,6 +148,12 @@ impl Composition for Frame<'_> {
                 let body = layout::body(surface, layout::LOCKED);
                 let row = layout::row(surface);
                 let message = match keys {
+                    Some(_) if app.on_td => {
+                        "Password notebook locked. Ctrl+Alt+K opens website passkeys."
+                    }
+                    None if app.on_td => {
+                        "No password notebook yet. Ctrl+Alt+K opens website passkeys."
+                    }
                     Some(_) => "The notebook is locked. Unlock it with one of its keys:",
                     None => "This account has no notebook yet.",
                 };

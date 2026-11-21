@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 mod credential;
 pub mod hid;
+mod management;
 pub mod service;
 pub mod uhid;
 mod vault;
@@ -694,6 +695,40 @@ mod tests {
             }
         }
         assert_eq!(control(&[2]), [0]);
+        for round in 0..3 {
+            let state = control(&[11]);
+            assert_eq!(state[9], 11);
+            let ticket = &state[1..9];
+            let send = |op, body: &[u8]| control(&[&[op][..], ticket, body].concat());
+            let wait = |expected| loop {
+                assert!(Instant::now() < end);
+                let state = control(&[1]);
+                assert_eq!(&state[1..9], ticket);
+                if state[9] == expected {
+                    break;
+                }
+                assert_eq!(state[9], 12);
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert_ne!(send(13, &[0]), [0]);
+            assert_eq!(send(12, b"guest PIN"), [0]);
+            wait(13);
+            let row = send(13, &[0]);
+            if round < 2 {
+                assert_eq!(row[0], 0);
+                let mut label = &row[33..];
+                assert_eq!(super::field(&mut label, 253).unwrap(), SITE.as_bytes());
+                assert_ne!(send(14, &[0xff; 32]), [0]);
+                if round == 1 {
+                    assert_eq!(send(14, &row[1..33]), [0]);
+                    wait(15);
+                }
+            } else {
+                assert_eq!(row, [0]);
+            }
+            assert_eq!(send(15, &[]), [0]);
+            assert_eq!(control(&[1]), [0]);
+        }
     }
 
     struct Socket(UnixStream);

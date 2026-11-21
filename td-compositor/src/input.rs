@@ -52,6 +52,7 @@ const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const KEY_ESC: u16 = 1;
 const KEY_TAB: u16 = 15;
+const KEY_PAGEDOWN: u16 = 109;
 const KEY_BRIGHTNESSDOWN: u16 = 224;
 const KEY_BRIGHTNESSUP: u16 = 225;
 const KEY_1: u16 = 2;
@@ -548,9 +549,11 @@ impl KeyBindings {
             }
             return decision;
         }
-        let website = (event.code == KEY_P)
-            .then(|| self.login.website_ticket())
-            .flatten();
+        let website = match event.code {
+            KEY_K => Some(None),
+            KEY_P => self.login.website_ticket().map(Some),
+            _ => None,
+        };
         if self.attention_enabled
             && (event.code == KEY_ESC || website.is_some())
             && event.value == KEY_PRESS
@@ -1066,6 +1069,8 @@ impl KeyBindings {
             ApprovalPress::Enter
         } else if code == KEY_TAB && !modified {
             ApprovalPress::Next
+        } else if code == KEY_PAGEDOWN && !modified {
+            ApprovalPress::Page
         } else {
             ApprovalPress::Other
         })
@@ -14911,6 +14916,51 @@ mod tests {
         run(&mut client, &mut root).unwrap();
         assert!(!seat.locked() && !seat.attention_open());
         seat
+    }
+
+    #[test]
+    fn an_expired_passkey_list_withdraws_its_credential_without_a_keypress() {
+        use crate::authority::consent::{Operation, Request, Website};
+        use crate::secret_client::{Attempt, Selection};
+        let seat = LockedSeat::open(&[]);
+        seat.chord(0);
+        let owner = seat.target.lock().unwrap().seat.clone();
+        let mut attempt = Attempt::seated(
+            test_origin(),
+            Arc::clone(&seat.runtime),
+            Selection::Website(None),
+            Some(owner),
+        );
+        let prompt = Request::new(
+            [9; 32],
+            1000,
+            Operation::Website(Website {
+                ticket: 8,
+                stage: 10,
+                register: false,
+                key: None,
+                site: "login.example".into(),
+                account: "Alice".into(),
+                credential: Some([3; 32]),
+            }),
+        )
+        .unwrap();
+        attempt.present(prompt.clone()).unwrap();
+        assert!(seat
+            .runtime
+            .lock()
+            .unwrap()
+            .attention_request_visible(&prompt));
+        Arc::get_mut(&mut attempt).unwrap().expire_now();
+        seat.target.lock().unwrap().secret_attempt = Some(Arc::clone(&attempt));
+        assert!(!attempt.active());
+        attempt.close_website().unwrap();
+        assert!(!seat.attention_open());
+        assert!(!seat
+            .runtime
+            .lock()
+            .unwrap()
+            .attention_request_visible(&prompt));
     }
 
     /// `events` read from `device` by its own reader, which has seen no

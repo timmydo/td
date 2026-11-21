@@ -596,3 +596,9 @@ for the vault can authorize one pending website request. An unlocked
 vault may answer restricted known-handle checks for up to three minutes.
 The session owner revokes the cache on lock and reaps the worker at
 teardown.
+
+On td the locked notebook window also shows Ctrl+Alt+K. This physical
+shortcut opens the device-bound website passkeys, including before the
+portable password notebook is enrolled. The trusted screen accepts the
+vault PIN, lists the site, account and credential ID, and confirms the
+exact entry before removing it. Escape closes the list and locks it.

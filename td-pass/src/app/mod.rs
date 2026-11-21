@@ -338,6 +338,7 @@ enum Target {
 }
 
 pub struct App {
+    pub(crate) on_td: bool,
     surface: Surface,
     phase: Phase,
     pane: Controller,
@@ -396,6 +397,7 @@ impl App {
         Ok(Self {
             surface,
             phase: Phase::Opening,
+            on_td: false,
             pane: Controller::pane().map_err(|error| error.to_string())?,
             history: History::default(),
             focus: Focus::Keys,

@@ -32,7 +32,7 @@ const PRIMARY: &str = "/run/td-admit/td-passkey-primary";
 const MAX: usize = 2048;
 const PAUSE: Duration = Duration::from_millis(5);
 
-fn protected() -> Result<()> {
+pub(super) fn protected() -> Result<()> {
     memory::with_memory_state(
         fs::read_to_string("/proc/swaps"),
         fs::read_to_string("/proc/self/limits"),
@@ -124,7 +124,7 @@ impl Drop for Hardware {
     }
 }
 
-fn storage() -> Result<(File, [u8; 34])> {
+pub(super) fn storage() -> Result<(File, [u8; 34])> {
     let (mut f, m) = td_fs::open_real_file(Path::new(PRIMARY), "passkey primary")?;
     if (m.uid(), m.gid(), m.nlink(), m.mode() & 0o7777, m.len()) != (0, 0, 1, 0o600, 34) {
         return Err(Error::Refused);
@@ -138,19 +138,23 @@ fn storage() -> Result<(File, [u8; 34])> {
     Ok((File::open(DIRECTORY)?, name))
 }
 
-enum VaultReply {
+pub(super) enum VaultReply {
     Open(Vault),
     Complete(Vault, Instant, Vec<u8>),
 }
 
-struct VaultJob {
+pub(super) struct VaultJob {
     ticket: u64,
-    cancel: Cancellation,
-    thread: thread::JoinHandle<Result<VaultReply>>,
+    pub(super) cancel: Cancellation,
+    pub(super) thread: thread::JoinHandle<Result<VaultReply>>,
+}
+
+pub(super) fn vault_result(thread: thread::JoinHandle<Result<VaultReply>>) -> Result<VaultReply> {
+    thread.join().unwrap_or(Err(Error::Refused))
 }
 
 impl VaultJob {
-    fn start(
+    pub(super) fn start(
         ticket: u64,
         end: Instant,
         run: impl FnOnce(&dyn Fn() -> bool) -> Result<VaultReply> + Send + 'static,
@@ -207,6 +211,7 @@ impl Attachments {
     }
 }
 struct Worker {
+    manager: Option<crate::management::Manager>,
     io: uhid::Device,
     session: Session,
     hardware: Option<Hardware>,
@@ -216,6 +221,9 @@ struct Worker {
 }
 impl Worker {
     fn status(&mut self, reply: &mut Vec<u8>) -> Result<()> {
+        if let Some(m) = &self.manager {
+            return m.status(reply);
+        }
         if let Some(j) = &self.vault_job {
             if self.session.active(j.ticket) {
                 td_alloc::extend_from_slice(reply, &j.ticket.to_be_bytes())?;
@@ -270,7 +278,21 @@ impl Worker {
         if packet == [1] {
             return self.status(reply);
         }
+        if packet == [11] {
+            if self.manager.is_some() || self.vault_job.is_some() || self.hardware.is_some() {
+                return Err(Error::Locked);
+            }
+            self.session.lock(|r| self.io.input(r))?;
+            self.pin_for = None;
+            let manager = crate::management::Manager::open()?;
+            manager.status(reply)?;
+            self.manager = Some(manager);
+            return Ok(());
+        }
         if packet == [2] {
+            if let Some(m) = &mut self.manager {
+                m.close();
+            }
             if let Some(h) = self.hardware.take() {
                 let ticket = h.ticket;
                 drop(h);
@@ -293,6 +315,9 @@ impl Worker {
         let (&op, rest) = packet.split_first().ok_or(Error::Invalid)?;
         let (ticket, body) = rest.split_at_checked(8).ok_or(Error::Invalid)?;
         let ticket = u64::from_be_bytes(ticket.try_into().map_err(|_| Error::Invalid)?);
+        if let Some(m) = &mut self.manager {
+            return m.command(ticket, op, body, reply);
+        }
         if !self.session.active(ticket) {
             return Err(Error::Stale);
         }
@@ -437,13 +462,19 @@ impl Worker {
                 .receive(&r, Instant::now(), |r| self.io.input(r))?;
         }
         self.session.poll(Instant::now(), |r| self.io.input(r))?;
+        if let Some(manager) = &mut self.manager {
+            self.session.lock(|r| self.io.input(r))?;
+            if manager.advance() {
+                self.manager = None;
+            }
+        }
         if let Some(j) = &self.vault_job {
             if !self.session.active(j.ticket) {
                 j.cancel.cancel();
             }
             if j.thread.is_finished() {
                 let job = self.vault_job.take().ok_or(Error::Stale)?;
-                let result = job.thread.join().unwrap_or(Err(Error::Refused));
+                let result = vault_result(job.thread);
                 if !job.cancel.cancelled() && self.session.active(job.ticket) {
                     match result {
                         Ok(VaultReply::Open(v)) => self.session.opened(job.ticket, v)?,
@@ -505,6 +536,7 @@ pub fn run(group: u32) -> std::result::Result<(), Error> {
         thread::sleep(PAUSE);
     }
     let mut w = Worker {
+        manager: None,
         io,
         session: Session::default(),
         hardware: None,

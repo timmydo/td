@@ -226,6 +226,7 @@ pub fn run_with(trusted: Option<crate::backend::Trusted>) -> Result<(), String> 
         lister,
         listings,
     };
+    session.app.on_td = is_trusted;
     let typeface = td_ui::pinned_face::load_or_note(
         "td-pass",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),

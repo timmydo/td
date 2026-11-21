@@ -5205,3 +5205,9 @@ website operations before local secret operations, session lock or
 suspend. Losing the generation closes the worker. A worker failure is
 reported as unavailable on this channel. The worker, its private storage
 and the TPM admission record are documented in td-passkeys/DESIGN.md.
+
+On the paired channel, 2d 03 starts a separate local management ticket.
+The worker's private replies identify its lifetime and PIN, listing and
+removal states. Root accepts only the typed PIN, bounded row index,
+32-byte credential ID, or close for the corresponding private verbs.
+A website operation cannot select the management ticket through hidraw.

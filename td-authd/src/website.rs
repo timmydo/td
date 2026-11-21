@@ -20,7 +20,7 @@ impl Drop for Frame {
 impl Frame {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
-            [1] => (),
+            [1] | [3] => (),
             [2, tail @ ..] => {
                 let (_, data) = tail
                     .split_at_checked(32)
@@ -28,10 +28,10 @@ impl Frame {
                 let (&verb, rest) = data.split_first().ok_or("missing website operation")?;
                 let (_, args) = rest.split_at_checked(8).ok_or("missing website ticket")?;
                 match (verb, args) {
-                    (3 | 9, []) | (5, [0..=1]) | (7, [_]) | (8, []) => (),
+                    (3 | 9 | 15, []) | (5, [0..=1]) | (7 | 13, [_]) | (8, []) => (),
                     (4, a) if a.len() == 9 => (),
-                    (8, a) if a.len() == 32 => (),
-                    (6, pin)
+                    (8 | 14, a) if a.len() == 32 => (),
+                    (6 | 12, pin)
                         if (4..=63).contains(&pin.len())
                             && pin.iter().all(|b| (0x20..=0x7e).contains(b)) =>
                     {
@@ -201,7 +201,9 @@ impl Authority {
                 return idle();
             }
         }
-        let q = if polling {
+        let q = if frame.0 == [3] {
+            &[11][..]
+        } else if polling {
             &[1][..]
         } else {
             let (_, tail) = frame.0.split_first().ok_or("missing website request")?;

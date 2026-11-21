@@ -138,7 +138,9 @@ enum State {
     Event(Ticket, u8),
 }
 fn status(wire: &mut impl Exchange) -> Result<State, String> {
-    let r = wire.exchange(&[0x2d, 1])?;
+    decode_status(&wire.exchange(&[0x2d, 1])?)
+}
+fn decode_status(r: &[u8]) -> Result<State, String> {
     if r == [0xad] {
         return Ok(State::Idle);
     }
@@ -162,7 +164,7 @@ fn status(wire: &mut impl Exchange) -> Result<State, String> {
     match tail {
         [kind @ 0..=3, b @ ..] => Ok(State::Offer(t, Offer::decode(*kind, b)?)),
         [6, 1..=255] => Ok(State::Event(t, 6)),
-        [k @ (7 | 8 | 10)] => Ok(State::Event(t, *k)),
+        [k @ (7 | 8 | 10..=16)] => Ok(State::Event(t, *k)),
         _ => Err("invalid website state".into()),
     }
 }
@@ -181,6 +183,7 @@ struct Interaction {
     shown: Option<Request>,
     account: Option<([u8; 32], String)>,
     index: u8,
+    last_index: u8,
 }
 impl Drop for Interaction {
     fn drop(&mut self) {
@@ -202,6 +205,49 @@ impl Client {
             shown: None,
             account: None,
             index: 0,
+            last_index: 0,
+        });
+        Ok(())
+    }
+    pub fn manage(
+        &mut self,
+        wire: &mut impl Exchange,
+        attempt: Arc<Attempt>,
+    ) -> Result<(), String> {
+        if self.run.is_some() {
+            return attempt.notice(crate::attention::Notice::Busy);
+        }
+        if attempt.claim_website_send().is_err() {
+            return Ok(());
+        }
+        if !attempt.sending() {
+            attempt.finish_sending();
+            return Ok(());
+        }
+        let sent = wire.send(&[0x2d, 3]);
+        attempt.finish_sending();
+        sent?;
+        let State::Event(t, stage @ (11 | 16)) = decode_status(&wire.receive()?)? else {
+            return attempt.notice(crate::attention::Notice::Unavailable);
+        };
+        self.pending = None;
+        self.run = Some(Interaction {
+            t,
+            offer: Offer {
+                kind: 4,
+                vault: 2,
+                site: String::new(),
+                account: String::new(),
+                revision: [0; 8],
+                keys: Vec::new(),
+            },
+            attempt,
+            choice: 0,
+            stage: if stage == 16 { 12 } else { 9 },
+            shown: None,
+            account: None,
+            index: 0,
+            last_index: 0,
         });
         Ok(())
     }
@@ -222,13 +268,22 @@ impl Client {
                     Ok(()) => self.run = Some(run),
                     Err(error) => {
                         eprintln!("td-compositor: website prompt: {error}");
-                        let _ = run.t.call(wire, 3, &[]);
-                        run.attempt.notice(crate::attention::Notice::Failed)?;
+                        let _ = run
+                            .t
+                            .call(wire, if run.offer.kind == 4 { 15 } else { 3 }, &[]);
+                        if run.attempt.active() {
+                            run.attempt.notice(crate::attention::Notice::Failed)?;
+                        } else {
+                            run.attempt.close_website()?;
+                        }
                     }
                 }
-            } else if same {
-                let _ = run.t.call(wire, 3, &[]);
             } else {
+                if same {
+                    let _ = run
+                        .t
+                        .call(wire, if run.offer.kind == 4 { 15 } else { 3 }, &[]);
+                }
                 run.attempt.close_website()?;
             }
             login.website(None);
@@ -286,13 +341,31 @@ impl Interaction {
         self.attempt.close_field();
     }
     fn row(&mut self, wire: &mut impl Exchange, index: u8) -> Result<bool, String> {
-        let row = self.t.call(wire, 7, &[index])?;
+        let managing = self.offer.kind == 4;
+        let row = self.t.call(wire, if managing { 13 } else { 7 }, &[index])?;
         if row.is_empty() {
             return Ok(false);
         }
         let (id, mut rest) = row.split_at_checked(32).ok_or("short credential id")?;
+        if managing {
+            self.offer.site = crate::allocation::string(
+                std::str::from_utf8(field(&mut rest)?).map_err(|_| "invalid saved site")?,
+            )
+            .map_err(capacity)?;
+        }
         let label = account_label(field(&mut rest)?)?;
-        let _user = field(&mut rest)?;
+        if managing {
+            let [last] = rest else {
+                return Err("invalid passkey list size".into());
+            };
+            if *last < index {
+                return Err("passkey list changed".into());
+            }
+            self.last_index = *last;
+            rest = &[];
+        } else {
+            let _user = field(&mut rest)?;
+        }
         if !rest.is_empty() {
             return Err("invalid account reply".into());
         }
@@ -307,6 +380,18 @@ impl Interaction {
         memory: fn() -> Result<(), String>,
     ) -> Result<(), String> {
         match state {
+            State::Event(_, 13) if self.offer.kind == 4 && self.stage == 5 => {
+                let found = self.row(wire, 0)?;
+                self.stage(if found { 10 } else { 12 });
+            }
+            State::Event(_, 14) if self.offer.kind == 4 => {
+                return Err("passkey vault operation failed".into())
+            }
+            State::Event(_, 15) if self.offer.kind == 4 && self.stage == 6 => {
+                self.offer.site.clear();
+                self.account = None;
+                self.stage(13);
+            }
             State::Offer(_, offer) if self.stage == 0 && self.offer != offer => {
                 self.offer = offer;
                 self.choice = 0;
@@ -332,14 +417,15 @@ impl Interaction {
         if self.shown.is_none() {
             let request = self.prompt()?;
             self.shown = Some(self.attempt.present(request)?);
-            if matches!(self.stage, 2 | 7 | 8) {
+            if matches!(self.stage, 2 | 7 | 8 | 9) {
                 memory()?;
                 self.attempt
                     .open_field(self.shown.as_ref().ok_or("missing PIN prompt")?)?;
             }
             return Ok(());
         }
-        if self.attempt.take_website_next() {
+        let next = self.attempt.take_website_next();
+        if next != 0 {
             if self.stage == 0 {
                 let count = self.offer.choices().count();
                 self.choice = if self.choice + 1 < count {
@@ -347,24 +433,38 @@ impl Interaction {
                 } else {
                     0
                 };
+            } else if self.stage == 10 {
+                let index = if self.index == self.last_index {
+                    0
+                } else {
+                    self.index.saturating_add(next).min(self.last_index)
+                };
+                if !self.row(wire, index)? {
+                    return Err("passkey list changed".into());
+                }
+                self.shown = Some(self.attempt.present(self.prompt()?)?);
+                return Ok(());
             } else if self.stage == 3 && !self.row(wire, self.index.wrapping_add(1))? {
                 self.row(wire, 0)?;
             }
             self.shown = None;
             return Ok(());
         }
-        if matches!(self.stage, 2 | 7 | 8) {
+        if matches!(self.stage, 2 | 7 | 8 | 9) {
             let mut pin = [0; 63];
             let Some(n) = self.attempt.take_pin(&mut pin) else {
                 return Ok(());
             };
             let result = (|| {
                 let p = pin.get(..n).ok_or("invalid PIN extent")?;
-                if self.stage != 2 {
+                if matches!(self.stage, 7 | 8) {
                     self.attempt.enrollment_pin(p, self.stage == 8)?;
                 }
                 if self.stage != 7 {
-                    self.t.send(wire, 6, p, || self.attempt.sending())?;
+                    self.t
+                        .send(wire, if self.stage == 9 { 12 } else { 6 }, p, || {
+                            self.attempt.sending()
+                        })?;
                 }
                 Ok::<(), String>(())
             })();
@@ -406,6 +506,15 @@ impl Interaction {
             1 => {
                 self.authorize(wire, 5, &[1])?;
                 self.stage(7);
+            }
+            10 => self.stage(11),
+            11 => {
+                self.authorize(
+                    wire,
+                    14,
+                    &self.account.as_ref().ok_or("missing saved credential")?.0,
+                )?;
+                self.stage(6);
             }
             3 => {
                 self.authorize(
