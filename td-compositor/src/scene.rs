@@ -2838,6 +2838,12 @@ impl Scene {
         self.hint.take().is_some()
     }
 
+    /// A stack's title bands select a window on press. Hovering its content
+    /// still focuses the window the stack is showing.
+    pub fn hover_focus_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+        self.window_at_pointer(width, height, false)
+    }
+
     /// The window under the pointer, band or client area. `None` over the
     /// status bar, a gap or a border — nowhere that belongs to a window, so
     /// nothing to answer. A stacked-away leaf answers only for its own BAND:
@@ -2852,7 +2858,12 @@ impl Scene {
     /// by shrinking, which would leave part of a tile nothing could focus.
     /// The cost is that a press and a hover over such a spot no longer name
     /// the same target.
-    pub fn window_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+    fn window_at_pointer(
+        &self,
+        width: usize,
+        height: usize,
+        include_stacked_bands: bool,
+    ) -> Option<SurfaceKey> {
         let placements = self.tiled_placements(width, height);
         // A pointer over a menu is over the WINDOW that opened it. Answering
         // the tile underneath would hand focus-follows-mouse to whatever the
@@ -2874,7 +2885,14 @@ impl Scene {
             return None;
         }
         let (x, y) = self.pointer_at_usize()?;
-        Some(placements.get(tile_at(&placements, x, y)?)?.key)
+        let placement = placements.get(tile_at(&placements, x, y)?)?;
+        if !include_stacked_bands
+            && placement.run == Some(Axis::Vertical)
+            && contains(placement.band, x, y)
+        {
+            return None;
+        }
+        Some(placement.key)
     }
 
     /// The window an ALT press picks up: the one under the pointer, and only
@@ -2882,7 +2900,7 @@ impl Scene {
     /// nothing must not be taken from the client — a fullscreen one would
     /// lose every Alt click it has.
     pub fn draggable_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
-        let key = self.window_at_pointer(width, height)?;
+        let key = self.window_at_pointer(width, height, true)?;
         self.layout.can_drag(key).then_some(key)
     }
 
@@ -10090,7 +10108,7 @@ mod tests {
             scene.pointer_target(width, height).map(|point| point.key),
             Some(menu)
         );
-        assert_eq!(scene.window_at_pointer(width, height), Some(key));
+        assert_eq!(scene.hover_focus_at_pointer(width, height), Some(key));
     }
 
     /// A chain deeper than the bound is drawn nowhere rather than walked

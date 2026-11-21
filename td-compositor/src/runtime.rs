@@ -4110,7 +4110,7 @@ impl Runtime {
             && !grabbed
             && self.scene.topmost_grab(size.width, size.height).is_none()
         {
-            self.scene.window_at_pointer(size.width, size.height)
+            self.scene.hover_focus_at_pointer(size.width, size.height)
         } else {
             None
         };
@@ -13752,101 +13752,74 @@ mod tests {
     }
 
     #[test]
-    fn sweeping_a_stacks_bands_shows_each_leaf_they_name() {
-        let path = std::env::temp_dir().join(format!(
-            "td-runtime-hover-focus-stack-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let cleanup = Cleanup(path);
-        let height = 600;
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+    fn stacked_titles_keep_focus_and_the_shown_window_until_pressed() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-stack-hover").unwrap();
+        let (width, height) = (600, 400);
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), width, height, width * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
-        let keys: Vec<SurfaceKey> = (1..=3)
-            .map(|object| SurfaceKey { client: 1, object })
-            .collect();
-        for (index, key) in keys.iter().enumerate() {
-            let shade = u8::try_from(index).unwrap().saturating_add(1);
-            runtime
-                .commit(*key, surface([shade, shade, shade, 0]))
-                .unwrap();
+        let key = |object| SurfaceKey { client: 1, object };
+        let (neighbor, hidden, shown) = (key(1), key(2), key(3));
+        for window in [neighbor, hidden, shown] {
+            runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
         }
-        runtime.command(Command::ToggleGrouped).unwrap();
-        let shown = |runtime: &Runtime| {
+        runtime.drop_below(shown, hidden).unwrap();
+        runtime
+            .command(Command::SetPresentation(Presentation::Stacked))
+            .unwrap();
+        let placements = runtime.scene.tiled_placements(width, height);
+        let tile = |key| placements.iter().find(|p| p.key == key).unwrap();
+        let hover = |runtime: &mut Runtime, rect: crate::layout::Rect| {
+            let (x, y) = runtime.scene.pointer_at();
             runtime
-                .scene
-                .tiled_placements(240, height)
-                .iter()
-                .position(|placement| placement.visible)
-                .and_then(|at| {
-                    runtime
-                        .scene
-                        .tiled_placements(240, height)
-                        .get(at)
-                        .map(|placement| placement.key)
-                })
-        };
-        let band = |runtime: &Runtime, key: SurfaceKey| {
-            let placements = runtime.scene.tiled_placements(240, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key == key)
-                .unwrap();
-            placements.get(at).unwrap().band
-        };
-        let goto = |runtime: &mut Runtime, x: usize, y: usize| {
-            let (at_x, at_y) = runtime.scene.pointer_at();
-            let (dx, dy) = (
-                i32::try_from(x).unwrap() - at_x,
-                i32::try_from(y).unwrap() - at_y,
-            );
-            runtime
-                .pointer_frame(1, dx, dy, &[], PointerScroll::default())
+                .pointer_frame(
+                    1,
+                    i32::try_from(rect.x + 2).unwrap() - x,
+                    i32::try_from(rect.y + 2).unwrap() - y,
+                    &[],
+                    PointerScroll::default(),
+                )
                 .unwrap();
         };
-        assert_eq!(shown(&runtime), keys.get(2).copied());
+        let assert_state = |runtime: &Runtime, focused, visible| {
+            assert_eq!(runtime.keyboard_snapshot().focus, Some(focused));
+            let layout = runtime.layout_snapshot();
+            for key in [hidden, shown] {
+                assert_eq!(layout.get(&key).unwrap().visible, key == visible);
+            }
+        };
+        assert_state(&runtime, shown, shown);
+        hover(&mut runtime, tile(hidden).band);
+        assert_state(&runtime, shown, shown);
 
-        // A stack's shown leaf is its most recently focused, so this reaches
-        // one place past the keyboard: sweeping the run of bands flips through
-        // the windows, one per band crossed. Walked in run order and back, so
-        // a rule that only ever moved one way would be caught. The bands do
-        // not move as it goes — every leaf of a stack gets the same content
-        // rectangle, so which one is SHOWN changes no geometry — which is why
-        // the sweep is a walk rather than a search.
-        let bands: Vec<crate::layout::Rect> = keys.iter().map(|key| band(&runtime, *key)).collect();
-        for (at, key) in keys.iter().enumerate().chain(keys.iter().enumerate().rev()) {
-            let strip = bands.get(at).unwrap();
-            goto(&mut runtime, strip.x + 2, strip.y + 2);
-            assert_eq!(runtime.keyboard_snapshot().focus, Some(*key), "band {at}");
-            assert_eq!(shown(&runtime), Some(*key), "band {at}");
-            assert_eq!(
-                bands,
-                keys.iter()
-                    .map(|key| band(&runtime, *key))
-                    .collect::<Vec<_>>(),
-                "the bands moved under the sweep"
-            );
+        // Even the shown window's title leaves focus in the neighboring tile.
+        hover(&mut runtime, tile(neighbor).rect);
+        for key in [shown, hidden] {
+            hover(&mut runtime, tile(key).band);
+            assert_state(&runtime, neighbor, shown);
         }
+        hover(&mut runtime, tile(shown).rect);
+        assert_state(&runtime, shown, shown);
 
-        // The one CONTENT rectangle beneath the bands belongs to the leaf
-        // being SHOWN, not to the first leaf under the stack: they all have
-        // the same rect, and the hit test's visibility guard is the only
-        // thing that tells them apart. Asked while the shown leaf is the
-        // LAST, so answering from tree order would name a different one.
-        let last = keys.last().copied().unwrap();
-        let strip = bands.last().unwrap();
-        goto(&mut runtime, strip.x + 2, strip.y + 2);
-        assert_eq!(shown(&runtime), Some(last));
-        let content = {
-            let placements = runtime.scene.tiled_placements(240, height);
-            let at = placements
-                .iter()
-                .position(|placement| placement.key == last)
-                .unwrap();
-            placements.get(at).unwrap().rect
-        };
-        goto(&mut runtime, content.x + 2, content.y + 2);
-        assert_eq!(runtime.keyboard_snapshot().focus, Some(last));
+        hover(&mut runtime, tile(hidden).band);
+        assert_eq!(
+            runtime.scene.draggable_at_pointer(width, height),
+            Some(hidden)
+        );
+        runtime
+            .pointer_frame(2, 0, 0, &[press(2), release(2)], PointerScroll::default())
+            .unwrap();
+        assert_state(&runtime, hidden, hidden);
+
+        runtime
+            .command(Command::SetPresentation(Presentation::Tabbed))
+            .unwrap();
+        let tabs = runtime.scene.tiled_placements(width, height);
+        hover(
+            &mut runtime,
+            tabs.iter().find(|p| p.key == shown).unwrap().band,
+        );
+        assert_state(&runtime, shown, shown);
     }
 
     #[test]

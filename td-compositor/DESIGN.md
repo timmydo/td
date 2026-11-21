@@ -3920,7 +3920,7 @@ to arrive. A nonzero delta is not that question's answer: one pointing off
 the edge of the output is clamped away, leaving a report that asked to move
 and did not. The paint owed, the focus re-answered and the drop re-derived
 all read the same "moved", which is what `Scene::move_pointer` reports.
-A window is its TILE, and its title band as much as its client pixels: the
+Outside a vertical stack, a title band takes hover focus like its tile. The
 band is the handle a drag picks it up by, and the tile is what a tiling
 compositor means by the window. So an undersized buffer or a narrow input
 region — which DELIVER nothing over the rest of the tile, and under
@@ -3932,20 +3932,11 @@ a press focuses nothing and a hover focuses the tile.
 
 Anywhere belonging to no window — the status bar, a gap, a border — KEEPS
 the focus that was there rather than clearing it, so crossing a gap on the
-way between two tiles does not leave the keyboard aimed at nothing. A
-grouped-away leaf answers for its own BAND alone: every leaf of a group
-shares one content rectangle, so that rectangle belongs to the leaf being
-SHOWN, and the hit test's visibility guard is what keeps a hidden one from
-claiming it.
-
-What that gives up is the argument the previous policy was written on: a
-pointer crossing a tile on its way somewhere else focuses it in passing, so
-a `Super+arrow` followed by any mouse movement loses the window it chose.
-That is what focus-follows-mouse IS, and it is what was asked for. It
-reaches one place beyond the keyboard, too: the shown leaf of a STACK is its
-most recently focused, so sweeping the pointer down a stack's run of bands
-flips through the windows it presents, one per band crossed — the same thing
-clicking each band in turn already did.
+way between two tiles does not leave the keyboard aimed at nothing. In a
+vertical stack, motion across any title band keeps keyboard focus where it
+is and keeps the same window on display. A press on a title selects its
+window. Motion into the shared content area focuses the displayed window.
+In a tabbed group, hovering a tab selects the window it names.
 
 Four things suspend it, and each would otherwise aim the keyboard somewhere
 the operator did not. A modal launcher owns the screen and keeps focus for as
@@ -4944,12 +4935,13 @@ The landing must prove:
   from code elsewhere — the dismissal filter and the model's focus — so a change
   to either would flip them silently;
 - the focus policy is proved end to end through the runtime in both its
-  halves — a hover focuses, and does so over a band and over a tile its
+  halves — a hover focuses over an ordinary title band and over a tile its
   client does not fill; a still pointer, a delta clamped away at the edge,
   a modal overlay, a live drag and a held grab each leave focus alone, the
   grab whether or not its last release shares a report with the motion;
   fullscreen and an empty workspace refuse a hover that would reach past
-  them; sweeping a stack's bands shows each leaf they name; and a press
+  them; sweeping a stack's bands preserves focus and the displayed leaf,
+  and clicking a title selects it; a client press
   focuses where it lands with the pointer still, not over the gap, not
   mid-drag, and where the press landed when a release and a press share one
   report — with the pointer model's press report and `Layout::focus_key`'s
