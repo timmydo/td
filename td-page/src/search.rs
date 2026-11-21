@@ -1,4 +1,4 @@
-//! Find (DESIGN.md §10, "Places, find, selection and links"): each
+//! Find (td-web/DESIGN.md §10, "Places, find, selection and links"): each
 //! paragraph's text as td-layout displays it, spaces collapsed, a tab
 //! taken as a space, a replaced scalar as U+FFFD, an image's `alt` text
 //! in its place and a wrap's white space put back as a copy puts it,

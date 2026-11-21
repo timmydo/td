@@ -1,4 +1,4 @@
-//! What the window shows of a laid page (DESIGN.md §10, "Places, find,
+//! What the window shows of a laid page (td-web/DESIGN.md §10, "Places, find,
 //! selection and links" and "Scrolling"): where it is scrolled to in
 //! device pixels, the focused link, find's matches and the selection,
 //! and the top's place kept through a relayout.

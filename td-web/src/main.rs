@@ -4,24 +4,15 @@
 #![forbid(unsafe_code)]
 
 mod app;
-mod charset;
 mod document;
 mod fetch;
-mod fonts;
-mod gather;
+#[cfg(test)]
+mod made;
 mod memory;
-mod page;
-mod paint;
 mod picture;
 mod pictures;
-mod pipeline;
 mod save;
-mod search;
-mod sheets;
 mod subresource;
-mod text;
-mod tree;
-mod view;
 mod worker;
 
 use std::ffi::OsString;

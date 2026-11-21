@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::document::{Document, Dropped, Made, Renderer, Styling};
 use crate::fetch::{self, Ask, Failure, Loaded};
-use crate::gather::{self, Refused};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString};
+use td_page::gather::{self, Refused};
 use td_url::Url;
 
 /// The most subresource fetches out at once, across the window's pages.
@@ -360,6 +360,9 @@ fn take(styling: &mut Styling, held: &mut Arrivals, answer: Answer) {
 mod tests {
     use super::*;
     use crate::fetch::Reply;
+    use crate::made::{markup, measure, WANT};
+    use std::sync::atomic::AtomicBool;
+    use td_alloc::Budget;
 
     fn loaded(status: u16, kind: Option<&str>) -> Loaded {
         Loaded {
@@ -434,5 +437,117 @@ mod tests {
         assert!(!acceptable(&loaded(200, Some("text/css2"))));
         assert!(!acceptable(&loaded(404, Some("text/css"))));
         assert!(!acceptable(&loaded(304, None)));
+    }
+
+    /// Resident and peak resident KiB, and the peak reset to now.
+    fn resident() -> (usize, usize) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib = |name: &str| -> usize {
+            let line = status.lines().find(|l| l.starts_with(name)).unwrap();
+            line.split_whitespace().nth(1).unwrap().parse().unwrap()
+        };
+        (kib("VmRSS:"), kib("VmHWM:"))
+    }
+
+    fn reset_peak() {
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    }
+
+    /// Increment 8's host measurement (DESIGN.md §10): each page of a
+    /// captured corpus (`fetch::tests::Corpus`) parsed, its sheets
+    /// gathered from the capture and compiled: the sheets linked and
+    /// imported, the text held, the least sheets term that compiles them
+    /// (by halving), and the resident peak's growth parsing and compiling
+    /// past the bytes td-alloc holds after the step, `WORKING`'s part, the
+    /// peak reset before each. A process a page: `TD_WEB_ONLY`.
+    #[test]
+    #[ignore = "host measurement: TD_WEB_CORPUS with a pages.tsv, release build"]
+    fn measure_sheets() {
+        use crate::fetch::{self, tests::Corpus, Fetcher};
+        use td_page::gather::{Refused, Sheets};
+        use td_page::pipeline::{parse, Parsed};
+        use td_page::{memory, sheets};
+        let dir = std::path::PathBuf::from(std::env::var_os("TD_WEB_CORPUS").unwrap());
+        let corpus = Corpus::read(&dir).unwrap();
+        let only = std::env::var("TD_WEB_ONLY").ok();
+        let cancel = AtomicBool::new(false);
+        for (name, address) in &corpus.pages {
+            if only.as_ref().is_some_and(|only| only != name) {
+                continue;
+            }
+            let reply = corpus
+                .table
+                .get(address, fetch::Ask::navigation(true))
+                .unwrap();
+            let text = String::from_utf8_lossy(&reply.body);
+            let page = Budget::new(memory::PAGES).unwrap();
+            let markup = markup(&page, &text);
+            let held = page.used();
+            reset_peak();
+            let (before, _) = resident();
+            let parsed = parse(markup, WANT, &mut measure(WANT), &cancel, &page).unwrap();
+            let (_, peak) = resident();
+            let tree_bytes = page.used() - held;
+            let parse_over = (peak - before) as f64 / 1024.0 - tree_bytes as f64 / 1048576.0;
+            let Parsed::Tree { tree, .. } = parsed else {
+                println!("{name}: not a tree");
+                continue;
+            };
+            let url = td_url::Url::parse(address).unwrap();
+            let mut sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, &page).unwrap();
+            while let Some((at, wanted)) = sheets.wanted() {
+                let wanted = td_url::Url::parse(wanted).unwrap();
+                sheets.asked(at);
+                match fetch::subresource(&corpus, wanted, url.https, SHEET, &cancel) {
+                    Ok(loaded) if acceptable(&loaded) => {
+                        let kind = loaded.reply.header("content-type");
+                        sheets
+                            .arrived(at, &loaded.url, kind, &loaded.reply.body)
+                            .unwrap();
+                    }
+                    _ => sheets.refused(at, Refused::Failed),
+                }
+            }
+            sheets.finish();
+            let environment = sheets::environment(WANT.width, WANT.height, u32::from(WANT.scale));
+            let compile = |limit: usize| {
+                let terms = page.child(limit + Budget::metadata_bytes()).unwrap();
+                let compiled = sheets::compile(&tree, Some(&sheets), true, &environment, &terms);
+                compiled.map(|(set, omitted)| (set, omitted, terms))
+            };
+            let room = memory::SHEETS - sheets.bytes();
+            reset_peak();
+            let (before, _) = resident();
+            let started = std::time::Instant::now();
+            let (set, omitted, terms) = compile(room).unwrap();
+            let took = started.elapsed();
+            let (_, peak) = resident();
+            let set_bytes = terms.used();
+            let compile_over = (peak - before) as f64 / 1024.0 - set_bytes as f64 / 1048576.0;
+            drop(set);
+            drop(terms);
+            let (mut low, mut high) = (0, room);
+            while high - low > 16 << 10 {
+                let mid = low + (high - low) / 2;
+                if compile(mid).is_ok() {
+                    high = mid;
+                } else {
+                    low = mid;
+                }
+            }
+            println!(
+                "{name}: {} sheets, {:?}, {omitted:?}; tree {:.1} MiB, parsing {:.1} MiB \
+                 past it; sheets {:.2} MiB held, set {:.1} MiB, compiled in {took:.1?} \
+                 with {:.1} MiB past it, the least term compiling them {:.1} MiB",
+                sheets.taken(),
+                sheets.tally(),
+                tree_bytes as f64 / 1048576.0,
+                parse_over,
+                sheets.bytes() as f64 / 1048576.0,
+                set_bytes as f64 / 1048576.0,
+                compile_over,
+                (high + sheets.bytes()) as f64 / 1048576.0,
+            );
+        }
     }
 }

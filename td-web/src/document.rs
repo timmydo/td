@@ -10,18 +10,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::worker::{Process, SubmitError, Worker};
 
-use crate::fonts::Measure;
-use crate::gather::{Refused, Sheets};
-use crate::memory::{self, Resident};
-use crate::page::Want;
-use crate::pipeline::{self, Again, Page, Parsed, Refusal};
+use crate::memory;
 use crate::subresource::Arrivals;
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString};
+use td_page::fonts::Measure;
+use td_page::gather::{Refused, Sheets};
+use td_page::memory::Resident;
+use td_page::page::Want;
+use td_page::pipeline::{self, Again, Page, Parsed, Refusal};
 use td_ui::picture::Picture;
 
-use crate::charset::{self, Rules};
 use crate::picture::{self, Format};
 use td_charset::Encoding;
+use td_page::charset::{self, Rules};
 #[cfg(test)]
 use td_ui::picture::{MAX_PICTURE_AXIS, MAX_PICTURE_PIXELS};
 use td_ui::prose::{Faces, Metrics};
@@ -253,8 +254,8 @@ impl Document {
                     Kind::Html if xml => (Rules::Xml, MAX_MARKUP),
                     Kind::Html => (Rules::Html, MAX_MARKUP),
                     // A text page's markup is its prefix and its text.
-                    _ if xml => (Rules::Xml, MAX_TEXT - crate::tree::TEXT_PREFIX.len()),
-                    _ => (Rules::Text, MAX_TEXT - crate::tree::TEXT_PREFIX.len()),
+                    _ if xml => (Rules::Xml, MAX_TEXT - td_page::tree::TEXT_PREFIX.len()),
+                    _ => (Rules::Text, MAX_TEXT - td_page::tree::TEXT_PREFIX.len()),
                 };
                 let declared = content_type.and_then(charset::label);
                 let declared = declared.as_ref().map(charset::Label::as_bytes);
@@ -458,7 +459,7 @@ pub struct Gathered {
     status: u16,
     note: Option<String>,
     want: Want,
-    tree: BudgetShared<crate::tree::Tree>,
+    tree: BudgetShared<td_page::tree::Tree>,
     markup: BudgetShared<BudgetString>,
     /// None for a page that names none to gather; refused for want of
     /// memory, the page is laid on rung 2.
@@ -1334,13 +1335,13 @@ pub(crate) mod tests {
     pub(crate) fn unanswered(answer: &Answer) -> impl Drop + '_ {
         Unanswered(answer)
     }
-    use crate::page::tests::WANT;
-    use crate::page::Laid;
-    use crate::pipeline::Rung;
-    use crate::text;
-    use crate::tree::Source;
+    use crate::made::WANT;
     use std::ops::ControlFlow;
     use td_css::values::{ComputedValue, Property};
+    use td_page::page::Laid;
+    use td_page::pipeline::Rung;
+    use td_page::text;
+    use td_page::tree::Source;
 
     fn base() -> Url {
         Url::parse("https://example.org/docs/page").unwrap()
@@ -1431,7 +1432,7 @@ pub(crate) mod tests {
         let mut texts = Vec::new();
         let mut at = Some(document.root());
         while let Some(id) = at {
-            if crate::tree::is_text(document, id) {
+            if td_page::tree::is_text(document, id) {
                 texts.push(document.node(id).unwrap().text().unwrap());
             }
             at = page.tree.next(id, false);
@@ -1614,7 +1615,7 @@ pub(crate) mod tests {
             Some("text/plain; charset=shift_jis"),
             &vec![0xb1; size],
         );
-        let read = (MAX_TEXT - crate::tree::TEXT_PREFIX.len()) / 3;
+        let read = (MAX_TEXT - td_page::tree::TEXT_PREFIX.len()) / 3;
         assert_eq!(
             doc.note.as_deref().unwrap(),
             format!("Shift_JIS · only the first {read} of the page's {size} bytes are shown")
@@ -1623,7 +1624,7 @@ pub(crate) mod tests {
         // Text within its prefix's length of the bound is cut, and said.
         let size = MAX_TEXT - 10;
         let doc = reply(200, Some("text/plain"), &vec![b'a'; size]);
-        let read = MAX_TEXT - crate::tree::TEXT_PREFIX.len();
+        let read = MAX_TEXT - td_page::tree::TEXT_PREFIX.len();
         assert_eq!(
             doc.note.as_deref().unwrap(),
             format!("only the first {read} of the page's {size} bytes are shown")

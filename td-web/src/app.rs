@@ -38,21 +38,21 @@ use td_url::{Reference, Url};
 
 use crate::document::{self, Answer, Body, Document, Dropped, Lane, Made, Renderer};
 use crate::fetch;
-use crate::fonts::Measure;
-use crate::page::{Laid, Want};
-use crate::paint::{self, Marks, Scratch};
 use crate::pictures::{self, Pictures};
-use crate::pipeline::{self, Again, Refusal, Rung};
 use crate::save;
 use crate::subresource::{self, Slots};
-use crate::text::{self, Move, Place};
-use crate::tree::Source;
-use crate::view::{self, Anchor, Pane, Selection, View};
+use td_page::fonts::Measure;
+use td_page::page::{Laid, Want};
+use td_page::paint::{self, Marks, Scratch};
+use td_page::pipeline::{self, Again, Refusal, Rung};
+use td_page::text::{self, Move, Place};
+use td_page::tree::Source;
+use td_page::view::{self, Anchor, Pane, Selection, View};
 
 pub mod control;
 
 const MAX_ADDRESS: usize = 4096;
-const MAX_QUERY: usize = crate::search::MAX_QUERY;
+const MAX_QUERY: usize = td_page::search::MAX_QUERY;
 /// The most pages each of back and forward keeps.
 pub const MAX_HISTORY: usize = 100;
 /// The most fetch threads at once, navigations and saves together.
@@ -286,13 +286,13 @@ impl Current {
 enum PictureFit {
     #[default]
     Empty,
-    Ready(crate::memory::Resident<Fitted>),
+    Ready(td_page::memory::Resident<Fitted>),
     Failed,
 }
 impl PictureFit {
     fn get_or_fit(
         &mut self,
-        fit: impl FnOnce() -> Option<crate::memory::Resident<Fitted>>,
+        fit: impl FnOnce() -> Option<td_page::memory::Resident<Fitted>>,
     ) -> Option<&Fitted> {
         if matches!(self, Self::Empty) {
             *self = fit().map_or(Self::Failed, Self::Ready);
@@ -563,7 +563,7 @@ fn saved(
     fetcher: &dyn fetch::Fetcher,
     directory: &File,
     url: Url,
-    held: Option<(crate::memory::Resident<Vec<u8>>, Option<String>)>,
+    held: Option<(td_page::memory::Resident<Vec<u8>>, Option<String>)>,
     state: &AtomicU8,
 ) -> Option<String> {
     let fetched;
@@ -1673,7 +1673,7 @@ impl App {
         else {
             return;
         };
-        if let Ok(hits) = crate::search::find(&laid, self.query.text(), &memory) {
+        if let Ok(hits) = td_page::search::find(&laid, self.query.text(), &memory) {
             let view = &mut self.current.view;
             view.at = view.at.min(hits.len().saturating_sub(1));
             view.hits = Some(hits);
@@ -1694,7 +1694,7 @@ impl App {
             self.current.find_refused = true;
             return;
         };
-        match crate::search::find(&laid, &query, &memory) {
+        match td_page::search::find(&laid, &query, &memory) {
             Ok(hits) => {
                 self.current.find_refused = false;
                 let none = hits.is_empty();
@@ -2977,7 +2977,7 @@ mod tests {
                 picture.fit(1, 1).and_then(|image| {
                     let budget = crate::memory::root().ok()?;
                     let bytes = image.bgra.capacity();
-                    crate::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
+                    td_page::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
                 })
             })
             .is_none());
@@ -2987,7 +2987,7 @@ mod tests {
             .get_or_fit(|| picture.fit(1, 1).and_then(|image| {
                 let budget = crate::memory::root().ok()?;
                 let bytes = image.bgra.capacity();
-                crate::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
+                td_page::memory::Resident::new(image, budget.charge(bytes).ok()?, bytes).ok()
             }))
             .is_some());
     }
@@ -4218,7 +4218,12 @@ mod tests {
         let mut app = app(site());
         typed(&mut app, "example.org");
         let (told, dropped) = mpsc::channel();
-        app.current.doc.page_mut().unwrap().recorder = Some(crate::pipeline::Recorder(told));
+        app.current.doc.page_mut().unwrap().witness = td_page::inline::Witnessed::new(
+            "page",
+            Box::leak(Box::new(move |_| {
+                let _ = told.send(std::thread::current().id());
+            })),
+        );
         resize(&mut app, 500);
         idle(&app);
         let thread = dropped
@@ -4983,7 +4988,8 @@ mod tests {
             selection: view.selection.and_then(Selection::range),
             link: None,
         };
-        let mut scratch = Scratch::new(app.renderer.budget());
+        let mut scratch = Scratch::new_empty();
+        paint::reserve(&mut scratch, app.renderer.budget()).unwrap();
         let (laid, measure) =
             measure_of(&app.current.doc, &mut app.current.measure, &app.renderer).unwrap();
         let mut glyphs = Vec::new();
@@ -5491,7 +5497,7 @@ mod tests {
         Option<usize>,
         usize,
         Option<Selection>,
-        Vec<crate::search::Hit>,
+        Vec<td_page::search::Hit>,
     );
 
     fn search_state(app: &App) -> SearchState {
@@ -6083,7 +6089,7 @@ mod tests {
                         && !app.current.again
                 });
                 if let Some(pictures) = app.current.pictures.as_ref() {
-                    let why: Vec<_> = (0..pictures::MAX_PICTURES)
+                    let why: Vec<_> = (0..td_page::inline::MAX_PICTURES)
                         .filter_map(|at| pictures.refused(at))
                         .collect();
                     println!(
@@ -6478,7 +6484,7 @@ mod tests {
         // MAX_SHEET_FETCHES linked; one more is not fetched.
         let mut markup = String::new();
         let mut table = Table::default();
-        for n in 0..=crate::gather::MAX_SHEET_FETCHES {
+        for n in 0..=td_page::gather::MAX_SHEET_FETCHES {
             markup.push_str(&format!("<link rel=stylesheet href=/s{n}.css>"));
             table = table.sheet(&format!("https://example.org/s{n}.css"), "");
         }
@@ -6488,7 +6494,7 @@ mod tests {
         typed(&mut app, "example.org");
         assert_eq!(page_text(&app), "shown");
         let fetched = table.urls().iter().filter(|u| u.ends_with(".css")).count();
-        assert_eq!(fetched, crate::gather::MAX_SHEET_FETCHES);
+        assert_eq!(fetched, td_page::gather::MAX_SHEET_FETCHES);
         assert_eq!(
             notes(&mut app),
             "1 of the page's style sheets was not applied"
@@ -6899,7 +6905,7 @@ mod tests {
     fn sheets_refused_at_once_are_each_answered() {
         let mut table = Table::default();
         let mut links = String::new();
-        for n in 0..crate::gather::MAX_SHEET_FETCHES {
+        for n in 0..td_page::gather::MAX_SHEET_FETCHES {
             links.push_str(&format!("<link rel=stylesheet href=/f{n}.css>"));
         }
         for n in 0..10 {
@@ -6965,7 +6971,7 @@ mod tests {
 
     /// The pictures the layout shown lays: each node's index and size.
     fn fits(app: &App) -> Vec<(usize, usize, usize)> {
-        crate::page::tests::fits(laid(app))
+        laid(app).fits().collect()
     }
 
     /// The node index of each picture the page names, in tree order.
@@ -7001,7 +7007,8 @@ mod tests {
             selection: None,
             link: None,
         };
-        let mut scratch = Scratch::new(app.renderer.budget());
+        let mut scratch = Scratch::new_empty();
+        paint::reserve(&mut scratch, app.renderer.budget()).unwrap();
         let (laid, measure) =
             measure_of(&app.current.doc, &mut app.current.measure, &app.renderer).unwrap();
         let mut out = Vec::new();
@@ -7110,8 +7117,8 @@ mod tests {
         );
         // At their own size drawn with no copy; one the page sizes, a
         // copy fitted to its box.
-        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[0]), Some(1));
-        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[2]), None);
+        assert_eq!(laid(&app).factor(nodes[0]), Some(1));
+        assert_eq!(laid(&app).factor(nodes[2]), None);
         // Each drawn in its box in place of its alt text.
         assert_eq!(glyph_text(&mut app), "top");
         assert_eq!(images(&mut app).len(), 3);
@@ -7170,7 +7177,7 @@ mod tests {
         pictured(&mut app);
         let nodes = picture_nodes(&app);
         assert_eq!(fits(&app), vec![(nodes[0], 6, 4)]);
-        assert_eq!(crate::page::tests::scaled(laid(&app), nodes[0]), Some(2));
+        assert_eq!(laid(&app).factor(nodes[0]), Some(2));
         let pixels = window_pixels(&mut app);
         // The box's top left, from its middle.
         let (x, y) = picture_point(&app, nodes[0]);
@@ -7299,7 +7306,7 @@ mod tests {
 
     #[test]
     fn pictures_past_max_pictures_keep_their_placeholders() {
-        let count = pictures::MAX_PICTURES + 2;
+        let count = td_page::inline::MAX_PICTURES + 2;
         let picture = png(1, 1, [1, 1, 1]);
         let mut table = Table::default().page(
             "https://example.org/many",
@@ -7315,12 +7322,12 @@ mod tests {
         let mut app = app_over(table.clone());
         typed(&mut app, "example.org/many");
         pictured(&mut app);
-        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        assert_eq!(fits(&app).len(), td_page::inline::MAX_PICTURES);
         // The first in tree order, each once.
         let mut asked = table.urls();
         asked.retain(|url| url.ends_with(".png"));
         asked.sort_unstable();
-        let mut first: Vec<_> = (0..pictures::MAX_PICTURES)
+        let mut first: Vec<_> = (0..td_page::inline::MAX_PICTURES)
             .map(|n| format!("https://example.org/p{n}.png"))
             .collect();
         first.sort_unstable();
@@ -7395,9 +7402,7 @@ mod tests {
         }
         let before = top(&app);
         let text = line_text(&app, top_line(&app));
-        let kept = crate::page::tests::fit_copy(laid(&app), nodes[0])
-            .try_clone()
-            .unwrap();
+        let kept = laid(&app).fit_copy(nodes[0]).unwrap().try_clone().unwrap();
         // b and c come within PICTURE_SETTLE of it: taken, not laid.
         release.send(()).unwrap();
         release.send(()).unwrap();
@@ -7426,7 +7431,7 @@ mod tests {
         assert_eq!(line_text(&app, top_line(&app)), text);
         assert!(BudgetShared::ptr_eq(
             &kept,
-            crate::page::tests::fit_copy(laid(&app), nodes[0])
+            laid(&app).fit_copy(nodes[0]).unwrap()
         ));
         drop(kept);
         app.poll(0);
@@ -7779,19 +7784,19 @@ mod tests {
             .page(
                 "https://example.org/thin",
                 "text/html",
-                &thin_pictures(pictures::MAX_PICTURES),
+                &thin_pictures(td_page::inline::MAX_PICTURES),
             )
             .page(next, "text/html", "<p>next");
         let (gate, release) = gate(table, &[next]);
         let mut app = app_over(gate.clone());
         typed(&mut app, "example.org/thin");
         pictured(&mut app);
-        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        assert_eq!(fits(&app).len(), td_page::inline::MAX_PICTURES);
         assert_eq!(laid(&app).short(), 0);
         let fitted = std::time::Instant::now();
         resize(&mut app, 700);
         let laid_again = fitted.elapsed();
-        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        assert_eq!(fits(&app).len(), td_page::inline::MAX_PICTURES);
         // A relayout asked, then a navigation before it is taken.
         app.input(Input::Resize(surface(760)), &mut Board::default());
         let running = app
@@ -7817,7 +7822,7 @@ mod tests {
         relaid(&mut app);
         assert!(!app.current.relay_after);
         assert_eq!(laid(&app).want.width, app.want().width);
-        assert_eq!(fits(&app).len(), pictures::MAX_PICTURES);
+        assert_eq!(fits(&app).len(), td_page::inline::MAX_PICTURES);
         // Asked again, its page made behind no relayout.
         app.input(Input::Resize(surface(700)), &mut Board::default());
         type_address(&mut app, "example.org/next");
@@ -7907,7 +7912,7 @@ mod tests {
             assert_ne!(width(&app), Some(first), "resize {n}");
             // Each copy made at the size it is drawn at.
             for &node in &nodes {
-                let copy = crate::page::tests::fit_copy(laid(&app), node);
+                let copy = laid(&app).fit_copy(node).unwrap();
                 let fit = fits(&app).into_iter().find(|f| f.0 == node).unwrap();
                 assert_eq!((copy.fitted().width, copy.fitted().height), (fit.1, fit.2));
             }
@@ -8288,7 +8293,8 @@ mod tests {
             selection: None,
             link: None,
         };
-        let mut scratch = Scratch::new(app.renderer.budget());
+        let mut scratch = Scratch::new_empty();
+        paint::reserve(&mut scratch, app.renderer.budget()).unwrap();
         let (laid_now, measure) =
             measure_of(&app.current.doc, &mut app.current.measure, &app.renderer).unwrap();
         let mut glyphs = Vec::new();

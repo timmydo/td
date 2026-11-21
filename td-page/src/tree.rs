@@ -1,4 +1,4 @@
-//! A page's document tree (DESIGN.md §10, "Pipeline and threads" and
+//! A page's document tree (td-web/DESIGN.md §10, "Pipeline and threads" and
 //! "Places"): td-html's tree, parsed under the page's tree term, with
 //! td-web's tables over it, each a node's: its place in tree order and the
 //! link it lies in. The markup td-web writes for its own pages and for a
@@ -23,7 +23,7 @@ pub const MAX_OWN_TEXT: usize = 4096;
 pub enum Source {
     /// A reply's markup.
     Markup,
-    /// A text page (DESIGN.md §10, "Cuts"), a reply's text or rung 3's.
+    /// A text page (td-web/DESIGN.md §10, "Cuts"), a reply's text or rung 3's.
     Text,
     /// A page td-web wrote: an error, or a type it does not show.
     Own,
@@ -93,7 +93,7 @@ fn css(element: &td_html::document::Element) -> bool {
 /// Whether a `link` names a style sheet to apply: its `rel` holds
 /// `stylesheet` and not `alternate`, it is not `disabled`, it has an
 /// `href`, and its `type`, if any, is CSS's by its MIME essence
-/// (DESIGN.md §10, "Subresources").
+/// (td-web/DESIGN.md §10, "Subresources").
 fn linked(element: &td_html::document::Element) -> bool {
     let rel = element.attribute("rel").unwrap_or("");
     let has = |name: &str| {
@@ -112,7 +112,7 @@ fn linked(element: &td_html::document::Element) -> bool {
 }
 
 /// Whether an `img` names a picture to fetch: a `src` that is not blank
-/// (DESIGN.md §10, "Subresources"); `srcset` is not read.
+/// (td-web/DESIGN.md §10, "Subresources"); `srcset` is not read.
 fn picture(element: &td_html::document::Element) -> bool {
     element.attribute("src").is_some_and(|src| {
         !src.trim_matches(|c: char| c.is_ascii_whitespace())
@@ -222,7 +222,7 @@ impl Tree {
                         sheets.try_push(id)?
                     }
                     "img" if picture(element) => {
-                        if pictures.len() < crate::pictures::MAX_PICTURES {
+                        if pictures.len() < crate::inline::MAX_PICTURES {
                             pictures.try_push(id)?;
                         } else {
                             past = past.saturating_add(1);
@@ -483,8 +483,7 @@ pub fn own_markup(text: &str, memory: &Budget) -> Result<BudgetString, BudgetErr
     Ok(out)
 }
 
-#[cfg(test)]
-/// Whether `id` is a text node.
+/// Whether `id` is a text node. For tests.
 pub fn is_text(document: &Document, id: NodeId) -> bool {
     use td_html::document::NodeKind;
     matches!(

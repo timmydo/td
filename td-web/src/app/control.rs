@@ -15,7 +15,7 @@ use td_ui::window::{self, Flow, Handler, NoClipboard};
 
 use super::{App, Canvas, Focus, PictureFit, PAGE_PICTURE};
 use crate::document::Body;
-use crate::paint::MAX_PAINT;
+use td_page::paint::MAX_PAINT;
 
 /// The most draws one recorded frame holds: the page's `MAX_PAINT` and
 /// the address and status rows', each a glyph a cell at most.

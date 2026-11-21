@@ -84,6 +84,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-page"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-charset",
+ "td-css",
+ "td-html",
+ "td-layout",
+ "td-ui",
+ "td-url",
+]
+
+[[package]]
 name = "td-png"
 version = "0.1.0"
 dependencies = [
@@ -119,6 +132,7 @@ dependencies = [
  "td-html",
  "td-jpeg",
  "td-layout",
+ "td-page",
  "td-png",
  "td-test-compositor",
  "td-ui",

@@ -13,18 +13,13 @@ use std::time::{Duration, Instant};
 
 use crate::document::{Lane, Renderer};
 use crate::fetch::{self, Ask, Failure, Loaded};
-use crate::memory::Resident;
 use crate::picture::{self, Format};
 use crate::subresource::{Slot, Slots};
-use crate::tree::Tree;
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString, BudgetVec};
 use td_html::document::NodeId;
-use td_ui::picture::Fitted;
+use td_page::inline::{Inline, Set, Witness, MAX_PICTURES};
+use td_page::tree::Tree;
 use td_url::{Reference, Url};
-
-/// The most pictures a page fetches, in tree order; those past it keep
-/// their placeholders.
-pub const MAX_PICTURES: usize = 128;
 /// How often, at most, pictures that came lay the page out again, in ms.
 pub const PICTURE_SETTLE: u64 = 250;
 /// How long a picture's fetch is given, each hop asked within it, so a
@@ -67,109 +62,6 @@ fn tell(told: Option<&Told>, what: &'static str) {
     }
 }
 
-/// A decoded picture: its pixels, premultiplied in the raster's order at
-/// its own size, charged to its page's pictures term, shared by the
-/// window's pictures and the layouts that lay it.
-pub struct Inline {
-    picture: Resident<Fitted>,
-    /// Its size as stored, its intrinsic size: a JPEG may be decoded at
-    /// a smaller scale.
-    natural: (usize, usize),
-    /// Every pixel opaque: drawn by copying, not blending.
-    opaque: bool,
-    #[cfg(test)]
-    told: Option<Told>,
-}
-
-impl Inline {
-    pub fn picture(&self) -> &Fitted {
-        &self.picture
-    }
-
-    pub fn opaque(&self) -> bool {
-        self.opaque
-    }
-
-    /// Its intrinsic size, as stored.
-    pub fn natural(&self) -> (usize, usize) {
-        self.natural
-    }
-
-    /// The whole multiple of its size `width` by `height` device pixels
-    /// is, if they are one: a box it is drawn in with no copy.
-    pub fn factor(&self, width: usize, height: usize) -> Option<usize> {
-        let factor = width.checked_div(self.picture.width)?;
-        (factor > 0
-            && factor.checked_mul(self.picture.width) == Some(width)
-            && factor.checked_mul(self.picture.height) == Some(height))
-        .then_some(factor)
-    }
-
-    /// The picture fitted to `width` by `height` device pixels, charged
-    /// to `term`: none when refused.
-    pub fn fit(
-        &self,
-        width: usize,
-        height: usize,
-        term: &Budget,
-        work: &mut u64,
-        cancel: &AtomicBool,
-    ) -> Option<FitCopy> {
-        let cost = self.picture.fit_exact_cost(width, height)?;
-        // Its steps spent only once its room is had.
-        let left = work.checked_sub(cost.steps)?;
-        let bytes = width.checked_mul(height)?.checked_mul(4)?;
-        let charge = term.charge(bytes).ok()?;
-        let scratch = term.charge(cost.scratch).ok()?;
-        *work = left;
-        let fitted = self
-            .picture
-            .fit_exact_until(width, height, &|| cancel.load(Ordering::SeqCst))?;
-        drop(scratch);
-        let capacity = fitted.bgra.capacity();
-        Some(FitCopy {
-            fitted: Resident::new(fitted, charge, capacity).ok()?,
-            // An average of opaque pixels is opaque.
-            opaque: self.opaque,
-            #[cfg(test)]
-            told: self.told.as_ref().cloned(),
-        })
-    }
-}
-
-#[cfg(test)]
-impl Drop for Inline {
-    fn drop(&mut self) {
-        tell(self.told.as_ref(), "inline");
-    }
-}
-
-/// A picture fitted to the box a layout lays it in, charged to its page's
-/// pictures term, shared by the layouts that lay it at that size.
-pub struct FitCopy {
-    fitted: Resident<Fitted>,
-    opaque: bool,
-    #[cfg(test)]
-    told: Option<Told>,
-}
-
-impl FitCopy {
-    pub fn fitted(&self) -> &Fitted {
-        &self.fitted
-    }
-
-    pub fn opaque(&self) -> bool {
-        self.opaque
-    }
-}
-
-#[cfg(test)]
-impl Drop for FitCopy {
-    fn drop(&mut self) {
-        tell(self.told.as_ref(), "fit");
-    }
-}
-
 /// Why a picture is not shown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Why {
@@ -207,9 +99,20 @@ pub struct Inbox {
     gone: AtomicBool,
     #[cfg(test)]
     told: Option<Told>,
+    #[cfg(test)]
+    witness: Option<Witness>,
 }
 
 impl Inbox {
+    /// Told where a page's decoded pictures and their copies drop, in
+    /// tests.
+    fn witness(&self) -> Option<Witness> {
+        #[cfg(test)]
+        return self.witness;
+        #[cfg(not(test))]
+        None
+    }
+
     /// `outcome` for picture `at`, given back when the page has gone or
     /// the picture was answered already, for the caller to let go.
     fn put(&self, at: usize, outcome: Outcome) -> Option<Outcome> {
@@ -367,6 +270,8 @@ impl Pictures {
             gone: AtomicBool::new(false),
             #[cfg(test)]
             told: tests::named(url),
+            #[cfg(test)]
+            witness: tests::witness(url),
         };
         Ok(Some(Self {
             entries,
@@ -559,12 +464,7 @@ impl Pictures {
                 }
             }
         }
-        shown.sort_unstable_by_key(|(node, _)| *node);
-        Ok(Set {
-            shown,
-            term: self.term.try_clone()?,
-            work: self.work,
-        })
+        Set::new(shown, &self.term, self.work)
     }
 
     /// Whether a picture is still to be asked for or to come.
@@ -664,34 +564,6 @@ impl Drop for Pictures {
         self.inbox.clear();
         #[cfg(test)]
         tell(self.inbox.told.as_ref(), "pictures");
-    }
-}
-
-/// The pictures a layout lays, by node index, and the term their fitted
-/// copies are charged to.
-pub struct Set {
-    shown: BudgetVec<(usize, BudgetShared<Inline>)>,
-    term: Budget,
-    /// The overlap steps a layout's copies may take (`FIT_WORK`).
-    work: u64,
-}
-
-impl Set {
-    /// The picture laid for `node`, if it has come.
-    pub fn get(&self, node: NodeId) -> Option<&BudgetShared<Inline>> {
-        let at = self
-            .shown
-            .binary_search_by_key(&node.index(), |(at, _)| *at)
-            .ok()?;
-        self.shown.get(at).map(|(_, inline)| inline)
-    }
-
-    pub fn term(&self) -> &Budget {
-        &self.term
-    }
-
-    pub fn work(&self) -> u64 {
-        self.work
     }
 }
 
@@ -842,16 +714,7 @@ fn decoded(body: &[u8], content_type: Option<&str>, term: &Budget, told: &Inbox)
     };
     match picture::decode_inline(format, body, term) {
         Ok((picture, natural)) => {
-            let opaque = picture.bgra.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
-            let inline = Inline {
-                picture,
-                natural,
-                opaque,
-                #[cfg(test)]
-                told: told.told.as_ref().cloned(),
-            };
-            #[cfg(not(test))]
-            let _ = told;
+            let inline = Inline::new(picture, natural, told.witness());
             match BudgetShared::new(term, inline) {
                 Ok(inline) => Outcome::Shown(inline),
                 Err(_) => Outcome::Refused(Why::Room),
@@ -894,7 +757,7 @@ pub(crate) fn decode_data(job: Data) {
     }
     let outcome = match tree
         .src(node)
-        .and_then(|src| crate::gather::data(src, &term))
+        .and_then(|src| td_page::gather::data(src, &term))
     {
         Some(Ok(Some(bytes))) if bytes.len() as u64 <= MAX_PICTURE_BODY => {
             decoded(&bytes, None, &term, &owed.inbox)
@@ -955,25 +818,11 @@ pub(crate) mod tests {
         inbox.gone.load(Ordering::SeqCst)
     }
 
-    /// A set laying `body`, a PNG, for `node`, its copies charged to
-    /// `term`.
-    pub(crate) fn set_of(node: NodeId, body: &[u8], term: &Budget) -> Set {
-        let (picture, natural) = picture::decode_inline(Format::Png, body, term).unwrap();
-        let inline = Inline {
-            picture,
-            natural,
-            opaque: true,
-            told: None,
-        };
-        let mut shown = BudgetVec::new(term).unwrap();
-        shown
-            .try_push((node.index(), BudgetShared::new(term, inline).unwrap()))
-            .unwrap();
-        Set {
-            shown,
-            term: term.try_clone().unwrap(),
-            work: FIT_WORK,
-        }
+    /// The witness of the pictures of a page at `url`, if watched: told
+    /// what of them dropped and whether on the render thread.
+    pub(super) fn witness(url: &Url) -> Option<Witness> {
+        named(url)
+            .map(|told| -> Witness { Box::leak(Box::new(move |what| tell(Some(&told), what))) })
     }
 
     pub(super) fn named(url: &Url) -> Option<Told> {
@@ -1010,12 +859,7 @@ pub(crate) mod tests {
         let (picture, natural) = picture::decode_inline(Format::Png, &body, &term).unwrap();
         assert_eq!(term.used(), base + 7 * 5 * 4);
         assert_eq!(natural, (7, 5));
-        let inline = Inline {
-            picture,
-            natural,
-            opaque: true,
-            told: None,
-        };
+        let inline = Inline::new(picture, natural, None);
         // Its pixels and its scratch, both held while it is made; its
         // steps from the layout's work.
         let cost = inline.picture().fit_exact_cost(9, 4).unwrap();
@@ -1051,6 +895,7 @@ pub(crate) mod tests {
             places: Mutex::new(std::array::from_fn(|_| Place::Empty)),
             gone: AtomicBool::new(false),
             told: None,
+            witness: None,
         };
         let term = Budget::new(64 << 20).unwrap();
         let why = |outcome: Outcome| match outcome {
@@ -1139,6 +984,7 @@ pub(crate) mod tests {
             places: Mutex::new(std::array::from_fn(|_| Place::Empty)),
             gone: AtomicBool::new(false),
             told: None,
+            witness: None,
         };
         for at in 0..MAX_PICTURES {
             assert!(inbox.put(at, Outcome::Refused(Why::Failed)).is_none());
@@ -1163,6 +1009,7 @@ pub(crate) mod tests {
             places: Mutex::new(std::array::from_fn(|_| Place::Empty)),
             gone: AtomicBool::new(false),
             told: None,
+            witness: None,
         };
         let term = Budget::new(64 << 20).unwrap();
         for (body, opaque) in [(png(3, 2), true), (picture::tests::GIF.to_vec(), false)] {
@@ -1183,7 +1030,7 @@ pub(crate) mod tests {
     /// failed as it drops, unless it was answered or handed back.
     #[test]
     fn what_the_inbox_holds_goes_with_the_pictures() {
-        let laid = crate::page::tests::laid("<img src=/a.png><img src=/b.png>");
+        let laid = crate::made::laid("<img src=/a.png><img src=/b.png>");
         let url = Url::parse("https://inbox.example/").unwrap();
         let told = watch("https://inbox.example/");
         let page = Budget::new(64 << 20).unwrap();

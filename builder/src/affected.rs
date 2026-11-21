@@ -10441,11 +10441,11 @@ mod tests {
         let setup = one("td-setup/src/welcome.rs");
         assert_eq!(setup.len(), 6, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);
-        // td-web, read by no crate: its own suite and the workspace's, so a
-        // browser edit stays a quick loop.
+        // td-web brings td-page, whose sources cite td-web/DESIGN.md §10,
+        // the contract they keep: its suite, td-page's and the workspace's.
         let web = one("td-web/src/app.rs");
         assert_eq!(workspace(&web), 3);
-        assert_eq!(names(&web), ["td-web"]);
+        assert_eq!(names(&web), ["td-page", "td-web"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile, and td-photo reads td-ui, which reads
@@ -10471,6 +10471,7 @@ mod tests {
                 "td-mta",
                 "td-news",
                 "td-open",
+                "td-page",
                 "td-pass",
                 "td-passkeys",
                 "td-photo",
@@ -10497,7 +10498,8 @@ mod tests {
         // td-agent's, td-photo's, td-mail's, td-pass's, td-pinentry's and
         // td-web's native cases make their commands three, as td-setup's are;
         // td-dua, td-news, td-review, td-sandbox, td-software and td-term,
-        // toolkit consumers with no native case, add two each.
+        // toolkit consumers with no native case, add two each, as does
+        // td-page, the page engine td-web draws through td-ui.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
         // fixture makes td-mta a reader through td-mail.
@@ -10512,7 +10514,7 @@ mod tests {
         // reader graph includes its test and Clippy legs.
         // The format check rides with the workspace.
         // td-sh exercises its job control through the toolkit PTY in its tests.
-        assert_eq!(comp.len(), 89, "{comp:?}");
+        assert_eq!(comp.len(), 91, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10537,6 +10539,7 @@ mod tests {
                 "td-mta",
                 "td-news",
                 "td-open",
+                "td-page",
                 "td-pass",
                 "td-passkeys",
                 "td-photo",
@@ -10583,6 +10586,7 @@ mod tests {
                 "td-mta",
                 "td-news",
                 "td-open",
+                "td-page",
                 "td-pass",
                 "td-passkeys",
                 "td-photo",

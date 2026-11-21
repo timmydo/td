@@ -1,4 +1,4 @@
-//! A computed style's font as td-ui draws it (DESIGN.md §10, "Faces"),
+//! A computed style's font as td-ui draws it (td-web/DESIGN.md §10, "Faces"),
 //! and td-layout's metrics over td-ui's prose `Metrics`: the render
 //! thread lays a page out with one, the window thread replays advances
 //! with its own over the same faces at the same scale, so the two agree.

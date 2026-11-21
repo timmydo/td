@@ -1,4 +1,4 @@
-//! Places in a laid page and the text between them (DESIGN.md §10,
+//! Places in a laid page and the text between them (td-web/DESIGN.md §10,
 //! "Places, find, selection and links"): a place is a DOM position, a
 //! paragraph a run of lines one block lays up to a line ended by a
 //! newline, a `br` or its block (`Line::end`), and the text find searches
@@ -399,7 +399,7 @@ fn units(
     }
 }
 
-/// `at` moved by `motion` (DESIGN.md §8): a scalar, the step from a
+/// `at` moved by `motion` (td-web/DESIGN.md §8): a scalar, the step from a
 /// paragraph's end to the next one's start being one of its own; to the
 /// end of the word after or the start of the word before; to the end of
 /// this paragraph or the next, the start of this one or the one before.
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     /// An empty item's marker is a paragraph of its own, copied when the
-    /// selection spans its item (DESIGN.md §10, "Copying").
+    /// selection spans its item (td-web/DESIGN.md §10, "Copying").
     #[test]
     fn an_empty_items_marker_is_a_paragraph_of_its_own() {
         let laid = laid("<ol><li>first<li><li>third</ol><p>after");

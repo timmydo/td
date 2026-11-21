@@ -1,4 +1,4 @@
-//! A page made on the render thread (DESIGN.md §10, "Pipeline and
+//! A page made on the render thread (td-web/DESIGN.md §10, "Pipeline and
 //! threads" and "Cuts"): parsed, its sheets compiled, cascaded and laid
 //! out, stepping down the cuts' ladder on a refusal; and laid out again
 //! for a new viewport, scale, face or `F9`.
@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fonts::Measure;
 use crate::gather::Sheets;
+use crate::inline::{Set, Witnessed};
 use crate::memory;
 use crate::page::{Laid, Styled, Want};
-use crate::pictures::Set;
 use crate::sheets::{self, Omitted};
 use crate::tree::{self, Source, Tree, TEXT_PREFIX};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString};
@@ -121,25 +121,12 @@ pub struct Page {
     pub notes: Notes,
     /// The page's budget, its terms' parent.
     pub budget: Budget,
-    /// Told the thread the page is dropped on, in tests: held for its
-    /// drop.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub recorder: Option<Recorder>,
+    /// Told `page` as the page drops, on the thread that drops it; none
+    /// as made.
+    pub witness: Witnessed,
 }
 
-/// Tells the thread it is dropped on: a page's, in tests.
-#[cfg(test)]
-pub struct Recorder(pub std::sync::mpsc::Sender<std::thread::ThreadId>);
-
-#[cfg(test)]
-impl Drop for Recorder {
-    fn drop(&mut self) {
-        let _ = self.0.send(std::thread::current().id());
-    }
-}
-
-/// Where a job tests its flag (DESIGN.md §10, "Pipeline and threads").
+/// Where a job tests its flag (td-web/DESIGN.md §10, "Pipeline and threads").
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
     Parse,
@@ -268,7 +255,6 @@ pub fn parse(
 /// A markup page from `markup` and its `style` elements alone, stepping
 /// down the ladder on a refusal; `Err(Cancelled)` once `cancel` is seen,
 /// `Err(Limit)` when rung 4's static notice is all there is.
-#[cfg(test)]
 pub fn markup_page(
     markup: BudgetShared<BudgetString>,
     want: Want,
@@ -315,8 +301,7 @@ pub fn styled_page(
                     rung: Rung::Own,
                     notes,
                     budget: page.try_clone()?,
-                    #[cfg(test)]
-                    recorder: None,
+                    witness: Witnessed::none("page"),
                 });
             }
             Err(Refusal::Cancelled) => return Err(Refusal::Cancelled),
@@ -365,8 +350,7 @@ pub fn user_agent(
             rung: Rung::UserAgent,
             notes,
             budget: page.try_clone()?,
-            #[cfg(test)]
-            recorder: None,
+            witness: Witnessed::none("page"),
         }),
         Err(Refusal::Cancelled) => Err(Refusal::Cancelled),
         Err(refusal) => {
@@ -450,7 +434,7 @@ fn lines_in(text: &str) -> usize {
 }
 
 /// `text` as a text page, cut where it would lay past `MAX_TEXT_LINES`
-/// lines in the least viewport (DESIGN.md §10, "Cuts").
+/// lines in the least viewport (td-web/DESIGN.md §10, "Cuts").
 pub fn text_page(
     text: &str,
     want: Want,
@@ -477,8 +461,7 @@ pub fn text_page(
             ..Notes::default()
         },
         budget: page.try_clone()?,
-        #[cfg(test)]
-        recorder: None,
+        witness: Witnessed::none("page"),
     })
 }
 
@@ -560,8 +543,7 @@ pub fn own_page(
         rung: Rung::Own,
         notes: Notes::default(),
         budget: page.try_clone()?,
-        #[cfg(test)]
-        recorder: None,
+        witness: Witnessed::none("page"),
     })
 }
 
@@ -734,8 +716,7 @@ pub fn again(again: Again, measure: &mut Measure, cancel: &AtomicBool) -> Result
                 rung,
                 notes,
                 budget,
-                #[cfg(test)]
-                recorder: None,
+                witness: Witnessed::none("page"),
             })
         }
         Err(Refusal::Cancelled) => Err(Refusal::Cancelled),
@@ -1536,7 +1517,7 @@ pub(crate) mod tests {
         assert!(!beside(past, 1.0, false, usize::MAX));
     }
 
-    /// The cutover's host measurement (DESIGN.md §10, increment 7): each
+    /// The cutover's host measurement (td-web/DESIGN.md §10, increment 7): each
     /// `.html` file under `$TD_WEB_CORPUS` (fetched into scratch, never
     /// committed) and synthetic shapes made, styled and laid on the cell,
     /// then laid again at another width and painted whole; times and the
@@ -1556,7 +1537,8 @@ pub(crate) mod tests {
             for path in names {
                 let bytes = std::fs::read(&path).unwrap();
                 let text = String::from_utf8_lossy(&bytes);
-                let cut = text.floor_char_boundary(crate::document::MAX_MARKUP);
+                // td-web's `MAX_MARKUP`: the most of a page it parses.
+                let cut = text.floor_char_boundary(2 << 20);
                 pages.push((path.display().to_string(), text[..cut].to_string()));
             }
         }
@@ -1656,122 +1638,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Resident and peak resident KiB, and the peak reset to now.
-    fn resident() -> (usize, usize) {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let kib = |name: &str| -> usize {
-            let line = status.lines().find(|l| l.starts_with(name)).unwrap();
-            line.split_whitespace().nth(1).unwrap().parse().unwrap()
-        };
-        (kib("VmRSS:"), kib("VmHWM:"))
-    }
-
-    fn reset_peak() {
-        std::fs::write("/proc/self/clear_refs", "5").unwrap();
-    }
-
-    /// Increment 8's host measurement (DESIGN.md §10): each page of a
-    /// captured corpus (`fetch::tests::Corpus`) parsed, its sheets
-    /// gathered from the capture and compiled: the sheets linked and
-    /// imported, the text held, the least sheets term that compiles them
-    /// (by halving), and the resident peak's growth parsing and compiling
-    /// past the bytes td-alloc holds after the step, `WORKING`'s part, the
-    /// peak reset before each. A process a page: `TD_WEB_ONLY`.
-    #[test]
-    #[ignore = "host measurement: TD_WEB_CORPUS with a pages.tsv, release build"]
-    fn measure_sheets() {
-        use crate::fetch::{self, tests::Corpus, Fetcher};
-        use crate::gather::{Refused, Sheets};
-        let dir = std::path::PathBuf::from(std::env::var_os("TD_WEB_CORPUS").unwrap());
-        let corpus = Corpus::read(&dir).unwrap();
-        let only = std::env::var("TD_WEB_ONLY").ok();
-        let cancel = AtomicBool::new(false);
-        for (name, address) in &corpus.pages {
-            if only.as_ref().is_some_and(|only| only != name) {
-                continue;
-            }
-            let reply = corpus
-                .table
-                .get(address, fetch::Ask::navigation(true))
-                .unwrap();
-            let text = String::from_utf8_lossy(&reply.body);
-            let page = Budget::new(memory::PAGES).unwrap();
-            let markup = markup(&page, &text);
-            let held = page.used();
-            reset_peak();
-            let (before, _) = resident();
-            let parsed = parse(markup, WANT, &mut measure(WANT), &cancel, &page).unwrap();
-            let (_, peak) = resident();
-            let tree_bytes = page.used() - held;
-            let parse_over = (peak - before) as f64 / 1024.0 - tree_bytes as f64 / 1048576.0;
-            let Parsed::Tree { tree, .. } = parsed else {
-                println!("{name}: not a tree");
-                continue;
-            };
-            let url = td_url::Url::parse(address).unwrap();
-            let mut sheets = Sheets::new(&tree, &url, td_charset::Encoding::Utf8, &page).unwrap();
-            while let Some((at, wanted)) = sheets.wanted() {
-                let wanted = td_url::Url::parse(wanted).unwrap();
-                sheets.asked(at);
-                match fetch::subresource(
-                    &corpus,
-                    wanted,
-                    url.https,
-                    crate::subresource::SHEET,
-                    &cancel,
-                ) {
-                    Ok(loaded) if crate::subresource::acceptable(&loaded) => {
-                        let kind = loaded.reply.header("content-type");
-                        sheets
-                            .arrived(at, &loaded.url, kind, &loaded.reply.body)
-                            .unwrap();
-                    }
-                    _ => sheets.refused(at, Refused::Failed),
-                }
-            }
-            sheets.finish();
-            let environment = sheets::environment(WANT.width, WANT.height, u32::from(WANT.scale));
-            let compile = |limit: usize| {
-                let terms = page.child(limit + Budget::metadata_bytes()).unwrap();
-                let compiled = sheets::compile(&tree, Some(&sheets), true, &environment, &terms);
-                compiled.map(|(set, omitted)| (set, omitted, terms))
-            };
-            let room = memory::SHEETS - sheets.bytes();
-            reset_peak();
-            let (before, _) = resident();
-            let started = std::time::Instant::now();
-            let (set, omitted, terms) = compile(room).unwrap();
-            let took = started.elapsed();
-            let (_, peak) = resident();
-            let set_bytes = terms.used();
-            let compile_over = (peak - before) as f64 / 1024.0 - set_bytes as f64 / 1048576.0;
-            drop(set);
-            drop(terms);
-            let (mut low, mut high) = (0, room);
-            while high - low > 16 << 10 {
-                let mid = low + (high - low) / 2;
-                if compile(mid).is_ok() {
-                    high = mid;
-                } else {
-                    low = mid;
-                }
-            }
-            println!(
-                "{name}: {} sheets, {:?}, {omitted:?}; tree {:.1} MiB, parsing {:.1} MiB \
-                 past it; sheets {:.2} MiB held, set {:.1} MiB, compiled in {took:.1?} \
-                 with {:.1} MiB past it, the least term compiling them {:.1} MiB",
-                sheets.taken(),
-                sheets.tally(),
-                tree_bytes as f64 / 1048576.0,
-                parse_over,
-                sheets.bytes() as f64 / 1048576.0,
-                set_bytes as f64 / 1048576.0,
-                compile_over,
-                (high + sheets.bytes()) as f64 / 1048576.0,
-            );
-        }
-    }
-
     /// A relayout stepped down to the user-agent sheets lays the
     /// pictures it was given, and says so; rung 3's text says it lays
     /// none.
@@ -1782,7 +1648,6 @@ pub(crate) mod tests {
         let made = made(&text, WANT, &root).unwrap();
         assert_eq!(made.rung, Rung::Own);
         let node = made.tree.pictures()[0];
-        let body = td_png::encode_rgb8(3, 2, &[1, 2, 3].repeat(6)).unwrap();
         let term = Budget::new(16 << 20).unwrap();
         let want = Want {
             pictures: 1,
@@ -1791,7 +1656,7 @@ pub(crate) mod tests {
         let relaid_within = |limit: usize| {
             let child = root.child(limit).unwrap();
             relaid(Again {
-                pictures: Some(crate::pictures::tests::set_of(node, &body, &term)),
+                pictures: Some(crate::inline::tests::set_of(node, &term)),
                 ..again_of(&made, Rung::Own, None, false, want, &child)
             })
         };

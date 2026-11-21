@@ -1,4 +1,4 @@
-//! A page's style sheets gathered (DESIGN.md §10, "Subresources"): its
+//! A page's style sheets gathered (td-web/DESIGN.md §10, "Subresources"): its
 //! `style` elements and `<link rel=stylesheet>`s in tree order, each
 //! sheet's `@import`s at its head, fetched sheets decoded as they arrive
 //! and `data:` ones at once, all on the render thread; and the order the
@@ -590,8 +590,7 @@ impl Sheets {
         visit(given)
     }
 
-    /// The sheets linked and imported, for the host measurements.
-    #[cfg(test)]
+    /// The sheets linked and imported. For tests and measurements.
     pub fn taken(&self) -> usize {
         self.taken
     }
@@ -1001,11 +1000,8 @@ fn data_url(href: &str, memory: &Budget) -> Option<Result<Option<Data>, BudgetEr
 
 /// `href`'s payload as a `data:` URL, whatever its type: `None` when it
 /// is no `data:` URL; within, none when it does not decode, an error when
-/// it cannot be held. A `data:` picture's (DESIGN.md §10, "Requests").
-pub(crate) fn data(
-    href: &str,
-    memory: &Budget,
-) -> Option<Result<Option<BudgetVec<u8>>, BudgetError>> {
+/// it cannot be held. A `data:` picture's (td-web/DESIGN.md §10, "Requests").
+pub fn data(href: &str, memory: &Budget) -> Option<Result<Option<BudgetVec<u8>>, BudgetError>> {
     data_url(href, memory).map(|data| data.map(|data| data.map(|data| data.bytes)))
 }
 

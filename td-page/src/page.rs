@@ -1,4 +1,4 @@
-//! A page's styled document and its layouts (DESIGN.md §10, "Pipeline and
+//! A page's styled document and its layouts (td-web/DESIGN.md §10, "Pipeline and
 //! threads", "Painting" and "Places"): td-layout's styled document over a
 //! tree, with td-web's per-box tables, and a layout with what td-web
 //! indexes over it. Each is immutable once made and shared between the
@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fonts::Measure;
-use crate::pictures::{FitCopy, Inline, Set};
+use crate::inline::{FitCopy, Inline, Set};
 use crate::sheets::Omitted;
 use crate::tree::{Tree, NONE};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetVec};
@@ -41,7 +41,7 @@ pub struct Want {
     /// With the page's own sheets and `style` attributes; `F9` clears it.
     pub styles: bool,
     /// The page's inline pictures come by its last settle, which it lays
-    /// at their size (DESIGN.md §10, "Subresources").
+    /// at their size (td-web/DESIGN.md §10, "Subresources").
     pub pictures: u32,
 }
 
@@ -435,7 +435,7 @@ fn fit(
 
 /// Each image's intrinsic size: its picture's, in CSS px a pixel, once it
 /// has come; else its `alt` text's line in its own font, none without
-/// one (DESIGN.md §10, "Subresources"). Sorted by node index.
+/// one (td-web/DESIGN.md §10, "Subresources"). Sorted by node index.
 fn alt_sizes(
     styled: &Styled,
     measure: &mut Measure,
@@ -778,6 +778,33 @@ impl Laid {
         }
     }
 
+    /// Each picture the layout lays, in node order: its node's index and
+    /// its box's size in device pixels. For tests and measurements.
+    pub fn fits(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.fits
+            .iter()
+            .map(|fit| (fit.node, fit.width, fit.height))
+    }
+
+    /// The copy fitted to its box for the picture of the node of index
+    /// `node`, when it is drawn from one. For tests and measurements.
+    pub fn fit_copy(&self, node: usize) -> Option<&BudgetShared<FitCopy>> {
+        match &self.fits.iter().find(|fit| fit.node == node)?.copy {
+            Drawn::Copy(copy) => Some(copy),
+            Drawn::Scaled(..) => None,
+        }
+    }
+
+    /// The whole multiple of its size the picture of the node of index
+    /// `node` is drawn at, when it is drawn with no copy. For tests and
+    /// measurements.
+    pub fn factor(&self, node: usize) -> Option<usize> {
+        match &self.fits.iter().find(|fit| fit.node == node)?.copy {
+            Drawn::Scaled(_, factor) => Some(*factor),
+            Drawn::Copy(_) => None,
+        }
+    }
+
     /// The picture a paint names by `id` and the whole multiple of its
     /// size it is drawn at.
     pub fn fitted_by(&self, id: u64) -> Option<(&Fitted, usize)> {
@@ -940,31 +967,6 @@ pub(crate) mod tests {
             None,
         )
         .unwrap()
-    }
-
-    /// Each picture `laid` lays fitted: its node's index and its size.
-    pub(crate) fn fits(laid: &Laid) -> Vec<(usize, usize, usize)> {
-        laid.fits
-            .iter()
-            .map(|fit| (fit.node, fit.width, fit.height))
-            .collect()
-    }
-
-    /// The fitted copy `laid` lays for the node of index `node`.
-    pub(crate) fn fit_copy(laid: &Laid, node: usize) -> &BudgetShared<FitCopy> {
-        match &laid.fits.iter().find(|fit| fit.node == node).unwrap().copy {
-            Drawn::Copy(copy) => copy,
-            Drawn::Scaled(..) => panic!("drawn scaled"),
-        }
-    }
-
-    /// The whole multiple of its size `laid` draws the picture of the
-    /// node of index `node` at, with no copy.
-    pub(crate) fn scaled(laid: &Laid, node: usize) -> Option<usize> {
-        match &laid.fits.iter().find(|fit| fit.node == node)?.copy {
-            Drawn::Scaled(_, factor) => Some(*factor),
-            Drawn::Copy(_) => None,
-        }
     }
 
     pub(crate) fn laid(markup: &str) -> Laid {

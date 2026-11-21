@@ -1,4 +1,4 @@
-//! A page's sheets (DESIGN.md §10, "Sources"): td-css's user-agent sheet,
+//! A page's sheets (td-web/DESIGN.md §10, "Sources"): td-css's user-agent sheet,
 //! td-web's own, then the page's own in cascade order with their media,
 //! compiled into one set for an environment.
 
@@ -145,7 +145,7 @@ fn names_colour(text: &str) -> bool {
 
 /// Whether the page's own sheets, its `style` elements and those
 /// `sheets` gathered, or its `style` attributes set any colour, by a scan
-/// for the properties that can (DESIGN.md §10, "Colours").
+/// for the properties that can (td-web/DESIGN.md §10, "Colours").
 pub fn coloured(tree: &Tree, sheets: Option<&Sheets>) -> bool {
     let inline = tree
         .sheets()

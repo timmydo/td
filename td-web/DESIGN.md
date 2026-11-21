@@ -39,9 +39,10 @@ not registered as `BROWSER` or as the OpenURI target.
 td-web is a zone-one program (TRUST.md "Trust zones"): the `td-web`
 crate is a standalone `td-*` roster crate built by td's Rust toolchain
 in the Debian build root like every Cargo recipe. Its closure is `std`
-and td's own crates by path: `td-ui` for the window, `td-html` for
+and td's own crates by path: `td-ui` for the window, `td-page` for
+making, laying out and painting a page (§10) with `td-html` for
 markup's tree, `td-css` for style sheets, `td-dom` for the tree's HTML
-projection and `td-layout` for layout (§10), `td-charset` for text in
+projection and `td-layout` for layout, `td-charset` for text in
 other encodings, `td-fetch-client` for the network, `td-url` for URLs,
 and the shared decoders (`td-png`,
 `td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. td-charset's
@@ -824,9 +825,12 @@ Increments 6 onward are §10's; 6 to 9 have landed.
 ## 10. Styled documents
 
 A page is a document tree, styled by td-css, laid out by td-layout and
-painted by td-web. Increments 8 and 9 (below), stylesheets and inline
-pictures fetched as subresources, have landed; this section is the
-contract.
+painted. Increments 8 and 9 (below), stylesheets and inline pictures
+fetched as subresources, have landed; this section is the contract.
+The making, laying out and painting, and the places over a layout, are
+td-page's (td-page/DESIGN.md), a crate of their own so another program
+can show a page, and this section governs them; the fetching, the
+threads and the window are td-web's.
 
 ### Pipeline and threads
 
@@ -972,7 +976,7 @@ td-layout measures the whole flow on every layout (td-layout/DESIGN.md
 §6): a width change of 2 MiB of synthetic markup takes 54 to 67 ms
 (medians, synthetic metrics; 105 to 194 ms under a heavier load) and the
 eight corpus pages 0.4 to 8.5 ms, on top of the cascade above. Measured
-on the cell (a development host, release build,
+on the cell (a development host, release build, td-page's
 `pipeline::tests::measure_pages`), seven of the corpus pages (GitHub's
 not fetched) are made, parsed, compiled, cascaded and laid out at 400
 CSS px, in 1.7 to 225 ms, and laid out again at 1200 px with the old
@@ -1092,7 +1096,7 @@ text, their entries, at most twice `MAX_SHEET_FETCHES` and never
 grown, and their fetches' URLs, each at most `MAX_URL`,
 `gather::MAX_HELD`, in a child of the page's budget, and the
 compilation's child is the sheets term less what they hold. Measured
-(`pipeline::tests::measure_sheets`, the corpus of
+(`subresource::tests::measure_sheets`, the corpus of
 increment 8 with every sheet it links and imports, the least child
 that compiles them found by halving), a page's sheets need at most
 27.2 MiB of the term, GitHub's 23 sheets of 3.6 MiB of text, which
@@ -1252,7 +1256,7 @@ blocks, which holds 71.9 MiB of td-alloc's owned storage and declares
 A page's sheets, in cascade order:
 
 1. td-css's `HTML_UA_CSS`, user-agent origin.
-2. td-web's own sheet, compiled in (`td-web/src/page.css`), user-agent
+2. td-web's own sheet, compiled in (`td-page/src/page.css`), user-agent
    origin after it: td's look and what `HTML_UA_CSS` lacks. The root's
    ink is `INK`, links are `ACCENT`, `code`, `kbd` and `samp` lie on
    `CHROME`; the root's family is `"td-body"` (below, "Faces") at 16
@@ -1331,7 +1335,7 @@ order the cascade takes them, an import standing at its rule's place
 with the media lists of its chain as its conditions, all of which must
 match: the `<style>`'s or `<link>`'s `media`, then each import's list,
 outermost first (a `<link media=print>` importing `x screen` applies in
-neither). td-web reads a sheet's head itself (`gather.rs`), as CSS
+neither). td-web reads a sheet's head itself (td-page's `gather.rs`), as CSS
 Syntax tokenizes it, comments, strings and blocks kept whole: an
 `@import` counts after `@charset` and `@layer` statements and before any
 other rule, an `@namespace` or an unknown statement among them; a
@@ -2282,7 +2286,7 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    td-web's service eight workers; and, in td-fetchd over its socket,
    `--workers 2` serving two at once while a third waits, each given up
    at the `deadline` it asked of an origin that never answers.
-   Measured on the host (`pipeline::tests::measure_sheets` and
+   Measured on the host (`subresource::tests::measure_sheets` and
    `app::tests::measure_window` over a `fetch::tests::Corpus`, a
    process a page and output, release build, the pinned faces): the
    corpus of increment 7, GitHub's included, with the WHATWG HTML and
@@ -2419,6 +2423,11 @@ order; each is its own design amendment when it starts:
   allowlists"; UNSAFE.md §9), with the probe's witness. td-ui's
   composition naming a picture's factor would let the seam's `frame`
   draw one as the window does.
+- **HTML mail.** td-page (td-page/DESIGN.md) showing a message's HTML
+  in td-mail: remote content off unless asked for, `cid:` pictures from
+  the message's own parts, links opened outside the pane with their
+  real target shown, and a page's terms of its own measured against
+  td-mail's jail; td-mail's quoting and CLI keep td-html's text.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

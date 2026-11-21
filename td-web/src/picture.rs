@@ -146,7 +146,7 @@ pub(crate) fn decode_with_budget(
     format: Format,
     body: &[u8],
     memory: &td_alloc::Budget,
-) -> Result<crate::memory::Resident<Picture>, Error> {
+) -> Result<td_page::memory::Resident<Picture>, Error> {
     let charge = memory
         .charge(crate::memory::PICTURE_WORK)
         .map_err(|_| Error::Room)?;
@@ -160,8 +160,8 @@ fn resident(
     picture: Picture,
     charge: td_alloc::Charge,
     capacity: usize,
-) -> Result<crate::memory::Resident<Picture>, Error> {
-    crate::memory::Resident::new(picture, charge, capacity).map_err(|_| Error::Resources)
+) -> Result<td_page::memory::Resident<Picture>, Error> {
+    td_page::memory::Resident::new(picture, charge, capacity).map_err(|_| Error::Resources)
 }
 
 /// What a picture is decoded as, read from its header before any of its
@@ -386,7 +386,7 @@ pub(crate) fn decode_inline(
     term: &td_alloc::Budget,
 ) -> Result<
     (
-        crate::memory::Resident<td_ui::picture::Fitted>,
+        td_page::memory::Resident<td_ui::picture::Fitted>,
         (usize, usize),
     ),
     Error,
@@ -397,7 +397,7 @@ pub(crate) fn decode_inline(
         .charge(work(&plan, body.len()))
         .map_err(|_| Error::Room)?;
     let (picture, capacity) = decode_plan(plan, body)?;
-    let kept = crate::memory::Resident::new(picture.into_fitted(), charge, capacity)
+    let kept = td_page::memory::Resident::new(picture.into_fitted(), charge, capacity)
         .map_err(|_| Error::Resources)?;
     Ok((kept, natural))
 }

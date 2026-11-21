@@ -3,9 +3,10 @@ use crate::types::Recipe;
 /// td-web, td's own document browser (td-web/DESIGN.md) and the program the
 /// `web` application packages. Built as the other toolkit consumers are: a
 /// static Cargo build of its own tree with its path dependencies staged
-/// beside it (td-css, td-dom and td-layout among them, which style and
-/// lay out its pages), td-compositor for the font and wire sources td-ui mounts,
-/// engine for td-png's checksums, td-inflate for its decoder and td-util for its DEFLATE
+/// beside it (td-page, which makes, lays out and paints its pages, and
+/// td-css, td-dom and td-layout, which it does that with), td-compositor
+/// for the font and wire sources td-ui mounts, engine for td-png's
+/// checksums, td-inflate for its decoder and td-util for its DEFLATE
 /// encoder, the dev-only td-fs its tests' scratch comes from and
 /// td-test-compositor its native cases drive the compositor with, the
 /// `td-web-source` seed pinned by the compiled local-source roster, and the
@@ -25,6 +26,7 @@ pub fn recipe() -> Recipe {
             "td-html",
             "td-jpeg",
             "td-layout",
+            "td-page",
             "td-png",
             "td-alloc",
             "td-ui",
@@ -68,6 +70,7 @@ mod tests {
                 "td-html".into(),
                 "td-jpeg".into(),
                 "td-layout".into(),
+                "td-page".into(),
                 "td-png".into(),
                 "td-alloc".into(),
                 "td-ui".into(),
@@ -116,6 +119,7 @@ mod tests {
                 "td-html",
                 "td-jpeg",
                 "td-layout",
+                "td-page",
                 "td-png",
                 "td-test-compositor",
                 "td-ui",

@@ -1,4 +1,4 @@
-//! How a document's bytes become its text (DESIGN.md §5): the encoding
+//! How a document's bytes become its text (td-web/DESIGN.md §5): the encoding
 //! WHATWG's rules choose, through td-charset, and the bytes decoded to at
 //! most a bound of UTF-8, malformed ones replaced, never refused.
 

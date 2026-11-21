@@ -703,6 +703,7 @@ mod tests {
                 "td-markdown",
                 "td-news",
                 "td-open",
+                "td-page",
                 "td-pass",
                 "td-passkeys",
                 "td-photo",

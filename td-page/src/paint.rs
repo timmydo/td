@@ -1,4 +1,4 @@
-//! A laid page painted (DESIGN.md §10, "Painting"): the canvas, each box's
+//! A laid page painted (td-web/DESIGN.md §10, "Painting"): the canvas, each box's
 //! background and borders in tree order, each line's content, then the
 //! marks over it, all clipped to the pane, the damage and the boxes that
 //! clip their descendants. Glyphs are drawn ordered by family and size so

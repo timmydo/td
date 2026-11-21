@@ -44,9 +44,9 @@ it in the same landing.
   serving, storage and submission (`td-mta`); service supervision
   (`td-svc`); allocation helpers and guards (`td-alloc`); the shared UI
   toolkit (`td-ui`); the agent harness (`td-agent`); the application
-  manager (`td-software`); td's web browser (`td-web`); document layout
-  (`td-layout`); Unicode normalization (`td-nfc`); header lexical syntax
-  (`td-header`).
+  manager (`td-software`); td's web browser (`td-web`) and its page
+  engine (`td-page`); document layout (`td-layout`); Unicode
+  normalization (`td-nfc`); header lexical syntax (`td-header`).
 
 # Request scope
 
