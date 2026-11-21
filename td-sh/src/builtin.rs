@@ -40,6 +40,8 @@ pub enum Builtin {
     Alias,
     Unalias,
     Jobs,
+    Fg,
+    Bg,
     Exec,
     Trap,
     Local,
@@ -50,10 +52,10 @@ pub enum Builtin {
 /// arm and a list entry are one fact written twice, so a source-text test below
 /// holds them together -- the compiler cannot.
 pub const NAMES: &[&str] = &[
-    ":", "[", ".", "alias", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
-    "export", "false", "getopts", "jobs", "local", "printf", "pwd", "read", "readonly", "return",
-    "set", "shift", "source", "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
-    "wait",
+    ":", "[", ".", "alias", "bg", "break", "cd", "command", "continue", "echo", "eval", "exec",
+    "exit", "export", "false", "fg", "getopts", "jobs", "local", "printf", "pwd", "read",
+    "readonly", "return", "set", "shift", "source", "test", "times", "trap", "true", "type",
+    "umask", "unalias", "unset", "wait",
 ];
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -87,6 +89,8 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "command" => Builtin::Command,
         "wait" => Builtin::Wait,
         "jobs" => Builtin::Jobs,
+        "fg" => Builtin::Fg,
+        "bg" => Builtin::Bg,
         "alias" => Builtin::Alias,
         "unalias" => Builtin::Unalias,
         "exec" => Builtin::Exec,
@@ -197,6 +201,26 @@ fn run_named(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Type => type_of(sh, argv),
         Builtin::Wait => wait(sh, argv),
         Builtin::Jobs => jobs(sh, argv),
+        Builtin::Fg | Builtin::Bg => {
+            if argv.len() > 2 {
+                err_line(sh, "expected at most one jobspec");
+                return status(sh, 2);
+            }
+            match sh
+                .jobs
+                .resume(argv.get(1).map(String::as_str), matches!(bi, Builtin::Fg))
+            {
+                Ok(crate::jobs::Resumed::Background(id)) => {
+                    sh.last_bg = Some(id);
+                    ok(sh)
+                }
+                Ok(crate::jobs::Resumed::Foreground(result)) => process::job_status(sh, result),
+                Err(why) => {
+                    err_line(sh, why);
+                    status(sh, 1)
+                }
+            }
+        }
         Builtin::Alias => alias(sh, argv),
         Builtin::Unalias => unalias(sh, argv),
         Builtin::Exec => exec_cmd(sh, argv),
@@ -217,16 +241,7 @@ fn ok(sh: &mut Shell) -> R<()> {
 /// running `jobs` inherits no jobs. td-sh clones per stage for the same reason,
 /// so the 0 falls out rather than being arranged.
 ///
-/// `-p` is ids alone, one per line. The rest is deliberately not served, and for
-/// two different reasons. `-n`, `-r` and `-s` select by a state this shell does
-/// not have -- nothing here is ever STOPPED, a thread having no `SIGTSTP` -- so
-/// there is nothing to filter by. `-l` is the opposite: dash's long form ADDS
-/// the process id to a listing that otherwise lacks it, and every line here
-/// already carries the job's id because there is no pid to add later, so
-/// serving it would be answering a question about a number this shell does not
-/// have. A `%…` operand is a scope decision rather than a gap: `spec_id` could
-/// resolve it, and selecting one job to print is simply not done yet. All take
-/// the 2 dash gives.
+/// `-p` prints ids alone. A listing takes no other options or operands.
 fn jobs(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut ids_only = false;
     let mut rest = argv.iter().skip(1);
@@ -6237,7 +6252,7 @@ mod tests {
     /// export through (ash.c:14158-14161).
     #[test]
     fn a_name_ash_seeds_is_not_a_fresh_name_for_export_n_or_readonly() {
-        const SEEDED: [&str; 14] = [
+        const SEEDED: &[&str] = &[
             "IFS",
             "MAIL",
             "MAILPATH",
@@ -6256,7 +6271,7 @@ mod tests {
         // Both spellings, because `export -n` CLEARS the flag whatever it was:
         // unlike `readonly` it has no prior state to preserve, so the seeded
         // name agrees with ash whether or not it was exported first.
-        for name in SEEDED {
+        for &name in SEEDED {
             for pre in [
                 format!("unset {name}"),
                 format!("export {name}=old; unset {name}"),
@@ -6289,7 +6304,7 @@ mod tests {
         let (_, out, _) =
             run_capturing("export MAIL=old; unset MAIL; set -a; readonly MAIL; export -p");
         assert!(lists(&out, "MAIL"), "{out:?}");
-        for name in SEEDED {
+        for &name in SEEDED {
             let src = format!("unset {name}; set -a; readonly {name}; export -p");
             let (_, out, _) = run_capturing(&src);
             assert!(!lists(&out, name), "{src}: {out:?}");
@@ -6298,7 +6313,7 @@ mod tests {
         // the export must not be a `readonly` quietly dropped instead. RANDOM
         // is in that list because the `unset` clears its dynamic flag, so the
         // exemption that would let an assignment through no longer applies.
-        for name in SEEDED {
+        for &name in SEEDED {
             let src = format!("unset {name}; set -a; readonly {name}; {name}=x");
             let (_, _, err) = run_capturing(&src);
             assert!(

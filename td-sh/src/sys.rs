@@ -43,12 +43,12 @@
 //! Deliberately NOT here: reading the mask out of `/proc/self/status`'s `Umask:`
 //! field. It is real and it is safe, but it answers only half the builtin (there
 //! is no way to SET through it), so it would buy a `/proc` dependency without
-//! removing the syscall. Nor `kill(2)`, `rt_sigprocmask(2)` or `sigaltstack(2)`:
-//! this shell sends no signals, blocks none, and runs on no alternate stack. Nor
+//! removing the syscall. Nor `sigaltstack(2)`:
+//! this shell runs on no alternate stack. Nor
 //! `isatty`, which `std::io::IsTerminal` already answers safely.
 //!
 //! `ioctl(2)` is the one with a REQUEST roster rather than a single meaning, so
-//! the three it may issue are pinned by value and `ioctl` refuses anything else
+//! the five it may issue are pinned by value and `ioctl` refuses anything else
 //! before the syscall — the roster is code, not just a test.
 //!
 //! `poll(2)` exists for ONE builtin, `read -t`,
@@ -65,6 +65,8 @@ compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
 use std::sync::Mutex;
 
+const SYS_KILL: usize = 62;
+const SYS_RT_SIGPROCMASK: usize = 14;
 const SYS_WAIT4: usize = 61;
 const SYS_MEMFD_CREATE: usize = 319;
 const SYS_POLL: usize = 7;
@@ -119,7 +121,7 @@ pub const SIG_MAX: u8 = 64;
 /// whenever an action is supplied, so nothing here asks -- which keeps every
 /// refusal below a case of the kernel disagreeing about something it could have
 /// done, rather than an expected failure callers learn to skip past.
-const UNCHANGEABLE: [u8; 2] = [9, 19];
+const UNCHANGEABLE: &[u8] = &[9, 19];
 
 /// The single raw-syscall entry point (x86_64 SysV syscall ABI), copied from
 /// `td-util/src/sys.rs`. Its body owns the only assembly instruction. The scoped
@@ -276,26 +278,53 @@ pub(super) fn here_file(bytes: &[u8]) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Reap exactly the child spawned by the short-lived worker.
-pub(super) fn wait_child(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+/// Only exact child PIDs may be waited on. The interactive loop also
+/// needs stop notifications and a nonblocking background status query.
+pub(super) enum Wait {
+    Exit,
+    Job,
+    PollJob,
+}
+
+pub(super) fn wait_child(pid: u32, how: Wait) -> std::io::Result<Option<std::process::ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
-    let pid = i32::try_from(pid)
-        .ok()
-        .filter(|p| *p > 0)
-        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let pid = positive_pid(pid)?;
+    let options = match how {
+        Wait::Exit => 0,
+        Wait::Job => 2,             // WUNTRACED
+        Wait::PollJob => 1 | 2 | 8, // WNOHANG | WUNTRACED | WCONTINUED
+    };
     let mut status = 0i32;
     loop {
         let ret = syscall4(
             SYS_WAIT4,
             pid as usize,
             (&mut status as *mut i32) as usize,
-            0,
+            options,
             0,
         );
         if ret != -4 {
-            return fd_result(ret).map(|_| std::process::ExitStatus::from_raw(status));
+            return fd_result(ret)
+                .map(|got| (got != 0).then(|| std::process::ExitStatus::from_raw(status)));
         }
     }
+}
+
+fn positive_pid(pid: u32) -> std::io::Result<i32> {
+    i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or(std::io::ErrorKind::InvalidInput.into())
+}
+
+/// kill(-1, ...) denotes every accessible process. A job group is always
+/// led by an unreaped child with a PID greater than one.
+pub(super) fn continue_job(pid: u32) -> std::io::Result<()> {
+    let group = positive_pid(pid)?;
+    if group <= 1 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    fd_result(syscall4(SYS_KILL, (-group) as usize, 18, 0, 0)).map(drop)
 }
 
 /// A kernel refusal, as the negative errno the raw ABI returns in place of
@@ -407,7 +436,7 @@ const _: () = assert!(TERMIOS_LEN == 4 * 4 + 1 + 19);
 const _: () = assert!(WINSIZE_LEN == 4 * 2);
 
 /// `ioctl(2)` is ONE syscall onto an unbounded space of operations, so the number
-/// in `rax` is not the surface — the request in `rsi` is. All three are pinned by
+/// in `rax` is not the surface — the request in `rsi` is. All five are pinned by
 /// VALUE, and `ioctl` below refuses anything outside this list BEFORE issuing,
 /// so the roster is enforced in code rather than only in a test.
 ///
@@ -418,7 +447,9 @@ const _: () = assert!(WINSIZE_LEN == 4 * 2);
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TIOCGWINSZ: usize = 0x5413;
-const IOCTL_REQUESTS: [usize; 3] = [TCGETS, TCSETS, TIOCGWINSZ];
+const TIOCGPGRP: usize = 0x540f;
+const TIOCSPGRP: usize = 0x5410;
+const IOCTL_REQUESTS: &[usize] = &[TCGETS, TCSETS, TIOCGWINSZ, TIOCGPGRP, TIOCSPGRP];
 
 /// The ONE `ioctl` call site, and the gate on its request.
 ///
@@ -426,7 +457,7 @@ const IOCTL_REQUESTS: [usize; 3] = [TCGETS, TCSETS, TIOCGWINSZ];
 /// has a reason to resize an operator's terminal), `TCSETSW`/`TCSETSF` (they
 /// drain or discard pending terminal I/O another process may own), and `TIOCSTI`
 /// (it injects input into a terminal, the classic escape from a restricted
-/// session). A fourth request is an amendment to UNSAFE.md.
+/// session). Another request is an amendment to UNSAFE.md.
 fn ioctl(fd: RawFd, request: usize, arg: usize) -> Result<(), String> {
     if !IOCTL_REQUESTS.contains(&request) {
         return Err(format!(
@@ -434,6 +465,43 @@ fn ioctl(fd: RawFd, request: usize, arg: usize) -> Result<(), String> {
         ));
     }
     check("ioctl", syscall4(SYS_IOCTL, fd as usize, request, arg, 0))
+}
+
+/// The interactive shell's physical stdin remains open across virtual redirections.
+pub(super) fn owns_terminal() -> bool {
+    let mut group = 0i32;
+    ioctl(0, TIOCGPGRP, (&mut group as *mut i32) as usize).is_ok()
+        && u32::try_from(group) == Ok(std::process::id())
+        // The child must remain waitable until we collect it. An inherited
+        // SIGCHLD ignore or SA_NOCLDWAIT would let its PID be recycled.
+        && query(17).is_ok_and(|action| {
+            let [_, flags, ..] = action;
+            decode(&action) == Some(Disposition::Default) && flags & 2 == 0
+        })
+}
+
+/// Linux sends SIGTTOU when a background group reclaims the terminal.
+/// Block it only on this thread for the ioctl, restoring the exact prior mask.
+pub(super) fn foreground(pid: u32) -> std::io::Result<()> {
+    let group = positive_pid(pid)?;
+    let ttou = 1u64 << (22 - 1);
+    let mut previous = 0u64;
+    fd_result(syscall4(
+        SYS_RT_SIGPROCMASK,
+        0,
+        (&ttou as *const u64) as usize,
+        (&mut previous as *mut u64) as usize,
+        SIGSETSIZE,
+    ))?;
+    let result = ioctl(0, TIOCSPGRP, (&group as *const i32) as usize);
+    fd_result(syscall4(
+        SYS_RT_SIGPROCMASK,
+        2,
+        (&previous as *const u64) as usize,
+        0,
+        SIGSETSIZE,
+    ))?;
+    result.map_err(std::io::Error::other)
 }
 
 /// `ioctl(fd, TCGETS, &mut termios)` — read the current line discipline.

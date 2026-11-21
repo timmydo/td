@@ -14,9 +14,7 @@
 //! The confined kernel interface for that handoff, signals, terminal state,
 //! readiness and umask is documented in UNSAFE.md §8 and pinned below.
 //!
-//! Still deferred, and each a further reviewed amendment: the half of job
-//! control that needs a job to be a PROCESS (see below), and
-//! CATCHING a signal — `trap 'action' SIG` needs a handler, and a handler on
+//! Catching a signal remains deferred — `trap 'action' SIG` needs a handler, and a handler on
 //! x86-64 needs a hand-laid `SA_RESTORER` trampoline to return through, where
 //! the two code-free dispositions run no handler at all and so need none.
 //! `trap '' SIG` is therefore already real, and reaches the children a script
@@ -24,9 +22,9 @@
 //! `std::io::pipe` descriptors — no `unsafe`, which is why that was a
 //! refinement rather than a syscall question. Async lists (`&`) now stream too,
 //! on threads of the same shape, with a real `$!` and a `wait` that answers for
-//! them (`jobs.rs`), plus `jobs` and the `%N` jobspecs that name one. What is
-//! still deferred is the part that needs a job to be a PROCESS: `fg`/`bg`, and
-//! the process group a signal would be aimed at.
+//! them (`jobs.rs`). A foreground external command in an interactive terminal
+//! gets a process group. A stopped group is a job for `fg`, `bg` and `wait`.
+//! Pipelines and asynchronous lists still run as shell threads.
 #![deny(unsafe_code)]
 
 #[allow(dead_code, reason = "shared fallible allocation helpers")]
@@ -501,6 +499,7 @@ fn repl(sh: &mut Shell) -> i32 {
     // one-line commands, a four-line `if`, and one more command.
     let mut line_base: u32 = 1;
     loop {
+        sh.jobs.reap();
         let mut buffer = String::new();
         let outcome = read_complete(&mut editor, sh, &mut buffer);
         // Counted before the run, and outside the emptiness test below: a blank
@@ -1026,10 +1025,10 @@ mod confinement {
         );
     }
 
-    /// The three ioctl requests are pinned by VALUE, since a name alone would let the number
+    /// The ioctl requests are pinned by VALUE, since a name alone would let the number
     /// change under it.
     #[test]
-    fn the_ioctl_requests_are_exactly_three_and_value_pinned() {
+    fn the_ioctl_requests_are_exactly_five_and_value_pinned() {
         // `ioctl(2)` is ONE syscall onto an unbounded space of operations, so
         // the number in `rax` is not the surface -- the request in `rsi` is.
         // The in-code roster refuses anything outside `IOCTL_REQUESTS`, but a
@@ -1041,6 +1040,8 @@ mod confinement {
             ("TCGETS", "0x5401"),
             ("TCSETS", "0x5402"),
             ("TIOCGWINSZ", "0x5413"),
+            ("TIOCGPGRP", "0x540f"),
+            ("TIOCSPGRP", "0x5410"),
         ];
         // Neighbours deliberately outside the surface, each a digit away from
         // something admitted: the two `TCSETS` variants that drain or discard
@@ -1109,6 +1110,8 @@ mod confinement {
         assert_eq!(
             seen,
             vec![
+                concat!("SYS", "_KILL:usize=62").to_string(),
+                concat!("SYS", "_RT_SIGPROCMASK:usize=14").to_string(),
                 concat!("SYS", "_WAIT4:usize=61").to_string(),
                 concat!("SYS", "_MEMFD_CREATE:usize=319").to_string(),
                 concat!("SYS", "_POLL:usize=7").to_string(),
@@ -1355,7 +1358,7 @@ mod confinement {
         let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            15,
+            18,
             "unexpected raw syscall site"
         );
         assert_eq!(
@@ -1379,7 +1382,10 @@ mod confinement {
             "SYS_FCNTL,fdasusize,F_GETFD,0,0)",
             "SYS_FCNTL,fdasusize,F_SETFD,FD_CLOEXEC,0)",
             "SYS_DUP3,src.as_raw_fd()asusize,destasusize,0,0,",
-            "SYS_WAIT4,pidasusize,(&mutstatusas*muti32)asusize,0,0,",
+            "SYS_WAIT4,pidasusize,(&mutstatusas*muti32)asusize,options,0,",
+            "SYS_KILL,(-group)asusize,18,0,0)",
+            "SYS_RT_SIGPROCMASK,0,(&ttouas*constu64)asusize,(&mutpreviousas*mutu64)asusize,SIGSETSIZE,",
+            "SYS_RT_SIGPROCMASK,2,(&previousas*constu64)asusize,0,SIGSETSIZE,",
             "SYS_CLOSE_RANGE,end,end,CLOSE_RANGE_UNSHARE,0)",
             "SYS_FCNTL,destasusize,F_SETFD,FD_CLOEXEC,0)",
         ] {
@@ -1402,6 +1408,9 @@ mod confinement {
             "constCLOSE_RANGE_UNSHARE:usize=2;",
             "letend=u32::MAXasusize;",
             "letmutstatus=0i32;",
+            "letoptions=matchhow{Wait::Exit=>0,Wait::Job=>2,Wait::PollJob=>1|2|8,};",
+            "letgroup=positive_pid(pid)?;ifgroup<=1{returnErr(std::io::ErrorKind::InvalidInput.into());}",
+            "letttou=1u64<<(22-1);",
         ] {
             assert_eq!(squeezed.matches(pin).count(), 1, "{pin}");
         }

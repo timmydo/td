@@ -241,12 +241,113 @@ impl Child {
     pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
         let status = match &mut self.process {
             Process::Native(c) => c.wait(),
-            Process::Pid(pid) => sys::wait_child(*pid),
+            Process::Pid(pid) => {
+                sys::wait_child(*pid, sys::Wait::Exit)?.ok_or(io::ErrorKind::Other.into())
+            }
         };
+        self.finish_drains()?;
+        status
+    }
+
+    fn finish_drains(&mut self) -> io::Result<()> {
         for thread in self.drains.drain(..) {
             JoinHandle::join(thread).map_err(|_| io::ErrorKind::Other)??;
         }
-        status
+        Ok(())
+    }
+
+    pub(super) fn id(&self) -> u32 {
+        match &self.process {
+            Process::Native(child) => child.id(),
+            Process::Pid(pid) => *pid,
+        }
+    }
+}
+
+/// The child leads a group created by Command::process_group(0).
+pub(super) struct TerminalJob {
+    pub child: Child,
+    pub stopped: Option<i32>,
+    pub exited: Option<ExitStatus>,
+    modes: Option<[u8; sys::TERMIOS_LEN]>,
+}
+
+impl TerminalJob {
+    pub fn new(child: Child) -> Self {
+        Self {
+            child,
+            stopped: None,
+            exited: None,
+            modes: None,
+        }
+    }
+
+    pub fn observe(&mut self, poll: bool) -> io::Result<Option<ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if self.exited.is_some() {
+            return Ok(self.exited);
+        }
+        let how = if poll {
+            sys::Wait::PollJob
+        } else {
+            sys::Wait::Job
+        };
+        let status = sys::wait_child(self.child.id(), how)?;
+        if let Some(status) = status {
+            self.stopped = status.stopped_signal();
+            if self.stopped.is_none() && !status.continued() {
+                self.exited = Some(status);
+                self.child.finish_drains()?;
+            }
+        }
+        Ok(status)
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        if self.stopped.is_some() {
+            sys::continue_job(self.child.id())?;
+            self.stopped = None;
+        }
+        Ok(())
+    }
+
+    pub fn foreground(&mut self, resume: bool) -> io::Result<ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut shell_modes = [0; sys::TERMIOS_LEN];
+        sys::termios_get(0, &mut shell_modes).map_err(io::Error::other)?;
+        if let Some(modes) = self.modes.as_ref().filter(|_| resume) {
+            sys::termios_set(0, modes).map_err(io::Error::other)?;
+        }
+        if let Err(error) = sys::foreground(self.child.id()) {
+            sys::termios_set(0, &shell_modes).map_err(io::Error::other)?;
+            return Err(error);
+        }
+        let result = (|| {
+            if resume {
+                self.resume()?;
+            }
+            let mut status = self.observe(false)?.ok_or(io::ErrorKind::Other)?;
+            // A newly spawned (or running background) reader may have reached
+            // the tty just before handoff and already stopped for tty I/O.
+            if matches!(status.stopped_signal(), Some(21 | 22)) {
+                self.resume()?;
+                status = self.observe(false)?.ok_or(io::ErrorKind::Other)?;
+            }
+            Ok(status)
+        })();
+        sys::foreground(std::process::id())?;
+        if result
+            .as_ref()
+            .is_ok_and(|status| status.stopped_signal().is_some())
+        {
+            let mut modes = [0; sys::TERMIOS_LEN];
+            sys::termios_get(0, &mut modes).map_err(io::Error::other)?;
+            self.modes = Some(modes);
+        }
+        if !result.as_ref().is_ok_and(|status| status.code().is_some()) {
+            sys::termios_set(0, &shell_modes).map_err(io::Error::other)?;
+        }
+        result
     }
 }
 

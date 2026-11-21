@@ -3700,7 +3700,7 @@ td-sh/src/expand.rs	allocation-macro	16
 td-sh/src/expand.rs	heap-owner	2
 td-sh/src/expand.rs	unchecked-growth-or-clone	54
 td-sh/src/funcs.rs	unchecked-growth-or-clone	1
-td-sh/src/jobs.rs	allocating-conversion	9
+td-sh/src/jobs.rs	allocating-conversion	7
 td-sh/src/jobs.rs	allocation-macro	3
 td-sh/src/jobs.rs	unchecked-growth-or-clone	5
 td-sh/src/lexer.rs	allocating-constructor	1

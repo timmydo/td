@@ -1,6 +1,6 @@
 //! Background jobs: what `&` starts and what `wait` collects.
 //!
-//! A job is a THREAD, for the same reason a pipeline stage is one: this shell
+//! An asynchronous list is a THREAD, for the same reason a pipeline stage is one: this shell
 //! clones itself in-process rather than forking, so the thing `&` starts is a
 //! `Subshell` that owns its state and a clone of the AST it runs. That is what
 //! makes `&` asynchronous at all -- before this, `&` ran the list to completion
@@ -43,14 +43,14 @@
 //! `td-sh -c 'sleep 100 &'` takes the full 100 seconds where bash returns at
 //! once. That is the wrong end state and it is bounded by the same thing job
 //! control is -- a job in a PROCESS of its own, which needs `fork(2)` or a
-//! re-exec, and is where `jobs`/`fg`/`bg` have to land too. It is not a
+//! re-exec. Only standalone foreground external jobs have a group to resume. It is not a
 //! regression against what this replaced: `&` used to run the list to
 //! completion before the NEXT command, so the shell blocked for the same
 //! duration and got no concurrency for it. And it is a visible failure rather
 //! than a silent one, which is the trade this crate takes everywhere else.
 //!
 //! A JOB'S STDIN IS `/dev/null`, which POSIX 2.9.3 requires of an asynchronous
-//! list wherever job control is disabled -- here, always. It reads as a nicety
+//! list wherever job control is disabled, including these threaded lists. It reads as a nicety
 //! and is the opposite: the script's own stdin is one descriptor with one
 //! offset, and `sh < script` reads the script through the very descriptor its
 //! commands share, deliberately, so that `cat` in a script sees the lines the
@@ -69,8 +69,30 @@
 
 use crate::ast::AndOr;
 use crate::exec::{self, Sig};
+use crate::fd_exec::TerminalJob;
 use crate::process::{self, Subshell};
+use std::os::unix::process::ExitStatusExt;
 use std::thread::JoinHandle;
+
+pub(super) fn status_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        128 + status
+            .stopped_signal()
+            .or_else(|| status.signal())
+            .unwrap_or(0)
+    })
+}
+
+pub(super) enum Resumed {
+    Background(u32),
+    Foreground(std::process::ExitStatus),
+}
+
+enum Task {
+    Thread(JoinHandle<i32>),
+    Terminal(TerminalJob),
+    Done(i32),
+}
 
 /// First job id. Above Linux's `PID_MAX_LIMIT` (4194304) so an id can never be
 /// mistaken for a live process -- see the module note on `kill $!`.
@@ -105,12 +127,7 @@ struct Job {
     /// joined, it just cannot be NAMED. Never matched by `wait_id`, since
     /// nothing can spell it.
     id: Option<u32>,
-    /// The running thread, or -- once reaped -- `None` and a status.
-    handle: Option<JoinHandle<i32>>,
-    /// Set when the thread has been joined, which a `wait` for this id then
-    /// answers with. A job is reaped as soon as it is seen to have FINISHED, so
-    /// the shell holds a status rather than a thread.
-    status: Option<i32>,
+    task: Task,
 }
 
 /// The shell's own background jobs. Not inherited by a clone: a subshell cannot
@@ -160,15 +177,30 @@ impl Jobs {
     ///
     /// `is_finished` is what makes it non-blocking: only threads already done
     /// are joined, so reaping never waits for anything.
-    fn reap(&mut self) {
+    pub fn reap(&mut self) {
         for job in &mut self.jobs {
-            if job.handle.as_ref().is_some_and(JoinHandle::is_finished) {
-                if let Some(handle) = job.handle.take() {
-                    job.status = Some(handle.join().unwrap_or(128));
+            match &mut job.task {
+                Task::Thread(handle) if handle.is_finished() => {
+                    if let Task::Thread(handle) = std::mem::replace(&mut job.task, Task::Done(128))
+                    {
+                        job.task = Task::Done(handle.join().unwrap_or(128));
+                    }
                 }
+                Task::Terminal(task) => {
+                    if let Ok(Some(status)) = task.observe(true) {
+                        if task.exited.is_some() {
+                            job.task = Task::Done(status_code(status));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        let collected = self.jobs.iter().filter(|j| j.handle.is_none()).count();
+        let collected = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.task, Task::Done(_)))
+            .count();
         let mut excess = collected.saturating_sub(REMEMBERED);
         // Oldest first, and only the ones already collected: a job still
         // RUNNING is never forgotten, because the shell has to join it. The
@@ -176,7 +208,7 @@ impl Jobs {
         // other two it gives the number back.
         let mut freed = Vec::new();
         self.jobs.retain(|j| {
-            if j.handle.is_none() && excess > 0 {
+            if matches!(j.task, Task::Done(_)) && excess > 0 {
                 excess -= 1;
                 freed.push(j.number);
                 return false;
@@ -211,6 +243,25 @@ impl Jobs {
                 |n| n.checked_add(1),
             )
             .ok();
+        self.add(id, Task::Thread(handle));
+        id
+    }
+
+    pub fn reserve_terminal(&mut self) -> Result<(), crate::allocation::Error> {
+        crate::allocation::reserve(&mut self.jobs, 1)
+    }
+
+    pub fn remember_terminal(&mut self, task: TerminalJob) {
+        let pid = task.child.id();
+        // The kernel can reuse a PID once its old status has been collected.
+        if let Some(at) = self.jobs.iter().position(|j| j.id == Some(pid)) {
+            let old = self.jobs.remove(at);
+            self.release(old.number);
+        }
+        self.add(Some(pid), Task::Terminal(task));
+    }
+
+    fn add(&mut self, id: Option<u32>, task: Task) {
         // The lowest number not currently in use, as both references do.
         let number = match self.free.pop() {
             Some(std::cmp::Reverse(n)) => n,
@@ -220,13 +271,22 @@ impl Jobs {
                 n
             }
         };
-        self.jobs.push(Job {
-            number,
-            id,
-            handle: Some(handle),
-            status: None,
-        });
-        id
+        self.jobs.push(Job { number, id, task });
+    }
+
+    /// Prefer a stopped job, then a running terminal job. Retained statuses
+    /// and threaded lists keep their relative order for scripted jobspecs.
+    fn recent(&self) -> impl Iterator<Item = &Job> {
+        (0..=2).flat_map(move |priority| {
+            self.jobs.iter().rev().filter(move |job| {
+                let rank = match &job.task {
+                    Task::Terminal(task) if task.stopped.is_some() => 0,
+                    Task::Terminal(_) => 1,
+                    _ => 2,
+                };
+                rank == priority
+            })
+        })
     }
 
     /// The id a `%…` jobspec names, or `None` if this shell has no such job.
@@ -237,17 +297,9 @@ impl Jobs {
     /// see `list` -- so they are refused rather than guessed at.
     pub fn spec_id(&self, spec: &str) -> Option<u32> {
         let rest = spec.strip_prefix('%')?;
-        // "Current" and "previous" are by START order, which is the table's
-        // order: nothing reorders it, and `retain`/`remove` keep it.
-        let nth_from_end = |n: usize| {
-            self.jobs
-                .len()
-                .checked_sub(n)
-                .and_then(|i| self.jobs.get(i))
-        };
         let job = match rest {
-            "%" | "+" => nth_from_end(1),
-            "-" => nth_from_end(2),
+            "%" | "+" => self.recent().next(),
+            "-" => self.recent().nth(1),
             digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
                 let number: u32 = digits.parse().ok()?;
                 // `position` + `get` rather than the searching adaptor: this
@@ -287,21 +339,29 @@ impl Jobs {
         // shown is whatever was true when the last `&` ran. Measured saying
         // `Running` for a job that had exited a fifth of a second earlier.
         self.reap();
-        let last = self.jobs.len();
+        let mut recent = self.recent();
+        let current = recent.next().map(|j| j.number);
+        let previous = recent.next().map(|j| j.number);
         let mut lines: Vec<(u32, String)> = self
             .jobs
             .iter()
-            .enumerate()
-            .map(|(at, job)| {
-                let mark = match at + 1 {
-                    n if n == last => '+',
-                    n if n + 1 == last => '-',
-                    _ => ' ',
+            .map(|job| {
+                let mark = if Some(job.number) == current {
+                    '+'
+                } else if Some(job.number) == previous {
+                    '-'
+                } else {
+                    ' '
                 };
-                let state = match (job.handle.is_some(), job.status) {
-                    (true, _) => "Running".to_string(),
-                    (false, Some(0)) | (false, None) => "Done".to_string(),
-                    (false, Some(code)) => format!("Done({code})"),
+                let done;
+                let state = match &job.task {
+                    Task::Done(0) => "Done",
+                    Task::Done(code) => {
+                        done = format!("Done({code})");
+                        &done
+                    }
+                    Task::Terminal(task) if task.stopped.is_some() => "Stopped",
+                    _ => "Running",
                 };
                 let line = match job.id {
                     Some(id) => format!("[{}] {mark} {state}\t{id}", job.number),
@@ -325,42 +385,76 @@ impl Jobs {
     /// gives this 0 whatever the jobs did, which is what "status is lost" in the
     /// corpus's own comment means.
     pub fn wait_all(&mut self) {
-        // Drained rather than iterated: a job collected once is gone, so a
-        // later `wait $id` for it reports no such job as bash does.
-        for mut job in std::mem::take(&mut self.jobs) {
-            if let Some(handle) = job.handle.take() {
-                let _ = handle.join();
-            }
+        let mut at = self.jobs.len();
+        while let Some(index) = at.checked_sub(1) {
+            self.wait_at(index);
+            at = index;
         }
-        // The table is empty, so the numbers start over rather than being handed
-        // back one at a time: `%1` means the first job again after a bare
-        // `wait`, which is what both references do.
-        self.free.clear();
-        self.next_number = 1;
+        if self.jobs.is_empty() {
+            self.free.clear();
+            self.next_number = 1;
+        }
     }
 
-    /// Is any job of this shell's still running? Only the `exec` path asks,
-    /// because replacing the process image is the one exit a join cannot follow.
     pub fn any_running(&self) -> bool {
-        self.jobs.iter().any(|j| j.handle.is_some())
+        self.jobs.iter().any(|j| matches!(j.task, Task::Thread(_)))
     }
 
-    /// `wait <id>`: collect that job and answer its status, or `None` if this
-    /// shell has no such job -- which includes one already collected.
     pub fn wait_id(&mut self, id: u32) -> Option<i32> {
         let at = self.jobs.iter().position(|j| j.id == Some(id))?;
-        let mut job = self.jobs.remove(at);
-        self.release(job.number);
-        match job.handle.take() {
-            // Already reaped: `reap` joined it when it was seen to have
-            // finished, and the status it left is the answer.
-            None => job.status,
-            // A job whose thread died leaves no status to report. It cannot
-            // happen through the closure below, which returns a status on every
-            // path, so this is the shape of a panic elsewhere -- and this crate
-            // aborts on one, so nothing observes the 128.
-            Some(handle) => Some(handle.join().unwrap_or(128)),
+        self.wait_at(at)
+    }
+
+    fn wait_at(&mut self, at: usize) -> Option<i32> {
+        let job = self.jobs.get_mut(at)?;
+        if let Task::Terminal(task) = &mut job.task {
+            // Consume a possible external SIGCONT before consulting the cached stop.
+            task.observe(true).ok()?;
+            if let Some(signal) = task.stopped {
+                return Some(128 + signal);
+            }
+            let status = task.observe(false).ok()??;
+            if task.exited.is_none() {
+                return Some(status_code(status));
+            }
+            job.task = Task::Done(status_code(status));
         }
+        let job = self.jobs.remove(at);
+        self.release(job.number);
+        match job.task {
+            Task::Done(code) => Some(code),
+            Task::Thread(handle) => Some(handle.join().unwrap_or(128)),
+            Task::Terminal(_) => None,
+        }
+    }
+
+    pub fn resume(
+        &mut self,
+        spec: Option<&str>,
+        foreground: bool,
+    ) -> Result<Resumed, &'static str> {
+        self.reap();
+        let at = self
+            .spec_id(spec.unwrap_or("%+"))
+            .and_then(|id| self.jobs.iter().position(|j| j.id == Some(id)))
+            .ok_or("no such job")?;
+        let job = self.jobs.get_mut(at).ok_or("no such job")?;
+        let Task::Terminal(task) = &mut job.task else {
+            return Err("job is not under terminal control");
+        };
+        if !foreground {
+            task.resume().map_err(|_| "cannot continue job")?;
+            return Ok(Resumed::Background(task.child.id()));
+        }
+        let status = task.foreground(true).map_err(|_| "cannot foreground job")?;
+        if task.exited.is_some() {
+            let job = self.jobs.remove(at);
+            self.release(job.number);
+        } else {
+            // The newly suspended job becomes current without changing its number.
+            self.jobs.get_mut(at..).ok_or("no such job")?.rotate_left(1);
+        }
+        Ok(Resumed::Foreground(status))
     }
 }
 
@@ -372,7 +466,11 @@ impl Jobs {
 /// holding that job.
 impl Drop for Jobs {
     fn drop(&mut self) {
-        self.wait_all();
+        for job in std::mem::take(&mut self.jobs) {
+            if let Task::Thread(handle) = job.task {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -791,7 +889,7 @@ pub fn spawn(mut child: Subshell, and_or: &AndOr) -> Result<JoinHandle<i32>, Str
     // interrupt guard and the kernel's signal dispositions are one cell shared
     // with whatever else is running, so neither is a job's to touch.
     child.concurrent = true;
-    // POSIX 2.9.3: with job control disabled -- which is this shell, always --
+    // POSIX 2.9.3: with job control disabled for asynchronous lists,
     // an asynchronous list's stdin is `/dev/null` BEFORE any explicit
     // redirection. Set on the table here, so a redirect the list writes for
     // itself still wins, and so a background PIPELINE's first stage gets it too.

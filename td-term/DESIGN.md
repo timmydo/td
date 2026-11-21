@@ -1257,19 +1257,18 @@ namespace, with bounded std file reads (`job.rs`), so asking adds no
 syscall: the kernel keeps the terminal's foreground process group, and the
 default shell, leading its session on the slave, reports it as `tpgid` in
 its `/proc/PID/stat`. Another group in the foreground is a job, which is
-how a shell with job control runs one. td's own shell has no job control
--- td-sh runs every command in its own group -- so the shell's group
+how a shell with job control runs one. td-sh gives a foreground external command
+its own group. Threaded pipelines share the shell's group, so that group
 holding any process but the shell is a job too. So is a process of the
 shell's session that a Control-z stopped (state `T` or `t`): it is in no
 foreground, but the hangup ends it with whatever it holds, and the prompt
-says it is stopped (under td-sh, whose jobs share its group, a stopped one
-is said to be running). One scan of the table's `stat` lines finds them,
+says it is stopped. One scan of the table's `stat` lines finds them,
 at most 65,536 entries of at most 4 KiB each, and runs only when a close
 is asked for, never per turn; an entry that vanishes between the listing
 and its read (`ENOENT`, or `ESRCH` from the read, a plain std read keeping
 the OS code that td-fs's path-naming errors would drop) is a process gone.
 A job a job-control shell runs in the background and has not stopped does
-not ask; one td-sh runs is in its group and does.
+not ask. A background command that shares the shell's group does.
 
 The child is the shell only while the kernel still names it as the program
 td-term started (`/proc/PID/stat`'s name is the exec'd path's last

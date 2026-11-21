@@ -196,7 +196,7 @@ one.
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
-| 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, `ioctl(2)` (three requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
+| 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
@@ -1299,11 +1299,25 @@ decoupling construct of their own.
 
 ## 8. `td-sh` — the shell
 
-The shell confines nine Linux syscalls to one instruction in
+The shell confines eleven Linux syscalls to one instruction in
 `td-sh/src/sys.rs`. The `umask` and `trap` builtins and process
 guards use `umask(2)` and disposition-only `rt_sigaction(2)`. The
 line editor uses three value-pinned `ioctl(2)` requests, and
 `read -t` uses `poll(2)` on one descriptor.
+
+For a foreground external command, an interactive shell that owns stdin's
+terminal (`TIOCGPGRP`, 0x540f, returns its PID) and retains child exit
+statuses starts a fresh group with `CommandExt::process_group(0)`.
+`TIOCSPGRP` (0x5410) on fd 0 hands the terminal to that child or back to
+the shell. Around this ioctl only, `rt_sigprocmask` blocks SIGTTOU (22)
+on the caller and restores the prior eight-byte mask. The exact-child
+`wait4` can request stops (WUNTRACED, 2) or poll background changes
+(WUNTRACED | WNOHANG | WCONTINUED, 11). A stopped child stays waitable.
+`fg` restores its terminal modes and foreground ownership before resuming
+it. `bg` resumes it in place. Only SIGCONT (18) can be sent, to the
+negative group ID of an owned unreaped child whose PID exceeds one.
+Pipelines, shell clones and asynchronous lists run on interpreter threads
+and retain their shared-group behavior.
 
 At startup, before starting an evaluator thread, the shell adopts
 inherited descriptors above stderr into its numbered table. It checks
@@ -1490,14 +1504,13 @@ Deliberately NOT in that surface: reading the mask out of
 `/proc/self/status`'s `Umask:` field (real and safe, but it answers only
 half the builtin, so it would buy a `/proc` dependency without removing
 the syscall); `chmod`/`fchmod` (`std::fs::set_permissions` covers them);
-`kill(2)`, `rt_sigprocmask(2)` and `sigaltstack(2)` — this shell sends no
-signals, blocks none, and runs on no alternate stack; a handler-bearing
+`sigaltstack(2)` — this shell runs on no alternate stack; a handler-bearing
 `rt_sigaction`, which is the `SA_RESTORER` question above and lands as its
 own amendment when `trap INT` is served for real.
 
-An additional syscall or a fourth `ioctl` request is an amendment here;
+An additional syscall or another `ioctl` request is an amendment here;
 `td-sh/src/main.rs`'s confinement tests assert the roster and its
-value-pinned numbers, that the three ioctl REQUESTS are value-pinned too
+value-pinned numbers, that the five ioctl REQUESTS are value-pinned too
 and named three times each — the declaration, the roster the gate checks
 against, and the one wrapper that issues them — with the five refused
 neighbours (`TCSETSW`, `TCSETSF`, `TIOCSWINSZ`, `TIOCSTI`, `TIOCSCTTY`)
@@ -1530,16 +1543,9 @@ gate has no terminal to ask. Every assertion above is about source TEXT,
 and a wrapper that returned a plausible value without issuing anything
 would satisfy all of them.
 
-`ioctl(2)` is the third, and it is td-util's surface arriving in the shell:
-the same `TCGETS`/`TCSETS`/`TIOCGWINSZ` roster, taken for the same reason
-that no stable `std` API exposes a terminal's mode or its width —
-`IsTerminal` answers only whether a descriptor IS one. Because `ioctl` is
-one syscall onto an unbounded space of operations, the number in `rax` is
-not the surface: the request in `rsi` is. All three are pinned by VALUE,
-and unlike td-util's per-wrapper form the roster is ENFORCED IN CODE — one
-`ioctl` entry point refuses anything outside the list before issuing, so a
-fourth request is a compile-time edit to a named array rather than a new
-call site somebody has to notice. Deliberately NOT in it: `TIOCSWINSZ`
+The shell shares td-util's mode and width requests and adds the two
+foreground-group requests above. The five values form the checked roster
+at the single `ioctl` entry point. Deliberately NOT in it: `TIOCSWINSZ`
 (the setter; nothing td ships has a reason to resize an operator's
 terminal), `TCSETSW`/`TCSETSF` (they drain or discard pending terminal I/O
 another process may own), and `TIOCSTI` (it injects input into a terminal,
@@ -1569,11 +1575,8 @@ its own prompt — which is what it did before the editor existed. With
 `ISIG` cleared, Ctrl-C arrives as a byte the editor acts on and the line
 is abandoned instead. The trade is bounded by the guard's lifetime: raw
 mode is taken PER LINE and dropped before any command runs, so a child
-still gets all three of Ctrl-C, Ctrl-\ and Ctrl-Z. Ctrl-Z is the one of
-the three nothing here answers: with no job control there is no `fg` and
-no parent to continue the process, so a stopped shell stays stopped —
-which is what dash does without job control too, and what job control is
-the fix for. Ctrl-C while a command is RUNNING is the other half, and
+still gets all three of Ctrl-C, Ctrl-\ and Ctrl-Z. A foreground external job can be stopped and resumed as described above.
+Ctrl-C while a command is RUNNING is the other half, and
 `rt_sigaction` serves it too: the shell ignores SIGINT and SIGQUIT for
 exactly as long as it waits, so the driver's signal ends the command and
 leaves the shell. NOT inside a pipeline, though, and that exception is
@@ -1633,8 +1636,7 @@ INSIDE the guard with nothing left to die of it is lost outright rather
 than deferred, for the same reason: with no handler there is nowhere to
 record that it arrived. That is not only a timing tail. `kill -INT $$` is
 DETERMINISTICALLY swallowed, and it is the POSIX idiom for a script to end
-itself as if by the terminal: this shell has no `kill` builtin — sending a
-signal would need `kill(2)`, which is not on this surface — so `kill` is
+itself as if by the terminal: this shell has no general-purpose `kill` builtin, so `kill` is
 an external command, always inside the guard, and the signal it sends to
 the shell arrives on an ignored disposition and is discarded. `sh -c 'kill
 -INT $$; echo alive'` prints `alive` here where dash and bash report 130
@@ -1647,10 +1649,8 @@ Both are inherent to installing none, since a
 shell that ignored the signal while doing its own work would lose the
 keystroke instead of surviving it. Closing either needs somewhere to
 RECORD the signal — a handler — or the child in a process group of its
-own. Real job control, with the child in that group and the terminal
-handed to it, closes it properly and is the better answer, and is still
-deferred: it needs `setpgid(2)` and a `TIOCSPGRP` ioctl, which is an
-amendment here rather than a use of what the surface already has.
+own. Interactive foreground external commands use that
+separate group. The shared-group signal guard still serves scripts.
 
 A BACKGROUND JOB now runs while that guard is held, which nothing did
 before `&` became asynchronous, and it is recorded rather than measured:

@@ -1292,10 +1292,6 @@ fn is_own_redirected_compound(cmd: &Cmd) -> bool {
 /// `may_set_signal` is what remembers that, and a shell that already ignores
 /// SIGINT already survives this.
 ///
-/// Real job control — the child in its own process group with the terminal handed
-/// to it — is the answer to both, and is deferred: it needs `setpgid(2)` and a
-/// `TIOCSPGRP` ioctl, which is an amendment to `UNSAFE.md` rather than a use of
-/// what is already there.
 pub(crate) struct InterruptibleChild {
     /// Whether this guard holds a REFERENCE, and so owes one back. What was
     /// actually installed lives in `GUARD` rather than here: the dispositions
@@ -1441,7 +1437,7 @@ impl InterruptibleChild {
             return Self { held: true };
         }
         let mut restore = [false; HELD.len()];
-        for (slot, sig) in restore.iter_mut().zip(HELD) {
+        for (slot, &sig) in restore.iter_mut().zip(HELD) {
             // Not the shell's to change if someone handed it an ignore -- and
             // nothing to do in that case either, since an ignored signal cannot
             // kill it.
@@ -1494,7 +1490,7 @@ impl Drop for InterruptibleChild {
         }
         let restore = guard.restore;
         guard.restore = [false; HELD.len()];
-        for (taken, sig) in restore.iter().zip(HELD) {
+        for (taken, &sig) in restore.iter().zip(HELD) {
             if *taken {
                 // Only a signal the guard found at `SIG_DFL` and changed itself
                 // is here, so `SIG_DFL` is what goes back. Asking for it outright
@@ -1512,7 +1508,7 @@ impl Drop for InterruptibleChild {
 /// operator meant them for. Ctrl-\ arrives exactly as Ctrl-C does, and a shell
 /// that survived one and died on the other would be a coin toss from the
 /// keyboard; dash and bash both outlive both.
-const HELD: [u8; 2] = [SIGINT, SIGQUIT];
+const HELD: &[u8] = &[SIGINT, SIGQUIT];
 
 /// The signal a terminal's interrupt character raises. The one definition in
 /// the crate: `main.rs` reads it to decide whether the editor may treat Ctrl-C
@@ -2262,7 +2258,17 @@ fn run_external(
     let word = arg0.unwrap_or(program);
     let args: Vec<&OsStr> = argv.iter().skip(1).map(OsStr::new).collect();
     let mut cmd = external_command(sh, resolved.as_os_str(), word, args.iter().copied());
-    let mut spawned = spawn_uninherited(sh, &mut cmd);
+    let controlled = sh.interactive && !sh.cloned && !replacing && crate::sys::owns_terminal();
+    if controlled {
+        sh.jobs.reserve_terminal().map_err(|_| Sig::Abort(1))?;
+    }
+    let launch = |sh: &mut Shell, cmd: &mut Command| {
+        if controlled {
+            std::os::unix::process::CommandExt::process_group(cmd, 0);
+        }
+        spawn_uninherited(sh, cmd)
+    };
+    let mut spawned = launch(sh, &mut cmd);
     // A file the kernel will not execute -- no `#!`, not an ELF -- is a
     // script for THIS shell, as POSIX asks and ash does: `tryexec`
     // (ash.c:8267) re-executes its own binary with the script as its first
@@ -2282,7 +2288,7 @@ fn run_external(
         let mut script: Vec<&OsStr> = vec![OsStr::new("--"), OsStr::new(&name)];
         script.extend(args.iter().copied());
         cmd = external_command(sh, OsStr::new(SELF_EXE), "sh", script.iter().copied());
-        spawned = spawn_uninherited(sh, &mut cmd);
+        spawned = launch(sh, &mut cmd);
     }
 
     let mut child = match spawned {
@@ -2309,39 +2315,20 @@ fn run_external(
     // Keep the guard until capture pipes inherited by descendants close.
     let interrupt_guard = InterruptibleChild::hold(sh);
 
-    let status = child.wait();
+    let status = if controlled {
+        let mut task = crate::fd_exec::TerminalJob::new(child);
+        let result = task.foreground(false);
+        if task.exited.is_none() {
+            sh.jobs.remember_terminal(task);
+        }
+        result
+    } else {
+        child.wait()
+    };
     drop(interrupt_guard);
 
     match status {
-        Ok(status) => {
-            // A signal-terminated child reports 128 + signal number (POSIX).
-            let code = status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-            sh.set_status(code);
-            // A child the INTERRUPT killed abandons what the shell was doing, or
-            // Ctrl-C would end one `sleep` of `for i in 1 2 3; do sleep 10; done`
-            // and go straight on to the next -- a loop nothing can stop, which is
-            // a worse answer than the death this guard was added to prevent. This
-            // stands in for the SIGINT the shell itself was sent, and `Sig::Abort`
-            // is exactly that shape: it ends a script, and returns an interactive
-            // shell to its prompt.
-            //
-            // Standing in for it means asking whether the shell would have DIED of
-            // it. The guard is already dropped, so the disposition here is the
-            // shell's own: under `trap '' INT` -- or a SIGINT ignored on entry, the
-            // `nohup` case -- the signal would have done nothing to this process,
-            // and inferring an abort from the child's death would end a script the
-            // operator asked to be uninterruptible.
-            // Only a child the KERNEL killed is visible here. A nested td-sh
-            // that aborted reports 130 as an ordinary exit, so this cannot see
-            // it and `for i in 1 2 3; do sh -c '...'; done` runs on; dash and
-            // bash avoid that by dying OF the signal, which needs `kill(2)`.
-            if status.signal() == Some(i32::from(SIGINT)) && dies_of_interrupt() {
-                return Err(Sig::Interrupt(code));
-            }
-            Ok(())
-        }
+        Ok(status) => job_status(sh, status),
         Err(e) => {
             let (why, code) = exec_failure(&e);
             let _ = exec::diag(sh, &format!("{program}: {why}"));
@@ -2349,6 +2336,20 @@ fn run_external(
             Ok(())
         }
     }
+}
+
+/// A stop or a keyboard interrupt abandons the current interactive unit.
+pub(super) fn job_status(sh: &mut Shell, status: std::process::ExitStatus) -> R<()> {
+    let code = crate::jobs::status_code(status);
+    sh.set_status(code);
+    if status.stopped_signal().is_some() {
+        let _ = write_fd(sh, 2, b"\nStopped\n");
+        return Err(Sig::Interrupt(code));
+    }
+    if status.signal() == Some(i32::from(SIGINT)) && dies_of_interrupt() {
+        return Err(Sig::Interrupt(code));
+    }
+    Ok(())
 }
 
 /// `command -p`'s default utility path: ash's `bb_default_path`, which is

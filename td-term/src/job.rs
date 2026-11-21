@@ -5,8 +5,8 @@
 //! The kernel keeps the terminal's foreground process group, and a
 //! session leader's `/proc/PID/stat` reports it (`tpgid`). A shell with job
 //! control hands the terminal to each job's group, so another group in the
-//! foreground is a job. td's own shell has no job control: its commands
-//! run in its own group, so the shell's group holding any process but the
+//! foreground is a job. Threaded pipeline stages can share the shell's group,
+//! so the shell's group holding any process but the
 //! shell is a job too, and so is a job a Control-z stopped, which the
 //! hangup would end with whatever it holds. Only a close asks, so the
 //! scan of `/proc` that finds them runs once per close request, not per

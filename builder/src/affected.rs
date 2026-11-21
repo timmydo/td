@@ -10478,6 +10478,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",
@@ -10505,7 +10506,8 @@ mod tests {
         // and td-kexec and td-update, which read td-boot, add two each, as do
         // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 84, "{comp:?}");
+        // td-sh exercises its job control through the toolkit PTY in its tests.
+        assert_eq!(comp.len(), 86, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10539,6 +10541,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",
@@ -10583,6 +10586,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",
