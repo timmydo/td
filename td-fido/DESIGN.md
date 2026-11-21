@@ -265,3 +265,7 @@ the authenticator. Its CTAP 2.0 mode (`Config::one_secret`) keeps one
 hmac-secret for assertions with and without UV whatever versions it
 claims, so the no-PIN probe's refusal is testable. The vectors and
 their optional host generators live under `tests/`.
+
+System FIDO discovery excludes the virtual device with physical path
+`td/firefox-passkeys`, including before its Firefox group is assigned.
+The shared 64-byte HID codec also frames and decodes diagnostic PINGs.

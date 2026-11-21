@@ -1,6 +1,8 @@
 //! The device-bound passkey store used by td-pass.
 #![forbid(unsafe_code)]
 mod credential;
+pub mod hid;
+pub mod uhid;
 mod vault;
 
 pub use credential::{Account, Approval};
@@ -284,6 +286,118 @@ mod tests {
         assert!(cred.assertion(&r, Approval::Verified).is_err());
     }
 
+    struct Browser {
+        device: hid::Authenticator,
+        channel: u32,
+    }
+    impl Browser {
+        fn open() -> Self {
+            use td_fido::fido_hid as wire;
+            let mut device = hid::Authenticator::default();
+            let mut init = wire::Initialization::new(wire::BROADCAST, [38; 8]).unwrap();
+            let packet = init.request().unwrap();
+            let mut channel = None;
+            device
+                .receive(&packet.as_ref()[0], Instant::now(), |r| {
+                    channel = init.push(r).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            let mut browser = Self {
+                device,
+                channel: channel.unwrap(),
+            };
+            let (command, reply) = browser.send(&[4]);
+            assert!(command.is_none());
+            assert_eq!(reply[0], 0);
+            let info = decode(&reply[1..]).unwrap();
+            assert!(info.get(&Value::Unsigned(4)).unwrap().is_some());
+            browser
+        }
+        fn send(&mut self, packet: &[u8]) -> (Option<hid::Command>, Vec<u8>) {
+            use td_fido::fido_hid as wire;
+            let mut response = wire::Decoder::cbor(self.channel).unwrap();
+            let mut body = vec![];
+            let mut command = None;
+            for report in wire::cbor(self.channel, packet).unwrap().as_ref() {
+                command = self
+                    .device
+                    .receive(report, Instant::now(), |r| {
+                        if let wire::Event::Complete(reply) = response.push(r).unwrap() {
+                            body.extend(reply.as_ref());
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            (command, body)
+        }
+        fn command(&mut self, packet: &[u8]) -> hid::Command {
+            let (pending, reply) = self.send(packet);
+            assert!(reply.is_empty());
+            pending.unwrap()
+        }
+        fn finish(&mut self, command: hid::Command, body: &[u8]) -> Vec<u8> {
+            use td_fido::fido_hid as wire;
+            let mut response = wire::Decoder::cbor(self.channel).unwrap();
+            let mut bytes = vec![];
+            self.device
+                .finish(command.ticket(), 0, body, |r| {
+                    if let wire::Event::Complete(reply) = response.push(r).unwrap() {
+                        bytes.extend(reply.as_ref());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(bytes[0], 0);
+            bytes[1..].to_vec()
+        }
+    }
+
+    #[test]
+    fn cancelled_channel_cannot_complete_or_send_management_to_a_worker() {
+        use td_fido::fido_hid as wire;
+        let mut browser = Browser::open();
+        let cmd = browser.command(&registration());
+        for frame in wire::cancel(browser.channel).unwrap().as_ref() {
+            browser
+                .device
+                .receive(frame, Instant::now(), |_| Ok(()))
+                .unwrap();
+        }
+        assert!(matches!(
+            browser.device.finish(cmd.ticket(), 0, &[], |_| Ok(())),
+            Err(Error::Stale)
+        ));
+        for op in [6, 7, 8, 0x0a, 0x0d, 0x40] {
+            let (command, reply) = browser.send(&[op]);
+            assert!(command.is_none());
+            assert_eq!(reply, [td_fido::web_request::Error::InvalidCommand as u8]);
+        }
+    }
+
+    #[test]
+    fn ping_echoes_empty_and_fragmented_messages_without_a_worker() {
+        use td_fido::fido_hid as wire;
+        let mut b = Browser::open();
+        for n in [0, 1, 57, 58, 150, wire::MAX_MESSAGE] {
+            let data = vec![42; n];
+            let reports = wire::ping(b.channel, &data).unwrap();
+            let mut echoed = Vec::new();
+            for report in reports.as_ref() {
+                assert!(b
+                    .device
+                    .receive(report, Instant::now(), |r| {
+                        echoed.push(*r);
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_none());
+            }
+            assert_eq!(echoed, reports.as_ref());
+        }
+    }
+
     struct Socket(UnixStream);
     impl Transport for Socket {
         fn exchange(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, String> {
@@ -367,11 +481,14 @@ mod tests {
             Enrollment::AcceptLossOfOriginalTpm,
         )
         .unwrap();
-        let request = registration();
-        let Request::Create(r) = parse(&request).unwrap() else {
+        let mut browser = Browser::open();
+        let cmd = browser.command(&registration());
+        let Request::Create(r) = cmd.request().unwrap() else {
             panic!("registration")
         };
-        let (id, public) = key_from_registration(&vault.register(&r, Approval::Verified).unwrap());
+        let created = vault.register(&r, Approval::Verified).unwrap();
+        let (id, public) = key_from_registration(&browser.finish(cmd, &created));
+        drop(browser);
         assert!(matches!(
             Vault::unlock(&dir, client(), &name, &pin),
             Err(Error::Locked)
@@ -396,8 +513,16 @@ mod tests {
         let hash = digest(
             br#"{"type":"webauthn.get","origin":"https://accounts.example","challenge":"Ag"}"#,
         );
+        let mut browser = Browser::open();
+        let cmd = browser.command(&probe(SITE, &digest(b""), &id));
+        let Request::Get(probe) = cmd.request().unwrap() else {
+            panic!("probe")
+        };
+        let reply = vault.preflight(&probe).unwrap();
+        browser.finish(cmd, &reply);
         let request = get(SITE, &hash);
-        let Request::Get(r) = parse(&request).unwrap() else {
+        let cmd = browser.command(&request);
+        let Request::Get(r) = cmd.request().unwrap() else {
             panic!("assertion")
         };
         let mut accounts = Vec::new();
@@ -408,11 +533,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(accounts, vec![id]);
-        verify(
-            &vault.sign(&r, &id, Approval::Verified).unwrap(),
-            &public,
-            &hash,
-        );
+        let assertion = vault.sign(&r, &id, Approval::Verified).unwrap();
+        verify(&browser.finish(cmd, &assertion), &public, &hash);
+        let Request::Get(r) = parse(&request).unwrap() else {
+            panic!("assertion")
+        };
         vault.delete(&id).unwrap();
         drop(vault);
         let vault = Vault::unlock(&dir, client(), &name, &pin).unwrap();

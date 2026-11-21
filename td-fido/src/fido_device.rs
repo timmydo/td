@@ -180,7 +180,12 @@ impl Device {
             .lines()
             .filter_map(|line| line.strip_prefix("HID_ID="));
         let id = ids.next().ok_or("missing token bus metadata")?;
-        if ids.next().is_some() || !id.starts_with("0003:") {
+        if ids.next().is_some()
+            || !id.starts_with("0003:")
+            || event
+                .lines()
+                .any(|line| line == "HID_PHYS=td/firefox-passkeys")
+        {
             return Err("token is not a USB HID device".into());
         }
         descriptor(&bounded_file(&descriptor_path, MAX_DESCRIPTOR)?)?;

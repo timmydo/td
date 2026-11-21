@@ -40,3 +40,11 @@ With swtpm 0.10.1 on PATH, run the persistent-store scenario with
 It covers enrollment refusal, the PIN retry counter, encrypted storage,
 reopening, site sign-in, deletion and corruption. It uses no hidraw
 device.
+
+The device transport accepts the unnumbered 64-byte FIDO HID reports.
+Every ceremony receives a private transaction identifier. Cancellation,
+resynchronization or an absolute deadline invalidates the identifier.
+Only parsed website operations reach a worker. The transport handles
+initialization, echo and authenticator information locally. Its UHID
+descriptor lives with the root session owner. Only the kernel virtual
+device carrying its random identity can be published to Firefox.
