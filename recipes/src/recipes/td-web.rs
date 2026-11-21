@@ -6,7 +6,8 @@ use crate::types::Recipe;
 /// beside it (td-css, td-dom and td-layout among them, which style and
 /// lay out its pages), td-compositor for the font and wire sources td-ui mounts,
 /// engine for td-png's checksums, td-inflate for its decoder and td-util for its DEFLATE
-/// encoder, the dev-only td-fs its tests' scratch comes from, the
+/// encoder, the dev-only td-fs its tests' scratch comes from and
+/// td-test-compositor its native cases drive the compositor with, the
 /// `td-web-source` seed pinned by the compiled local-source roster, and the
 /// crate's committed lock naming itself and those crates.
 pub fn recipe() -> Recipe {
@@ -33,6 +34,7 @@ pub fn recipe() -> Recipe {
             "td-compositor",
             "engine",
             "td-inflate",
+            "td-test-compositor",
         ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
@@ -75,6 +77,7 @@ mod tests {
                 "td-compositor".into(),
                 "engine".into(),
                 "td-inflate".into(),
+                "td-test-compositor".into(),
             ])
         );
         assert_eq!(r.cargo_subdir.as_deref(), Some("td-web"));
@@ -114,6 +117,7 @@ mod tests {
                 "td-jpeg",
                 "td-layout",
                 "td-png",
+                "td-test-compositor",
                 "td-ui",
                 "td-url",
                 "td-web",

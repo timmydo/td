@@ -7418,7 +7418,8 @@ mod tests {
                 "td-term",
                 "td-ui",
                 "td-vm",
-                "td-vm-guest"
+                "td-vm-guest",
+                "td-web"
             ]
         );
         // Jail, login, update and the VM helper share the primary-account reader;
@@ -10491,10 +10492,10 @@ mod tests {
                 "td-web"
             ]
         );
-        // td-agent's, td-photo's, td-mail's, td-pass's and td-pinentry's
-        // native cases make their commands three, as td-setup's are; td-dua,
-        // td-news, td-review, td-sandbox, td-software, td-term and td-web, toolkit
-        // consumers with no native case, add two each.
+        // td-agent's, td-photo's, td-mail's, td-pass's, td-pinentry's and
+        // td-web's native cases make their commands three, as td-setup's are;
+        // td-dua, td-news, td-review, td-sandbox, td-software and td-term,
+        // toolkit consumers with no native case, add two each.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
         // fixture makes td-mta a reader through td-mail.
@@ -10507,7 +10508,7 @@ mod tests {
         // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
         // The format check rides with the workspace.
         // td-sh exercises its job control through the toolkit PTY in its tests.
-        assert_eq!(comp.len(), 86, "{comp:?}");
+        assert_eq!(comp.len(), 87, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(

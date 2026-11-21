@@ -2233,12 +2233,24 @@ kinds above alone; a `data:` URL makes none. No executable memory (§2).
    "Memory", "Painting" and "Time", and §3). Measured with increment 8
    (below): the WHATWG HTML and ECMAScript specifications cut to 2 MiB,
    SANE's list of backends and long Wikipedia articles, the sheets term
-   and `WORKING` for parsing and compiling. Not yet done, and still
-   this increment's though it has landed: td-web run
-   under a headless td-compositor at those outputs (td-test-compositor's
-   output is 800x600 and td-web has no native-compositor tests); and
-   whether sizes rounded to device pixels move a page's lines visibly
-   against an unrounded layout.
+   and `WORKING` for parsing and compiling. Run as a process under a
+   headless td-compositor at 1920x1200 and 3840x2160, each at scale one,
+   the headless compositor's only scale (`tests/control_process.rs`,
+   the gate's native case, over a mock td-fetch service): the window
+   fills the output but for td-compositor's frame, fetches a page and
+   its picture, reads back as its words over the control socket, and
+   the compositor's capture of it has the digest of the seam's frame of
+   it, both on the cell face (`TD_UI_FACE=bitmap`), with the picture's
+   pixels on it; the seat's Tab and Return follow a link, and Ctrl+Q
+   closes the window. The state first read the page loaded 343 and 500
+   ms after launch in a release build on the development host; in the
+   gate's debug build a 3840x2160 `frame` takes about a second and the
+   compositor's capture about two and a half, so the case asks both
+   again past their five-second exchange bounds on a loaded host. Not
+   yet done, and still this increment's
+   though it has landed: the 3840x2160 output at scale two, which needs
+   a headless output of that scale; and whether sizes rounded to device
+   pixels move a page's lines visibly against an unrounded layout.
 8. **Stylesheets**: `<link rel=stylesheet>` and `@import` as
    "Subresources" says. Landed. Validation through the injected
    fetcher, in-process: cascade order of links, `<style>` elements and

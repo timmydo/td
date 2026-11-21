@@ -7,6 +7,14 @@ license = "MIT"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+# The native cases launch the window under the real headless td-compositor
+# at the outputs its pages were measured at (tests/control_process.rs).
+native-compositor-tests = true
+# They bind the window's control socket under the harness's directory in
+# /tmp, which td-ui's binder refuses where the gate's namespace shows an
+# ancestor as owned by no one; the gate's test runs take the builder's
+# caller-owned root instead, as td-photo's and td-taskmgr's do.
+trusted-test-root = true
 
 [[bin]]
 name = "td-web"
@@ -46,6 +54,8 @@ td-ui = { path = "../td-ui" }
 td-url = { path = "../td-url" }
 td-webp = { path = "../td-webp" }
 
-# Test scratch, owned by td-fs's TempDir guard (AGENTS.md "Parallel work").
+# Test scratch, owned by td-fs's TempDir guard (AGENTS.md "Parallel work"),
+# and the native cases' headless compositor harness.
 [dev-dependencies]
 td-fs = { path = "../td-fs" }
+td-test-compositor = { path = "../td-test-compositor" }
