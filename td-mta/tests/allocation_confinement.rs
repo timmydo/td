@@ -48,6 +48,28 @@ fn readiness_users(relative: &str, source: &str) {
             }
             0
         }
+        "td-mta/src/acme/challenge.rs" => {
+            let compact: String = source.split_whitespace().collect();
+            for expected in [
+                "PollSet::new(&receiver.socket)",
+                "poll.add_tcp_listener(listener)",
+                "poll.add_connected(Connected::Tcp(&slot.stream),",
+                "slots:&[Option<Slot>;PEER_SLOTS]",
+                "constPEER_SLOTS:usize=8;",
+            ] {
+                assert!(compact.contains(expected), "{relative}: {expected}");
+            }
+            for (token, count) in [
+                ("PollSet", 2),
+                ("Connected", 2),
+                ("add_connected", 1),
+                ("add_tcp_listener", 1),
+                ("add_unix_listener", 0),
+            ] {
+                assert_eq!(words(source, token), count, "{relative}: {token}");
+            }
+            1
+        }
         "td-mta/src/smtp_receiving/wait.rs" => {
             let compact: String = source.split_whitespace().collect();
             for expected in [

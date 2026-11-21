@@ -3699,7 +3699,9 @@ aarch64). Each eight-byte C-layout pollfd holds a transparent
 `BorrowedFd` and two 16-bit event fields. HTTPS and direct SMTP each admit
 at most 49 entries: one private Unix wake receiver, up to 16 listeners
 and up to 32 connected sockets. SMTP borrows TCP sockets. HTTPS also
-admits Unix sockets. Only connected sockets can request writable
+admits Unix sockets. The ACME HTTP-01 responder borrows a private stop
+receiver, at most one TCP listener and up to eight connected TCP sockets.
+Only connected sockets can request writable
 readiness. PostgreSQL and single-socket transport waits pass
 one connected socket and optionally a private Unix wake receiver.
 All descriptors remain borrowed through the call. The syscall receives

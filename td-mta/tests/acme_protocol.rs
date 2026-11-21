@@ -509,7 +509,6 @@ fn complete_issuance_over_verified_local_https() {
     use std::{
         net::TcpListener,
         path::Path,
-        sync::atomic::{AtomicBool, Ordering},
         time::{Duration, Instant},
     };
     use td_crypto::{
@@ -569,7 +568,7 @@ fn complete_issuance_over_verified_local_https() {
         expires: Instant::now() + ATTEMPT_DURATION * ATTEMPTS,
     }));
     store.1 = Some(current.clone());
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(acme::challenge::Control::default());
     let http_stop = stop.clone();
     let http_worker = std::thread::spawn(move || {
         acme::challenge::run(challenge_listener, &current, &http_stop).unwrap()
@@ -577,7 +576,7 @@ fn complete_issuance_over_verified_local_https() {
     let child_stop = stop.clone();
     let worker = std::thread::spawn(move || {
         let limit = Instant::now() + ATTEMPT_DURATION * ATTEMPTS;
-        while !child_stop.load(Ordering::Acquire) && Instant::now() < limit {
+        while !child_stop.stopped() && Instant::now() < limit {
             let socket = match listener.accept() {
                 Ok((s, _)) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -670,10 +669,13 @@ fn complete_issuance_over_verified_local_https() {
             }
         }
     });
-    struct Stop(Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>);
+    struct Stop(
+        Arc<acme::challenge::Control>,
+        Vec<std::thread::JoinHandle<()>>,
+    );
     impl Drop for Stop {
         fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
+            self.0.stop();
             for worker in self.1.drain(..) {
                 let _ = worker.join();
             }

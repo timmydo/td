@@ -3,10 +3,7 @@ use super::{config_failure, ConfigFailure};
 use std::{
     ffi::OsString,
     net::{SocketAddr, TcpListener},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        RwLock,
-    },
+    sync::RwLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use td_crypto::{Entropy, SystemEntropy, TrustStore};
@@ -71,10 +68,10 @@ fn now() -> Result<i64, acme::Error> {
     )
     .map_err(|_| acme::Error::Deadline)
 }
-struct Stop<'a>(&'a AtomicBool);
+struct Stop<'a>(&'a acme::challenge::Control);
 impl Drop for Stop<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.stop();
     }
 }
 pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
@@ -113,19 +110,19 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
         authorization: String::new(),
         expires: Instant::now(),
     });
-    let stop = AtomicBool::new(false);
+    let stop = acme::challenge::Control::default();
     std::thread::scope(|scope| {
         let _stop = Stop(&stop);
         let challenge = std::thread::Builder::new()
             .name("acme-http01".into())
             .spawn_scoped(scope, || {
                 let result = acme::challenge::run(listener, &current, &stop);
-                stop.store(true, Ordering::Release);
+                stop.stop();
                 result
             })
             .map_err(|_| config_failure("acme", "worker"))?;
         let mut next = Instant::now();
-        while !stop.load(Ordering::Acquire)
+        while !stop.stopped()
             && !super::signal_sys::requested().map_err(|_| config_failure("acme", "signals"))?
         {
             if Instant::now() < next {
@@ -230,7 +227,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 }
             }
         }
-        stop.store(true, Ordering::Release);
+        stop.stop();
         challenge
             .join()
             .map_err(|_| config_failure("acme", "worker"))?

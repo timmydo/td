@@ -1,6 +1,10 @@
-//! Dedicated HTTP-01 responder: exact host/token, two independently serviced peer slots.
+//! Dedicated HTTP-01 responder: exact host/token on bounded, independently serviced peer slots.
 use super::Error;
-use crate::smtp_rate::PeerKey;
+use crate::{
+    network_wake::{Notifications, Receiver},
+    readiness_sys::{Connected, Interest, PollSet},
+    smtp_rate::PeerKey,
+};
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -16,16 +20,39 @@ pub struct Current {
     pub authorization: String,
     pub expires: Instant,
 }
+const PEER_SLOTS: usize = 8;
+const LIFETIME: Duration = Duration::from_secs(5);
+const ACCEPT_RETRY: Duration = Duration::from_millis(10);
+
+#[derive(Default)]
+pub struct Control {
+    stopped: AtomicBool,
+    wake: Notifications,
+}
+
+impl Control {
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.wake.notify();
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
 pub fn run(
     listener: TcpListener,
     current: &RwLock<Current>,
-    stop: &AtomicBool,
+    control: &Control,
 ) -> Result<(), Error> {
     listener
         .set_nonblocking(true)
         .map_err(|_| Error::Transport)?;
-    let mut slots: [Option<Slot>; 2] = [None, None];
-    while !stop.load(Ordering::Acquire) {
+    let receiver = control.wake.attach().map_err(|_| Error::Transport)?;
+    let mut slots: [Option<Slot>; PEER_SLOTS] = [const { None }; PEER_SLOTS];
+    let mut accept_after = Instant::now();
+    while !control.stopped() {
         for slot in &mut slots {
             if let Some(active) = slot {
                 if !active.step(current, Instant::now()).unwrap_or(false) {
@@ -33,25 +60,56 @@ pub fn run(
                 }
             }
         }
-        // Bound accept work even when the listener stays readable.
-        for _ in 0..16 {
-            match listener.accept() {
-                Ok((stream, address)) => {
-                    let now = Instant::now();
-                    let peer = PeerKey::from(address.ip());
-                    if let Some(place) = available(&mut slots, peer, now) {
-                        if stream.set_nonblocking(true).is_ok() {
-                            *place = Some(Slot::new(stream, peer, now));
+        if Instant::now() >= accept_after {
+            // Bound accept work even when the listener stays readable.
+            for _ in 0..16 {
+                match listener.accept() {
+                    Ok((stream, address)) => {
+                        let now = Instant::now();
+                        let peer = PeerKey::from(address.ip());
+                        if let Some(place) = available(&mut slots, peer, now) {
+                            if stream.set_nonblocking(true).is_ok() {
+                                *place = Some(Slot::new(stream, peer, now));
+                            }
                         }
                     }
+                    Err(e) if pending(&e) => break,
+                    Err(e) if crate::transport::retry_accept(&e) => {
+                        accept_after = Instant::now() + ACCEPT_RETRY;
+                        break;
+                    }
+                    Err(_) => return Err(Error::Transport),
                 }
-                Err(e) if pending(&e) || crate::transport::retry_accept(&e) => break,
-                Err(_) => return Err(Error::Transport),
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wait(&listener, &slots, &receiver, accept_after).map_err(|_| Error::Transport)?;
     }
     Ok(())
+}
+
+fn wait(
+    listener: &TcpListener,
+    slots: &[Option<Slot>; PEER_SLOTS],
+    receiver: &Receiver<'_>,
+    accept_after: Instant,
+) -> io::Result<()> {
+    let now = Instant::now();
+    let mut poll = PollSet::new(&receiver.socket);
+    let mut until = if now < accept_after {
+        accept_after
+    } else {
+        poll.add_tcp_listener(listener)?;
+        now + Duration::from_secs(3600)
+    };
+    for slot in slots.iter().flatten() {
+        let read = matches!(slot.phase, Phase::Read);
+        poll.add_connected(
+            Connected::Tcp(&slot.stream),
+            Interest { read, write: !read },
+        )?;
+        until = until.min(slot.opened + LIFETIME);
+    }
+    poll.wait(until)
 }
 
 struct Slot {
@@ -113,7 +171,7 @@ impl Slot {
 
     /// Perform at most one nonblocking transfer. False releases the slot.
     fn step(&mut self, current: &RwLock<Current>, now: Instant) -> Result<bool, Error> {
-        if now.duration_since(self.opened) >= Duration::from_secs(5) {
+        if now.duration_since(self.opened) >= LIFETIME {
             return Ok(false);
         }
         let transfer = match self.phase {
@@ -345,6 +403,78 @@ mod tests {
         client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 404"));
         assert!(!response.contains("abc.key"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn eight_validators_complete_independent_challenge_requests() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control = Control::default();
+        let receiver = control.wake.attach().unwrap();
+        let now = Instant::now();
+        let current = RwLock::new(Current {
+            names: vec!["mail.example.test".into()],
+            token: "abc".into(),
+            authorization: "abc.key".into(),
+            expires: now + Duration::from_secs(60),
+        });
+        let mut slots = [const { None }; PEER_SLOTS];
+        let mut clients = Vec::new();
+        // Use loopback socket pairs with distinct validator identities.
+        for id in 1..=8 {
+            let peer = PeerKey::V4(id);
+            let (client, slot) = connected(peer, now);
+            *available(&mut slots, peer, now).unwrap() = Some(slot);
+            clients.push(client);
+        }
+        assert!(available(&mut slots, PeerKey::V4(9), now).is_none());
+        for client in &mut clients {
+            client.write_all(b"GET /.well-known/acme-challenge/abc HTTP/1.1\r\nHost: mail.example.test\r\n\r\n").unwrap();
+        }
+        while slots.iter().any(Option::is_some) {
+            wait(&listener, &slots, &receiver, now).unwrap();
+            for place in &mut slots {
+                if let Some(slot) = place {
+                    if !slot.step(&current, Instant::now()).unwrap() {
+                        *place = None;
+                    }
+                }
+            }
+            assert!(now.elapsed() < LIFETIME);
+        }
+        for mut client in clients {
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(reply.ends_with("\r\n\r\nabc.key"));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn backoff_masks_listener_until_retry_while_peer_expiry_and_stop_wake_earlier() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _queued = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let control = Control::default();
+        let receiver = control.wake.attach().unwrap();
+        let mut slots = [const { None }; PEER_SLOTS];
+        let first_retry = Instant::now() + ACCEPT_RETRY;
+        wait(&listener, &slots, &receiver, first_retry).unwrap();
+        assert!(Instant::now() >= first_retry);
+
+        let now = Instant::now();
+        let peer = PeerKey::V4(1);
+        let deadline = now + ACCEPT_RETRY;
+        let (_client, slot) = connected(peer, deadline - LIFETIME);
+        *available(&mut slots, peer, now).unwrap() = Some(slot);
+        let retry = now + Duration::from_secs(2);
+        wait(&listener, &slots, &receiver, retry).unwrap();
+        assert!(Instant::now() >= deadline && Instant::now() < retry);
+
+        control.stop();
+        wait(&listener, &[const { None }; PEER_SLOTS], &receiver, retry).unwrap();
+        assert!(control.stopped());
+        assert!(Instant::now() < retry);
     }
 
     #[test]

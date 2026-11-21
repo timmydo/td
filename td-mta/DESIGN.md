@@ -1032,7 +1032,9 @@ Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
 through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
 fixed set sized for a private wake receiver, 16 listeners and 32 client slots. PostgreSQL
-and single-connection transport waits use one or two entries. UNSAFE.md
+and single-connection transport waits use one or two entries. The dedicated
+HTTP-01 responder waits on its private stop receiver, one TCP listener and
+up to eight connected TCP sockets. UNSAFE.md
 section 22 pins the syscall ABI.
 The binary denies unsafe code
 with function-scoped termination and listener exceptions recorded in
