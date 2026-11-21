@@ -3782,6 +3782,64 @@ impl Scene {
                 }
             }
         }
+        self.paint_bar(frame, width, height, stride, furniture);
+        // A workspace block is the one that goes OVER the bar rather than
+        // under it. The rule above — a block must not hide the bar — is about
+        // a block that would obscure something it is not talking about; this
+        // one IS the bar, and drawn in the same order would be painted away by
+        // the strip it is promising.
+        if let Some(hint) = self.hint {
+            if matches!(hint.destination, DropDestination::Workspace(_)) {
+                draw_hint(frame, width, height, stride, hint.area);
+            }
+        }
+        if furniture == Furniture::Omitted {
+            return;
+        }
+        self.launcher
+            .paint(frame, width, height, stride, &self.text);
+        self.help.paint(frame, width, height, stride, &self.text);
+        self.screenshot
+            .paint(frame, width, height, stride, &self.text);
+        self.paint_pointer(frame, width, height, stride);
+    }
+
+    fn paint_pointer(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
+        draw_pointer(
+            frame,
+            width,
+            height,
+            stride,
+            self.pointer_x,
+            self.pointer_y,
+            self.drawn_cursor(),
+        );
+    }
+
+    pub(crate) fn render_status(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Result<(), String> {
+        if self.modal() || self.hint.is_some() {
+            return self.render_display(frame, width, height, stride);
+        }
+        let rows = height.min(BAR_HEIGHT);
+        self.paint_bar(frame, width, rows, stride, Furniture::Drawn);
+        self.paint_pointer(frame, width, rows, stride);
+        Ok(())
+    }
+
+    fn paint_bar(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        furniture: Furniture,
+    ) {
         let active = self.layout.active_workspace();
         let desks = self.desks();
         bar::paint(
@@ -3804,33 +3862,6 @@ impl Scene {
                 Furniture::Drawn => self.notice.as_deref().unwrap_or(&self.status),
                 Furniture::Omitted => &self.status,
             },
-        );
-        // A workspace block is the one that goes OVER the bar rather than
-        // under it. The rule above — a block must not hide the bar — is about
-        // a block that would obscure something it is not talking about; this
-        // one IS the bar, and drawn in the same order would be painted away by
-        // the strip it is promising.
-        if let Some(hint) = self.hint {
-            if matches!(hint.destination, DropDestination::Workspace(_)) {
-                draw_hint(frame, width, height, stride, hint.area);
-            }
-        }
-        if furniture == Furniture::Omitted {
-            return;
-        }
-        self.launcher
-            .paint(frame, width, height, stride, &self.text);
-        self.help.paint(frame, width, height, stride, &self.text);
-        self.screenshot
-            .paint(frame, width, height, stride, &self.text);
-        draw_pointer(
-            frame,
-            width,
-            height,
-            stride,
-            self.pointer_x,
-            self.pointer_y,
-            self.drawn_cursor(),
         );
     }
 }

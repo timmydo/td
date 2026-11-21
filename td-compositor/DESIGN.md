@@ -1021,8 +1021,9 @@ answer before either compound-commit deferral or backend I/O; explicitly
 deferred repaint does the same. A pending or failed request therefore leaves
 `last_submission` empty, and only that request's successful backend answer
 can fill it again. This is submission bookkeeping, not request-bound
-consent. Only the headless observers and the public capture still read it,
-and only backends that answer `Presented` serve those. What reached the
+consent. Headless observers and public capture require `Presented`. The
+status sampler uses the last successful submission to recognize a retained
+frame. What reached the
 screen is counted in paint EPOCHS: each successful paint is numbered, and
 the newest known to be on glass is recorded (at once for `Presented`, at the
 completion or the watchdog's recovery for `Queued`). Presentation evidence
@@ -1033,13 +1034,20 @@ consumer.
 
 `Damage` travels the other way. `Unknown` means the caller does not know what
 changed and a backend may discover it — fbdev compares its own shadow copy —
-while `Whole` means what the device holds cannot be trusted. A tiling command
-is the one caller that says `Whole`, and it now says it as damage rather than
-by reaching into fbdev's shadow copy, because a KMS backend has no shadow copy
-and the same request still means the same thing to it. Damage is cleared only
+while `Whole` means what the device holds cannot be trusted. A tiling command requests
+`Whole` to repair the device. Fbdev has one shadow of the written pixels,
+and KMS has a shadow for each scanout buffer. Damage is cleared only
 on a successful paint, so a failed one still owes the whole output —
 `a_failed_paint_keeps_the_whole_output_owed_for_the_next_one` is what holds
 that, and it fails if the clear is hoisted above the paint.
+
+An idle status tick renders only the top 24 rows into the retained software
+frame, including the part of the pointer that overlaps them. Both backends
+present that frame through their usual shadow comparison. Each KMS buffer
+can therefore catch up even if its last contents predate the current window.
+Initial, deferred, failed and whole-output paints require the full scene,
+as do compositor overlays, drag hints and private screens.
+
 Completions are DELIVERED to the runtime, not polled from a repaint. An
 earlier trait carried a `poll_events` that nothing called, because a draft had
 drained it at the end of every repaint and three reviewers independently

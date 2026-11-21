@@ -44,6 +44,9 @@ pub const DRM_FORMAT_XRGB8888: Fourcc = Fourcc(0x3432_5258);
 /// What the caller knows about what changed since the last frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Damage {
+    /// Only the status strip changed since the last successful paint.
+    /// The software backends retain that frame in their render target.
+    StatusBar,
     /// The caller does not know. A backend that can discover it cheaply may —
     /// fbdev compares its own shadow copy — and one that cannot must treat
     /// this as the whole output rather than as nothing.
@@ -456,7 +459,11 @@ pub trait OutputBackend {
     /// promise.
     fn paint(&mut self, scene: &Scene, damage: Damage) -> Result<Submission, String> {
         let target = self.begin_frame(damage)?;
-        scene.render_display(target.pixels, target.width, target.height, target.stride)?;
+        if damage == Damage::StatusBar {
+            scene.render_status(target.pixels, target.width, target.height, target.stride)?;
+        } else {
+            scene.render_display(target.pixels, target.width, target.height, target.stride)?;
+        }
         self.present()
     }
 }

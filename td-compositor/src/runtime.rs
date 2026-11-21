@@ -1511,6 +1511,10 @@ impl Runtime {
     /// pixels are on glass is `last_submission`'s to answer, and against a
     /// KMS backend the answer would be "not yet".
     pub fn repaint(&mut self) -> Result<(), String> {
+        self.repaint_with_damage(self.owed_damage)
+    }
+
+    fn repaint_with_damage(&mut self, damage: Damage) -> Result<(), String> {
         // A window that maps repaints, and ends the launch waiting for it
         // in the same paint.
         if self.launch.is_some() && self.launch_mapped() {
@@ -1546,7 +1550,7 @@ impl Runtime {
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
         // distrust did before this was the caller's to say.
-        let submission = self.backend.paint(&self.scene, self.owed_damage)?;
+        let submission = self.backend.paint(&self.scene, damage)?;
         self.paints = epoch;
         match submission {
             Submission::Queued(frame) => {
@@ -3710,7 +3714,18 @@ impl Runtime {
         if previous.is_none() && !cleared && !launch {
             return Ok(());
         }
-        if let Err(error) = self.repaint() {
+        // A coalesced or retried paint must also deliver the older scene changes.
+        // Narrow only this submission; a deferral always flushes ordinary damage.
+        let damage = if self.owed_damage == Damage::Unknown
+            && self.last_submission.is_some()
+            && !self.pending_paint
+            && !launch
+        {
+            Damage::StatusBar
+        } else {
+            self.owed_damage
+        };
+        if let Err(error) = self.repaint_with_damage(damage) {
             if let Some(previous) = previous {
                 self.scene.set_status(previous);
             }
@@ -15247,6 +15262,41 @@ mod tests {
         assert!(runtime.paint_pending());
         runtime.flush_paint().unwrap();
         assert_ne!(fs::read(&cleanup.0).unwrap(), renamed);
+    }
+
+    #[test]
+    fn idle_status_reuses_the_window_rows_but_a_pending_paint_refreshes_them() {
+        let dir = crate::temp_dir::TempDir::new("td-runtime-bar-repaint").unwrap();
+        let path = dir.path().join("fb");
+        let stride = 320 * 4;
+        let mut runtime = Runtime::new(Framebuffer::test_file(&path, 320, 200, stride).unwrap());
+        // A pointer straddling the strip must be restored above the new text.
+        runtime.scene.move_pointer(100, 23, 320, 200);
+        runtime.repaint().unwrap();
+        let before = fs::read(&path).unwrap();
+        let below = crate::bar::BAR_HEIGHT * stride;
+        // Mark the retained render target below the strip to detect a full
+        // scene traversal even though an idle window's pixels would match.
+        runtime
+            .framebuffer_for_test()
+            .begin_frame(Damage::Unknown)
+            .unwrap()
+            .pixels[below] ^= 0xff;
+        runtime.set_status("LOAD 0.42".into()).unwrap();
+        let partial = fs::read(&path).unwrap();
+        assert_ne!(
+            partial[below], before[below],
+            "status recomposed window rows"
+        );
+        runtime.defer_repaint();
+        runtime.set_status("LOAD 0.43".into()).unwrap();
+        let settled = fs::read(&path).unwrap();
+        assert_eq!(&settled[below..], &before[below..]);
+        runtime.set_status("LOAD 0.42".into()).unwrap();
+        let reference = fs::read(&path).unwrap();
+        runtime.repaint().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), reference);
+        assert_eq!(&partial[..below], &reference[..below]);
     }
 
     #[test]
