@@ -525,6 +525,13 @@ impl Cache {
             .map(<[u8]>::to_vec)
     }
 
+    pub fn has_queued_operations(&self) -> bool {
+        self.store
+            .read()
+            .table(OP_QUEUE)
+            .is_some_and(|table| !table.is_empty())
+    }
+
     pub fn queued_operations(&self) -> Vec<(u64, Vec<u8>)> {
         let txn = self.store.read();
         let Some(table) = txn.table(OP_QUEUE) else {

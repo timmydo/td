@@ -2223,7 +2223,7 @@ td-mail/src/ui/frame.rs	allocating-constructor	1
 td-mail/src/ui/frame.rs	allocating-conversion	10
 td-mail/src/ui/frame.rs	allocation-macro	2
 td-mail/src/ui/frame.rs	unchecked-growth-or-clone	7
-td-mail/src/ui/mod.rs	allocating-conversion	30
+td-mail/src/ui/mod.rs	allocating-conversion	29
 td-mail/src/ui/mod.rs	allocation-macro	28
 td-mail/src/ui/mod.rs	heap-owner	11
 td-mail/src/ui/mod.rs	unchecked-growth-or-clone	47

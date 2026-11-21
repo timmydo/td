@@ -574,9 +574,13 @@ folder counts even while you compose. When the account tree is hidden,
 the draft's status row shows the inbox unread count. A push refresh
 keeps the selected message visible when a server limits the first page. While
 you browse later pages, folder counts stay current and the list keeps its
-loaded pages until you refresh it or reopen the folder. Idle refresh also checks for
-changes when push is unavailable. Set `sync_interval_secs = 0` to turn off
-both forms of automatic sync. If an account cannot be reached
+loaded pages until you refresh it or reopen the folder. The folder counts
+also refresh at `sync_interval_secs` while you read, scroll or type, so they
+stay current when push is unavailable. Message-list polling waits for idle.
+Setting the interval to zero disables automatic sync. Reading, marking unread
+or moving a message still refreshes the affected account's counts. A locally
+queued write shows its cached counts. The next successful live folder listing
+supplies and saves the server's counts. If an account cannot be reached
 (server down, network not up yet, placeholder credentials), td-mail lists
 what its cache holds instead of exiting, and everything it cannot serve
 from the cache says why the connection failed

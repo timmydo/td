@@ -16,9 +16,24 @@ use td_json::{Json, ObjectBuilder, ToJson};
 
 pub(crate) const CHANGED_EMAILS: &str = "mailbox state change";
 
+/// In priority order: a queued write has a local projection, and a push hint
+/// also invalidates message lists. Each account holds one outstanding refresh.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MailboxRefresh {
+    Counts,
+    QueuedCounts,
+    Changes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteState {
+    Confirmed,
+    Queued,
+}
+
 /// Commands sent from the UI thread to the backend thread.
 pub enum BackendCommand {
-    RefreshChangedMailboxes,
+    RefreshMailboxes(MailboxRefresh),
     FetchMailboxes {
         origin: String,
     },
@@ -163,7 +178,7 @@ pub enum BackendCommand {
 /// Responses sent from the backend thread to the UI thread.
 pub enum BackendResponse {
     MailboxStateChanged,
-    ChangedMailboxes(Result<Vec<Mailbox>, String>),
+    RefreshedMailboxes(MailboxRefresh, Result<Vec<Mailbox>, String>),
     AccountReadOnly(bool),
     Mailboxes(Result<Vec<Mailbox>, String>),
     MailboxCreated {
@@ -208,7 +223,7 @@ pub enum BackendResponse {
         op_id: u64,
         id: String,
         action: EmailMutationAction,
-        result: Result<(), String>,
+        result: Result<WriteState, String>,
     },
     MailboxMarkedRead {
         mailbox_id: String,
@@ -821,7 +836,7 @@ fn process_mutation_via_queue(
     custom_headers: &[String],
     my_email_regex: &UserRegex,
     cache: Option<&Cache>,
-) -> Result<(), String> {
+) -> Result<WriteState, String> {
     process_online_mutation(
         client,
         op,
@@ -832,7 +847,13 @@ fn process_mutation_via_queue(
         cache,
         true,
     )
-    .map(|_| ())
+    .map(|deferred| {
+        if deferred.is_some() {
+            WriteState::Queued
+        } else {
+            WriteState::Confirmed
+        }
+    })
 }
 
 /// None confirms the remote result; Some retains durable intent and its refusal.
@@ -898,6 +919,28 @@ fn process_online_mutation(
             Ok(Some(e))
         }
     }
+}
+
+fn list_mailboxes(
+    cache: Option<&Cache>,
+    refresh: Option<MailboxRefresh>,
+    fetch: impl FnOnce() -> Result<Vec<Mailbox>, String>,
+) -> Result<Vec<Mailbox>, String> {
+    // Show a retained write's local effect immediately. A separate live
+    // listing remains authoritative for every folder, as on manual refresh.
+    if refresh == Some(MailboxRefresh::QueuedCounts) {
+        if let Some(folders) = cache
+            .filter(|c| c.has_queued_operations())
+            .and_then(Cache::get_mailboxes)
+        {
+            return Ok(folders);
+        }
+    }
+    let folders = fetch()?;
+    if let Some(cache) = cache {
+        cache.put_mailboxes(&folders);
+    }
+    Ok(folders)
 }
 
 /// Spawns the account's backend thread and returns the command sender and
@@ -1010,18 +1053,14 @@ fn handle_offline_command(
     reason: Option<&str>,
 ) -> bool {
     match cmd {
-        BackendCommand::RefreshChangedMailboxes => {
-            let _ = resp_tx.send(BackendResponse::ChangedMailboxes(Err(offline_error(
-                "cannot refresh mailbox changes",
-                reason,
-            ))));
-        }
-        BackendCommand::FetchMailboxes { origin } => {
-            log_info!(
-                "[Backend/offline] cmd#{} FetchMailboxes origin='{}'",
-                command_seq,
-                origin
-            );
+        BackendCommand::FetchMailboxes { .. } | BackendCommand::RefreshMailboxes(_) => {
+            if let BackendCommand::FetchMailboxes { origin } = cmd {
+                log_info!(
+                    "[Backend/offline] cmd#{} FetchMailboxes origin='{}'",
+                    command_seq,
+                    origin
+                );
+            }
             let result = if let Some(ref cache) = cache {
                 if let Some(mboxes) = cache.get_mailboxes() {
                     if !mboxes.is_empty() {
@@ -1036,7 +1075,11 @@ fn handle_offline_command(
             } else {
                 Err(offline_error("cache unavailable", reason))
             };
-            let _ = resp_tx.send(BackendResponse::Mailboxes(result));
+            let _ = resp_tx.send(if let BackendCommand::RefreshMailboxes(kind) = cmd {
+                BackendResponse::RefreshedMailboxes(*kind, result)
+            } else {
+                BackendResponse::Mailboxes(result)
+            });
         }
         BackendCommand::QueryEmails {
             origin,
@@ -1180,7 +1223,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
                 action: EmailMutationAction::MarkRead,
-                result: result.map(|_| ()),
+                result: result.map(|_| WriteState::Queued),
             });
         }
         BackendCommand::MarkEmailUnread { op_id, id, .. } => {
@@ -1193,7 +1236,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
                 action: EmailMutationAction::MarkUnread,
-                result: result.map(|_| ()),
+                result: result.map(|_| WriteState::Queued),
             });
         }
         BackendCommand::SetEmailFlagged {
@@ -1209,7 +1252,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
                 action: EmailMutationAction::SetFlagged(*flagged),
-                result: result.map(|_| ()),
+                result: result.map(|_| WriteState::Queued),
             });
         }
         BackendCommand::MoveEmail {
@@ -1227,7 +1270,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
                 action: EmailMutationAction::Move,
-                result: result.map(|_| ()),
+                result: result.map(|_| WriteState::Queued),
             });
         }
         BackendCommand::DestroyEmail { op_id, id, .. } => {
@@ -1240,7 +1283,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
                 action: EmailMutationAction::Destroy,
-                result: result.map(|_| ()),
+                result: result.map(|_| WriteState::Queued),
             });
         }
         BackendCommand::CreateMailbox { name } => {
@@ -2061,15 +2104,19 @@ fn backend_loop(
         };
 
         match cmd {
-            BackendCommand::FetchMailboxes { .. } | BackendCommand::RefreshChangedMailboxes => {
-                let changed = matches!(cmd, BackendCommand::RefreshChangedMailboxes);
+            BackendCommand::FetchMailboxes { .. } | BackendCommand::RefreshMailboxes(_) => {
                 let origin = if let BackendCommand::FetchMailboxes { ref origin } = cmd {
                     origin.as_str()
-                } else {
+                } else if matches!(
+                    cmd,
+                    BackendCommand::RefreshMailboxes(MailboxRefresh::Changes)
+                ) {
                     if let Some(watcher) = watcher.as_deref_mut() {
                         watcher.refresh_started();
                     }
                     "mailbox change"
+                } else {
+                    "folder counts"
                 };
                 log_info!(
                     "[Backend] cmd#{} FetchMailboxes origin='{}'",
@@ -2079,7 +2126,9 @@ fn backend_loop(
 
                 // For TUI, serve cached mailboxes instantly then follow with live data.
                 // CLI expects one response per command, so skip the cached pre-response there.
-                if !changed && !origin.starts_with("cli") {
+                if matches!(cmd, BackendCommand::FetchMailboxes { .. })
+                    && !origin.starts_with("cli")
+                {
                     if let Some(ref cache) = cache {
                         if let Some(cached_mboxes) = cache.get_mailboxes() {
                             if !cached_mboxes.is_empty() {
@@ -2094,15 +2143,18 @@ fn backend_loop(
                     }
                 }
 
-                let result = client.get_mailboxes().map_err(|e| e.to_string());
+                let refresh = match cmd {
+                    BackendCommand::RefreshMailboxes(kind) => Some(kind),
+                    _ => None,
+                };
+                let result = list_mailboxes(cache.as_ref(), refresh, || {
+                    client.get_mailboxes().map_err(|error| error.to_string())
+                });
                 if let Ok(ref mailboxes) = result {
                     cached_mailboxes = mailboxes.clone();
-                    if let Some(ref cache) = cache {
-                        cache.put_mailboxes(mailboxes);
-                    }
                 }
-                let _ = resp_tx.send(if changed {
-                    BackendResponse::ChangedMailboxes(result)
+                let _ = resp_tx.send(if let BackendCommand::RefreshMailboxes(kind) = cmd {
+                    BackendResponse::RefreshedMailboxes(kind, result)
                 } else {
                     BackendResponse::Mailboxes(result)
                 });
@@ -2211,9 +2263,7 @@ fn backend_loop(
                     let rule_scope = !client.is_read_only()
                         && !rules.is_empty()
                         && rules_mailbox_regex.is_match(&mailbox_name);
-                    let pending_writes = cache
-                        .as_ref()
-                        .is_some_and(|cache| !cache.queued_operations().is_empty());
+                    let pending_writes = cache.as_ref().is_some_and(Cache::has_queued_operations);
                     if rule_scope && pending_writes {
                         rule_failure = Some(
                             "Automatic filing paused: pending changes need reconnect replay"
@@ -2724,7 +2774,7 @@ fn backend_loop(
                     mailbox_id,
                     mailbox_name,
                     updated,
-                    result,
+                    result: result.map(drop),
                 });
             }
             BackendCommand::GetEmailRawHeaders { id } => {
@@ -2847,7 +2897,7 @@ fn backend_loop(
                             &my_email_regex,
                             cache.as_ref(),
                         ) {
-                            Ok(()) => {
+                            Ok(_) => {
                                 deleted += 1;
                             }
                             Err(e) => {
@@ -4148,6 +4198,60 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn a_deferred_read_refreshes_the_cached_count_without_contacting_the_server() {
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-queued-folder-count").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let cache = Cache::open("queued-count").unwrap();
+        let mailbox = Mailbox::from_json(&td_json::json!({
+            "id":"inbox", "name":"Inbox", "role":"inbox", "totalEmails":1, "unreadEmails":1
+        }))
+        .unwrap();
+        let email = Email::from_json(&td_json::json!({
+            "id":"message", "keywords":{}, "mailboxIds":{"inbox":true}
+        }))
+        .unwrap();
+        cache.put_mailboxes(&[mailbox]);
+        cache.put_emails(&[email]);
+        let op = QueuedMutation::MarkRead {
+            op_id: 1,
+            id: "message".into(),
+        };
+        let client = JmapClient::unreachable_for_tests();
+        let pattern = UserRegex::compile(".*").unwrap();
+        assert_eq!(
+            process_mutation_via_queue(
+                &client,
+                &op,
+                &mut Vec::new(),
+                &[],
+                &[],
+                &pattern,
+                Some(&cache)
+            )
+            .unwrap(),
+            WriteState::Queued
+        );
+        let counts = list_mailboxes(Some(&cache), Some(MailboxRefresh::QueuedCounts), || {
+            panic!("a locally queued read must use its saved projection")
+        })
+        .unwrap();
+        assert_eq!(counts[0].unread_emails, 0);
+        for kind in [MailboxRefresh::Counts, MailboxRefresh::Changes] {
+            let other = Mailbox::from_json(&td_json::json!({
+                "id":"other", "name":"New folder", "totalEmails":3, "unreadEmails":2
+            }))
+            .unwrap();
+            list_mailboxes(Some(&cache), Some(kind), || Ok(vec![other])).unwrap();
+            let saved = cache.get_mailboxes().unwrap();
+            assert_eq!(saved[0].name, "New folder");
+            assert_eq!(saved[0].unread_emails, 2);
+        }
+        assert!(cache.has_queued_operations());
+    }
 
     #[test]
     fn failed_automatic_move_keeps_server_membership_and_durable_intent() {

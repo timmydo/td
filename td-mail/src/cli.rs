@@ -733,7 +733,7 @@ fn mutate_many_move(state: &mut CliState, ids: &[String], target_mailbox_id: &st
         }
         match state.recv_resp() {
             Ok(BackendResponse::EmailMutation { result, id, .. }) => match result {
-                Ok(()) => results.push(json!({"id": id, "ok": true})),
+                Ok(_) => results.push(json!({"id": id, "ok": true})),
                 Err(e) => results.push(json!({"id": id, "ok": false, "error": e})),
             },
             Ok(_) => results.push(json!({"id": id, "ok": false, "error": "unexpected response"})),
@@ -1223,7 +1223,7 @@ fn cmd_destroy(state: &mut CliState, input: &Value) -> Value {
         }
         match state.recv_resp() {
             Ok(BackendResponse::EmailMutation { result, id, .. }) => match result {
-                Ok(()) => results.push(json!({"id": id, "ok": true})),
+                Ok(_) => results.push(json!({"id": id, "ok": true})),
                 Err(e) => results.push(json!({"id": id, "ok": false, "error": e})),
             },
             Ok(_) => results.push(json!({"id": id, "ok": false, "error": "unexpected response"})),
@@ -1715,7 +1715,7 @@ fn recv_mutation_response(state: &CliState) -> Value {
             action,
             result,
         }) => match result {
-            Ok(()) => ok_response(json!({
+            Ok(_) => ok_response(json!({
                 "op_id": op_id,
                 "id": id,
                 "action": format!("{:?}", action),

@@ -605,7 +605,7 @@ impl View for ThreadView {
             } => {
                 if let Some(pending) = self.pending_write_ops.remove(op_id) {
                     match result {
-                        Ok(()) => {
+                        Ok(_) => {
                             // No refresh: optimistic update + cache already
                             // reflect the correct state. Press 'g' to refresh.
                         }

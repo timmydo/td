@@ -14,7 +14,9 @@ pub mod sidebar;
 pub mod views;
 
 use crate::attach;
-use crate::backend::{self, BackendCommand, BackendResponse};
+use crate::backend::{
+    self, BackendCommand, BackendResponse, EmailMutationAction, MailboxRefresh, WriteState,
+};
 use crate::compose;
 use crate::config::{AccountConfig, PasswordSource, RetentionPolicyConfig, SpamConfig};
 use crate::regex::UserRegex;
@@ -236,8 +238,8 @@ fn reply_from(account: &AccountConfig) -> String {
 struct Live {
     cmd_tx: Sender<BackendCommand>,
     resp_rx: Receiver<BackendResponse>,
-    changed: bool,
-    fetching_changes: bool,
+    pending_refresh: Option<MailboxRefresh>,
+    fetching_mailboxes: bool,
 }
 
 impl Live {
@@ -245,9 +247,16 @@ impl Live {
         Self {
             cmd_tx,
             resp_rx,
-            changed: false,
-            fetching_changes: false,
+            pending_refresh: None,
+            fetching_mailboxes: false,
         }
+    }
+
+    fn request_refresh(&mut self, kind: MailboxRefresh) {
+        self.pending_refresh = Some(
+            self.pending_refresh
+                .map_or(kind, |pending| pending.max(kind)),
+        );
     }
 }
 
@@ -404,7 +413,7 @@ struct Session {
     title: String,
     sync_interval: Option<Duration>,
     last_user_activity: Instant,
-    last_idle_sync: Instant,
+    last_sync: Instant,
     dirty: bool,
     quitting: bool,
     /// The window's close was asked with a draft unsaved: the draft's
@@ -477,7 +486,7 @@ impl Session {
             surface,
             title: String::new(),
             last_user_activity: Instant::now(),
-            last_idle_sync: Instant::now(),
+            last_sync: Instant::now(),
             dirty: true,
             quitting: false,
             closing: false,
@@ -1275,7 +1284,6 @@ impl Session {
         for slot in old.into_slots() {
             self.pane.close(slot.text);
         }
-        self.last_idle_sync = Instant::now();
         self.redraw();
     }
 
@@ -2318,19 +2326,51 @@ impl Handler for Session {
             {
                 let response = match response {
                     BackendResponse::MailboxStateChanged => {
-                        if let Some(live) = self.live.get_mut(index) {
-                            live.changed = self.sync_interval.is_some() && !self.setup.offline;
+                        if self.sync_interval.is_some() && !self.setup.offline {
+                            if let Some(live) = self.live.get_mut(index) {
+                                live.request_refresh(MailboxRefresh::Changes);
+                            }
                         }
                         continue;
                     }
-                    BackendResponse::ChangedMailboxes(result) => {
+                    BackendResponse::RefreshedMailboxes(kind, result) => {
                         if let Some(live) = self.live.get_mut(index) {
-                            live.fetching_changes = false;
+                            live.fetching_mailboxes = false;
                         }
-                        self.stack
-                            .handle_response(index, &BackendResponse::MailboxStateChanged);
-                        let Ok(folders) = result else { continue };
-                        BackendResponse::Mailboxes(Ok(folders))
+                        if !self.stack.accepts_folder_refresh(index) {
+                            // A folder question can open while the request is in flight.
+                            self.sidebar.listed(index, &result);
+                            self.redraw();
+                            if let Some(live) = self.live.get_mut(index) {
+                                live.request_refresh(kind);
+                            }
+                            continue;
+                        }
+                        if kind == MailboxRefresh::Changes {
+                            self.stack
+                                .handle_response(index, &BackendResponse::MailboxStateChanged);
+                            if result.is_err() {
+                                continue;
+                            }
+                        }
+                        BackendResponse::Mailboxes(result)
+                    }
+                    mutation @ BackendResponse::EmailMutation {
+                        action:
+                            EmailMutationAction::MarkRead
+                            | EmailMutationAction::MarkUnread
+                            | EmailMutationAction::Move
+                            | EmailMutationAction::Destroy,
+                        result: Ok(state),
+                        ..
+                    } => {
+                        if let Some(live) = self.live.get_mut(index) {
+                            live.request_refresh(match state {
+                                WriteState::Confirmed => MailboxRefresh::Counts,
+                                WriteState::Queued => MailboxRefresh::QueuedCounts,
+                            });
+                        }
+                        mutation
                     }
                     other => other,
                 };
@@ -2353,22 +2393,6 @@ impl Handler for Session {
                 self.hold_draft();
                 self.take_pending();
             }
-            if let Some(live) = self.live.get_mut(index) {
-                if live.changed
-                    && !live.fetching_changes
-                    && (self.stack.top_account() != Some(index)
-                        || self
-                            .stack
-                            .current()
-                            .is_none_or(|v| v.accepts_folder_refresh()))
-                {
-                    live.changed = false;
-                    live.fetching_changes = live
-                        .cmd_tx
-                        .send(BackendCommand::RefreshChangedMailboxes)
-                        .is_ok();
-                }
-            }
         }
         if self
             .stack
@@ -2390,33 +2414,38 @@ impl Handler for Session {
             self.redraw();
         }
         if let Some(interval) = self.sync_interval {
-            if self.last_user_activity.elapsed() >= interval
-                && self.last_idle_sync.elapsed() >= interval
-            {
-                let synced = self
-                    .stack
-                    .current_mut()
-                    .is_some_and(|view| view.trigger_idle_sync());
-                // The tree's counts, whatever view is on top: the accounts
-                // not shown, and the shown one while a view is over its
-                // page. On top, the page syncs itself, and declines while
-                // it asks a question a listing under it could change.
-                // Single-account drafts display their own inbox count.
-                let refresh_counts =
-                    self.setup.accounts.len() > 1 || (!self.setup.offline && self.editing(false));
-                if refresh_counts {
-                    let page_on_top =
-                        self.stack.depth() == 1 && self.stack.root_account() == Some(self.current);
-                    for (index, live) in self.live.iter().enumerate() {
-                        if index != self.current || !page_on_top {
-                            let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
-                                origin: "idle_sync.sidebar".to_string(),
-                            });
+            if self.last_sync.elapsed() >= interval {
+                // Refreshing the viewed message list still waits for idle. The
+                // tree and draft count are also visible during keyboard input.
+                let folder_page = self.stack.depth() == 1 && self.stack.root_account().is_some();
+                let show_counts = folder_page
+                    || self.setup.accounts.len() > 1
+                    || (!self.setup.offline && self.editing(false));
+                let synced = self.last_user_activity.elapsed() >= interval
+                    && !folder_page
+                    && self
+                        .stack
+                        .current_mut()
+                        .is_some_and(|v| v.trigger_idle_sync());
+                if show_counts {
+                    for live in &mut self.live {
+                        if !live.fetching_mailboxes {
+                            live.request_refresh(MailboxRefresh::Counts);
                         }
                     }
                 }
-                if synced || refresh_counts {
-                    self.last_idle_sync = Instant::now();
+                if synced || show_counts {
+                    self.last_sync = Instant::now();
+                }
+            }
+        }
+        for (index, live) in self.live.iter_mut().enumerate() {
+            if !live.fetching_mailboxes && self.stack.accepts_folder_refresh(index) {
+                if let Some(kind) = live.pending_refresh.take() {
+                    live.fetching_mailboxes = live
+                        .cmd_tx
+                        .send(BackendCommand::RefreshMailboxes(kind))
+                        .is_ok();
                 }
             }
         }
@@ -3003,7 +3032,7 @@ mod frame_tests {
     /// shown one too while a folder is open.
     #[test]
     fn a_press_opens_a_tree_entry_and_the_idle_sync_asks_every_account() {
-        let (mut session, _state, test_cmds, work_cmds) = two_accounts();
+        let (mut session, _state, test_cmds, work_cmds, answers) = two_accounts_answering();
         while test_cmds.try_recv().is_ok() {}
         // The tree: All inboxes, test, its INBOX, work, its INBOX and Projects.
         let row = |session: &Session, index: usize| {
@@ -3032,9 +3061,18 @@ mod frame_tests {
         session.poll(0);
         assert!(test_cmds.try_iter().any(|command| matches!(
             command,
-            BackendCommand::FetchMailboxes { origin } if origin == "idle_sync.sidebar"
+            BackendCommand::RefreshMailboxes(MailboxRefresh::Counts)
         )));
         session.sync_interval = None;
+        for (index, answer) in answers.iter().enumerate() {
+            answer
+                .send(BackendResponse::RefreshedMailboxes(
+                    MailboxRefresh::Counts,
+                    Ok(session.sidebar.folders(index).unwrap().to_vec()),
+                ))
+                .unwrap();
+        }
+        session.poll(0);
 
         // The bar's first label is the email list's Open, not the tree's,
         // whose selection is now the work account's heading.
@@ -3060,22 +3098,170 @@ mod frame_tests {
         session.sync_interval = None;
         assert!(!work_cmds
             .try_iter()
-            .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+            .any(|command| matches!(command, BackendCommand::RefreshMailboxes(_))));
         key(&mut session, "Escape");
 
         session.sync_interval = Some(Duration::ZERO);
         session.poll(0);
         assert!(test_cmds.try_iter().any(|command| matches!(
             command,
-            BackendCommand::FetchMailboxes { origin } if origin == "idle_sync.sidebar"
+            BackendCommand::RefreshMailboxes(MailboxRefresh::Counts)
         )));
         assert!(work_cmds
             .try_iter()
-            .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+            .any(|command| matches!(command, BackendCommand::RefreshMailboxes(_))));
     }
 
     #[test]
-    fn idle_draft_refreshes_the_single_inbox_count_without_a_stream() {
+    fn acknowledged_writes_refresh_only_the_affected_accounts_folder_counts() {
+        use crate::backend::EmailMutationAction::{MarkRead, MarkUnread, Move, SetFlagged};
+        let (mut session, _state, test_cmds, work_cmds, answers) = two_accounts_answering();
+        test_cmds.try_iter().for_each(drop);
+        work_cmds.try_iter().for_each(drop);
+        let answer = |action, result| BackendResponse::EmailMutation {
+            op_id: 1,
+            id: "message".into(),
+            action,
+            result,
+        };
+        answers[1]
+            .send(answer(SetFlagged(true), Ok(WriteState::Confirmed)))
+            .unwrap();
+        answers[1]
+            .send(answer(MarkRead, Err("refused".into())))
+            .unwrap();
+        session.poll(0);
+        assert!(work_cmds.try_recv().is_err());
+        for action in [MarkRead, Move] {
+            answers[1]
+                .send(answer(action, Ok(WriteState::Confirmed)))
+                .unwrap();
+        }
+        session.poll(0);
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Counts))
+        ));
+        answers[1]
+            .send(answer(MarkUnread, Ok(WriteState::Queued)))
+            .unwrap();
+        session.poll(0);
+        assert!(
+            work_cmds.try_recv().is_err(),
+            "only one outstanding listing"
+        );
+        answers[1]
+            .send(BackendResponse::RefreshedMailboxes(
+                MailboxRefresh::Counts,
+                Ok(vec![mailbox("w1", "INBOX", "inbox", 5, 1)]),
+            ))
+            .unwrap();
+        session.poll(0);
+        let frame = session.shown();
+        let rows: Vec<_> = frame
+            .lines()
+            .map(|line| line.get(..sidebar::CELLS).unwrap_or(line))
+            .map(|tree| tree.split_whitespace().collect::<Vec<_>>())
+            .filter(|cells| cells.first() == Some(&"*"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                vec!["*", "All", "inboxes", "2"],
+                vec!["*", "test", "1"],
+                vec!["*", "INBOX", "1"],
+                vec!["*", "work", "1"],
+                vec!["*", "INBOX", "1"],
+            ]
+        );
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::RefreshMailboxes(
+                MailboxRefresh::QueuedCounts
+            ))
+        ));
+        assert!(test_cmds.try_recv().is_err());
+        assert!(work_cmds.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_count_reply_in_flight_keeps_the_folder_question_bound_to_its_target() {
+        let (mut session, _state, test_cmds, _, answers) = two_accounts_answering();
+        session.sync_interval = Some(Duration::ZERO);
+        session.poll(0);
+        assert!(test_cmds
+            .try_iter()
+            .any(|cmd| matches!(cmd, BackendCommand::RefreshMailboxes(_))));
+        session.sync_interval = None;
+        key(&mut session, "d");
+        assert!(!session.stack.accepts_folder_refresh(0));
+        answers[0]
+            .send(BackendResponse::RefreshedMailboxes(
+                MailboxRefresh::Counts,
+                Ok(Vec::new()),
+            ))
+            .unwrap();
+        session.poll(0);
+        assert!(session.sidebar.folders(0).unwrap().is_empty());
+        assert!(
+            !session.stack.accepts_folder_refresh(0),
+            "keep the original folder prompt"
+        );
+        assert!(test_cmds.try_recv().is_err());
+        key(&mut session, "Escape");
+        session.poll(0);
+        assert!(matches!(
+            test_cmds.try_recv(),
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Counts))
+        ));
+    }
+
+    #[test]
+    fn active_browsing_checks_folder_counts_at_the_interval_without_push() {
+        let (mut session, _state, test_cmds, work_cmds) = two_accounts();
+        session.setup.offline = false;
+        session.sync_interval = Some(Duration::from_secs(60));
+        session.last_sync = Instant::now() - Duration::from_secs(61);
+        session.open_entry(Entry::Folder {
+            account: 0,
+            id: "t1".into(),
+        });
+        test_cmds.try_iter().for_each(drop);
+        work_cmds.try_iter().for_each(drop);
+        session.last_user_activity = Instant::now();
+        session.poll(0);
+        for commands in [&test_cmds, &work_cmds] {
+            assert!(
+                matches!(
+                    commands.try_recv(),
+                    Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Counts))
+                ),
+                "folder counts must refresh while the user is active"
+            );
+            assert!(commands.try_recv().is_err());
+        }
+        session.poll(0);
+        assert!(test_cmds.try_recv().is_err());
+        assert!(work_cmds.try_recv().is_err());
+    }
+
+    #[test]
+    fn scrolling_a_single_accounts_folder_page_checks_its_counts() {
+        let (mut session, commands, _) = session(false);
+        session.setup.offline = false;
+        session.sync_interval = Some(Duration::from_secs(60));
+        session.last_sync = Instant::now() - Duration::from_secs(61);
+        key(&mut session, "j");
+        session.poll(0);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Counts))
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn typing_in_a_draft_refreshes_the_single_inbox_count_without_a_stream() {
         let state = td_fs::TempDir::new("td-mail-idle-draft").unwrap();
         let (mut session, commands, responses) = session(false);
         session.setup.draft_dir = Some(state.path().join("drafts"));
@@ -3084,12 +3270,11 @@ mod frame_tests {
         key(&mut session, "c");
         key(&mut session, "x");
         let draft = text(&session);
-        session.last_user_activity = Instant::now() - Duration::from_secs(61);
-        session.last_idle_sync = session.last_user_activity;
+        session.last_sync = Instant::now() - Duration::from_secs(61);
         session.poll(0);
         assert!(matches!(
             commands.try_recv(),
-            Ok(BackendCommand::FetchMailboxes { .. })
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Counts))
         ));
         responses
             .send(BackendResponse::Mailboxes(Ok(vec![mailbox(
@@ -3126,7 +3311,7 @@ mod frame_tests {
         session.poll(0);
         assert!(matches!(
             commands.try_recv(),
-            Ok(BackendCommand::RefreshChangedMailboxes)
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Changes))
         ));
         // Further hints can accumulate in at most one follow-up, even when
         // another request's cached mailbox listing arrives in between.
@@ -3143,14 +3328,15 @@ mod frame_tests {
         session.poll(0);
         assert!(commands.try_recv().is_err());
         responses
-            .send(BackendResponse::ChangedMailboxes(Ok(vec![mailbox(
-                "1", "INBOX", "inbox", 13, 4,
-            )])))
+            .send(BackendResponse::RefreshedMailboxes(
+                MailboxRefresh::Changes,
+                Ok(vec![mailbox("1", "INBOX", "inbox", 13, 4)]),
+            ))
             .unwrap();
         session.poll(0);
         assert!(matches!(
             commands.try_recv(),
-            Ok(BackendCommand::RefreshChangedMailboxes)
+            Ok(BackendCommand::RefreshMailboxes(MailboxRefresh::Changes))
         ));
         assert!(commands.try_recv().is_err());
         assert_eq!(session.sidebar.folders(0).unwrap()[0].unread_emails, 4);

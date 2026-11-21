@@ -316,6 +316,13 @@ impl ViewStack {
         }
     }
 
+    pub fn accepts_folder_refresh(&self, account: usize) -> bool {
+        self.top_account() != Some(account)
+            || self
+                .current()
+                .is_none_or(|view| view.accepts_folder_refresh())
+    }
+
     pub fn current_mut(&mut self) -> Option<&mut Box<dyn View>> {
         self.slots.last_mut().map(|slot| &mut slot.view)
     }

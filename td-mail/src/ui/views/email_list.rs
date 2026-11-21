@@ -1316,7 +1316,7 @@ impl View for EmailListView {
             } => {
                 if let Some(pending) = self.pending_write_ops.remove(op_id) {
                     match result {
-                        Ok(()) => {
+                        Ok(_) => {
                             // No refresh needed for any mutation type: optimistic
                             // update + cache update already show the correct state.
                             // The user can press 'g' to refresh manually. Auto-
@@ -2374,7 +2374,7 @@ mod tests {
                     id: "preview".into(),
                     action,
                     result: if succeed {
-                        Ok(())
+                        Ok(crate::backend::WriteState::Confirmed)
                     } else {
                         Err("refused".into())
                     },
