@@ -249,7 +249,7 @@ pub(super) fn exercise(
         )
         .unwrap()
         .version,
-        44
+        postgres_schema::VERSION
     );
     sql(
         &fixture,

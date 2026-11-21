@@ -1891,6 +1891,16 @@ sort by ascending Email ID, preserving the existing query interpretation.
 A foreign wire mailbox can be represented by the explicit empty scope.
 No text-search, thread collapse or new client feature is added here.
 
+The account's B-tree on `(account, received_at DESC, id ASC)` supplies
+the default newest-first order. PostgreSQL can stop once it finds enough
+qualifying Emails. For ascending dates it can scan the index backwards
+and sort equal-date groups by ascending ID. A selective mailbox may use
+its membership index first. Large offsets still skip rows, and a requested
+total counts all matches. The index consumes database, WAL and physical
+backup space on the primary and each replica. Logical dumps carry its
+definition and rebuild it during restore; account body quotas measure
+message storage separately.
+
 The page and its query state use the same authenticated repeatable-read
 snapshot as metadata and body reads. Closed SQL filters by account and
 mailbox before ordering; optional totals count the same filtered relation.

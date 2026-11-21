@@ -59,8 +59,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_retry_floor.sql"),
     "DROP TABLE td_mta.receiving_receipts;",
     include_str!("postgres_replica_retention.sql"),
+    include_str!("postgres_email_received_order.sql"),
 ];
-pub const VERSION: u32 = 44;
+pub const VERSION: u32 = 45;
 #[path = "postgres_schema_acl.rs"]
 mod acl;
 // Shared by every future serving connection and explicit schema operation.

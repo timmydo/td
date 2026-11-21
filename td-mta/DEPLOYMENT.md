@@ -809,6 +809,9 @@ restrict,command="/opt/td-mta/bin/td-mta-operator install-td-mta --export-latest
 ```
 
 Install the export-capable helper on the source before enabling pulls.
+Before upgrading the mail schema, install a recovery helper built with the
+target migration pins on the recovery host. Its drill accepts earlier
+supported ledgers as well as the new one.
 The recovery host needs read access through this identity only. Keep the
 production database login on the source. Run the first copy, age check
 and drill under the identity that will own the scheduled jobs:
@@ -1233,7 +1236,7 @@ origin, a protected password file, your local mailbox address, resolver and
 explicit body/blob/Email/receipt quotas. Place the database on a dedicated
 size-limited volume and verify the mount before enabling the generated copy
 worker. The [desktop replica runbook](REPLICA-OPERATIONS.md#size-and-verify-the-replica-volume)
-covers new and installed volumes and the fenced schema-44 upgrade.
+covers new and installed volumes and the fenced upgrade to schema 45.
 Source credentials stay separate from
 the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.

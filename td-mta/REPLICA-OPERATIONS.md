@@ -248,7 +248,7 @@ does not undo a schema upgrade. PostgreSQL package updates are a separate
 operation. Public-server deployment and ACME renewal are independent of local
 replica updates.
 
-### Fenced desktop upgrade from schema 43 to 44
+### Fenced desktop upgrade from schema 43 or 44 to 45
 
 This procedure is for a private Unix-socket replica with the three generated
 services. Keep the public deployment tooling on the primary. Schedule a
@@ -293,9 +293,11 @@ desktop read outage. Run the mail commands as the installation user.
      -c "unix_socket_directories=$replica_root/socket"
    ```
 
-4. Read the plan with the candidate. Require current 43, target 44, exactly
-   one pending migration (44), and the recorded local store epoch. Allow a
-   bounded maintenance window for the identity backfill. For example:
+4. Read the plan with the candidate. Require the recorded local store epoch
+   and target 45. From schema 44 expect one pending migration (45). From
+   schema 43 expect migrations 44 and 45 in order. Budget space and time
+   for the Email order index build and its WAL. An upgrade from 43 also
+   backfills replica identities. For example:
 
    ```sh
    owner_file="$replica_root/owner-connection"
@@ -312,13 +314,12 @@ desktop read outage. Run the mail commands as the installation user.
      --epoch "$replica_epoch" --account "$replica_account"
    ```
 
-   Require version 44 and the same epoch, source binding, account, generation,
-   cursor, pending ID count and unfinished ID count as before. The live
-   receipt count can decrease.
-   Schema 44 requires no additional grants. Keep the replica reader and
+   Require version 45 and the same epoch, source binding, account, generation,
+   cursor, pending ID count and unfinished ID count as before. When upgrading
+   from 43 the live receipt count can decrease. Keep the replica reader and
    publisher privilege sets. After a lost upgrade response, keep writers
    fenced, wait for the migration lock to release and inspect the ledger.
-   A confirmed 43 may be retried after diagnosis. A confirmed 44 goes through
+   The original version may be retried after diagnosis. A confirmed 45 goes through
    the same verification before serving.
 5. Stop the private foreground server with `pg_ctl -D "$replica_root/postgres"
    -m fast -w stop`. Confirm clean shutdown. Start the normal PostgreSQL
@@ -329,15 +330,15 @@ desktop read outage. Run the mail commands as the installation user.
 
 If the cutover fails, stop the copier, reader, scheduled jobs and **both**
 possible PostgreSQL launches. Preserve the failed cluster separately.
-Restore the verified schema-43 cold archive with `tar -xpf "$backup/root.tar"
+Restore the verified pre-upgrade cold archive with `tar -xpf "$backup/root.tar"
 -C "$replica_root"` into an **empty, mode-0700 root** at the original absolute
 path on the capped volume. Select the saved old executable by atomically
 replacing the installation's `bin/td-mta` symlink. Start PostgreSQL, verify
-schema 43, the saved local epoch, source binding and checkpoints with the old
+the original schema version, local epoch, source binding and checkpoints with the old
 binary, then restart and verify the reader and copier. Recheck freshness.
 Copy progress made after the archive must be fetched again. If the required source history has expired,
 keep this copy for reading and provision a separate fresh replica from the
-source before switching clients. Never start the old binary on ledger 44.
+source before switching clients. The previous binary requires its original ledger.
 
 ## Integrity and recovery evidence
 
