@@ -1,0 +1,22 @@
+[package]
+name = "td-pulse"
+version = "0.1.0"
+edition = "2021"
+description = "The PulseAudio native protocol codec: pstream framing, tagstruct and the captured command table"
+license = "MIT"
+
+# This crate's confinement assertions live in test targets, so the lint pass
+# has to reach them.
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

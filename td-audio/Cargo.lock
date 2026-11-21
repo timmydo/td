@@ -5,3 +5,10 @@ version = 3
 [[package]]
 name = "td-audio"
 version = "0.1.0"
+dependencies = [
+ "td-pulse",
+]
+
+[[package]]
+name = "td-pulse"
+version = "0.1.0"

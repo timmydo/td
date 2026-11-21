@@ -2579,6 +2579,12 @@ that serves clients over a Unix socket. The dedicated `audio` account §K.5
 specifies is a rung of its own and lands separately; nothing here creates an
 account or a directory.
 
+The protocol codec, meaning the framing, tagstruct and command table, lives
+in `td-pulse`, which the daemon links by path and the td-audio recipe
+compiles to an rlib. That crate forbids `unsafe` and names no OS facility,
+device or refused request. Its own tests, and the recipe's scans of every
+staged file, pin this, so it adds nothing to this surface.
+
 §I's rung 25 and §K.5 both call this "surface #11". That was already
 `td-profiler` when the audio reversal reached the ladder, and `td-portal`
 has since taken #12, so both are corrected to #13 in the landing that adds

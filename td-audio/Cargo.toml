@@ -16,6 +16,9 @@ clippy-all-targets = true
 name = "td-audio"
 path = "src/main.rs"
 
+[dependencies]
+td-pulse = { path = "../td-pulse" }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

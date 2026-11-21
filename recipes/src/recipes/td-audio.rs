@@ -6,7 +6,8 @@ use crate::types::{Recipe, Step};
 // that owns the only path to the hardware must not depend on a dynamic loader
 // that the thing it is diagnosing may have broken. The crate is the one source
 // of truth; this recipe preserves the source layout, including the shared
-// broker policy, for direct rustc module resolution.
+// broker policy, for direct rustc module resolution, and first compiles the
+// td-pulse protocol codec to the rlib the daemon links as `td_pulse`.
 //
 // This is APPLICATIONS.md §I rungs 25 and 26 — the ALSA PCM back end and its
 // mixer, driven by a tone fixture, plus the PulseAudio protocol and the socket
@@ -22,28 +23,44 @@ const MODULES: &[(&str, &str)] = &[
     ("device", include_str!("../../../td-audio/src/device.rs")),
     ("mixer", include_str!("../../../td-audio/src/mixer.rs")),
     ("pcm", include_str!("../../../td-audio/src/pcm.rs")),
-    ("proto", include_str!("../../../td-audio/src/proto.rs")),
     ("serve", include_str!("../../../td-audio/src/serve.rs")),
     ("session", include_str!("../../../td-audio/src/session.rs")),
     ("sink", include_str!("../../../td-audio/src/sink.rs")),
     ("sys", include_str!("../../../td-audio/src/sys.rs")),
-    ("tag", include_str!("../../../td-audio/src/tag.rs")),
     ("tone", include_str!("../../../td-audio/src/tone.rs")),
     ("wav", include_str!("../../../td-audio/src/wav.rs")),
-    ("wire", include_str!("../../../td-audio/src/wire.rs")),
     (
         "workload_accounts",
         include_str!("../../../engine/src/workload_accounts.rs"),
     ),
 ];
 
-/// Where a module is staged: the shared sources at the paths
-/// the crate root's `#[path]` attributes name, the rest beside `main.rs`.
+/// The protocol codec crate the daemon links: its root and its modules, staged
+/// at the crate's own path and compiled to an rlib before the daemon.
+const PULSE_LIB_RS: &str = include_str!("../../../td-pulse/src/lib.rs");
+const PULSE: &[(&str, &str)] = &[
+    ("lib", PULSE_LIB_RS),
+    ("proto", include_str!("../../../td-pulse/src/proto.rs")),
+    ("tag", include_str!("../../../td-pulse/src/tag.rs")),
+    ("wire", include_str!("../../../td-pulse/src/wire.rs")),
+];
+
+/// Where a file is staged: the shared sources at the paths the crate root's
+/// `#[path]` attributes name, td-pulse's in its own tree, the rest beside
+/// `main.rs`.
 fn staged_path(name: &str) -> String {
+    // The two shared paths stay literal: the affected self-test finds each
+    // `#[path]` source's staging in this text.
     match name {
         "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
         "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
-        _ => format!("{{src}}/td-audio/src/{name}.rs"),
+        _ => {
+            let dir = match name {
+                "lib" | "proto" | "tag" | "wire" => "td-pulse",
+                _ => "td-audio",
+            };
+            format!("{{src}}/{dir}/src/{name}.rs")
+        }
     }
 }
 
@@ -111,18 +128,46 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
     ];
-    for (name, source) in MODULES {
+    for (name, source) in MODULES.iter().chain(PULSE) {
         steps.push(Step::WriteFile {
             path: staged_path(name),
             content: (*source).into(),
             exec: false,
         });
     }
-    steps.push(
+    steps.extend([
         target_rustc(
             "{src}",
             rustc,
             &[
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_pulse",
+                "-C",
+                "opt-level=s",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "panic=abort",
+                "-o",
+                "{src}/libtd_pulse.rlib",
+                "{src}/td-pulse/src/lib.rs",
+            ],
+        )
+        .env("SOURCE_DATE_EPOCH", "1"),
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--extern",
+                "td_pulse={src}/libtd_pulse.rlib",
                 "--edition",
                 "2021",
                 "-C",
@@ -141,13 +186,13 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("SOURCE_DATE_EPOCH", "1"),
-    );
-    steps.push(Step::Require {
-        paths: vec!["{out}/bin/td-audio".into()],
-        exec: true,
-    });
-    steps.push(split_target_debug("{out}"));
-    steps.push(Step::assert_static(&["{out}/bin/td-audio"]));
+        Step::Require {
+            paths: vec!["{out}/bin/td-audio".into()],
+            exec: true,
+        },
+        split_target_debug("{out}"),
+        Step::assert_static(&["{out}/bin/td-audio"]),
+    ]);
 
     Recipe::mesboot("td-audio", "0.1")
         .build_root()
@@ -173,13 +218,25 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 15);
+        assert_eq!(written.len(), 12);
+
+        let mut pulse_declared = declared_in(PULSE_LIB_RS);
+        let mut pulse_written: Vec<_> = PULSE
+            .iter()
+            .filter(|(name, _)| *name != "lib")
+            .map(|(name, _)| name.to_string())
+            .collect();
+        pulse_declared.sort_unstable();
+        pulse_written.sort_unstable();
+        assert_eq!(pulse_written, pulse_declared);
+        assert_eq!(pulse_written.len(), 3);
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
         let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())
             .chain(
                 MODULES
                     .iter()
+                    .chain(PULSE)
                     .map(|(name, _)| staged_path(name).replacen("{src}/", "", 1)),
             )
             .collect();
@@ -341,6 +398,7 @@ mod tests {
             let expected = match name.as_str() {
                 "td-audio/src/main.rs" => KEYWORD_USES_IN_MAIN,
                 "td-audio/src/sys.rs" => KEYWORD_USES_IN_SYS,
+                "td-pulse/src/lib.rs" => KEYWORD_USES_IN_PULSE_ROOT,
                 _ => 0,
             };
             assert_eq!(
@@ -356,13 +414,13 @@ mod tests {
             !staged.contains(concat!("#[cfg_", "attr(")),
             "the staged tree writes an attribute conditionally"
         );
-        // No module is declared anywhere but the root. One declared in `sys`
+        // No module is declared anywhere but the two crate roots. One declared in `sys`
         // would resolve to `sys/extra.rs`, which this recipe stages nowhere and
         // no scan here reads — a confirmation pass put a back door there and
         // every assertion passed. Each staged module has no submodules, so the build would
         // fail on the missing file; failing in the scan says why.
         for (name, text) in &files {
-            if name == "td-audio/src/main.rs" {
+            if name == "td-audio/src/main.rs" || name == "td-pulse/src/lib.rs" {
                 continue;
             }
             assert!(
@@ -394,19 +452,29 @@ mod tests {
     const KEYWORD_USES_IN_SYS: usize = 2;
     /// And the staged crate root: the crate-level denial, and nothing else.
     const KEYWORD_USES_IN_MAIN: usize = 1;
+    /// And the codec crate's root: its crate-level prohibition, and nothing
+    /// else. Its modules name the keyword nowhere.
+    const KEYWORD_USES_IN_PULSE_ROOT: usize = 1;
 
     /// The two §K.4 refusals that would be invisible in a passing build: the
     /// mmap machinery, and the card control device.
     #[test]
     fn the_staged_source_refuses_the_mmap_ring_and_the_control_device() {
-        for (name, source) in MODULES {
+        // Every staged file, td-pulse's included: the daemon links the codec,
+        // so a refused name there reaches the binary as surely as one in
+        // td-audio's own tree.
+        let files = staged_files();
+        assert!(files
+            .iter()
+            .any(|(name, _)| name == "td-pulse/src/proto.rs"));
+        for (name, source) in &files {
             assert!(
                 !source.contains(concat!("SNDRV_PCM_IOCTL_", "SYNC_PTR")),
-                "the staged {name} module reaches for the mapped-ring interface"
+                "the staged {name} reaches for the mapped-ring interface"
             );
             assert!(
                 !source.contains(concat!("/dev/snd/cont", "rolC")),
-                "the staged {name} module names the card control device"
+                "the staged {name} names the card control device"
             );
         }
     }

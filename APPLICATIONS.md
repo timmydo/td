@@ -8693,7 +8693,12 @@ restricted to `SOL_SOCKET`/`SO_PEERCRED` with a pinned 12-byte
 `[i32; 3]`. The landed multicall provides the server, deterministic ALSA
 and WAV tone paths, WAV verification, device enumeration and a live-socket
 probe. `status` and `volume` remain future ordinary Pulse clients of the
-daemon's own socket, so policy tooling will cost no second protocol.
+daemon's own socket, so policy tooling will cost no second protocol. The
+protocol codec they will share with the daemon, the pstream framing, the
+tagstruct reader and writer and the captured command table, is the
+separate safe, std-only `td-pulse` crate, which forbids `unsafe` and which
+the td-audio recipe compiles to an rlib before linking the daemon against
+it; surface #13 stays in td-audio.
 
 **It runs as a dedicated `audio` uid, not as uid 1000 — CONFIRMED by the
 maintainer**, which §O listed as the one privilege question the two

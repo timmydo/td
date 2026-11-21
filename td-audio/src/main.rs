@@ -27,15 +27,16 @@ mod alsa;
 mod device;
 mod mixer;
 mod pcm;
-mod proto;
 mod serve;
 mod session;
 mod sink;
 mod sys;
-mod tag;
 mod tone;
 mod wav;
-mod wire;
+
+// The protocol codec is td-pulse's; naming its modules at the root keeps
+// every `crate::tag`, `crate::wire` and `crate::proto` path the daemon uses.
+use td_pulse::{proto, tag, wire};
 
 use crate::alsa::{AlsaSink, Request};
 use crate::mixer::{Mixer, StreamId};
@@ -692,15 +693,12 @@ mod tests {
             ("device.rs", include_str!("device.rs")),
             ("mixer.rs", include_str!("mixer.rs")),
             ("pcm.rs", include_str!("pcm.rs")),
-            ("proto.rs", include_str!("proto.rs")),
             ("serve.rs", include_str!("serve.rs")),
             ("session.rs", include_str!("session.rs")),
             ("sink.rs", include_str!("sink.rs")),
             ("sys.rs", include_str!("sys.rs")),
-            ("tag.rs", include_str!("tag.rs")),
             ("tone.rs", include_str!("tone.rs")),
             ("wav.rs", include_str!("wav.rs")),
-            ("wire.rs", include_str!("wire.rs")),
             (
                 "workload_accounts.rs",
                 include_str!("../../engine/src/workload_accounts.rs"),
