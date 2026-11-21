@@ -32,6 +32,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/web_assertion.rs"),
     ),
     (
+        "{src}/td-fido/src/web_request.rs",
+        include_str!("../../../td-fido/src/web_request.rs"),
+    ),
+    (
         "{src}/td-fido/src/fido_enroll.rs",
         include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),

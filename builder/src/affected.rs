@@ -5057,6 +5057,7 @@ fn manifest_path_dependencies(
 const FIDO_DEPENDENTS: &[&str] = &[
     "td-secret",
     "td-tpm",
+    "td-passkeys",
     "td-protector",
     "td-boot",
     "td-install",
@@ -10471,6 +10472,7 @@ mod tests {
                 "td-news",
                 "td-open",
                 "td-pass",
+                "td-passkeys",
                 "td-photo",
                 "td-pinentry",
                 "td-portal",
@@ -10506,9 +10508,11 @@ mod tests {
         // td-boot, which includes td-init's console identity by `#[path]`,
         // and td-kexec and td-update, which read td-boot, add two each, as do
         // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
+        // td-passkeys names the notebook in its manifest, so the conservative
+        // reader graph includes its test and Clippy legs.
         // The format check rides with the workspace.
         // td-sh exercises its job control through the toolkit PTY in its tests.
-        assert_eq!(comp.len(), 87, "{comp:?}");
+        assert_eq!(comp.len(), 89, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10534,6 +10538,7 @@ mod tests {
                 "td-news",
                 "td-open",
                 "td-pass",
+                "td-passkeys",
                 "td-photo",
                 "td-pinentry",
                 "td-portal",
@@ -10579,6 +10584,7 @@ mod tests {
                 "td-news",
                 "td-open",
                 "td-pass",
+                "td-passkeys",
                 "td-photo",
                 "td-pinentry",
                 "td-portal",

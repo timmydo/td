@@ -1788,8 +1788,8 @@ framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
 AES, HMAC-SHA256 and hidraw admission) moves into one std-only sibling
 crate, `td-fido`, which forbids `unsafe` (AGENTS.md principle 2); what
 needs `unsafe` stays in td-secret. td-protector takes td-fido's
-HMAC-SHA256; those four are td-fido's only dependents
-(td-fido/DESIGN.md, "Consumers").
+HMAC-SHA256. td-fido/DESIGN.md, "Consumers", records the admitted
+dependents, including those outside disk protection.
 
 **Threat and limits.** FIDO2 release binds no measurement, and the
 salt is public in the header. Presenting a token and typing its PIN

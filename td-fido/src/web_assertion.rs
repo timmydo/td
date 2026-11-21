@@ -63,6 +63,20 @@ pub struct Assertion<'a> {
     pub user_handle: Option<&'a [u8]>,
 }
 
+pub(crate) fn website_rp(rp: &str) -> bool {
+    !rp.is_empty()
+        && rp.len() <= 253
+        && rp != RP_ID
+        && rp.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
 impl<'a> Request<'a> {
     pub fn new(
         rp: &'a str,
@@ -71,18 +85,7 @@ impl<'a> Request<'a> {
         verification: Verification<'a>,
         max_message: usize,
     ) -> Result<Self, Error> {
-        if rp.is_empty()
-            || rp.len() > 253
-            || rp == RP_ID
-            || !rp.split('.').all(|label| {
-                (1..=63).contains(&label.len())
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            })
-        {
+        if !website_rp(rp) {
             return Err(Error::RelyingParty);
         }
         // Even the smallest encoded descriptor takes more than one byte.

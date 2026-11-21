@@ -129,6 +129,18 @@ so:
   consumer serves the role from its own command line
   (td-secret/DESIGN.md names td-secret's).
 
+### Browser CTAP requests
+
+`web_request::parse` accepts getInfo, ES256 makeCredential and
+getAssertion. A CTAP 2.0 makeCredential with empty pinAuth produces
+only a presence-selection request. Typed fields borrow the checked packet. Each request names
+a canonical website RP, excludes td.invalid, bounds credential lists to
+32 entries, and carries the browser's 32-byte client-data hash. It
+rejects PIN management, reset, credential management, extension operations
+and unknown request fields. Firefox may explicitly disable hmac-secret
+on registration. The typed request discards that setting. Local policy supplies user presence and
+verification. The decoder has no authority to operate a device.
+
 ### Website key attachment
 
 `website_candidate` inspects the fixed hidraw names without opening them.
@@ -151,8 +163,9 @@ td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"
 modules, and the files td-firstboot and td-portal share with it, name
 them as before. td-tpm depends on it the same way for its salted
 sessions (td-tpm/DESIGN.md). Per `td-install/ENCRYPTION.md` item 8,
-td-protector (its HMAC-SHA256), td-boot and td-install are the only
-other crates that may depend on it directly. Since increment 8b td-boot does, for its
+td-protector, td-boot and td-install use it for the disk protectors.
+td-passkeys depends on it for the checked browser requests, CBOR and RP
+hashes. Since increment 8b td-boot does, for its
 selector's FIDO2 client: `fido_disk` over root-admitted devices, each
 session's worker td-boot's own `fido-worker` verb (`Program::ROOT`),
 whose desktop verb it never builds or dispatches. Since increment 8e

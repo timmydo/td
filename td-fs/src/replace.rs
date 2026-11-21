@@ -33,6 +33,17 @@ const NAME_ATTEMPTS: u32 = 64;
 /// taken as synced. A temporary name that is taken, left by a crash, is
 /// passed over for the next, never removed.
 pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    replace_with(path, bytes, mode, |_| Ok(()))
+}
+
+/// Set and check a sensitive file's attributes on its new private inode
+/// before writing or publishing it. A failed check preserves the old file.
+pub fn replace_with(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    prepare: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let named =
@@ -68,8 +79,8 @@ pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
             Err(error) => return Err(named(error)),
         }
     };
-    let placed = file
-        .write_all(bytes)
+    let placed = prepare(&file)
+        .and_then(|()| file.write_all(bytes))
         .and_then(|()| file.sync_all())
         .and_then(|()| std::fs::rename(&temporary, path));
     if let Err(error) = placed {
