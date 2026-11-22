@@ -2173,7 +2173,7 @@ td-mail/src/cache.rs	allocating-conversion	21
 td-mail/src/cache.rs	allocation-macro	9
 td-mail/src/cache.rs	unchecked-growth-or-clone	31
 td-mail/src/cli.rs	allocating-constructor	3
-td-mail/src/cli.rs	allocating-conversion	80
+td-mail/src/cli.rs	allocating-conversion	79
 td-mail/src/cli.rs	allocation-macro	21
 td-mail/src/cli.rs	heap-owner	6
 td-mail/src/cli.rs	unchecked-growth-or-clone	90

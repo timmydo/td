@@ -2,6 +2,15 @@
 // (UNSAFE.md §17) went with the terminal, and the Wayland transport is
 // td-ui's (§19), so no `unsafe` is written here.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
+// A diagnostic sink may fail alongside the original operation.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
 
 #[macro_use]
 mod log;
@@ -25,6 +34,7 @@ mod ui;
 
 use config::{AccountConfig, Config, PasswordSource};
 use jmap::client::{JmapClient, JmapError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,7 +45,7 @@ fn default_config_path() -> PathBuf {
     match td_ui::xdg::from_env(td_ui::xdg::Base::Config) {
         Some(dir) => dir.join("td-mail").join("config.toml"),
         None => {
-            eprintln!("td-mail: {}", td_ui::xdg::Base::Config.missing());
+            diagnostic!("td-mail: {}", td_ui::xdg::Base::Config.missing());
             std::process::exit(1)
         }
     }
@@ -435,11 +445,11 @@ pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
 
 fn show_log() {
     let Some(path) = log::log_path() else {
-        eprintln!("td-mail: {}", td_ui::xdg::Base::State.missing());
+        diagnostic!("td-mail: {}", td_ui::xdg::Base::State.missing());
         std::process::exit(1)
     };
     if !path.exists() {
-        eprintln!("No log file found at {}", path.display());
+        diagnostic!("No log file found at {}", path.display());
         std::process::exit(1);
     }
     let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
@@ -448,13 +458,14 @@ fn show_log() {
         Ok(s) if s.success() => {}
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("Failed to launch pager '{}': {}", pager, e);
+            diagnostic!("Failed to launch pager '{}': {}", pager, e);
             std::process::exit(1);
         }
     }
 }
 
-fn print_rules() {
+fn print_rules() -> io::Result<()> {
+    let mut out = io::stdout().lock();
     let config_path = default_config_path();
     let rules_path = config_path
         .parent()
@@ -462,14 +473,14 @@ fn print_rules() {
         .unwrap_or_else(|| PathBuf::from("rules.toml"));
 
     if !rules_path.exists() {
-        eprintln!("No rules file found at {}", rules_path.display());
+        diagnostic!("No rules file found at {}", rules_path.display());
         std::process::exit(1);
     }
 
     let loaded = match rules::load_rules(&rules_path) {
         Ok(rules) => rules,
         Err(e) => {
-            eprintln!("Failed to load rules from {}: {}", rules_path.display(), e);
+            diagnostic!("Failed to load rules from {}: {}", rules_path.display(), e);
             std::process::exit(1);
         }
     };
@@ -479,11 +490,11 @@ fn print_rules() {
         Ok(config) => {
             let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
             if let Err(e) = rules::check_accounts(&loaded, &names) {
-                eprintln!("Rules in {} are not used: {}", rules_path.display(), e);
+                diagnostic!("Rules in {} are not used: {}", rules_path.display(), e);
                 std::process::exit(1);
             }
         }
-        Err(e) => eprintln!(
+        Err(e) => diagnostic!(
             "Account names not checked: {}: {}",
             config_path.display(),
             e
@@ -491,18 +502,21 @@ fn print_rules() {
     }
     let custom_headers = rules::extract_custom_headers(&loaded);
 
-    println!("Rules file: {}", rules_path.display());
-    println!("Rules loaded: {}", loaded.len());
-    println!("Custom headers requested: {}", custom_headers.len());
-    println!();
-    print!("{}", rules::format_rules_for_display(&loaded));
+    writeln!(out, "Rules file: {}", rules_path.display())?;
+    writeln!(out, "Rules loaded: {}", loaded.len())?;
+    writeln!(out, "Custom headers requested: {}", custom_headers.len())?;
+    writeln!(out)?;
+    write!(out, "{}", rules::format_rules_for_display(&loaded))?;
+    out.flush()
 }
 
-fn print_prompt(topic: &str) {
+fn print_prompt(topic: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
     match topic {
         "config" => {
             let config_path = default_config_path();
-            print!(
+            write!(
+                out,
                 r#"I need help generating a configuration file for td-mail (Timmy's Mail Console), a terminal email client that connects via JMAP.
 
 The config file goes at: {}
@@ -581,7 +595,7 @@ Rules:
 Please ask me for my email provider, username, and how I store passwords, then generate a config file.
 "#,
                 config_path.display()
-            );
+            )?;
         }
         "rules" => {
             let config_path = default_config_path();
@@ -589,7 +603,8 @@ Please ask me for my email provider, username, and how I store passwords, then g
                 .parent()
                 .map(|p| p.join("rules.toml"))
                 .unwrap_or_else(|| PathBuf::from("rules.toml"));
-            print!(
+            write!(
+                out,
                 r#"I need help generating a rules file for td-mail (Timmy's Mail Console), a terminal email client.
 
 The rules file goes at: {}
@@ -683,83 +698,125 @@ Set `account = "NAME"` to run a rule for the configured [account.NAME] alone (`d
 Please ask me what kinds of emails I receive and how I want them organized, then generate a rules file.
 "#,
                 rules_path.display()
-            );
+            )?;
         }
         _ => {
-            eprintln!(
+            diagnostic!(
                 "Unknown prompt topic '{}'. Available topics: config, rules",
                 topic
             );
             std::process::exit(1);
         }
     }
+    out.flush()
 }
 
-fn print_help_config() {
+fn print_help_config() -> io::Result<()> {
+    let mut out = io::stdout().lock();
     let config_path = default_config_path();
-    println!("Default config file: {}", config_path.display());
-    println!();
-    println!("Available options:");
-    println!();
-    println!("[ui]");
-    println!(
+    writeln!(out, "Default config file: {}", config_path.display())?;
+    writeln!(out)?;
+    writeln!(out, "Available options:")?;
+    writeln!(out)?;
+    writeln!(out, "[ui]")?;
+    writeln!(
+        out,
         "  editor = \"nvim\"              # Accepted and ignored: drafts are edited in the window"
-    );
-    println!("  browser = \"firefox\"           # Browser for opening URLs (fallback: $BROWSER, xdg-open)");
-    println!("  page_size = 500              # Emails per page (default: 500)");
-    println!("  mouse = true                 # Enable mouse support (default: true)");
-    println!("  sync_interval_secs = 60      # Background sync interval in seconds (default: 60, 0 = off)");
-    println!();
-    println!("[mail]");
-    println!("  archive_folder = \"archive\"   # Target folder for 'a' archive action (default: \"archive\")");
-    println!("  deleted_folder = \"trash\"     # Target folder for 'd' delete action (default: \"trash\")");
-    println!("  archive_mailbox_id = \"id\"    # Override archive folder by JMAP mailbox ID (--cli only)");
-    println!("  deleted_mailbox_id = \"id\"    # Override deleted folder by JMAP mailbox ID (--cli only)");
-    println!("  reply_from = \"Name <email>\"  # Override From header for replies/compose/forward");
-    println!("  rules_mailbox_regex = \"^INBOX$\"  # Run rules only on matching mailbox names (default: \"^INBOX$\")");
-    println!("  my_email_regex = \"^$\"        # Your email addresses for skip_if_to_me rule option (default: \"^$\")");
-    println!();
-    println!("[spam]                           # Built-in Bayesian spam classifier (scores new INBOX mail)");
-    println!("  enabled = true               # Score new INBOX messages (default: true)");
-    println!("  threshold = 0.9              # Score >= this is verdict \"spam\" (default: 0.9)");
-    println!("  ham_threshold = 0.2          # Score <= this is verdict \"ham\"; between is \"unsure\" (default: 0.2)");
-    println!("  min_training = 20            # Min trained messages per class before verdicts go live (default: 20)");
-    println!("  # Train with J (spam) / H (not-spam) in the message view; act on the");
-    println!("  # X-Tmc-Spam-Verdict header from rules.toml (see: td-mail --prompt=rules).");
-    println!();
-    println!("[account.NAME]                   # At least one account required");
-    println!(
+    )?;
+    writeln!(out, "  browser = \"firefox\"           # Browser for opening URLs (fallback: $BROWSER, xdg-open)")?;
+    writeln!(
+        out,
+        "  page_size = 500              # Emails per page (default: 500)"
+    )?;
+    writeln!(
+        out,
+        "  mouse = true                 # Enable mouse support (default: true)"
+    )?;
+    writeln!(out, "  sync_interval_secs = 60      # Background sync interval in seconds (default: 60, 0 = off)")?;
+    writeln!(out)?;
+    writeln!(out, "[mail]")?;
+    writeln!(out, "  archive_folder = \"archive\"   # Target folder for 'a' archive action (default: \"archive\")")?;
+    writeln!(out, "  deleted_folder = \"trash\"     # Target folder for 'd' delete action (default: \"trash\")")?;
+    writeln!(out, "  archive_mailbox_id = \"id\"    # Override archive folder by JMAP mailbox ID (--cli only)")?;
+    writeln!(out, "  deleted_mailbox_id = \"id\"    # Override deleted folder by JMAP mailbox ID (--cli only)")?;
+    writeln!(
+        out,
+        "  reply_from = \"Name <email>\"  # Override From header for replies/compose/forward"
+    )?;
+    writeln!(out, "  rules_mailbox_regex = \"^INBOX$\"  # Run rules only on matching mailbox names (default: \"^INBOX$\")")?;
+    writeln!(out, "  my_email_regex = \"^$\"        # Your email addresses for skip_if_to_me rule option (default: \"^$\")")?;
+    writeln!(out)?;
+    writeln!(out, "[spam]                           # Built-in Bayesian spam classifier (scores new INBOX mail)")?;
+    writeln!(
+        out,
+        "  enabled = true               # Score new INBOX messages (default: true)"
+    )?;
+    writeln!(
+        out,
+        "  threshold = 0.9              # Score >= this is verdict \"spam\" (default: 0.9)"
+    )?;
+    writeln!(out, "  ham_threshold = 0.2          # Score <= this is verdict \"ham\"; between is \"unsure\" (default: 0.2)")?;
+    writeln!(out, "  min_training = 20            # Min trained messages per class before verdicts go live (default: 20)")?;
+    writeln!(
+        out,
+        "  # Train with J (spam) / H (not-spam) in the message view; act on the"
+    )?;
+    writeln!(
+        out,
+        "  # X-Tmc-Spam-Verdict header from rules.toml (see: td-mail --prompt=rules)."
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "[account.NAME]                   # At least one account required"
+    )?;
+    writeln!(
+        out,
         "  well_known_url = \"https://.../.well-known/jmap\"  # JMAP discovery URL (required)"
-    );
-    println!("  username = \"user@example.com\"                    # Email address (required)");
-    println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this, password_file or password_command)");
-    println!("  # unix_socket = \"/absolute/path/jmap/socket\"      # Local replica; use http://localhost/.well-known/jmap and no TLS CA");
-    println!("  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin");
-    println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
-    println!("  password_file = \"mail.password\"                  # File holding it, beside this config, chmod 600 (or secret)");
-    println!("  reply_from, archive_folder, deleted_folder,      # Optional: [mail]'s keys for this account alone");
-    println!("  archive_mailbox_id, deleted_mailbox_id");
-    println!();
-    println!("[retention.NAME]                 # Optional folder retention policies");
-    println!("  folder = \"Archive\"            # Mailbox name to apply retention (required)");
-    println!("  days = 365                   # Expire mail older than this many days (required)");
-    println!(
+    )?;
+    writeln!(
+        out,
+        "  username = \"user@example.com\"                    # Email address (required)"
+    )?;
+    writeln!(out, "  secret = \"portal\"                                # The credential portal, mail/NAME (this, password_file or password_command)")?;
+    writeln!(out, "  # unix_socket = \"/absolute/path/jmap/socket\"      # Local replica; use http://localhost/.well-known/jmap and no TLS CA")?;
+    writeln!(out, "  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin")?;
+    writeln!(out, "  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)")?;
+    writeln!(out, "  password_file = \"mail.password\"                  # File holding it, beside this config, chmod 600 (or secret)")?;
+    writeln!(out, "  reply_from, archive_folder, deleted_folder,      # Optional: [mail]'s keys for this account alone")?;
+    writeln!(out, "  archive_mailbox_id, deleted_mailbox_id")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "[retention.NAME]                 # Optional folder retention policies"
+    )?;
+    writeln!(
+        out,
+        "  folder = \"Archive\"            # Mailbox name to apply retention (required)"
+    )?;
+    writeln!(
+        out,
+        "  days = 365                   # Expire mail older than this many days (required)"
+    )?;
+    writeln!(
+        out,
         "  account = \"NAME\"             # The one account it is for (default: every account)"
-    );
-    println!();
-    println!(
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
         "# `scrolloff` under [ui] and a [theme] section were the terminal's: accepted, ignored."
-    );
-    println!();
-    println!(
+    )?;
+    writeln!(out)?;
+    writeln!(out,
         "Legacy: [jmap] section with well_known_url, username, and a password source is also supported."
-    );
+    )?;
+    out.flush()
 }
 
 /// Launcher-only export: parse configuration without running credentials,
 /// touching logs or caches, or requiring the replica to be running.
 fn fetch_unix_endpoints(args: &[String]) -> Result<(), String> {
-    use std::io::Write;
     if args
         .iter()
         .any(|a| a != "--fetch-unix-endpoints" && !a.starts_with("--config="))
@@ -797,47 +854,76 @@ fn fetch_unix_endpoints(args: &[String]) -> Result<(), String> {
 }
 
 fn main() {
+    if let Err(error) = run() {
+        let _ = writeln!(io::stderr().lock(), "td-mail: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: td-mail [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --config=PATH    Use config file at PATH instead of default");
-        eprintln!("  --rules=PATH     Use rules file at PATH instead of default");
-        eprintln!("  --clear-cache    Delete all local email cache files");
-        eprintln!("  --clear-log      Truncate the log file at startup");
-        eprintln!("  --log            View the log file in $PAGER");
-        eprintln!("  --offline        Browse cached mail without network access");
-        eprintln!("  --print-rules    Parse and print rules.toml");
-        eprintln!("  --prompt=TOPIC   Print an AI-friendly prompt (config, rules)");
-        eprintln!("  --cli            Run in JSON-over-stdin/stdout CLI mode");
-        eprintln!("  --help-cli       Print CLI mode protocol documentation");
-        eprintln!("  --help-config    Print default config path and all options");
-        eprintln!("  --help           Show this help");
-        std::process::exit(0);
+        let mut out = io::stderr().lock();
+        writeln!(out, "Usage: td-mail [OPTIONS]")?;
+        writeln!(out)?;
+        writeln!(out, "Options:")?;
+        writeln!(
+            out,
+            "  --config=PATH    Use config file at PATH instead of default"
+        )?;
+        writeln!(
+            out,
+            "  --rules=PATH     Use rules file at PATH instead of default"
+        )?;
+        writeln!(out, "  --clear-cache    Delete all local email cache files")?;
+        writeln!(out, "  --clear-log      Truncate the log file at startup")?;
+        writeln!(out, "  --log            View the log file in $PAGER")?;
+        writeln!(
+            out,
+            "  --offline        Browse cached mail without network access"
+        )?;
+        writeln!(out, "  --print-rules    Parse and print rules.toml")?;
+        writeln!(
+            out,
+            "  --prompt=TOPIC   Print an AI-friendly prompt (config, rules)"
+        )?;
+        writeln!(
+            out,
+            "  --cli            Run in JSON-over-stdin/stdout CLI mode"
+        )?;
+        writeln!(
+            out,
+            "  --help-cli       Print CLI mode protocol documentation"
+        )?;
+        writeln!(
+            out,
+            "  --help-config    Print default config path and all options"
+        )?;
+        writeln!(out, "  --help           Show this help")?;
+        return out.flush();
     }
 
     if args.iter().any(|a| a == "--fetch-unix-endpoints") {
         let result = fetch_unix_endpoints(&args);
         if let Err(error) = result {
-            eprintln!("td-mail: {error}");
+            diagnostic!("td-mail: {error}");
             std::process::exit(1);
         }
-        return;
+        return Ok(());
     }
 
     if args.iter().any(|a| a == "--clear-cache") {
         if let Err(e) = cache::Cache::clear_all_accounts() {
-            eprintln!("td-mail: {e}");
+            diagnostic!("td-mail: {e}");
             std::process::exit(1);
         }
-        eprintln!("Cache cleared.");
+        diagnostic!("Cache cleared.");
     }
 
     if args.iter().any(|a| a == "--clear-log") {
         if let Err(e) = log::clear() {
-            eprintln!("{}", e);
+            diagnostic!("{}", e);
             std::process::exit(1);
         }
     }
@@ -848,29 +934,25 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--print-rules") {
-        print_rules();
-        std::process::exit(0);
+        return print_rules();
     }
 
     if let Some(prompt_arg) = args.iter().find(|a| a.starts_with("--prompt=")) {
         let topic = &prompt_arg["--prompt=".len()..];
-        print_prompt(topic);
-        std::process::exit(0);
+        return print_prompt(topic);
     }
 
     if args.iter().any(|a| a == "--prompt") {
-        eprintln!("Usage: --prompt=TOPIC (available topics: config, rules)");
+        diagnostic!("Usage: --prompt=TOPIC (available topics: config, rules)");
         std::process::exit(1);
     }
 
     if args.iter().any(|a| a == "--help-cli") {
-        cli::print_help_cli();
-        std::process::exit(0);
+        return cli::print_help_cli();
     }
 
     if args.iter().any(|a| a == "--help-config") {
-        print_help_config();
-        std::process::exit(0);
+        return print_help_config();
     }
 
     log::init();
@@ -887,13 +969,13 @@ fn main() {
         Err(e) => {
             log_error!("[Main] config {}: {}", config_path.display(), e);
             log_info!("[Main] td-mail exiting");
-            eprintln!("Error loading config from {}: {}", config_path.display(), e);
-            eprintln!("Create a config file with:");
-            eprintln!();
-            eprintln!("  [account.personal]");
-            eprintln!("  well_known_url = \"https://your-server/.well-known/jmap\"");
-            eprintln!("  username = \"you@example.com\"");
-            eprintln!("  secret = \"portal\"");
+            diagnostic!("Error loading config from {}: {}", config_path.display(), e);
+            diagnostic!("Create a config file with:");
+            diagnostic!();
+            diagnostic!("  [account.personal]");
+            diagnostic!("  well_known_url = \"https://your-server/.well-known/jmap\"");
+            diagnostic!("  username = \"you@example.com\"");
+            diagnostic!("  secret = \"portal\"");
             std::process::exit(1);
         }
     };
@@ -916,7 +998,7 @@ fn main() {
         match loaded {
             Ok(rules) => {
                 let headers = rules::extract_custom_headers(&rules);
-                eprintln!(
+                diagnostic!(
                     "Loaded {} filtering rule(s){}",
                     rules.len(),
                     if headers.is_empty() {
@@ -931,7 +1013,7 @@ fn main() {
                 // Logged too: a window the compositor starts has no
                 // stderr anyone reads.
                 log_warn!("[Main] rules in {} not used: {}", rules_path.display(), e);
-                eprintln!(
+                diagnostic!(
                     "Warning: failed to load rules from {}: {}",
                     rules_path.display(),
                     e
@@ -946,9 +1028,9 @@ fn main() {
     let offline = args.iter().any(|a| a == "--offline");
 
     if args.iter().any(|a| a == "--cli") {
-        cli::run_cli(config, compiled_rules, custom_headers, offline);
+        let result = cli::run_cli(config, compiled_rules, custom_headers, offline);
         log_info!("[Main] td-mail exiting");
-        std::process::exit(0);
+        return result;
     }
 
     // `Config::parse` refuses a configuration with no account, so this holds;
@@ -956,12 +1038,12 @@ fn main() {
     let Some(first_account) = config.accounts.first() else {
         log_error!("[Main] no accounts in {}", config_path.display());
         log_info!("[Main] td-mail exiting");
-        eprintln!("No accounts configured in {}", config_path.display());
+        diagnostic!("No accounts configured in {}", config_path.display());
         std::process::exit(1);
     };
 
     if offline {
-        eprintln!("Offline mode ({})", first_account.name);
+        diagnostic!("Offline mode ({})", first_account.name);
     }
 
     // Open the window before any account connects; the connections are
@@ -987,8 +1069,9 @@ fn main() {
     if let Err(e) = outcome {
         log_error!("[Main] window error: {}", e);
         log_info!("[Main] td-mail exiting");
-        eprintln!("Window error: {}", e);
+        diagnostic!("Window error: {}", e);
         std::process::exit(1);
     }
     log_info!("[Main] td-mail exiting");
+    Ok(())
 }

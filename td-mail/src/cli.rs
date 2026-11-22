@@ -1732,7 +1732,7 @@ pub fn run_cli(
     rules: Vec<CompiledRule>,
     custom_headers: Vec<String>,
     offline: bool,
-) {
+) -> io::Result<()> {
     let mut state = CliState {
         reply_from: config.mail.reply_from.clone(),
         rules_mailbox_regex: Arc::new(config.mail.rules_mailbox_regex.clone()),
@@ -1756,46 +1756,41 @@ pub fn run_cli(
         offline,
     };
 
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let result = replies(io::stdin().lock(), io::stdout().lock(), |input| {
+        dispatch(&mut state, input)
+    });
+    if let Some(ref tx) = state.cmd_tx {
+        let _ = tx.send(BackendCommand::Shutdown);
+    }
+    result
+}
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
+fn replies(
+    input: impl BufRead,
+    mut out: impl Write,
+    mut answer: impl FnMut(&Value) -> Value,
+) -> io::Result<()> {
+    for line in input.lines() {
+        let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-
-        let input = match td_json::parse(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = err_response(&format!("JSON parse error: {}", e));
-                let _ = stdout.write_all(&resp.to_vec());
-                let _ = stdout.write_all(b"\n");
-                let _ = stdout.flush();
-                continue;
-            }
+        let response = match td_json::parse(trimmed) {
+            Ok(value) => answer(&value),
+            Err(e) => err_response(&format!("JSON parse error: {}", e)),
         };
-
-        let response = dispatch(&mut state, &input);
-        let _ = stdout.write_all(&response.to_vec());
-        let _ = stdout.write_all(b"\n");
-        let _ = stdout.flush();
+        out.write_all(&response.to_vec())?;
+        out.write_all(b"\n")?;
+        out.flush()?;
     }
-
-    // Shutdown backend on exit
-    if let Some(ref tx) = state.cmd_tx {
-        let _ = tx.send(BackendCommand::Shutdown);
-    }
+    Ok(())
 }
 
-pub fn print_help_cli() {
-    print!(
+pub fn print_help_cli() -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write!(
+        out,
         r#"td-mail --cli: JSON-over-stdin/stdout CLI mode
 ==========================================
 
@@ -1940,13 +1935,29 @@ keybindings: Export the window's keybinding dictionary, the rows its key list (F
    > {{"command": "keybindings"}}
    < {{"ok": true, "keybindings": [{{"view": "global", "key": "?", "action": "show_keys", "description": "Show this list of keys (F1 too)"}}, ...]}}
 "#
-    );
+    )?;
+    out.flush()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::jmap::types::{BodyPart, BodyValue};
+
+    #[test]
+    fn response_failure_stops_before_dispatching_the_next_command() -> io::Result<()> {
+        for (input, count) in [("{}\n{}\n", 1), ("?\n{}\n", 0)] {
+            let full = std::fs::OpenOptions::new().write(true).open("/dev/full")?;
+            let mut calls = 0;
+            let result = replies(input.as_bytes(), io::BufWriter::new(full), |_| {
+                calls += 1;
+                Value::Null
+            });
+            assert_eq!(result.err().and_then(|e| e.raw_os_error()), Some(28));
+            assert_eq!(calls, count);
+        }
+        Ok(())
+    }
 
     /// A body cut at `compose::HTML_LIMITS` is reported truncated, with
     /// what was read and the notice, and a short one is not.

@@ -33,13 +33,13 @@ pub fn init() {
     let sink = match open_log(&path) {
         Ok(file) => Sink::File(file),
         Err(error) => {
-            eprintln!("td-mail log open failed for {}: {error}", path.display());
+            diagnostic!("td-mail log open failed for {}: {error}", path.display());
             Sink::Failed
         }
     };
     match LOG_FILE.lock() {
         Ok(mut guard) => *guard = sink,
-        Err(error) => eprintln!("td-mail log initialization failed: {error}"),
+        Err(error) => diagnostic!("td-mail log initialization failed: {error}"),
     }
 }
 
@@ -81,13 +81,13 @@ pub fn write_log(level: &str, msg: &str) {
         Ok(mut guard) => match &mut *guard {
             Sink::File(file) => {
                 if let Err(error) = append_bounded(file, line.as_bytes(), MAX_LOG_BYTES) {
-                    eprintln!("td-mail log write failed: {error}; {line}");
+                    diagnostic!("td-mail log write failed: {error}; {line}");
                 }
             }
-            Sink::Failed => eprintln!("td-mail log unavailable; {line}"),
+            Sink::Failed => diagnostic!("td-mail log unavailable; {line}"),
             Sink::Disabled => {}
         },
-        Err(error) => eprintln!("td-mail log lock failed: {error}; {line}"),
+        Err(error) => diagnostic!("td-mail log lock failed: {error}; {line}"),
     }
 }
 

@@ -590,7 +590,7 @@ impl Cache {
                     continue;
                 }
                 if let Err(e) = std::fs::remove_file(&path) {
-                    eprintln!(
+                    diagnostic!(
                         "Warning: failed to remove cache file {}: {}",
                         path.display(),
                         e
