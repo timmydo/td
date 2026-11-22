@@ -247,12 +247,7 @@ impl Drop for Permit<'_> {
 }
 enum Stage {
     Writing,
-    Prepared(
-        Deadline,
-        Option<crate::spf::Outcome>,
-        Option<crate::dkim::Report>,
-        Option<crate::dmarc::Report>,
-    ),
+    Prepared(Deadline, Option<crate::sender_authentication::Observed>),
     Done,
 }
 pub struct Delivery<'a, 'b> {
@@ -485,6 +480,28 @@ impl Delivery<'_, '_> {
         Ok(())
     }
 }
+impl Delivery<'_, '_> {
+    fn prepare_observed(
+        &mut self,
+        deadline: Deadline,
+        observed: Option<crate::sender_authentication::Observed>,
+    ) -> Result<(), Failure> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !matches!(self.stage, Stage::Writing) {
+            return Err(Failure::Refused(Error::Conflict));
+        }
+        let deadline = deadline.min(self.deadline);
+        if deadline.expired(self.backend.clock.monotonic().map_err(Failure::Refused)?) {
+            self.failure = Some(Failure::Refused(Error::Deadline));
+            return Err(Failure::Refused(Error::Deadline));
+        }
+        charge(&self.backend.clock, &mut self.meter, Charge::default())?;
+        self.stage = Stage::Prepared(deadline, observed);
+        Ok(())
+    }
+}
 impl Job for Delivery<'_, '_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), Failure> {
         if let Some(error) = self.failure {
@@ -499,54 +516,30 @@ impl Job for Delivery<'_, '_> {
             .then_some(self.bytes.as_slice())
     }
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure> {
-        self.prepare_with_auth(deadline, None, None)
+        self.prepare_observed(deadline, None)
     }
-    fn prepare_with_spf(
+    fn prepare_authenticated(
         &mut self,
         deadline: Deadline,
-        spf: Option<crate::spf::Outcome>,
+        observed: crate::sender_authentication::Observed,
     ) -> Result<(), Failure> {
-        self.prepare_with_auth(deadline, spf, None)
-    }
-    fn prepare_with_auth(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<crate::spf::Outcome>,
-        dkim: Option<crate::dkim::Report>,
-    ) -> Result<(), Failure> {
-        self.prepare_with_dmarc(deadline, spf, dkim, None)
-    }
-    fn prepare_with_dmarc(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<crate::spf::Outcome>,
-        dkim: Option<crate::dkim::Report>,
-        dmarc: Option<crate::dmarc::Report>,
-    ) -> Result<(), Failure> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if !matches!(self.stage, Stage::Writing) {
-            return Err(Failure::Refused(Error::Conflict));
-        }
-        let deadline = deadline.min(self.deadline);
-        if deadline.expired(self.backend.clock.monotonic().map_err(Failure::Refused)?) {
-            self.failure = Some(Failure::Refused(Error::Deadline));
-            return Err(Failure::Refused(Error::Deadline));
-        }
-        charge(&self.backend.clock, &mut self.meter, Charge::default())?;
-        self.stage = Stage::Prepared(deadline, spf, dkim, dmarc);
-        Ok(())
+        self.prepare_observed(deadline, Some(observed))
     }
     fn commit(&mut self) -> Result<Completion, Failure> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let Stage::Prepared(deadline, spf, dkim, dmarc) = &mut self.stage else {
+        let Stage::Prepared(deadline, observed) = &mut self.stage else {
             return Err(Failure::Refused(Error::Conflict));
         };
-        let (deadline, spf, dkim, dmarc) = (*deadline, *spf, dkim.take(), dmarc.take());
+        let (deadline, observed) = (*deadline, observed.take());
         self.stage = Stage::Done;
+        let results = observed
+            .map(|observed| {
+                crate::sender_authentication::Results::new(observed, &self.ehlo, &self.reverse)
+            })
+            .transpose()
+            .map_err(Failure::Refused)?;
         charge(
             &self.backend.clock,
             &mut self.meter,
@@ -599,11 +592,7 @@ impl Job for Delivery<'_, '_> {
                     cap,
                     meter,
                     session,
-                    crate::receiving_headers::Observations {
-                        spf,
-                        dkim: dkim.as_ref(),
-                        dmarc: dmarc.as_ref(),
-                    },
+                    results.as_ref(),
                 )
             },
         );

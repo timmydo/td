@@ -26,11 +26,56 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+/// The disposition a policy requests; td records it and never applies it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Disposition {
+    None,
+    Quarantine,
+    Reject,
+}
+
+impl Disposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Quarantine => "quarantine",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+/// The policy that governs the author domain, with its alignment modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Requested {
+    pub disposition: Disposition,
+    pub strict_spf: bool,
+    pub strict_dkim: bool,
+}
+
+/// The authenticated identifier whose alignment produced `pass`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Identifier {
+    Spf,
+    Dkim,
+}
+
+impl Identifier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spf => "spf",
+            Self::Dkim => "dkim",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Report {
     pub outcome: Outcome,
     pub author: Option<String>,
     pub policy_domain: Option<String>,
+    pub policy: Option<Requested>,
+    /// Present exactly when `outcome` is `pass`.
+    pub aligned: Option<Identifier>,
 }
 
 impl Report {
@@ -39,6 +84,8 @@ impl Report {
             outcome: Outcome::Temperror,
             author: None,
             policy_domain: None,
+            policy: None,
+            aligned: None,
         }
     }
 
@@ -67,6 +114,12 @@ impl PendingReport {
     }
 
     pub(crate) fn finish(mut self, spf: spf::Outcome) -> Report {
+        if self.report.outcome != Outcome::Pass
+            && spf == spf::Outcome::Pass
+            && self.spf_alignment == Ok(true)
+        {
+            self.report.aligned = Some(Identifier::Spf);
+        }
         self.report.outcome = match (spf, self.spf_alignment) {
             (spf::Outcome::Pass, Ok(true)) => Outcome::Pass,
             (spf::Outcome::Pass, Err(error)) => combine(self.report.outcome, error),
@@ -156,6 +209,8 @@ pub(crate) fn evaluate(
         outcome: Outcome::None,
         author: Some(owned_author),
         policy_domain: None,
+        policy: None,
+        aligned: None,
     };
     let mut discovery = Discovery::new(dns, current);
     let mut align = Alignment { author, tree: None };
@@ -166,12 +221,13 @@ pub(crate) fn evaluate(
                 let walked = discovery.walk(author)?;
                 align.tree = Some(Ok(walked));
                 let Some(found) = walked.inherited else {
-                    return Ok((Outcome::None, Ok(false)));
+                    return Ok((Outcome::None, None, Ok(false)));
                 };
                 found
             }
         };
         report.policy_domain = Some(td_alloc::string(name).map_err(|_| Outcome::Temperror)?);
+        report.policy = Some(policy.requested(!name.eq_ignore_ascii_case(author)));
 
         let exact_dkim = dkim.signatures.iter().any(|sig| {
             sig.outcome == dkim::Outcome::Pass
@@ -180,11 +236,13 @@ pub(crate) fn evaluate(
                     .as_deref()
                     .is_some_and(|d| d.eq_ignore_ascii_case(author))
         });
-        if exact_dkim
-            || (spf == Some(spf::Outcome::Pass)
-                && spf_domain.is_some_and(|d| d.eq_ignore_ascii_case(author)))
+        if exact_dkim {
+            return Ok((Outcome::Pass, Some(Identifier::Dkim), Ok(false)));
+        }
+        if spf == Some(spf::Outcome::Pass)
+            && spf_domain.is_some_and(|d| d.eq_ignore_ascii_case(author))
         {
-            return Ok((Outcome::Pass, Ok(false)));
+            return Ok((Outcome::Pass, Some(Identifier::Spf), Ok(false)));
         }
         let mut dkim_result = if dkim.incomplete {
             Outcome::Temperror
@@ -201,7 +259,7 @@ pub(crate) fn evaluate(
             };
             match align.aligned(domain, policy.strict_dkim, &mut discovery) {
                 Ok(true) if sig.outcome == dkim::Outcome::Pass => {
-                    return Ok((Outcome::Pass, Ok(false)))
+                    return Ok((Outcome::Pass, Some(Identifier::Dkim), Ok(false)))
                 }
                 Ok(true) => dkim_result = combine(dkim_result, Outcome::Temperror),
                 Err(error) => dkim_result = combine(dkim_result, error),
@@ -214,10 +272,12 @@ pub(crate) fn evaluate(
             }
             _ => Ok(false),
         };
-        Ok((dkim_result, spf_alignment))
+        Ok((dkim_result, None, spf_alignment))
     })();
-    let (outcome, spf_alignment) = computation.unwrap_or_else(|error| (error, Ok(false)));
+    let (outcome, aligned, spf_alignment) =
+        computation.unwrap_or_else(|error| (error, None, Ok(false)));
     report.outcome = outcome;
+    report.aligned = aligned;
     PendingReport {
         report,
         spf_alignment,

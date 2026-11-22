@@ -91,6 +91,8 @@ fn receive(table: &str) -> Option<&'static str> {
         | "blob_summaries"
         | "blob_interpretations"
         | "smtp_receipt_recipients"
+        | "email_authentication"
+        | "email_dkim_signatures"
         | "memberships" => "INSERT",
         "emails" => "SELECT (account,id,thread_id,changed), INSERT",
         "threads" => "SELECT, INSERT, UPDATE (changed)",
@@ -104,7 +106,10 @@ fn receive(table: &str) -> Option<&'static str> {
 fn frontend(table: &str) -> Option<&'static str> {
     Some(match table {
         "devices" => "SELECT (account,id,salt,verifier,revoked_at)",
-        "blob_search" | "smtp_receipt_recipients" => "SELECT",
+        "blob_search"
+        | "smtp_receipt_recipients"
+        | "email_authentication"
+        | "email_dkim_signatures" => "SELECT",
         "blob_chunks" | "blob_summaries" | "blob_interpretations" | "submission_routes" => "SELECT, INSERT",
         "mailboxes" | "emails" | "threads" => "SELECT, INSERT, UPDATE (changed), DELETE",
         "blobs" | "memberships" | "thread_anchors" | "keywords" | "leases"

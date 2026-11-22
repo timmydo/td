@@ -274,9 +274,14 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool,
     // All recipients retain the same trusted observation in their immutable copy.
     assert_eq!(sql(fixture, "SELECT bool_and(accounts >= 2 AND variants = 1 AND observed)
         FROM (SELECT blob_id, count(DISTINCT account) AS accounts, count(DISTINCT bytes) AS variants,
-            bool_and(position(convert_to(E'\\r\\nX-TD-DKIM-Results: none; receiver=localhost\\r\\n', 'UTF8') in bytes) > 0 AND
-                position(convert_to(E'\\r\\nX-TD-DMARC-Result: fail; author=example.test; policy-domain=example.test\\r\\n', 'UTF8') in bytes) > 0) AS observed
+            bool_and(position(convert_to(E'\\r\\nAuthentication-Results: localhost;\\r\\n', 'UTF8') in bytes) > 0 AND
+                position(convert_to(E'\\r\\n\\tdkim=none;\\r\\n\\tdmarc=fail (policy=', 'UTF8') in bytes) > 0) AS observed
         FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('Subject: SMTP fanout', 'UTF8') in bytes)>0 GROUP BY blob_id) AS copies"), "t");
+    // Each account's Email has its own rows stating the same results.
+    assert_eq!(sql(fixture, "SELECT count(*) = count(a.email_id) AND bool_and(a.dkim_complete AND a.dmarc_result = 'fail' AND a.dmarc_author = 'example.test')
+        FROM td_mta.emails e JOIN td_mta.blob_chunks c ON c.account = e.account AND c.blob_id = e.blob_id AND c.ordinal = 0
+        LEFT JOIN td_mta.email_authentication a ON a.account = e.account AND a.email_id = e.id
+        WHERE position(convert_to('Subject: SMTP fanout', 'UTF8') in c.bytes) > 0"), "t");
     if !many {
         let count = |account: &str, origin: u8| {
             sql(fixture, &format!("SELECT count(*) FROM td_mta.emails WHERE account=decode(repeat('{account}',16),'hex') AND origin={origin}"))
@@ -327,6 +332,13 @@ pub(super) fn smtp(fixture: &Fixture, address: std::net::SocketAddr, many: bool,
         let text = refused_notice(fixture, "cc");
         assert!(text.contains("Recipient: second@example.test"), "{text}");
         assert!(!text.contains("main@example.test"), "{text}");
+        // Only the delivered copy carries the receiver's results; the notice has none.
+        assert_eq!(sql(fixture, "SELECT count(*) || '/' || count(a.email_id)
+            FROM td_mta.emails e JOIN td_mta.blob_chunks c ON c.account = e.account AND c.blob_id = e.blob_id AND c.ordinal = 0
+            LEFT JOIN td_mta.email_authentication a ON a.account = e.account AND a.email_id = e.id
+            WHERE e.origin = 1 AND position(convert_to('Subject: full at DATA', 'UTF8') in c.bytes) > 0"), "1/1");
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.email_authentication a JOIN td_mta.emails e ON e.account = a.account AND e.id = a.email_id
+            WHERE e.origin = 4"), "0");
         unfill(real);
         // Past the notice margin too the whole message stays refused, and
         // the sender's retry is refused for B alone at RCPT.

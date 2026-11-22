@@ -199,6 +199,7 @@ pub mod reference_sweep;
 pub mod replica_source;
 pub mod root_headers;
 pub mod row_references;
+pub mod sender_authentication;
 pub mod smtp_network;
 pub mod smtp_rate;
 pub mod smtp_receiving;

@@ -248,7 +248,7 @@ does not undo a schema upgrade. PostgreSQL package updates are a separate
 operation. Public-server deployment and ACME renewal are independent of local
 replica updates.
 
-### Fenced desktop upgrade from schema 43 or 44 to 45
+### Fenced desktop upgrade from schema 43, 44 or 45 to 46
 
 This procedure is for a private Unix-socket replica with the three generated
 services. Keep the public deployment tooling on the primary. Schedule a
@@ -294,10 +294,12 @@ desktop read outage. Run the mail commands as the installation user.
    ```
 
 4. Read the plan with the candidate. Require the recorded local store epoch
-   and target 45. From schema 44 expect one pending migration (45). From
-   schema 43 expect migrations 44 and 45 in order. Budget space and time
-   for the Email order index build and its WAL. An upgrade from 43 also
-   backfills replica identities. For example:
+   and target 46. From schema 45 expect one pending migration (46), which
+   adds two empty sender-authentication tables. From schema 44 expect 45
+   and 46, and from schema 43 expect 44, 45 and 46, in order. Budget space
+   and time for the Email order index build and its WAL when 45 is
+   pending. An upgrade from 43 also backfills replica identities. For
+   example:
 
    ```sh
    owner_file="$replica_root/owner-connection"
@@ -314,12 +316,24 @@ desktop read outage. Run the mail commands as the installation user.
      --epoch "$replica_epoch" --account "$replica_account"
    ```
 
-   Require version 45 and the same epoch, source binding, account, generation,
+   Require version 46 and the same epoch, source binding, account, generation,
    cursor, pending ID count and unfinished ID count as before. When upgrading
    from 43 the live receipt count can decrease. Keep the replica reader and
-   publisher privilege sets. After a lost upgrade response, keep writers
+   publisher privilege sets, and extend them to the two new tables with the
+   owner role over the private socket. Use the port from the socket's
+   `.s.PGSQL.PORT` filename and the password from the owner connection file:
+
+   ```sh
+   psql -h "$replica_root/socket" -p PORT -U td_mta_owner -d td_mta -v ON_ERROR_STOP=1 -c \
+     'GRANT SELECT, INSERT, UPDATE, DELETE ON td_mta.email_authentication, td_mta.email_dkim_signatures TO td_mta_runtime; GRANT SELECT ON td_mta.email_authentication, td_mta.email_dkim_signatures TO td_mta_reader'
+   ```
+
+   This step is required: until it runs, the reader and copier refuse to
+   qualify and the replica serves nothing, because qualification requires
+   the shared roles' privileges on every table. Replicated Emails carry no
+   sender-authentication rows; the tables stay empty on a replica. After a lost upgrade response, keep writers
    fenced, wait for the migration lock to release and inspect the ledger.
-   The original version may be retried after diagnosis. A confirmed 45 goes through
+   The original version may be retried after diagnosis. A confirmed 46 goes through
    the same verification before serving.
 5. Stop the private foreground server with `pg_ctl -D "$replica_root/postgres"
    -m fast -w stop`. Confirm clean shutdown. Start the normal PostgreSQL

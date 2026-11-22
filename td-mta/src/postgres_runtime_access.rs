@@ -58,6 +58,8 @@ const TABLES: &[(&str, Access)] = &[
     ("threads", Access::Mail),
     ("emails", Access::Mail),
     ("smtp_receipt_recipients", Access::Mail),
+    ("email_authentication", Access::Mail),
+    ("email_dkim_signatures", Access::Mail),
     ("memberships", Access::Mail),
     ("keywords", Access::Mail),
     ("thread_anchors", Access::Mail),

@@ -48,35 +48,18 @@ pub trait Job: Send {
     /// Called on the network loop: no database, filesystem, peer I/O or waits.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Failure>;
     fn prepare(&mut self, deadline: Deadline) -> Result<(), Failure>;
-    /// The verdict belongs to this SMTP transaction. Backends that retain
-    /// received messages record it beside the local trace.
-    fn prepare_with_spf(
+    /// The observations belong to this SMTP transaction. Backends that
+    /// retain received messages record them with the message.
+    fn prepare_authenticated(
         &mut self,
         deadline: Deadline,
-        _spf: Option<crate::spf::Outcome>,
+        _observed: crate::sender_authentication::Observed,
     ) -> Result<(), Failure> {
         self.prepare(deadline)
     }
     /// Original decoded DATA while this job retains its ingress permit.
     fn dkim_input(&self) -> Option<&[u8]> {
         None
-    }
-    fn prepare_with_auth(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<crate::spf::Outcome>,
-        _dkim: Option<crate::dkim::Report>,
-    ) -> Result<(), Failure> {
-        self.prepare_with_spf(deadline, spf)
-    }
-    fn prepare_with_dmarc(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<crate::spf::Outcome>,
-        dkim: Option<crate::dkim::Report>,
-        _dmarc: Option<crate::dmarc::Report>,
-    ) -> Result<(), Failure> {
-        self.prepare_with_auth(deadline, spf, dkim)
     }
     fn commit(&mut self) -> Result<Completion, Failure>;
 }

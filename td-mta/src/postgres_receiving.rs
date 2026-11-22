@@ -18,6 +18,7 @@ use std::{
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
+mod authentication;
 pub(crate) mod fanout;
 mod input;
 pub use fanout::{
@@ -64,6 +65,7 @@ pub struct Delivery {
     message_id: String,
     anchors: Arc<Vec<String>>,
     provenance: input::Provenance,
+    authentication: Option<crate::sender_authentication::Results>,
 }
 impl Delivery {
     pub fn email(&self) -> EmailId {
@@ -163,7 +165,7 @@ pub fn prepare_with_meter(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Delivery, Error> {
-    prepare_observed(binding, message, deadline, meter, clock, Default::default())
+    prepare_observed(binding, message, deadline, meter, clock, None)
 }
 
 fn prepare_observed(
@@ -172,7 +174,7 @@ fn prepare_observed(
     deadline: Instant,
     meter: &mut Meter,
     clock: &RuntimeClock,
-    observed: crate::receiving_headers::Observations<'_>,
+    results: Option<&crate::sender_authentication::Results>,
 ) -> Result<Delivery, Error> {
     preparation_time(binding, deadline)?;
     let clock = PreparationClock { clock, deadline };
@@ -194,7 +196,7 @@ fn prepare_observed(
         (email, blob, new_thread),
         &clock,
         meter,
-        observed,
+        results,
     )?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in bytes.chunks(publication::CHUNK) {
@@ -225,6 +227,10 @@ fn prepare_observed(
         message_id,
         anchors: Arc::new(anchors),
         provenance,
+        authentication: results
+            .map(crate::sender_authentication::Results::try_copy)
+            .transpose()
+            .map_err(Error::Input)?,
     })
 }
 fn sequence(bytes: &[u8]) -> Result<u64, Error> {
@@ -467,6 +473,9 @@ async fn write_delivery(
     recipients.extend(facts.recipients.iter().map(String::as_str));
     let count = i64::try_from(recipients.len()).map_err(|_| Error::Capacity)?;
     if client.execute("INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,peer_family,peer_octets,gateway,tls,ehlo,reverse_path,receipt_count,changed) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,$12,$13)", &[&account,&email,&delivery.blob.as_bytes().as_slice(),&thread,&facts.received_at,&family,&peer,&facts.gateway,&facts.tls,&facts.ehlo,&facts.reverse,&count,&changed]).await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
+    if let Some(results) = &delivery.authentication {
+        authentication::write(client, account, email, results).await?;
+    }
     if client.execute("INSERT INTO td_mta.smtp_receipt_recipients SELECT $1,$2,ordinality-1,address FROM unnest($3::text[]) WITH ORDINALITY q(address,ordinality)", &[&account,&email,&recipients]).await.map_err(|_| Error::Database)? != recipients.len() as u64 { return Err(Error::Integrity); }
     if client
         .execute(

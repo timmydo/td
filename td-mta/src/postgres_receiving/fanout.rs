@@ -49,7 +49,7 @@ pub fn prepare_fanout(
     meter: &mut Meter,
     clock: &RuntimeClock,
 ) -> Result<Fanout, Error> {
-    prepare_observed(targets, message, deadline, meter, clock, Default::default())
+    prepare_observed(targets, message, deadline, meter, clock, None)
 }
 
 pub(crate) fn prepare_observed(
@@ -58,7 +58,7 @@ pub(crate) fn prepare_observed(
     deadline: Instant,
     meter: &mut Meter,
     clock: &RuntimeClock,
-    observed: crate::receiving_headers::Observations<'_>,
+    results: Option<&crate::sender_authentication::Results>,
 ) -> Result<Fanout, Error> {
     if targets.is_empty() || targets.len() > crate::config::identities::MAX_ACCOUNTS {
         return Err(Error::Capacity);
@@ -117,7 +117,7 @@ pub(crate) fn prepare_observed(
         return Err(Error::Policy);
     }
     let prepared =
-        super::prepare_observed(first.binding, message, deadline, meter, clock, observed)?;
+        super::prepare_observed(first.binding, message, deadline, meter, clock, results)?;
     let mut deliveries = Vec::new();
     deliveries
         .try_reserve_exact(targets.len())
@@ -152,6 +152,10 @@ pub(crate) fn prepare_observed(
             message_id: copy(&prepared.message_id)?,
             anchors: prepared.anchors.clone(),
             provenance: input::provenance(&private, prepared.blob, prepared.new_thread)?,
+            authentication: results
+                .map(crate::sender_authentication::Results::try_copy)
+                .transpose()
+                .map_err(Error::Input)?,
         });
     }
     deliveries.sort_unstable_by_key(|delivery| delivery.binding.account());

@@ -4605,10 +4605,13 @@ typed; there is no local fallback.
 ### Receiving header and trace preparation
 
 The storage-independent `receiving_headers` module owns bounded root-header
-retention, Return-Path removal, supplied trace insertion and
-Message-ID/References/In-Reply-To selection used by receiving. It uses
-64 KiB output turns, source bounds, deadline checks and the caller's work
-meter. The module grants no recipient, gateway or publication authority and
+retention, Return-Path and receiver-claimed Authentication-Results removal,
+supplied trace insertion and Message-ID/References/In-Reply-To selection
+used by receiving. It uses 64 KiB output turns, source bounds, deadline
+checks and the caller's work meter. Reading each supplied
+Authentication-Results authserv-id is an extra pass outside that meter,
+bounded by its own visit limit of four per field byte plus 64. The module
+grants no recipient, gateway or publication authority and
 performs no database access. PostgreSQL receiving owns publication and
 runtime authorization.
 
@@ -4717,8 +4720,9 @@ Passive receipt facts confer no authority. The receiving service supplies this t
 Preparation validates bounded SMTP metadata, non-NUL DATA with complete CRLF
 lines of arbitrary length within the selected message ceiling, and a root-header
 ceiling of at most 1 MiB. It uses the shared receiving header and trace formatter: prepend the
-server Return-Path, the local SPF, DKIM and DMARC observations when present, and
-the Received field in that order, strip supplied Return-Path fields, retain
+server Return-Path, the local Authentication-Results field for direct MX, and
+the Received field in that order, strip supplied Return-Path fields and
+Authentication-Results fields claiming the receiver, retain
 root identifiers and keep body bytes unchanged. The header scanner borrows the already admitted immutable DATA, so tentative
 field-name bytes that become body consume work but no extra header backing
 or recognized-header allowance. Original work/deadline limits
@@ -4729,7 +4733,7 @@ Publication takes the configuration share lock before the account write lock,
 rechecks epoch and selected profile generation, and requires its receiving
 role. It resolves exactly one Inbox, selects the thread using the shared draft
 anchor lookup, and publishes body chunks, SMTP provenance and ordered envelope
-recipients, one unread/unstarred Email, membership, anchor, history, shared
+recipients, direct-MX sender authentication rows, one unread/unstarred Email, membership, anchor, history, shared
 quota effects in one synchronous transaction. Each delivery advances account
 state and charges body and blob quotas once per target account. Repeated
 envelope recipients for an account produce one Email.
@@ -4741,135 +4745,143 @@ as soon as database locks and ordinary worker capacity permit. Schema 43
 drops the schema-13 recovery ledger. This migration preserves message bodies,
 envelope provenance, recipient rows, Inbox membership, history and quota usage.
 
+### Direct-MX sender authentication results
+
+Direct MX records its SPF, DKIM and DMARC observations twice from one
+validated value, in the same publication transaction: as one RFC 8601
+`Authentication-Results` field naming the receiver's configured hostname as
+its authserv-id, and as rows in `td_mta.email_authentication` and
+`td_mta.email_dkim_signatures` (schema 46). Each fanout account copy has its
+own rows; all copies share the same immutable body. Gateway, imported, JMAP
+and failure-notice Emails have none, nor do Emails received before schema
+46. Delivery never reads the rows: every result follows ordinary recipient,
+quota and publication policy, including `dmarc=fail` under `p=reject`.
+
+The field sits between the receiver's Return-Path and Received fields:
+
+```text
+Authentication-Results: mx.example.net;
+	spf=pass smtp.mailfrom=example.org;
+	dkim=pass (2048-bit key) header.d=example.org header.s=s1 header.a=rsa-sha256;
+	dmarc=pass (policy=reject aspf=r adkim=r aligned=dkim policy-domain=example.org) header.from=example.org
+	(...)
+```
+
+Folded padding comments give every verdict the same stored length, so a
+result cannot change header admission or the quota charge. Receiving
+removes every supplied `Authentication-Results` field whose authserv-id
+equals the receiver's hostname, ignoring ASCII case, or cannot be read
+(RFC 8601 section 5); fields naming other servers stay below the local
+trace. The receiver writes no `Received-SPF` field: RFC 7208 section 9
+permits recording the result in Authentication-Results instead, and the
+client address, HELO and envelope sender it would repeat are already in
+the receiver's Received and Return-Path fields. Every `Received-SPF` in a
+stored message was therefore supplied by the peer, even one naming this
+receiver, and is untrusted; receiving keeps it below the local trace like
+any other supplied trace field.
+
+`email_authentication` has one row per direct-MX Email. `spf_result` is the
+RFC 7208 result and `spf_domain` the MAIL FROM domain evaluated, or the
+HELO domain for a null reverse path, when `spf_helo` is true and the field
+names it `smtp.helo`; `none` means no applicable policy or
+usable sender domain, and `temperror` includes DNS and local timeouts.
+`dkim_complete` is false when the verifier could not examine every
+signature within its work and time limits; the field then adds
+`dkim=temperror (verification incomplete)`. `dmarc_result` is the DMARC
+outcome, `dmarc_author` the visible From domain and `dmarc_policy_domain`
+the domain that published the governing policy. `dmarc_policy` is the
+requested disposition (`sp` for a subdomain author when present, else
+`p`; `np` is not evaluated), with the alignment modes in
+`dmarc_strict_spf` and `dmarc_strict_dkim`. `dmarc_aligned` names the
+identifier, `spf` or `dkim`, whose alignment produced `pass`.
+
+`email_dkim_signatures` holds up to four rows per Email in signature order:
+`result`, `algorithm`, signing `domain`, `selector` and `key_bits`, the
+exact RSA modulus or Ed25519 key size. A valid 1,024-bit RSA signature
+records `pass` and 1024. A DKIM domain or selector, or a DMARC domain, that
+the field cannot state withdraws that whole observation: DKIM becomes an
+incomplete report without signatures, and DMARC `temperror`; a DMARC pass
+through DKIM alignment is withdrawn with the DKIM it rests on. The field's
+DMARC comment states the requested disposition as `policy=`. A peer cannot
+add rows. Separate service logins grant INSERT to the receiving login and
+SELECT to the frontend; a single runtime login and a replica's publisher
+need full DML and a replica reader SELECT (PRODUCTION.md,
+REPLICA-OPERATIONS.md). Rows cascade with their Email.
+
+The receiver accepts DNS A-labels in From. A raw Unicode domain requires
+IDNA conversion and yields a temporary DMARC result on this SMTP profile.
+Multiple mailboxes with the same domain can supply one author. Distinct
+domains or multiple From fields are ambiguous and yield `permerror`. A
+DMARC `pass` means an authenticated SPF or DKIM identifier aligned with the
+author; `fail` means a policy was found and the evidence established
+alignment failure; an absent policy yields `none`. For a missing or invalid
+`p`, or an invalid `sp` or `np`, the receiver follows RFC 9989 section
+4.10.1: with a valid reporting URI in `rua` it evaluates alignment under
+the monitoring policy and records `dmarc_policy` as `none`; otherwise it
+records a policy error. Reporting URIs are checked locally. The difference
+between the RFC's two descriptions of a missing `p` is recorded in
+[RFC erratum 9236](https://mailarchive.ietf.org/arch/msg/dmarc/PLyfRTXCYKRgss8WQonFqif0OkM/).
+
 ### Inspecting direct-MX SPF observations
 
-The receiver stores its verdict in the immutable message body alongside its
-own Received field. All fanout copies retain the same trace. A raw download
-begins with Return-Path, then Received-SPF for an observed direct delivery,
-then X-TD-DKIM-Results and X-TD-DMARC-Result when observed, then Received. The folded Received-SPF properties identify the receiver,
-socket peer, HELO/EHLO and effective envelope sender. The result `none`
-means an evaluation found no applicable SPF policy or usable sender domain.
-Older direct deliveries have Received immediately after Return-Path and
-have no local observation. A peer can supply additional Received-SPF or
-Authentication-Results fields below the local trace.
-
-Run this read-only query on the primary to count the most recent 1,000
-retained direct delivery rows. Each row represents one delivered account
-copy. It reads the start of chunk zero and matches only the receiver's
-second physical line. Encoding the prefix as PostgreSQL bytea escape text
-also works with non-UTF-8 message content. The provenance predicate excludes
-gateway, imported and JMAP messages even if their headers claim a result.
+Run this read-only query on the primary to count SPF results in the most
+recent 1,000 retained direct-MX account copies. Copies without a row
+predate schema 46 and count as `unobserved`.
 
 ```sql
 WITH recent AS (
-    SELECT account, blob_id
-    FROM td_mta.emails
+    SELECT account, id FROM td_mta.emails
     WHERE origin = 1 AND gateway IS NULL
     ORDER BY received_at DESC, account, id
     LIMIT 1000
-), lines AS (
-    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 512), 'escape'),
-                      E'\r\n', 2) AS second_line
-    FROM recent r
-    JOIN td_mta.blob_chunks c
-      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
 )
-SELECT coalesce(substring(second_line FROM
-           '^Received-SPF: (pass|fail|softfail|neutral|none|temperror|permerror) identity=mailfrom;$'),
-           'unobserved') AS result,
+SELECT coalesce(a.spf_result, 'unobserved') AS result,
        count(*) AS account_deliveries
-FROM lines
-GROUP BY 1
-ORDER BY 1;
+FROM recent r LEFT JOIN td_mta.email_authentication a
+  ON a.account = r.account AND a.email_id = r.id
+GROUP BY 1 ORDER BY 1;
 ```
-
-For example, an old message containing a peer-supplied pass counts as
-`unobserved`. An observed failure followed by the same peer claim counts
-as `fail`. A `temperror` includes DNS and local evaluation timeouts and
-does not establish that the peer failed the sender's policy.
 
 ### Inspecting direct-MX DKIM observations
 
-Open the raw message and read the local `X-TD-DKIM-Results` field between
-the receiver's Received-SPF and Received fields. Historical direct deliveries
-without this field have no local DKIM observation. Lower fields, including
-fields with the same name, came with the message. Each local field begins
-with `none` (unsigned), `complete`, or `incomplete`. The last status means
-the verifier could not finish all signatures within its work and time limits.
-A signature row identifies the outcome and the available algorithm, exact key
-size in bits, signing domain and selector. In particular, a valid 1,024-bit
-RSA signature records `pass` and `bits=1024`. The private trace is padded to
-a fixed byte length so a verdict cannot change quota or header admission.
-
-On the primary, this query counts RSA signatures by outcome, key size and
-signing domain in the most recent 1,000 retained direct deliveries. The
-initial Received field delimits the local trace even on older mail.
-Multi-account deliveries contribute one observation per account copy.
+This query counts RSA signatures by outcome, key size and signing domain in
+the same recent copies. Future enforcement will require at least 2,048-bit
+RSA keys (DESIGN.md section 4.1); the `rsa_bits` column shows which signers
+that would affect.
 
 ```sql
 WITH recent AS (
-    SELECT account, blob_id FROM td_mta.emails
+    SELECT account, id FROM td_mta.emails
     WHERE origin = 1 AND gateway IS NULL
     ORDER BY received_at DESC, account, id
     LIMIT 1000
-), traces AS (
-    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 8192), 'escape'),
-                      E'\r\nReceived: ', 1) AS prefix
-    FROM recent r JOIN td_mta.blob_chunks c
-      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
 )
-SELECT parts[1] AS outcome, parts[2]::integer AS rsa_bits,
-       parts[3] AS signing_domain, count(*)
-FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
-    E'\r\n\tresult=([a-z]+); a=rsa-sha256; bits=([0-9]+); d=([A-Za-z0-9.-]+);', 'g') AS m(parts)
+SELECT s.result AS outcome, s.key_bits AS rsa_bits,
+       s.domain AS signing_domain, count(*)
+FROM recent r JOIN td_mta.email_dkim_signatures s
+  ON s.account = r.account AND s.email_id = r.id
+WHERE s.algorithm = 'rsa-sha256'
 GROUP BY 1, 2, 3 ORDER BY 4 DESC, 3, 2, 1;
 ```
 
 ### Inspecting direct-MX DMARC observations
 
-Direct MX writes one local `X-TD-DMARC-Result` field immediately before its
-Received field. It records the DMARC outcome, the visible From domain and
-the DNS domain that supplied the policy when available. A dash marks an
-unavailable domain. The receiver accepts DNS A-labels in From. A raw
-Unicode domain requires IDNA conversion and yields a temporary result on
-this SMTP profile. Multiple mailboxes with the same domain can supply one
-author. Distinct domains or multiple From fields are ambiguous.
-Older deliveries can lack this observation. A sender's
-own fields appear below the receiver's Received line.
-
-Run this read-only query on the primary to assess recent traffic. It counts
-account copies in the most recent 1,000 retained direct deliveries. A
-`pass` means an authenticated SPF or DKIM identifier aligned with the author.
-A `fail` means a policy was found and the available evidence established
-alignment failure. An absent policy yields `none`. Temporary or incomplete
-checks yield `temperror`. A missing or ambiguous author can yield
-`permerror`. Every outcome follows ordinary SMTP delivery policy, including
-mail claiming a hosted domain whose owner publishes `p=reject`.
-
-For a missing or invalid `p`, or an invalid `sp` or `np`, the receiver
-follows RFC 9989 section 4.10.1. With a valid reporting URI in `rua`, it
-evaluates alignment under the monitoring policy. Otherwise, it records a
-policy error. Reporting URIs are checked locally. The difference between
-the RFC's two descriptions of a missing `p` is recorded in
-[RFC erratum 9236](https://mailarchive.ietf.org/arch/msg/dmarc/PLyfRTXCYKRgss8WQonFqif0OkM/).
+This query counts DMARC outcomes by author, policy domain, requested
+disposition and aligned identifier in the same recent copies.
 
 ```sql
 WITH recent AS (
-    SELECT account, blob_id FROM td_mta.emails
+    SELECT account, id FROM td_mta.emails
     WHERE origin = 1 AND gateway IS NULL
     ORDER BY received_at DESC, account, id
     LIMIT 1000
-), traces AS (
-    SELECT split_part(encode(substring(c.bytes FROM 1 FOR 8192), 'escape'),
-                      E'\r\nReceived: ', 1) AS prefix
-    FROM recent r JOIN td_mta.blob_chunks c
-      ON c.account = r.account AND c.blob_id = r.blob_id AND c.ordinal = 0
 )
-SELECT parts[1] AS outcome, parts[2] AS author, parts[3] AS policy_domain,
-       count(*) AS account_copies
-FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
-    E'\r\nX-TD-DMARC-Result: ([a-z]+); author=([A-Za-z0-9.-]+); policy-domain=([A-Za-z0-9.-]+)\r\n') AS m(parts)
-GROUP BY 1, 2, 3 ORDER BY 4 DESC, 2, 3, 1;
+SELECT a.dmarc_result AS outcome, a.dmarc_author AS author,
+       a.dmarc_policy_domain AS policy_domain, a.dmarc_policy AS policy,
+       a.dmarc_aligned AS aligned, count(*) AS account_copies
+FROM recent r JOIN td_mta.email_authentication a
+  ON a.account = r.account AND a.email_id = r.id
+GROUP BY 1, 2, 3, 4, 5 ORDER BY 6 DESC, 2, 3, 1;
 ```
 
 ## Transactional incoming delivery across accounts
@@ -4923,7 +4935,9 @@ notice in the same transaction instead, through the renderer and Inbox
 write of [Local terminal-delivery notices](#local-terminal-delivery-notices)
 and charged against caps raised by one compact notice, naming the
 unverified reverse path, the message size and at most eight of that account's own accepted
-addresses. Nothing is sent to the reverse path. When no account can take
+addresses. The notice carries no `Authentication-Results` field and no
+sender-authentication rows: only delivered copies record the receiver's
+observations. Nothing is sent to the reverse path. When no account can take
 the message, or a notice is refused past its margin, the transaction rolls
 back and DATA gets `452 4.2.2 Recipient mailbox full`, which is temporary:
 the owner can make room. An account then past its cap is refused at RCPT

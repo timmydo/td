@@ -352,9 +352,12 @@ impl<'a> Headers<'a> {
         }
         Ok((anchors, own))
     }
+    /// Drops supplied Return-Path fields and Authentication-Results fields
+    /// that claim `authserv_id` or whose authserv-id cannot be read.
     pub fn write_filtered(
         &self,
         trace: &[u8],
+        authserv_id: &str,
         mut write: impl FnMut(&[u8]) -> Result<(), Error>,
         work: &mut Work<'_>,
     ) -> Result<(), HeaderError> {
@@ -384,7 +387,12 @@ impl<'a> Headers<'a> {
             match progress.status {
                 headers::Status::Field(field) => {
                     let name = extent(&self.source, field.name_start, field.name_end)?;
-                    if !name.eq_ignore_ascii_case(b"return-path") {
+                    let forged = name.eq_ignore_ascii_case(b"authentication-results")
+                        && crate::sender_authentication::claims_receiver(
+                            extent(&self.source, field.value_start, field.value_end)?,
+                            authserv_id,
+                        );
+                    if !name.eq_ignore_ascii_case(b"return-path") && !forged {
                         let end = field.value_end.checked_add(2).ok_or(Error::Capacity)?;
                         let bytes = extent(&self.source, field.name_start, end)?;
                         if !bytes.ends_with(b"\r\n") {
@@ -472,161 +480,23 @@ pub(crate) fn trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
         .and_then(|n| n.checked_add(52 + 32 + 128 + 2))
         .ok_or(ports::Error::Capacity)
 }
-/// Upper bound including RFC 7208 §9.1. A quoted byte can double; a null
-/// reverse path supplies postmaster@ followed by the greeting a second time.
-pub(crate) fn spf_trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
-    let frame = b"Received-SPF: permerror identity=mailfrom;\r\n\treceiver=; client-ip=\"\";\r\n\thelo=\"\";\r\n\tenvelope-from=\"\"\r\n".len();
-    let helo = 2 * crate::format::row::MAX_EHLO;
-    let sender = (2 * crate::format::row::MAX_ADDRESS).max("postmaster@".len() + helo);
-    Ok(trace_allowance(hostname)? + frame + hostname.len() + 39 + helo + sender)
+/// The direct-MX trace adds one fixed-length Authentication-Results field.
+pub(crate) fn auth_trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
+    trace_allowance(hostname)?
+        .checked_add(crate::sender_authentication::field_bytes(hostname)?)
+        .ok_or(ports::Error::Capacity)
 }
 
-const DKIM_NAME_BYTES: usize = 253;
-const DKIM_ROW_BYTES: usize =
-    b"\r\n\tresult=permerror; a=ed25519-sha256; bits=65535; d=; s=".len() + 2 * DKIM_NAME_BYTES;
-const DKIM_FIXED_BYTES: usize = b"X-TD-DKIM-Results: incomplete; receiver=".len()
-    + crate::dkim::MAX_SIGNATURES * DKIM_ROW_BYTES
-    + 7;
-
-const DMARC_BYTES: usize =
-    b"X-TD-DMARC-Result: permerror; author=; policy-domain=".len() + 2 * DKIM_NAME_BYTES + 7;
-
-fn dkim_trace_allowance(hostname: &str) -> Result<usize, Error> {
-    Ok(spf_trace_allowance(hostname)? + DKIM_FIXED_BYTES + hostname.len())
-}
-
-pub(crate) fn auth_trace_allowance(hostname: &str) -> Result<usize, Error> {
-    Ok(dkim_trace_allowance(hostname)? + DMARC_BYTES)
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Observations<'a> {
-    pub spf: Option<crate::spf::Outcome>,
-    pub dkim: Option<&'a crate::dkim::Report>,
-    pub dmarc: Option<&'a crate::dmarc::Report>,
-}
-
-impl Observations<'_> {
-    pub fn allowance(self, hostname: &str) -> Result<usize, Error> {
-        match (self.spf, self.dkim, self.dmarc) {
-            (None, None, None) => trace_allowance(hostname),
-            (Some(_), None, None) => spf_trace_allowance(hostname),
-            (Some(_), Some(_), None) => dkim_trace_allowance(hostname),
-            (Some(_), Some(_), Some(_)) => auth_trace_allowance(hostname),
-            _ => Err(Error::Invalid),
-        }
-    }
-}
-
-fn valid_trace_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= DKIM_NAME_BYTES
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
-
-fn dkim_trace(
-    output: &mut String,
+pub(crate) fn allowance(
     hostname: &str,
-    report: &crate::dkim::Report,
-) -> Result<(), Error> {
-    let start = output.len();
-    let rows = || report.signatures.iter().take(crate::dkim::MAX_SIGNATURES);
-    let invalid = rows().any(|row| {
-        [row.domain.as_deref(), row.selector.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|name| !valid_trace_name(name))
-    });
-    let status =
-        if invalid || report.incomplete || report.signatures.len() > crate::dkim::MAX_SIGNATURES {
-            "incomplete"
-        } else if report.signatures.is_empty() {
-            "none"
-        } else {
-            "complete"
-        };
-    write!(output, "X-TD-DKIM-Results: {status}; receiver={hostname}")
-        .map_err(|_| Error::Capacity)?;
-    if !invalid {
-        for row in rows() {
-            write!(output, "\r\n\tresult={}", row.outcome.as_str()).map_err(|_| Error::Capacity)?;
-            if let Some(algorithm) = row.algorithm {
-                write!(output, "; a={}", algorithm.as_str()).map_err(|_| Error::Capacity)?;
-            }
-            if let Some(bits) = row.key_bits {
-                write!(output, "; bits={bits}").map_err(|_| Error::Capacity)?;
-            }
-            if let Some(domain) = &row.domain {
-                write!(output, "; d={domain}").map_err(|_| Error::Capacity)?;
-            }
-            if let Some(selector) = &row.selector {
-                write!(output, "; s={selector}").map_err(|_| Error::Capacity)?;
-            }
-        }
-    }
-    finish_field(output, start, DKIM_FIXED_BYTES + hostname.len())
-}
-
-fn dmarc_trace(output: &mut String, report: &crate::dmarc::Report) -> Result<(), Error> {
-    let start = output.len();
-    let valid = [report.author.as_deref(), report.policy_domain.as_deref()]
-        .into_iter()
-        .flatten()
-        .all(|name| crate::config::values::certificate_name(name).is_ok());
-    let (outcome, author, policy) = if valid {
-        (
-            report.outcome.as_str(),
-            report.author.as_deref(),
-            report.policy_domain.as_deref(),
-        )
-    } else {
-        ("temperror", None, None)
-    };
-    write!(
-        output,
-        "X-TD-DMARC-Result: {outcome}; author={}; policy-domain={}",
-        author.unwrap_or("-"),
-        policy.unwrap_or("-")
-    )
-    .map_err(|_| Error::Capacity)?;
-    finish_field(output, start, DMARC_BYTES)
-}
-
-fn finish_field(output: &mut String, start: usize, length: usize) -> Result<(), Error> {
-    // Fill with folded comments to give every verdict and timeout the same
-    // stored length. Each physical line contains text and stays below 998 bytes.
-    let used = output.len() - start;
-    let mut remaining = (length - 2).checked_sub(used).ok_or(Error::Capacity)?;
-    while remaining > 0 {
-        let fold = if remaining > 996 {
-            (remaining - 5).min(996)
-        } else {
-            remaining
-        };
-        let spaces = fold.checked_sub(5).ok_or(Error::Invalid)?;
-        write!(output, "\r\n\t({empty:spaces$})", empty = "").map_err(|_| Error::Capacity)?;
-        remaining -= fold;
-    }
-    output.write_str("\r\n").map_err(|_| Error::Capacity)
-}
-
-struct QuotedContent<'a>(&'a str);
-impl std::fmt::Display for QuotedContent<'_> {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0.bytes() {
-            if !byte.is_ascii_graphic() && byte != b' ' {
-                return Err(std::fmt::Error);
-            }
-            if matches!(byte, b'\\' | b'"') {
-                output.write_char('\\')?;
-            }
-            output.write_char(char::from(byte))?;
-        }
-        Ok(())
+    results: Option<&crate::sender_authentication::Results>,
+) -> Result<usize, ports::Error> {
+    match results {
+        None => trace_allowance(hostname),
+        Some(_) => auth_trace_allowance(hostname),
     }
 }
+
 pub(crate) fn trace(
     receipt: &SmtpReceipt<'_>,
     hostname: &str,
@@ -634,7 +504,7 @@ pub(crate) fn trace(
     email: EmailId,
     utc_ms: i64,
     maximum: usize,
-    observed: Observations<'_>,
+    results: Option<&crate::sender_authentication::Results>,
 ) -> Result<String, ports::Error> {
     let date = td_civil::unix_to_civil_utc_checked(utc_ms.div_euclid(1000))
         .ok_or(ports::Error::Invalid)?;
@@ -667,35 +537,11 @@ pub(crate) fn trace(
         .map_err(|_| ports::Error::Capacity)?;
     write!(output, "Return-Path: <{}>\r\n", receipt.reverse_path)
         .map_err(|_| ports::Error::Capacity)?;
-    if (observed.dkim.is_some() && observed.spf.is_none())
-        || (observed.dmarc.is_some() && observed.dkim.is_none())
-    {
-        return Err(Error::Invalid);
-    }
-    if let Some(result) = observed.spf {
+    if let Some(results) = results {
         if receipt.gateway.is_some() {
             return Err(ports::Error::Invalid);
         }
-        let (prefix, mailbox) = if receipt.reverse_path.is_empty() {
-            ("postmaster@", receipt.ehlo)
-        } else {
-            ("", receipt.reverse_path)
-        };
-        // Folding whitespace keeps the committed byte charge and header ceiling
-        // independent of the authentication result.
-        let width = "permerror".len().saturating_sub(result.as_str().len());
-        write!(
-            output,
-            "Received-SPF: {} identity=mailfrom;\r\n\t{pad:width$}receiver={hostname}; client-ip=\"{}\";\r\n\thelo=\"{}\";\r\n\tenvelope-from=\"{prefix}{}\"\r\n",
-            result.as_str(), receipt.peer, QuotedContent(receipt.ehlo), QuotedContent(mailbox), pad = ""
-        )
-        .map_err(|_| ports::Error::Invalid)?;
-    }
-    if let Some(report) = observed.dkim {
-        dkim_trace(&mut output, hostname, report)?;
-    }
-    if let Some(report) = observed.dmarc {
-        dmarc_trace(&mut output, report)?;
+        results.write_field(&mut output, hostname)?;
     }
     write!(output, "Received: from {} (", receipt.ehlo).map_err(|_| ports::Error::Capacity)?;
     match receipt.peer {
@@ -739,42 +585,43 @@ fn copy_identifier(id: &str, work: &mut Work<'_>) -> Result<String, Error> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod spf_tests {
+mod authentication_tests {
     use super::*;
-    use crate::{format::row::ReceiptRecipients, spf::Outcome};
+    use crate::{
+        dkim, dmarc,
+        format::row::ReceiptRecipients,
+        sender_authentication::{Observed, Results},
+        spf::Outcome,
+    };
+
+    const HOST: &str = "mx.example.test";
+
+    fn longest() -> String {
+        [
+            "x".repeat(63),
+            "y".repeat(63),
+            "z".repeat(63),
+            "a".repeat(61),
+        ]
+        .join(".")
+    }
+
+    fn results(spf: Outcome, dkim: dkim::Report, dmarc: dmarc::Report, reverse: &str) -> Results {
+        Results::new(Observed { spf, dkim, dmarc }, "sender.test", reverse).unwrap()
+    }
 
     fn render(
         host: &str,
-        ehlo: &str,
         reverse_path: &str,
         gateway: Option<&str>,
-        observed: Option<Outcome>,
-    ) -> Result<String, Error> {
-        render_auth(
-            host,
-            ehlo,
-            reverse_path,
-            gateway,
-            Observations {
-                spf: observed,
-                dkim: None,
-                dmarc: None,
-            },
-        )
-    }
-    fn render_auth(
-        host: &str,
-        ehlo: &str,
-        reverse_path: &str,
-        gateway: Option<&str>,
-        observed: Observations<'_>,
+        results: Option<&Results>,
     ) -> Result<String, Error> {
         let mut encoded = [0; 64];
         let receipt = SmtpReceipt {
             peer: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
             gateway,
             tls: ReceiptTls::Tls13,
-            ehlo,
+            ehlo: "sender.test",
             reverse_path,
             recipients: ReceiptRecipients::encode(&["owner@example.test"], &mut encoded).unwrap(),
         };
@@ -784,96 +631,149 @@ mod spf_tests {
             true,
             EmailId::from_bytes([1; 16]),
             0,
-            observed.allowance(host)?,
-            observed,
+            allowance(host, results)?,
+            results,
         )
     }
 
-    #[test]
-    fn dkim_report_uses_a_fixed_charge_and_a_trusted_position() {
-        use crate::dkim::{Outcome as DkimOutcome, Report, SignatureResult, MAX_SIGNATURES};
-        let host = "mx.example.test";
-        let unavailable = Report::unavailable();
-        let render = |report: &Report| {
-            render_auth(
-                host,
-                "sender.test",
-                "",
-                None,
-                Observations {
-                    spf: Some(Outcome::Pass),
-                    dkim: Some(report),
-                    dmarc: None,
-                },
-            )
-        };
-        let field = |trace: &str| {
-            trace
-                .split_once("\r\nX-TD-DKIM-Results: ")
-                .unwrap()
-                .1
-                .split_once("\r\nReceived: ")
-                .unwrap()
-                .0
-                .to_owned()
-        };
-        let none = Report {
+    fn field(trace: &str) -> &str {
+        trace
+            .split_once("\r\nAuthentication-Results: ")
+            .unwrap()
+            .1
+            .split_once("\r\nReceived: ")
+            .unwrap()
+            .0
+    }
+
+    fn unsigned() -> dkim::Report {
+        dkim::Report {
             signatures: Vec::new(),
             incomplete: false,
-        };
-        let unsigned = render(&none).unwrap();
-        assert!(field(&unsigned).starts_with("none; receiver=mx.example.test\r\n"));
-        assert!(field(&render(&unavailable).unwrap()).starts_with("incomplete; receiver="));
-        assert_eq!(render(&unavailable).unwrap().len(), unsigned.len());
-        assert_eq!(
-            dkim_trace_allowance(host).unwrap() - spf_trace_allowance(host).unwrap(),
-            2299 + host.len()
-        );
-        assert!(
-            unsigned.find("Received-SPF:").unwrap() < unsigned.find("X-TD-DKIM-Results:").unwrap()
-        );
+        }
+    }
 
-        let longest = [
-            "x".repeat(63),
-            "y".repeat(63),
-            "z".repeat(63),
-            "a".repeat(61),
+    #[test]
+    fn authentication_results_sits_between_return_path_and_received() {
+        let none = results(Outcome::None, unsigned(), dmarc::Report::unavailable(), "");
+        let trace = render(HOST, "", None, Some(&none)).unwrap();
+        assert!(trace.starts_with(
+            "Return-Path: <>\r\nAuthentication-Results: mx.example.test;\r\n\tspf=none smtp.helo=sender.test;\r\n\tdkim=none;\r\n\tdmarc=temperror\r\n\t("
+        ), "{trace}");
+        assert!(trace.contains(")\r\nReceived: from sender.test ([IPv6:"));
+        assert_eq!(
+            auth_trace_allowance(HOST).unwrap() - trace_allowance(HOST).unwrap(),
+            3297 + HOST.len()
+        );
+        for gateway in [None, Some("gateway")] {
+            let plain = render(HOST, "", gateway, None).unwrap();
+            assert!(plain.starts_with("Return-Path: <>\r\nReceived: "));
+        }
+        assert_eq!(
+            render(HOST, "", Some("gateway"), Some(&none)),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn every_verdict_renders_the_same_field_length() {
+        let reference = render(
+            HOST,
+            "",
+            None,
+            Some(&results(
+                Outcome::None,
+                dkim::Report::unavailable(),
+                dmarc::Report::unavailable(),
+                "",
+            )),
+        )
+        .unwrap();
+        let longest = longest();
+        let sender = format!("owner@{longest}");
+        let dkim_outcomes = [
+            dkim::Outcome::Pass,
+            dkim::Outcome::Fail,
+            dkim::Outcome::Temperror,
+            dkim::Outcome::Permerror,
+        ];
+        let dmarc_outcomes = [
+            dmarc::Outcome::None,
+            dmarc::Outcome::Pass,
+            dmarc::Outcome::Fail,
+            dmarc::Outcome::Temperror,
+            dmarc::Outcome::Permerror,
+        ];
+        for (index, spf) in [
+            Outcome::None,
+            Outcome::Neutral,
+            Outcome::Pass,
+            Outcome::Fail,
+            Outcome::Softfail,
+            Outcome::Temperror,
+            Outcome::Permerror,
         ]
-        .join(".");
-        for outcome in [
-            DkimOutcome::Pass,
-            DkimOutcome::Fail,
-            DkimOutcome::Temperror,
-            DkimOutcome::Permerror,
-        ] {
-            let details = || SignatureResult {
+        .into_iter()
+        .enumerate()
+        {
+            let row = |outcome| dkim::SignatureResult {
                 outcome,
                 algorithm: Some(td_crypto::DkimAlgorithm::Ed25519),
-                key_bits: Some(256),
+                key_bits: Some(65535),
                 domain: Some(longest.clone()),
                 selector: Some(longest.clone()),
             };
-            let full = Report {
-                signatures: (0..MAX_SIGNATURES).map(|_| details()).collect(),
+            let outcome = *dkim_outcomes.get(index % dkim_outcomes.len()).unwrap();
+            let full = dkim::Report {
+                signatures: (0..dkim::MAX_SIGNATURES).map(|_| row(outcome)).collect(),
                 incomplete: true,
             };
-            let raw = render(&full).unwrap();
-            assert_eq!(raw.len(), unsigned.len());
-            assert!(raw.split("\r\n").all(|line| line.len() <= 998));
+            let dmarc = dmarc::Report {
+                outcome: *dmarc_outcomes.get(index % dmarc_outcomes.len()).unwrap(),
+                author: Some(longest.clone()),
+                policy_domain: Some(longest.clone()),
+                policy: Some(dmarc::Requested {
+                    disposition: dmarc::Disposition::Quarantine,
+                    strict_spf: true,
+                    strict_dkim: true,
+                }),
+                aligned: Some(dmarc::Identifier::Dkim),
+            };
+            let trace = render(
+                HOST,
+                &sender,
+                None,
+                Some(&results(spf, full, dmarc, &sender)),
+            )
+            .unwrap();
+            assert!(trace.split("\r\n").all(|line| line.len() <= 998));
+            let field = field(&trace);
+            assert_eq!(field.len(), self::field(&reference).len());
+            assert!(field.starts_with(&format!(
+                "mx.example.test;\r\n\tspf={} smtp.mailfrom={longest};",
+                spf.as_str()
+            )));
             assert_eq!(
-                field(&raw)
+                field
                     .matches(&format!(
-                        "result={}; a=ed25519-sha256; bits=256; d={longest}; s={longest}",
+                        "\r\n\tdkim={} (65535-bit key) header.d={longest} header.s={longest} header.a=ed25519-sha256;",
                         outcome.as_str()
                     ))
                     .count(),
-                MAX_SIGNATURES
+                dkim::MAX_SIGNATURES
             );
+            assert!(field.contains(";\r\n\tdkim=temperror (verification incomplete);"));
+            assert!(field.contains(&format!(
+                " (policy=quarantine aspf=s adkim=s aligned=dkim policy-domain={longest}) header.from={longest}\r\n\t("
+            )));
         }
+    }
 
-        let invalid = Report {
-            signatures: vec![SignatureResult {
-                outcome: DkimOutcome::Pass,
+    #[test]
+    fn unrepresentable_names_withdraw_the_observation() {
+        let forged = dkim::Report {
+            signatures: vec![dkim::SignatureResult {
+                outcome: dkim::Outcome::Pass,
                 algorithm: Some(td_crypto::DkimAlgorithm::Rsa),
                 key_bits: Some(1024),
                 domain: Some("x\r\nForged: pass".into()),
@@ -881,160 +781,68 @@ mod spf_tests {
             }],
             incomplete: false,
         };
-        assert_eq!(render(&invalid).unwrap(), render(&unavailable).unwrap());
-        assert_eq!(
-            render_auth(
-                host,
-                "sender.test",
-                "",
-                Some("gateway"),
-                Observations {
-                    spf: Some(Outcome::Pass),
-                    dkim: Some(&none),
-                    dmarc: None,
-                }
-            ),
-            Err(Error::Invalid)
-        );
-        assert_eq!(
-            render_auth(
-                host,
-                "sender.test",
-                "",
-                None,
-                Observations {
-                    spf: None,
-                    dkim: Some(&none),
-                    dmarc: None,
-                }
-            ),
-            Err(Error::Invalid)
-        );
-    }
-
-    #[test]
-    fn dmarc_field_has_a_fixed_charge_and_ends_the_local_auth_trace() {
-        use crate::dmarc::{Outcome as Dmarc, Report};
-        let host = "mx.example.test";
-        let dkim = crate::dkim::Report::unavailable();
-        let render = |report: &Report| {
-            render_auth(
-                host,
-                "sender.test",
-                "owner@sender.test",
-                None,
-                Observations {
-                    spf: Some(Outcome::Fail),
-                    dkim: Some(&dkim),
-                    dmarc: Some(report),
-                },
-            )
-            .unwrap()
-        };
-        let longest = [
-            "x".repeat(63),
-            "y".repeat(63),
-            "z".repeat(63),
-            "a".repeat(61),
-        ]
-        .join(".");
-        let reference = render(&Report::unavailable());
-        let earlier = render_auth(
-            host,
-            "sender.test",
-            "owner@sender.test",
-            None,
-            Observations {
-                spf: Some(Outcome::Fail),
-                dkim: Some(&dkim),
-                dmarc: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(reference.len() - earlier.len(), DMARC_BYTES);
-        assert_eq!(auth_trace_allowance(host).unwrap(), 4759 + 3 * host.len());
-        let (prefix, suffix) = reference.split_once("X-TD-DMARC-Result: ").unwrap();
-        assert!(prefix.contains("X-TD-DKIM-Results: "));
-        assert!(suffix.starts_with("temperror; "));
-        assert!(suffix.contains("\r\nReceived: "));
-        for outcome in [
-            Dmarc::None,
-            Dmarc::Pass,
-            Dmarc::Fail,
-            Dmarc::Temperror,
-            Dmarc::Permerror,
-        ] {
-            let report = Report {
-                outcome,
-                author: Some(longest.clone()),
-                policy_domain: Some(longest.clone()),
-            };
-            let trace = render(&report);
-            assert_eq!(trace.len(), reference.len());
-            assert!(trace.contains(&format!(
-                "X-TD-DMARC-Result: {}; author={longest}; policy-domain={longest}\r\n",
-                outcome.as_str()
-            )));
-            assert!(trace.lines().all(|line| line.len() <= 998));
-        }
-        let invalid = Report {
-            outcome: Dmarc::Pass,
-            author: Some("x\r\nForged: pass".into()),
+        let author = dmarc::Report {
+            outcome: dmarc::Outcome::Pass,
+            author: Some("x; dkim=pass".into()),
             policy_domain: None,
+            policy: None,
+            aligned: Some(dmarc::Identifier::Spf),
         };
-        assert_eq!(render(&invalid), reference);
-    }
-
-    const OUTCOMES: &[Outcome] = &[
-        Outcome::None,
-        Outcome::Neutral,
-        Outcome::Pass,
-        Outcome::Fail,
-        Outcome::Softfail,
-        Outcome::Temperror,
-        Outcome::Permerror,
-    ];
-
-    #[test]
-    fn received_spf_precedes_the_receivers_own_received_field() {
-        const HOST: &str = "mx.example.test";
-        const HELO: &str = "[IPv6:::1]";
-        let size = render(HOST, HELO, "", None, Some(Outcome::Permerror))
-            .unwrap()
-            .len();
-        for &outcome in OUTCOMES {
-            let header = render(HOST, HELO, "", None, Some(outcome)).unwrap();
-            assert_eq!(header.len(), size);
-            assert!(header.starts_with(&format!(
-                "Return-Path: <>\r\nReceived-SPF: {} identity=mailfrom;\r\n\t{}receiver=mx.example.test; client-ip=\"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff\";\r\n\thelo=\"[IPv6:::1]\";\r\n\tenvelope-from=\"postmaster@[IPv6:::1]\"\r\nReceived: ",
-                outcome.as_str(), " ".repeat("permerror".len() - outcome.as_str().len())
-            )));
-        }
-        for gateway in [None, Some("gateway")] {
-            let header = render(HOST, HELO, "", gateway, None).unwrap();
-            assert!(header.starts_with("Return-Path: <>\r\nReceived: "));
-        }
-        assert_eq!(
-            render(HOST, HELO, "", Some("gateway"), Some(Outcome::Pass)),
-            Err(Error::Invalid)
-        );
-        let quoted = render(
-            HOST,
-            HELO,
-            r#""a\"b"@example.test"#,
-            None,
-            Some(Outcome::None),
-        )
-        .unwrap();
-        assert!(quoted.contains(r#"envelope-from="\"a\\\"b\"@example.test""#));
-        assert_eq!(
-            render(HOST, "a\r\nForged: pass", "", None, Some(Outcome::None)),
-            Err(Error::Invalid)
-        );
+        let withdrawn = results(Outcome::Pass, forged, author, "a@sender.test");
+        assert_eq!(withdrawn.dkim, dkim::Report::unavailable());
+        assert_eq!(withdrawn.dmarc, dmarc::Report::unavailable());
+        let trace = render(HOST, "a@sender.test", None, Some(&withdrawn)).unwrap();
+        assert!(field(&trace).starts_with(
+            "mx.example.test;\r\n\tspf=pass smtp.mailfrom=sender.test;\r\n\tdkim=temperror (verification incomplete);\r\n\tdmarc=temperror\r\n"
+        ));
     }
 
     #[test]
-    fn local_verdict_and_sender_trace_fit_the_exact_filtered_header_budget() {
+    fn dmarc_resting_on_withdrawn_dkim_is_withdrawn_with_it() {
+        let forged = || dkim::Report {
+            signatures: vec![dkim::SignatureResult {
+                outcome: dkim::Outcome::Pass,
+                algorithm: Some(td_crypto::DkimAlgorithm::Rsa),
+                key_bits: Some(2048),
+                domain: Some("bad domain".into()),
+                selector: None,
+            }],
+            incomplete: false,
+        };
+        let aligned = |identifier| dmarc::Report {
+            outcome: dmarc::Outcome::Pass,
+            author: Some("sender.test".into()),
+            policy_domain: Some("sender.test".into()),
+            policy: Some(dmarc::Requested {
+                disposition: dmarc::Disposition::Reject,
+                strict_spf: false,
+                strict_dkim: false,
+            }),
+            aligned: Some(identifier),
+        };
+        let dkim = results(
+            Outcome::Pass,
+            forged(),
+            aligned(dmarc::Identifier::Dkim),
+            "a@sender.test",
+        );
+        assert_eq!(dkim.dmarc, dmarc::Report::unavailable());
+        let spf = results(
+            Outcome::Pass,
+            forged(),
+            aligned(dmarc::Identifier::Spf),
+            "a@sender.test",
+        );
+        assert_eq!(spf.dkim, dkim::Report::unavailable());
+        assert_eq!(spf.dmarc, aligned(dmarc::Identifier::Spf));
+        assert!(!spf.spf_helo);
+        let trace = render(HOST, "a@sender.test", None, Some(&spf)).unwrap();
+        assert!(field(&trace).contains(
+            ";\r\n\tdmarc=pass (policy=reject aspf=r adkim=r aligned=spf policy-domain=sender.test) header.from=sender.test\r\n"
+        ), "{trace}");
+    }
+
+    fn filter(source: &[u8], trace: &str, limit: usize) -> Result<Vec<u8>, HeaderError> {
         let clock = crate::clock::RuntimeClock::new();
         let mut last = clock.monotonic().unwrap();
         let deadline = Deadline::after(last, 10_000).unwrap();
@@ -1053,66 +861,64 @@ mod spf_tests {
             meter: &mut meter,
             last: &mut last,
         };
-        let original = b"Received-SPF: pass (prior hop)\r\n";
-        let tail = b"\r\nbody\r\n";
-        let source = [
-            b"Return-Path: <injected@example.test>\r\n".as_slice(),
-            original,
-            tail,
-        ]
-        .concat();
-        let trace = |outcome| {
-            render(
-                "mx.example.test",
-                "mail.example.test",
-                "user@example.test",
-                None,
-                Some(outcome),
-            )
-            .unwrap()
-        };
-        let limit = trace(Outcome::Fail).len() + original.len();
-        let filtered = |trace: &str, limit, work: &mut Work<'_>| -> Result<Vec<u8>, HeaderError> {
-            let mut headers = Headers::resident(&source, limit);
-            assert!(headers.push(&source, true, work)?);
-            let mut raw = Vec::new();
-            headers.write_filtered(
-                trace.as_bytes(),
-                |bytes| {
-                    raw.extend_from_slice(bytes);
-                    Ok(())
-                },
-                work,
-            )?;
-            Ok(raw)
-        };
-        for &outcome in OUTCOMES {
-            let trace = trace(outcome);
-            assert_eq!(
-                filtered(&trace, limit - 1, &mut work),
-                Err(HeaderError::HeaderLimit)
-            );
-            let raw = filtered(&trace, limit, &mut work).unwrap();
-            assert_eq!(raw, [trace.as_bytes(), original, tail].concat());
-            // PostgreSQL charges this exact byte length to the account.
-            assert_eq!(raw.len(), limit + tail.len());
-        }
+        let mut headers = Headers::resident(source, limit);
+        assert!(headers.push(source, true, &mut work)?);
+        let mut raw = Vec::new();
+        headers.write_filtered(
+            trace.as_bytes(),
+            HOST,
+            |bytes| {
+                raw.extend_from_slice(bytes);
+                Ok(())
+            },
+            &mut work,
+        )?;
+        Ok(raw)
     }
 
     #[test]
-    fn maximum_quoted_properties_fit_the_advertised_trace_allowance() {
-        let host = [
-            "x".repeat(63),
-            "y".repeat(63),
-            "z".repeat(63),
-            "t".repeat(61),
-        ]
-        .join(".");
-        let helo = "\\".repeat(crate::format::row::MAX_EHLO);
+    fn supplied_fields_claiming_this_receiver_are_removed() {
+        let kept: &[&[u8]] = &[
+            b"Authentication-Results: other.example.test; spf=pass\r\n",
+            b"Authentication-Results: mx.example.test.evil; dkim=pass\r\n",
+            b"Authentication-Results: \"mx.example.test.\"; none\r\n",
+            b"Received-SPF: pass (prior hop)\r\n",
+        ];
+        let removed: &[&[u8]] = &[
+            b"Return-Path: <injected@example.test>\r\n",
+            b"Authentication-Results: mx.example.test; spf=pass\r\n",
+            b"authentication-results:MX.Example.Test;dkim=pass\r\n",
+            b"Authentication-Results: (comment (nested)) \"mx.ex\\ample.test\" 1;\r\n\tdmarc=pass\r\n",
+            b"Authentication-Results: ; none\r\n",
+            b"Authentication-Results: (unterminated\r\n",
+            b"Authentication-Results: \"unterminated\r\n",
+        ];
+        let tail = b"\r\nbody\r\n";
+        let source = [kept.concat(), removed.concat(), tail.to_vec()].concat();
+        // The scanner's ceiling also bounds the supplied header section.
+        let trace = format!("Return-Path: <>\r\nX-Pad: {}\r\n", "x".repeat(512));
+        let limit = trace.len() + kept.concat().len();
+        let raw = filter(&source, &trace, limit).unwrap();
+        assert_eq!(raw, [trace.as_bytes(), &kept.concat(), tail].concat());
+        assert_eq!(
+            filter(&source, &trace, limit - 1),
+            Err(HeaderError::HeaderLimit)
+        );
+    }
+
+    #[test]
+    fn maximum_envelope_values_fit_the_advertised_trace_allowance() {
+        let host = longest();
         let sender = "\"".repeat(crate::format::row::MAX_ADDRESS);
         for reverse in ["", sender.as_str()] {
-            let header = render(&host, &helo, reverse, None, Some(Outcome::Temperror)).unwrap();
-            assert!(header.len() + 2 <= spf_trace_allowance(&host).unwrap());
+            let observed = results(
+                Outcome::Temperror,
+                dkim::Report::unavailable(),
+                dmarc::Report::unavailable(),
+                reverse,
+            );
+            let header = render(&host, reverse, None, Some(&observed)).unwrap();
+            assert!(header.len() + 2 <= auth_trace_allowance(&host).unwrap());
             assert!(header.split("\r\n").all(|line| line.len() <= 998));
         }
     }

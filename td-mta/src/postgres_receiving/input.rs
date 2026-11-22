@@ -36,11 +36,11 @@ pub(super) fn prepare(
     ids: (EmailId, BlobId, ThreadId),
     clock: &impl Clock,
     meter: &mut Meter,
-    observed: headers::Observations<'_>,
+    results: Option<&crate::sender_authentication::Results>,
 ) -> Result<(Vec<u8>, Vec<String>, String, Provenance), Error> {
     let (email, blob, thread) = ids;
     let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
-    let allowance = observed.allowance(message.hostname).map_err(Error::Input)?;
+    let allowance = headers::allowance(message.hostname, results).map_err(Error::Input)?;
     if message.header_bytes == 0
         || message.header_bytes > 1024 * 1024
         || message.header_bytes > maximum
@@ -63,7 +63,7 @@ pub(super) fn prepare(
         email,
         message.received_at,
         allowance,
-        observed,
+        results,
     )
     .map_err(Error::Input)?;
     let mut last = clock.sample().map_err(Error::Input)?.monotonic;
@@ -113,7 +113,7 @@ pub(super) fn prepare(
         }
         if header.push(line, false, &mut work).map_err(header_error)? {
             header
-                .write_filtered(trace.as_bytes(), &mut append, &mut work)
+                .write_filtered(trace.as_bytes(), message.hostname, &mut append, &mut work)
                 .map_err(header_error)?;
         }
     }
@@ -122,7 +122,7 @@ pub(super) fn prepare(
             return Err(Error::Integrity);
         }
         header
-            .write_filtered(trace.as_bytes(), &mut append, &mut work)
+            .write_filtered(trace.as_bytes(), message.hostname, &mut append, &mut work)
             .map_err(header_error)?;
     }
     copy_body(remaining, cr, &mut append, &mut work)?;

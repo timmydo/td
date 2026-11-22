@@ -1303,12 +1303,12 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 if !prepared {
                     let authentication = slot.authentication.take().ok_or(Error::Conflict)?;
                     let spf = slot.spf_result.ok_or(Error::Conflict)?;
-                    if let Err(error) = job.prepare_with_dmarc(
-                        cap,
-                        Some(spf),
-                        Some(authentication.dkim),
-                        Some(authentication.dmarc.finish(spf)),
-                    ) {
+                    let observed = crate::sender_authentication::Observed {
+                        spf,
+                        dkim: authentication.dkim,
+                        dmarc: authentication.dmarc.finish(spf),
+                    };
+                    if let Err(error) = job.prepare_authenticated(cap, observed) {
                         return self.delivery_refused(slot, work, error, control);
                     }
                 }

@@ -645,13 +645,22 @@ submission or route.
 
 The separate foreground-process fixture also mixes an accepted local RCPT
 with rejected external RCPT commands. Its delivered message carries forged
-From, To, Bcc, Resent-To, X-Original-To, X-Forwarded-To, Received and
-Authentication-Results and Received-SPF headers. Its private resolver
-publishes `v=spf1 -all` for the envelope domain. The executable returns 250,
-and its PostgreSQL body begins with the local Return-Path and Received-SPF
-fail fields while preserving the sender's claimed pass farther down. Header
-tests cover all seven results, the effective null sender, quoted values and
-maximum trace size. DNS and policy fixtures exercise aliases, TCP fallback,
+From, To, Bcc, Resent-To, X-Original-To, X-Forwarded-To, Received,
+Received-SPF and Authentication-Results headers, two of the latter claiming
+the receiver's own hostname. Its private resolver publishes `v=spf1 -all`
+for the envelope domain. The executable returns 250, and its PostgreSQL body
+begins with the local Return-Path and one Authentication-Results field
+recording SPF fail, both DKIM passes with key sizes and DMARC pass. The
+fields claiming the receiver are gone; the one naming another server and
+the claimed Received-SPF pass stay farther down. The `email_authentication`
+and `email_dkim_signatures` rows state the same results, and the POSTGRES.md
+inspection queries return them. Header tests cover every SPF,
+DKIM and DMARC result at one fixed field length, the effective null sender,
+names the field cannot state, authserv-id parsing through comments and
+quoted strings, and maximum trace size. A schema-46 upgrade test checks
+that existing Emails gain no rows, PUBLIC has no access, the CHECK and
+foreign-key constraints refuse malformed rows and rows cascade with their
+Email. DNS and policy fixtures exercise aliases, TCP fallback,
 lookup exhaustion and nested policies without public DNS. After local
 acceptance, outbound submission,
 recipient and route tables remain empty, queue usage remains zero, and the

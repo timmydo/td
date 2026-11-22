@@ -140,7 +140,7 @@ pub(super) fn exercise(
     exchange(b"RCPT TO:<main@example.test>\r\n", "250");
     exchange(b"RCPT TO:<@example.test:outside@remote.test>\r\n", "550");
     exchange(b"DATA\r\n", "354");
-    let mut signed = Vec::from(&b"Bcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\nX-TD-DKIM-Results: fail (sender supplied)\r\nX-TD-DMARC-Result: fail; author=spoof.test; policy-domain=spoof.test\r\n"[..]);
+    let mut signed = Vec::from(&b"Bcc: hidden@remote.test\r\nResent-To: other@remote.test\r\nX-Original-To: third@remote.test\r\nX-Forwarded-To: fourth@remote.test\r\nReceived: from trusted.example.test with ESMTPA\r\nAuthentication-Results: mx.example.test; auth=pass\r\nReceived-SPF: pass (sender supplied)\r\nAuthentication-Results: localhost; dkim=fail (sender supplied)\r\nAuthentication-Results: (forged) LocalHost;\r\n\tdmarc=fail header.from=spoof.test\r\n"[..]);
     signed.extend_from_slice(super::dkim_vectors::MESSAGE);
     signed.extend_from_slice(b".\r\n");
     exchange(&signed, "250");
@@ -151,52 +151,57 @@ pub(super) fn exercise(
         "SELECT convert_from(bytes,'UTF8') FROM td_mta.blob_chunks WHERE ordinal=0",
         16384,
     );
-    assert!(
-        received.starts_with(
-            "Return-Path: <sender@example.test>\r\nReceived-SPF: fail identity=mailfrom;"
-        ),
-        "{received}"
-    );
-    assert!(received.contains("\r\nReceived-SPF: pass (sender supplied)\r\n"));
     let (local_trace, incoming) = received.split_once("\r\nReceived: ").unwrap();
     assert!(
-        local_trace.contains("\r\nX-TD-DKIM-Results: complete; receiver="),
+        local_trace.starts_with(concat!(
+            "Return-Path: <sender@example.test>\r\n",
+            "Authentication-Results: localhost;\r\n",
+            "\tspf=fail smtp.mailfrom=example.test;\r\n",
+            "\tdkim=pass (256-bit key) header.d=football.example.com header.s=brisbane header.a=ed25519-sha256;\r\n",
+            "\tdkim=pass (1024-bit key) header.d=football.example.com header.s=test header.a=rsa-sha256;\r\n",
+            "\tdmarc=pass (policy=reject aspf=s adkim=s aligned=dkim policy-domain=football.example.com) header.from=football.example.com\r\n\t(",
+        )),
         "{local_trace}"
     );
-    for signature in [
-        "result=pass; a=rsa-sha256; bits=1024; d=football.example.com; s=test",
-        "result=pass; a=ed25519-sha256; bits=256; d=football.example.com; s=brisbane",
-    ] {
-        assert!(local_trace.contains(signature), "{local_trace}");
-    }
-    assert!(incoming.contains("\r\nX-TD-DKIM-Results: fail (sender supplied)\r\n"));
-    assert!(local_trace.contains("\r\nX-TD-DMARC-Result: pass; author=football.example.com; policy-domain=football.example.com\r\n"), "{local_trace}");
-    assert!(incoming
-        .contains("\r\nX-TD-DMARC-Result: fail; author=spoof.test; policy-domain=spoof.test\r\n"));
-    let query = include_str!("../../POSTGRES.md")
-        .split_once("### Inspecting direct-MX DKIM observations")
-        .unwrap()
-        .1
-        .split_once("```sql\n")
-        .unwrap()
-        .1
-        .split_once("\n```")
-        .unwrap()
-        .0;
-    assert_eq!(sql(fixture, query), "pass|1024|football.example.com|1");
-    let dmarc_query = include_str!("../../POSTGRES.md")
-        .split_once("### Inspecting direct-MX DMARC observations")
-        .unwrap()
-        .1
-        .split_once("```sql\n")
-        .unwrap()
-        .1
-        .split_once("\n```")
-        .unwrap()
-        .0;
+    // Fields naming another server stay; those claiming this one do not.
+    assert!(incoming.contains("\r\nAuthentication-Results: mx.example.test; auth=pass\r\n"));
+    assert!(incoming.contains("\r\nReceived-SPF: pass (sender supplied)\r\n"));
+    assert_eq!(received.matches("Authentication-Results: ").count(), 2);
+    assert!(!received.contains("spoof.test") && !received.contains("dkim=fail (sender supplied)"));
     assert_eq!(
-        sql(fixture, dmarc_query),
-        "pass|football.example.com|football.example.com|1"
+        sql(fixture, "SELECT spf_result,spf_domain,spf_helo,dkim_complete,dmarc_result,dmarc_author,dmarc_policy_domain,dmarc_policy,dmarc_strict_spf,dmarc_strict_dkim,dmarc_aligned FROM td_mta.email_authentication"),
+        "fail|example.test|f|t|pass|football.example.com|football.example.com|reject|t|t|dkim"
+    );
+    assert_eq!(
+        sql(fixture, "SELECT string_agg(concat_ws(',',ordinal,result,algorithm,domain,selector,key_bits),';' ORDER BY ordinal) FROM td_mta.email_dkim_signatures"),
+        "0,pass,ed25519-sha256,football.example.com,brisbane,256;1,pass,rsa-sha256,football.example.com,test,1024"
+    );
+    let query = |section: &str| {
+        include_str!("../../POSTGRES.md")
+            .split_once(section)
+            .unwrap()
+            .1
+            .split_once("```sql\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        sql(fixture, query("### Inspecting direct-MX SPF observations")),
+        "fail|1"
+    );
+    assert_eq!(
+        sql(fixture, query("### Inspecting direct-MX DKIM observations")),
+        "pass|1024|football.example.com|1"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            query("### Inspecting direct-MX DMARC observations")
+        ),
+        "pass|football.example.com|football.example.com|reject|dkim|1"
     );
     assert!(smtp_address.is_ipv6() && https_address.is_ipv6());
     assert_eq!(

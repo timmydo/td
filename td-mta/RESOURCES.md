@@ -501,8 +501,8 @@ job; direct receiving then accepts at roughly the pool's rate instead of
 promptly recording `temperror`. Missing worker capacity, local work
 exhaustion, an observation that outlives its own budget or a wait that
 ends first produces `temperror`. The direct SMTP SIZE and header limits
-reserve space for the longest generated Received-SPF trace and escaped
-envelope values.
+reserve space for the fixed-length Authentication-Results field and the
+longest envelope values in the receiver's trace.
 
 Three DKIM workers verify the original dot-unstuffed DATA before the
 receiver rewrites trace headers. A verifier borrows the admitted bytes
@@ -527,7 +527,11 @@ examines up to 1,024 fields and 256 KiB of headers, with at most 16 KiB
 for From. Policy discovery visits at most eight names in each DNS tree
 walk and shares answers between walks in this message. A slot reserves 1
 KiB for the retained DMARC result and its author and policy domains. The
-generated DMARC field uses 566 bytes for every outcome. SPF, DKIM and
+Authentication-Results field uses 3,297 bytes plus the hostname for every
+outcome. Publication adds two statements per account copy inside its
+transaction: one `email_authentication` row and one statement for up to
+four signature rows, at most 32 statements for 16 accounts. Each copy
+retains its own validated result, a few hundred bytes. SPF, DKIM and
 DMARC share the receiver's final wait, which is the longer of the SPF
 bound above and two DKIM budgets. Observations still queued or running
 when it ends, including when the full commit budget needs the time, are

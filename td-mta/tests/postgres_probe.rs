@@ -2108,7 +2108,12 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     }
 }
 
+fn rewind_sender_authentication(fixture: &Fixture) {
+    sql(fixture, "DROP TABLE td_mta.email_dkim_signatures, td_mta.email_authentication; DELETE FROM td_mta.schema_migrations WHERE version=46");
+}
+
 fn rewind_email_order(fixture: &Fixture) {
+    rewind_sender_authentication(fixture);
     sql(fixture, "DROP INDEX td_mta.emails_received_order; DELETE FROM td_mta.schema_migrations WHERE version=45");
 }
 
@@ -2175,7 +2180,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let receipt = postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
     sql(&fixture, "CREATE ROLE service_reader; GRANT USAGE ON SCHEMA td_mta TO service_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO service_reader; GRANT UPDATE (store_epoch) ON td_mta.schema_migrations TO service_reader; REVOKE TEMP ON DATABASE postgres FROM PUBLIC");
-    let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536);
+    let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' AND c.relname NOT IN ('email_authentication','email_dkim_signatures') ORDER BY 1,2,3,4,5", 65536);
     // Exercise the deployed table with its runtime grants and a retained
     // operation. Upgrade must leave the account state and other grants intact.
     rewind_replica_retention(&fixture);
@@ -2244,8 +2249,16 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
         &fixture,
         "DROP TABLE td_mta.acl_overflow_1,td_mta.acl_overflow_2,td_mta.acl_overflow_3",
     );
-    assert_eq!(sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536), grants);
+    assert_eq!(sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' AND c.relname NOT IN ('email_authentication','email_dkim_signatures') ORDER BY 1,2,3,4,5", 65536), grants);
     assert_eq!(sql(&fixture, "SELECT has_column_privilege('service_reader','td_mta.schema_migrations','store_epoch','UPDATE'),has_table_privilege('service_reader','td_mta.blob_search','SELECT'),has_schema_privilege('service_reader','td_mta','USAGE')"), "t|t|t");
+    // Tables a replayed migration recreates need their explicit grants again.
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT has_table_privilege('service_reader','td_mta.email_authentication','SELECT')"
+        ),
+        "f"
+    );
 }
 
 #[test]
@@ -2856,6 +2869,8 @@ mod multi_relay;
 
 #[path = "postgres_probe/search_index.rs"]
 mod search_index;
+#[path = "postgres_probe/sender_authentication.rs"]
+mod sender_authentication;
 
 #[path = "postgres_probe/isolated_services.rs"]
 mod isolated_services;
@@ -2888,6 +2903,10 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     timed(
         "real_postgres_schema_upgrade_preserves_explicit_service_grants",
         real_postgres_schema_upgrade_preserves_explicit_service_grants,
+    );
+    timed(
+        "sender_authentication::sender_authentication_upgrade_adds_checked_cascading_rows",
+        sender_authentication::sender_authentication_upgrade_adds_checked_cascading_rows,
     );
     timed(
         "search_index::received_order_upgrade_preserves_pages_and_indexes_the_first_page",

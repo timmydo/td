@@ -421,3 +421,88 @@ fn inherited_policy_discovery_skips_an_unusable_intermediary() {
         Outcome::None
     );
 }
+
+#[test]
+fn report_records_the_governing_policy_and_the_aligned_identifier() {
+    let requested = |disposition, strict_spf, strict_dkim| {
+        Some(Requested {
+            disposition,
+            strict_spf,
+            strict_dkim,
+        })
+    };
+    let mut zone = Zone::default();
+    zone.publish(
+        "example.test",
+        &["v=DMARC1; p=reject; sp=quarantine; aspf=s"],
+    );
+    let signed = dkim::Report {
+        signatures: vec![signature("example.test", dkim::Outcome::Pass)],
+        incomplete: false,
+    };
+    let report = check("example.test", None, spf::Outcome::None, &signed, &mut zone);
+    assert_eq!(report.outcome, Outcome::Pass);
+    assert_eq!(report.policy, requested(Disposition::Reject, true, false));
+    assert_eq!(report.aligned, Some(Identifier::Dkim));
+
+    // A subdomain author inherits sp; an exact SPF domain aligns at once.
+    let mut zone = Zone::default();
+    zone.publish(
+        "example.test",
+        &["v=DMARC1; p=reject; sp=quarantine; aspf=s"],
+    );
+    let report = check(
+        "mail.example.test",
+        Some("mail.example.test"),
+        spf::Outcome::Pass,
+        &dkim::Report::default(),
+        &mut zone,
+    );
+    assert_eq!(report.outcome, Outcome::Pass);
+    assert_eq!(
+        report.policy,
+        requested(Disposition::Quarantine, true, false)
+    );
+    assert_eq!(report.aligned, Some(Identifier::Spf));
+
+    // Relaxed SPF alignment is decided when the SPF result arrives.
+    let mut zone = Zone::default();
+    zone.publish("example.test", &["v=DMARC1; p=none; adkim=s"]);
+    let pending = evaluate(
+        "news.example.test",
+        Some("example.test"),
+        None,
+        &dkim::Report::default(),
+        &mut zone,
+        &|| true,
+    );
+    let report = pending.finish(spf::Outcome::Pass);
+    assert_eq!(report.outcome, Outcome::Pass);
+    assert_eq!(report.policy, requested(Disposition::None, false, true));
+    assert_eq!(report.aligned, Some(Identifier::Spf));
+
+    // Failures carry the policy but no aligned identifier.
+    let mut zone = Zone::default();
+    zone.publish("example.test", &["v=DMARC1; p=quarantine"]);
+    let report = unsigned(&mut zone, "example.test");
+    assert_eq!(report.outcome, Outcome::Fail);
+    assert_eq!(
+        report.policy,
+        requested(Disposition::Quarantine, false, false)
+    );
+    assert_eq!(report.aligned, None);
+
+    // A record admitted only for its reporting URI monitors.
+    let mut zone = Zone::default();
+    zone.publish(
+        "example.test",
+        &["v=DMARC1; p=bogus; sp=reject; rua=mailto:admin@example.test"],
+    );
+    let report = unsigned(&mut zone, "a.example.test");
+    assert_eq!(report.outcome, Outcome::Fail);
+    assert_eq!(report.policy, requested(Disposition::None, false, false));
+
+    let report = unsigned(&mut Zone::default(), "example.test");
+    assert_eq!(report.outcome, Outcome::None);
+    assert_eq!((report.policy, report.aligned), (None, None));
+}

@@ -859,6 +859,27 @@ confirms COMMIT and 451 on an uncertain result. A sender retry may produce
 a duplicate if the first delivery committed. Use the consistent pre-upgrade
 backup for rollback across this schema change.
 
+## Sender authentication results (schema 46)
+
+Schema 46 adds `td_mta.email_authentication` and
+`td_mta.email_dkim_signatures` (POSTGRES.md, [Direct-MX sender authentication results](POSTGRES.md#direct-mx-sender-authentication-results)). The supervised
+`./td-mta/deploy` path treats the pending migration and the new
+`service_grants` entries (INSERT for the receiving login, SELECT for the
+frontend login) like any other schema migration, so no manual grant is
+needed there. A single-runtime-login installation follows the fenced owner
+upgrade procedure above and then grants the runtime role SELECT, INSERT,
+UPDATE and DELETE on both tables before `runtime-check`; the role refuses
+to qualify until it holds them. The migration is two empty tables, so it
+needs no backfill and little time or space.
+
+Existing Emails keep their stored bodies and gain no rows. From the first
+delivery under the candidate, the receiver writes one
+`Authentication-Results` field instead of its former private trace fields
+and `Received-SPF`; scripts that scraped the stored trace should read the
+rows instead. Rolling back to a schema-45 binary requires the retained
+pre-upgrade backup, as for every schema change, and loses mail received
+after the upgrade unless that mail is separately preserved.
+
 ## Deploy from the development machine
 
 Run `./td-mta/deploy` from the root of the reviewed development checkout. The command

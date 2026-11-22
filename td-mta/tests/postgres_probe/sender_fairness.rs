@@ -183,31 +183,23 @@ pub(super) fn exercise(
     );
 
     let ordinary = stored(fixture, "Is dinner ready?");
-    let (trace, _) = ordinary.split_once("\r\nReceived: ").unwrap();
     assert!(
-        trace.starts_with("Return-Path: <sender@pass.example.test>\r\nReceived-SPF: pass "),
-        "{trace}"
+        ordinary.starts_with(concat!(
+            "Return-Path: <sender@pass.example.test>\r\n",
+            "Authentication-Results: localhost;\r\n",
+            "\tspf=pass smtp.mailfrom=pass.example.test;\r\n",
+            "\tdkim=pass (256-bit key) header.d=football.example.com header.s=brisbane header.a=ed25519-sha256;\r\n",
+            "\tdkim=pass (1024-bit key) header.d=football.example.com header.s=test header.a=rsa-sha256;\r\n",
+            "\tdmarc=pass (policy=reject aspf=s adkim=s aligned=dkim policy-domain=football.example.com) header.from=football.example.com\r\n",
+        )),
+        "{ordinary}"
     );
-    assert!(
-        trace.contains("\r\nX-TD-DKIM-Results: complete;"),
-        "{trace}"
-    );
-    for signature in [
-        "result=pass; a=rsa-sha256; bits=1024; d=football.example.com; s=test",
-        "result=pass; a=ed25519-sha256; bits=256; d=football.example.com; s=brisbane",
-    ] {
-        assert!(trace.contains(signature), "{trace}");
-    }
-    assert!(
-        trace.contains("\r\nX-TD-DMARC-Result: pass; author=football.example.com;"),
-        "{trace}"
-    );
+    let results = |domain: &str| {
+        sql(fixture, &format!("SELECT a.spf_result, a.dkim_complete, a.dmarc_result, (SELECT string_agg(s.result, ',' ORDER BY s.ordinal) FROM td_mta.email_dkim_signatures s WHERE s.account = a.account AND s.email_id = a.email_id) FROM td_mta.email_authentication a WHERE a.spf_domain = '{domain}'"))
+    };
+    assert_eq!(results("pass.example.test"), "pass|t|pass|pass,pass");
     // The slow sender really did hold a worker past its own budget.
-    let delayed = stored(fixture, "slow sender");
-    assert!(
-        delayed.starts_with("Return-Path: <sender@slow.example.test>\r\nReceived-SPF: temperror "),
-        "{delayed}"
-    );
+    assert!(results("slow.example.test").starts_with("temperror|"));
     super::smtp_transport::command(&mut normal, b"QUIT\r\n", "221");
     super::smtp_transport::command(&mut slow, b"QUIT\r\n", "221");
 }

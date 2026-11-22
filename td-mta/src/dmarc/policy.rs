@@ -1,5 +1,5 @@
 //! RFC 9989 version selection, policy syntax and bounded DNS tree walks.
-use super::{Checked, Outcome};
+use super::{Checked, Disposition, Outcome, Requested};
 use crate::spf::{Dns, DnsError, Query, Record};
 
 const POLICY_BYTES: usize = 16 * 1024;
@@ -10,6 +10,38 @@ pub(super) struct Policy {
     pub strict_spf: bool,
     pub strict_dkim: bool,
     psd: Option<bool>,
+    p: Option<Disposition>,
+    sp: Option<Disposition>,
+}
+
+impl Policy {
+    /// `sp` governs a subdomain author and `p` the policy domain itself. A
+    /// record admitted for its reporting URI without a usable `p` monitors.
+    /// `np` would need an author-existence query, which td does not make.
+    pub fn requested(self, subdomain: bool) -> Requested {
+        let chosen = if subdomain {
+            self.sp.or(self.p)
+        } else {
+            self.p
+        };
+        Requested {
+            disposition: chosen.unwrap_or(Disposition::None),
+            strict_spf: self.strict_spf,
+            strict_dkim: self.strict_dkim,
+        }
+    }
+}
+
+fn disposition(value: &[u8]) -> Option<Disposition> {
+    if value.eq_ignore_ascii_case(b"none") {
+        Some(Disposition::None)
+    } else if value.eq_ignore_ascii_case(b"quarantine") {
+        Some(Disposition::Quarantine)
+    } else if value.eq_ignore_ascii_case(b"reject") {
+        Some(Disposition::Reject)
+    } else {
+        None
+    }
 }
 
 fn wsp(mut input: &[u8]) -> &[u8] {
@@ -125,11 +157,6 @@ fn parse(record: &[u8], current: &dyn Fn() -> bool) -> Checked<Policy> {
     {
         return Err(Outcome::Permerror);
     }
-    let disposition = |s: &[u8]| {
-        s.eq_ignore_ascii_case(b"none")
-            || s.eq_ignore_ascii_case(b"reject")
-            || s.eq_ignore_ascii_case(b"quarantine")
-    };
     let strict = |s: &[u8]| s.eq_ignore_ascii_case(b"s");
     let policy = Policy {
         strict_spf: aspf.is_some_and(strict),
@@ -139,14 +166,22 @@ fn parse(record: &[u8], current: &dyn Fn() -> bool) -> Checked<Policy> {
             Some(s) if s.eq_ignore_ascii_case(b"y") => Some(true),
             _ => None,
         },
+        p: p.and_then(disposition),
+        sp: sp.and_then(disposition),
     };
-    if p.is_some_and(disposition) && sp.is_none_or(disposition) && np.is_none_or(disposition) {
+    let valid = |tag: Option<&[u8]>| tag.is_none_or(|value| disposition(value).is_some());
+    if policy.p.is_some() && valid(sp) && valid(np) {
         return Ok(policy);
     }
     // Section 4.10.1 supplies the processing rule for absent/broken policies.
     for uri in rua.into_iter().flat_map(|v| v.split(|&b| b == b',')) {
         if reporting_uri(uri, current)? {
-            return Ok(policy);
+            // Section 4.10.1: evaluate under the monitoring policy.
+            return Ok(Policy {
+                p: None,
+                sp: None,
+                ..policy
+            });
         }
     }
     Err(Outcome::Permerror)

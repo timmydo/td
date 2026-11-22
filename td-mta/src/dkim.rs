@@ -39,7 +39,7 @@ impl From<td_alloc::Error> for Error {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignatureResult {
     pub outcome: Outcome,
     pub domain: Option<String>,
@@ -48,7 +48,7 @@ pub struct SignatureResult {
     pub key_bits: Option<u16>,
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct Report {
     pub signatures: Vec<SignatureResult>,
     /// More signatures may exist, or limits prevented examining all of them.

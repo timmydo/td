@@ -1245,7 +1245,7 @@ origin, a protected password file, your local mailbox address, resolver and
 explicit body/blob/Email/receipt quotas. Place the database on a dedicated
 size-limited volume and verify the mount before enabling the generated copy
 worker. The [desktop replica runbook](REPLICA-OPERATIONS.md#size-and-verify-the-replica-volume)
-covers new and installed volumes and the fenced upgrade to schema 45.
+covers new and installed volumes and the fenced upgrade to schema 46.
 Source credentials stay separate from
 the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.

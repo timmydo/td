@@ -2914,7 +2914,8 @@ These do not block v1 and must not be advertised before their own acceptance.
 socket peer using the configured resolvers and RFC 7208 terms. The worker
 has per-message work and time bounds and no cross-message cache.
 Accepted mail records pass, fail, softfail, neutral, none, temperror or
-permerror in the local Received-SPF trace. Recipient policy and final SMTP
+permerror in the receiver's Authentication-Results field and its
+per-Email sender authentication rows. Recipient policy and final SMTP
 disposition are independent of the result. Gateway-origin evaluation still
 requires a trusted original-peer contract. CONFORMANCE.md describes the
 local DNS and stored-message evidence.
@@ -2922,7 +2923,7 @@ local DNS and stored-message evidence.
 **F02 — DKIM and DMARC.** Direct MX verifies RSA-SHA256 and Ed25519-SHA256
 signatures under RFCs 6376, 8301 and 8463 and stores an observation per
 evaluated signature with its signing domain, selector and available key size.
-Section 46 of POSTGRES.md covers local inspection. Outbound signing belongs
+POSTGRES.md, [Direct-MX sender authentication results](POSTGRES.md#direct-mx-sender-authentication-results), covers local inspection. Outbound signing belongs
 to the smart host.
 
 Direct MX observes DMARC with RFC 9989 DNS policy discovery and identifier

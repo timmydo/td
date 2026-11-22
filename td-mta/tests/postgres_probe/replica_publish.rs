@@ -255,6 +255,9 @@ pub(super) fn exercise(
         &fixture,
         "DROP TRIGGER migration_time ON td_mta.replica_progress",
     );
+    // REPLICA-OPERATIONS.md: tables new since the rewound schema need the
+    // publisher's grants before it qualifies again.
+    sql(&fixture, "GRANT SELECT,INSERT,UPDATE,DELETE ON td_mta.email_authentication,td_mta.email_dkim_signatures TO mail_runtime");
     assert_eq!(
         sql(
             &fixture,

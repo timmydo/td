@@ -139,29 +139,12 @@ impl<J: Job> Job for ObservedJob<J> {
     fn prepare(&mut self, deadline: Deadline) -> Result<(), smtp_storage::Failure> {
         self.inner.prepare(deadline)
     }
-    fn prepare_with_spf(
+    fn prepare_authenticated(
         &mut self,
         deadline: Deadline,
-        spf: Option<td_mta::spf::Outcome>,
+        observed: td_mta::sender_authentication::Observed,
     ) -> Result<(), smtp_storage::Failure> {
-        self.inner.prepare_with_spf(deadline, spf)
-    }
-    fn prepare_with_auth(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<td_mta::spf::Outcome>,
-        dkim: Option<td_mta::dkim::Report>,
-    ) -> Result<(), smtp_storage::Failure> {
-        self.inner.prepare_with_auth(deadline, spf, dkim)
-    }
-    fn prepare_with_dmarc(
-        &mut self,
-        deadline: Deadline,
-        spf: Option<td_mta::spf::Outcome>,
-        dkim: Option<td_mta::dkim::Report>,
-        dmarc: Option<td_mta::dmarc::Report>,
-    ) -> Result<(), smtp_storage::Failure> {
-        self.inner.prepare_with_dmarc(deadline, spf, dkim, dmarc)
+        self.inner.prepare_authenticated(deadline, observed)
     }
     fn commit(&mut self) -> Result<smtp_storage::Completion, smtp_storage::Failure> {
         if self.gated {
@@ -728,7 +711,7 @@ pub(super) fn exercise(
                 silent.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 assert!(silent.recv(&mut [0; 512]).unwrap() > 12);
             }
-            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to(E'Return-Path: <sender@example.test>\\r\\nReceived-SPF: temperror ', 'UTF8') in bytes)=1"), "1");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to(E'Return-Path: <sender@example.test>\\r\\nAuthentication-Results: localhost;\\r\\n\\tspf=temperror ', 'UTF8') in bytes)=1"), "1");
             let preserved = format!("{long_header}{}\r\n.dot\r\n", "b".repeat(8192));
             let hex: String = preserved.bytes().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.blob_chunks WHERE position(decode('{hex}','hex') in bytes)>0")), "1");
@@ -751,10 +734,10 @@ pub(super) fn exercise(
                 assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
                 // The silent resolver spent the observation window. The signed
                 // message still reached durable custody without a false pass.
-                let trace = sql(fixture, "SELECT split_part(split_part(encode(substring(bytes FROM 1 FOR 8192),'escape'), E'\\r\\nReceived: ', 1), 'X-TD-DKIM-Results: ', 2) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('football.example.com','UTF8') in bytes)>0");
-                assert!(trace.starts_with("incomplete;"), "{trace}");
-                assert!(!trace.contains("result=pass"));
-                assert!(trace.contains("\r\nX-TD-DMARC-Result: temperror;"), "{trace}");
+                let trace = sql(fixture, "SELECT split_part(split_part(encode(substring(bytes FROM 1 FOR 8192),'escape'), E'\\r\\nReceived: ', 1), 'Authentication-Results: ', 2) FROM td_mta.blob_chunks WHERE ordinal=0 AND position(convert_to('football.example.com','UTF8') in bytes)>0");
+                assert!(trace.contains(";\r\n\tdkim=temperror (verification incomplete);\r\n\tdmarc=temperror"), "{trace}");
+                assert!(!trace.contains("=pass"), "{trace}");
+                assert_eq!(sql(fixture, "SELECT a.spf_result, a.dkim_complete, a.dmarc_result, (SELECT count(*) FROM td_mta.email_dkim_signatures s WHERE s.account=a.account AND s.email_id=a.email_id AND s.result='pass') FROM td_mta.email_authentication a JOIN td_mta.emails e ON e.account=a.account AND e.id=a.email_id JOIN td_mta.blob_chunks c ON c.account=e.account AND c.blob_id=e.blob_id AND c.ordinal=0 WHERE position(convert_to('football.example.com','UTF8') in c.bytes)>0"), "temperror|f|temperror|0");
                 // A new session from the address is greeted, then refused at MAIL.
                 let greeted = Instant::now() + Duration::from_secs(20);
                 let mut again = loop {
