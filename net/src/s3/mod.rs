@@ -9,7 +9,7 @@
     clippy::indexing_slicing
 )]
 
-mod inventory;
+pub(crate) mod inventory;
 mod sources;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -623,9 +623,26 @@ pub(crate) fn file_hash_until(file: &mut File, size: u64, deadline: Instant) -> 
     Ok(sig::to_hex(&digest.finalize()))
 }
 
-const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 website DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 sources DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]";
+const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 website DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 sources DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 sources-gc KEEP ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--delete --exclusive-publisher]";
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
+    if let ["sources-gc", keep, endpoint, region, bucket, credentials, profile, flags @ ..] =
+        words.as_slice()
+    {
+        let delete = match flags {
+            [] => false,
+            ["--delete", "--exclusive-publisher"] => true,
+            _ => return Err(HELP.into()),
+        };
+        let bucket = sources::Bucket {
+            endpoint,
+            region,
+            bucket,
+            credentials: Path::new(credentials),
+            profile,
+        };
+        return sources::collect(Path::new(keep), &bucket, delete);
+    }
     let (words, dry) = if words.last() == Some(&"--dry-run") {
         (words.get(..words.len() - 1).ok_or(HELP)?, true)
     } else {

@@ -18,8 +18,9 @@ A pin's bytes live at `sources/SHA256` under the mirror origin, the
 pin's lowercase hex digest, beside the release repository's own keys
 (`RELEASES.md`) in the same bucket. Release collection lists and
 deletes only `releases/` indexes and `objects/` it can derive from the
-local repository, so it never removes a source. Objects are immutable
-and carry `Cache-Control: public, max-age=31536000, immutable`.
+local repository, so it never removes a source; only `./publish`'s
+retention does (below). Objects are immutable and carry
+`Cache-Control: public, max-age=31536000, immutable`.
 
 ## Fetching
 
@@ -94,6 +95,26 @@ Uploads use `s3 put`'s immutable rule: an object already present with
 the same length, SHA-256 metadata and cache policy is reused, a
 conflicting one refuses, and a rerun resumes. Each pin's upload has its
 own one-hour deadline. `s3 put` refuses keys under `sources/`.
+
+## Retention
+
+Each publish records the digests it mirrored and then deletes every
+`sources/` object that none of the releases it still lists pins
+(`OPERATIONS.md`, "Storage retention"). A branch's pin that no listed
+release names is fetched upstream:
+
+```text
+net/target/release/td-net s3 sources-gc KEEP ENDPOINT auto td-releases CREDENTIALS td-releases
+```
+
+KEEP lists one lowercase SHA-256 per line and may not be empty. Without
+`--delete --exclusive-publisher` the command only plans: it lists
+`sources/` with the bounded inventory release collection uses and
+checks each candidate's upload metadata. With them it deletes each
+candidate whose metadata still names its digest, with `If-Match` on the
+observed ETag.
+
+## Licences
 
 The mirror redistributes upstream bytes under their own licences.
 Firmware and font notices are pins of their own and are mirrored with

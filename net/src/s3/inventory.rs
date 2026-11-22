@@ -1,4 +1,4 @@
-//! Bounded inventory of td's digest-named release namespace.
+//! Bounded inventory of td's digest-named namespaces, and their cleanup.
 use super::*;
 use std::collections::BTreeSet;
 
@@ -46,7 +46,52 @@ fn unescape(value: &str) -> Result<String> {
     out.push_str(rest);
     Ok(out)
 }
-fn page(xml: &str) -> Result<(Vec<String>, Option<String>)> {
+/// The namespaces `digest_keys` lists: each holds only `NAMESPACE/SHA256`.
+const LISTED: &[&str] = &["releases", "sources"];
+
+fn digest_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// An ISO basename as `release sign-iso` admits it (`release/iso.rs` holds
+/// its signer to this one rule).
+pub(crate) fn iso_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.ends_with(".iso")
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+/// The keys cleanup may delete, within the caller's `scope` of namespaces:
+/// digest-named release indexes, objects and mirrored sources, and a retired
+/// ISO image or its signature record.
+fn cleanup_key(key: &str, scope: &[&str]) -> bool {
+    let Some((namespace, rest)) = key.split_once('/') else {
+        return false;
+    };
+    if !scope.contains(&namespace) {
+        return false;
+    }
+    match namespace {
+        "objects" | "releases" | "sources" => digest_name(rest),
+        "iso" => match rest.split_once('/') {
+            Some(("signatures", file)) => file.strip_suffix(".sig").is_some_and(digest_name),
+            Some((digest, name)) => digest_name(digest) && iso_name(name),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn page(xml: &str, namespace: &str) -> Result<(Vec<String>, Option<String>)> {
     if xml.contains("<!")
         || !xml.contains("<ListBucketResult")
         || !xml.trim_end().ends_with("</ListBucketResult>")
@@ -73,14 +118,11 @@ fn page(xml: &str) -> Result<(Vec<String>, Option<String>)> {
             .ok_or("truncated S3 inventory entry")?;
         let key = field(entry, "Key")?.ok_or("missing inventory key")?;
         let digest = key
-            .strip_prefix("releases/")
+            .strip_prefix(namespace)
+            .and_then(|rest| rest.strip_prefix('/'))
             .ok_or("unexpected inventory namespace")?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("invalid remote release key".into());
+        if !digest_name(digest) {
+            return Err("invalid remote digest key".into());
         }
         keys.push(key.to_string());
         rest = tail;
@@ -106,11 +148,18 @@ fn page(xml: &str) -> Result<(Vec<String>, Option<String>)> {
 }
 impl Client {
     pub(crate) fn release_keys(&self) -> Result<BTreeSet<String>> {
+        self.digest_keys("releases")
+    }
+    /// Every `NAMESPACE/SHA256` key, for a namespace in `LISTED`.
+    pub(crate) fn digest_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
+        if !LISTED.contains(&namespace) {
+            return Err("unlisted S3 inventory namespace".into());
+        }
         let mut keys = BTreeSet::new();
         let mut continuation: Option<String> = None;
         let mut tokens = BTreeSet::new();
         loop {
-            let mut query = "list-type=2&max-keys=1000&prefix=releases%2F".to_string();
+            let mut query = format!("list-type=2&max-keys=1000&prefix={namespace}%2F");
             if let Some(token) = &continuation {
                 query = format!("continuation-token={}&{query}", encode(token));
             }
@@ -128,11 +177,13 @@ impl Client {
             if bytes.len() > 2 * 1024 * 1024 {
                 return Err("S3 inventory response too large".into());
             }
-            let (part, next) =
-                page(std::str::from_utf8(&bytes).map_err(|_| "inventory is not UTF-8")?)?;
+            let (part, next) = page(
+                std::str::from_utf8(&bytes).map_err(|_| "inventory is not UTF-8")?,
+                namespace,
+            )?;
             for key in part {
                 if !keys.insert(key) || keys.len() > 200_000 {
-                    return Err("duplicate or excessive S3 release inventory".into());
+                    return Err("duplicate or excessive S3 inventory".into());
                 }
             }
             match next {
@@ -146,15 +197,19 @@ impl Client {
             }
         }
     }
-    pub(crate) fn prune(&self, key: &str, digest: &str, size: u64, delete: bool) -> Result<bool> {
-        let (namespace, name) = key.split_once('/').ok_or("invalid cleanup key")?;
-        if !matches!(namespace, "objects" | "releases")
-            || name.len() != 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("cleanup accepts only digest-named release indexes and objects".into());
+    /// Delete `key` (or, without `delete`, only check it) if it lies in
+    /// `scope` and its upload metadata names `digest` and, when given,
+    /// `size`; absent is `Ok(false)`.
+    pub(crate) fn prune(
+        &self,
+        key: &str,
+        scope: &[&str],
+        digest: &str,
+        size: Option<u64>,
+        delete: bool,
+    ) -> Result<bool> {
+        if !cleanup_key(key, scope) {
+            return Err("cleanup accepts only digest-named keys and retired ISO files".into());
         }
         let response = self.request("HEAD", key, &hash(b""), &[], None)?;
         if response.status().as_u16() == 404 {
@@ -162,8 +217,13 @@ impl Client {
         }
         if response.status().as_u16() != 200
             || header(&response, "x-amz-meta-sha256")? != Some(digest)
-            || header(&response, "content-length")?.and_then(|v| v.parse::<u64>().ok())
-                != Some(size)
+            || size.is_some_and(|size| {
+                header(&response, "content-length")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    != Some(size)
+            })
         {
             return Err(format!(
                 "refusing cleanup of mismatched remote object {key}"
@@ -198,7 +258,7 @@ mod tests {
     #[test]
     fn listing_is_bounded_and_cannot_hide_a_truncated_page() {
         let body=format!("<ListBucketResult><KeyCount>1</KeyCount><IsTruncated>true</IsTruncated><Contents><Key>releases/{}</Key></Contents><NextContinuationToken>a&amp;b</NextContinuationToken></ListBucketResult>","a".repeat(64));
-        let (keys, next) = page(&body).unwrap();
+        let (keys, next) = page(&body, "releases").unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(next.as_deref(), Some("a&b"));
         for bad in [
@@ -209,8 +269,47 @@ mod tests {
             body.replace("a&amp;b", "&unknown;"),
             body.replace("</Contents>", ""),
         ] {
-            assert!(page(&bad).is_err());
+            assert!(page(&bad, "releases").is_err());
         }
+        assert!(page(&body.replace("releases/", "sources/"), "sources").is_ok());
+        assert!(page(&body, "sources").is_err());
         assert_eq!(encode("a+/=&b"), "a%2B%2F%3D%26b");
+    }
+
+    #[test]
+    fn cleanup_touches_only_digest_keys_and_retired_iso_files() {
+        const ALL: &[&str] = &["objects", "releases", "sources", "iso"];
+        let d = "a".repeat(64);
+        for good in [
+            format!("objects/{d}"),
+            format!("releases/{d}"),
+            format!("sources/{d}"),
+            format!("iso/{d}/td-install-x86-64.iso"),
+            format!("iso/signatures/{d}.sig"),
+        ] {
+            assert!(cleanup_key(&good, ALL), "{good}");
+        }
+        // Each caller reaches only its own namespaces.
+        assert!(!cleanup_key(
+            &format!("sources/{d}"),
+            &["objects", "releases"]
+        ));
+        assert!(!cleanup_key(
+            &format!("iso/signatures/{d}.sig"),
+            &["sources"]
+        ));
+        for bad in [
+            format!("roots/{d}"),
+            format!("heads/{d}"),
+            "index.html".to_string(),
+            format!("sources/{}", "A".repeat(64)),
+            format!("iso/{d}/../index.html"),
+            format!("iso/{d}/td.img"),
+            format!("iso/signatures/{d}"),
+            format!("iso/{d}"),
+            format!("sources/{d}/x"),
+        ] {
+            assert!(!cleanup_key(&bad, ALL), "{bad}");
+        }
     }
 }

@@ -28,10 +28,12 @@ and the Rust command resolves a freshly built td-net through the existing
 provisioned host toolchain, warms pinned inputs, builds the ISO and
 retains the exact deployment it carries, warms every source and
 build-root pin and uploads them to the [source mirror](MIRROR.md), signs
-the image and ISO, promotes and uploads the update, and publishes the
-complete ISO listing. A pin it cannot warm stops the run, naming it,
-before anything is signed or promoted; rerun once its upstream serves it. All three host tools come
-from that checkout; target builds retain their normal pinned input rules.
+the image and ISO, promotes and uploads the update, publishes the ISO
+listing trimmed to the newest releases, and then deletes what that trim
+retired ([Storage retention](#storage-retention)). A pin it cannot warm
+stops the run, naming it, before anything is signed or promoted; rerun
+once its upstream serves it. All three host tools come from that
+checkout; target builds retain their normal pinned input rules.
 Only the desktop `system-x86-64` profile is supported by this convenience
 command. The lower-level [release commands](RELEASES.md#local-operator-workflow)
 remain available for other operator workflows.
@@ -63,12 +65,15 @@ state is `~/.local/share/td-publisher`. Absolute `XDG_CONFIG_HOME` and
   "profile": "td-releases",
   "root": "~/.local/share/td-publisher/root-v2",
   "release-key": "~/.local/share/td-publisher/signing/release-v1.key",
-  "credentials": "r2-credentials"
+  "credentials": "r2-credentials",
+  "retain": 5
 }
 ```
 
 The required settings are `endpoint` and `bucket`. Region defaults to `auto`
-and credential profile to `td-releases`. Optional `repository`, `catalog`
+and credential profile to `td-releases`. `retain`, a whole number from 1 to
+128, is how many ISO releases of each profile stay listed and stored; it
+defaults to 5. Optional `repository`, `catalog`
 and `artifacts` paths default to `repository`, `iso-catalog.tsv` and `releases`
 under the data directory. The default public root is `root` in that directory;
 the default private release key is `signing/release-v1.key` there. Credentials
@@ -121,7 +126,8 @@ index hash, ISO signature path, original and selected signed heads, and
 successful completion.
 `tests-passed` exists only after both requested test commands pass. Keep these
 records and back up the publisher repository and catalog after publication.
-No command here deletes remote files or schedules periodic signing.
+Only `./publish`'s retention step deletes remote files; nothing schedules
+periodic signing.
 
 For the separate public hosting check, run the
 [public HTTPS oracle](../td-update/ADMIN.md#installed-machine-oracle) from a
@@ -149,6 +155,42 @@ part of that migration. An existing immutable root is never edited.
 
 ## Storage retention
 
+`./publish` keeps the newest `retain` ISO rows of each profile (default
+5), newest meaning latest in the catalog, which is the order it
+published them; a row added to the catalog by hand counts like any
+other, by its position. It also keeps the source mirror digests the
+listed releases pin. Each run moves older rows to `retired-isos.tsv`
+beside the catalog, uploads the listing without them, and only then
+deletes each retired ISO and its signature record (`retire-iso-s3`,
+`ISO.md`) and every `sources/` digest that no listed release pins
+(`s3 sources-gc`, `MIRROR.md`). A retired row whose ISO basename a
+listed row also names (one commit signed under two roots) is only
+unlisted and never deleted; a pending row that is listed again, by a
+raised `retain` or a hand edit, leaves `retired-isos.tsv` undeleted. A
+failed deletion stays in `retired-isos.tsv` and the run exits non-zero
+after publishing; rerun `./publish` to finish it.
+
+Each release records the digests it mirrored in `source-digests` in its
+artifact directory, with a header and count so a truncated copy is
+refused. Until every listed release has one, mirror cleanup waits and
+says so; a malformed one stops it until it is restored or removed
+(removing it makes cleanup wait again). `s3 sources-gc` refuses a keep list
+that names nothing the mirror holds. These deletions run with
+`--exclusive-publisher`, which is this command's own rule of one
+publisher at a time. Roots, heads and the update repository are left to
+the collector below.
+
+Some failures recur on every run until resolved by hand. A retired
+row's signature or root file was removed, or its record no longer
+verifies (an expired legacy root): delete its files with the S3
+console or `retire-iso-s3` from a copy, then remove the row from
+`retired-isos.tsv`. A remote file's upload metadata does not match: the
+deletion refuses rather than guess; reconcile or delete the object
+yourself. Retired releases' local artifact directories stay; remove one
+only once its row has left `retired-isos.tsv`, since retiring needs its
+signature and root.
+
+Update-image storage is collected separately, by age rather than count.
 Run remote cleanup as a dry run before deciding to delete. Pause all other
 publishers, including those on other hosts, for the entire deletion window:
 
@@ -170,5 +212,5 @@ remote deletion or absence. Do not run standalone local GC on this published
 repository: losing local history still present remotely blocks safe remote
 collection. Unknown remote indexes or differing heads require reconciliation.
 Keep the latest repository backup. [S3.md](S3.md#remote-collection) defines
-the bounds and exclusivity assumptions. ISO retirement is an explicit
-catalog operation; this collector never deletes installer downloads.
+the bounds and exclusivity assumptions. This collector never deletes
+installer downloads or mirrored sources; `./publish`'s retention does.

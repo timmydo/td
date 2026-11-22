@@ -13,8 +13,10 @@ const HELP: &str = "usage: ./publish [--test] [--config FILE]\n\
 Build and publish the current clean checkout. Tests are opt-in.\n\
 Configuration: $XDG_CONFIG_HOME/td-publisher/publish.json (otherwise\n\
 ~/.config/td-publisher/publish.json). See net/OPERATIONS.md.\n\
-Always verifies signatures and payloads; never deletes remote files.\n\
-Retry the same command after an interrupted upload.";
+Always verifies signatures and payloads. Keeps the newest `retain` ISOs\n\
+of each profile (default 5) and the source mirror digests they pin,\n\
+deleting older ones.\n\
+Retry the same command after an interrupted upload or cleanup.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
@@ -48,7 +50,14 @@ struct Config {
     region: String,
     bucket: String,
     profile: String,
+    retain: usize,
 }
+
+/// ISO releases of each profile kept when the configuration does not say.
+const DEFAULT_RETAIN: usize = 5;
+/// The ISO catalog's row limit (net/ISO.md); with several profiles the
+/// catalog can still exceed it, which the index dry run refuses.
+const MAX_RETAIN: usize = 128;
 
 fn xdg(name: &str, home: &Path, fallback: &str) -> Result<PathBuf, String> {
     match std::env::var_os(name).filter(|v| !v.is_empty()) {
@@ -64,7 +73,20 @@ impl Config {
             return Err("publisher configuration must be a JSON object".into());
         };
         let mut values = BTreeMap::new();
+        let mut retain = None;
         for (key, value) in fields {
+            if key == "retain" {
+                let count = match &value {
+                    json::Json::Num(text) => text.parse::<usize>().ok(),
+                    _ => None,
+                }
+                .filter(|count| (1..=MAX_RETAIN).contains(count))
+                .ok_or("publisher setting retain must be a whole number from 1 to 128")?;
+                if retain.replace(count).is_some() {
+                    return Err("duplicate publisher setting: retain".into());
+                }
+                continue;
+            }
             if !matches!(
                 key.as_str(),
                 "root"
@@ -131,6 +153,7 @@ impl Config {
                 .get("profile")
                 .cloned()
                 .unwrap_or_else(|| "td-releases".into()),
+            retain: retain.unwrap_or(DEFAULT_RETAIN),
         })
     }
 
@@ -332,6 +355,256 @@ fn append_catalog(text: &str, row: &str, base: &Path) -> Result<String, String> 
     Ok(output)
 }
 
+const CATALOG_HEADER: &str = "td-iso-catalog-v1";
+const RETIRED_HEADER: &str = "td-iso-retired-v1";
+const DIGESTS_HEADER: &str = "td-source-digests-v1";
+const MAX_DIGEST_RECORD: u64 = 8 * 1024 * 1024;
+
+fn basename(row: &str) -> Option<&str> {
+    Path::new(row.rsplit('\t').next()?).file_name()?.to_str()
+}
+
+fn row_profile(row: &str) -> Option<&str> {
+    row.split('\t').nth(1)
+}
+
+/// Keep the newest `keep` catalog rows of each profile, which
+/// `append_catalog` holds in publication order, and retire the older ones.
+/// A retired row whose ISO a kept row also lists (one commit signed under two
+/// roots) is only unlisted: deleting it would take the kept row's image.
+fn retain_rows(catalog: &str, keep: usize, current: &str) -> Result<(String, Vec<String>), String> {
+    let mut lines = catalog.lines();
+    if lines.next() != Some(CATALOG_HEADER) {
+        return Err("invalid ISO catalog header".into());
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut marked = Vec::new();
+    for row in lines.rev() {
+        let count = seen
+            .entry(row_profile(row).ok_or("invalid ISO catalog row")?)
+            .or_insert(0);
+        let kept = *count < keep;
+        if kept {
+            *count += 1;
+        }
+        marked.push((row, kept));
+    }
+    marked.reverse();
+    if !marked.contains(&(current, true)) {
+        return Err("the release being published is not among the newest kept".into());
+    }
+    let mut text = format!("{CATALOG_HEADER}\n");
+    for (row, _) in marked.iter().filter(|(_, kept)| *kept) {
+        text.push_str(row);
+        text.push('\n');
+    }
+    let retired = still_retired(
+        marked
+            .iter()
+            .filter(|(_, kept)| !*kept)
+            .map(|(row, _)| row.to_string())
+            .collect(),
+        &text,
+    );
+    Ok((text, retired))
+}
+
+/// The retired rows `catalog` does not list again by ISO basename: a row
+/// back in the listing (a raised `retain`, a hand edit) is no longer retired.
+fn still_retired(rows: Vec<String>, catalog: &str) -> Vec<String> {
+    let listed: Vec<_> = catalog.lines().skip(1).filter_map(basename).collect();
+    rows.into_iter()
+        .filter(|row| basename(row).is_some_and(|name| !listed.contains(&name)))
+        .collect()
+}
+
+/// Retired ISO rows whose remote files are not yet deleted, beside the
+/// catalog so a failed cleanup resumes on the next run.
+fn retired_path(config: &Config) -> PathBuf {
+    config.catalog.with_file_name("retired-isos.tsv")
+}
+
+fn read_retired(path: &Path) -> Result<Vec<String>, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(_) => {}
+    }
+    let text = read(path, 1024 * 1024)?;
+    let mut lines = text.lines();
+    if lines.next() != Some(RETIRED_HEADER) {
+        return Err(format!("invalid retired ISO list {}", path.display()));
+    }
+    let rows: Vec<String> = lines.map(str::to_owned).collect();
+    if rows.iter().any(|row| row.split('\t').count() != 4) {
+        return Err(format!("invalid retired ISO row in {}", path.display()));
+    }
+    Ok(rows)
+}
+
+fn write_retired(path: &Path, rows: &[String]) -> Result<(), String> {
+    if rows.is_empty() {
+        return match fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        };
+    }
+    atomic(
+        path,
+        &(format!("{RETIRED_HEADER}\n") + &rows.join("\n") + "\n"),
+    )
+}
+
+/// A digest record: its header, its count, then one digest per line, so a
+/// truncated or emptied copy is refused rather than read as fewer pins.
+fn digests_text(digests: &std::collections::BTreeSet<String>) -> String {
+    let mut text = format!("{DIGESTS_HEADER}\n{}\n", digests.len());
+    for digest in digests {
+        text.push_str(digest);
+        text.push('\n');
+    }
+    text
+}
+
+fn parse_digests(text: &str) -> Result<Vec<&str>, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(DIGESTS_HEADER) {
+        return Err("invalid source digest record header".into());
+    }
+    let count: usize = lines
+        .next()
+        .and_then(|line| line.parse().ok())
+        .ok_or("invalid source digest record count")?;
+    let digests: Vec<&str> = lines.collect();
+    if count == 0
+        || digests.len() != count
+        || !digests
+            .iter()
+            .all(|d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return Err("source digest record is empty, truncated or malformed".into());
+    }
+    Ok(digests)
+}
+
+/// The digests this commit mirrored, which source mirror retention keeps
+/// while its release is listed: the rosters `td-net s3 sources` uploads.
+fn record_source_digests(dir: &Path) -> Result<(), String> {
+    let mut digests = std::collections::BTreeSet::new();
+    for pin in td_recipe::source_pins::all() {
+        digests.insert(pin.sha256);
+    }
+    for pin in td_recipe::source_pins::build_root_pins()? {
+        digests.insert(pin.sha256);
+    }
+    let text = digests_text(&digests);
+    parse_digests(&text)?;
+    atomic(&dir.join("source-digests"), &text)
+}
+
+enum MirrorKeep {
+    /// Every listed release's digests.
+    Keep(std::collections::BTreeSet<String>),
+    /// A listed release has no record, so nothing may be collected yet.
+    Unrecorded(PathBuf),
+}
+
+/// The union of the listed releases' digest records. `record` reads one,
+/// `None` when it does not exist; any unreadable record is an error.
+fn mirror_keep(
+    catalog: &str,
+    record: impl Fn(&Path) -> Result<Option<String>, String>,
+) -> Result<MirrorKeep, String> {
+    let mut keep = std::collections::BTreeSet::new();
+    for row in catalog.lines().skip(1) {
+        let path = Path::new(row.rsplit('\t').next().ok_or("invalid ISO catalog row")?)
+            .parent()
+            .ok_or("catalog ISO has no directory")?
+            .join("source-digests");
+        let Some(text) = record(&path)? else {
+            return Ok(MirrorKeep::Unrecorded(path));
+        };
+        let digests = parse_digests(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        keep.extend(digests.into_iter().map(str::to_owned));
+    }
+    if keep.is_empty() {
+        return Err("no listed release to keep the source mirror for".into());
+    }
+    Ok(MirrorKeep::Keep(keep))
+}
+
+fn read_record(path: &Path) -> Result<Option<String>, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+        Ok(_) => read(path, MAX_DIGEST_RECORD).map(Some),
+    }
+}
+
+/// Delete what retention retired, after the trimmed listing is published:
+/// each pending retired ISO and signature not listed again, then every
+/// mirrored source no listed release pins. Failures stay pending.
+fn retention(net: &Path, config: &Config, catalog: &str, dir: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let pending = retired_path(config);
+    match read_retired(&pending) {
+        Err(e) => failures.push(e),
+        Ok(rows) => {
+            let mut remaining = Vec::new();
+            for row in still_retired(rows, catalog) {
+                let fields: Vec<&str> = row.split('\t').collect();
+                let [root, profile, signature, _iso] = fields.as_slice() else {
+                    failures.push(format!("invalid retired ISO row: {row}"));
+                    remaining.push(row);
+                    continue;
+                };
+                let mut args = vec![
+                    "release".into(),
+                    "retire-iso-s3".into(),
+                    root.to_string(),
+                    profile.to_string(),
+                    signature.to_string(),
+                ];
+                args.extend(config.upload_args());
+                args.extend(["--delete".into(), "--exclusive-publisher".into()]);
+                if let Err(e) = run(net, &args) {
+                    failures.push(format!("retire {signature}: {e}"));
+                    remaining.push(row);
+                }
+            }
+            if let Err(e) = write_retired(&pending, &remaining) {
+                failures.push(e);
+            }
+        }
+    }
+
+    match mirror_keep(catalog, read_record) {
+        Err(e) => failures.push(format!("source mirror retention: {e}")),
+        Ok(MirrorKeep::Unrecorded(path)) => println!(
+            "[publish] source mirror retention waits until every listed release has its digest record ({} is missing)",
+            path.display()
+        ),
+        Ok(MirrorKeep::Keep(keep)) => {
+            let list = dir.join("mirror-keep");
+            let text: String = keep.iter().map(|digest| format!("{digest}\n")).collect();
+            let mut args = vec!["s3".into(), "sources-gc".into(), path_text(&list)];
+            args.extend(config.upload_args());
+            args.extend(["--delete".into(), "--exclusive-publisher".into()]);
+            if let Err(e) = atomic(&list, &text).and_then(|()| run(net, &args)) {
+                failures.push(format!("source mirror cleanup: {e}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "published, but retention is incomplete; rerun ./publish, or see net/OPERATIONS.md, \"Storage retention\":\n{}",
+            failures.join("\n")
+        ))
+    }
+}
+
 /// Internal child entry point: only the image build holds a compiler grant.
 pub(crate) fn build_cli(args: &[String]) -> Result<(), String> {
     let [iso, deployment] = args else {
@@ -416,6 +689,8 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         return Err("publisher repository missing; restore its complete history first".into());
     }
     read(&config.catalog, 1024 * 1024)?;
+    // A malformed pending list must stop the run here, before promotion.
+    read_retired(&retired_path(&config))?;
     File::open(&config.credentials).map_err(|e| format!("open upload credentials: {e}"))?;
     File::open(&config.key).map_err(|e| format!("open release signing key: {e}"))?;
     directory(&config.artifacts)?;
@@ -537,6 +812,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
     ];
     sources.extend(config.upload_args());
     run(&net, &sources)?;
+    record_source_digests(&dir)?;
     let common = vec![
         path_text(&config.repository),
         path_text(&config.root),
@@ -604,6 +880,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         &row,
         config.catalog.parent().ok_or("catalog has no parent")?,
     )?;
+    let (catalog, retired) = retain_rows(&catalog, config.retain, &row)?;
     let next_catalog = dir.join("iso-catalog.tsv");
     atomic(&next_catalog, &catalog)?;
     let mut iso_args = vec![path_text(&next_catalog), path_text(&dir.join("index.html"))];
@@ -633,6 +910,15 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
     ];
     upload.extend(config.upload_args());
     run(&net, &release_args("upload-s3", upload))?;
+    // Record what retires before the catalog forgets it, so a failed
+    // cleanup resumes from the pending list on the next run.
+    let mut pending = read_retired(&retired_path(&config))?;
+    for row in retired {
+        if !pending.contains(&row) {
+            pending.push(row);
+        }
+    }
+    write_retired(&retired_path(&config), &still_retired(pending, &catalog))?;
     // Keep the complete intended catalog even if the final page PUT loses its reply.
     atomic(&config.catalog, &catalog)?;
     run(&net, &release_args("upload-iso-index-s3", iso_args))?;
@@ -644,6 +930,12 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         "[publish] published {}\n[publish] records and retry artifacts: {}",
         source.commit,
         dir.display()
+    );
+    // Only now that the listing no longer names them are old files deleted.
+    retention(&net, &config, &catalog, &dir)?;
+    println!(
+        "[publish] retention: the newest {} ISO releases of each profile and their source digests are kept",
+        config.retain
     );
     Ok(())
 }
@@ -700,6 +992,158 @@ mod tests {
             next
         );
         assert!(append_catalog("garbage", row, Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn retention_defaults_to_five_and_takes_a_bounded_count() {
+        let parse = |extra: &str| {
+            Config::parse(
+                &format!(r#"{{"endpoint":"a","bucket":"c"{extra}}}"#),
+                Path::new("/c"),
+                Path::new("/h"),
+                Path::new("/d"),
+            )
+        };
+        assert_eq!(parse("").unwrap().retain, 5);
+        assert_eq!(parse(r#","retain":2"#).unwrap().retain, 2);
+        for bad in [
+            r#","retain":0"#,
+            r#","retain":129"#,
+            r#","retain":"5""#,
+            r#","retain":2.5"#,
+            r#","retain":2,"retain":3"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_rows_and_spares_a_shared_image() {
+        let row = |n: &str| format!("/r\tsystem-x86-64\t/s{n}\t/a{n}/td-{n}.iso");
+        let shared = "/r2\tsystem-x86-64\t/s9\t/b/td-3.iso".to_string();
+        let catalog = format!(
+            "{CATALOG_HEADER}\n{}\n{}\n{shared}\n{}\n{}\n",
+            row("1"),
+            row("2"),
+            row("3"),
+            row("4")
+        );
+
+        let (kept, retired) = retain_rows(&catalog, 2, &row("4")).unwrap();
+        assert_eq!(
+            kept,
+            format!("{CATALOG_HEADER}\n{}\n{}\n", row("3"), row("4"))
+        );
+        // td-3.iso stays listed through row 3, so its other row only unlists.
+        assert_eq!(retired, [row("1"), row("2")]);
+
+        let (kept, retired) = retain_rows(&catalog, 5, &row("4")).unwrap();
+        assert_eq!(kept, catalog);
+        assert!(retired.is_empty());
+        assert!(retain_rows(&catalog, 1, &row("3")).is_err());
+        assert!(retain_rows("garbage", 1, &row("1")).is_err());
+    }
+
+    #[test]
+    fn retention_counts_each_profile_on_its_own() {
+        let desktop = |n: &str| format!("/r\tsystem-x86-64\t/s{n}\t/a{n}/td-{n}.iso");
+        let server = "/r\tserver-x86-64\t/srv\t/srv/td-server.iso".to_string();
+        let catalog = format!(
+            "{CATALOG_HEADER}\n{server}\n{}\n{}\n{}\n",
+            desktop("1"),
+            desktop("2"),
+            desktop("3")
+        );
+        let (kept, retired) = retain_rows(&catalog, 2, &desktop("3")).unwrap();
+        assert_eq!(
+            kept,
+            format!(
+                "{CATALOG_HEADER}\n{server}\n{}\n{}\n",
+                desktop("2"),
+                desktop("3")
+            )
+        );
+        assert_eq!(retired, [desktop("1")]);
+    }
+
+    #[test]
+    fn a_pending_row_listed_again_is_no_longer_retired() {
+        let listed = "/r\tsystem-x86-64\t/s1\t/a1/td-1.iso".to_string();
+        let gone = "/r\tsystem-x86-64\t/s0\t/a0/td-0.iso".to_string();
+        let catalog = format!("{CATALOG_HEADER}\n{listed}\n");
+        // The same ISO under another signature is listed too, by basename.
+        let resigned = "/r2\tsystem-x86-64\t/s9\t/b/td-1.iso".to_string();
+        assert_eq!(
+            still_retired(vec![listed, gone.clone(), resigned], &catalog),
+            [gone]
+        );
+    }
+
+    #[test]
+    fn digest_records_refuse_truncation_and_union_over_listed_releases() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let set = |items: &[&String]| {
+            items
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let one = digests_text(&set(&[&a, &b]));
+        assert_eq!(parse_digests(&one).unwrap(), [a.as_str(), b.as_str()]);
+        let truncated = one.rsplit_once(&b).unwrap().0;
+        for bad in [
+            "",
+            truncated,
+            "td-source-digests-v1\n0\n",
+            "td-source-digests-v1\n1\nNOT-A-DIGEST\n",
+            "a-different-header\n1\n",
+        ] {
+            assert!(parse_digests(bad).is_err(), "{bad:?}");
+        }
+
+        let catalog = format!(
+            "{CATALOG_HEADER}\n/r\tsystem-x86-64\t/s1\t/a1/td-1.iso\n/r\tsystem-x86-64\t/s2\t/a2/td-2.iso\n"
+        );
+        let records = |path: &Path| {
+            Ok(match path.to_str().unwrap() {
+                "/a1/source-digests" => Some(digests_text(&set(&[&a]))),
+                "/a2/source-digests" => Some(digests_text(&set(&[&b]))),
+                _ => None,
+            })
+        };
+        assert!(matches!(
+            mirror_keep(&catalog, records).unwrap(),
+            MirrorKeep::Keep(keep) if keep == set(&[&a, &b])
+        ));
+
+        let unrecorded = |path: &Path| {
+            Ok((path == Path::new("/a1/source-digests")).then(|| digests_text(&set(&[&a]))))
+        };
+        assert!(matches!(
+            mirror_keep(&catalog, unrecorded).unwrap(),
+            MirrorKeep::Unrecorded(path) if path == Path::new("/a2/source-digests")
+        ));
+        let broken = |_: &Path| Ok(Some(truncated.to_string()));
+        assert!(mirror_keep(&catalog, broken).is_err());
+        let failing = |_: &Path| Err("unreadable".to_string());
+        assert!(mirror_keep(&catalog, failing).is_err());
+        assert!(mirror_keep(CATALOG_HEADER, records).is_err());
+    }
+
+    #[test]
+    fn the_retired_list_round_trips_and_empties_away() {
+        let dir = crate::test_temp::TempDir::new("td-publish-retired").unwrap();
+        let path = dir.path().join("retired-isos.tsv");
+        assert!(read_retired(&path).unwrap().is_empty());
+        let rows = ["/r\tsystem-x86-64\t/s\t/a.iso".to_string()];
+        write_retired(&path, &rows).unwrap();
+        assert_eq!(read_retired(&path).unwrap(), rows);
+        write_retired(&path, &[]).unwrap();
+        assert!(!path.exists());
+        write_retired(&path, &[]).unwrap();
+        fs::write(&path, "td-iso-retired-v1\nnot four fields\n").unwrap();
+        assert!(read_retired(&path).is_err());
     }
 
     #[test]

@@ -3,6 +3,9 @@ use super::*;
 use crate::s3;
 use std::collections::BTreeMap;
 
+/// What release collection may delete: never ISOs or mirrored sources.
+const SCOPE: &[&str] = &["objects", "releases"];
+
 fn remote_heads(client: &s3::Client, repo: &Path) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
     let mut heads = BTreeMap::new();
     for profile in ["system-x86-64", "server-x86-64"] {
@@ -60,7 +63,7 @@ pub(super) fn gc(words: &[&str]) -> Result<()> {
         let key = relative.to_str().ok_or("cleanup key UTF-8")?.to_string();
         let (mut file, meta) = io(td_fs::open_real_file(&path, "cleanup candidate"))?;
         let digest = s3::file_hash(&mut file, meta.len(), &client)?;
-        client.prune(&key, &digest, meta.len(), false)?;
+        client.prune(&key, SCOPE, &digest, Some(meta.len()), false)?;
         plan.push((key, digest, meta.len()));
     }
     if remote_heads(&client, repo)? != heads || client.release_keys()? != keys {
@@ -80,7 +83,7 @@ pub(super) fn gc(words: &[&str]) -> Result<()> {
             if remote_heads(&client, repo)? != heads {
                 return Err("remote head changed during cleanup; stopping".into());
             }
-            client.prune(&key, &digest, size, true)?;
+            client.prune(&key, SCOPE, &digest, Some(size), true)?;
             // Use this exact plan, never a later GC cutoff. A retry also reclaims
             // a local candidate whose remote deletion succeeded before a crash.
             io(fs::remove_file(repo.join(&key)))?;

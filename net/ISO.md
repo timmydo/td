@@ -29,15 +29,35 @@ requests, uploads `iso/ISO_SHA256/BASENAME`, then `roots/ROOT_VERSION`, then
 `iso/signatures/RECORD_SHA256.sig`. All three are immutable, using the
 conditional upload and reuse rules in [S3.md](S3.md). A failed upload can leave
 unreferenced objects; retry resumes by reusing matching remote objects.
-There is no mutable latest-ISO pointer or remote deletion. Operators publish
-links to the exact image and signature. Legacy expiry refuses verification;
+There is no mutable latest-ISO pointer. Operators publish links to the
+exact image and signature. Legacy expiry refuses verification;
 it does not delete files or invalidate already written media.
 
 A non-expiring root requires zero record expiry: verification needs no
 periodic re-signing. Legacy expiring roots retain their 30-day maximum,
 clipped to root expiry. Old records remain valid according to their own
-signed policy. Configure storage retirement separately, retaining active
+signed policy. Retirement (below) deletes storage, retaining active
 releases; deletion does not revoke cached authentic bytes.
+
+```text
+td-net release retire-iso-s3 ROOT system-x86-64 SIGNATURE ENDPOINT auto td-releases CREDENTIALS PROFILE
+td-net release retire-iso-s3 ROOT system-x86-64 SIGNATURE ENDPOINT auto td-releases CREDENTIALS PROFILE --delete --exclusive-publisher
+```
+
+Retirement verifies the signature record against ROOT, derives the two
+keys `upload-iso-s3` wrote from the record alone (no ISO bytes are
+needed), and deletes `iso/ISO_SHA256/BASENAME` and then
+`iso/signatures/RECORD_SHA256.sig`, each only if its upload metadata
+matches the record's length and SHA-256, with `If-Match` on the observed
+ETag. Without both flags it only reports `would-delete` or `absent`. An
+absent file counts as retired, so a rerun after a lost reply succeeds.
+Roots are never deleted. A record that no longer verifies (an expired
+legacy root) cannot be retired this way. Remove the entry from the
+listing first: the page must not link to deleted files. The image key
+is the ISO's digest and basename, so the same image signed under two
+roots or profiles shares it: retiring one record deletes the image the
+other still lists. `./publish` never retires a row whose basename a
+listed row still names.
 
 Private keys must be owned regular files with no group/other permissions.
 Images must be nonempty regular files, at most four GiB; their ASCII basename
@@ -92,7 +112,8 @@ td-net release upload-iso-index-s3 CATALOG index.html ENDPOINT auto td-releases 
 Both commands verify the complete local ISO bytes, signatures and root policy.
 Invalid or missing entries, and expired legacy entries, refuse the entire
 operation. Non-expiring entries display "No expiry". Retire obsolete entries
-explicitly in the catalog; no recurring signature renewal is needed.
+explicitly in the catalog (`./publish` keeps its newest `retain`); no
+recurring signature renewal is needed.
 For one ISO/profile select one signature; duplicate entries and conflicting
 roots for one epoch refuse. Multiple root epochs and profiles are supported.
 Keep the complete catalog: uploading it replaces the listing, it does not
@@ -110,7 +131,8 @@ ISO, root and signature before publishing `index.html` last, with
 Publication uses the original page's ETag (or absence) as a write condition;
 a concurrent change refuses unless exact readback equals the intended page.
 A failed operation may leave reusable immutable files, but does not publish
-an incomplete listing. No remote files are deleted. No signing key is needed.
+an incomplete listing. This command deletes no remote files. No signing key
+is needed.
 Local inputs and output directories must remain stable during the command.
 
 Configure the public serving layer to rewrite `/` to `/index.html`, preserve

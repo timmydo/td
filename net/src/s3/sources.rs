@@ -45,6 +45,82 @@ fn outcome(tally: &Tally) -> Result<()> {
     Ok(())
 }
 
+/// The largest keep list `sources-gc` reads: far above any real roster union.
+const MAX_KEEP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The digests a keep list names, one lowercase SHA-256 per line.
+fn keep_digests(text: &str) -> Result<std::collections::BTreeSet<&str>> {
+    let mut keep = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if !feed::is_sha256_hex(line) {
+            return Err("a keep list holds one lowercase SHA-256 per line".into());
+        }
+        keep.insert(line);
+    }
+    if keep.is_empty() {
+        return Err("an empty keep list would delete the whole source mirror".into());
+    }
+    Ok(keep)
+}
+
+/// `sources-gc`: delete every mirrored digest the keep list does not name.
+/// Without `delete` it only plans, checking each candidate's metadata.
+pub(super) fn collect(keep: &Path, bucket: &Bucket<'_>, delete: bool) -> Result<()> {
+    let (mut file, meta) = io(td_fs::open_real_file(keep, "source mirror keep list"))?;
+    if meta.len() > MAX_KEEP_BYTES {
+        return Err("source mirror keep list too large".into());
+    }
+    let mut text = String::new();
+    io(Read::by_ref(&mut file)
+        .take(MAX_KEEP_BYTES + 1)
+        .read_to_string(&mut text))?;
+    if text.len() as u64 > MAX_KEEP_BYTES {
+        return Err("source mirror keep list too large".into());
+    }
+    let keep = keep_digests(&text)?;
+    let client = Client::new(
+        bucket.endpoint,
+        bucket.region,
+        bucket.bucket,
+        bucket.credentials,
+        bucket.profile,
+    )?;
+    // Plan the whole pass first: a keep list naming none of what is mirrored
+    // belongs to some other bucket or roster, and deletes nothing.
+    let remote = client.digest_keys("sources")?;
+    let mut kept = 0u64;
+    let mut candidates = Vec::new();
+    for key in &remote {
+        let digest = key
+            .strip_prefix(SOURCE_MIRROR_PREFIX)
+            .ok_or("unexpected source mirror key")?;
+        if keep.contains(digest) {
+            kept += 1;
+        } else {
+            candidates.push((key, digest));
+        }
+    }
+    if kept == 0 && !candidates.is_empty() {
+        return Err(
+            "the keep list names nothing the source mirror holds; refusing to empty it".into(),
+        );
+    }
+    let mut removed = 0u64;
+    for (key, digest) in candidates {
+        client.remaining()?;
+        if client.prune(key, &["sources"], digest, None, delete)? {
+            println!("{} {key}", if delete { "delete" } else { "would-delete" });
+            removed += 1;
+        }
+    }
+    println!(
+        "S3 sources-gc {}: {kept} kept, {removed} {}",
+        if delete { "delete" } else { "dry run" },
+        if delete { "deleted" } else { "to delete" }
+    );
+    Ok(())
+}
+
 /// `sources/SHA256`, written into `buffer`.
 fn object_key<'b>(sha256: &str, buffer: &'b mut [u8; KEY_BYTES]) -> Option<&'b str> {
     if !feed::is_sha256_hex(sha256) {
@@ -195,5 +271,88 @@ mod tests {
         let linked = [pin("linked", "link.bin", b"firmware a")];
         upload(&linked, &dir, &bucket, true, &mut tally).unwrap();
         assert_eq!((tally.verified, tally.missing), (0, 1));
+    }
+
+    #[test]
+    fn collection_keeps_only_listed_digests_and_plans_first() {
+        let dir = crate::test_temp::TempDir::new("s3-sources-gc").unwrap();
+        let cred = dir.join("credentials");
+        write_credentials(&cred);
+        let names = ["old.bin", "kept.bin", "older.bin"];
+        for name in names {
+            fs::write(dir.join(name), name.as_bytes()).unwrap();
+        }
+        let pins: Vec<_> = names
+            .iter()
+            .map(|name| pin(name, name, name.as_bytes()))
+            .collect();
+        let mock = Mock::new();
+        let bucket = Bucket {
+            endpoint: &mock.endpoint,
+            region: "auto",
+            bucket: "td-releases",
+            credentials: &cred,
+            profile: "test",
+        };
+        upload(&pins, &dir, &bucket, false, &mut Tally::default()).unwrap();
+        let release = format!("releases/{}", hash(b"index"));
+        mock.store.lock().unwrap().files.insert(
+            release.clone(),
+            crate::s3::tests::Stored {
+                bytes: b"index".to_vec(),
+                headers: BTreeMap::new(),
+            },
+        );
+        let keep = dir.join("keep");
+        fs::write(&keep, format!("{}\n", hash(b"kept.bin"))).unwrap();
+
+        collect(&keep, &bucket, false).unwrap();
+        assert_eq!(mock.store.lock().unwrap().files.len(), 4);
+
+        // A list naming nothing mirrored is refused before any deletion.
+        let foreign = dir.join("foreign");
+        fs::write(&foreign, format!("{}\n", hash(b"elsewhere"))).unwrap();
+        assert!(collect(&foreign, &bucket, true).is_err());
+        assert_eq!(mock.store.lock().unwrap().files.len(), 4);
+
+        // An object whose upload metadata does not name its key's digest
+        // is not deleted, and stops the pass.
+        mock.store
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(&format!("sources/{}", hash(b"old.bin")))
+            .unwrap()
+            .headers
+            .insert("x-amz-meta-sha256".into(), hash(b"other"));
+        assert!(collect(&keep, &bucket, true).is_err());
+        assert!(mock
+            .store
+            .lock()
+            .unwrap()
+            .files
+            .contains_key(&format!("sources/{}", hash(b"old.bin"))));
+        mock.store
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(&format!("sources/{}", hash(b"old.bin")))
+            .unwrap()
+            .headers
+            .insert("x-amz-meta-sha256".into(), hash(b"old.bin"));
+
+        collect(&keep, &bucket, true).unwrap();
+        let store = mock.store.lock().unwrap();
+        let left: Vec<_> = store.files.keys().cloned().collect();
+        assert_eq!(left, [release, format!("sources/{}", hash(b"kept.bin"))]);
+    }
+
+    #[test]
+    fn a_keep_list_must_be_nonempty_digests() {
+        assert!(keep_digests("").is_err());
+        assert!(keep_digests("not-a-digest\n").is_err());
+        assert!(keep_digests(&hash(b"x").to_uppercase()).is_err());
+        let one = hash(b"x");
+        assert_eq!(keep_digests(&format!("{one}\n{one}\n")).unwrap().len(), 1);
     }
 }

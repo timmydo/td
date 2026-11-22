@@ -242,11 +242,19 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
     if !query.is_empty() {
         assert_eq!(method, "GET");
         assert!(key.is_empty());
-        assert!(query.ends_with("list-type=2&max-keys=1000&prefix=releases%2F"));
+        let namespace = query
+            .strip_suffix("%2F")
+            .and_then(|q| q.rsplit_once("list-type=2&max-keys=1000&prefix="))
+            .map(|(_, namespace)| namespace)
+            .unwrap();
+        assert!(["releases", "sources"].contains(&namespace));
         let keys: Vec<_> = store
             .files
             .keys()
-            .filter(|k| k.starts_with("releases/"))
+            .filter(|k| {
+                k.strip_prefix(namespace)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
             .collect();
         let start: usize = query
             .strip_prefix("continuation-token=page")

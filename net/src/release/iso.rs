@@ -57,16 +57,7 @@ impl Record {
 }
 
 fn filename(name: &str) -> Result<()> {
-    if name.len() > 128
-        || !name.ends_with(".iso")
-        || !name
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-    {
+    if !s3::inventory::iso_name(name) {
         return Err(
             "ISO filename must be an ASCII basename ending in .iso, at most 128 bytes".into(),
         );
@@ -245,6 +236,57 @@ pub(super) fn upload(words: &[&str]) -> Result<()> {
         "ISO S3 complete: {} files uploaded, {} reused",
         client.uploaded, client.reused
     );
+    Ok(())
+}
+
+/// `retire-iso-s3`: delete one retired ISO and its signature record, the
+/// keys `upload-iso-s3` wrote for it, derived from the record alone. The
+/// root stays: other records and clients rely on it.
+pub(super) fn retire(words: &[&str]) -> Result<()> {
+    let (words, delete) = if words.ends_with(&["--delete", "--exclusive-publisher"]) {
+        (words.get(..words.len() - 2).ok_or(HELP)?, true)
+    } else {
+        (words, false)
+    };
+    let [root, profile, signature, endpoint, region, bucket, credentials, credential_profile] =
+        words
+    else {
+        return Err(HELP.into());
+    };
+    let (_, root_text) = open_text(Path::new(root))?;
+    let root = Root::parse(&root_text, None)?;
+    let (_, signature) = open_text(Path::new(signature))?;
+    let record = Record::parse(&signature, &root, profile, now()?)?;
+    let client = s3::Client::new(
+        endpoint,
+        region,
+        bucket,
+        Path::new(credentials),
+        credential_profile,
+    )?;
+    let image_key = record.image_key();
+    let signature_digest = hash(signature.as_bytes());
+    let signature_key = format!("iso/signatures/{signature_digest}.sig");
+    // The image first: a signature left behind names nothing, while an image
+    // whose signature went first would be an object no record names.
+    for (key, digest, size) in [
+        (image_key.as_str(), record.digest.as_str(), record.size),
+        (
+            signature_key.as_str(),
+            signature_digest.as_str(),
+            signature.len() as u64,
+        ),
+    ] {
+        let present = client.prune(key, &["iso"], digest, Some(size), delete)?;
+        println!(
+            "{} {key}",
+            match (present, delete) {
+                (false, _) => "absent",
+                (true, true) => "deleted",
+                (true, false) => "would-delete",
+            }
+        );
+    }
     Ok(())
 }
 
@@ -455,6 +497,75 @@ mod tests {
         fs::write(&f.image, b"corrupted").unwrap();
         assert!(f.upload(&bad, false).is_err());
         assert!(bad.store.lock().unwrap().requests.is_empty());
+    }
+    #[test]
+    fn retirement_removes_the_image_and_record_but_keeps_the_root() {
+        let f = Fixture::new();
+        let mock = s3::tests::Mock::new();
+        f.upload(&mock, false).unwrap();
+        let credentials = f.dir.join("credentials");
+        let retire_with = |flags: &[&str]| {
+            let mut args = vec![
+                f.root.to_str().unwrap(),
+                "system-x86-64",
+                f.signature.to_str().unwrap(),
+                &mock.endpoint,
+                "auto",
+                "td-releases",
+                credentials.to_str().unwrap(),
+                "test",
+            ];
+            args.extend_from_slice(flags);
+            retire(&args)
+        };
+
+        retire_with(&[]).unwrap();
+        assert_eq!(mock.store.lock().unwrap().files.len(), 3);
+        assert!(retire_with(&["--delete"]).is_err());
+
+        retire_with(&["--delete", "--exclusive-publisher"]).unwrap();
+        let left: Vec<_> = mock.store.lock().unwrap().files.keys().cloned().collect();
+        assert_eq!(left, ["roots/1"]);
+        // A rerun after a lost reply finds both gone and succeeds.
+        retire_with(&["--delete", "--exclusive-publisher"]).unwrap();
+    }
+    #[test]
+    fn retirement_refuses_an_unverified_record_and_resumes_a_partial_one() {
+        let f = Fixture::new();
+        let mock = s3::tests::Mock::new();
+        f.upload(&mock, false).unwrap();
+        let credentials = f.dir.join("credentials");
+        let retire_as = |profile: &str, signature: &Path| {
+            retire(&[
+                f.root.to_str().unwrap(),
+                profile,
+                signature.to_str().unwrap(),
+                &mock.endpoint,
+                "auto",
+                "td-releases",
+                credentials.to_str().unwrap(),
+                "test",
+                "--delete",
+                "--exclusive-publisher",
+            ])
+        };
+        assert!(retire_as("server-x86-64", &f.signature).is_err());
+        let tampered = f.dir.join("tampered.sig");
+        let text = fs::read_to_string(&f.signature).unwrap();
+        fs::write(&tampered, text.replacen("td.iso", "tx.iso", 1)).unwrap();
+        assert!(retire_as("system-x86-64", &tampered).is_err());
+        assert_eq!(mock.store.lock().unwrap().files.len(), 3);
+
+        // Only the image went before an interruption: the rerun finishes.
+        let digest = hash(&fs::read(&f.image).unwrap());
+        mock.store
+            .lock()
+            .unwrap()
+            .files
+            .remove(&format!("iso/{digest}/td.iso"));
+        retire_as("system-x86-64", &f.signature).unwrap();
+        let left: Vec<_> = mock.store.lock().unwrap().files.keys().cloned().collect();
+        assert_eq!(left, ["roots/1"]);
     }
     #[test]
     fn failed_image_upload_never_publishes_signature() {
