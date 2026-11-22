@@ -88,5 +88,4 @@ No embedded-database dependency or its allocation/backup probes remain.
 Backup, restore and server resource management use PostgreSQL facilities;
 there is no td-mta local-store backup or SQLite import command. Deployment
 and startup are documented in [DEPLOYMENT.md](DEPLOYMENT.md) and
-[CONFIG.md](CONFIG.md). Database transactions remain atomic; replacement of
-the unused old implementation requires no production cutover protocol.
+[CONFIG.md](CONFIG.md). Database transactions remain atomic.

@@ -8,7 +8,11 @@ and several cooperating processes sharing one writable database. A cloud VM
 can receive and relay mail while a local process serves JMAP or relays through
 a configured smart host. This remains a bounded personal service, not a general
 multi-tenant platform. Peer-to-peer replication, an offline writable mail store
-and read-replica routing are outside its scope.
+and routing reads to a PostgreSQL standby are outside its scope: serving reads
+use the writer endpoint (section 3). Application-level account replication
+into a separate local database served read-only is a distinct feature owned
+by [REPLICATION.md](REPLICATION.md); it uses this schema and grants its
+serving instance no mail write authority.
 
 PostgreSQL stores message and attachment bytes, metadata, configuration,
 device verifiers, TLS/ACME keys and smart-host credentials. The embedded
@@ -29,6 +33,30 @@ provides SCRAM crypto and string preparation; TLS remains the td-crypto
 boundary. Serving and owner commands use this driver; the connection probe
 in section 8 is a diagnostic, not an alternative backend. No server package
 is admitted by the driver dependency; source-build rules still apply.
+
+### Storage authority
+
+The PostgreSQL server is td-mta's storage authority by the owner's
+decision, after two earlier stores. A custom file-based store came first;
+the owner replaced it because re-implementing database machinery cost too
+much effort. A private SQLite store (rusqlite with bundled source, commit
+fcb2fa651) followed and was close to shipping. The owner then moved to
+PostgreSQL (commit 19191de88, which also let cloud and local instances
+share one database) to take backups while the MTA runs and to separate the
+services more firmly from their data; the database also enforces
+per-service least privilege (commit bdb4414ea; DESIGN.md, "Production
+service authority").
+
+The decision keeps the PostgreSQL server and sets two targets: a small
+synchronous td-owned client crate, `td-postgres`, replaces tokio-postgres
+and its closure of about 56 crates; and PostgreSQL 17 is built from source
+as a td recipe, so td-mta can run against a td-built server. Until each
+switch-over lands, the admitted driver above and an externally provided
+server remain in use. Rejected alternatives: returning
+to SQLite behind a single storage-owner process, which would need the IPC
+and service layer td avoids and would lose database-enforced privileges;
+and leaving things unchanged, since an unbuilt server and an external
+closure conflict with td's dependency and build principles (AGENTS.md).
 
 ### Contract navigation
 
@@ -72,17 +100,19 @@ there is no opportunistic TLS fallback. Local TCP follows the same rule.
 A protected Unix-domain socket is a separately explicit local transport,
 with SCRAM database login and trusted socket-directory ownership.
 It does not silently replace a failed TLS connection. Initial authentication
-is PostgreSQL SCRAM over verified TLS or the private socket; cloud identity-token login is
-not required for the initial runtime integration. Select addresses for the configured
-writer endpoint within bounded DNS and connection deadlines, under the one-second
-positive-answer policy in section 10.
+is PostgreSQL SCRAM over verified TLS or the private socket; cloud
+identity-token login is not supported. Select addresses for the configured
+writer endpoint within bounded DNS and connection deadlines, under the
+one-second positive-answer policy in section 10.
 
 Startup connects, verifies writable-primary status and supported schema,
 loads and validates a complete profile/configuration generation, checks
 required secrets and certificates, and initializes bounded pools before
 opening service admission. An unavailable database never starts an offline
 service. Unsupported schema or invalid configuration fails startup with a
-redacted actionable error. Serving does not create or upgrade a schema.
+redacted actionable error. Serving does not create or upgrade a schema. A
+`serve --read-only` replica qualifies its bound local replica instead of a
+writable primary, as [REPLICATION.md](REPLICATION.md) specifies.
 
 ## 2. Schema, configuration and trust
 
@@ -93,7 +123,7 @@ a separate owner credential, an exclusive database migration lock, and a
 version/checksum ledger. Initialize only when the application namespace is
 absent; refuse even an existing empty namespace and never replace a store.
 Incompatible upgrades require all instances to drain and stop; no mixed-version
-deployment is promised initially. Serving database connections acquire a shared
+deployment is supported. Serving database connections acquire a shared
 session-level advisory lock on the fixed migration key before checking schema
 compatibility and retain it until closure. A one-shot operation uses that
 connection's verified schema version and store epoch. Every reconnect verifies
@@ -162,8 +192,8 @@ serving instance before ACME activation; shared rows alone do not prove that.
 
 Keep exact immutable message/upload/transmission bytes in bounded `bytea`
 chunk rows keyed by account, blob and ordinal, with a manifest holding length,
-digest and chunk count. Start with a 64 KiB chunk ceiling and retain the
-32 MiB message ceiling. Validate contiguous ordinals, exact total length and
+digest and chunk count. Chunks hold at most 64 KiB, under the 32 MiB
+message ceiling. Validate contiguous ordinals, exact total length and
 SHA-256 before publication. No SQL operation returns a whole message value;
 read ranges in bounded batches with caller-owned scratch. Use ordinary logged
 tables, foreign keys, uniqueness and checked scalar constraints. PostgreSQL
@@ -192,11 +222,13 @@ endpoint, binding state tokens and object/body reads to the same view.
 Snapshot deadlines include MIME work and response production; slow clients
 cannot indefinitely prevent vacuum/reclamation. The effective transfer
 deadline is the minimum of the HTTP allowance and the remaining snapshot
-lifetime. At cutover, replace ADMISSION's existing transfer formula with this
-combined cap and reject inconsistent timer configurations: idle-transaction
-limits must cover admitted gaps between database reads within that cap.
-A minimum HTTP rate never extends a database snapshot lifetime. Qualify this
-cap against real td-mail downloads before activation. A failed snapshot cannot be
+lifetime. A PostgreSQL download's deadline is at most 30 seconds after its
+exchange starts, so that ceiling, not ADMISSION.md's longer transfer budget,
+bounds the download. Each read transaction sets a 10-second
+`idle_in_transaction_session_timeout`; timer configuration is not checked
+against it, so a gap between database reads that outlasts it ends the
+snapshot and with it the response. A minimum HTTP rate never extends a
+database snapshot lifetime. A failed snapshot cannot be
 transparently replaced halfway through a response. End incomplete output
 rather than splice a different snapshot into it. Download digest verification
 and byte replay retain the same immutable blob and snapshot.
@@ -246,7 +278,7 @@ explicit operation; no automatic fallback to another profile's route exists.
 
 Preserve QUEUE.md's immutable outgoing bytes/envelope, per-recipient states,
 uncertainty latch, retry limits, cancellation and retained failure notices.
-Replace its process-local worker fence with durable route/attempt ownership.
+Durable route/attempt ownership replaces its process-local worker fence.
 The one concurrent delivery limit per account/route pair is database-wide.
 Route pauses, backoff and repair generations share that account/route scope.
 Each foreground process has one outbound worker across its configured accounts;
@@ -264,8 +296,9 @@ stale workers cannot overwrite a replacement's result or renew an old claim.
 Use database time for cross-instance lease eligibility and local monotonic
 deadlines for network attempts. Clock jumps/failover trigger conservative
 clock validation and the existing retry guard; elapsed wall time alone never
-proves a remote attempt harmless. Exact lease/heartbeat/attempt limits and
-clock tests are part of worker activation, not arbitrary per-host tuning.
+proves a remote attempt harmless. The route-owner lease and heartbeat
+periods are fixed contract values, not per-host tuning; SMTP network timers
+stay within ADMISSION.md's configurable bounds.
 
 Persist Body before body transmission and AcceptancePossible before any
 terminator byte enters the transport buffer. If a phase commit is unknown,
@@ -306,10 +339,9 @@ and reservations shared by all instances. Process-local counters only bound
 that process's concurrency and scratch. Reservation reclaim uses durable
 ownership and fences: expiry cannot free capacity while an old holder can
 still publish against it. Logical quotas do not reserve server disk/WAL space;
-server resource exhaustion produces bounded temporary failure. SQLite heap,
-VM-fuel, WAL-file and checkpoint ceilings do not describe PostgreSQL limits.
-Server memory, vacuum, WAL growth and backups belong to database operations;
-MTA RSS and pool/resource observations remain separate measurements.
+server resource exhaustion produces bounded temporary failure. Server
+memory, vacuum, WAL growth and backups belong to database operations; MTA RSS
+and pool/resource observations remain separate measurements.
 
 On a connection blip, mark affected roles unready, stop new durable work and
 reconnect with bounded exponential backoff and jitter. No offline acceptance,
@@ -350,34 +382,14 @@ empty disposable databases: TLS/name refusal, reconnect through failover,
 role privileges and acknowledgement durability. Never silently use a live
 mailbox or claim cloud qualification from a local mock.
 
-## 7. Landing sequence and removal boundary
+## 7. Backend boundary
 
-1. This contract and dependency/driver evaluation, including TLS and bounded
-   I/O integration. Obtain explicit approval before adding a driver closure.
-2. PostgreSQL bootstrap/schema/storage foundations with real local database
-   tests.
-3. Replace active configuration, credentials, body/metadata storage, runtime
-   coordinators and operational commands with PostgreSQL. This service has
-   no production deployment to preserve: replacement may span independently
-   tested commits and need not be an atomic landing. Remove SQLite code,
-   dependencies/pins, private device files, exclusive-store assumptions and
-   obsolete SQLite qualification as their consumers are replaced. Do not
-   introduce a selectable production dual backend or migrate existing data.
-   Update the routed contracts to describe each implemented replacement.
-   Prior references below to an runtime integration do not require preserving the
-   SQLite executable or completing all operational tooling before wiring
-   PostgreSQL serving.
-4. Activate distributed relay and complete td-mail sending on the replacement
-   backend under the ownership contract above. Incomplete roles stay refused.
-5. Add one-way Stalwart import, preserving raw bytes, folder membership,
-   received dates and flags with durable source-ID mappings and resumability.
-   DESIGN section 13's source freeze, verification and rollback rules remain.
-   Local PostgreSQL installation/supervision can follow independently.
-
-Do not claim PostgreSQL support, automatic delivery takeover or cloud
-qualification until their named integration evidence passes. Freeze exact SQL,
-supported server versions, driver pins and command syntax in implementation
-increments rather than implying this contract already supplies them.
+PostgreSQL is the only backend. The SQLite backend, its dependencies and
+pins, private device files, exclusive-store assumptions and SQLite
+qualification are removed. There is no selectable dual backend and no
+conversion of SQLite data. Do not claim provider support, automatic delivery
+takeover or cloud qualification beyond the integration evidence section 6
+and [CONFORMANCE.md](CONFORMANCE.md) name.
 
 ## References
 
