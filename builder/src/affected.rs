@@ -315,7 +315,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
+        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, target-static td-util's sha256sum applet, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/flathub_app.rs",
@@ -2528,6 +2528,10 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-install (its live installation");
+    assert_contains!(
+        "engine/src/sha256.rs",
+        "target-static td-util's sha256sum applet"
+    );
     assert_contains!("engine/src/flathub_app.rs", "td-software's status reader");
     assert_contains!("engine/src/flathub_app.rs", "target-static td-firstboot");
     assert_contains!("engine/src/flathub_app.rs", "td-sandbox's runtime names");

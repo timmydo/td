@@ -7,6 +7,8 @@
 //! names uutils does not provide at all — `less` not quite: uutils has a pager
 //! behind a feature flag that compiles a crossterm stack in, which is a dependency
 //! this image does not take, so busybox was being carried for `more` alone.
+//! `sha256sum` is one too: uutils' checksum feature pulls a crate closure td
+//! does not take, so the engine's own SHA-256 serves it.
 //! `cat`/`chmod`/`chown`/`ln`/`mkdir`/`printf`/`readlink`/`rm`/`sleep`/`test` it
 //! DOES provide — dynamically linked, against a runtime closure that the pre-pivot
 //! initramfs has no loader for and that the boot self-check exists to report the
@@ -95,6 +97,21 @@ mod od;
 mod printf;
 mod procfs;
 mod ps;
+// The engine's SHA-256, the copy source preparation trusts. The engine file's
+// own tests, held to the engine's lints rather than these.
+#[path = "../../engine/src/sha256.rs"]
+#[allow(dead_code)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+mod sha256;
+mod sha256sum;
 mod sleep;
 mod sys;
 mod tar;
@@ -141,6 +158,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("ps", ps::run),
     ("readlink", fileops::readlink),
     ("rm", fileops::rm),
+    ("sha256sum", sha256sum::run),
     ("sleep", sleep::run),
     ("tar", tar::run),
     ("test", test::run),
@@ -389,6 +407,10 @@ mod confinement {
             "tar_write.rs",
             concat!("#[", "path=\"../../engine/src/tar_write.rs\"]"),
         ),
+        (
+            "sha256.rs",
+            concat!("#[", "path=\"../../engine/src/sha256.rs\"]"),
+        ),
     ];
 
     /// The engine files are compiled under this crate's `deny`, so an `allow`
@@ -436,8 +458,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            27,
-            "expected twenty-seven modules in src/ beside the crate root"
+            28,
+            "expected twenty-eight modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -486,6 +508,7 @@ mod confinement {
                 "printf.rs",
                 "procfs.rs",
                 "ps.rs",
+                "sha256sum.rs",
                 "sleep.rs",
                 "sys.rs",
                 "tar.rs",

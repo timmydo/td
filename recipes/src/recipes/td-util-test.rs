@@ -85,7 +85,9 @@ pub fn recipe() -> Recipe {
 
     // Applet roster: the /bin symlink farm this multicall will back is generated
     // from `--list`, so a dropped or renamed applet must red here rather than
-    // strand a dead /bin symlink on the image.
+    // strand a dead /bin symlink on the image. Then sha256sum: FIPS 180-4's
+    // "abc" on standard input, a line it writes that the build root's
+    // coreutils accepts, and one coreutils writes that it accepts in turn.
     steps.push(
         Step::run(
             "{root}",
@@ -94,11 +96,18 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear cmp cpio diff dmesg free gen_init_cpio gunzip gzip hwcheck less ln mkdir mv od printf ps readlink rm sleep tar test uname which zcat; do \
+                     for a in cat chmod chown clear cmp cpio diff dmesg free gen_init_cpio gunzip gzip hwcheck less ln mkdir mv od printf ps readlink rm sha256sum sleep tar test uname which zcat; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 30 ] || {{ echo \"td-util serves $n applets, expected exactly 30 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 31 ] || {{ echo \"td-util serves $n applets, expected exactly 31 — update this check deliberately when adding one\" >&2; exit 1; }}; \
+                     d=$(printf abc | '{bin}' sha256sum) || {{ echo 'td-util sha256sum failed' >&2; exit 1; }}; \
+                     [ \"$d\" = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -' ] || {{ echo \"sha256sum of abc printed '$d'\" >&2; exit 1; }}; \
+                     printf abc > sha-a; \
+                     '{bin}' sha256sum sha-a > sha-td.list && /usr/bin/sha256sum -c --status sha-td.list || {{ echo 'coreutils sha256sum refused the td-util line' >&2; exit 1; }}; \
+                     /usr/bin/sha256sum sha-a > sha-gnu.list && '{bin}' sha256sum -c --status sha-gnu.list || {{ echo 'td-util sha256sum refused the coreutils line' >&2; exit 1; }}; \
+                     printf abd > sha-a; \
+                     if '{bin}' sha256sum -c --status sha-gnu.list; then echo 'td-util sha256sum passed a changed file' >&2; exit 1; fi"
                 ),
             ],
         )
@@ -210,7 +219,7 @@ pub fn recipe() -> Recipe {
     // trimmed. The other two build-tool applets are left to the crate's
     // process tests, which the in-sandbox cargo gate runs: their names are
     // the retired findutils words, which the ladder guard refuses in any Run
-    // argv, so this text names them nowhere — the count of 30 above pins
+    // argv, so this text names them nowhere — the count of 31 above pins
     // that they are served.
     // The build root creates an independent ustar fixture; the realized target
     // binary extracts both its plain and gzip forms. Then the other way: the
@@ -411,7 +420,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly thirty applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/hwcheck/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/tar/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip, GNU gzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly thirty-one applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/hwcheck/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sha256sum/sleep/tar/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), digests with SHA-256 in a line coreutils sha256sum -c accepts, interoperates with zlib's minigzip, GNU gzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -426,7 +435,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/hwcheck/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/tar/test/uname/which/zcat and two more, statically linked by the pinned Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/hwcheck/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sha256sum/sleep/tar/test/uname/which/zcat and two more, statically linked by the pinned Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

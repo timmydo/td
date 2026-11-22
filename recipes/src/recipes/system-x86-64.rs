@@ -1150,7 +1150,8 @@ fn td_init_probe(applet: &str, probe: &Probe) -> String {
 }
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
-/// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
+/// uutils does not provide, and `sha256sum`, which the uutils build leaves out.
+/// Like busybox and uutils it dispatches on argv[0]'s basename, so
 /// a `/bin/<applet>` -> td-util symlink runs that applet. Unlike uutils it is an ET_EXEC
 /// with an EMPTY runtime closure, so these entries keep working when no dynamic loader
 /// would: a diagnostics tool that dies with the closure is useless exactly when it is
@@ -1158,7 +1159,15 @@ fn td_init_probe(applet: &str, probe: &Probe) -> String {
 /// entry td-util does not serve reds the build rather than shipping a `/bin` name that
 /// dispatches to nothing.
 const TD_UTIL_APPLETS: &[&str] = &[
-    "clear", "which", "free", "ps", "dmesg", "hwcheck", "less", "tar",
+    "clear",
+    "which",
+    "free",
+    "ps",
+    "dmesg",
+    "hwcheck",
+    "less",
+    "tar",
+    "sha256sum",
 ];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
@@ -3944,12 +3953,22 @@ fn td_util_probe_args(applet: &str) -> &'static str {
 }
 
 fn td_util_probe_command(applet: &str) -> String {
-    if applet == "dmesg" {
-        "td_dmesg=$(/bin/dmesg) && case \"$td_dmesg\" in \
-         *TD-DMESG-INCOMPLETE*) false;; *) :;; esac"
-            .to_string()
-    } else {
-        format!("/bin/{applet}{}", td_util_probe_args(applet))
+    let whole = match applet {
+        "dmesg" => Some(
+            "td_dmesg=$(/bin/dmesg) && case \"$td_dmesg\" in \
+             *TD-DMESG-INCOMPLETE*) false;; *) :;; esac",
+        ),
+        // A known answer, FIPS 180-4's "abc", on standard input: with no
+        // operand it would otherwise read the boot's own.
+        "sha256sum" => Some(
+            "td_sha=$(printf abc | /bin/sha256sum) && [ \"$td_sha\" = \
+             \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\" ]",
+        ),
+        _ => None,
+    };
+    match whole {
+        Some(command) => command.to_string(),
+        None => format!("/bin/{applet}{}", td_util_probe_args(applet)),
     }
 }
 
@@ -17128,6 +17147,12 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(bootsuccess.contains(
             "td_dmesg=$(/bin/dmesg) && case \"$td_dmesg\" in \
              *TD-DMESG-INCOMPLETE*) false;; *) :;; esac"
+        ));
+        // sha256sum with no operand reads stdin too: its probe feeds one, and
+        // checks the known answer, not merely the exit status.
+        assert!(bootsuccess.contains(
+            "td_sha=$(printf abc | /bin/sha256sum) && [ \"$td_sha\" = \
+             \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\" ]"
         ));
         // A pager with no operand reads stdin. Deriving the args above means the
         // assertion follows whatever the generator does, so state the one property

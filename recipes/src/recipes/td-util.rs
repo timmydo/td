@@ -14,6 +14,8 @@ use crate::types::{Recipe, Step};
 // provide at all, and get `/bin` symlinks — `less` not quite: uutils has a pager
 // behind a feature flag that compiles a crossterm stack in, which is a dependency
 // this image does not take, so busybox was being carried for `more` alone.
+// `sha256sum` gets one too: its uutils feature pulls a checksum crate closure td
+// does not take, so it is served here from the engine's own SHA-256.
 // `cat`, `chmod`, `chown`, `ln`, `mkdir`, `printf`, `readlink`, `rm`, `sleep` and
 // `test` it DOES provide — dynamically linked, which the pre-pivot initramfs has no
 // loader for and which `/etc/rootcheck` must not depend on, since reporting a broken
@@ -40,7 +42,7 @@ use crate::types::{Recipe, Step};
 // syscall this roster does not have, which is a further reviewed amendment.
 //
 // system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
-// /bin/{clear,which,free,ps,dmesg,hwcheck,less} here, and calls the others as
+// /bin/{clear,which,free,ps,dmesg,hwcheck,less,tar,sha256sum} here, and calls the others as
 // `td-util <applet>` where it used to call `busybox <applet>`. The greeter runs each
 // by its /bin path and emits TD_UTIL_RUNTIME_MARKER only if all of them exit 0, so
 // `td-recipe-eval qemu-boot-system` re-proves the whole
@@ -99,6 +101,10 @@ const MODULES: &[(&str, &str)] = &[
     ("printf", include_str!("../../../td-util/src/printf.rs")),
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
     ("ps", include_str!("../../../td-util/src/ps.rs")),
+    (
+        "sha256sum",
+        include_str!("../../../td-util/src/sha256sum.rs"),
+    ),
     ("sleep", include_str!("../../../td-util/src/sleep.rs")),
     ("sys", include_str!("../../../td-util/src/sys.rs")),
     ("tar", include_str!("../../../td-util/src/tar.rs")),
@@ -110,8 +116,8 @@ const MODULES: &[(&str, &str)] = &[
 ];
 
 // The engine files main.rs reaches by `#[path = "../../engine/src/NAME.rs"]`:
-// its CRC and inflater, the ones source preparation trusts, and the tar reader
-// and writer. Staged at the
+// its CRC, inflater and SHA-256, the ones source preparation trusts, and the
+// tar reader and writer. Staged at the
 // checkout's own layout so the relative path resolves.
 // Each with its staged path spelled out: builder/src/affected.rs reads this
 // text for the destination of every `#[path]` include it routes here.
@@ -140,6 +146,11 @@ const ENGINE: &[(&str, &str, &str)] = &[
         "tar_write",
         "{src}/engine/src/tar_write.rs",
         include_str!("../../../engine/src/tar_write.rs"),
+    ),
+    (
+        "sha256",
+        "{src}/engine/src/sha256.rs",
+        include_str!("../../../engine/src/sha256.rs"),
     ),
 ];
 
