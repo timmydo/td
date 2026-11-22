@@ -25,6 +25,13 @@ const EXIT_GRACE: Duration = Duration::from_millis(250);
 const EXIT_FLOOR: Duration = Duration::from_millis(20);
 const EXIT_STEP: Duration = Duration::from_millis(10);
 
+/// A short frame in a clearing owner, its allocation fallible.
+fn frame(bytes: &[u8]) -> Result<Bytes, String> {
+    crate::allocation::copy(bytes)
+        .map(Bytes)
+        .map_err(|_| "notebook frame allocation failed".into())
+}
+
 struct Process {
     child: Child,
     wire: PendingWire,
@@ -94,9 +101,6 @@ pub(crate) fn log(line: &str) {
 pub(crate) struct Ending {
     /// The line for root's log; none when the person closed the window.
     pub line: Option<String>,
-    /// A process exited unsuccessfully on its own, which the next
-    /// selection reports on the attention screen.
-    pub failed: bool,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -112,12 +116,67 @@ enum Waiting {
     Mail(u64),
 }
 
+/// The vault service's token request root refuses, and why, as a code
+/// it relays unread (td-secret/PORTABLE.md, "Root notebook token
+/// exchange"): `3f` and the code.
+const DECLINED: u8 = 0x3f;
+/// The person declined the step in the window.
+const CANCELLED: u8 = 0x10;
+/// The operation outlived its ceiling, or its step its deadline.
+const EXPIRED: u8 = 0x11;
+/// What the window is told of an operation that waited out its ceiling
+/// for the token slot: td-secret's words for an expired step.
+const WAITED_OUT: &[u8] = b"the security key did not finish in time";
+/// The window's PIN is outside a PIN's profile.
+const PIN_INPUT: u8 = 0x15;
+/// The secure attention screen took the security key.
+const SUPERSEDED: u8 = 0x04;
+/// A step that ended without the token's own reason.
+const FAILED: u8 = 0x03;
+
+/// What the window was last asked in the running step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// Step zero: the person connects the key and proceeds, or declines.
+    Approval,
+    /// A PIN step: the person types the key's PIN, or declines.
+    Pin,
+}
+
+/// One admitted notebook hardware operation. While nothing has declined
+/// it, it holds the token slot; root presents each of its steps in the
+/// pinned window and relays to the vault service only a step's verified
+/// result or a refusal's code. The service's final reply ends it.
+struct Ceremony {
+    token: Option<Token>,
+    nonce: [u8; 32],
+    action: u8,
+    digest: [u8; 32],
+    deadline: Instant,
+    /// The key the running step names, when it names an enrolled one.
+    key: Option<[u8; 4]>,
+    /// The prompt the window shows: its number, what it asks and the
+    /// step it presents, which an answer must name to count.
+    asked: Option<(u64, Asked, Request)>,
+    /// Once set, the operation releases nothing more: a step running is
+    /// reaped and every further token request is refused with this code.
+    declined: Option<u8>,
+}
+
 pub(crate) struct Bridge {
     owner: u32,
     gui: Process,
     service: Process,
     pending: Option<Bytes>,
+    /// A hardware operation's ceiling, from when the window asked for it,
+    /// so the wait for the slot counts against it.
+    pending_deadline: Option<Instant>,
     waiting: Option<Waiting>,
+    ceremony: Option<Ceremony>,
+    /// The last prompt's number; each prompt the window is sent has its own.
+    prompts: u64,
+    /// Starts a step's root worker: `Token::start`, a fixed command.
+    worker: fn(Request, &[u8]) -> Result<Token, String>,
     heartbeat: Instant,
     was_unlocked: bool,
     mail_revoked: bool,
@@ -176,7 +235,11 @@ impl Bridge {
             gui,
             service,
             pending: None,
+            pending_deadline: None,
             waiting: None,
+            ceremony: None,
+            prompts: 0,
+            worker: Token::start,
             heartbeat: Instant::now(),
             was_unlocked: false,
             mail_revoked: false,
@@ -205,11 +268,12 @@ impl Bridge {
         if !self.was_unlocked
             || self.waiting.is_some()
             || self.pending.is_some()
+            || self.ceremony.is_some()
             || self.mail_reply.is_some()
         {
             return Ok(false);
         }
-        let mut request = Bytes(vec![12]);
+        let mut request = frame(&[12])?;
         put_binding(&mut request, binding)?;
         self.service.wire.queue(request)?;
         self.waiting = Some(Waiting::Mail(id));
@@ -234,12 +298,268 @@ impl Bridge {
         Ok(())
     }
 
-    pub fn pending(&self) -> bool {
-        self.waiting.is_none()
-            && self
-                .pending
-                .as_ref()
-                .is_some_and(|p| action(&p.0).is_some())
+    /// Whether a notebook operation holds the token slot.
+    pub fn busy(&self) -> bool {
+        self.ceremony.as_ref().is_some_and(|c| c.declined.is_none())
+    }
+
+    /// Gives the token slot to the secure attention screen: the running
+    /// step is stopped and reaped, and the operation fails, saying so.
+    /// One waiting for the slot keeps waiting.
+    pub fn yield_slot(&mut self) -> Result<(), String> {
+        self.decline(SUPERSEDED)
+    }
+
+    /// Ends the operation's releases with `code`. A step running is
+    /// reaped now and its token request refused; a later request is
+    /// refused when it comes. One not yet begun is dropped, and the
+    /// window told.
+    fn decline(&mut self, code: u8) -> Result<(), String> {
+        let Some(ceremony) = &mut self.ceremony else {
+            if code != SUPERSEDED && self.pending.take_if(|p| action(&p.0).is_some()).is_some() {
+                self.pending_deadline = None;
+                let mut reply = frame(&[1])?;
+                crate::notebook_wire::field(
+                    &mut reply,
+                    if code == EXPIRED {
+                        WAITED_OUT
+                    } else {
+                        b"cancelled"
+                    },
+                )?;
+                self.gui.wire.queue(reply)?;
+            }
+            return Ok(());
+        };
+        if ceremony.declined.is_some() {
+            return Ok(());
+        }
+        ceremony.declined = Some(code);
+        ceremony.asked = None;
+        if let Some(token) = ceremony.token.take() {
+            token.reap_for_teardown()?;
+            self.service.wire.queue(frame(&[DECLINED, code])?)?;
+        }
+        Ok(())
+    }
+
+    /// The window's answer to a prompt (`7c`, the prompt's number, then
+    /// proceed, a PIN or decline). An answer to a prompt no longer shown
+    /// is dropped; a decline ends the operation when it names no prompt
+    /// or the one shown.
+    fn answer(&mut self, frame: &Bytes) -> Result<(), String> {
+        let mut input = Reader::new(&frame.0);
+        input.byte()?;
+        let number = input.number()?;
+        let pin = match input.byte()? {
+            0 => None,
+            1 => Some(input.field(63)?),
+            2 => {
+                input.finish()?;
+                let shown = self
+                    .ceremony
+                    .as_ref()
+                    .and_then(|c| c.asked.as_ref())
+                    .map(|(asked, _, _)| *asked);
+                // td-pass numbers a decline only for the prompt it shows
+                // and sends zero for a cancel, so a numbered decline with
+                // no prompt shown is stale.
+                if number != 0 && shown != Some(number) {
+                    return Ok(());
+                }
+                return self.decline(CANCELLED);
+            }
+            _ => return Err("invalid notebook answer".into()),
+        };
+        input.finish()?;
+        let Some(ceremony) = &mut self.ceremony else {
+            return Ok(());
+        };
+        let Some((asked_number, asked, request)) = ceremony.asked.take() else {
+            return Ok(());
+        };
+        if asked_number != number {
+            ceremony.asked = Some((asked_number, asked, request));
+            return Ok(());
+        }
+        let token = ceremony
+            .token
+            .as_mut()
+            .ok_or("notebook prompt without its step")?;
+        // A refusal here cancels the step, whose poll then reports it.
+        match (asked, pin) {
+            (Asked::Approval, None) => {
+                let _ = token.presented(&request);
+            }
+            (Asked::Pin, Some(pin)) => match Pin::entry(pin) {
+                Ok(pin) if pin.is_pin() => {
+                    let _ = token.pin(&request, pin);
+                }
+                _ => return self.decline(PIN_INPUT),
+            },
+            _ => return Err("notebook answer for another step".into()),
+        }
+        Ok(())
+    }
+
+    /// Starts the operation waiting for the token slot.
+    fn begin(&mut self) -> Result<(), String> {
+        let pending = self.pending.take().ok_or("no notebook operation waits")?;
+        let deadline = self
+            .pending_deadline
+            .take()
+            .ok_or("notebook operation has no ceiling")?;
+        let action = action(&pending.0).ok_or("not a notebook token operation")?;
+        let mut hash = crate::sha256::Sha256::new();
+        hash.update(&pending.0);
+        let digest = hash.finalize();
+        let mut nonce = [0; 32];
+        File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut nonce))
+            .map_err(|_| "read notebook operation randomness")?;
+        self.service.wire.queue(pending)?;
+        self.ceremony = Some(Ceremony {
+            token: None,
+            nonce,
+            action,
+            digest,
+            deadline,
+            key: None,
+            asked: None,
+            declined: None,
+        });
+        Ok(())
+    }
+
+    /// The vault service's reply within an operation: a token request,
+    /// which starts the step's worker or is refused, or the final reply,
+    /// which goes to the window and ends it.
+    fn service_reply(&mut self, reply: Bytes) -> Result<(), String> {
+        let ceremony = self.ceremony.as_mut().ok_or("missing notebook operation")?;
+        match reply.0.first() {
+            Some(0 | 1) => {
+                if ceremony.token.is_some() {
+                    return Err("notebook service answered during a token step".into());
+                }
+                if reply.0.first() == Some(&0) {
+                    self.was_unlocked = true;
+                }
+                self.ceremony = None;
+                self.gui.wire.queue(reply)?;
+                self.heartbeat = Instant::now();
+            }
+            Some(0x30 | 0x31) => {
+                if ceremony.token.is_some() {
+                    return Err("notebook service asked for two token steps".into());
+                }
+                if let Some(code) = ceremony.declined {
+                    self.service.wire.queue(frame(&[DECLINED, code])?)?;
+                    return Ok(());
+                }
+                let mut input = Reader::new(&reply.0);
+                let method = input.byte()?;
+                let purpose = input.byte()?;
+                let role = input.byte()?;
+                ceremony.key = if method == 0x31 {
+                    let mut hash = crate::sha256::Sha256::new();
+                    hash.update(input.field(1024)?);
+                    let digest = hash.finalize();
+                    let mut key = [0; 4];
+                    key.copy_from_slice(digest.get(..4).ok_or("short credential digest")?);
+                    Some(key)
+                } else {
+                    None
+                };
+                let mut hash = crate::sha256::Sha256::new();
+                hash.update(&reply.0);
+                let request = Request::new(
+                    ceremony.nonce,
+                    self.owner,
+                    Operation::Notebook(Notebook {
+                        method,
+                        action: ceremony.action,
+                        purpose,
+                        role,
+                        step: 0,
+                        operation: ceremony.digest,
+                        token: hash.finalize(),
+                    }),
+                )?;
+                ceremony.token = Some((self.worker)(request, &reply.0)?);
+            }
+            _ => return Err("invalid notebook operation result".into()),
+        }
+        Ok(())
+    }
+
+    /// Advances the running step: each new presentation is prompted in
+    /// the window, and a step's end relays its result or its refusal.
+    fn advance(&mut self) -> Result<(), String> {
+        let Some(ceremony) = &mut self.ceremony else {
+            return Ok(());
+        };
+        if ceremony.declined.is_none() && Instant::now() >= ceremony.deadline {
+            return self.decline(EXPIRED);
+        }
+        let Some(token) = &mut ceremony.token else {
+            return Ok(());
+        };
+        match token.poll()? {
+            Event::Present(request) => {
+                if ceremony
+                    .asked
+                    .as_ref()
+                    .is_some_and(|(_, _, asked)| asked == &request)
+                {
+                    return Ok(());
+                }
+                let Operation::Notebook(step) = request.operation() else {
+                    return Err("notebook step names another operation".into());
+                };
+                let asked = if request.asks_pin() {
+                    Asked::Pin
+                } else {
+                    Asked::Approval
+                };
+                self.prompts = self.prompts.wrapping_add(1);
+                let mut prompt = frame(&[0x7d])?;
+                prompt.extend(&self.prompts.to_be_bytes())?;
+                prompt.extend(&[step.purpose, step.role, step.step])?;
+                match ceremony.key {
+                    Some(key) => {
+                        prompt.push(1)?;
+                        prompt.extend(&key)?;
+                    }
+                    None => prompt.push(0)?,
+                }
+                self.gui.wire.queue(prompt)?;
+                // The window's PIN prompt presents the step.
+                if asked == Asked::Pin {
+                    let _ = token.presented(&request);
+                }
+                ceremony.asked = Some((self.prompts, asked, request));
+            }
+            Event::Complete => {
+                let result = token
+                    .take_result()
+                    .ok_or("notebook token has no proved result")?;
+                ceremony.token = None;
+                ceremony.asked = None;
+                self.service.wire.queue(result)?;
+            }
+            Event::Failed(_) | Event::Ended(_) => {
+                let code = token
+                    .refusal()
+                    .or(token.expired().then_some(EXPIRED))
+                    .unwrap_or(FAILED);
+                ceremony.token = None;
+                ceremony.asked = None;
+                self.service.wire.queue(frame(&[DECLINED, code])?)?;
+            }
+            Event::Waiting | Event::Pin(_) => {}
+            Event::Commit(_) => return Err("notebook step asked for a commit".into()),
+        }
+        Ok(())
     }
 
     /// What root logs of the bridge it is about to drop for `why`: each
@@ -269,10 +589,7 @@ impl Bridge {
             .iter()
             .any(|status| status.is_some_and(|status| !status.success()));
         if !failed && self.gui.exited.is_some_and(|status| status.success()) {
-            return Ending {
-                line: None,
-                failed: false,
-            };
+            return Ending { line: None };
         }
         Ending {
             line: Some(format!(
@@ -280,16 +597,21 @@ impl Bridge {
                 self.gui.describe(),
                 self.service.describe()
             )),
-            failed,
         }
     }
 
-    pub fn poll(&mut self) -> Result<(), String> {
-        // Drained every poll, and every ceremony advance, so neither
-        // process fills its channel.
+    /// One turn: replies and requests move, a hardware operation starts
+    /// when `slot_free` says the token slot is root's to give, and its
+    /// step advances. True when an operation began and took the slot.
+    pub fn poll(&mut self, slot_free: bool) -> Result<bool, String> {
+        // Drained every poll so neither process fills its channel.
         self.gui.stderr.drain();
         self.service.stderr.drain();
-        if let Some(reply) = self.service.wire.poll()? {
+        if self.ceremony.is_some() {
+            if let Some(reply) = self.service.wire.poll()? {
+                self.service_reply(reply)?;
+            }
+        } else if let Some(reply) = self.service.wire.poll()? {
             match self
                 .waiting
                 .take()
@@ -327,7 +649,49 @@ impl Bridge {
             self.heartbeat = Instant::now();
         }
         if let Some(request) = self.gui.wire.poll()? {
-            if self.pending.is_some() || matches!(self.waiting, Some(Waiting::Gui)) {
+            if request.0.first() == Some(&0x7c) {
+                self.answer(&request)?;
+            } else {
+                self.window_request(request)?;
+            }
+        }
+        let waits = self.ceremony.is_none()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|p| action(&p.0).is_some());
+        let mut began = false;
+        if waits && self.pending_deadline.is_some_and(|d| Instant::now() >= d) {
+            self.decline(EXPIRED)?;
+        } else if waits && self.waiting.is_none() && slot_free {
+            self.begin()?;
+            began = true;
+        }
+        self.advance()?;
+        if self.waiting.is_none() && self.ceremony.is_none() {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| action(&p.0).is_none())
+            {
+                let pending = self.pending.take().ok_or("missing notebook request")?;
+                self.send_gui(pending)?;
+            } else if self.heartbeat.elapsed() >= Duration::from_secs(10) {
+                self.service.wire.queue(frame(&[13])?)?;
+                self.waiting = Some(Waiting::Heartbeat);
+            }
+        }
+        Ok(began)
+    }
+
+    /// A browsing, binding or lifecycle request from the window, which
+    /// may not overlap another.
+    fn window_request(&mut self, request: Bytes) -> Result<(), String> {
+        {
+            if self.pending.is_some()
+                || self.ceremony.is_some()
+                || matches!(self.waiting, Some(Waiting::Gui))
+            {
                 return Err("concurrent notebook window requests".into());
             }
             let tag = request.0.first().copied().ok_or("empty notebook request")?;
@@ -335,7 +699,7 @@ impl Bridge {
                 if request.0 != [15] {
                     return Err("invalid notebook request list".into());
                 }
-                let mut reply = Bytes(vec![0, self.requests.len() as u8]);
+                let mut reply = frame(&[0, self.requests.len() as u8])?;
                 for binding in &self.requests {
                     put_binding(&mut reply, binding)?;
                 }
@@ -350,8 +714,13 @@ impl Bridge {
                     return Err("notebook window requested another capability".into());
                 }
                 if action(&request.0).is_some() {
+                    // It waits for the token slot, within its ceiling.
+                    self.pending_deadline = Some(
+                        Instant::now()
+                            .checked_add(crate::consent::NOTEBOOK_CEILING)
+                            .ok_or("notebook operation deadline overflow")?,
+                    );
                     self.pending = Some(request);
-                    self.gui.wire.queue(Bytes(vec![0x7e]))?;
                 } else {
                     // An outstanding heartbeat must finish before the next request.
                     if self.waiting.is_some() {
@@ -362,196 +731,13 @@ impl Bridge {
                 }
             }
         }
-        if self.waiting.is_none() {
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|p| action(&p.0).is_none())
-            {
-                let pending = self.pending.take().ok_or("missing notebook request")?;
-                self.send_gui(pending)?;
-            } else if self.heartbeat.elapsed() >= Duration::from_secs(10) {
-                self.service.wire.queue(Bytes(vec![13]))?;
-                self.waiting = Some(Waiting::Heartbeat);
-            }
-        }
         Ok(())
-    }
-
-    pub fn begin(mut self) -> Result<Ceremony, String> {
-        if self.waiting.is_some() {
-            return Err("notebook service is busy".into());
-        }
-        let pending = self.pending.take().ok_or("no notebook operation waits")?;
-        let action = action(&pending.0).ok_or("not a notebook token operation")?;
-        let mut hash = crate::sha256::Sha256::new();
-        hash.update(&pending.0);
-        let digest = hash.finalize();
-        let mut nonce = [0; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut nonce))
-            .map_err(|_| "read notebook operation randomness")?;
-        self.service.wire.queue(pending)?;
-        Ok(Ceremony {
-            bridge: Some(self),
-            token: None,
-            nonce,
-            action,
-            digest,
-            deadline: Instant::now()
-                .checked_add(crate::consent::NOTEBOOK_CEILING)
-                .ok_or("notebook operation deadline overflow")?,
-            event: Event::Waiting,
-            description: None,
-            complete: false,
-        })
-    }
-}
-
-pub(crate) struct Ceremony {
-    bridge: Option<Bridge>,
-    token: Option<Token>,
-    nonce: [u8; 32],
-    action: u8,
-    digest: [u8; 32],
-    deadline: Instant,
-    event: Event,
-    description: Option<Request>,
-    complete: bool,
-}
-impl Ceremony {
-    pub fn request(&self) -> Option<&Request> {
-        self.description.as_ref()
-    }
-    pub fn nonce(&self) -> &[u8; 32] {
-        &self.nonce
-    }
-    pub fn presented(&mut self, request: &Request) -> Result<(), String> {
-        self.token
-            .as_mut()
-            .ok_or("no notebook token presentation")?
-            .presented(request)
-    }
-    pub fn pin(&mut self, request: &Request, pin: Pin) -> Result<bool, String> {
-        self.token
-            .as_mut()
-            .ok_or("no notebook PIN step")?
-            .pin(request, pin)
-    }
-    pub fn commit(&mut self, _: &Request) -> Result<(), String> {
-        Err("notebook does not take an elevation commit".into())
-    }
-    pub fn cancel(&mut self) -> Result<(), String> {
-        if let Some(token) = self.token.take() {
-            token.reap_for_teardown()?;
-        }
-        self.bridge = None;
-        self.complete = true;
-        self.event = Event::Failed("notebook operation cancelled; vault locked".into());
-        Ok(())
-    }
-    pub fn poll(&mut self) -> Result<Event, String> {
-        if self.complete {
-            return Ok(self.event.clone());
-        }
-        if Instant::now() >= self.deadline {
-            self.cancel()?;
-            return Ok(self.event.clone());
-        }
-        match self.advance() {
-            Ok(event) => {
-                self.event = event.clone();
-                Ok(event)
-            }
-            Err(why) => {
-                // A token's own failure is the screen's to say; a process
-                // that died under the operation is the log's.
-                if let Some(ending) = self.bridge.as_mut().map(|b| b.ending(&why)) {
-                    if let (true, Some(line)) = (ending.failed, ending.line) {
-                        log(&line);
-                    }
-                }
-                self.cancel()?;
-                Ok(self.event.clone())
-            }
-        }
-    }
-    fn advance(&mut self) -> Result<Event, String> {
-        let bridge = self.bridge.as_mut().ok_or("missing notebook processes")?;
-        bridge.gui.stderr.drain();
-        bridge.service.stderr.drain();
-        if bridge.gui.wire.poll()?.is_some() {
-            return Err("window changed a pending notebook operation".into());
-        }
-        if let Some(token) = &mut self.token {
-            let event = token.poll()?;
-            self.description = Some(token.request().clone());
-            match event {
-                Event::Complete => {
-                    let result = token
-                        .take_result()
-                        .ok_or("notebook token has no proved result")?;
-                    bridge.service.wire.queue(result)?;
-                    self.token = None;
-                }
-                Event::Failed(_) | Event::Ended(_) => return Err("notebook token failed".into()),
-                other => return Ok(other),
-            }
-        }
-        if let Some(reply) = bridge.service.wire.poll()? {
-            match reply.0.first() {
-                Some(0 | 1) => {
-                    if reply.0.first() == Some(&0) {
-                        bridge.was_unlocked = true;
-                    }
-                    bridge.gui.wire.queue(reply)?;
-                    bridge.heartbeat = Instant::now();
-                    self.complete = true;
-                    return Ok(Event::Complete);
-                }
-                Some(0x30 | 0x31) => {
-                    let mut input = Reader::new(&reply.0);
-                    let method = input.byte()?;
-                    let purpose = input.byte()?;
-                    let role = input.byte()?;
-                    let mut hash = crate::sha256::Sha256::new();
-                    hash.update(&reply.0);
-                    let request = Request::new(
-                        self.nonce,
-                        bridge.owner,
-                        Operation::Notebook(Notebook {
-                            method,
-                            action: self.action,
-                            purpose,
-                            role,
-                            step: 0,
-                            operation: self.digest,
-                            token: hash.finalize(),
-                        }),
-                    )?;
-                    self.description = Some(request.clone());
-                    self.token = Some(Token::start(request, &reply.0)?);
-                }
-                _ => return Err("invalid notebook operation result".into()),
-            }
-        }
-        Ok(Event::Waiting)
-    }
-    pub fn take_bridge(&mut self) -> Option<Bridge> {
-        if self.complete && self.event == Event::Complete {
-            self.bridge.take()
-        } else {
-            None
-        }
-    }
-    pub fn reap_for_teardown(mut self) -> Result<(), String> {
-        self.cancel()
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
     #[test]
@@ -561,10 +747,21 @@ pub(crate) mod tests {
         let _ = std::io::stdin().read_exact(&mut byte);
     }
 
-    pub(crate) fn ceremony() -> (Ceremony, [u32; 2]) {
+    /// A bridge whose creation holds the token slot.
+    pub(crate) fn ceremony() -> (Bridge, [u32; 2]) {
         let (mut bridge, pids) = bridge();
         bridge.pending = Some(Bytes(vec![2, 0]));
-        (bridge.begin().unwrap(), pids)
+        bridge.pending_deadline = Some(Instant::now() + crate::consent::NOTEBOOK_CEILING);
+        bridge.begin().unwrap();
+        (bridge, pids)
+    }
+
+    /// A bridge whose unlock waits for the token slot.
+    pub(crate) fn waiting() -> (Bridge, [u32; 2]) {
+        let (mut bridge, pids) = bridge();
+        bridge.pending = Some(Bytes(unlock_request()));
+        bridge.pending_deadline = Some(Instant::now() + crate::consent::NOTEBOOK_CEILING);
+        (bridge, pids)
     }
 
     #[test]
@@ -609,7 +806,11 @@ pub(crate) mod tests {
                 gui,
                 service,
                 pending: None,
+                pending_deadline: None,
                 waiting: None,
+                ceremony: None,
+                prompts: 0,
+                worker: crate::notebook_token::tests::succeeding,
                 heartbeat: Instant::now(),
                 was_unlocked: true,
                 mail_revoked: false,
@@ -640,7 +841,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(bridge.mail(42, &binding).unwrap());
         assert!(!bridge.mail(43, &binding).unwrap());
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         let request = service.receive(Duration::from_secs(1)).unwrap();
         let mut input = Reader::new(&request.0);
         assert_eq!(input.byte().unwrap(), 12);
@@ -649,14 +850,14 @@ pub(crate) mod tests {
         let mut reply = Bytes(vec![0]);
         field(&mut reply, b"secret-token").unwrap();
         service.send(&reply.0).unwrap();
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         let (id, response) = bridge.take_mail_reply().unwrap();
         assert_eq!(id, 42);
         assert_eq!(response.0, reply.0);
         assert!(gui.poll().unwrap().is_none());
         gui.queue(Bytes(vec![12])).unwrap();
         gui.poll().unwrap();
-        assert!(bridge.poll().is_err());
+        assert!(bridge.poll(true).is_err());
     }
 
     #[test]
@@ -691,17 +892,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(bridge.mail(42, &binding).unwrap());
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         service.receive(Duration::from_secs(1)).unwrap();
         gui.send(&[11]).unwrap();
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         assert!(!bridge.was_unlocked);
         let mut reply = Bytes(vec![0]);
         field(&mut reply, b"secret-token").unwrap();
         service.send(&reply.0).unwrap();
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         assert!(bridge.take_mail_reply().is_none());
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         assert_eq!(service.receive(Duration::from_secs(1)).unwrap().0, [11]);
     }
     /// A window that exits unsuccessfully on its own is a failure, its
@@ -712,14 +913,13 @@ pub(crate) mod tests {
         let (mut bridge, _) = refusing_bridge();
         let deadline = Instant::now() + Duration::from_secs(10);
         let why = loop {
-            if let Err(why) = bridge.poll() {
+            if let Err(why) = bridge.poll(true) {
                 break why;
             }
             assert!(Instant::now() < deadline, "the window's end went unseen");
             std::thread::sleep(Duration::from_millis(10));
         };
         let ending = bridge.ending(&why);
-        assert!(ending.failed);
         let line = ending.line.unwrap();
         assert!(
             line.starts_with(&format!("notebook ended: {why}; ")),
@@ -739,14 +939,13 @@ pub(crate) mod tests {
         let (mut bridge, _) = bridge_with(process("notebook::tests::closing_process"));
         let deadline = Instant::now() + Duration::from_secs(10);
         let why = loop {
-            if let Err(why) = bridge.poll() {
+            if let Err(why) = bridge.poll(true) {
                 break why;
             }
             assert!(Instant::now() < deadline, "the window's end went unseen");
             std::thread::sleep(Duration::from_millis(10));
         };
         let ending = bridge.ending(&why);
-        assert!(!ending.failed);
         assert!(ending.line.is_none());
     }
 
@@ -759,7 +958,310 @@ pub(crate) mod tests {
         let mut gui = Wire::new(peer).unwrap();
         bridge.heartbeat = Instant::now() - Duration::from_secs(11);
         gui.send(&[15]).unwrap();
-        bridge.poll().unwrap();
+        bridge.poll(true).unwrap();
         assert!(matches!(bridge.waiting, Some(Waiting::Heartbeat)));
+    }
+
+    /// The window's and the vault service's ends of a bridge, and the
+    /// processes' own ends, held so neither sees its endpoint close.
+    struct Peers {
+        gui: PendingWire,
+        service: PendingWire,
+        _held: [PendingWire; 2],
+    }
+
+    fn wired(bridge: &mut Bridge) -> Peers {
+        let (root, gui) = UnixStream::pair().unwrap();
+        let gui_hold = std::mem::replace(&mut bridge.gui.wire, PendingWire::new(root).unwrap());
+        let (root, service) = UnixStream::pair().unwrap();
+        let service_hold =
+            std::mem::replace(&mut bridge.service.wire, PendingWire::new(root).unwrap());
+        Peers {
+            gui: PendingWire::new(gui).unwrap(),
+            service: PendingWire::new(service).unwrap(),
+            _held: [gui_hold, service_hold],
+        }
+    }
+
+    /// Turns the bridge until `peer` receives a frame, flushing what it
+    /// has queued on the way.
+    fn next(bridge: &mut Bridge, slot_free: bool, peer: &mut PendingWire) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            bridge.poll(slot_free).unwrap();
+            if let Some(frame) = peer.poll().unwrap() {
+                return frame.0.clone();
+            }
+            assert!(Instant::now() < deadline, "nothing arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn send(peer: &mut PendingWire, bytes: &[u8]) {
+        peer.queue(Bytes(bytes.to_vec())).unwrap();
+        assert!(peer.poll().unwrap().is_none());
+    }
+
+    const CREDENTIAL: &[u8] = b"enrolled-credential";
+
+    fn unlock_request() -> Vec<u8> {
+        let mut request = Bytes(vec![3]);
+        crate::notebook_wire::field(&mut request, CREDENTIAL).unwrap();
+        request.0.clone()
+    }
+
+    /// The service's assertion request for an unlock with the primary.
+    fn assertion() -> Vec<u8> {
+        let mut request = Bytes(vec![0x31, 3, 1]);
+        crate::notebook_wire::field(&mut request, CREDENTIAL).unwrap();
+        request.extend(&[7; 96]).unwrap();
+        request.0.clone()
+    }
+
+    fn answer(number: &[u8], kind: u8, pin: Option<&[u8]>) -> Vec<u8> {
+        let mut frame = Bytes(vec![0x7c]);
+        frame.extend(number).unwrap();
+        frame.push(kind).unwrap();
+        if let Some(pin) = pin {
+            crate::notebook_wire::field(&mut frame, pin).unwrap();
+        }
+        frame.0.clone()
+    }
+
+    /// The window's view of an unlock: root prompts for the key named by
+    /// its fingerprint and approval, then its PIN, each prompt numbered;
+    /// the step's result reaches only the service, whose reply reaches
+    /// the window, and the slot is free again.
+    #[test]
+    fn an_unlock_is_prompted_in_the_window_and_its_result_goes_to_the_service() {
+        let (mut bridge, _) = bridge();
+        bridge.was_unlocked = false;
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        // Another operation holds the slot: the unlock waits.
+        for _ in 0..20 {
+            bridge.poll(false).unwrap();
+            assert!(peers.service.poll().unwrap().is_none());
+        }
+        assert!(!bridge.busy());
+        assert!(bridge.poll(true).unwrap());
+        assert!(bridge.busy());
+        assert_eq!(
+            next(&mut bridge, true, &mut peers.service),
+            unlock_request()
+        );
+        send(&mut peers.service, &assertion());
+        let prompt = next(&mut bridge, true, &mut peers.gui);
+        let mut hash = crate::sha256::Sha256::new();
+        hash.update(CREDENTIAL);
+        let fingerprint = hash.finalize();
+        assert_eq!(prompt[0], 0x7d);
+        assert_eq!(&prompt[9..14], [3, 1, 0, 1, fingerprint[0]]);
+        assert_eq!(&prompt[14..], &fingerprint[1..4]);
+        send(&mut peers.gui, &answer(&prompt[1..9], 0, None));
+        let pin = next(&mut bridge, true, &mut peers.gui);
+        assert_eq!(&pin[9..12], [3, 1, 1]);
+        assert_ne!(pin[1..9], prompt[1..9]);
+        // An answer to the earlier prompt is dropped.
+        send(&mut peers.gui, &answer(&prompt[1..9], 1, Some(b"999999")));
+        for _ in 0..20 {
+            bridge.poll(true).unwrap();
+            assert!(peers.service.poll().unwrap().is_none());
+        }
+        send(&mut peers.gui, &answer(&pin[1..9], 1, Some(b"123456")));
+        assert_eq!(next(&mut bridge, true, &mut peers.service), [0x31; 37]);
+        send(&mut peers.service, &[0]);
+        assert_eq!(next(&mut bridge, true, &mut peers.gui), [0]);
+        assert!(bridge.ceremony.is_none());
+        assert!(!bridge.busy());
+        assert!(bridge.was_unlocked);
+    }
+
+    /// A wrong PIN fails the operation with the token's own code, and
+    /// the window and service go on: the next request is served.
+    #[test]
+    fn a_refused_step_fails_its_operation_and_keeps_the_bridge() {
+        let (mut bridge, _) = bridge();
+        bridge.worker = crate::notebook_token::tests::refusing;
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        next(&mut bridge, true, &mut peers.service);
+        send(&mut peers.service, &assertion());
+        let prompt = next(&mut bridge, true, &mut peers.gui);
+        send(&mut peers.gui, &answer(&prompt[1..9], 0, None));
+        let pin = next(&mut bridge, true, &mut peers.gui);
+        send(&mut peers.gui, &answer(&pin[1..9], 1, Some(b"123456")));
+        assert_eq!(
+            next(&mut bridge, true, &mut peers.service),
+            [DECLINED, 0x25]
+        );
+        let mut failure = Bytes(vec![1]);
+        crate::notebook_wire::field(&mut failure, b"wrong PIN").unwrap();
+        send(&mut peers.service, &failure.0);
+        assert_eq!(next(&mut bridge, true, &mut peers.gui), failure.0);
+        assert!(!bridge.busy());
+        send(&mut peers.gui, &[1]);
+        assert_eq!(next(&mut bridge, true, &mut peers.service), [1]);
+    }
+
+    /// Declining a prompt reaps the step and refuses it as cancelled; a
+    /// PIN outside a PIN's profile is refused as such.
+    #[test]
+    fn a_decline_or_a_malformed_pin_refuses_the_running_step() {
+        for (answered, code) in [(None, CANCELLED), (Some(&b"12"[..]), PIN_INPUT)] {
+            let (mut bridge, _) = bridge();
+            let mut peers = wired(&mut bridge);
+            send(&mut peers.gui, &unlock_request());
+            next(&mut bridge, true, &mut peers.service);
+            send(&mut peers.service, &assertion());
+            let prompt = next(&mut bridge, true, &mut peers.gui);
+            match answered {
+                None => send(&mut peers.gui, &answer(&[0; 8], 2, None)),
+                Some(pin) => {
+                    send(&mut peers.gui, &answer(&prompt[1..9], 0, None));
+                    let asked = next(&mut bridge, true, &mut peers.gui);
+                    send(&mut peers.gui, &answer(&asked[1..9], 1, Some(pin)));
+                }
+            }
+            assert_eq!(
+                next(&mut bridge, true, &mut peers.service),
+                [DECLINED, code]
+            );
+            assert!(!bridge.busy());
+            // A later request of the same operation is refused unasked.
+            send(&mut peers.service, &assertion());
+            assert_eq!(
+                next(&mut bridge, true, &mut peers.service),
+                [DECLINED, code]
+            );
+        }
+    }
+
+    /// The secure attention screen takes the slot: the step is reaped
+    /// before the answer, and its operation fails as superseded.
+    #[test]
+    fn attention_takes_the_slot_from_a_running_step() {
+        let (mut bridge, _) = bridge();
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        next(&mut bridge, true, &mut peers.service);
+        send(&mut peers.service, &assertion());
+        next(&mut bridge, true, &mut peers.gui);
+        bridge.yield_slot().unwrap();
+        assert!(!bridge.busy());
+        assert!(bridge.ceremony.as_ref().is_some_and(|c| c.token.is_none()));
+        assert_eq!(
+            next(&mut bridge, false, &mut peers.service),
+            [DECLINED, SUPERSEDED]
+        );
+    }
+
+    /// A step whose prompt goes unanswered past its deadline fails as
+    /// expired; the service hears the code and both processes go on.
+    #[test]
+    fn an_unanswered_prompt_expires_its_step_and_keeps_the_bridge() {
+        let (mut bridge, _) = bridge();
+        bridge.worker = crate::notebook_token::tests::expiring;
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        next(&mut bridge, true, &mut peers.service);
+        send(&mut peers.service, &assertion());
+        assert_eq!(next(&mut bridge, true, &mut peers.gui)[0], 0x7d);
+        assert_eq!(
+            next(&mut bridge, true, &mut peers.service),
+            [DECLINED, EXPIRED]
+        );
+        let mut failure = Bytes(vec![1]);
+        crate::notebook_wire::field(&mut failure, b"the security key did not finish in time")
+            .unwrap();
+        send(&mut peers.service, &failure.0);
+        assert_eq!(next(&mut bridge, true, &mut peers.gui), failure.0);
+        send(&mut peers.gui, &[1]);
+        assert_eq!(next(&mut bridge, true, &mut peers.service), [1]);
+    }
+
+    /// A worker that ends without the token's reason fails its step as
+    /// root's generic failure.
+    #[test]
+    fn a_worker_ending_without_a_reason_fails_its_step() {
+        let (mut bridge, _) = bridge();
+        bridge.worker = crate::notebook_token::tests::failing;
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        next(&mut bridge, true, &mut peers.service);
+        send(&mut peers.service, &assertion());
+        assert_eq!(
+            next(&mut bridge, true, &mut peers.service),
+            [DECLINED, FAILED]
+        );
+        // The step failed; its operation holds the slot until the
+        // service's final reply.
+        assert!(bridge.ceremony.as_ref().is_some_and(|c| c.token.is_none()));
+    }
+
+    /// An answer naming the shown prompt but another kind of step ends
+    /// the bridge; a decline naming another prompt is dropped.
+    #[test]
+    fn a_wrong_kind_of_answer_ends_the_bridge_and_a_stale_decline_is_dropped() {
+        let (mut bridge, _) = bridge();
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        next(&mut bridge, true, &mut peers.service);
+        send(&mut peers.service, &assertion());
+        let prompt = next(&mut bridge, true, &mut peers.gui);
+        let mut stale = prompt[1..9].to_vec();
+        stale[7] ^= 0x40;
+        send(&mut peers.gui, &answer(&stale, 2, None));
+        for _ in 0..20 {
+            bridge.poll(true).unwrap();
+            let got = peers.service.poll().unwrap();
+            assert!(got.is_none(), "{:?}", got.map(|b| b.0.clone()));
+        }
+        assert!(bridge.busy());
+        send(&mut peers.gui, &answer(&prompt[1..9], 1, Some(b"123456")));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while bridge.poll(true).is_ok() {
+            assert!(Instant::now() < deadline, "the wrong answer went unseen");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// An operation that waits out its ceiling for the slot is dropped,
+    /// the window told, and the service never sees it.
+    #[test]
+    fn an_operation_that_waits_out_its_ceiling_for_the_slot_is_dropped() {
+        let (mut bridge, _) = bridge();
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        bridge.poll(false).unwrap();
+        assert!(bridge.pending.is_some());
+        bridge.pending_deadline = Some(Instant::now());
+        let mut expired = Bytes(vec![1]);
+        crate::notebook_wire::field(&mut expired, WAITED_OUT).unwrap();
+        assert_eq!(next(&mut bridge, false, &mut peers.gui), expired.0);
+        assert!(bridge.pending.is_none());
+        for _ in 0..20 {
+            bridge.poll(true).unwrap();
+            assert!(peers.service.poll().unwrap().is_none());
+        }
+    }
+
+    /// An operation still waiting for the slot is dropped by a decline,
+    /// and the window told; the service never saw it.
+    #[test]
+    fn a_decline_before_the_slot_frees_drops_the_waiting_operation() {
+        let (mut bridge, _) = bridge();
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        bridge.poll(false).unwrap();
+        send(&mut peers.gui, &answer(&[0; 8], 2, None));
+        let mut cancelled = Bytes(vec![1]);
+        crate::notebook_wire::field(&mut cancelled, b"cancelled").unwrap();
+        assert_eq!(next(&mut bridge, false, &mut peers.gui), cancelled.0);
+        assert!(bridge.pending.is_none());
+        for _ in 0..20 {
+            bridge.poll(true).unwrap();
+            assert!(peers.service.poll().unwrap().is_none());
+        }
     }
 }

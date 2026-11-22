@@ -997,9 +997,6 @@ impl KeyBindings {
                 decision.notice = Some(Notice::PowerConfirm(choice));
                 None
             }
-            KEY_N => Some(Selection::Login(
-                crate::secret_client::LoginSelection::Notebook,
-            )),
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
             KEY_U => Some(Selection::Unlock(Role::Primary)),

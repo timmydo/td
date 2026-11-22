@@ -8245,18 +8245,13 @@ same presented, fresh Enter as other elevations; success displays REMOTE
 ADMIN KEY ENROLLED. This does not replace an existing admin key.
 `td-update/ADMIN.md` owns the remote workflow and its authorization policy.
 
-Notebook token descriptions use the shared consent tag 41 and its
-`asks_pin` predicate for the protected PIN field. The operation and exact
-step are rendered by the shared codec; ordinary notebook windows never
-receive PIN input. The attention menu's N, AUTHORIZE NOTEBOOK, selects the
-notebook's pending operation in the one authority slot; it opens no window,
-which only the launcher's entry does, and with none it says to open the
-notebook from the launcher. Root's `a9 03`, a window or vault
-service that exited unsuccessfully, shows THE NOTEBOOK WINDOW STOPPED and
-the log root wrote its reason to (td-authd/DESIGN.md, "Notebook token
-descriptions"); the notice is fixed text, never the process's. Each exchange requires its own physical
-approval; each PIN remains bound to the exact acknowledged description.
-Notebook completion never unlocks the login screen.
+The attention screen has no notebook selection and presents no notebook
+step. A notebook's security-key approval and PIN are asked for in
+td-pass's own window, which root prompts and answers (td-pass/DESIGN.md,
+"Trusted td backend"); the compositor carries none of it. An operation
+the attention screen selects takes the token slot from a notebook step
+in progress, which then fails in its window. A notebook operation never
+unlocks the login screen.
 
 ### Update publisher recovery
 

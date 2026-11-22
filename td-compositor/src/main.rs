@@ -1398,7 +1398,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xa7120dd4dfca6446,
+            0x39b4c94dd70ed878,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3710,7 +3710,7 @@ pub struct MappedRegion {
         // Root's description alone says which prompts await approval: the
         // presented prompt's keeping, the press's check and a login step's
         // receipt.
-        assert_eq!(occurrences(client, "awaits_approval()"), 4);
+        assert_eq!(occurrences(client, "awaits_approval()"), 3);
         // A login disclosure step's receipt goes only once Enter approved
         // that exact prompt; any other step's follows its presentation.
         let tick = body(client, "    fn tick_login(");
@@ -3719,7 +3719,7 @@ pub struct MappedRegion {
              && (!description.awaits_approval() || login.attempt.approved(&description))\n                    \
              && login.attempt.active()\n"
         ));
-        assert_eq!(occurrences(client, ".approved("), 2);
+        assert_eq!(occurrences(client, ".approved("), 1);
         let approved = body(client, "    pub(crate) fn approved(");
         assert!(approved.contains(
             "        self.confirmed.load(Ordering::SeqCst)\n            \

@@ -131,7 +131,13 @@ fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
             pin: Some(PinUse::Authorize),
         },
     });
-    typed(&mut app, board, "1234");
+    // A PIN too short keeps the prompt and sends nothing.
+    typed(&mut app, board, "123");
+    key(&mut app, board, "Return");
+    assert!(app.take_out().is_empty());
+    assert!(app.prompt.is_some());
+    assert_eq!(app.status, "A PIN has 4 to 63 printable ASCII characters");
+    typed(&mut app, board, "4");
     key(&mut app, board, "Return");
     match &app.take_out()[..] {
         [Out::Answer(o, Answer::Pin(pin))] => {
@@ -3637,7 +3643,15 @@ mod scrollbars {
         });
         assert!(app.prompt.is_some());
         // No input is needed for the backend to withdraw its prompt.
-        app.reply(Reply::TrustedAttention { op });
+        app.reply(Reply::Failed {
+            op,
+            failure: Failure {
+                text: "wrong PIN".into(),
+                stale: false,
+                uncertain: false,
+                cancelled: false,
+            },
+        });
         assert!(app.prompt.is_none());
         app.input(
             Input::Pointer {

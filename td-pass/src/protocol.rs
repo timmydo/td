@@ -218,9 +218,6 @@ pub enum Reply {
         id: EntryId,
         revision: u64,
     },
-    TrustedAttention {
-        op: Op,
-    },
     /// The enrolled keys, `None` when the account holds no vault yet.
     Opened {
         keys: Option<Vec<KeyLabel>>,

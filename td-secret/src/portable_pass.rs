@@ -229,7 +229,9 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-fn token_text(error: &TokenError) -> &'static str {
+/// A token failure in the words every notebook window shows; the trusted
+/// service's replies use them too.
+pub(super) fn token_text(error: &TokenError) -> &'static str {
     match error {
         TokenError::Unavailable => "no security key is connected",
         TokenError::Denied => "the host's device policy denies this account the security key",
@@ -492,6 +494,26 @@ impl Vault {
 /// `Host::import` reads at most this many bytes plus one, and refuses a
 /// copy that reaches the extra byte without reading further.
 pub const MAX_COPY: usize = super::MAX_ENVELOPE;
+
+/// What a trusted notebook step authorizes, from the purpose byte root's
+/// prompt carries, in the words this module's own prompts use.
+pub fn step_operation(purpose: u8) -> Option<&'static str> {
+    use lifecycle::Purpose;
+    const PURPOSES: &[Purpose] = &[
+        Purpose::CreatePrimary,
+        Purpose::CreateBackup,
+        Purpose::Unlock,
+        Purpose::AuthorizeAddKey,
+        Purpose::AddKey,
+        Purpose::AuthorizeReplaceKey,
+        Purpose::ReplaceKey,
+        Purpose::Import,
+    ];
+    PURPOSES
+        .iter()
+        .find(|known| **known as u8 == purpose)
+        .map(|known| known.label())
+}
 
 /// The keys enrolled in an exported copy, read without authenticating it,
 /// so a person can choose which one to import it with.

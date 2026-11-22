@@ -1,6 +1,8 @@
 //! Root's one bounded notebook token exchange, on an inherited capability.
 
-use super::lifecycle::{AssertRequest, EnrollRequest, Hardware, Presented, Purpose, Tokens};
+use super::lifecycle::{
+    AssertRequest, EnrollRequest, Hardware, Presented, Purpose, TokenError, Tokens,
+};
 use super::{host, Role, VerificationKey, MAX_CREDENTIAL, MAX_SLOTS};
 use crate::consent::{Notebook, Operation, Request};
 use crate::fido_device::{Device, Session};
@@ -9,7 +11,23 @@ use crate::fido_transaction::PinPurpose;
 use crate::notebook_wire::{field, Bytes, Reader, Wire};
 use std::time::{Duration, Instant};
 
-const LIFETIME: Duration = Duration::from_secs(120);
+/// The worker's absolute lifetime: longer than root's 120-second step
+/// deadline, so root decides a step's end and relays it.
+const LIFETIME: Duration = Duration::from_secs(130);
+
+/// Why a step released nothing: the token's own refusal, which root hears
+/// as its code (`45`) and relays, or a fault of this worker's, which ends
+/// it unsuccessfully.
+#[derive(Debug)]
+enum Refusal {
+    Token(TokenError),
+    Fault(String),
+}
+impl From<String> for Refusal {
+    fn from(fault: String) -> Self {
+        Self::Fault(fault)
+    }
+}
 
 struct Exchange<'a> {
     purpose: Purpose,
@@ -110,7 +128,7 @@ impl<'a> Exchange<'a> {
         })
     }
 
-    fn execute(&self, tokens: &mut impl Tokens) -> Result<Bytes, String> {
+    fn execute(&self, tokens: &mut impl Tokens) -> Result<Bytes, Refusal> {
         let mut out = Bytes(Vec::new());
         match &self.request {
             Token::Enroll {
@@ -135,7 +153,7 @@ impl<'a> Exchange<'a> {
                             excluded,
                         },
                     )
-                    .map_err(|_| "notebook token enrollment failed")?;
+                    .map_err(Refusal::Token)?;
                 out.push(0x30)?;
                 field(&mut out, &enrolled.credential)?;
                 field(&mut out, enrolled.key.cose())?;
@@ -163,7 +181,7 @@ impl<'a> Exchange<'a> {
                             challenge: *challenge,
                         },
                     )
-                    .map_err(|_| "notebook token assertion failed")?;
+                    .map_err(Refusal::Token)?;
                 out.push(0x31)?;
                 out.extend(&asserted.secret.0)?;
                 out.extend(&asserted.counter.to_be_bytes())?;
@@ -236,10 +254,11 @@ pub(crate) fn run(owner: u32) -> Result<(), String> {
     presentation(&mut wire, &request)?;
     protected.recheck()?;
     let devices = Device::discover()?;
-    let [device] = devices.as_slice() else {
-        return Err("notebook operation requires exactly one security key".into());
+    let device = match devices.as_slice() {
+        [device] => *device,
+        [] => return refuse(&mut wire, &TokenError::Unavailable),
+        _ => return refuse(&mut wire, &TokenError::Several),
     };
-    let device = *device;
     let mut entropy = host::Entropy::open()?;
     let mut tokens = Hardware {
         open: |_: Presented<'_>| {
@@ -248,11 +267,23 @@ pub(crate) fn run(owner: u32) -> Result<(), String> {
         prompt: |_: Presented<'_>, purpose| prompt(&mut wire, &mut request, purpose),
         entropy: |bytes: &mut [u8]| entropy.fill(bytes),
     };
-    let result = exchange.execute(&mut tokens)?;
+    let result = match exchange.execute(&mut tokens) {
+        Ok(result) => result,
+        Err(Refusal::Token(error)) => {
+            return refuse(&mut wire, &error);
+        }
+        Err(Refusal::Fault(fault)) => return Err(fault),
+    };
     protected.recheck()?;
     let mut out = Bytes(vec![0x44]);
     field(&mut out, &result.0)?;
     wire.send(&out.0)
+}
+
+/// Tells root why the step released nothing, so the window can say so:
+/// `45` and the refusal's code, which carries no PIN or token output.
+fn refuse(wire: &mut Wire, error: &TokenError) -> Result<(), String> {
+    wire.send(&[0x45, super::service_tokens::refusal(error)])
 }
 
 #[cfg(test)]
@@ -335,7 +366,9 @@ mod tests {
                     token: crate::crypto::digest(&bytes.0),
                 };
                 let exchange = Exchange::decode(&bytes.0, &binding)?;
-                let result = exchange.execute(&mut bench)?;
+                let result = exchange
+                    .execute(&mut bench)
+                    .map_err(|refusal| format!("{refusal:?}"))?;
                 methods.push(bytes.0[0]);
                 wire.send(&result.0)?;
             }
@@ -348,6 +381,67 @@ mod tests {
         assert!(result.is_ok(), "{handled:?}");
         assert_eq!(handled.unwrap(), [0x30, 0x31, 0x30, 0x31]);
         assert_eq!(lifecycle::keys(&directory).unwrap().len(), 2);
+    }
+
+    /// Root relays a refusal as its code: each token refusal comes back
+    /// as itself (a protocol reason's text excepted), an unknown code is
+    /// the host's, and a declined step fails creation with its reason
+    /// while the service's token authority stays good.
+    #[test]
+    fn refusals_cross_root_as_codes_and_a_decline_revokes_nothing() {
+        use super::super::lifecycle::{self, tests::Random, Directory};
+        use super::super::service_tokens::{refusal, refused, Remote, DECLINED};
+        use crate::fido_transaction::{Error as Transaction, Status};
+        use std::os::unix::fs::MetadataExt;
+        let mut named = 0;
+        for code in 0..=u8::MAX {
+            let error = refused(code);
+            if refusal(&error) == code {
+                named += 1;
+            } else {
+                assert_eq!(refusal(&error), 0x03, "{code:#x}");
+            }
+        }
+        // Four device and host kinds, seven transaction kinds, fourteen
+        // statuses; root's superseded code reads as the host's.
+        assert_eq!(named, 4 + 7 + 14);
+        assert_eq!(
+            refused(0x25),
+            TokenError::Failed(Transaction::Status(Status::PinInvalid))
+        );
+        assert_eq!(super::super::pass::token_text(&refused(0x25)), "wrong PIN");
+        assert_eq!(
+            refusal(&refused(super::super::service_tokens::SUPERSEDED)),
+            0x03
+        );
+
+        let temp = crate::test_temp::TempDir::new("notebook-token-decline").unwrap();
+        let file = std::fs::File::open(temp.path()).unwrap();
+        let directory = Directory {
+            owner: file.metadata().unwrap().uid(),
+            file,
+        };
+        let (left, right) = UnixStream::pair().unwrap();
+        let root = std::thread::spawn(move || {
+            let mut wire = Wire::new(right).unwrap();
+            let request = wire.receive(LIFETIME).unwrap();
+            assert_eq!(request.0[0], 0x30);
+            wire.send(&[DECLINED, 0x25]).unwrap();
+        });
+        let mut wire = Wire::new(left).unwrap();
+        let mut remote = Remote::new(&mut wire);
+        let result = lifecycle::create(&directory, &mut remote, &mut Random(0), false);
+        root.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(lifecycle::Error::Token(TokenError::Failed(
+                Transaction::Status(Status::PinInvalid)
+            )))
+        ));
+        assert!(!remote.revoked());
+        assert!(
+            lifecycle::keys(&directory).is_err() || lifecycle::keys(&directory).unwrap().is_empty()
+        );
     }
 
     #[test]

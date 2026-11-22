@@ -58,9 +58,14 @@ PIN, extension, or physical-device interoperability. Every token operation
 has a fresh operation-bound challenge, a fixed deadline, bounded messages,
 explicit cancellation and no automatic retry after an uncertain result.
 
-On td, the dedicated backend identity, exclusive token mediation and trusted
-compositor/td-authd presentation enforce authorization. Authentication input
-does not go through the notebook text editor. An explicitly authorized
+On td, the dedicated backend identity and td-authd's exclusive token
+mediation enforce authorization: root alone opens the key, holds the token
+slot and binds each step to the exact admitted operation. The pinned
+td-pass window presents each step and takes the key's PIN in its own
+masked prompt, never the notebook text editor, and root gives it only to
+its token worker. The PIN and the step's description therefore pass
+through the human account's window process; what that exposes is
+td-pass/DESIGN.md's ("Trusted td backend"). An explicitly authorized
 notebook session permits list, read and entry writes to its pinned
 application instance until it locks; it grants no other application
 personal-vault access. That one unlock is the consent for the session's
@@ -321,8 +326,9 @@ password clears the outgoing buffer, and dropping an entry clears its
 password, notes, title and binding strings. As with the existing notebook,
 this is best-effort clearing, not a claim about compiler or recipient copies.
 The storage/API prerequisite does not itself expose credentials to apps;
-trusted launch admission, secure-attention authorization, session revocation
-and the app-facing transport remain required before the workflow is usable.
+trusted launch admission, root-mediated token authorization, session
+revocation and the app-facing transport remain required before the workflow
+is usable.
 
 ### Implemented ciphertext publication prerequisite
 
@@ -1411,8 +1417,9 @@ out by the trusted launcher; there is no public notebook listener and no
 UID-only browsing admission. Account validation belongs to the launcher before its credential
 drop; the worker reads only the immutable public registry.
 The paired authority launches the pinned service and td-pass window,
-mediates token operations through secure attention, and destroys both at
-session revocation. Standalone mode on td remains refused.
+mediates token operations, presenting each step in that window, and
+destroys both at session revocation. Standalone mode on td remains
+refused.
 
 The worker owns mode-0700 `/var/lib/td/notebooks/OWNER`, under the dedicated
 service identity rather than the human or portal. It applies non-dumpability,
@@ -1453,10 +1460,21 @@ Token operations leave the worker through its private authority connection:
 `30` enrollment and `31` assertion carry purpose, role, fresh operation-bound
 challenges and bounded public credential metadata. Matching replies carry
 only verified token results into clearing owners. The backend does not open
-USB nodes or receive PINs. Missing, malformed or timed-out token replies end
-the service and its unlocked session. The authority adapter must own the
-exclusive token slot and physical secure-attention presentation; no caller
-outside that private root-created connection may supply these replies.
+USB nodes or receive PINs. A refusal, `3f` and one code byte, says the step
+released nothing and why: the token's own reason (a wrong or blocked PIN, no
+key or several connected, a key not enrolled, a step not finished in time,
+the person's decline) or root's (the secure attention screen took the key,
+or a step that ended without a reason). The operation fails with that
+reason in the words standalone mode uses, publishes nothing, and the
+service and any session it holds go on; an unknown code reads as a failed
+step. A step past root's 120-second deadline is the expired code, which
+reads as a step not finished in time. Each token
+request waits 150 seconds for root, longer than that deadline and the
+worker's lifetime, so an unanswered prompt ends as a refusal; missing,
+malformed or timed-out token replies end the service and its unlocked
+session. The authority adapter must own the exclusive token slot
+and each step's presentation; no caller outside that private root-created
+connection may supply these replies.
 
 Synthetic-token tests cover locked and absent-binding refusal, exact matching
 of all three binding fields, independent notes and password text, reopening
@@ -1482,7 +1500,8 @@ responsible for admitting the notebook operation and owning the single
 hardware slot; knowing these bytes is not admission to that slot.
 
 The worker shares the notebook u32 framing, bounded additionally by a
-120-second absolute lifetime. Its initial frame holds a length-prefixed
+130-second absolute lifetime, longer than root's 120-second step deadline
+so that root decides a step's end and relays it. Its initial frame holds a length-prefixed
 consent description and length-prefixed service token request. Presentation
 `40` holds the description; acknowledgement `41` must repeat it exactly.
 PIN `42` holds that same description and a bounded 4–63 byte printable
@@ -1497,8 +1516,11 @@ buffers and never enter diagnostics or the notebook service.
 Only the existing root-admitted FIDO transport and portable lifecycle
 transaction perform device I/O. There must be exactly one admitted key.
 Successful `44` carries the verified service result as one length-prefixed
-field; any error ends the worker without a result. Root supervises this worker in the one operation slot; only successful
-exit plus a clean channel end releases its result to the dedicated service.
+field. A token's refusal, or no key or several connected, is `45` and the
+refusal's code, which root relays to the service as `3f`; any other error
+ends the worker without a result. Root supervises this worker in the one
+token slot; only successful exit plus a clean channel end releases its
+result, or its refusal, to the dedicated service.
 The td-pass client reaches the backend only through root's fixed launch.
 
 The notebook credential-form change saves title, optional replacement notes

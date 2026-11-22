@@ -89,11 +89,12 @@ library's `pass` module, with its host authentication adapter.
 No failed td service request can select standalone mode. Production builds
 do not contain a synthetic-token, file-key or test-authorization fallback.
 
-Stored note text is ordinary application content. Authentication PIN entry
-is a distinct adapter: td uses its trusted attention path, while the host
-adapter states its host trust boundary. td-ui's ordinary editor is not a
-trusted authentication widget. Protocol state, device paths, key material
-and cryptographic details stay out of the notebook flow.
+Stored note text is ordinary application content. A key's PIN is typed
+into the window's own masked prompt in both modes, never into td-ui's
+editor: standalone, the host adapter takes it and states its host trust
+boundary; on td, root's token worker does ("Trusted td backend").
+Protocol state, device paths, key material and cryptographic details
+stay out of the notebook flow.
 
 ## Implemented window
 
@@ -281,7 +282,13 @@ run standalone. No refusal falls back to another mode.
   keeps the field and buttons, the instruction's rows before the
   title's, and a text cut short ends in an ellipsis. The status line
   carries the instruction and the operation. Escape or Cancel declines,
-  which the vault reports as cancelled.
+  which the vault reports as cancelled. A PIN outside 4 to 63 printable
+  ASCII characters keeps the prompt open, saying so, and is not sent.
+  In trusted mode the same prompt
+  shows each step root presents ("Trusted td backend"). A failed or
+  declined step leaves the window on the view it was on, saying why: a
+  wrong PIN, no key or several connected, a key not enrolled, a step
+  not finished in time; the next attempt starts afresh.
 - **Lock.** Lock forgets every document and its history, the find query,
   the titles, the fields and any pending paste, withdraws the window's
   clipboard offer, and has td-ui zero the frames it keeps: its pixels
@@ -539,21 +546,46 @@ exception. Closing it shuts down the socket, including the inherited
 stdin alias, so root observes revocation even if the process remains
 alive.
 
-Browsing and edits use the service protocol. A hardware operation first
-asks the person to press Ctrl+Alt+Esc, then N, which authorizes it on the
-secure-attention screen; N opens no window. Its PIN fields
-exist only there; the ordinary window shows a waiting status and receives
-no PIN or vault key. Creation, unlock, key addition/replacement, encrypted
-export and encrypted-copy import use the same lifecycle as standalone mode.
-Encrypted import/export file access stays in the human's GUI process.
-The shell-based password-store importer is unavailable in trusted mode.
+Browsing and edits use the service protocol. A hardware operation
+(creation, unlock, key addition and replacement, encrypted-copy import)
+runs in the window: root holds the request until the token slot is free,
+then presents each of its token steps there as the standalone prompt
+does. Step zero asks for the named key and Proceed; a PIN step asks for
+the key's PIN, which the window sends to root in a clearing owner and
+root gives only to its token worker. The window never receives a vault
+key or a token's output. These operations use the same lifecycle as
+standalone mode. Encrypted import/export file access stays in the
+human's GUI process. The shell-based password-store importer is
+unavailable in trusted mode.
 
-Root owns session lock, suspend, generation loss and GUI-loss revocation.
-A cancellation closes the notebook window and destroys its vault session.
-A trusted window that refuses to start, or ends on an error, says why on
-stderr and exits 1; root keeps that line in its log and the attention
-screen names the log (td-authd/DESIGN.md, "Notebook token descriptions").
-Closing the window exits 0, which root takes as the person's choice.
+What this mode protects and what it does not: root alone opens the
+key's USB device, holds the slot, and binds each step to the exact
+operation the window asked for, so the key performs only that
+operation, and every step needs the key, its PIN and its touch. The PIN
+and the operation's description pass through the human account's td-pass
+process. Code that can read that process's memory, or a window that
+imitates its prompt, can learn the key's PIN, and a compromised td-pass
+can describe one operation while asking for another, such as a key
+replacement that revokes the backup. Neither reaches the key without the
+person's touch at the machine, and an unlocked notebook already lets its
+window change or delete every entry. A key's PIN is the key's, not the
+notebook credential's: when the notebook's key is also a login key, the
+PIN learned this way also guards boot, login and the session lock, so a
+separate key for the notebook keeps them apart
+(td-login/THREAT-MODEL.md, "How far principle 7 holds").
+
+A declined, refused or failed step fails its operation only: the window
+stays, says why, and the next operation starts afresh; the vault service
+and any session it holds go on. The secure attention screen outranks the
+window: an operation selected there takes the token slot from a notebook
+step, which fails, saying the attention screen took the key, and an
+operation still waiting for the slot waits on. Root owns session lock,
+suspend, generation loss and GUI-loss revocation, each of which closes
+the window and its vault session. A trusted window that refuses to
+start, or ends on an error, says why on stderr and exits 1; root keeps
+that line in its log (td-authd/DESIGN.md, "Notebook token
+descriptions"). Closing the window exits 0, which root takes as the
+person's choice.
 The service has a fifteen-minute absolute unlock ceiling; root closes the
 window when its heartbeat observes expiry. No host logind watcher or
 standalone token worker is started by this backend. Ordinary human-account

@@ -1893,25 +1893,6 @@ impl Request {
             .or(self.protector_step())
     }
 
-    /// Whether the description's ceremony step asks for the recovery key,
-    /// whose field and `1c` are 48 digits.
-    /// Notebook transition shape; receipts and PIN delivery are checked by
-    /// the authority and the physical-input controller, not this codec.
-    pub fn notebook_successor(&self, next: &Self) -> bool {
-        match (&self.operation, &next.operation) {
-            (Operation::Notebook(before), Operation::Notebook(after)) => {
-                self.owner == next.owner
-                    && self.nonce == next.nonce
-                    && before.action == after.action
-                    && before.operation == after.operation
-                    && (after.follows(before)
-                        || (after.step == 0
-                            && matches!((before.method, before.step), (0x30, 3) | (0x31, 1))))
-            }
-            _ => false,
-        }
-    }
-
     pub fn website_successor(&self, next: &Self) -> bool {
         let (Operation::Website(a), Operation::Website(b)) = (&self.operation, &next.operation)
         else {

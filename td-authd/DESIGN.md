@@ -5053,35 +5053,74 @@ are td-secret/PORTABLE.md's lifecycle purposes (1, 2, 3, 5–9); the codec
 rejects mismatched action/purpose pairs. Roles are primary 1 and backup 2.
 Methods are enrollment 0x30 and assertion 0x31. Enrollment purposes also
 permit assertion, for the lifecycle’s independent repeatability proof.
-Step zero requires explicit Enter approval; assertion step 1 or creation
-step 2 and proof step 3 take protected PIN input. All immutable arguments
-must remain identical between steps, and no step repeats or skips.
+Step zero requires the window's explicit approval; assertion step 1 or
+creation step 2 and proof step 3 take the PIN the window sends. All
+immutable arguments must remain identical between steps, and no step
+repeats or skips.
 
-The description labels the notebook, the operation, key role, and whether
-it authorizes with an existing key or enrolls a new one. Creating without
-a backup explicitly says that losing the key makes the vault unrecoverable.
-The digests bind the operation without rendering notebook content. They
-are not authentication. Only root's admitted notebook operation may create
-this description or supply its token result. No public listener or
-standalone fallback supplies notebook credentials.
+The description binds the notebook, the operation, key role, and whether
+it authorizes with an existing key or enrolls a new one; the attention
+screen renders none, and the window words each step from its purpose,
+role and step (td-pass/DESIGN.md, "Trusted td backend"). The digests bind
+the operation without rendering notebook content. They are not
+authentication. Only root's admitted notebook operation may create this
+description or supply its token result. No public listener or standalone
+fallback supplies notebook credentials.
 
-
-The paired session's requests 28, 29 and 2a open the notebook, select its
-pending hardware operation, and query whether one waits. Their replies are
-`a8 00/01`, `a9 01 NONCE`, `a9 00` (nothing selected), `a9 03` (the last
-window failed) and `aa BOOL`. Only 28, the compositor's launcher entry,
-opens a window; 29, the attention screen's N, is the trusted path's
-token step and selects nothing when no window is open. Selecting while
-another operation owns the slot starts nothing.
-
-Request 28 takes no slot, so it opens a window beside another
-operation, and it polls the bridge first, so a window that has just
-closed is not taken for an open one. It answers `a8 01` before the
+The paired session's request 28, the compositor's launcher entry, opens
+the notebook, replying `a8 00` or `a8 01`; the attention screen has no
+notebook request. Request 28 takes no slot, so it opens a window beside
+another operation, and it polls the bridge first, so a window that has
+just closed is not taken for an open one. It answers `a8 01` before the
 session is prepared, during cleanup or a pending suspend, and while a
-failed revocation restarts the machine. With a window already open or a
-notebook operation running it starts nothing and answers `a8 00`. A
-start root cannot make answers `a8 01`: root logs its own reason, as
-`notebook not opened: REASON`, and arms `a9 03` as a failed window does.
+failed revocation restarts the machine. With a window already open it
+starts nothing and answers `a8 00`. A start root cannot make answers
+`a8 01`, and root logs its own reason, as `notebook not opened: REASON`.
+
+The window's hardware operation (actions 1 to 6) waits for the token
+slot: no attention operation, inspection, cleanup, pending suspend,
+restarting revocation or website ceremony in flight: the website
+worker's status at the compositor's last poll names a ticket the seat
+has taken up, past an offer still waiting for it (kinds 0 to 3), which a
+page may hold open. A ceremony begun since that poll is not seen; the
+notebook's synchronous revoke then ends it. Its ten-minute ceiling runs from root's
+receipt of the request, the wait included; one that waits it out is
+dropped, and the window answered `01` and td-secret's words for an
+expired step, without the service seeing it. When it takes the slot,
+root revokes website operations before the service receives it, as for
+any local secret operation, and each token request the service makes
+starts root's worker. Physical attention outranks it: an attention
+operation, once admitted, takes the slot from a running step, which
+fails as superseded, and a failed revocation's reboot waits for the
+operation, at most its ceiling. Each presentation the worker sends
+becomes a prompt to the window, `7d`, a fresh u64 prompt number, the
+step's purpose, role and step, and a flag with the first four bytes of
+the named credential's SHA-256 when the request names one. The window
+answers `7c`, the number, and `00` to proceed, `01` and a PIN field, or
+`02` to decline, naming no prompt (zero) or the one shown; a decline
+naming another is dropped. Root acknowledges step zero's presentation
+on proceed, and a PIN step's when it sends the prompt, since the prompt
+is that step's presentation; it gives the worker the PIN only within a
+PIN's profile (four to 63 printable ASCII bytes) and declines one
+outside it. An answer naming another prompt is dropped, its PIN
+cleared; one naming the current prompt but another kind of step ends
+the bridge.
+
+A step's verified result goes to the service. Anything else declines the
+operation with a code root relays unread as `3f CODE`
+(td-secret/PORTABLE.md, "Private td notebook service"): the worker's
+`45` refusal code, the window's decline, a PIN outside its profile, the
+step's 120-second deadline or the operation's ceiling (both as expired),
+a worker that ended without a reason, or a slot-taking attention
+request, before which root reaps the running step. The step deadline
+runs from the worker's start; the worker's own lifetime is 130 seconds
+and the service waits 150 for each token request, so root's answer
+always arrives first. Once declined, the operation's later token
+requests are refused with the same code without starting a worker. The
+service's final reply goes to the window and ends the operation; the
+window and service stay. A decline while the operation still waits for
+the slot drops it and answers the window `01` and `cancelled`; the
+service never sees it.
 
 Each process's stderr is a nonblocking socketpair whose root end keeps
 its last 512 bytes, drained on every poll and every ceremony advance.
@@ -5099,18 +5138,13 @@ backtrace note, and root then says only that it panicked: the message
 above it may quote what the process held. A later panic in another
 thread prints no note; td-secret aborts on its first, and both programs'
 lints deny panicking code. td-pass and td-secret put no password, PIN or
-token in their failure texts. When a process exited unsuccessfully on
-its own, the next selection with no window answers `a9 03` once, and the
-compositor shows a fixed notice naming the log; the selection after that
-answers `a9 00` again, and an open that starts a window clears it. The
-process's words never reach the attention screen: they are the human
-account's, and the screen is the trusted path. During a hardware
-operation a process that exits unsuccessfully is logged the same way,
-and the operation's own failure is the screen's to show; a token's
-ordinary refusal is not logged, and neither arms `a9 03`. A lock,
-suspend or the generation's close drops the bridge without a line and
-clears `a9 03`, as a newly opened window does; the vault heartbeat's
-expiry is logged like a failed poll but arms nothing.
+token in their failure texts. The process's words never reach the
+attention screen: they are the human account's, and the screen is the
+trusted path. During a hardware operation a process that exits
+unsuccessfully is logged the same way; a token's ordinary refusal is
+the window's to show and is not logged. A lock, suspend or the
+generation's close drops the bridge without a line; the vault
+heartbeat's expiry is logged like a failed poll.
 
 The fixed human GUI command is
 `td-login exec-as PRIMARY -- /bin/td-authd notebook-ui 1000`; the checked
@@ -5129,15 +5163,16 @@ the authority worker sends it before handling further queued work.
 Repeated lock events coalesce. A failed exchange ends the paired session.
 An active notebook operation is cancelled; other operations are untouched.
 
-One immutable GUI request waits for physical selection before root sends
-it to the service. Root hashes it and retains its action across every token
+One immutable GUI request waits for the token slot before root sends it
+to the service. Root hashes it and retains its action across every token
 exchange, each additionally bound to the service's exact request. Root's
 nonblocking worker supervisor checks every presentation transition and PIN
-receipt, bounds each frame, and accepts a result only after a successful
-worker exit and clean EOF. Failure, cancellation or unexpected bytes clear
-the result and stop/reap the worker. No new operation starts until the old
-worker is gone. The overall notebook ceremony has a ten-minute deadline;
-each token worker retains its own 120-second ceiling.
+receipt, bounds each frame, and accepts a result or a `45` refusal only
+after a successful worker exit and clean EOF. Failure, cancellation or
+unexpected bytes clear the result and stop/reap the worker. No new step
+starts until the old worker is gone. The overall notebook operation has a
+ten-minute deadline from root's receipt; each token step has root's
+120-second deadline.
 
 Only the pinned window may browse, edit, import/export or set bindings.
 It cannot submit the service's credential-only tag 12 or token replies.
@@ -5202,7 +5237,11 @@ from the application ledger and starts the fixed td-pass worker with an
 unnamed socketpair. The 32-byte worker generation and the individual
 ticket bind commands to that process and that ceremony. Root revokes
 website operations before local secret operations, session lock or
-suspend. Losing the generation closes the worker. A worker failure is
+suspend. A notebook operation instead waits while the worker's last
+status names a ticket the seat has taken up, since the physical seat
+drives that ceremony, and
+revokes website operations when it takes the slot. Losing the generation
+closes the worker. A worker failure is
 reported as unavailable on this channel. The worker, its private storage
 and the TPM admission record are documented in td-passkeys/DESIGN.md.
 

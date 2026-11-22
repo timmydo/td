@@ -54,7 +54,7 @@ pub fn start(trusted: Option<pass::Trusted>) -> Result<Client, String> {
     let thread = std::thread::Builder::new()
         .name("vault".to_owned())
         .spawn(move || match trusted {
-            Some(transport) => trusted::serve(transport, &job_rx, &reply_tx),
+            Some(transport) => trusted::serve(transport, &job_rx, &answer_rx, &reply_tx),
             None => vault(&job_rx, &answer_rx, &reply_tx),
         })
         .map_err(|error| format!("td-pass cannot start its vault thread: {error}"))?;

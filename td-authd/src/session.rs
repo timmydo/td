@@ -52,8 +52,6 @@ pub(crate) enum Request {
     Prepare,
     Website(crate::website::Frame),
     NotebookOpen,
-    NotebookBegin,
-    NotebookState,
     NotebookLock,
     Poll,
     Inspect,
@@ -91,8 +89,7 @@ impl Request {
     fn takes_slot(&self) -> bool {
         matches!(
             self,
-            Self::NotebookBegin
-                | Self::Inspect
+            Self::Inspect
                 | Self::Write
                 | Self::Install
                 | Self::Begin(_)
@@ -111,8 +108,6 @@ impl Request {
             [0x10] => Ok(Self::Prepare),
             [0x2d, rest @ ..] => Ok(Self::Website(crate::website::Frame::parse(rest)?)),
             [0x28] => Ok(Self::NotebookOpen),
-            [0x29] => Ok(Self::NotebookBegin),
-            [0x2a] => Ok(Self::NotebookState),
             [0x2b] => Ok(Self::NotebookLock),
             [0x11] => Ok(Self::Poll),
             [0x17] => Ok(Self::Inspect),
@@ -172,7 +167,6 @@ impl Start {
 }
 
 enum Active {
-    Notebook(Box<crate::notebook::Ceremony>),
     Secret(Box<Unlock>),
     Install(Box<crate::deployment::Installation>),
     /// A login-key worker shares the one operation slot.
@@ -189,7 +183,6 @@ impl Active {
     /// None only for a login operation awaiting its worker's baseline.
     fn description(&self) -> Option<&Description> {
         match self {
-            Self::Notebook(op) => op.request(),
             Self::Secret(op) => Some(op.request()),
             Self::Install(op) => Some(op.request()),
             Self::Login(op) => op.request(),
@@ -201,7 +194,6 @@ impl Active {
     }
     fn nonce(&self) -> &[u8; 32] {
         match self {
-            Self::Notebook(op) => op.nonce(),
             Self::Secret(op) => op.request().nonce(),
             Self::Install(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
@@ -213,7 +205,6 @@ impl Active {
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
         match self {
-            Self::Notebook(op) => op.presented(request),
             Self::Secret(op) => op.presented(request),
             Self::Install(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
@@ -225,7 +216,6 @@ impl Active {
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
         match self {
-            Self::Notebook(op) => op.commit(request),
             Self::Secret(op) => op.commit(request),
             Self::Install(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
@@ -237,7 +227,6 @@ impl Active {
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
         match self {
-            Self::Notebook(op) => op.cancel(),
             Self::Secret(op) => op.cancel(reason),
             Self::Install(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
@@ -250,7 +239,6 @@ impl Active {
     }
     fn poll(&mut self) -> Result<Event, String> {
         match self {
-            Self::Notebook(op) => op.poll(),
             Self::Secret(op) => op.poll(),
             Self::Install(op) => op.poll(),
             Self::Login(op) => op.poll(),
@@ -262,7 +250,6 @@ impl Active {
     }
     fn reap_for_teardown(self) -> Result<(), String> {
         match self {
-            Self::Notebook(op) => op.reap_for_teardown(),
             Self::Secret(op) => op.reap_for_teardown(),
             Self::Install(op) => op.reap_for_teardown(),
             // The setup intake owns the service and stops it at teardown.
@@ -360,9 +347,6 @@ pub(crate) struct Session {
     website: crate::website::Authority,
     owner: u32,
     notebook: Option<crate::notebook::Bridge>,
-    /// The last notebook bridge ended with a process's own failed exit,
-    /// which the next selection answers with `a9 03` once.
-    notebook_failed: bool,
     notebook_mail: Option<crate::notebook_mail::Intake>,
     intake: Option<crate::secret_intake::Intake>,
     writing: bool,
@@ -404,7 +388,6 @@ impl Session {
             owner,
             website: crate::website::Authority::default(),
             notebook: None,
-            notebook_failed: false,
             notebook_mail: None,
             intake: None,
             writing: false,
@@ -495,12 +478,8 @@ impl Session {
             }
             Request::NotebookLock => {
                 self.notebook = None;
-                self.notebook_failed = false;
                 if let Some(intake) = &mut self.notebook_mail {
                     intake.revoke();
-                }
-                if let Some(Active::Notebook(operation)) = &mut self.operation {
-                    operation.cancel()?;
                 }
                 Ok(vec![0xab])
             }
@@ -511,6 +490,10 @@ impl Session {
                     && self.operation.is_none()
                     && self.inspection.is_none()
                     && self.suspending.is_none()
+                    && !self
+                        .notebook
+                        .as_ref()
+                        .is_some_and(crate::notebook::Bridge::busy)
                     && !self
                         .revocation
                         .as_ref()
@@ -531,53 +514,22 @@ impl Session {
                 {
                     return Ok(vec![0xa8, 1]);
                 }
-                if self.notebook.is_none() && !matches!(self.operation, Some(Active::Notebook(_))) {
+                if self.notebook.is_none() {
                     match crate::notebook::Bridge::start(self.owner) {
                         Ok(bridge) => {
                             self.notebook = Some(bridge);
-                            self.notebook_failed = false;
                         }
-                        // Root's own reason, logged; the next N names the log.
+                        // Root's own reason, logged; the launcher says the
+                        // notebook could not open.
                         Err(why) => {
                             crate::notebook::log(&crate::message(format_args!(
                                 "notebook not opened: {why}"
                             )));
-                            self.notebook_failed = true;
                             return Ok(vec![0xa8, 1]);
                         }
                     }
                 }
                 Ok(vec![0xa8, 0])
-            }
-            Request::NotebookState => {
-                self.tick()?;
-                Ok(vec![
-                    0xaa,
-                    u8::from(self.notebook.as_ref().is_some_and(|b| b.pending())),
-                ])
-            }
-            Request::NotebookBegin => {
-                self.tick()?;
-                // Said once. Only `28`, the launcher's, opens a window: a
-                // selection with none selects nothing.
-                if self.notebook.is_none() && std::mem::take(&mut self.notebook_failed) {
-                    return Ok(vec![0xa9, 3]);
-                }
-                if !self.prepared
-                    || self.cleanup.is_some()
-                    || self.operation.is_some()
-                    || self.inspection.is_some()
-                    || !self.notebook.as_ref().is_some_and(|b| b.pending())
-                {
-                    return Ok(vec![0xa9, 0]);
-                }
-                let bridge = self.notebook.take().ok_or("missing notebook")?;
-                let operation = bridge.begin()?;
-                let mut reply = vec![0xa9, 1];
-                reply.extend_from_slice(operation.nonce());
-                self.operation = Some(Active::Notebook(Box::new(operation)));
-                self.event = Some(Event::Waiting);
-                Ok(reply)
             }
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
@@ -632,7 +584,6 @@ impl Session {
             }
             Request::Pin(description, pin) => {
                 let queued = match &mut self.operation {
-                    Some(Active::Notebook(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Login(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Proof(operation)) => operation.pin(&description, pin)?,
                     // An upgrade's new key's PIN steps, and protector
@@ -758,7 +709,6 @@ impl Session {
             return Ok(vec![0xa5, 2]);
         }
         self.notebook = None;
-        self.notebook_failed = false;
         if let Some(intake) = &mut self.notebook_mail {
             intake.revoke();
         }
@@ -801,6 +751,7 @@ impl Session {
         {
             return Ok(vec![0xa1, 1]);
         }
+        self.yield_notebook();
         let verb = choice.verb();
         let reply = run(choice);
         let accepted = reply.is_some_and(|bytes| {
@@ -855,6 +806,7 @@ impl Session {
                 return Ok(vec![0x99, 0]);
             }
         };
+        self.yield_notebook();
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
         self.operation = Some(Active::Install(Box::new(operation)));
@@ -881,6 +833,7 @@ impl Session {
             Ok(selectors) => selectors,
             Err(refusal) => return Ok(refusal.answer()),
         };
+        self.yield_notebook();
         let operation = Rollback::start(self.owner, selectors)?;
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
@@ -931,6 +884,7 @@ impl Session {
                 return Ok(Refusal::Nothing.answer());
             }
         };
+        self.yield_notebook();
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
         self.operation = Some(Active::Hostname(Box::new(operation)));
@@ -952,10 +906,13 @@ impl Session {
             Ok(value) => value,
             Err(_) => return Ok(vec![0x98, 0]),
         };
+        self.yield_notebook();
         let operation = match Unlock::start_write(self.owner, description, credential) {
             Ok(operation) => operation,
             Err(_) => {
-                intake.finish(false);
+                if let Some(intake) = &mut self.intake {
+                    intake.finish(false);
+                }
                 return Ok(vec![0x98, 0]);
             }
         };
@@ -978,6 +935,7 @@ impl Session {
         {
             return Err("secret session is not ready for inspection".into());
         }
+        self.yield_notebook();
         self.inspection = Some(start(self.owner)?);
         self.inspection_event = Some(InspectionEvent::Waiting);
         Ok(vec![0x97])
@@ -995,6 +953,7 @@ impl Session {
         {
             return Err("secret session is not ready for a new operation".into());
         }
+        self.yield_notebook();
         let operation = begin(self.owner, start)?;
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
@@ -1017,6 +976,7 @@ impl Session {
         {
             return Err("secret session is not ready for a login operation".into());
         }
+        self.yield_notebook();
         let operation = start(self.owner, selection)?;
         let mut answer = vec![0x9b, 1];
         answer.extend_from_slice(operation.nonce());
@@ -1040,6 +1000,7 @@ impl Session {
         {
             return Err("secret session is not ready for a login operation".into());
         }
+        self.yield_notebook();
         let operation = start(self.owner, selection)?;
         let mut answer = vec![0x9b, 1];
         answer.extend_from_slice(operation.nonce());
@@ -1068,6 +1029,7 @@ impl Session {
         {
             return Err("secret session is not ready for a storage operation".into());
         }
+        self.yield_notebook();
         let operation = start(self.owner, selection)?;
         let mut answer = vec![0xa0, 1];
         answer.extend_from_slice(operation.nonce());
@@ -1076,21 +1038,55 @@ impl Session {
         Ok(answer)
     }
 
-    /// Terminal traffic also advances watchdogs without consuming events.
-    pub fn tick(&mut self) -> Result<(), String> {
-        let ended = self
+    /// Drops the notebook bridge for `why`, logging its ending.
+    fn end_notebook(&mut self, why: &str) {
+        let Some(mut bridge) = self.notebook.take() else {
+            return;
+        };
+        if let Some(line) = &bridge.ending(why).line {
+            crate::notebook::log(line);
+        }
+        drop(bridge);
+        if let Some(intake) = &mut self.notebook_mail {
+            intake.revoke();
+        }
+    }
+
+    /// Physical attention outranks the notebook window: an operation it
+    /// admits takes the token slot from a notebook step, which fails. A
+    /// bridge that cannot give the slot up ends, as a failed poll does.
+    fn yield_notebook(&mut self) {
+        let yielded = self
             .notebook
             .as_mut()
-            .and_then(|bridge| bridge.poll().err().map(|why| bridge.ending(&why)));
-        if let Some(ending) = ended {
-            if let Some(line) = &ending.line {
-                crate::notebook::log(line);
-            }
-            self.notebook_failed = ending.failed;
-            self.notebook = None;
-            if let Some(intake) = &mut self.notebook_mail {
-                intake.revoke();
-            }
+            .map(crate::notebook::Bridge::yield_slot);
+        if let Some(Err(why)) = yielded {
+            self.end_notebook(&why);
+        }
+    }
+
+    /// Terminal traffic also advances watchdogs without consuming events.
+    pub fn tick(&mut self) -> Result<(), String> {
+        // The notebook takes the token slot only when nothing else holds
+        // it and nothing could claim it before its step ends.
+        // A website ceremony the physical seat drives outranks it too.
+        let slot_free = self.prepared
+            && self.cleanup.is_none()
+            && self.operation.is_none()
+            && self.inspection.is_none()
+            && self.suspending.is_none()
+            && !self.website.busy()
+            && !self
+                .revocation
+                .as_ref()
+                .is_some_and(crate::revocation::Revocation::restarting);
+        let polled = self.notebook.as_mut().map(|bridge| bridge.poll(slot_free));
+        match polled {
+            // Its operation took the slot: like any local secret operation,
+            // it revokes website operations before its first token step.
+            Some(Ok(true)) => self.website.revoke(),
+            Some(Err(why)) => self.end_notebook(&why),
+            Some(Ok(false)) | None => {}
         }
         if let Some(intake) = &mut self.notebook_mail {
             if let Some(bridge) = &mut self.notebook {
@@ -1176,8 +1172,13 @@ impl Session {
         if let Some(helper) = &mut self.suspending {
             let _ = helper.finished()?;
         }
-        let slot_free =
-            self.operation.is_none() && self.inspection.is_none() && self.suspending.is_none();
+        let slot_free = self.operation.is_none()
+            && self.inspection.is_none()
+            && self.suspending.is_none()
+            && !self
+                .notebook
+                .as_ref()
+                .is_some_and(crate::notebook::Bridge::busy);
         if let Some(revocation) = &mut self.revocation {
             let status = &self.login_state;
             revocation.tick(slot_free, || status.reduced())?;
@@ -1277,9 +1278,6 @@ impl Session {
             // However it ended, the next `1a` reads the login state afresh,
             // and the revocation check begins before this status is sent.
             let login = matches!(operation, Active::Login(_) | Active::Proof(_));
-            if let Some(Active::Notebook(operation)) = &mut self.operation {
-                self.notebook = operation.take_bridge();
-            }
             self.operation = None;
             self.event = None;
             if login {
@@ -1313,7 +1311,6 @@ impl Session {
             }
         }
         self.notebook = None;
-        self.notebook_failed = false;
         if let Some(intake) = &mut self.notebook_mail {
             intake.revoke();
         }

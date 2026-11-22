@@ -159,9 +159,33 @@ impl Worker {
 pub(crate) struct Authority {
     worker: Option<Worker>,
     attempted: Option<Instant>,
+    /// The worker's last status named a ticket the physical seat has taken
+    /// up: a website or management ceremony it is driving.
+    active: bool,
+    /// A test's stand-in for a ceremony in flight.
+    #[cfg(test)]
+    pub(crate) held: bool,
+    #[cfg(test)]
+    pub(crate) revocations: u32,
 }
 impl Authority {
+    /// Whether a ceremony was in flight at the last poll. A notebook
+    /// operation waits for it (td-authd/DESIGN.md, "Notebook token
+    /// descriptions").
+    pub fn busy(&self) -> bool {
+        #[cfg(test)]
+        if self.held {
+            return true;
+        }
+        self.worker.is_some() && self.active
+    }
     pub fn revoke(&mut self) {
+        self.active = false;
+        #[cfg(test)]
+        {
+            self.held = false;
+            self.revocations += 1;
+        }
         if self
             .worker
             .as_mut()
@@ -216,11 +240,50 @@ impl Authority {
             q
         };
         match worker.exchange(q) {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                if polling {
+                    self.active = taken_up(&answer);
+                }
+                Ok(answer)
+            }
             Err(_) => {
                 self.worker = None;
+                self.active = false;
                 idle()
             }
+        }
+    }
+}
+
+/// Whether a status names a ticket the seat has taken up. The status is
+/// `ad`, the generation, the result byte and, while a ticket is open, the
+/// ticket and its kind; kinds 0-3 are an offer still waiting for the seat,
+/// which a page may hold open, so it does not hold the notebook back.
+fn taken_up(status: &[u8]) -> bool {
+    status.get(42).is_some_and(|kind| *kind > 3)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_ticket_the_seat_took_up_holds_the_notebook() {
+        let status = |tail: &[u8]| {
+            let mut bytes = vec![0xad];
+            bytes.extend_from_slice(&[7; 32]);
+            bytes.push(0);
+            bytes.extend_from_slice(tail);
+            bytes
+        };
+        assert!(!super::taken_up(&status(&[])));
+        for offer in 0..=3 {
+            assert!(!super::taken_up(&status(
+                &[[9; 8].as_slice(), &[offer, 1, 2]].concat()
+            )));
+        }
+        for kind in [6, 7, 8, 10, 11, 12, 13, 14, 15, 16] {
+            assert!(super::taken_up(&status(
+                &[[9; 8].as_slice(), &[kind]].concat()
+            )));
         }
     }
 }

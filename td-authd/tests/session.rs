@@ -2542,12 +2542,14 @@ fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
 }
 
 /// `28`, the launcher's, takes no slot and opens nothing before the
-/// session is prepared. A start root cannot make is logged and armed as
-/// a failed window, which the next selection names (`a9 03`).
+/// session is prepared; a start root cannot make answers `a8 01`. The
+/// attention screen's notebook selection and state requests are gone.
 #[test]
-fn a_notebook_open_refuses_unprepared_and_arms_a_failed_start() {
+fn a_notebook_open_refuses_unprepared_and_a_failed_start() {
     assert_eq!(Request::decode(&[0x28]).unwrap(), Request::NotebookOpen);
     assert!(!Request::NotebookOpen.takes_slot());
+    assert!(Request::decode(&[0x29]).is_err());
+    assert!(Request::decode(&[0x2a]).is_err());
     let mut session = quiet();
     let open = |session: &mut Session| {
         session
@@ -2560,22 +2562,10 @@ fn a_notebook_open_refuses_unprepared_and_arms_a_failed_start() {
     };
     assert_eq!(open(&mut session), [0xa8, 1]);
     assert!(session.notebook.is_none());
-    assert!(!session.notebook_failed);
     // Prepared, but the test host has no notebook account to start.
     session.prepared = true;
     assert_eq!(open(&mut session), [0xa8, 1]);
     assert!(session.notebook.is_none());
-    assert!(session.notebook_failed);
-    assert_eq!(
-        session
-            .answer_with(
-                Request::NotebookBegin,
-                |_| panic!("cleanup"),
-                unexpected_begin
-            )
-            .unwrap(),
-        [0xa9, 3]
-    );
 }
 
 /// An open window is kept, not started again: `28` answers that it is
@@ -2602,31 +2592,10 @@ fn a_notebook_open_keeps_an_open_window() {
     }
 }
 
-/// Only the launcher's `28` opens the notebook: a prepared session's
-/// selection with no window selects nothing and starts no window.
+/// A window that exits unsuccessfully ends its bridge, and nothing of it
+/// reaches the attention screen: its words are root's log's.
 #[test]
-fn a_notebook_selection_with_no_window_opens_none() {
-    let mut session = quiet();
-    session.prepared = true;
-    assert_eq!(
-        session
-            .answer_with(
-                Request::NotebookBegin,
-                |_| panic!("cleanup"),
-                unexpected_begin
-            )
-            .unwrap(),
-        [0xa9, 0]
-    );
-    assert!(session.notebook.is_none());
-    assert!(session.operation.is_none());
-}
-
-/// A window that exits unsuccessfully is reported once, to the next
-/// selection, as `a9 03`, and only once: the selection after it is an
-/// ordinary one.
-#[test]
-fn a_notebook_window_that_failed_answers_the_next_selection_once() {
+fn a_notebook_window_that_failed_ends_its_bridge() {
     let mut session = quiet();
     let (bridge, _) = crate::notebook::tests::refusing_bridge();
     session.notebook = Some(bridge);
@@ -2636,36 +2605,19 @@ fn a_notebook_window_that_failed_answers_the_next_selection_once() {
         assert!(Instant::now() < deadline, "the failed window went unseen");
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(session.notebook_failed);
-    assert_eq!(
-        session
-            .answer_with(
-                Request::NotebookBegin,
-                |_| panic!("cleanup"),
-                unexpected_begin
-            )
-            .unwrap(),
-        [0xa9, 3]
-    );
-    assert!(!session.notebook_failed);
-    // Said once: the next selection is an ordinary one.
-    assert_eq!(
-        session
-            .answer_with(
-                Request::NotebookBegin,
-                |_| panic!("cleanup"),
-                unexpected_begin
-            )
-            .unwrap(),
-        [0xa9, 0]
-    );
+    assert!(session.operation.is_none());
 }
 
+/// A notebook operation holds the token slot outside the attention
+/// screen's: revocation waits for it, and a lock ends it with both
+/// private processes.
 #[test]
-fn notebook_lock_stops_an_active_ceremony_and_both_private_processes() {
+fn notebook_lock_stops_an_active_operation_and_both_private_processes() {
     let mut session = quiet();
-    let (ceremony, pids) = crate::notebook::tests::ceremony();
-    session.operation = Some(Active::Notebook(Box::new(ceremony)));
+    let (bridge, pids) = crate::notebook::tests::ceremony();
+    assert!(bridge.busy());
+    session.notebook = Some(bridge);
+    assert!(session.operation.is_none());
     assert_eq!(
         session
             .answer_with(
@@ -2676,11 +2628,50 @@ fn notebook_lock_stops_an_active_ceremony_and_both_private_processes() {
             .unwrap(),
         [0xab]
     );
+    assert!(session.notebook.is_none());
     for pid in pids {
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
-    assert!(matches!(
-        session.operation.as_mut().unwrap().poll().unwrap(),
-        Event::Failed(_)
-    ));
+}
+
+/// A website ceremony the physical seat drives holds a waiting notebook
+/// operation back; once it ends, the notebook takes the slot and revokes
+/// website operations before its first token step.
+#[test]
+fn a_website_ceremony_holds_a_notebook_operation_back() {
+    let mut session = quiet();
+    prepare(&mut session);
+    let (bridge, _) = crate::notebook::tests::waiting();
+    session.notebook = Some(bridge);
+    session.website.held = true;
+    for _ in 0..5 {
+        session.tick().unwrap();
+        assert!(!session.notebook.as_ref().unwrap().busy());
+    }
+    session.website.held = false;
+    let revocations = session.website.revocations;
+    session.tick().unwrap();
+    assert!(session.notebook.as_ref().unwrap().busy());
+    assert_eq!(session.website.revocations, revocations + 1);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// An operation the attention screen selects takes the slot from the
+/// notebook's: the notebook stops holding it, whatever then answers.
+#[test]
+fn an_attention_operation_takes_the_slot_from_the_notebook() {
+    let mut session = quiet();
+    prepare(&mut session);
+    let (bridge, _) = crate::notebook::tests::ceremony();
+    session.notebook = Some(bridge);
+    // A slot request refused before admission takes nothing.
+    assert!(session
+        .answer_with(Request::Write, |_| panic!("cleanup"), unexpected_begin)
+        .is_err());
+    assert!(session.notebook.as_ref().unwrap().busy());
+    session
+        .inspect_with(|_| Ok(crate::inspection::tests::fixture(3)))
+        .unwrap();
+    assert!(!session.notebook.as_ref().unwrap().busy());
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
 }

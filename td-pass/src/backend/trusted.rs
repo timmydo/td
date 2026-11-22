@@ -9,46 +9,218 @@ use super::*;
 mod wire;
 use wire::{field, Bytes as Frame, Reader};
 
-struct Backend {
-    transport: pass::Trusted,
+/// How long root may take to answer: an operation's ceiling, ten
+/// minutes from root's receipt with the wait for the slot within it, and
+/// the vault service's own allowance after it; and, once declined, root's
+/// reply saying so.
+#[derive(Clone, Copy)]
+struct Times {
+    answer: Duration,
+    decline: Duration,
+}
+
+const TIMES: Times = Times {
+    answer: Duration::from_secs(650),
+    decline: Duration::from_secs(30),
+};
+
+/// Root's end of the window's private channel.
+trait Link {
+    type Message: Message;
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn poll(&mut self) -> Result<Option<Self::Message>, String>;
+}
+
+trait Message {
+    fn bytes(&self) -> &[u8];
+}
+
+impl Link for pass::Trusted {
+    type Message = pass::TrustedMessage;
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        pass::Trusted::send(self, bytes)
+    }
+    fn poll(&mut self) -> Result<Option<pass::TrustedMessage>, String> {
+        pass::Trusted::poll(self)
+    }
+}
+
+impl Message for pass::TrustedMessage {
+    fn bytes(&self) -> &[u8] {
+        pass::TrustedMessage::bytes(self)
+    }
+}
+
+struct Backend<'a, L: Link> {
+    transport: L,
+    times: Times,
+    answers: &'a Receiver<(Op, Answer)>,
     enrolled: Vec<pass::Key>,
     using: Option<usize>,
     revision: u64,
     copy: Option<(Vec<u8>, Vec<pass::Key>)>,
+    /// Root did not answer in time: the channel's replies can no longer
+    /// be matched to requests, and the thread ends.
+    broken: bool,
 }
 
-impl Backend {
+/// Root's prompt for a step (`7d`): its number, the step's purpose, the
+/// key's role, the step, and the enrolled key's fingerprint when the
+/// step names one.
+fn prompt(bytes: &[u8]) -> Result<([u8; 8], Ask), String> {
+    let mut input = Reader::new(bytes);
+    input.byte()?;
+    let number = input.array()?;
+    let operation =
+        pass::step_operation(input.byte()?).ok_or("root prompted for an unknown purpose")?;
+    let role = match input.byte()? {
+        1 => Role::Primary,
+        2 => Role::Backup,
+        _ => return Err("root prompted for an unknown key role".into()),
+    };
+    let pin = match input.byte()? {
+        0 => None,
+        1 => Some(PinUse::Authorize),
+        2 => Some(PinUse::Enroll),
+        3 => Some(PinUse::Proof),
+        _ => return Err("root prompted for an unknown step".into()),
+    };
+    let key = if input.boolean()? {
+        Some(fingerprint(input.array()?)?)
+    } else {
+        None
+    };
+    input.finish()?;
+    Ok((
+        number,
+        Ask {
+            operation,
+            role,
+            key,
+            pin,
+        },
+    ))
+}
+
+/// The window's answer to root's prompt `number` (`7c`): proceed, the
+/// PIN, or decline, which names no prompt.
+fn answer(number: [u8; 8], answer: Answer) -> Result<Frame, String> {
+    let (kind, pin) = match &answer {
+        Answer::Proceed => (0, None),
+        Answer::Pin(pin) => (1, Some(pin.as_slice())),
+        Answer::Decline => (2, None),
+    };
+    let size = pin.map_or(0, |pin| 4 + pin.len());
+    // Reserved whole, so no reallocation leaves a copy of the PIN behind.
+    let mut frame = Frame(td_alloc::with_capacity(10 + size).map_err(|_| ALLOCATION)?);
+    let head = [[0x7c].as_slice(), &number, &[kind]];
+    for part in head {
+        td_alloc::extend_from_slice(&mut frame.0, part).map_err(|_| ALLOCATION)?;
+    }
+    if let Some(pin) = pin {
+        field(&mut frame, pin)?;
+    }
+    Ok(frame)
+}
+
+const ALLOCATION: &str = "the notebook window could not allocate a message";
+
+/// A key's fingerprint in hex, as standalone mode shows it.
+fn fingerprint(key: [u8; 4]) -> Result<String, String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = td_alloc::with_capacity(8).map_err(|_| ALLOCATION)?;
+    for byte in key {
+        for nibble in [byte >> 4, byte & 15] {
+            let digit = HEX.get(usize::from(nibble)).copied().unwrap_or(b'0');
+            td_alloc::push(&mut text, digit).map_err(|_| ALLOCATION)?;
+        }
+    }
+    String::from_utf8(text).map_err(|_| ALLOCATION.into())
+}
+
+impl<L: Link> Backend<'_, L> {
+    /// One request and root's reply. Root's prompts for a hardware step
+    /// go to the window as the standalone prompt's, and the window's
+    /// answers back; abandoning the operation declines it, and the
+    /// reply root then sends, saying so, ends the exchange.
     fn exchange(
         &mut self,
         frame: Frame,
         op: Op,
         cancel: &pass::Cancel,
         replies: &Sender<Reply>,
-    ) -> Result<pass::TrustedMessage, String> {
+    ) -> Result<L::Message, String> {
+        match self.exchange_framed(frame, op, cancel, replies) {
+            Ok(reply) => reply,
+            Err(broken) => {
+                self.broken = true;
+                Err(broken)
+            }
+        }
+    }
+
+    /// The exchange's reply, root's refusal as the inner error; the outer
+    /// one is the channel's, after which no reply can be trusted to
+    /// answer its request.
+    fn exchange_framed(
+        &mut self,
+        frame: Frame,
+        op: Op,
+        cancel: &pass::Cancel,
+        replies: &Sender<Reply>,
+    ) -> Result<Result<L::Message, String>, String> {
         self.transport.send(&frame.0)?;
-        let end = Instant::now()
-            .checked_add(Duration::from_secs(650))
+        let mut end = Instant::now()
+            .checked_add(self.times.answer)
             .ok_or("notebook deadline overflow")?;
+        let mut asked: Option<[u8; 8]> = None;
+        let mut declined = false;
         loop {
-            if cancel.cancelled() || Instant::now() >= end {
-                return Err("notebook operation cancelled; close and reopen the window".into());
+            if Instant::now() >= end {
+                return Err(
+                    "the notebook service stopped answering; close and reopen the window".into(),
+                );
+            }
+            if cancel.cancelled() && !declined {
+                declined = true;
+                asked = None;
+                end = Instant::now()
+                    .checked_add(self.times.decline)
+                    .ok_or("notebook deadline overflow")?;
+                self.transport.send(&answer([0; 8], Answer::Decline)?.0)?;
+            }
+            // Only the asked operation's answer counts; a late one is
+            // dropped, clearing any PIN it carried.
+            while let Ok((answered, reply)) = self.answers.try_recv() {
+                if answered != op || declined {
+                    continue;
+                }
+                if let Some(number) = asked.take() {
+                    declined = matches!(reply, Answer::Decline);
+                    self.transport.send(&answer(number, reply)?.0)?;
+                }
             }
             if let Some(message) = self.transport.poll()? {
-                if message.bytes() == [0x7e] {
-                    replies
-                        .send(Reply::TrustedAttention { op })
-                        .map_err(|_| "notebook window closed")?;
-                } else {
-                    let mut input = Reader::new(message.bytes());
-                    match input.byte()? {
-                        0 => return Ok(message),
-                        1 => {
-                            let error = input.text(4096)?.to_owned();
-                            input.finish()?;
-                            return Err(error);
+                let mut input = Reader::new(message.bytes());
+                match input.byte()? {
+                    0x7d => {
+                        let (number, ask) = prompt(message.bytes())?;
+                        if !declined {
+                            asked = Some(number);
+                            replies
+                                .send(Reply::Ask { op, ask })
+                                .map_err(|_| "notebook window closed")?;
                         }
-                        _ => return Err("invalid trusted notebook reply".into()),
                     }
+                    0 => return Ok(Ok(message)),
+                    1 => {
+                        let error = td_alloc::copy(input.text(4096)?.as_bytes())
+                            .map_err(|_| ALLOCATION)
+                            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| ALLOCATION))?;
+                        input.finish()?;
+                        return Ok(Err(error));
+                    }
+                    _ => return Err("invalid trusted notebook reply".into()),
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -60,7 +232,7 @@ impl Backend {
         op: Op,
         cancel: &pass::Cancel,
         replies: &Sender<Reply>,
-    ) -> Result<pass::TrustedMessage, String> {
+    ) -> Result<L::Message, String> {
         self.exchange(Frame(bytes), op, cancel, replies)
     }
     fn keys(
@@ -364,7 +536,7 @@ impl Backend {
         }
     }
 }
-fn success(message: &pass::TrustedMessage) -> Result<Reader<'_>, String> {
+fn success(message: &impl Message) -> Result<Reader<'_>, String> {
     let mut reader = Reader::new(message.bytes());
     if reader.byte()? != 0 {
         return Err("notebook request failed".into());
@@ -388,15 +560,36 @@ fn operation(command: &Command) -> Op {
         _ => 0,
     }
 }
-pub(super) fn serve(transport: pass::Trusted, jobs: &Receiver<Job>, replies: &Sender<Reply>) {
+pub(super) fn serve(
+    transport: pass::Trusted,
+    jobs: &Receiver<Job>,
+    answers: &Receiver<(Op, Answer)>,
+    replies: &Sender<Reply>,
+) {
+    serve_on(transport, TIMES, jobs, answers, replies);
+}
+
+fn serve_on(
+    transport: impl Link,
+    times: Times,
+    jobs: &Receiver<Job>,
+    answers: &Receiver<(Op, Answer)>,
+    replies: &Sender<Reply>,
+) {
     let mut backend = Backend {
         transport,
+        times,
+        answers,
         enrolled: Vec::new(),
         using: None,
         revision: 0,
         copy: None,
+        broken: false,
     };
     loop {
+        // An answer that came after its operation ended is dropped here,
+        // clearing any PIN it carried.
+        while answers.try_recv().is_ok() {}
         let job = match jobs.recv_timeout(Duration::from_millis(750)) {
             Ok(job) => job,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -452,8 +645,270 @@ pub(super) fn serve(transport: pass::Trusted, jobs: &Receiver<Job>, replies: &Se
                 },
             },
         };
-        if replies.send(reply).is_err() || cancelled {
+        // A declined operation fails like any other; the next is served.
+        if replies.send(reply).is_err() || backend.broken {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn frame(purpose: u8, role: u8, step: u8, key: Option<[u8; 4]>) -> Vec<u8> {
+        let mut bytes = vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 9, purpose, role, step];
+        match key {
+            Some(key) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&key);
+            }
+            None => bytes.push(0),
+        }
+        bytes
+    }
+
+    /// Root's prompt becomes the standalone prompt's ask, in its words:
+    /// step zero asks for the key, later steps for its PIN by use.
+    #[test]
+    fn root_prompts_read_as_the_standalone_prompt() {
+        let (number, ask) = prompt(&frame(3, 1, 0, Some([0xab, 0, 0x12, 0xff]))).unwrap();
+        assert_eq!(number, [0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(
+            ask,
+            Ask {
+                operation: pass::step_operation(3).unwrap(),
+                role: Role::Primary,
+                key: Some("ab0012ff".into()),
+                pin: None,
+            }
+        );
+        assert!(ask.operation.starts_with("unlock"));
+        for (step, pin) in [
+            (1, PinUse::Authorize),
+            (2, PinUse::Enroll),
+            (3, PinUse::Proof),
+        ] {
+            let (_, ask) = prompt(&frame(6, 2, step, None)).unwrap();
+            assert_eq!(
+                (ask.role, ask.key, ask.pin),
+                (Role::Backup, None, Some(pin))
+            );
+        }
+        for bad in [
+            frame(4, 1, 0, None),
+            frame(3, 3, 0, None),
+            frame(3, 1, 4, None),
+            frame(3, 1, 0, None)[..11].to_vec(),
+            [frame(3, 1, 0, None), vec![0]].concat(),
+        ] {
+            assert!(prompt(&bad).is_err());
+        }
+    }
+
+    /// A link whose replies a script gives from the frames sent so far.
+    struct Scripted<F: FnMut(&[Vec<u8>]) -> Option<Vec<u8>>> {
+        sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+        script: F,
+    }
+
+    struct Plain(Vec<u8>);
+    impl Message for Plain {
+        fn bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl<F: FnMut(&[Vec<u8>]) -> Option<Vec<u8>>> Link for Scripted<F> {
+        type Message = Plain;
+        fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.sent.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Option<Plain>, String> {
+            Ok((self.script)(&self.sent.borrow()).map(Plain))
+        }
+    }
+
+    const QUICK: Times = Times {
+        answer: Duration::from_secs(5),
+        decline: Duration::from_millis(100),
+    };
+
+    type Sent = std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>;
+
+    fn backend<'a, F: FnMut(&[Vec<u8>]) -> Option<Vec<u8>>>(
+        script: F,
+        answers: &'a Receiver<(Op, Answer)>,
+    ) -> (Backend<'a, Scripted<F>>, Sent) {
+        let sent = Sent::default();
+        (
+            Backend {
+                transport: Scripted {
+                    sent: sent.clone(),
+                    script,
+                },
+                times: QUICK,
+                answers,
+                enrolled: Vec::new(),
+                using: None,
+                revision: 0,
+                copy: None,
+                broken: false,
+            },
+            sent,
+        )
+    }
+
+    fn failure(text: &str) -> Vec<u8> {
+        let mut bytes = Frame(vec![1]);
+        field(&mut bytes, text.as_bytes()).unwrap();
+        bytes.0.clone()
+    }
+
+    /// Abandoning an operation declines it once, naming no prompt, and
+    /// root then has only the decline's time to answer.
+    #[test]
+    fn a_cancel_declines_once_and_shortens_the_wait() {
+        let (_answering, answers) = std::sync::mpsc::channel();
+        let (replies, _shown) = std::sync::mpsc::channel();
+        let (mut backend, sent) = backend(|_| None, &answers);
+        let cancel = pass::Cancel::new();
+        cancel.cancel();
+        let start = Instant::now();
+        assert!(backend
+            .exchange(Frame(vec![3]), 4, &cancel, &replies)
+            .is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(backend.broken);
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], answer([0; 8], Answer::Decline).unwrap().0);
+    }
+
+    /// A prompt root sends after the decline is not shown, and root's
+    /// reply saying so ends the exchange as that failure.
+    #[test]
+    fn a_prompt_after_a_decline_is_not_shown() {
+        let (_answering, answers) = std::sync::mpsc::channel();
+        let (replies, shown) = std::sync::mpsc::channel();
+        let mut turn = 0;
+        let (mut backend, _) = backend(
+            |sent| {
+                if sent.len() < 2 {
+                    return None;
+                }
+                turn += 1;
+                match turn {
+                    1 => Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 2, 3, 1, 1, 0]),
+                    2 => Some(failure("cancelled")),
+                    _ => None,
+                }
+            },
+            &answers,
+        );
+        let cancel = pass::Cancel::new();
+        cancel.cancel();
+        let reply = backend
+            .exchange_framed(Frame(vec![3]), 4, &cancel, &replies)
+            .unwrap();
+        assert_eq!(reply.err().unwrap(), "cancelled");
+        assert!(shown.try_recv().is_err());
+        assert!(!backend.broken);
+    }
+
+    /// Only the asked operation's answer reaches root, naming its prompt.
+    #[test]
+    fn answers_for_another_operation_are_dropped() {
+        let (answering, answers) = std::sync::mpsc::channel();
+        let (replies, shown) = std::sync::mpsc::channel();
+        let mut prompted = false;
+        let (mut backend, sent) = backend(
+            |sent| {
+                if !prompted {
+                    prompted = true;
+                    return Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 7, 3, 1, 1, 0]);
+                }
+                if shown_answer(sent) {
+                    return Some(vec![0]);
+                }
+                answering.send((5, Answer::Proceed)).unwrap();
+                answering
+                    .send((4, Answer::Pin(Bytes::copy(b"123456"))))
+                    .unwrap();
+                None
+            },
+            &answers,
+        );
+        let reply = backend
+            .exchange_framed(Frame(vec![3]), 4, &pass::Cancel::new(), &replies)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.bytes(), [0]);
+        assert!(matches!(shown.try_recv(), Ok(Reply::Ask { op: 4, .. })));
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[1],
+            answer(
+                [0, 0, 0, 0, 0, 0, 0, 7],
+                Answer::Pin(Bytes::copy(b"123456"))
+            )
+            .unwrap()
+            .0
+        );
+    }
+
+    fn shown_answer(sent: &[Vec<u8>]) -> bool {
+        sent.iter().any(|frame| frame.first() == Some(&0x7c))
+    }
+
+    /// A channel root stopped answering ends the thread, and an answer
+    /// left from an ended operation is dropped before the next job.
+    #[test]
+    fn a_broken_channel_ends_the_thread_and_late_answers_are_dropped() {
+        let (answering, answers) = std::sync::mpsc::channel();
+        let (replies, shown) = std::sync::mpsc::channel();
+        let (jobs, queue) = std::sync::mpsc::channel();
+        answering
+            .send((9, Answer::Pin(Bytes::copy(b"123456"))))
+            .unwrap();
+        jobs.send(Job {
+            command: Command::Open,
+            cancel: pass::Cancel::new(),
+        })
+        .unwrap();
+        let sent = Sent::default();
+        let link = Scripted {
+            sent: sent.clone(),
+            script: |_: &[Vec<u8>]| None,
+        };
+        let times = Times {
+            answer: Duration::from_millis(100),
+            decline: Duration::from_millis(100),
+        };
+        // The jobs channel stays open: only the broken channel ends it.
+        serve_on(link, times, &queue, &answers, &replies);
+        assert!(answers.try_recv().is_err());
+        assert!(matches!(shown.try_recv(), Ok(Reply::Refused { .. })));
+        assert_eq!(sent.borrow().len(), 1);
+        drop(jobs);
+    }
+
+    #[test]
+    fn answers_name_their_prompt_and_a_decline_names_none() {
+        let number = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(
+            answer(number, Answer::Proceed).unwrap().0,
+            [0x7c, 1, 2, 3, 4, 5, 6, 7, 8, 0]
+        );
+        assert_eq!(
+            answer(number, Answer::Pin(Bytes::copy(b"123456")))
+                .unwrap()
+                .0,
+            [0x7c, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0, 0, 0, 6, b'1', b'2', b'3', b'4', b'5', b'6']
+        );
+        assert_eq!(answer([0; 8], Answer::Decline).unwrap().0[9], 2);
     }
 }

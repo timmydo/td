@@ -33,6 +33,7 @@ dependencies = [
 name = "td-pass"
 version = "0.1.0"
 dependencies = [
+ "td-alloc",
  "td-passkeys",
  "td-secret",
  "td-test-compositor",

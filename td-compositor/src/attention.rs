@@ -180,8 +180,7 @@ impl Prepared {
                 && request.protector_step().is_none()
                 && !matches!(
                     request.operation(),
-                    crate::authority::consent::Operation::Notebook(_)
-                        | crate::authority::consent::Operation::Website(_)
+                    crate::authority::consent::Operation::Website(_)
                 ))
         {
             let scale = if doubled { 2 } else { 1 };
@@ -756,7 +755,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
-            "K: LOGIN KEYS  N: AUTHORIZE NOTEBOOK",
+            "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
         ],
@@ -1166,7 +1165,7 @@ mod tests {
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
-            "K: LOGIN KEYS  N: AUTHORIZE NOTEBOOK",
+            "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO SETTINGS WAITING",
@@ -1418,8 +1417,6 @@ mod tests {
         Notice::Login(&["A RETAINED SYSTEM CANNOT READ KEYS"]),
         Notice::Login(&["THE OPERATION FAILED"]),
         Notice::Login(crate::secret_client::TOO_SMALL),
-        Notice::Login(crate::secret_client::NOTEBOOK_FAILED),
-        Notice::Login(crate::secret_client::NOTEBOOK_NOTHING_WAITING),
         Notice::Uncertain(&["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"]),
         Notice::Restarting,
     ];

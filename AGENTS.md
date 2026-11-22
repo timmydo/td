@@ -142,7 +142,7 @@ keeps these invariants:
    this ships. Other secrets require a second recovery token or an explicit
    unrecoverability decision.
 
-Principle 7 has two explicit exceptions. Trusted live-media installation
+Principle 7 has three explicit exceptions. Trusted live-media installation
 needs no secure attention: its isolated wizard and ordinary input are
 trusted to confirm the exact reviewed disk and erase/preserve mode, which
 is neither installed-session elevation nor authentication
@@ -151,7 +151,10 @@ separately provisioned SSH key may request signed-release or fixed-main
 installation, rollback to the retained deployment and orderly reboot
 without another prompt; the source revision is pinned per job, builds use a
 separate unprivileged identity, and no caller-supplied command or source is
-admitted (`td-update/ADMIN.md`).
+admitted (`td-update/ADMIN.md`). The trusted password notebook's window
+takes its key's approval and PIN in its own prompt; root owns the token
+slot and binds each step to the window's admitted operation
+(`td-pass/DESIGN.md`, "Trusted td backend", states what this exposes).
 
 Principle 7 is a target, not a current claim; `td-login/THREAT-MODEL.md`,
 "How far principle 7 holds", says what holds today.

@@ -451,7 +451,8 @@ fn the_test_vault_is_built_only_by_its_feature() {
     assert_eq!(backend.matches("fixture").count(), 3);
     assert!(backend.contains("#[cfg(not(feature = \"test-vault\"))]\nuse serve as vault;\n"));
     assert!(backend.contains("None => vault(&job_rx, &answer_rx, &reply_tx),"));
-    assert!(backend.contains("Some(transport) => trusted::serve(transport, &job_rx, &reply_tx),"));
+    assert!(backend
+        .contains("Some(transport) => trusted::serve(transport, &job_rx, &answer_rx, &reply_tx),"));
     assert!(backend.contains("let _ = started.send(watch());"));
     for &name in FILES {
         if !matches!(name, "backend.rs" | "backend/fixture.rs" | "main.rs") {

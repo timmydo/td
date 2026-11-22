@@ -1174,8 +1174,8 @@ td-authd/src/login_status.rs	unchecked-growth-or-clone	15
 td-authd/src/main.rs	allocating-conversion	10
 td-authd/src/main.rs	allocation-macro	3
 td-authd/src/notebook.rs	allocating-conversion	5
-td-authd/src/notebook.rs	allocation-macro	10
-td-authd/src/notebook.rs	unchecked-growth-or-clone	6
+td-authd/src/notebook.rs	allocation-macro	6
+td-authd/src/notebook.rs	unchecked-growth-or-clone	5
 td-authd/src/notebook_mail.rs	allocation-macro	1
 td-authd/src/notebook_mail.rs	unchecked-growth-or-clone	5
 td-authd/src/notebook_token.rs	allocating-conversion	1
@@ -1205,9 +1205,9 @@ td-authd/src/secret_request.rs	allocation-macro	1
 td-authd/src/secret_request.rs	unchecked-growth-or-clone	7
 td-authd/src/secret_sys.rs	unchecked-growth-or-clone	2
 td-authd/src/session.rs	allocating-conversion	1
-td-authd/src/session.rs	allocation-macro	59
-td-authd/src/session.rs	heap-owner	10
-td-authd/src/session.rs	unchecked-growth-or-clone	20
+td-authd/src/session.rs	allocation-macro	55
+td-authd/src/session.rs	heap-owner	9
+td-authd/src/session.rs	unchecked-growth-or-clone	19
 td-authd/src/set_hostname.rs	allocating-constructor	2
 td-authd/src/set_hostname.rs	allocating-conversion	11
 td-authd/src/set_hostname.rs	allocation-macro	8
@@ -1486,9 +1486,9 @@ td-compositor/src/screenshot.rs	allocating-conversion	3
 td-compositor/src/screenshot.rs	allocation-macro	8
 td-compositor/src/screenshot.rs	unchecked-growth-or-clone	1
 td-compositor/src/secret_client.rs	allocating-conversion	11
-td-compositor/src/secret_client.rs	allocation-macro	27
+td-compositor/src/secret_client.rs	allocation-macro	25
 td-compositor/src/secret_client.rs	heap-owner	1
-td-compositor/src/secret_client.rs	unchecked-growth-or-clone	20
+td-compositor/src/secret_client.rs	unchecked-growth-or-clone	17
 td-compositor/src/server.rs	allocating-constructor	4
 td-compositor/src/server.rs	allocating-conversion	223
 td-compositor/src/server.rs	allocation-macro	269
@@ -3188,7 +3188,7 @@ td-pass/src/backend/fixture.rs	allocating-conversion	12
 td-pass/src/backend/fixture.rs	allocation-macro	13
 td-pass/src/backend/fixture.rs	unchecked-growth-or-clone	7
 td-pass/src/backend/trusted.rs	allocating-constructor	1
-td-pass/src/backend/trusted.rs	allocating-conversion	11
+td-pass/src/backend/trusted.rs	allocating-conversion	10
 td-pass/src/backend/trusted.rs	allocation-macro	14
 td-pass/src/backend/trusted.rs	unchecked-growth-or-clone	23
 td-pass/src/files.rs	allocating-constructor	1

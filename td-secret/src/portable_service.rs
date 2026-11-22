@@ -242,8 +242,20 @@ impl Backend {
 }
 
 fn reason(error: lifecycle::Error) -> String {
-    // Lifecycle errors contain no PIN, key, notebook text or device response.
-    format!("notebook operation refused: {error:?}")
+    format!("{}", Reason(error))
+}
+
+/// A refusal in words: a token's in the words standalone mode uses, any
+/// other the lifecycle's. Neither contains a PIN, key, notebook text or
+/// device response.
+struct Reason(lifecycle::Error);
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            lifecycle::Error::Token(token) => f.write_str(super::pass::token_text(token)),
+            error => write!(f, "notebook operation refused: {error:?}"),
+        }
+    }
 }
 
 fn change(input: &mut Reader<'_>) -> Result<Change, String> {

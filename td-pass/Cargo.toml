@@ -31,6 +31,7 @@ indexing_slicing = "deny"
 # The window draws through td-ui; the vault, its tokens and the host's
 # protection are td-secret's notebook library, its `pass` module.
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-ui = { path = "../td-ui" }
 td-passkeys = { path = "../td-passkeys" }
 td-secret = { path = "../td-secret" }

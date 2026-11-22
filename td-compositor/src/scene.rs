@@ -3485,14 +3485,6 @@ impl Scene {
                 Some(previous)
                     if matches!(
                         previous.operation(),
-                        crate::authority::consent::Operation::Notebook(_)
-                    ) =>
-                {
-                    previous.notebook_successor(&request)
-                }
-                Some(previous)
-                    if matches!(
-                        previous.operation(),
                         crate::authority::consent::Operation::Website(_)
                     ) =>
                 {

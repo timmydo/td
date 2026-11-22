@@ -9,6 +9,12 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// One step's deadline from its worker's start. The worker's own
+/// lifetime is longer and the vault service waits longer still, so root
+/// decides a step's end and relays it (td-secret/PORTABLE.md, "Root
+/// notebook token exchange").
+const STEP_TIME: Duration = Duration::from_secs(120);
+
 #[derive(PartialEq, Eq)]
 enum Phase {
     Starting,
@@ -29,6 +35,11 @@ pub(crate) struct Token {
     pending_pin: Option<Bytes>,
     result: Option<Bytes>,
     failure: Option<String>,
+    /// The worker's `45`: the token refused the step, and why, as a code
+    /// root relays to the vault service unread.
+    refusal: Option<u8>,
+    /// The step outlived its deadline: root's reason, which it relays.
+    expired: bool,
 }
 
 impl Token {
@@ -53,7 +64,7 @@ impl Token {
         let mut wire = PendingWire::new(root)?;
         wire.queue(initial)?;
         let deadline = Instant::now()
-            .checked_add(Duration::from_secs(120))
+            .checked_add(STEP_TIME)
             .ok_or("notebook deadline overflow")?;
         let child = command
             .stdin(Stdio::from(OwnedFd::from(worker)))
@@ -68,18 +79,38 @@ impl Token {
             pending_pin: None,
             result: None,
             failure: None,
+            refusal: None,
+            expired: false,
         })
     }
 
-    pub fn request(&self) -> &Request {
-        &self.request
+    /// Whether the step ended because it outlived its deadline.
+    pub fn expired(&self) -> bool {
+        self.phase == Phase::Done && self.expired
+    }
+
+    /// Ends a step that outlived its deadline.
+    fn expire(&mut self) -> Result<(), String> {
+        self.cancel()?;
+        self.expired = true;
+        Ok(())
+    }
+
+    /// Why the token refused, when its worker said so before a clean exit.
+    pub fn refusal(&self) -> Option<u8> {
+        if self.phase == Phase::Done {
+            self.refusal
+        } else {
+            None
+        }
     }
 
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
-        if self.phase != Phase::Present
-            || request != &self.request
-            || Instant::now() >= self.deadline
-        {
+        if self.phase == Phase::Present && Instant::now() >= self.deadline {
+            self.expire()?;
+            return Err("expired notebook presentation receipt".into());
+        }
+        if self.phase != Phase::Present || request != &self.request {
             self.cancel()?;
             return Err("stale notebook presentation receipt".into());
         }
@@ -98,8 +129,11 @@ impl Token {
     }
 
     pub fn pin(&mut self, request: &Request, pin: Pin) -> Result<bool, String> {
-        if matches!(self.phase, Phase::Stopping | Phase::Done) || Instant::now() >= self.deadline {
-            self.cancel()?;
+        if matches!(self.phase, Phase::Stopping | Phase::Done) {
+            return Ok(false);
+        }
+        if Instant::now() >= self.deadline {
+            self.expire()?;
             return Ok(false);
         }
         if self.phase != Phase::Pin
@@ -125,6 +159,8 @@ impl Token {
         self.wire = None;
         self.pending_pin = None;
         self.result = None;
+        self.refusal = None;
+        self.expired = false;
         self.failure = Some("notebook token operation ended without a result".into());
         if let Some(child) = &mut self.child {
             let _ = child.kill();
@@ -144,7 +180,7 @@ impl Token {
             return self.reap();
         }
         if Instant::now() >= self.deadline {
-            self.cancel()?;
+            self.expire()?;
             return self.reap();
         }
         match self.advance() {
@@ -174,7 +210,7 @@ impl Token {
             if finished && self.child.is_none() {
                 self.wire = None;
                 self.phase = Phase::Done;
-                return Ok(Event::Complete);
+                return Ok(self.terminal());
             }
             return Ok(Event::Waiting);
         }
@@ -224,6 +260,15 @@ impl Token {
                         return Err("notebook result changed method".into());
                     }
                     self.result = Some(Bytes(result.to_vec()));
+                    self.phase = Phase::Exit;
+                }
+                // A refusal releases nothing; it ends like a result, at a
+                // successful exit and clean end, and the step fails.
+                0x45 if self.phase == Phase::Running && self.pending_pin.is_none() => {
+                    let code = input.byte()?;
+                    input.finish()?;
+                    self.refusal = Some(code);
+                    self.failure = Some("the security key refused the notebook step".into());
                     self.phase = Phase::Exit;
                 }
                 _ => return Err("unexpected notebook worker frame".into()),
@@ -296,7 +341,7 @@ impl Drop for Token {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
     use crate::consent::Notebook;
@@ -367,6 +412,11 @@ mod tests {
         assert_eq!(reader.field(256).unwrap(), request.encode());
         assert_eq!(reader.field(63).unwrap(), b"123456");
         reader.finish().unwrap();
+        if script == "refused" {
+            // The token's own refusal: a wrong PIN, then a clean exit.
+            wire.send(&[0x45, 0x25]).unwrap();
+            return;
+        }
         let mut result = Bytes(vec![0x44]);
         field(&mut result, &[0x31; 37]).unwrap();
         wire.send(&result.0).unwrap();
@@ -379,7 +429,7 @@ mod tests {
         }
     }
 
-    fn worker(script: &str) -> Token {
+    fn scripted(script: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -391,7 +441,48 @@ mod tests {
             .env("TD_NOTEBOOK_WORKER_SCRIPT", script)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        Token::spawn(request(), &[0x31, 3, 1], command).unwrap()
+        command
+    }
+
+    fn worker(script: &str) -> Token {
+        Token::spawn(request(), &[0x31, 3, 1], scripted(script)).unwrap()
+    }
+
+    /// A bridge's step worker that asks for approval and the PIN
+    /// `123456`, then proves a result.
+    pub(crate) fn succeeding(request: Request, token: &[u8]) -> Result<Token, String> {
+        Token::spawn(request, token, scripted("success"))
+    }
+
+    /// One whose step outlives a short deadline unless answered at once.
+    pub(crate) fn expiring(request: Request, token: &[u8]) -> Result<Token, String> {
+        let mut token = Token::spawn(request, token, scripted("success"))?;
+        token.deadline = Instant::now() + Duration::from_millis(400);
+        Ok(token)
+    }
+
+    /// One that sends a result before its PIN: a worker ending without a
+    /// reason of the token's.
+    pub(crate) fn failing(request: Request, token: &[u8]) -> Result<Token, String> {
+        Token::spawn(request, token, scripted("early-result"))
+    }
+
+    /// One that asks the same, then refuses: a wrong PIN.
+    pub(crate) fn refusing(request: Request, token: &[u8]) -> Result<Token, String> {
+        Token::spawn(request, token, scripted("refused"))
+    }
+
+    #[test]
+    fn a_refusal_ends_cleanly_with_its_code_and_releases_nothing() {
+        let mut token = worker("refused");
+        assert!(matches!(drive(&mut token), Event::Failed(_)));
+        assert_eq!(token.refusal(), Some(0x25));
+        assert!(token.take_result().is_none());
+        assert!(token.child.is_none());
+        let mut cancelled = worker("refused");
+        cancelled.cancel().unwrap();
+        assert!(matches!(drive(&mut cancelled), Event::Failed(_)));
+        assert_eq!(cancelled.refusal(), None);
     }
 
     fn drive(token: &mut Token) -> Event {
@@ -409,6 +500,30 @@ mod tests {
             assert!(Instant::now() < end);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A step past its deadline ends as expired, which root relays;
+    /// a cancelled one does not.
+    #[test]
+    fn a_step_past_its_deadline_ends_expired() {
+        let mut token = worker("success");
+        token.deadline = Instant::now();
+        let end = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            match token.poll().unwrap() {
+                event @ Event::Failed(_) => break event,
+                _ => assert!(Instant::now() < end),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(event, Event::Failed(_)));
+        assert!(token.expired());
+        assert_eq!(token.refusal(), None);
+        assert!(token.child.is_none());
+        let mut cancelled = worker("success");
+        cancelled.cancel().unwrap();
+        assert!(matches!(drive(&mut cancelled), Event::Failed(_)));
+        assert!(!cancelled.expired());
     }
 
     #[test]

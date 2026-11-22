@@ -2,7 +2,8 @@ use crate::types::Recipe;
 
 /// td-pass, the encrypted notebook (td-pass/DESIGN.md), built as a TARGET
 /// recipe from the checkout's own trees. The crate depends by path on the
-/// shared UI toolkit `td-ui` and on td-secret's notebook library. td-ui
+/// shared UI toolkit `td-ui`, on td-secret's notebook library, on
+/// td-passkeys and on td-alloc for its fallible message growth. td-ui
 /// mounts the compositor's font reader and wire codec and embeds its licence
 /// notices, so `td-compositor` is staged as for td-photo; td-secret mounts
 /// td-authd's request, descriptor and consent modules, td-busd's D-Bus codec
@@ -134,6 +135,7 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "td-alloc = { path = \"../td-alloc\" }",
                 "td-ui = { path = \"../td-ui\" }",
                 "td-passkeys = { path = \"../td-passkeys\" }",
                 "td-secret = { path = \"../td-secret\" }",

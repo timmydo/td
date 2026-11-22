@@ -878,6 +878,19 @@ impl App {
                 self.prompt = Some(prompt);
                 return self.say("Type the key's PIN, or Cancel");
             }
+            // A PIN's profile, the one the key and root accept: anything
+            // else would fail the whole operation.
+            (true, Some(_))
+                if !(4..=63).contains(&prompt.pin.text().len())
+                    || !prompt
+                        .pin
+                        .text()
+                        .bytes()
+                        .all(|b| (0x20..=0x7e).contains(&b)) =>
+            {
+                self.prompt = Some(prompt);
+                return self.say("A PIN has 4 to 63 printable ASCII characters");
+            }
             (true, Some(_)) => {
                 let pin = Bytes::copy(prompt.pin.text().as_bytes());
                 prompt.pin.clear();

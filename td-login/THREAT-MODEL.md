@@ -52,6 +52,19 @@ is invalid, though every paired session consumes `Super+l` and shows
 `L`. That document says when the tier may be called usable and what it
 does not protect.
 
+The trusted password notebook is principle 7's third exception
+(`AGENTS.md`): its window, a human-account process, takes its key's
+approval and PIN in its own prompt, while root owns the token slot and
+binds each step to the operation the window asked for
+(`td-pass/DESIGN.md`, "Trusted td backend"). A FIDO2 PIN belongs to the
+token, not to one credential. When the notebook's key is also an
+enrolled login key, human-account code that can read the td-pass process
+or imitate its prompt learns the PIN that guards boot, login and the
+session lock; with the key stolen as well, a person at the locked
+machine (A4) holds both factors. Use a separate key for the notebook, or
+the machine's TPM once the notebook accepts it as a key, rather than a
+login key.
+
 ## 1. Assets and adversaries
 
 Assets, in the order an attacker wants them:
